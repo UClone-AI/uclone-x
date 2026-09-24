@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Question about using UClone-X
+    url: https://github.com/UClone-AI/uclone-x/discussions
+    about: For "how do I…" — questions are answered faster there than in an issue.
+  - name: Security vulnerability
+    url: https://github.com/UClone-AI/uclone-x/blob/main/SECURITY.md
+    about: Do not open a public issue. Report privately, as SECURITY.md describes.

@@ -1,0 +1,142 @@
+{
+  "about": "What /api/stream delivers on room.{room_id} for one conversation that produces every kind of event the topic carries: the human composing (USER_INPUT), two turns (scout, then critic), a turn stopped by Stop while it writes (INTERRUPT, then its landed row), and a cascade that fails before anyone speaks (the HTTP layer's status \"error\"). Each entry is the envelope's event_type and payload, the two fields App.tsx hands to applyRoomEvent. Not hand-written: tests/unit/test_room_orchestrator.py::TestTheHeadCanFollowAlong::test_the_heads_payload_fixture_is_what_the_room_publishes fails when this file and the room disagree, and prints the replacement. turn_id is a uuid per turn, renumbered by first appearance.",
+  "events": [
+    {
+      "event_type": "USER_INPUT",
+      "payload": {
+        "room_id": "r1",
+        "sender_id": "alice",
+        "status": "typing"
+      }
+    },
+    {
+      "event_type": "AGENT_REPLY",
+      "payload": {
+        "room_id": "r1",
+        "agent_id": "scout",
+        "turn_id": "turn-1",
+        "status": "generating"
+      }
+    },
+    {
+      "event_type": "AGENT_REPLY",
+      "payload": {
+        "room_id": "r1",
+        "agent_id": "scout",
+        "turn_id": "turn-1",
+        "status": "streaming",
+        "delta": "scout "
+      }
+    },
+    {
+      "event_type": "AGENT_REPLY",
+      "payload": {
+        "room_id": "r1",
+        "agent_id": "scout",
+        "turn_id": "turn-1",
+        "status": "streaming",
+        "delta": "says "
+      }
+    },
+    {
+      "event_type": "AGENT_REPLY",
+      "payload": {
+        "room_id": "r1",
+        "agent_id": "scout",
+        "turn_id": "turn-1",
+        "status": "streaming",
+        "delta": "TTL"
+      }
+    },
+    {
+      "event_type": "AGENT_REPLY",
+      "payload": {
+        "room_id": "r1",
+        "agent_id": "scout",
+        "seq": 2,
+        "status": "final",
+        "turn_id": "turn-1",
+        "content": "scout says TTL",
+        "completed": true
+      }
+    },
+    {
+      "event_type": "AGENT_REPLY",
+      "payload": {
+        "room_id": "r1",
+        "agent_id": "critic",
+        "turn_id": "turn-2",
+        "status": "generating"
+      }
+    },
+    {
+      "event_type": "AGENT_REPLY",
+      "payload": {
+        "room_id": "r1",
+        "agent_id": "critic",
+        "turn_id": "turn-2",
+        "status": "streaming",
+        "delta": "critic "
+      }
+    },
+    {
+      "event_type": "AGENT_REPLY",
+      "payload": {
+        "room_id": "r1",
+        "agent_id": "critic",
+        "turn_id": "turn-2",
+        "status": "streaming",
+        "delta": "disagrees"
+      }
+    },
+    {
+      "event_type": "AGENT_REPLY",
+      "payload": {
+        "room_id": "r1",
+        "agent_id": "critic",
+        "seq": 3,
+        "status": "final",
+        "turn_id": "turn-2",
+        "content": "critic disagrees",
+        "completed": true
+      }
+    },
+    {
+      "event_type": "AGENT_REPLY",
+      "payload": {
+        "room_id": "r1",
+        "agent_id": "scout",
+        "turn_id": "turn-3",
+        "status": "generating"
+      }
+    },
+    {
+      "event_type": "INTERRUPT",
+      "payload": {
+        "room_id": "r1",
+        "reason": "Stopped by the user"
+      }
+    },
+    {
+      "event_type": "AGENT_REPLY",
+      "payload": {
+        "room_id": "r1",
+        "agent_id": "scout",
+        "seq": 5,
+        "status": "final",
+        "turn_id": "turn-3",
+        "content": "",
+        "completed": false,
+        "error": "Turn was interrupted"
+      }
+    },
+    {
+      "event_type": "AGENT_REPLY",
+      "payload": {
+        "room_id": "r1",
+        "status": "error",
+        "error": "Room 'r1' has no participant matching @phantm. Participants: @alice, @scout, @critic"
+      }
+    }
+  ]
+}

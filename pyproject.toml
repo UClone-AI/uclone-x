@@ -1,0 +1,243 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "uclone-x"
+version = "0.2.0"
+description = "Next-Generation Event-Driven AI Agent Core & High-Performance Collaboration Framework"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+authors = [
+    { name = "Kenny Lim", email = "kennylim@uclone.net" }
+]
+keywords = [
+    "ai",
+    "agents",
+    "multi-agent",
+    "a2a",
+    "google-a2a",
+    "ontology",
+    "knowledge-graph",
+    "llm",
+    "event-driven",
+    "opentelemetry"
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+]
+
+dependencies = [
+    "pydantic>=2.7.0",
+    "pydantic-settings>=2.2.0",
+    "pyyaml>=6.0.1",
+    "httpx>=0.27.0",
+]
+
+# Frameworks used by a shell (FastAPI, Typer, Rich, uvicorn) and by an adapter
+# (tree-sitter, OTel SDK, provider SDKs) are optional extras (docs/core-shell-architecture.md §1 goal 3).
+
+[project.optional-dependencies]
+# CLI Shell: Typer, Rich
+cli = [
+    # `typer`, not `typer[all]`: typer dropped that extra, so every install
+    # printed "typer 0.27.2 does not provide the extra 'all'". What it used to
+    # pull that is still wanted is `rich`, declared on its own line below.
+    "typer>=0.12.0",
+    "rich>=13.7.0",
+]
+# HTTP Shell: FastAPI, uvicorn
+http = [
+    "fastapi>=0.110.0",
+    "uvicorn>=0.29.0",
+]
+# Code intelligence: AST parsing through tree-sitter.
+#
+# `tree-sitter-language-pack` replaced `tree-sitter-languages` here in #1100: the latter
+# publishes no wheel above cp312, so `[code-intel]` -- and through it `[all]` -- failed to
+# resolve on Python 3.13 with nothing installed at all. Measured on CPython 3.13.14: the
+# pack installs in 5 MB and parses every language this codebase asks for (python,
+# javascript, typescript, tsx, go, rust). The parser still reads the old bundle when an
+# environment already holds it, so nothing has to be re-installed to keep working.
+# Separate from the base because `ucx` works without it; the AST parser falls back and says so.
+code-intel = [
+    "tree-sitter>=0.21.0",
+    "tree-sitter-language-pack>=1.20.0",
+]
+# Telemetry: OpenTelemetry SDK & OTLP exporter
+telemetry = [
+    "opentelemetry-api>=1.24.0",
+    "opentelemetry-sdk>=1.24.0",
+    "opentelemetry-exporter-otlp>=1.24.0",
+]
+# LLM Providers
+llm = [
+    "google-genai>=0.1.0",
+    "anthropic>=0.25.0",
+    "openai>=1.25.0",
+]
+# Knowledge Graph & Ontology
+ontology = [
+    "linkml-runtime>=1.6.0",
+    "rdflib>=7.0.0",
+    "networkx>=3.3",
+]
+# Media & Image Generation: in-process diffusers (single-file SDXL checkpoint) / Pillow.
+# No model is declared here and none is downloaded by installing this extra: the in-process
+# engine loads a checkpoint already on disk, and a ComfyUI daemon is detected, never
+# installed (#1095).
+#
+# `torch` and `transformers` are named explicitly because `diffusers` does not depend on
+# either: an earlier version of this extra said torch "arrives as a diffusers dependency",
+# and a measured install into a clean Python 3.13 venv brought neither, leaving
+# `ucx media status` reporting ready for an engine that would fail on `import torch`.
+# The floors here are the same ones `IN_PROCESS_REQUIREMENTS` checks at runtime, so a
+# beginner who installs this extra and a beginner who follows the hint end up equivalent.
+media = [
+    "pillow>=10.0.0",
+    "diffusers>=0.31.0",
+    "torch>=2.2.0",
+    "transformers>=4.40.0",
+]
+# Development & Quality Gate
+dev = [
+    # Undeclared until 2026-09-10, and invisible because the shared venv already had
+    # it: four files under `tests/e2e/` import it, the gate type-checks `tests/`, and a
+    # venv rebuilt from this file produced 320 pyright errors. Nothing catches that
+    # short of a from-scratch sync, which no check runs.
+    #
+    # The browser binaries are a separate step and not a Python package:
+    # `playwright install chromium` after syncing.
+    "playwright>=1.44.0",
+    "pytest>=8.1.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-cov>=5.0.0",
+    # The gate's pytest stage runs on N workers (#967): measured serial it was the whole of
+    # the gate's wall time. The gate refuses to start rather than run serially when this is
+    # missing, so a venv not yet re-synced says so instead of silently getting slower.
+    "pytest-xdist>=3.6.0",
+    "ruff>=0.4.0",
+    "pyright>=1.1.360",
+    "uv>=0.1.30",
+]
+# Everything. It was capped at 3.12 until #1100, because `all` carries `code_intel`,
+# whose `tree-sitter-languages` had no wheel above cp312 -- raised in review of #605,
+# where "only code_intel is capped" was true of the extra and misleading about `all`.
+# `code_intel` now installs `tree-sitter-language-pack`, which ships cp313 wheels.
+# Per P0 and D5, includes all shell and adapter extras for full-featured default environments.
+all = [
+    "uclone-x[cli,http,code_intel,telemetry,llm,ontology,media,dev]",
+]
+
+
+[project.scripts]
+ucx = "uclone_x.shells.entry:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/uclone_x"]
+
+[tool.hatch.build.targets.sdist]
+# Narrowed deliberately. Hatchling's default sdist is "everything git tracks", which
+# on 0.1.0 was 559 files against a 134-file wheel: the whole development repository,
+# including the directories this project does not publish. The build tooling does not
+# consult the publication manifest, so the sdist walked straight past the
+# classification the release process applies, and a `pip download --no-binary :all:`
+# would have handed a reader material that is not published.
+#
+# This file ships inside the distribution, so it names no withheld path: the counts
+# and the directory list live in the private release documentation, where they can be
+# specific. Release artifacts are built from the exported public tree, not from here,
+# because that tree carries the public README and has been through the scrub, and
+# holds no private file to exclude in the first place. This narrowing is the second
+# line rather than the first: a test in the development repository asserts the
+# outcome against the manifest, so a directory added later cannot slip in.
+only-include = [
+    "src/uclone_x",
+    "pyproject.toml",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE",
+    "NOTICE",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP", "B", "C4"]
+ignore = ["E501"]
+
+[tool.pyright]
+# Policy: All top-level directories containing Python code (src, tests,
+# src, tests) are subject to strict type checking.
+# The publication export narrows this list to the published directories when it
+# builds the public tree, since pyright errors on an include path that is
+# not there. Non-Python or
+# build-artifact directories (node_modules, __pycache__, frontend) are
+# excluded.
+include = ["src", "tests"]
+# `evals/fixtures/` holds the *contents of a measured workspace*, not code this
+# project runs: the agent under test reads those files, and a question about them
+# has a fixed answer only while they stay exactly as written. Type-annotating them
+# to satisfy strict mode would edit the thing being measured.
+exclude = [
+    "**/node_modules",
+    "**/__pycache__",
+    "frontend",
+    "evals/fixtures",
+]
+venvPath = "."
+venv = ".venv"
+pythonVersion = "3.11"
+typeCheckingMode = "strict"
+reportMissingImports = true
+reportMissingTypeStubs = false
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+pythonpath = [".", "src"]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+markers = [
+    "e2e: End-to-end integration and Playwright tests",
+    "allow_network: Explicit opt-out for tests requiring outbound network connections",
+    "recorded: Tier 2 - replays a committed VCR cassette; never touches the network",
+    "live: Tier 3 - consumes a real LLM endpoint; collected but skipped without --live",
+    "fitness: checks the repository's own declarations rather than product code; no coverage",
+    "pre_release: Acceptance scenarios executed exclusively during release qualification",
+]
+addopts = "--cov=src/uclone_x --cov-branch --cov-report=term-missing --cov-fail-under=70"
+
+[tool.coverage.run]
+branch = true
+source = ["src/uclone_x"]
+omit = [
+    "src/uclone_x/ui_static/*",
+]
+
+
+[tool.coverage.report]
+fail_under = 70
+show_missing = true
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.:",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+    # A bare `...` is a Protocol method body or an @overload signature — a declaration,
+    # not code any test can execute. Counting them as misses understated real coverage
+    # and, worse, filled the report's Missing column with line numbers nobody can act on:
+    # `agent/protocols.py` read 65% with 25 such lines, `tools/protocols.py` 66% with 12,
+    # `telemetry/protocols.py` 76% with 8. All three have zero non-trivial statements.
+    "^\\s*\\.\\.\\.$",
+]
+

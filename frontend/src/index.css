@@ -1,0 +1,231 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    color-scheme: dark;
+  }
+
+  body {
+    @apply bg-slate-950 text-slate-100 antialiased font-sans;
+  }
+
+  /* Firefox & modern standard CSS compatibility */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: rgba(148, 163, 184, 0.25) transparent;
+  }
+
+  /* Global Custom Scrollbars for WebKit/Blink */
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background: rgba(148, 163, 184, 0.25);
+    border-radius: 9999px;
+    transition: background 0.2s ease;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    background: rgba(148, 163, 184, 0.45);
+  }
+}
+
+@layer utilities {
+  .custom-scrollbar {
+    scrollbar-width: thin;
+    scrollbar-color: rgba(148, 163, 184, 0.25) transparent;
+  }
+
+  .scrollbar-hide::-webkit-scrollbar {
+    display: none;
+  }
+  .scrollbar-hide {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+}
+
+/*
+ * Dock-scoped layout correction.
+ *
+ * The panels the workspace dock hosts were written for the centre column and lay themselves
+ * out with Tailwind's *viewport* breakpoints (`lg:grid-cols-3`, `md:grid-cols-4`). The dock's
+ * width is dragged by the operator and has nothing to do with the viewport, so on a wide
+ * screen a 380px dock still matched `lg:` and rendered a three-column grid — which is how the
+ * DAG's agent-inspector column became a strip one character wide.
+ *
+ * A container query fixes every panel at once, including any added later, and it corrects the
+ * axis rather than hard-coding a second set of numbers. `!important` is required because the
+ * declarations it overrides come from utility classes of equal specificity that are emitted
+ * later in the sheet.
+ *
+ * `ArtifactsDock` carries the class (#1029; the dock it was first written for was retired by
+ * #1055, which left this rule applying to nothing). The threshold is 480px of content, the
+ * same as `.column-scope`'s: a 360-480px dock gets one column. Above 480 the viewport classes
+ * decide, except for the four-column rows the next rule takes up to 720px -- a gap this one
+ * left, and the default 520px dock fell in it. The panels' header and filter rows are not
+ * either rule's business: they are `flex-wrap`, so they fit at any dock width without a
+ * threshold.
+ */
+.dock-scope {
+  container-type: inline-size;
+}
+
+/*
+ * Between the two thresholds, a four-column row of cards is two columns.
+ *
+ * The rule below collapses every dock grid to one column under 480px and then hands the
+ * decision back to the viewport classes, which is where `lg:grid-cols-4` picks the fight
+ * again: a 520px dock on a 1600px screen matches `lg:` and lays four cards across it. A
+ * 2xl figure and the phrase naming its unit do not fit that, and the cards carried
+ * `overflow-hidden`, so the phrase was cut off mid-word -- "axiomatic defense" on the
+ * scorecard's own Ontology Defense card, the one reporting that defence held.
+ *
+ * Measured in that dock with this rule removed and the cards as they were, by
+ * `tests/e2e/test_dock_metric_cards_e2e.py`: all four held 133-155px of content in a
+ * 110px box. Three dock panels draw such a row -- Ontology, Skills, Evaluations --
+ * and the scorecard is the one with seeded numbers on every machine, so it is the one
+ * that test reads.
+ *
+ * Bounded below by 481px so it cannot argue with the one-column rule, whatever order the
+ * sheet ends up in, and above by 720px so a dock dragged wide gets its four back.
+ */
+@container (min-width: 481px) and (max-width: 720px) {
+  .dock-scope [class*='grid-cols-4'] {
+    grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
+  }
+}
+
+@container (max-width: 480px) {
+  .dock-scope [class*='grid-cols-'] {
+    grid-template-columns: minmax(0, 1fr) !important;
+  }
+
+  .dock-scope [class*='col-span-'] {
+    grid-column: auto !important;
+  }
+}
+
+/*
+ * Above that threshold, a two-column grid is two columns -- decided by the dock, not the window.
+ *
+ * The two rules above take columns *away* from a dock too narrow for them, which is the half of
+ * #1029 that showed as overflow. The other half is silent: a grid whose only column class is a
+ * viewport one (`md:grid-cols-2` on the Evaluations suite cards) draws a single column in a dock
+ * wide enough for two whenever the *window* is under 768px -- and below 768px the dock is drawn
+ * over the workspace at the full window width (#1019), so that is every narrow window. Measured
+ * with the same seeded suite in a ~739px dock: one column of 715px at a 740px window, two of
+ * 329.5px at 1280px. Nothing overflowed, so no guard said anything (#1311).
+ *
+ * 481px rather than the 768px the class names: it is the threshold the rule above already draws,
+ * so no width that renders two columns today renders one after this, and the dock's default 520px
+ * keeps the two columns `test_a_dock_narrower_than_its_grids_lays_them_out_in_one_column` pins.
+ *
+ * `grid-cols-4` rows are excluded because the rule above them owns the band it draws -- two
+ * columns from 481 to 720px -- and because `[class*='grid-cols-2']` would otherwise match
+ * `sm:grid-cols-2 lg:grid-cols-4`, the scorecard's own metric row, and hold it at two columns at
+ * every width. What the exclusion does *not* do is give those rows a container answer above
+ * 720px: no block here matches them there, so the window decides, and the last paragraph carries
+ * what that leaves.
+ *
+ * That exclusion is a denylist, which is the weakness of this rule and not a hidden one: a dock
+ * grid carrying `grid-cols-2` together with a larger count other than four would be pinned at
+ * two above 480px. The only such class string in the frontend today is `SettingsModal`'s
+ * `grid-cols-2 sm:grid-cols-3 md:grid-cols-5`, and it sits outside every `.dock-scope`: the
+ * modal mounts in `App` rather than inside `ArtifactsDock`, and the only `.dock-scope` wrappers
+ * inside the modal are its Skills and Diagnostics sections (#1358), which hold `SkillsTab`,
+ * `AcpTab` and `EvaluationsTab` and not that grid. When a third band is needed, it wants its own
+ * `@container` range like the four-column rule has -- not another `:not()` here.
+ *
+ * And this rule does not finish #1029's axis correction. It matches `grid-cols-2` only, so the
+ * dock's `md:grid-cols-4`, `lg:grid-cols-3` and `sm:grid-cols-3` rows still take their column
+ * count from the window below their own breakpoints. #1327 carries those.
+ *
+ * The exclusion above leaves one more, and it is the row this rule spares rather than some
+ * future one: `EvaluationsTab`'s `grid-cols-1 sm:grid-cols-2 lg:grid-cols-4` metric cards. Above
+ * a 720px container no `@container` block here matches them, so the window picks between
+ * `sm:grid-cols-2` and `lg:grid-cols-4` -- two columns below a 1024px window, four at 1024 and
+ * up. It is reachable at one unchanged container width, which is what makes it this defect and
+ * not a width nobody has: `overlaid = windowWidth - reservedWidth <= width` (`ArtifactsDock`),
+ * and `reservedWidth` is 0 with the rail closed, so an 880px dock is not overlaid at any window
+ * wider than itself -- 1000px and 1400px both qualify, and its 879px surface draws two columns
+ * at the first and four at the second. (It *is* overlaid at or below 880px, where it renders the
+ * window's width instead; overlay is a fact about both numbers, not about the rail alone.) Milder
+ * than #1029 -- the panel's `p-3` and three `gap-4` gaps leave four cards 201.8px each there,
+ * against the 133-155px of content the cards above were measured needing, so nothing overflows;
+ * the cost is a wide dock under-using its width, and the axis still being the window's. Deduced
+ * from these three rules and the class string, on the same footing as #1327's own bands, and
+ * recorded there.
+ */
+@container (min-width: 481px) {
+  .dock-scope [class*='grid-cols-2']:not([class*='grid-cols-4']) {
+    grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
+  }
+}
+
+/*
+ * The conversation column's own width (#1015, #1227).
+ *
+ * The rail and the dock both take width from the conversation, so the column's width is not
+ * the viewport's, and Tailwind's viewport breakpoints cannot see the difference. So the column
+ * is the container. At 320px or less the header's and composer's buttons drop their text,
+ * keeping their icon and their `aria-label`, so each one still fits and still says what it is.
+ *
+ * **The container is not reachable only on a phone.** `RoomConversation` carries these rules
+ * since #1227; `PlaygroundTab` carried them until #1234 deleted it, which left them applying
+ * to nothing while the surface that replaced it adapted to its container not at all. The case
+ * that decides this is a *wide* window: the rail takes 240px from the row and the dock seats
+ * itself whenever what is left is wider than its own width (`ArtifactsDock`'s `overlaid`),
+ * with no floor kept for the conversation -- the hole `lib/rail.ts` records and this rule does
+ * not close. So at a 920px window with the rail open and the dock at its default 520px the
+ * column is 160px, and at a 1280px window with the dock dragged to its 900px maximum it is
+ * 140px. Measured on `193fafee` before these classes were adopted: in both, `clear-history`
+ * rendered past the column's right edge and a click at its centre reached the dock.
+ * `tests/e2e/test_room_conversation_layout_e2e.py` holds the 920px case.
+ *
+ * Three rules that used to live here went with the surface that used them, rather than being
+ * kept against a future user (#1227). `.column-hide` dropped `PlaygroundTab`'s `/` separators
+ * and `.column-pad` narrowed its header's gutter; the room header has no separators, and
+ * measured at 320px and at 360px it overflows by nothing, so the gutter buys it no room it
+ * needs. `.column-wrap` wrapped the header's control group at 480px or less, and on this
+ * header it is never the remedy: the `<header>` already wraps that group onto a row of its
+ * own unconditionally, so with `.column-wrap` removed and the bundle rebuilt, columns of 140,
+ * 200, 260, 340, 400 and 460px all render every control inside the column and hittable -- at
+ * 340px and up the labelled buttons measure 113 and 64px against a 340px row, and below 320
+ * `.column-icon-only` has already reduced them to 30px each. A rule no reachable width
+ * exercises cannot be guarded, and this issue was opened about CSS that nothing exercises;
+ * keeping a rule for a caller that does not exist, or for a width that does not occur, is the
+ * same defect in a slower form.
+ *
+ * The selectors here are more specific than the utilities they override, so no `!important`
+ * is needed.
+ */
+.column-scope {
+  container-type: inline-size;
+}
+
+@container (max-width: 320px) {
+  .column-scope .column-icon-only {
+    display: none;
+  }
+}
+
+/*
+ * A table wider than its bubble scrolls in its own box (#1010). Overlay scrollbars show only
+ * while the table is being scrolled, so nothing on screen said it scrolled at all. While more of
+ * the table lies past the right edge, that edge fades out (#1015). A mask, not a gradient
+ * overlay, so it fades whatever background the bubble has. `RichText`'s `TableScroll` sets the
+ * class from the scroll position.
+ */
+.table-scroll-more {
+  -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 2rem), transparent);
+  mask-image: linear-gradient(to right, #000 calc(100% - 2rem), transparent);
+}

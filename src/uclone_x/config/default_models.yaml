@@ -1,0 +1,61 @@
+# Default image model profiles and prompt family bindings for UClone-X (P0/P9)
+version: "1.0"
+
+models:
+  - model_id: "anillustrious_v4"
+    display_name: "Illustrious-XL v4 (Anime SDXL)"
+    filename: "anillustrious_v4.safetensors"
+    family: "danbooru"
+    skill_name: "media-prompt-danbooru"
+    engine_type: "auto"
+    width: 832
+    height: 1216
+    steps: 30
+    cfg: 5.5
+    sampler: "dpmpp_2m"
+    scheduler: "karras"
+    default_negative: "worst quality, bad anatomy, deformed, bad hands, animal, blurry, text, watermark"
+
+  - model_id: "Illustrious-XL-v0.1"
+    display_name: "Illustrious-XL v0.1 (SDXL Checkpoint)"
+    filename: "Illustrious-XL-v0.1.safetensors"
+    family: "danbooru"
+    skill_name: "media-prompt-danbooru"
+    engine_type: "auto"
+    width: 832
+    height: 1216
+    steps: 30
+    cfg: 5.5
+    sampler: "dpmpp_2m"
+    scheduler: "karras"
+    default_negative: "worst quality, bad anatomy, deformed, bad hands, animal, blurry, text, watermark"
+
+  - model_id: "flux-2-klein-base-4b"
+    display_name: "FLUX.2 Klein Base 4B (Apache 2.0)"
+    filename: "flux-2-klein-base-4b.safetensors"
+    family: "prose"
+    skill_name: "media-prompt-flux"
+    engine_type: "mlx"
+    width: 1024
+    height: 1024
+    steps: 4
+    cfg: 1.0
+    sampler: "euler"
+    scheduler: "normal"
+    default_negative: ""
+    suppress_negative: true
+
+default_fallback:
+  model_id: "generic_fallback"
+  display_name: "Universal Image Generation Model"
+  filename: ""
+  family: "generic"
+  skill_name: "media-prompt-generic"
+  engine_type: "auto"
+  width: 768
+  height: 768
+  steps: 20
+  cfg: 7.0
+  sampler: "euler"
+  scheduler: "normal"
+  default_negative: "worst quality, blurry, deformed, bad anatomy, bad hands, text"

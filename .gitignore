@@ -1,0 +1,104 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+# Anchored to the repository root. These are setuptools build artifacts from the standard
+# Python template, and unanchored they match a directory named `lib` at ANY depth — which
+# silently swallowed `frontend/src/lib/`, a source directory. A source file that git
+# ignores is worse than a missing one: it builds locally and breaks for everyone else.
+# The neighbouring `build/`, `dist/` and friends have the same shape; they are left alone
+# because nothing currently collides with them, and widening this edit would be a change
+# nobody has a failing case for.
+/lib/
+/lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+.venv
+venv/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+.claude/
+*.swp
+*.swo
+.DS_Store
+
+# Testing & Coverage
+.coverage
+.coverage.*
+.pytest_cache/
+htmlcov/
+.ruff_cache/
+.mypy_cache/
+.pyright/
+
+# Node / UI
+node_modules/
+dist/
+ui/dist/
+ui/node_modules/
+frontend/node_modules
+frontend/node_modules/
+.vite/
+
+# Secrets & Environment
+.env
+.env.*
+!.env.example
+credentials/
+
+# GitHub App credentials.
+# The App's private key downloads as a `.pem` straight into whatever directory
+# the browser points at, and a repository root is a normal place for it to land.
+# `*.key` covers the same key in the other extension people reach for; measured
+# 2026-09-04, `git ls-files` matched zero paths under either, so nothing tracked
+# is orphaned by these rules.
+*.pem
+*.key
+# `.env.github_app` is already matched by the `.env.*` glob above, but only
+# incidentally. A credential protected by accident is one edit to an unrelated
+# glob away from not being protected at all, so it is named here on purpose.
+.env.github_app
+
+# Builder Worktrees & Swarm State
+.worktrees/
+.swarm/
+# `swarm/leases/*.json` is lease scratch some manager sessions write by hand. It is runtime
+# state like `.swarm/`, never tracked (no commit has touched it), and `./swx lease` does not
+# read it — its leases live in `.swarm/manager-<tier>.json` (`swarm/core/lease.py`).
+swarm/leases/
+
+# Evaluation Reports
+evals/reports/*.json
+!evals/reports/.gitkeep
+
+
+# TypeScript incremental build state (tsc -b)
+*.tsbuildinfo
+
+# Runtime workspace output.
+# `ucx` treats the directory it runs in as the agent's workspace, so a run started at the
+# repository root writes its generated files here: the image tools default to
+# `artifacts/images/...`, and the UI reads a session's tool output from
+# `.sandbox/tool_artifacts/<session>/`. Fifty such PNGs were staged by a `git add -A` before
+# a gate run, and the check that classifies every tracked file refused them.
+artifacts/
+.sandbox/

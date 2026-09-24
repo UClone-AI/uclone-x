@@ -1,0 +1,55 @@
+# Field ids are a contract with `uclone_x.core.diagnostic_report`: `ucx report
+# --open` pre-fills this form by naming them as URL query parameters, so
+# renaming one silently drops what the command sent.
+name: Bug report
+description: Something failed, behaved wrongly, or the error message was not enough
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **The fastest way to fill this in:** run `ucx report --open` and this form
+        arrives already filled. Everything it sends is shown to you first, and
+        nothing is uploaded until you press Submit below.
+
+        If `ucx` will not start at all, that is still a bug worth reporting —
+        just paste what your terminal printed.
+
+  - type: textarea
+    id: what_happened
+    attributes:
+      label: What happened?
+      description: What you were doing, what you expected, and what you got instead.
+      placeholder: |
+        I ran `ucx run` and asked it to read a file. It answered without reading it.
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment and recorded failures
+      description: |
+        `ucx report` fills this. Otherwise: your UClone-X version (`ucx version`),
+        Python version, operating system, and which model provider you configured.
+      render: markdown
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: How can we reproduce it?
+      description: The smallest sequence you can find. "I do not know" is a valid answer.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checked
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues for this fingerprint or error message
+          required: false
+        - label: I checked that no API key or private path is visible in what I pasted
+          required: false

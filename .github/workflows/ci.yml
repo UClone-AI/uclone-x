@@ -1,0 +1,207 @@
+# The open-source repository's continuous integration.
+#
+# This file exists only in the published repository. The development repository
+# it is exported from has no hosted CI by design: its gate runs on the
+# maintainer's machine, and the export refuses to publish a tree that does not
+# pass it. What CI adds here is the two things that check cannot do —
+#
+#   1. verify a contribution whose author's local run nobody can vouch for, and
+#   2. cover axes a single developer machine does not have: three Python
+#      versions, Linux, and a from-scratch install of the built artifact.
+#
+# Everything else would be a second opinion on a question already answered
+# before the snapshot was published.
+
+name: CI
+
+# `pull_request`, never `pull_request_target`: a fork's code then runs with a
+# read-only token and no access to secrets. This workflow needs neither.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A new push supersedes the run it interrupts. Without this, a branch pushed
+# three times in a minute holds three runners.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    name: gate (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      # Every version reports. A failure on one version alone is the finding,
+      # and fail-fast would cancel the runs that establish it is specific to it.
+      fail-fast: false
+      matrix:
+        # `--all-extras` on every version, and the same gate on every version.
+        #
+        # This used to be a per-version `extras` list with a reduced gate on
+        # 3.13, because `code-intel` pulled `tree-sitter-languages`, which
+        # publishes no wheel above cp312 and no sdist: `uv sync --all-extras
+        # --python 3.13` failed to resolve before a single test ran, and
+        # dropping the extra only moved the failure from resolution to Pyright's
+        # `reportMissingImports` over `code_intel/ast_parser.py`. So 3.13 ran
+        # neither Pyright nor the per-package coverage floors -- a real gap in
+        # the support this project claims, held open by one unmaintained
+        # package.
+        #
+        # `code-intel` now declares `tree-sitter-language-pack`, which ships
+        # cp313 wheels, so both halves of that are gone and the asymmetry has no
+        # cause left. If a version ever cannot install an extra again, say so
+        # here with the package that cannot be built rather than reducing a leg
+        # silently.
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Sync dependencies
+        run: uv sync --all-extras --python ${{ matrix.python-version }}
+
+      # `./ucx test check` runs the frontend vitest suite and rebuilds the UI
+      # bundle into a temporary directory to check the committed
+      # `src/uclone_x/ui_static` is what the source builds. Both fail -- by
+      # design, not by accident -- when `frontend/node_modules` is absent: a
+      # check that cannot run must not read as a check that passed. Every leg
+      # runs that gate, so every leg needs Node.
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        run: npm ci --prefix frontend
+
+      # `--fast` drops the browser suite and keeps everything else, including
+      # the coverage floor and the frontend vitest suite. The E2E tests need
+      # `playwright install chromium`, which is a separate download and belongs
+      # in a path-filtered job rather than in the check every pull request
+      # waits on.
+      - name: Quality gate
+        run: ./ucx test check --fast
+
+  packaging:
+    name: install from the built artifact
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Build the distribution
+        run: uv build
+
+      # Installed without extras, outside the checkout, with nothing on the
+      # path from this repository. This is the state of a user who ran
+      # `pip install uclone-x` and nothing else, and it is the one state a
+      # developer machine never reproduces: a missing optional import or a
+      # broken console script is invisible in a synced checkout.
+      - name: Library install imports with no shell framework
+        run: |
+          set -euo pipefail
+          python -m venv "$RUNNER_TEMP/base"
+          "$RUNNER_TEMP/base/bin/pip" install --quiet --disable-pip-version-check dist/*.whl
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/base/bin/python" -c "import uclone_x; print(uclone_x.__version__)"
+
+      # `ucx` ships with the library but needs the `cli` extra to run. It must
+      # say which extra, in one line, and exit non-zero -- not raise the
+      # instruction as the last line of a traceback.
+      - name: Console script without its extra reports the extra
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          output="$("$RUNNER_TEMP/base/bin/ucx" --help 2>&1)" && exit_status=0 || exit_status=$?
+          echo "$output"
+          test "$exit_status" -ne 0
+          if grep -q "Traceback (most recent call last)" <<<"$output"; then
+            echo "::error::ucx raised its missing-extra error instead of reporting it" >&2
+            exit 1
+          fi
+          grep -q "uclone-x\[cli\]" <<<"$output"
+
+      # The command the README gives, run exactly as the README gives it.
+      - name: Documented install runs
+        run: |
+          set -euo pipefail
+          python -m venv "$RUNNER_TEMP/cli"
+          "$RUNNER_TEMP/cli/bin/pip" install --quiet --disable-pip-version-check "$(echo dist/*.whl)[cli,http]"
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/cli/bin/ucx" version
+          "$RUNNER_TEMP/cli/bin/ucx" --help > /dev/null
+
+      # The evaluation suites are not part of this distribution. The runtime is
+      # required to say so and keep working, rather than fail to import.
+      - name: Absent evaluation backend is reported, not raised
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          output="$("$RUNNER_TEMP/cli/bin/ucx" eval list 2>&1)" && exit_status=0 || exit_status=$?
+          echo "$output"
+          test "$exit_status" -ne 0
+          grep -q "No evaluation backend is installed" <<<"$output"
+
+      # An installed distribution is a user build: `test`, `dev` and `setup`
+      # drive a source checkout and are registered only from one. Asserted on
+      # the artifact because the gate that decides it -- whether the running
+      # module sits inside a checkout -- is always true where the suite runs.
+      - name: Installed build is a user build
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          help="$("$RUNNER_TEMP/cli/bin/ucx" --help 2>&1)"
+          echo "$help"
+
+          for user_command in run ui llm status version; do
+            grep -qE "^[^A-Za-z]*$user_command\\b" <<<"$help" \
+              || { echo "::error::user command '$user_command' missing from the installed build" >&2; exit 1; }
+          done
+
+          for maintainer_command in test dev setup; do
+            if grep -qE "^[^A-Za-z]*$maintainer_command\\b" <<<"$help"; then
+              echo "::error::maintainer command '$maintainer_command' is exposed to users" >&2
+              exit 1
+            fi
+          done
+
+      # Reaching for one anyway is a usage error, and it has to read as one.
+      - name: An absent maintainer command fails cleanly
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          output="$("$RUNNER_TEMP/cli/bin/ucx" test check 2>&1)" && exit_status=0 || exit_status=$?
+          echo "$output"
+          test "$exit_status" -ne 0
+          if grep -q "Traceback (most recent call last)" <<<"$output"; then
+            echo "::error::ucx raised instead of reporting an unknown command" >&2
+            exit 1
+          fi
+
+      - name: Install with the provider extras
+        run: |
+          set -euo pipefail
+          python -m venv "$RUNNER_TEMP/full"
+          "$RUNNER_TEMP/full/bin/pip" install --quiet --disable-pip-version-check "$(echo dist/*.whl)[cli,http,llm,ontology]"
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/full/bin/python" -c "import uclone_x; print(uclone_x.__version__)"
+          "$RUNNER_TEMP/full/bin/ucx" --help > /dev/null

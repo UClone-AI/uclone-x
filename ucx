@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# UCX: Unified Developer CLI for UClone-X
+# ==============================================================================
+set -e
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$REPO_ROOT"
+
+# Resolve .venv: check local directory first, then resolve git common root for worktrees
+VENV_DIR=""
+if [ -d "$REPO_ROOT/.venv" ]; then
+    VENV_DIR="$REPO_ROOT/.venv"
+else
+    GIT_COMMON="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
+    if [ -n "$GIT_COMMON" ]; then
+        MAIN_ROOT="$(cd "$GIT_COMMON/.." && pwd)"
+        if [ -d "$MAIN_ROOT/.venv" ]; then
+            VENV_DIR="$MAIN_ROOT/.venv"
+        fi
+    fi
+fi
+
+if [ -n "$VENV_DIR" ] && [ -d "$VENV_DIR" ]; then
+    export PATH="$VENV_DIR/bin:$PATH"
+    PYTHON_BIN="$VENV_DIR/bin/python"
+else
+    PYTHON_BIN="python3"
+fi
+
+export PYTHONPATH="$REPO_ROOT/src:$REPO_ROOT:$PYTHONPATH"
+
+# Never write __pycache__ from a `ucx` invocation. CPython invalidates a cached .pyc on
+# the tuple (source mtime in whole seconds, source size); a size-preserving mutation
+# re-applied inside one wall-clock second matches both components, so the stale .pyc is
+# reused and a mutation run reports the PREVIOUS mutation's results — silently, with a
+# plausible failure set, and undetectable by a `cmp -s` source-presence check (#482).
+# This variable suppresses *writing*, never *reading*, so it is not the whole remedy; it
+# is the half that can be enforced here rather than remembered. The other half — purging
+# `__pycache__` before every mutation — belongs to the harness. See Swarm Guide §6.9.
+export PYTHONDONTWRITEBYTECODE=1
+
+exec "$PYTHON_BIN" -m uclone_x.cli.main "$@"
