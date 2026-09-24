@@ -833,7 +833,9 @@ def test_ui_chat_offline_llm_warning_notice(tmp_path: Path) -> None:
     assert data["response"] == OFFLINE_LLM_DIAGNOSTIC_MESSAGE
     assert "⚠️ No active LLM provider connected." in data["response"]
     assert "ollama serve" in data["response"]
-    assert "./ucx llm status" in data["response"]
+    assert "ucx llm status" in data["response"]
+    assert "./ucx" not in data["response"]
+    assert "Settings" in data["response"]
     assert data["provenance"]["degraded"] is True
     assert data["provenance"]["path"] == "OFFLINE_FALLBACK"
     assert data["provenance"]["served_by"] == "offline_diagnostic"

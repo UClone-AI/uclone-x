@@ -1753,8 +1753,8 @@ async def test_a_watched_step_is_estimated_exactly_as_a_headless_one(
 
     Killed by: src/uclone_x/agent/base.py :: full_content, tool_calls_list
     Becomes: full_content, ()
-    Killed by: src/uclone_x/agent/base.py :: "".join(content_chunks), tool_calls_list
-    Becomes: "".join(content_chunks), ()
+    Killed by: src/uclone_x/agent/base.py :: known_model, "".join(content_chunks), tool_calls
+    Becomes: known_model, "".join(content_chunks), ()
     """
     request = LLMRequest(
         messages=(

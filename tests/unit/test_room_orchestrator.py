@@ -82,16 +82,20 @@ class FakeAgent:
         self.tool_executions_complete: bool = True
         #: Every checkpoint the orchestrator handed back to undo a turn (#1423), in order.
         self.rolled_back: list[Any] = []
+        self.caller_turn_ids: list[str | None] = []
 
     async def execute_turn(
         self,
         prompt: str,
         *,
         stream_callback: Any = None,
+        caller_turn_id: str | None = None,
+        **kwargs: Any,
     ) -> Any:
         from uclone_x.agent.models import TurnResult
 
         self.prompts.append(prompt)
+        self.caller_turn_ids.append(caller_turn_id)
         #: What the orchestrator handed this turn. `None` is a real answer and not a
         #: missing value -- it is how a room with no bus says "do not pay for chunks".
         self.stream_callbacks.append(stream_callback)
@@ -453,6 +457,28 @@ class TestOrchestratorDecides:
 
         assert state.transcript[-1].decision is not None
         assert state.transcript[-1].decision.selector == "mention"
+
+    @pytest.mark.asyncio
+    async def test_each_seat_turn_is_called_with_the_id_its_row_carries(self, built: Any) -> None:
+        """The seat's `TURN_START` link to the room row (turn inspection design §4.2.1).
+
+        Each agent turn is run with `caller_turn_id` equal to the `turn_id` its transcript
+        row records, and two turns get two ids -- the join the trace reader makes.
+
+        Killed by: src/uclone_x/room/orchestrator.py :: caller_turn_id=turn_id,
+        Becomes: caller_turn_id=None,
+        """
+        _, _, agents = built
+        selector = ScriptedSelector("s", [speak("scout"), speak("critic")])
+        orch = _orchestrator(built, [selector])
+
+        state = await orch.post("r1", "alice", "discuss")
+
+        scout_row, critic_row = state.transcript[1], state.transcript[2]
+        assert scout_row.turn_id is not None and critic_row.turn_id is not None
+        assert scout_row.turn_id != critic_row.turn_id
+        assert agents["scout"].caller_turn_ids == [scout_row.turn_id]
+        assert agents["critic"].caller_turn_ids == [critic_row.turn_id]
 
 
 class TestOrchestratorBoundsTurns:
@@ -926,7 +952,9 @@ class TestProvenanceReachesTheTranscript:
         prov = Provenance.primary(provider="mock", model="mock-model")
 
         class Attributing(FakeAgent):
-            async def execute_turn(self, prompt: str, *, stream_callback: Any = None) -> Any:
+            async def execute_turn(
+                self, prompt: str, *, stream_callback: Any = None, **kwargs: Any
+            ) -> Any:
                 from uclone_x.agent.models import TurnResult
 
                 self.prompts.append(prompt)
@@ -950,7 +978,9 @@ class TestProvenanceReachesTheTranscript:
         prov = Provenance.primary(provider="mock", model="mock-model")
 
         class Attributing(FakeAgent):
-            async def execute_turn(self, prompt: str, *, stream_callback: Any = None) -> Any:
+            async def execute_turn(
+                self, prompt: str, *, stream_callback: Any = None, **kwargs: Any
+            ) -> Any:
                 from uclone_x.agent.models import TurnResult
 
                 self.prompts.append(prompt)
@@ -2024,8 +2054,8 @@ class TestTheHeadCanFollowAlong:
         green. It now counts what arrives and looks for the scratchpad's own text, both
         of which change the moment a non-token event is let through.
 
-        Killed by: src/uclone_x/room/orchestrator.py :: if not live or event_name != "token":
-        Becomes: if not live:
+        Killed by: src/uclone_x/room/orchestrator.py :: if event_name != "token":
+        Becomes: if False:
         """
         from uclone_x.engine.event_bus import AgentEvent, EventBus
 
@@ -2185,6 +2215,47 @@ class TestTheHeadCanFollowAlong:
         assert stored is not None
         assert [m.sender_id for m in stored.transcript] == ["alice", "alice", "scout"]
         assert final[0]["seq"] == 3
+
+    @pytest.mark.asyncio
+    async def test_stream_callback_forwards_status_updates(self, built: Any) -> None:
+        """Lightweight tool-calling and progress notices are published as status_update.
+
+        Allows the UI to display live status (e.g. 'Running tool: generate_image...')
+        instead of generic 'Thinking...' while an agent is executing tools.
+
+        Killed by: src/uclone_x/room/orchestrator.py :: "status": "status_update",
+        Becomes: "status": "streaming",
+        """
+        from uclone_x.engine.event_bus import EventBus, EventType
+        from uclone_x.room.orchestrator import RoomOrchestrator
+
+        store, resolver, _agents = built
+        async with EventBus() as bus:
+            sub = bus.subscribe({"room.r1"})
+            orch = RoomOrchestrator(
+                store=store,
+                selectors=[],
+                resolver=resolver,
+                bus=bus,
+            )
+            callback = orch._stream_callback("r1", "scout", "turn-42")  # pyright: ignore[reportPrivateUsage]
+            assert callback is not None
+
+            # Stream a status update
+            await callback(
+                "status",
+                {"status": "calling_tool", "detail": "Running tool: generate_image..."},
+            )
+
+            event = await asyncio.wait_for(sub.get(), timeout=1.0)
+            assert event.type is EventType.AGENT_REPLY
+            assert event.payload == {
+                "room_id": "r1",
+                "agent_id": "scout",
+                "turn_id": "turn-42",
+                "status": "status_update",
+                "detail": "Running tool: generate_image...",
+            }
 
     @pytest.mark.asyncio
     async def test_the_heads_payload_fixture_is_what_the_room_publishes(
@@ -3986,3 +4057,45 @@ class TestMemorySaveOutcome:
             )
         ]
         assert _memory_save_outcome(records) == (0, 0)
+
+
+class TestAutonomousDiscussionMode:
+    """Autonomous discussion runs under user presence and circuit breaker ceiling."""
+
+    @pytest.mark.asyncio
+    async def test_autonomous_mode_pauses_when_user_not_present(self, built: Any) -> None:
+        store, _, _ = built
+        state = store.load("r1")
+        assert state is not None
+        store.save(state.model_copy(update={"policy": RoomPolicy(autonomous=True)}))
+
+        orch = _orchestrator(built, [ScriptedSelector("s", [speak("scout")])])
+        # Presence is not noted, so user is inactive
+        result = await orch.post("r1", "alice", "hello")
+
+        assert result.last_decision is not None
+        assert result.last_decision.verdict is SelectionVerdict.SILENCE
+        assert "autonomous discussion paused" in result.last_decision.reasoning
+
+    @pytest.mark.asyncio
+    async def test_autonomous_mode_runs_with_active_presence_and_stops_at_circuit_breaker(
+        self, built: Any
+    ) -> None:
+        from uclone_x.room.orchestrator import AUTONOMOUS_CIRCUIT_BREAKER_TURNS
+
+        store, _, _ = built
+        state = store.load("r1")
+        assert state is not None
+        store.save(state.model_copy(update={"policy": RoomPolicy(autonomous=True)}))
+
+        # Script 25 speak decisions
+        decisions = [speak("scout" if i % 2 == 0 else "critic") for i in range(25)]
+        orch = _orchestrator(built, [ScriptedSelector("s", decisions)])
+        orch.note_presence("r1", active=True)
+
+        result = await orch.post("r1", "alice", "let's discuss")
+
+        assert result.turn_state.agent_turns_since_human == AUTONOMOUS_CIRCUIT_BREAKER_TURNS
+        assert result.last_decision is not None
+        assert result.last_decision.verdict is SelectionVerdict.SILENCE
+        assert "circuit breaker" in result.last_decision.reasoning

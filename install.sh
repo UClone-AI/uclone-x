@@ -2,6 +2,8 @@
 # ==============================================================================
 # UClone-X — beginner installer: the one install a first-time user runs.
 #
+#   curl -fsSL https://raw.githubusercontent.com/UClone-AI/uclone-x/main/install.sh | bash
+#
 # Installs the seed — `[cli,http]`, ~31 MB — which is the whole of what the
 # dashboard needs. Then *offers* the image engine, which is two orders of
 # magnitude larger. The seed install is the part that must not fail; the image
@@ -17,11 +19,14 @@
 #   ./install.sh --dry-run       resolve everything, install nothing
 #   ./install.sh --venv PATH     target a venv other than ./.venv
 #   ./install.sh --yes           allow fetching uv, Python, the image engine and the models without asking
+#   ./install.sh --no-start      do not offer to start the dashboard at the end
 #
 # It needs nothing but macOS or Linux and curl. When no Python 3.11+ is present
 # it fetches a private Python 3.12 (~71 MB) through uv, installing uv first
 # (~39 MB, ~/.local/bin) when it is missing, after asking once. Run from a checkout it installs that checkout into ./.venv; run on its
-# own it installs the published package into ~/.uclone-x/venv.
+# own it installs the published package into ~/.uclone-x/venv and links `ucx` into
+# ~/.local/bin. The questions are asked on the terminal even when the script is
+# piped from curl, and the last one offers to start the dashboard.
 #
 # The models are the last step and the largest: Ollama and a local LLM, and the
 # SDXL checkpoint the image engine loads. Software without weights cannot answer
@@ -48,10 +53,16 @@ IMAGE_MODE="ask"
 MODELS_MODE="ask"
 DRY_RUN="no"
 ASSUME_YES="no"
+START_MODE="ask"
 UV_PYTHON="3.12"
 UV_INSTALLER_URL="https://astral.sh/uv/install.sh"
 # Where macOS keeps the Command Line Tools shims. Overridable only for the tests.
 CLT_SHIM_DIR="${UCX_INSTALL_CLT_SHIM_DIR:-/usr/bin}"
+# The terminal the questions are asked on. Under `curl ... | bash` stdin is the
+# script itself: a question read from it would swallow the script's next line, and
+# `[ -t 0 ]` is false, so every question used to be skipped on the documented path.
+# The terminal is still there as /dev/tty. Overridable only for the tests.
+TTY="${UCX_INSTALL_TTY:-/dev/tty}"
 
 # The seed: the smallest set of extras that still serves the dashboard.
 SEED_EXTRAS="cli,http"
@@ -71,6 +82,21 @@ ok()   { printf '\033[1;32m✔\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m✖\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31m✖ %s\033[0m\n' "$*" >&2; exit 1; }
 
+# usage: ask "<question>" <y|n default>. Sets ANSWER to y or n. Returns 1, asking
+# nothing, when there is no terminal to ask on (CI, cron, a detached session).
+ask() {
+    { : < "$TTY"; } 2>/dev/null || return 1
+    printf '  %s ' "$1"
+    answer=""
+    read -r answer < "$TTY" || true
+    case "$answer" in
+        [yY]*) ANSWER="y" ;;
+        [nN]*) ANSWER="n" ;;
+        *)     ANSWER="$2" ;;
+    esac
+    return 0
+}
+
 while [ $# -gt 0 ]; do
     case "$1" in
         --with-image)  IMAGE_MODE="yes"; shift ;;
@@ -79,11 +105,14 @@ while [ $# -gt 0 ]; do
         --no-models)   MODELS_MODE="no"; shift ;;
         --dry-run)    DRY_RUN="yes"; shift ;;
         -y|--yes)     ASSUME_YES="yes"; shift ;;
+        --no-start)   START_MODE="no"; shift ;;
         --venv)       [ $# -ge 2 ] || die "--venv needs a path"; VENV_DIR="$2"; shift 2 ;;
-        -h|--help)    sed -n '2,29p' "${SCRIPT_PATH:-/dev/null}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help)    sed -n '2,34p' "${SCRIPT_PATH:-/dev/null}" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *)            die "unknown option: $1 (try --help)" ;;
     esac
 done
+# The link in ~/.local/bin points at this path, and a relative one would dangle.
+case "$VENV_DIR" in /*) ;; *) VENV_DIR="$(pwd)/$VENV_DIR" ;; esac
 
 # ------------------------------------------------------------------------------
 # Step 0a — the interpreter. A normal Mac has Python 3.9 at best, and without the
@@ -151,14 +180,10 @@ elif [ -z "$PYTHON" ]; then
     # weights too -- questions this run is about to ask properly, one at a time.
     FETCH_PYTHON="$ASSUME_YES"
     if [ "$FETCH_PYTHON" != "yes" ]; then
-        if [ -t 0 ]; then
-            if [ -z "$UV" ]; then
-                printf '  Install uv and Python %s now? [Y/n] ' "$UV_PYTHON"
-            else
-                printf '  Fetch Python %s now? [Y/n] ' "$UV_PYTHON"
-            fi
-            read -r answer
-            case "$answer" in [nN]*) FETCH_PYTHON="no" ;; *) FETCH_PYTHON="yes" ;; esac
+        question="Fetch Python $UV_PYTHON now? [Y/n]"
+        [ -z "$UV" ] && question="Install uv and Python $UV_PYTHON now? [Y/n]"
+        if ask "$question" y; then
+            [ "$ANSWER" = "y" ] && FETCH_PYTHON="yes"
         else
             say "  Not a terminal, so not asking. Re-run with --yes to allow it."
         fi
@@ -284,14 +309,12 @@ if [ "$IMAGE_MODE" = "ask" ]; then
     say "  The dashboard works without any of this."
     # --yes is read here exactly as step 0e reads it below, so the flag means one thing.
     # The documented one-liner -- `curl ... | bash -s -- --yes` -- has no terminal, so
-    # deciding this on `[ -t 0 ]` alone gave the person who consented to ~12 GB of weights
+    # deciding this on the terminal alone gave the person who consented to ~12 GB of weights
     # no engine and no checkpoint, under a summary that read `models installed`.
     if [ "$ASSUME_YES" = "yes" ]; then
         IMAGE_MODE="yes"
-    elif [ -t 0 ]; then
-        printf '  Install it now? [y/N] '
-        read -r answer
-        case "$answer" in [yY]*) IMAGE_MODE="yes" ;; *) IMAGE_MODE="no" ;; esac
+    elif ask "Install it now? [y/N]" n; then
+        if [ "$ANSWER" = "y" ]; then IMAGE_MODE="yes"; else IMAGE_MODE="no"; fi
     else
         say "  Not a terminal, so not asking. Re-run with --with-image to include it."
         IMAGE_MODE="no"
@@ -346,10 +369,8 @@ if [ "$MODELS_MODE" = "ask" ]; then
     say "  You can skip this and let the dashboard ask you later instead."
     if [ "$ASSUME_YES" = "yes" ]; then
         MODELS_MODE="yes"
-    elif [ -t 0 ]; then
-        printf '  Download them now? [y/N] '
-        read -r answer
-        case "$answer" in [yY]*) MODELS_MODE="yes" ;; *) MODELS_MODE="no" ;; esac
+    elif ask "Download them now? [y/N]" n; then
+        if [ "$ANSWER" = "y" ]; then MODELS_MODE="yes"; else MODELS_MODE="no"; fi
     else
         say "  Not a terminal, so not asking. Re-run with --with-models to include them."
         MODELS_MODE="no"
@@ -403,6 +424,30 @@ if [ "$DRY_RUN" = "no" ] && [ -x "$UCX" ] && ! "$UCX" start --help >/dev/null 2>
 fi
 
 # ------------------------------------------------------------------------------
+# The command. A venv buried in ~/.uclone-x is not somewhere a beginner will type,
+# so the published install links `ucx` into ~/.local/bin -- the directory uv and
+# pipx use for the same purpose. A checkout keeps its own ./ucx and gets no link.
+# An existing ucx there that is not this install's (`uv tool install`, say) is
+# left alone: replacing someone's working command is not this script's call.
+# ------------------------------------------------------------------------------
+LINK_DIR="$HOME/.local/bin"
+LINK="$LINK_DIR/ucx"
+SHOW_UCX="$UCX"
+PATH_HINT="no"
+if [ "$SOURCE" != "$REPO_ROOT" ] && [ "$DRY_RUN" = "no" ] && [ -x "$UCX" ]; then
+    if [ -e "$LINK" ] && ! { [ -L "$LINK" ] && [ "$(readlink "$LINK")" = "$UCX" ]; }; then
+        warn "$LINK already exists and is not this install's; left it alone."
+    elif mkdir -p "$LINK_DIR" && ln -sf "$UCX" "$LINK"; then
+        case ":$PATH:" in
+            *":$LINK_DIR:"*) SHOW_UCX="ucx" ;;
+            *)               SHOW_UCX="$LINK"; PATH_HINT="yes" ;;
+        esac
+    else
+        warn "Could not link ucx into $LINK_DIR; use the full path below."
+    fi
+fi
+
+# ------------------------------------------------------------------------------
 # Done.
 # ------------------------------------------------------------------------------
 step "Done"
@@ -425,7 +470,13 @@ if [ -n "$RAM" ]; then
 fi
 say ""
 say "Start it with:"
-say "    $UCX $START"
+say "    $SHOW_UCX $START"
+if [ "$PATH_HINT" = "yes" ]; then
+    say ""
+    say "To type just \`ucx\`, put $LINK_DIR on your PATH: add this line to"
+    say "~/.zshrc (or ~/.bashrc), then open a new terminal:"
+    say "    export PATH=\"\$HOME/.local/bin:\$PATH\""
+fi
 say ""
 say "That opens the dashboard at http://127.0.0.1:5180. Everything still missing —"
 say "a model, the image engine, credentials — is something you ask for there."
@@ -435,6 +486,17 @@ case "$MODELS_OK" in
     skipped|incomplete)
         say ""
         say "Or fetch the models from here instead:"
-        say "    $UCX install"
+        say "    $SHOW_UCX install"
         ;;
 esac
+
+# Last, because it does not return: the dashboard runs in this terminal until
+# Ctrl-C. Only on a terminal -- a scripted run (CI, --yes under a pipe) that started
+# a server would never finish -- and `ucx start` gets the terminal as its stdin, so
+# its own questions are asked there rather than read from curl's pipe.
+if [ "$DRY_RUN" = "no" ] && [ "$START_MODE" != "no" ] && [ -x "$UCX" ]; then
+    say ""
+    if ask "Start UClone-X now? [Y/n]" y && [ "$ANSWER" = "y" ]; then
+        exec "$UCX" "$START" < "$TTY"
+    fi
+fi

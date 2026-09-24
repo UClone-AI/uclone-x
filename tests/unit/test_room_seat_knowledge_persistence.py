@@ -435,7 +435,9 @@ class _Seat:
     def __init__(self) -> None:
         self.ontology = OntologyEngine()
 
-    async def execute_turn(self, prompt: str, *, stream_callback: Any = None) -> TurnResult:
+    async def execute_turn(
+        self, prompt: str, *, stream_callback: Any = None, **kwargs: Any
+    ) -> TurnResult:
         return TurnResult(turn_index=1, content="done", provenance=None)
 
     def checkpoint_turn(self, session_id: str | None = None) -> SessionState:

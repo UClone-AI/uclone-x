@@ -22,7 +22,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 INSTALL_SH = REPO_ROOT / "install.sh"
 # /bin/bash on macOS is 3.2, which is what a beginner's Mac runs the script with.
 BASH = "/bin/bash" if Path("/bin/bash").exists() else (shutil.which("bash") or "bash")
-REAL_TOOLS = ("sed", "dirname", "grep", "cat", "mkdir", "sh", "chmod", "cp")
+REAL_TOOLS = ("sed", "dirname", "grep", "cat", "mkdir", "sh", "chmod", "cp", "ln", "readlink")
 
 # A uv that records its calls and, for `uv venv`, makes a venv whose ucx has `start`.
 # Like the real one, `uv venv --python 3.12` probes the first python3 on PATH
@@ -41,6 +41,7 @@ if [ "$1" = "venv" ]; then
 echo "ucx $*" >> "$STUB_LOG"
 if [ "$1 $2" = "install --help" ]; then exit "${STUB_UCX_HAS_INSTALL:-0}"; fi
 if [ "$1" = "install" ]; then exit "${STUB_UCX_INSTALL_EXIT:-0}"; fi
+if [ "$*" = "start" ]; then read -r l || true; echo "ucx start stdin=$l" >> "$STUB_LOG"; fi
 exit 0
 EOU
     chmod +x "$last/bin/python" "$last/bin/ucx"
@@ -111,6 +112,9 @@ class Machine:
         extra_path: list[Path] | None = None,
         env_extra: dict[str, str] | None = None,
         image: str | None = "--no-image",
+        tty: str | None = None,
+        standalone: bool = False,
+        piped: bool = False,
     ) -> subprocess.CompletedProcess[str]:
         # Every case but the image-consent one answers the image question in advance, so
         # that the branch under test is never the one deciding a 1.0 GB install. Passing
@@ -122,13 +126,31 @@ class Machine:
             "STUB_LOG": str(self.log),
             "STUB_UV_SOURCE": str(self.uv_source),
             "UCX_INSTALL_CLT_SHIM_DIR": str(self.root / "shims"),
+            # The terminal the script asks on. Absent by default, so no case waits on
+            # the developer's own terminal; ``tty`` is the answer the user types.
+            "UCX_INSTALL_TTY": str(self.root / "no-tty"),
             **(env_extra or {}),
         }
-        argv = [BASH, str(script), *([image] if image else []), "--venv", str(self.root / "venv")]
+        if tty is not None:
+            (self.root / "tty").write_text(tty + "\n")
+            env["UCX_INSTALL_TTY"] = str(self.root / "tty")
+        venv = [] if standalone else ["--venv", str(self.root / "venv")]
+        if standalone:
+            script = self.root / "lone" / "install.sh"
+            script.parent.mkdir(exist_ok=True)
+            shutil.copy(INSTALL_SH, script)
+        flags = [*([image] if image else []), *venv, *args]
+        # `piped` is the README's `curl ... | bash` itself: the script arrives on stdin,
+        # so anything in it that reads stdin eats the script's own remaining lines.
+        argv = [BASH, "-s", "--", *flags] if piped else [BASH, str(script), *flags]
         return subprocess.run(
-            [*argv, *args],
+            argv,
             env=env,
-            stdin=subprocess.DEVNULL,
+            cwd=self.root,
+            input=INSTALL_SH.read_text() if piped else None,
+            # Otherwise stdin is never a terminal either, and a new session has no /dev/tty.
+            stdin=None if piped else subprocess.DEVNULL,
+            start_new_session=True,
             capture_output=True,
             text=True,
             timeout=120,
@@ -382,37 +404,152 @@ def test_dry_run_describes_the_models_without_fetching_them(machine: Machine) ->
     assert not any(c.startswith("ucx") for c in machine.calls())
 
 
-def test_run_outside_a_checkout_installs_the_published_package(
-    machine: Machine, tmp_path: Path
-) -> None:
-    lone = tmp_path / "lone" / "install.sh"
-    lone.parent.mkdir()
-    shutil.copy(INSTALL_SH, lone)
+def test_run_outside_a_checkout_installs_the_published_package(machine: Machine) -> None:
     py = machine.python("python3.12", "3.12")
     machine.uv_on_path()
-    env_run = subprocess.run(
-        [BASH, str(lone), "--with-image"],
-        env={
-            "PATH": str(machine.bin),
-            "HOME": str(machine.home),
-            "STUB_LOG": str(machine.log),
-            "UCX_INSTALL_CLT_SHIM_DIR": str(tmp_path / "shims"),
-        },
-        stdin=subprocess.DEVNULL,
-        capture_output=True,
-        text=True,
-        timeout=30,
-        check=False,
-    )
-    assert env_run.returncode == 0, env_run.stdout + env_run.stderr
+    result = machine.run("--with-image", image=None, standalone=True)
+    assert result.returncode == 0, result.stdout + result.stderr
     venv = machine.home / ".uclone-x" / "venv"
     calls = machine.calls()
     assert f"uv venv --python {py} {venv}" in calls
     assert any(c.endswith("uclone-x[cli,http]") for c in calls)
     # The published package has no image extra; installing it would be a silent no-op.
     assert not any(c.endswith("uclone-x[media]") for c in calls)
-    assert "image engine  not in the published package" in env_run.stdout
-    assert f"{venv}/bin/ucx start" in env_run.stdout
+    assert "image engine  not in the published package" in result.stdout
+
+
+# --- the command and the first start ------------------------------------------
+# The README promises: paste one line, and UClone-X opens. These cases pin the two
+# steps after the install that make that true -- a `ucx` the user can type, and the
+# offer to start it -- on the piped path, where stdin is not the terminal.
+
+
+def test_the_published_install_links_ucx_and_says_how_to_reach_it(machine: Machine) -> None:
+    _ready(machine)
+    result = machine.run(standalone=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+    link = machine.home / ".local" / "bin" / "ucx"
+    assert link.is_symlink()
+    assert os.readlink(link) == str(machine.home / ".uclone-x" / "venv" / "bin" / "ucx")
+    # ~/.local/bin is not on this PATH, so the short name would not resolve.
+    assert f"    {link} start" in result.stdout
+    assert 'export PATH="$HOME/.local/bin:$PATH"' in result.stdout
+
+
+def test_with_local_bin_on_path_the_short_name_is_given(machine: Machine) -> None:
+    _ready(machine)
+    local_bin = machine.home / ".local" / "bin"
+    result = machine.run(standalone=True, extra_path=[local_bin])
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "    ucx start" in result.stdout
+    assert "export PATH" not in result.stdout
+
+
+def test_someone_elses_ucx_on_path_is_left_alone(machine: Machine) -> None:
+    _ready(machine)
+    local_bin = machine.home / ".local" / "bin"
+    local_bin.mkdir(parents=True)
+    _write(local_bin / "ucx", "#!/bin/sh\n# uv tool install's\n")
+    result = machine.run(standalone=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (local_bin / "ucx").read_text() == "#!/bin/sh\n# uv tool install's\n"
+    assert "left it alone" in result.stdout
+    assert f"{machine.home / '.uclone-x' / 'venv'}/bin/ucx start" in result.stdout
+
+
+def test_a_checkout_gets_no_link(machine: Machine) -> None:
+    _ready(machine)
+    result = machine.run()
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not (machine.home / ".local" / "bin" / "ucx").exists()
+
+
+def test_a_piped_run_asks_on_the_terminal_and_starts(machine: Machine) -> None:
+    """The one-liner, answered yes: Python fetched, models fetched, dashboard started.
+
+    stdin is not a terminal here, exactly as under `curl ... | bash`. Before the
+    questions moved to /dev/tty every one of them was skipped on that path, and a
+    stock Mac with Python 3.9 ended at "Nothing was installed".
+    """
+    machine.python("python3", "3.9")
+    machine.uv_on_path()
+    result = machine.run(tty="y")
+    assert result.returncode == 0, result.stdout + result.stderr
+    calls = machine.calls()
+    assert f"uv venv --python 3.12 {machine.root / 'venv'}" in calls
+    assert "ucx install --yes --no-image" in calls
+    # Started last, with the terminal -- not curl's pipe -- as its stdin.
+    assert calls[-1] == "ucx start stdin=y"
+
+
+def test_the_readme_one_liner_end_to_end(machine: Machine) -> None:
+    """`curl ... | bash`, answered yes: the script comes in on stdin and runs to the end.
+
+    Every other case hands bash a file. This one hands it the script on stdin, so a
+    later command that read stdin -- a bare `read`, a prompt, a child inheriting it --
+    would swallow the rest of the script and the start would never be reached.
+    """
+    _ready(machine)
+    result = machine.run(tty="y", piped=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+    calls = machine.calls()
+    assert any(c.endswith("uclone-x[cli,http]") for c in calls)
+    assert "ucx install --yes --no-image" in calls
+    assert (machine.home / ".local" / "bin" / "ucx").is_symlink()
+    assert calls[-1] == "ucx start stdin=y"
+
+
+def test_a_relative_venv_is_linked_absolutely(machine: Machine) -> None:
+    _ready(machine)
+    result = machine.run("--venv", "rel-venv", standalone=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+    link = machine.home / ".local" / "bin" / "ucx"
+    assert os.path.isabs(os.readlink(link))
+    assert link.resolve().exists()
+
+
+def test_enter_starts_it_and_skips_the_big_download(machine: Machine) -> None:
+    _ready(machine)
+    result = machine.run(tty="")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "ucx install --yes --no-image" not in machine.calls()
+    assert machine.calls()[-1] == "ucx start stdin="
+
+
+def test_answering_no_leaves_it_stopped(machine: Machine) -> None:
+    _ready(machine)
+    result = machine.run(tty="n")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not any(c.startswith("ucx start stdin") for c in machine.calls())
+    assert f"{machine.root / 'venv'}/bin/ucx start" in result.stdout
+
+
+def test_no_start_does_not_ask(machine: Machine) -> None:
+    _ready(machine)
+    result = machine.run("--no-start", tty="y")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not any(c.startswith("ucx start stdin") for c in machine.calls())
+    assert "Start UClone-X now?" not in result.stdout
+
+
+def test_without_a_terminal_it_never_starts(machine: Machine) -> None:
+    """The real /dev/tty, in a session that has none: CI, cron, `--yes` in a script.
+
+    A started server never returns, so a scripted install that reached it would hang.
+    """
+    _ready(machine)
+    result = machine.run("--yes", env_extra={"UCX_INSTALL_TTY": "/dev/tty"})
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not any(c.startswith("ucx start stdin") for c in machine.calls())
+    assert "Start UClone-X now?" not in result.stdout
+
+
+def test_dry_run_neither_links_nor_starts(machine: Machine) -> None:
+    _ready(machine)
+    result = machine.run("--dry-run", tty="y", standalone=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not (machine.home / ".local" / "bin" / "ucx").exists()
+    assert not any(c.startswith("ucx") for c in machine.calls())
 
 
 def test_install_sh_parses_and_is_executable() -> None:

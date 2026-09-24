@@ -14,7 +14,7 @@ from uclone_x.agent.hooks.protocols import BaseHook
 from uclone_x.agent.prompts import compose_system_prompt
 from uclone_x.core.immutable import ImmutableJsonMapping, ImmutableStrMapping
 from uclone_x.core.provenance import Provenance
-from uclone_x.llm.models import TokenBudget, ToolCallRequest
+from uclone_x.llm.models import TokenBudget, TokenUsage, ToolCallRequest
 from uclone_x.sandbox.models import (
     IsolationPolicy,
     WorkspaceIsolation,
@@ -561,4 +561,11 @@ class TurnResult(BaseModel):
     loaded_skills: tuple[str, ...] = Field(
         default_factory=tuple,
         description="Names of skills explicitly loaded into session context.",
+    )
+    usage: TokenUsage | None = Field(
+        default=None,
+        description="Total tokens consumed across all model calls of this turn. "
+        "Summed over every completed step. `count_source` is `provider` only if every "
+        "step's was `provider`; otherwise it is the least certain source (e.g. `estimate`). "
+        "`None` when no model call completed (e.g. hook block or immediate pre-loop failure).",
     )

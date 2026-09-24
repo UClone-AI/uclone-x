@@ -123,7 +123,7 @@ class _Seat:
         self.tool_executions: tuple[Any, ...] = ()
         self.fail_with: Exception | None = None
 
-    async def execute_turn(self, prompt: str, *, stream_callback: Any = None) -> Any:
+    async def execute_turn(self, prompt: str, *, stream_callback: Any = None, **kwargs: Any) -> Any:
         from uclone_x.agent.models import TurnResult
 
         if self.fail_with is not None:
@@ -1035,10 +1035,10 @@ class _CasWriter(_Seat):
             ),
         )
 
-    async def execute_turn(self, prompt: str, *, stream_callback: Any = None) -> Any:
+    async def execute_turn(self, prompt: str, *, stream_callback: Any = None, **kwargs: Any) -> Any:
         self.workspace.mkdir(parents=True, exist_ok=True)
         (self.workspace / "cas.md").write_text("x", encoding="utf-8")
-        return await super().execute_turn(prompt, stream_callback=stream_callback)
+        return await super().execute_turn(prompt, stream_callback=stream_callback, **kwargs)
 
 
 class TestAFileOnDiskIsNeverReportedAsNoneWritten:

@@ -132,6 +132,7 @@ from uclone_x.llm.models import (
     TokenUsage,
     ToolCallRequest,
     ToolDefinition,
+    aggregate_token_usages,
 )
 from uclone_x.llm.protocols import (
     ContextCompactorProtocol,
@@ -210,6 +211,39 @@ def _named_model(value: object) -> str | None:
         return None
     stripped = value.strip()
     return stripped if stripped and stripped != "default" else None
+
+
+def _caller_turn_id_field(caller_turn_id: str | None) -> dict[str, str]:
+    """`{"caller_turn_id": …}` when the caller gave one, else nothing to spread in."""
+    return {} if caller_turn_id is None else {"caller_turn_id": caller_turn_id}
+
+
+def _model_name_reason(model_name: str | None, why: str) -> dict[str, str]:
+    """`{"model_name_reason": why}` when no model is named, else nothing to spread in."""
+    return {} if model_name is not None else {"model_name_reason": why}
+
+
+@dataclass(slots=True)
+class _StreamProgress:
+    """What one model call had produced when it stopped (#1489).
+
+    `_invoke_model` fills it as chunks arrive, so the caller can record how far a call
+    got when it raises -- including on `CancelledError`, which carries no payload and
+    must be re-raised unchanged. `usage` is set only when the partial call was booked
+    to the budget, so the record and the budget always carry the same figure.
+    """
+
+    content_chunks: list[str] = field(default_factory=lambda: [])
+    thinking_chunks: list[str] = field(default_factory=lambda: [])
+    usage: TokenUsage | None = None
+
+    @property
+    def content(self) -> str:
+        return "".join(self.content_chunks)
+
+    @property
+    def thinking(self) -> str | None:
+        return "".join(self.thinking_chunks) if self.thinking_chunks else None
 
 
 def _is_provider_timeout(exc: BaseException) -> bool:
@@ -3177,6 +3211,7 @@ class BaseAgent(BaseAgentProtocol):
         req: LLMRequest,
         *,
         stream_callback: Callable[[str, dict[str, Any]], Awaitable[None] | None] | None = None,
+        progress: _StreamProgress | None = None,
     ) -> ModelResponse:
         """One model invocation, with the token budget checked before and charged after.
 
@@ -3192,6 +3227,9 @@ class BaseAgent(BaseAgentProtocol):
 
         A stream that fails before it finishes raises `LLMStreamInterruptedError`, after
         booking what the partial stream spent; it is not retried through `generate` (#938).
+        A stream cancelled before it finishes books the same way and re-raises the
+        `CancelledError` unchanged. `progress`, when given, receives the streamed content,
+        thinking and booked usage as they arrive, so a caller can record a failed call.
         """
         if self._budget is not None:
             self._budget.enforce_budget(self._context.session_id, provider=llm.provider_name)
@@ -3209,8 +3247,10 @@ class BaseAgent(BaseAgentProtocol):
             # What served it: whatever the stream itself reports, like `generate` reads the
             # response body. The last chunk that names one wins.
             served_model: str | None = None
-            content_chunks: list[str] = []
-            thinking_chunks: list[str] = []
+            if progress is None:
+                progress = _StreamProgress()
+            content_chunks = progress.content_chunks
+            thinking_chunks = progress.thinking_chunks
             tool_calls_list: list[ToolCallRequest] = []
             last_usage: TokenUsage | None = None
             last_finish: FinishReason | None = None
@@ -3265,6 +3305,21 @@ class BaseAgent(BaseAgentProtocol):
                         last_usage = chunk.usage
                     if chunk.finish_reason:
                         last_finish = chunk.finish_reason
+            except asyncio.CancelledError:
+                # Stopped by the caller (the room's Stop). What streamed was served and is
+                # booked like an interrupted stream's, then the cancellation propagates
+                # unchanged: it is never converted into a turn error.
+                cancelled_usage = self._book_partial_stream(
+                    llm,
+                    req,
+                    last_usage,
+                    served_model or requested_model,
+                    chunks_received,
+                    tool_calls_list,
+                    content_chunks,
+                )
+                progress.usage = cancelled_usage
+                raise
             except Exception as stream_err:
                 # The stream stopped before it finished, and the turn fails (#938). This
                 # used to re-request the step through `llm.generate` under `PRIMARY`
@@ -3276,14 +3331,16 @@ class BaseAgent(BaseAgentProtocol):
                 # one, an estimate of what arrived if any chunk did, and nothing if none
                 # did, since then nothing shows the provider served the request. Design:
                 # the room UI design document §6.7 [#938].
-                partial_usage = last_usage
                 known_model = served_model or requested_model
-                if partial_usage is None and chunks_received:
-                    partial_usage = self._estimate_stream_usage(
-                        llm, req, known_model, "".join(content_chunks), tool_calls_list
-                    )
-                if self._budget is not None and partial_usage is not None:
-                    self._budget.record_usage(self._context.session_id, partial_usage)
+                progress.usage = self._book_partial_stream(
+                    llm,
+                    req,
+                    last_usage,
+                    known_model,
+                    chunks_received,
+                    tool_calls_list,
+                    content_chunks,
+                )
                 source = (
                     f"{llm.provider_name}/{known_model}"
                     if known_model
@@ -3299,10 +3356,12 @@ class BaseAgent(BaseAgentProtocol):
                     model=known_model,
                     chunks_received=chunks_received,
                     discarded_tool_calls=len(tool_calls_list),
+                    partial_content="".join(content_chunks),
                 )
                 raise interrupted from stream_err
             else:
                 full_content = "".join(content_chunks)
+                full_thinking = "".join(thinking_chunks) if thinking_chunks else None
                 # A request that named no model resolved, on the provider's side, to the one
                 # the stream reports; that is what was asked for, not a substitution. A
                 # stream that names none was served by what was asked for, as `generate`
@@ -3327,6 +3386,7 @@ class BaseAgent(BaseAgentProtocol):
                 )
                 resp = ModelResponse(
                     content=full_content,
+                    thinking=full_thinking,
                     tool_calls=tuple(tool_calls_list),
                     usage=last_usage,
                     finish_reason=finish_reason,
@@ -3343,6 +3403,31 @@ class BaseAgent(BaseAgentProtocol):
         if self._budget is not None:
             self._budget.record_usage(self._context.session_id, resp.usage)
         return resp
+
+    def _book_partial_stream(
+        self,
+        llm: LLMProviderProtocol,
+        req: LLMRequest,
+        last_usage: TokenUsage | None,
+        known_model: str | None,
+        chunks_received: int,
+        tool_calls: Sequence[ToolCallRequest],
+        content_chunks: Sequence[str],
+    ) -> TokenUsage | None:
+        """Book what a stream that stopped early spent, and return that figure (#938).
+
+        The provider's count if a chunk carried one, an estimate of what arrived if any
+        chunk did, and nothing if none did, since then nothing shows the provider served
+        the request.
+        """
+        partial_usage = last_usage
+        if partial_usage is None and chunks_received:
+            partial_usage = self._estimate_stream_usage(
+                llm, req, known_model, "".join(content_chunks), tool_calls
+            )
+        if self._budget is not None and partial_usage is not None:
+            self._budget.record_usage(self._context.session_id, partial_usage)
+        return partial_usage
 
     @staticmethod
     def _estimate_stream_usage(
@@ -3374,11 +3459,115 @@ class BaseAgent(BaseAgentProtocol):
             count_source=TokenCountSource.ESTIMATE,
         )
 
+    async def _invoke_step_model(
+        self,
+        llm: LLMProviderProtocol,
+        req: LLMRequest,
+        step: int,
+        stream_callback: Callable[[str, dict[str, Any]], Awaitable[None] | None] | None,
+        durable_events: list[dict[str, Any]],
+        step_usages: list[TokenUsage],
+    ) -> ModelResponse:
+        """`_invoke_model`, recorded as one `MODEL_RESPONSE` whether it returns or raises.
+
+        On an exception -- cancellation included -- the event carries what had streamed
+        (content, thinking) and the usage the budget was charged for it, then the exception
+        is re-raised unchanged. That charged usage also joins `step_usages`, so the turn's
+        `usage` and the budget agree on an interrupted step (turn inspection design §4.2).
+        """
+        started_at = _now_iso()
+        is_streamed = stream_callback is not None and hasattr(llm, "stream")
+        progress = _StreamProgress()
+        try:
+            resp = await self._invoke_model(
+                llm, req, stream_callback=stream_callback, progress=progress
+            )
+        except (Exception, asyncio.CancelledError) as invoke_exc:
+            ended_at = _now_iso()
+            partial_content = getattr(invoke_exc, "partial_content", None)
+            if not isinstance(partial_content, str):
+                partial_content = progress.content if progress.content_chunks else None
+            err_model = _named_model(getattr(invoke_exc, "model", None)) or _named_model(req.model)
+            if progress.usage is not None:
+                step_usages.append(progress.usage)
+            durable_events.append(
+                {
+                    "type": "MODEL_RESPONSE",
+                    "turn_index": self._turn_counter,
+                    "step": step,
+                    "started_at": started_at,
+                    "ended_at": ended_at,
+                    "streamed": is_streamed,
+                    "content": partial_content or "",
+                    "thinking": progress.thinking,
+                    "tool_calls": [],
+                    "finish_reason": None,
+                    "model_name": err_model,
+                    "usage": (
+                        progress.usage.model_dump(mode="json")
+                        if progress.usage is not None
+                        else None
+                    ),
+                    "error": {
+                        "type": type(invoke_exc).__name__,
+                        "message": str(invoke_exc),
+                        "partial_content": partial_content,
+                    },
+                    **_model_name_reason(
+                        err_model,
+                        "the call failed before any model was reported, and the request named none",
+                    ),
+                }
+            )
+            raise
+        ended_at = _now_iso()
+        # Read defensively: a test double may hand back something other than a
+        # `ModelResponse`, and recording the step must not be what fails the turn.
+        usage = getattr(resp, "usage", None)
+        if not isinstance(usage, TokenUsage):
+            usage = None
+        if usage is not None:
+            step_usages.append(usage)
+        finish_reason = getattr(resp, "finish_reason", None)
+        finish_str = getattr(finish_reason, "value", None)
+        # `ModelResponse.model_name` defaults to "unknown"; that names no model either.
+        served_name = _named_model(getattr(resp, "model_name", None))
+        model_name = (served_name if served_name != "unknown" else None) or _named_model(req.model)
+        durable_events.append(
+            {
+                "type": "MODEL_RESPONSE",
+                "turn_index": self._turn_counter,
+                "step": step,
+                "started_at": started_at,
+                "ended_at": ended_at,
+                "streamed": is_streamed,
+                "content": getattr(resp, "content", "") or "",
+                "thinking": getattr(resp, "thinking", None),
+                "tool_calls": [
+                    {
+                        "id": tc.id,
+                        "name": tc.name,
+                        "arguments": unwrap_immutable(tc.arguments),
+                    }
+                    for tc in getattr(resp, "tool_calls", ()) or ()
+                ],
+                "finish_reason": finish_str,
+                "model_name": model_name,
+                "usage": usage.model_dump(mode="json") if usage is not None else None,
+                "error": None,
+                **_model_name_reason(
+                    model_name, "the provider reported no model, and the request named none"
+                ),
+            }
+        )
+        return resp
+
     async def execute_turn(
         self,
         input_data: str | AgentEvent,
         *,
         stream_callback: Callable[[str, dict[str, Any]], Awaitable[None] | None] | None = None,
+        caller_turn_id: str | None = None,
     ) -> TurnResult:
         """Execute a single reasoning turn with serialized execution lock (P4, Issue #60).
 
@@ -3490,11 +3679,16 @@ class BaseAgent(BaseAgentProtocol):
             # calls that ran, so the result then says its list is incomplete.
             tools_unreported = False
             stop_reason: TurnStopReason = "not_started"
+            step_usages: list[TokenUsage] = []
+            # `caller_turn_id` is spread in by a helper: `execute_turn` sits at pyright's
+            # code-flow complexity limit, and one more branch here makes it unanalysable.
             durable_events: list[dict[str, Any]] = [
                 {
                     "type": "TURN_START",
                     "turn_index": self._turn_counter,
                     "agent_id": self.agent_id,
+                    "at": _now_iso(),
+                    **_caller_turn_id_field(caller_turn_id),
                 }
             ]
             try:
@@ -3539,6 +3733,7 @@ class BaseAgent(BaseAgentProtocol):
                         persona=self.persona_name or self.persona,
                         active_skills=live_active_skills,
                         loaded_skills=loaded_skills_snapshot,
+                        usage=None,
                     )
                 if (
                     pre_turn_decision.action == HookAction.MODIFY
@@ -3746,6 +3941,7 @@ class BaseAgent(BaseAgentProtocol):
                             # session context and the pre-turn snapshot would omit it.
                             # Same reason the success return below re-reads.
                             loaded_skills=tuple(sorted(self._loaded_skills)),
+                            usage=aggregate_token_usages(step_usages),
                         )
 
                     # The counter a reporting surface can read. `step` is a local and
@@ -3778,7 +3974,9 @@ class BaseAgent(BaseAgentProtocol):
                         "status",
                         {"status": "generating", "detail": "Generating response..."},
                     )
-                    resp = await self._invoke_model(llm, req, stream_callback=stream_callback)
+                    resp = await self._invoke_step_model(
+                        llm, req, step, stream_callback, durable_events, step_usages
+                    )
                     resp_content = resp.content or ""
                     tool_calls = resp.tool_calls
 
@@ -4076,6 +4274,8 @@ class BaseAgent(BaseAgentProtocol):
                                 # that gave up, and the giving up looks unmotivated.
                                 "status": tr.status,
                                 "outcome": _tool_outcome_of(tr),
+                                "at": _now_iso(),
+                                "duration_ms": tr.duration_ms,
                             }
                         )
                     self.transition_to(AgentState.REASONING)
@@ -4244,6 +4444,7 @@ class BaseAgent(BaseAgentProtocol):
                     persona=self.persona_name or self.persona,
                     active_skills=live_active_skills,
                     loaded_skills=tuple(sorted(self._loaded_skills)),
+                    usage=aggregate_token_usages(step_usages),
                 )
             except (BudgetExceededError, TokenBudgetExhaustedError) as exc:
                 # P6, "Error classification never authorises substitution", classification
@@ -4313,6 +4514,7 @@ class BaseAgent(BaseAgentProtocol):
                     # ceiling can be reached on any step's pre-flight check, so skills
                     # loaded earlier in this turn belong in the envelope.
                     loaded_skills=tuple(sorted(self._loaded_skills)),
+                    usage=aggregate_token_usages(step_usages),
                 )
             except (Exception, asyncio.CancelledError) as exc:
                 if isinstance(exc, asyncio.CancelledError):
@@ -4431,6 +4633,7 @@ class BaseAgent(BaseAgentProtocol):
                     persona=self.persona_name or self.persona,
                     active_skills=live_active_skills,
                     loaded_skills=loaded_skills_snapshot,
+                    usage=aggregate_token_usages(step_usages),
                 )
             finally:
                 if stop_reason == "cancelled":
@@ -4447,6 +4650,7 @@ class BaseAgent(BaseAgentProtocol):
                         "steps": self._run_steps,
                         "tool_executions": len(tool_executions),
                         "stop_reason": stop_reason,
+                        "at": _now_iso(),
                     }
                 )
                 # The floor under every way a turn can stop (#1423): a step whose tools

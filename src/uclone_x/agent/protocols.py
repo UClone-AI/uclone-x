@@ -123,6 +123,7 @@ class BaseAgentProtocol(Protocol):
         input_data: str | AgentEvent,
         *,
         stream_callback: Callable[[str, dict[str, Any]], Awaitable[None] | None] | None = None,
+        caller_turn_id: str | None = None,
     ) -> TurnResult:
         """Execute a single reasoning turn.
 

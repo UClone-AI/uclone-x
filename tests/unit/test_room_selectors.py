@@ -15,6 +15,7 @@ import pytest
 
 from uclone_x.errors import SpeakerSelectionError, UnknownRoomParticipantError
 from uclone_x.llm.connectors.mock import MockLLMConnector
+from uclone_x.llm.models import LLMRequest, ModelResponse
 from uclone_x.room.models import (
     Participant,
     ParticipantKind,
@@ -58,6 +59,7 @@ def _request(
     *participants: Participant,
     utterances: tuple[tuple[str, str], ...] = (("alice", "hello"),),
     turn_state: TurnState | None = None,
+    policy: RoomPolicy | None = None,
 ) -> SpeakerRequest:
     """Build a `SpeakerRequest` from `(sender_id, content)` pairs."""
     transcript = tuple(
@@ -69,7 +71,7 @@ def _request(
         participants=participants,
         transcript=transcript,
         turn_state=turn_state or TurnState(),
-        policy=RoomPolicy(),
+        policy=policy or RoomPolicy(),
     )
 
 
@@ -306,7 +308,6 @@ class TestLLMSpeakerSelector:
 
     @pytest.mark.asyncio
     async def test_default_max_tokens_accommodates_reasoning_models(self) -> None:
-        from uclone_x.llm.models import LLMRequest
         from uclone_x.room.selectors import DEFAULT_SELECTOR_MAX_TOKENS
 
         assert DEFAULT_SELECTOR_MAX_TOKENS >= 1024
@@ -859,6 +860,53 @@ class TestNoMalformedReplyBecomesASilentSilence:
             with pytest.raises(SpeakerSelectionError):
                 await LLMSpeakerSelector(llm).select(request)
             return
+        decision = await LLMSpeakerSelector(llm).select(request)
+        assert decision.verdict is SelectionVerdict.SPEAK
+        assert decision.speaker_id == "scout"
+
+
+class TestLLMSelectorAutonomousAndThinking:
+    """Verify autonomous mode rendering and thinking=False parameter on LLMRequest."""
+
+    @pytest.mark.asyncio
+    async def test_llm_selector_requests_no_thinking_tokens(self) -> None:
+        recorded: list[LLMRequest] = []
+
+        class RecordingMock(MockLLMConnector):
+            async def generate(self, request: LLMRequest) -> ModelResponse:
+                recorded.append(request)
+                return await super().generate(request)
+
+        llm = RecordingMock(responses=['{"speaker_id": "scout"}'])
+        request = _request(ALICE, SCOUT, CRITIC)
+        selector = LLMSpeakerSelector(llm)
+        await selector.select(request)
+        assert len(recorded) == 1
+        assert recorded[0].thinking is False
+
+    def test_llm_selector_renders_autonomous_mode(self) -> None:
+        request_normal = _request(ALICE, SCOUT, CRITIC, policy=RoomPolicy(autonomous=False))
+        rendered_normal = LLMSpeakerSelector._render(request_normal)  # pyright: ignore[reportPrivateUsage]
+        assert "AUTONOMOUS DISCUSSION MODE: ENABLED" not in rendered_normal
+
+        request_auto = _request(ALICE, SCOUT, CRITIC, policy=RoomPolicy(autonomous=True))
+        rendered_auto = LLMSpeakerSelector._render(request_auto)  # pyright: ignore[reportPrivateUsage]
+        assert "AUTONOMOUS DISCUSSION MODE: ENABLED" in rendered_auto
+
+    @pytest.mark.asyncio
+    async def test_llm_selector_falls_back_to_thinking_for_json(self) -> None:
+        class ThinkingMockLLM(MockLLMConnector):
+            async def generate(self, request: LLMRequest) -> ModelResponse:
+                resp = await super().generate(request)
+                return resp.model_copy(
+                    update={
+                        "content": "I think scout should speak next.",
+                        "thinking": '{"speaker_id": "scout", "confidence": 1.0, "reasoning": "scout is ready"}',
+                    }
+                )
+
+        llm = ThinkingMockLLM()
+        request = _request(ALICE, SCOUT, CRITIC)
         decision = await LLMSpeakerSelector(llm).select(request)
         assert decision.verdict is SelectionVerdict.SPEAK
         assert decision.speaker_id == "scout"

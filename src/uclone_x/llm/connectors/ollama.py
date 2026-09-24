@@ -479,6 +479,8 @@ class OllamaConnector(BaseLLMConnector):
             "options": options,
             "keep_alive": self.keep_alive,
         }
+        if request.thinking is not None:
+            payload["think"] = request.thinking
 
         if request.tools:
             payload["tools"] = [

@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { ArrowDown, Bot, Cpu, Loader2, Mic, Plus, Send, Square, Trash2 } from 'lucide-react';
+import { ArrowDown, Bot, Cpu, Loader2, Mic, Plus, Send, Sparkles, Square, Trash2 } from 'lucide-react';
 import type {
   AgentInfo,
   RoomContext,
@@ -13,6 +13,7 @@ import {
   attributionLines,
   conversationShape,
   headerAttribution,
+  roomsApi,
   lastServedModel,
   mentionCandidates,
   mentionUnderCaret,
@@ -94,6 +95,8 @@ interface RoomConversationProps {
   agentModelOverride?: string;
   /** Sets (or clears, with `null`) the model for the one clone seated here. */
   onSelectAgentModel?: (agentId: string, model: string | null) => void;
+  /** Toggle autonomous discussion mode. */
+  onToggleAutonomous?: (enabled: boolean) => void;
   /**
    * Show one turn's record, by `seq`, on the workspace dock's Turn surface.
    *
@@ -463,8 +466,51 @@ export const RoomConversation: React.FC<RoomConversationProps> = ({
   currentModel,
   agentModelOverride,
   onSelectAgentModel,
+  onToggleAutonomous,
   onOpenTurn,
 }) => {
+  const isAutonomous = Boolean(room.policy?.autonomous);
+
+  useEffect(() => {
+    if (!isAutonomous) return;
+
+    const report = (active: boolean) => {
+      void roomsApi.reportPresence(room.room_id, active).catch(() => {});
+    };
+
+    if (document.visibilityState === 'visible') {
+      report(true);
+    }
+
+    const onVisibility = () => {
+      report(document.visibilityState === 'visible');
+    };
+    const onFocus = () => report(true);
+    const onBlur = () => {
+      if (document.visibilityState !== 'visible') {
+        report(false);
+      }
+    };
+
+    document.addEventListener('visibilitychange', onVisibility);
+    window.addEventListener('focus', onFocus);
+    window.addEventListener('blur', onBlur);
+
+    const interval = setInterval(() => {
+      if (document.visibilityState === 'visible') {
+        report(true);
+      }
+    }, 15000);
+
+    return () => {
+      document.removeEventListener('visibilitychange', onVisibility);
+      window.removeEventListener('focus', onFocus);
+      window.removeEventListener('blur', onBlur);
+      clearInterval(interval);
+      report(false);
+    };
+  }, [room.room_id, isAutonomous]);
+
   const [caret, setCaret] = useState(0);
   const [completionOpen, setCompletionOpen] = useState(false);
   const [inviting, setInviting] = useState(false);
@@ -958,6 +1004,31 @@ export const RoomConversation: React.FC<RoomConversationProps> = ({
               ))}
             </select>
           </label>
+        ) : null}
+
+        {onToggleAutonomous ? (
+          <Button
+            data-testid="toggle-autonomous"
+            onClick={() => onToggleAutonomous(!isAutonomous)}
+            aria-label={isAutonomous ? '자율 토론 모드 켜짐' : '자율 토론 모드 꺼짐'}
+            title={
+              isAutonomous
+                ? '자율 토론 활성화됨 (화면을 보고 있는 동안 에이전트 간 연속 대화)'
+                : '자율 토론 켜기 (화면을 보고 있는 동안 에이전트 간 연속 대화)'
+            }
+            className={cn(
+              'shrink-0 whitespace-nowrap text-xs flex items-center gap-1.5 transition-colors',
+              isAutonomous
+                ? 'bg-emerald-600 hover:bg-emerald-500 text-white font-medium shadow-sm'
+                : 'text-slate-400 hover:text-slate-200',
+            )}
+          >
+            <Sparkles className={cn('w-3 h-3', isAutonomous ? 'text-amber-300' : 'text-slate-400')} />
+            <span className="column-icon-only">자율 토론</span>
+            <span className="text-[10px] uppercase tracking-wider font-semibold opacity-90">
+              {isAutonomous ? 'ON' : 'OFF'}
+            </span>
+          </Button>
         ) : null}
 
         <Button

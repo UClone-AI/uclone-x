@@ -165,7 +165,9 @@ class _RecordingAgent:
         self.persisted: list[str | None] = []
         self.persist_fails_with: Exception | None = None
 
-    async def execute_turn(self, prompt: str, *, stream_callback: Any = None) -> TurnResult:
+    async def execute_turn(
+        self, prompt: str, *, stream_callback: Any = None, **kwargs: Any
+    ) -> TurnResult:
         if self.result_error is not None:
             return TurnResult(turn_index=1, content="", error=self.result_error, provenance=None)
         return TurnResult(turn_index=1, content="done", provenance=None)

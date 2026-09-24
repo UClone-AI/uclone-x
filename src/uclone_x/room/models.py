@@ -486,6 +486,11 @@ class RoomPolicy(BaseModel):
         "Selection runs once per human message and is a short classification, so it is "
         "the one place in a room where a smaller model is the right default.",
     )
+    autonomous: bool = Field(
+        default=False,
+        description="Whether agents discuss and collaborate autonomously as long as the "
+        "user is actively viewing the room, bounded by a 20-turn safety circuit breaker.",
+    )
 
     @model_validator(mode="after")
     def _window_must_outlast_the_turn_ceiling(self) -> RoomPolicy:

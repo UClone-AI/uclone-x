@@ -118,7 +118,9 @@ class _RaisingAgent:
     def __init__(self, missing: Path) -> None:
         self.missing = missing
 
-    async def execute_turn(self, prompt: str, *, stream_callback: Any = None) -> TurnResult:
+    async def execute_turn(
+        self, prompt: str, *, stream_callback: Any = None, **kwargs: Any
+    ) -> TurnResult:
         self.missing.read_text(encoding="utf-8")
         raise AssertionError("unreachable: the read above raises")
 

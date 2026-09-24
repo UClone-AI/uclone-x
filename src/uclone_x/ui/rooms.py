@@ -55,7 +55,10 @@ from uclone_x.room.models import (
     RoomPolicy,
     RoomState,
 )
-from uclone_x.room.orchestrator import RoomOrchestrator
+from uclone_x.room.orchestrator import (
+    AUTONOMOUS_CIRCUIT_BREAKER_TURNS,
+    RoomOrchestrator,
+)
 from uclone_x.room.resolver import RoomAgentResolver
 from uclone_x.room.selectors import build_selector_chain
 from uclone_x.room.service import RoomService
@@ -320,6 +323,32 @@ class RoomStack:
         """
         runtime = self._rooms.get(room_id)
         return runtime is not None and runtime.orchestrator.turn_unlanded(room_id)
+
+    def note_presence(self, state: RoomState, active: bool = True) -> None:
+        """Report presence for a room, ensuring its orchestrator is built."""
+        orch = self.orchestrator(state)
+        orch.note_presence(state.room_id, active)
+
+    def is_presence_active(self, room_id: str) -> bool:
+        """Whether the user is currently actively viewing the room."""
+        runtime = self._rooms.get(room_id)
+        return runtime is not None and runtime.orchestrator.is_presence_active(room_id)
+
+    async def set_autonomous(self, state: RoomState, enabled: bool) -> RoomState:
+        """Toggle autonomous discussion on room policy."""
+        updated_policy = state.policy.model_copy(update={"autonomous": enabled})
+        turn_state = state.turn_state
+        if enabled and turn_state.agent_turns_since_human >= AUTONOMOUS_CIRCUIT_BREAKER_TURNS:
+            turn_state = turn_state.model_copy(update={"agent_turns_since_human": 0})
+        saved = self.store.save(
+            state.model_copy(update={"policy": updated_policy, "turn_state": turn_state})
+        )
+        orch = self.orchestrator(saved)
+        orch.note_presence(state.room_id, active=True)
+        if enabled and not self.turn_in_flight(state.room_id):
+            last_seq = saved.transcript[-1].seq if saved.transcript else 0
+            self.drive(state.room_id, lambda: orch.resume(state.room_id, last_seq))
+        return saved
 
     def live_agent(self, room_id: str, session_id: str) -> BaseAgent | None:
         """The agent this room's resolver has already built for a seat, or `None`.
@@ -954,6 +983,29 @@ def register_room_routes(app: FastAPI, stack: RoomStack) -> None:
             await stack.orchestrator(state).note_human_activity(room_id, _sole_human(state))
         except Exception as exc:
             raise _http_error(exc) from exc
+
+    @app.post("/api/rooms/{room_id}/autonomous")
+    async def toggle_autonomous(room_id: str, req: dict[str, Any]) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
+        """Toggle autonomous discussion mode for this room."""
+        state = _room(room_id)
+        enabled = bool(req.get("enabled", True))
+        try:
+            updated = await stack.set_autonomous(state, enabled)
+        except Exception as exc:
+            raise _http_error(exc) from exc
+        return updated.model_dump(mode="json")
+
+    @app.post("/api/rooms/{room_id}/presence")
+    async def report_presence(room_id: str, req: dict[str, Any]) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
+        """Report whether the user is actively viewing this room."""
+        state = _room(room_id)
+        active = bool(req.get("active", True))
+        stack.note_presence(state, active)
+        if active and state.policy.autonomous and not stack.turn_in_flight(room_id):
+            orch = stack.orchestrator(state)
+            last_seq = state.transcript[-1].seq if state.transcript else 0
+            stack.drive(room_id, lambda: orch.resume(room_id, last_seq))
+        return {"room_id": room_id, "active": active}
 
     @app.post("/api/rooms/{room_id}/retry")
     async def retry_turn(room_id: str) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]

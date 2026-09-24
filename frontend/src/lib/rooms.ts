@@ -273,6 +273,23 @@ export const roomsApi = {
     await readOrThrow(await ask(`/api/rooms/${roomId}/typing`, { method: 'POST' }));
   },
 
+  setAutonomous: async (roomId: string, enabled: boolean): Promise<RoomState> =>
+    readOrThrow(
+      await ask(`/api/rooms/${roomId}/autonomous`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled }),
+      }),
+    ),
+
+  reportPresence: async (roomId: string, active: boolean): Promise<void> => {
+    await ask(`/api/rooms/${roomId}/presence`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ active }),
+    });
+  },
+
   /**
    * How full each seat is, read on its own and not as part of `get`.
    *

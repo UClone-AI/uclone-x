@@ -14,27 +14,59 @@
 
 ## Install
 
+On macOS or Linux, paste this into a terminal:
+
 ```bash
-uv tool install --managed-python --python 3.12 "uclone-x[cli,http]"
-ucx --help
+curl -fsSL https://raw.githubusercontent.com/UClone-AI/uclone-x/main/install.sh | bash
 ```
 
-Or `uvx --managed-python --python 3.12 --from "uclone-x[cli,http]" ucx --help` to try
-it without installing anything permanently. Keep both flags: without `--python 3.12` uv
-uses the first `python3` on PATH, which on macOS is 3.9, and the install fails; without
-`--managed-python` it still runs that `python3` to check its version, and on a Mac
-without the Xcode Command Line Tools that opens an install dialog. With both, uv
-downloads its own Python 3.12 and touches nothing else.
+That is the whole install. It needs nothing but `curl` — no Python, Homebrew or
+admin rights of its own. It installs the core (~31 MB), then asks before each
+larger download: a private Python 3.12 when your machine has nothing newer than
+3.10, then a local AI model through Ollama (~1.4–5.2 GB, depending on memory; say
+no to use an API key instead). Ollama's own installer may ask for your password.
+At the end it asks **Start UClone-X now?** — press Enter, answer any remaining
+setup question, and the dashboard opens in your browser at
+<http://127.0.0.1:5180>. The agents work in the folder you ran it from.
 
-The two extras are not optional in practice: `cli` is typer and rich, which the
-`ucx` shell is written in, and `http` is FastAPI and uvicorn, which the
-dashboard and the A2A gateway serve through. The base install is the runtime
-without a shell — usable as a library, and what you want if you are importing
-`uclone_x` rather than running `ucx`. Install without them and `ucx` tells you
-which one is missing rather than failing obscurely.
+To answer, UClone-X needs a model: the local one above, which needs no account,
+or an API key for OpenAI, Anthropic or Gemini, pasted into the dashboard's
+**Settings**. Nothing needs editing in a file.
 
-Provider SDKs and the heavier stacks are the genuinely optional extras — install
-what you use:
+Next time, start it with:
+
+```bash
+ucx start
+```
+
+If your shell says `command not found`, the installer printed one `export PATH=…`
+line at the end; add it to `~/.zshrc` (or `~/.bashrc`) and open a new terminal.
+Until then, `~/.local/bin/ucx start` works.
+
+UClone-X itself lives in `~/.uclone-x` and the `ucx` link in `~/.local/bin`;
+`rm -rf ~/.uclone-x ~/.local/bin/ucx` removes it. What the installer fetched
+alongside it stays: uv (`~/.local/bin/uv`, `uvx`) and the Python it downloaded
+(`uv python uninstall 3.12` removes that), and Ollama with its models.
+
+### Other ways to install
+
+If you already use [uv](https://docs.astral.sh/uv/):
+
+```bash
+uv tool install --managed-python --python 3.12 "uclone-x[cli,http]"
+ucx start
+```
+
+Keep both flags: without `--python 3.12` uv uses the first `python3` on PATH,
+which on macOS is 3.9, and the install fails; without `--managed-python` it still
+runs that `python3` to check its version, and on a Mac without the Xcode Command
+Line Tools that opens an install dialog.
+
+With pip, into a Python 3.11+ environment of your own:
+`pip install "uclone-x[cli,http]"`. The two extras are not optional in practice:
+`cli` is the `ucx` shell and `http` serves the dashboard. The base install is the
+runtime without a shell — what you want if you are importing `uclone_x` as a
+library. Provider SDKs and the heavier stacks are the genuinely optional extras:
 
 ```bash
 pip install "uclone-x[llm]"         # Gemini, Claude, OpenAI SDKs
@@ -43,37 +75,19 @@ pip install "uclone-x[code_intel]"  # tree-sitter AST parsing
 pip install "uclone-x[all]"
 ```
 
-Python 3.11 or newer, and every extra resolves on every version of it, 3.13
-included. `code_intel` used to be capped at 3.12, because the grammar bundle it
-declared — `tree-sitter-languages` — publishes no wheel above cp312, and since
-`all` includes `code_intel` that ceiling was `uclone-x[all]`'s too. It now
-declares `tree-sitter-language-pack`, which ships cp313 wheels, so neither is
-capped. Without the extra the AST parser falls back to Python's own `ast` and
-says so.
+Every extra resolves on Python 3.11, 3.12 and 3.13.
 
-## First run
-
-Configure at least one provider, then start a chat session:
-
-```bash
-cp .env.example .env    # then fill in one API key, or point at a local Ollama
-ucx run
-```
+### From a terminal
 
 `ucx run` is an interactive terminal REPL with streaming responses, tool calls
-and slash commands. A local model needs no API key at all:
+and slash commands. It reads its model from the environment — an API key such as
+`OPENAI_API_KEY`, or a local Ollama:
 
 ```bash
 OLLAMA_FAST_BASE_URL=http://localhost:11434/v1 OLLAMA_FAST_MODEL=qwen3:8b ucx run
 ```
 
-The dashboard — an agent and event-bus explorer — is a single command:
-
-```bash
-ucx ui
-```
-
-It serves a prebuilt interface, so it needs no Node toolchain.
+`ucx llm status` reports which models are reachable.
 
 ## What UClone-X is
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from enum import StrEnum
 from typing import Self
 
@@ -163,6 +164,37 @@ class TokenUsage(BaseModel):
         return self
 
 
+def aggregate_token_usages(usages: Sequence[TokenUsage]) -> TokenUsage | None:
+    """Sum token usage records across a sequence of model invocations (e.g. within a turn).
+
+    Returns None if no usage records are provided (i.e. no model calls completed).
+    `count_source` is `TokenCountSource.PROVIDER` only if every step's source was `PROVIDER`.
+    Otherwise, the least certain source across steps is used (ESTIMATE < PROVIDER).
+    """
+    if not usages:
+        return None
+    input_tokens = sum(u.input_tokens for u in usages)
+    output_tokens = sum(u.output_tokens for u in usages)
+    total_tokens = sum(u.total_tokens for u in usages)
+
+    provider = usages[-1].provider if usages else "unknown"
+    model = usages[-1].model if usages else None
+
+    if all(u.count_source == TokenCountSource.PROVIDER for u in usages):
+        count_source = TokenCountSource.PROVIDER
+    else:
+        count_source = TokenCountSource.ESTIMATE
+
+    return TokenUsage(
+        provider=provider,
+        model=model,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        total_tokens=total_tokens,
+        count_source=count_source,
+    )
+
+
 class ModelResponse(BaseModel):
     """Standardized response from an LLM provider."""
 
@@ -229,6 +261,11 @@ class LLMRequest(BaseModel):
         "(`AgentLLMConfig.context_limit`). A connector whose server picks its own window "
         "sends it -- Ollama as `num_ctx` -- so the window served and the window counted "
         "agree (#1372). `None` leaves the choice to the server.",
+    )
+    thinking: bool | None = Field(
+        default=None,
+        description="Explicit control over provider reasoning/thinking tokens (e.g. Ollama think parameter). "
+        "When None, default provider behavior is preserved.",
     )
 
 

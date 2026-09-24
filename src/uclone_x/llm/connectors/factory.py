@@ -150,6 +150,6 @@ def create_llm_connector(
         "OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY or GOOGLE_API_KEY; "
         f"an Ollama endpoint in one of {', '.join(OLLAMA_ENDPOINT_ENV_VARS)}; "
         f"or a vLLM endpoint in {', '.join(VLLM_ENDPOINT_ENV_VARS)}. "
-        "In the desktop app, use the Settings panel. From a terminal, "
-        "`./ucx llm status` reports what is reachable."
+        "In the dashboard (`ucx start`), pick a model in Settings. From a terminal, "
+        "`ucx llm status` reports what is reachable."
     )

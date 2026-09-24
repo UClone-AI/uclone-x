@@ -407,13 +407,13 @@ class DefaultResponderSelector:
         )
 
 
-DEFAULT_SELECTOR_MAX_TOKENS: Final[int] = 1024
+DEFAULT_SELECTOR_MAX_TOKENS: Final[int] = 2048
 """Default max output tokens for speaker selection classification.
 
 Reasoning and thinking models (such as Qwen3, DeepSeek-R1) generate internal thinking tokens
-before emitting the final JSON payload. A tight token ceiling (e.g. 256) causes thinking tokens
+before emitting the final JSON payload. A tight token ceiling (e.g. 256 or 1024) causes thinking tokens
 to exhaust the entire budget before the JSON payload is emitted, leading to empty replies and
-selection crashes. 1024 tokens provides ample room for reasoning followed by the compact JSON.
+selection crashes. 2048 tokens provides ample room for reasoning followed by the compact JSON.
 """
 
 _SYSTEM_PROMPT: Final = """\
@@ -426,9 +426,18 @@ Rules:
 - If the human user greets, asks a question, or addresses the room (e.g. '안녕', '누구 있니?', '아무도 없니?'), \
 an agent MUST respond. If no specific specialist is indicated, pick the primary personal clone/partner (e.g. clone) \
 or the first available agent.
+- If the human user tells agents to converse among themselves (e.g. '니들끼리 이야기 해봐', '대화 나눠봐', '토론해봐', 'talk among yourselves', 'free discussion'), \
+an agent MUST respond to initiate or continue the discussion.
+- In AUTONOMOUS DISCUSSION MODE (when enabled), agents are expected to maintain an active, collaborative dialogue with each other. \
+Select an appropriate agent to respond, build upon the previous speaker's ideas, ask follow-up questions, or offer alternative perspectives. \
+Never choose nobody/silence merely because the human is silent or the last speaker was an agent.
+- If the previous turn's speaker was an agent who asked a question, proposed a topic/idea, or invited collaboration \
+(e.g. '어떤 이야기를 시작할까요?', '어떻게 생각하세요?', '이 아이디어는 어때?'), you MUST select another agent \
+to answer and continue the collaboration. Never choose nobody/silence when an open question or cooperative proposal \
+between agents remains unanswered.
 - Choose nobody only when the exchange has reached a natural resting point where all questions have been answered, \
 when the agents are repeating each other, or when the last message needs no answer. Never choose nobody if a human \
-message is still unanswered.
+message or an agent's open collaborative question is still unanswered.
 - Never choose a human participant, and never choose the agent that spoke last unless it was asked a direct follow-up question.
 - Do not answer the conversation yourself. Emit only the JSON object.
 
@@ -497,6 +506,7 @@ class LLMSpeakerSelector:
             ),
             temperature=self._temperature,
             max_tokens=self._max_tokens,
+            thinking=False,
         )
 
         try:
@@ -508,8 +518,15 @@ class LLMSpeakerSelector:
             ) from exc
 
         speaker_source = response.content
-        if (speaker_source is None or not speaker_source.strip()) and response.thinking:
+        if (
+            (speaker_source is None or "{" not in speaker_source)
+            and response.thinking
+            and "{" in response.thinking
+        ):
             speaker_source = response.thinking
+        elif speaker_source is None or not speaker_source.strip():
+            if response.thinking:
+                speaker_source = response.thinking
 
         speaker_id, confidence, reasoning = self._parse(
             speaker_source, request.room_id, response.model_name
@@ -551,6 +568,8 @@ class LLMSpeakerSelector:
 
         last_speaker = request.turn_state.last_speaker_id
         lines.append("")
+        if request.policy.autonomous:
+            lines.append("AUTONOMOUS DISCUSSION MODE: ENABLED")
         lines.append(
             f"AGENT TURNS SINCE THE LAST HUMAN MESSAGE: {request.turn_state.agent_turns_since_human}"
         )

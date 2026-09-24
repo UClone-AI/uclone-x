@@ -689,12 +689,14 @@ class LLMStreamInterruptedError(LLMError):
         model: str | None,
         chunks_received: int,
         discarded_tool_calls: int,
+        partial_content: str | None = None,
     ) -> None:
         super().__init__(message)
         self.provider = provider
         self.model = model
         self.chunks_received = chunks_received
         self.discarded_tool_calls = discarded_tool_calls
+        self.partial_content = partial_content
 
 
 class MalformedToolCallArgumentsError(LLMError):

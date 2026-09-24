@@ -42,7 +42,7 @@ class FakeAgent:
         self.prompts: list[str] = []
         self.fail_with: Exception | None = None
 
-    async def execute_turn(self, prompt: str, *, stream_callback: Any = None) -> Any:
+    async def execute_turn(self, prompt: str, *, stream_callback: Any = None, **kwargs: Any) -> Any:
         from uclone_x.agent.models import TurnResult
 
         self.prompts.append(prompt)

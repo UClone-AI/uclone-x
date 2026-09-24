@@ -19,7 +19,7 @@ import logging
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from typing import Any
+from typing import Any, Final
 
 from uclone_x.agent.models import ToolExecutionRecord
 from uclone_x.agent.protocols import BaseAgentProtocol
@@ -65,6 +65,11 @@ logger = logging.getLogger(__name__)
 #: full trace is the seat's own (G1, G2); the room's record is for a reader asking what a
 #: seat did, and a `file_write`'s arguments carry the whole file.
 TOOL_PREVIEW_CHARS = 2000
+
+#: Circuit breaker ceiling for autonomous room discussions
+AUTONOMOUS_CIRCUIT_BREAKER_TURNS: Final = 20
+#: Default hesitation pause between turns in autonomous mode to ensure readable pacing
+AUTONOMOUS_DEFAULT_HESITATION_SECONDS: Final = 1.5
 
 
 def _preview(value: Any) -> tuple[str, bool]:
@@ -246,8 +251,24 @@ class RoomOrchestrator:
         #: nobody sent to twice.
         self._floor: dict[str, asyncio.Lock] = {}
         self._activity_events: dict[str, list[asyncio.Event]] = {}
+        #: room id -> monotonic timestamp of last reported user presence
+        self._presence: dict[str, float] = {}
 
     # -- public surface ----------------------------------------------------------------
+
+    def note_presence(self, room_id: str, active: bool = True) -> None:
+        """Record whether a human is actively viewing this room."""
+        if active:
+            self._presence[room_id] = time.monotonic()
+        else:
+            self._presence.pop(room_id, None)
+
+    def is_presence_active(self, room_id: str, timeout_seconds: float = 30.0) -> bool:
+        """Whether user presence in this room was recorded within timeout."""
+        last_ts = self._presence.get(room_id)
+        if last_ts is None:
+            return False
+        return (time.monotonic() - last_ts) <= timeout_seconds
 
     async def interrupt(self, room_id: str, reason: str = "Turn was interrupted") -> None:
         """Signal an interrupt/stop to a running room.
@@ -509,21 +530,37 @@ class RoomOrchestrator:
 
             # (b) The ceiling is checked before anyone is consulted, so an exhausted
             # budget costs no selector call and no model call.
-            ceiling = state.policy.max_agent_turns_per_human_message
+            ceiling = (
+                AUTONOMOUS_CIRCUIT_BREAKER_TURNS
+                if state.policy.autonomous
+                else state.policy.max_agent_turns_per_human_message
+            )
             if state.turn_state.agent_turns_since_human >= ceiling:
                 # Recorded, like every other stop. Since one address may name more agents
                 # than the ceiling allows, reaching it now routinely means somebody was
                 # asked and never got the floor — and a state that says nothing reads as
                 # though everything asked was answered.
+                reasoning = (
+                    f"the autonomous circuit breaker of {ceiling} turns was reached; "
+                    f"paused to prevent infinite looping. Post a message to continue."
+                    if state.policy.autonomous
+                    else f"the turn ceiling of {ceiling} for one human message was reached; "
+                    f"anything still outstanding was not given the floor"
+                )
                 reached = SpeakerDecision(
                     verdict=SelectionVerdict.SILENCE,
                     selector="orchestrator",
-                    reasoning=(
-                        f"the turn ceiling of {ceiling} for one human message was reached; "
-                        f"anything still outstanding was not given the floor"
-                    ),
+                    reasoning=reasoning,
                 )
                 return self._store.save(state.model_copy(update={"last_decision": reached}))
+
+            if state.policy.autonomous and not self.is_presence_active(room_id):
+                paused = SpeakerDecision(
+                    verdict=SelectionVerdict.SILENCE,
+                    selector="orchestrator",
+                    reasoning="autonomous discussion paused: user is not actively viewing the room",
+                )
+                return self._store.save(state.model_copy(update={"last_decision": paused}))
 
             chain_saw = state
             decision = await self._decide(state)
@@ -559,6 +596,8 @@ class RoomOrchestrator:
 
             # (f) Hesitation pause: race a timer against human activity.
             pause = max(0.0, state.policy.hesitation_seconds * (1.0 - decision.confidence))
+            if state.policy.autonomous and state.policy.hesitation_seconds > 0.0:
+                pause = max(pause, AUTONOMOUS_DEFAULT_HESITATION_SECONDS)
             if pause > 0.0:
                 pre_wait_activity = state.turn_state.last_activity_ts
                 activity_event = asyncio.Event()
@@ -743,6 +782,7 @@ class RoomOrchestrator:
         error: str | None = None
         content = ""
         provenance = None
+        usage = None
         completed = True
         refusal: RoomTurnRefusal | None = None
         # What the turn says its tools were. Stays empty *and unrecorded* when the turn
@@ -752,7 +792,9 @@ class RoomOrchestrator:
         tools_recorded = False
         turn_task = asyncio.create_task(
             agent.execute_turn(
-                prompt, stream_callback=self._stream_callback(room_id, speaker.id, turn_id)
+                prompt,
+                stream_callback=self._stream_callback(room_id, speaker.id, turn_id),
+                caller_turn_id=turn_id,
             )
         )
         self._active_turns[room_id] = (turn_id, turn_task)
@@ -770,6 +812,7 @@ class RoomOrchestrator:
         else:
             content = result.content
             provenance = result.provenance
+            usage = result.usage
             executions = result.tool_executions
             # Not simply True: a turn that failed while a step's tools were running may
             # have run calls whose records never reached the list, and storing that list
@@ -850,6 +893,7 @@ class RoomOrchestrator:
             memory_facts_unsaved=memory_facts_unsaved,
             turn_id=turn_id,
             tools_recorded=tools_recorded,
+            usage=usage,
         )
         uses, written = _record_tools(speaker, turn_id, executions)
         turn_state = state.turn_state.model_copy(
@@ -1079,9 +1123,9 @@ class RoomOrchestrator:
         listener hands the agent no callback, so it pays nothing per token and `G7` is
         untouched. A CLI still constructs no bus to say so.
 
-        **Only `token` is forwarded.** An agent's thinking deltas and tool traces are its
-        own session's (G1, G2); the room's channel carries what was said. Forwarding them
-        would put one agent's scratchpad on the topic every other participant's head reads.
+        **`token` and `status` updates are forwarded.** An agent's thinking deltas and raw
+        tool traces are its own session's (G1, G2); conversational tokens and lightweight
+        progress notices (e.g. running a tool) reach the room's channel to inform the UI.
         A turn's tool calls do reach the bus, but not from here: `_publish_tools` announces
         them once the turn has landed, from the room's bounded record of them and on a
         topic of their own (#1353).
@@ -1089,9 +1133,9 @@ class RoomOrchestrator:
         Scoped, because the stronger reading is false: `execute_turn` invokes its callback
         once per *step* of the reasoning loop, while `TurnResult.content` is the last
         step's text. So on a tool-using turn the deltas include prose the transcript will
-        never hold, and it disappears when the row lands. What this guarantees is that no
-        event **named** anything other than `token` is forwarded -- not that everything
-        forwarded survives into the transcript.
+        never hold, and it disappears when the row lands. What this guarantees is that only
+        `token` and `status` events are forwarded -- not that everything forwarded survives
+        into the transcript.
 
         **The first publishing failure ends streaming for this turn.** `_publish` already
         tolerates a failing bus once per utterance; doing the same per chunk turns one
@@ -1106,7 +1150,46 @@ class RoomOrchestrator:
 
         async def forward(event_name: str, data: dict[str, Any]) -> None:
             nonlocal live
-            if not live or event_name != "token":
+            if not live:
+                return
+
+            if event_name == "status" and data.get("status") == "calling_tool":
+                detail = data.get("detail")
+                if not detail:
+                    return
+                try:
+                    publisher = self._publishers.get(agent_id)
+                    if publisher is None:
+                        assert self._bus is not None
+                        publisher = self._bus.register_publisher(
+                            sender_id=agent_id, source=EventSource.AGENT
+                        )
+                        self._publishers[agent_id] = publisher
+                    await publisher.publish(
+                        AgentEvent(
+                            type=EventType.AGENT_REPLY,
+                            topic=f"room.{room_id}",
+                            payload={
+                                "room_id": room_id,
+                                "agent_id": agent_id,
+                                "turn_id": turn_id,
+                                "status": "status_update",
+                                "detail": str(detail),
+                            },
+                        )
+                    )
+                except Exception:
+                    live = False
+                    logger.warning(
+                        "Room %s could not stream %s's status update (%s); the turn continues",
+                        room_id,
+                        agent_id,
+                        turn_id,
+                        exc_info=True,
+                    )
+                return
+
+            if event_name != "token":
                 return
             delta = data.get("content")
             if not delta:

@@ -1325,6 +1325,15 @@ export function App() {
               // header's picker is a statement about who answers *here*.
               agentModelOverride={seatedCloneId ? agentModelOverrides[seatedCloneId] : undefined}
               onSelectAgentModel={handleSelectAgentModel}
+              onToggleAutonomous={(enabled) => {
+                const generation = roomGenerationRef.current;
+                void roomsApi
+                  .setAutonomous(currentRoomId, enabled)
+                  .then((next) => commitRoomAct(currentRoomId, generation, next))
+                  .catch((err) =>
+                    setRoomNotice(`자율 토론 설정 실패: ${roomFailureReason(err)}`),
+                  );
+              }}
               // `why ›` on a turn. The dock is opened, not merely switched: a control
               // that changed a hidden panel's surface and left the screen unchanged is the
               // invisible selection `handleSelectAgent` was written to stop doing.

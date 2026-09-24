@@ -793,6 +793,7 @@ export interface RoomPolicy {
   transcript_window: number;
   hesitation_seconds: number;
   default_responder_id: string;
+  autonomous?: boolean;
 }
 
 export interface RoomTurnState {

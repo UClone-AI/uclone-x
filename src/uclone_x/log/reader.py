@@ -81,6 +81,7 @@ TURN_LOOP_EVENT_TYPES: frozenset[str] = frozenset(
         "USER_MESSAGE",
         "ASSISTANT_ATTEMPT",
         "REQUEST_CONTEXT",
+        "MODEL_RESPONSE",
         "ASSISTANT_MESSAGE",
         "TOOL_CALL",
         "TOOL_RESULT",

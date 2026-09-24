@@ -5697,3 +5697,16 @@ def test_ollama_sends_the_configured_window_as_num_ctx_and_keeps_sending_it() ->
     assert first["options"]["num_ctx"] == 16_384
     assert later["options"]["num_ctx"] == 16_384
     assert "num_ctx" not in other["options"]
+
+
+def test_ollama_sends_think_parameter_when_thinking_is_specified() -> None:
+    connector = OllamaConnector(base_url="http://localhost:11434")
+
+    default_body = _ollama_body(connector, model="qwen3:8b")
+    assert "think" not in default_body
+
+    think_false_body = _ollama_body(connector, model="qwen3:8b", thinking=False)
+    assert think_false_body["think"] is False
+
+    think_true_body = _ollama_body(connector, model="qwen3:8b", thinking=True)
+    assert think_true_body["think"] is True

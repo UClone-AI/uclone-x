@@ -1686,3 +1686,43 @@ class TestHistoryIsRefusedWhileSomebodyIsAnswering:
         client.post(f"/api/rooms/{room_id}/messages", json={"content": "/loop list"})
         room = client.get(f"/api/rooms/{room_id}").json()
         assert any("실행 중인 반복 작업이 없습니다" in m["content"] for m in room["transcript"])
+
+    def test_room_toggle_autonomous_and_presence(self, client: TestClient) -> None:
+        """POST /api/rooms/{id}/autonomous toggles policy, /presence updates presence."""
+        room_id = _create(client).json()["room_id"]
+
+        # Initially autonomous is False
+        room = client.get(f"/api/rooms/{room_id}").json()
+        assert room["policy"]["autonomous"] is False
+
+        # Enable autonomous
+        res = client.post(f"/api/rooms/{room_id}/autonomous", json={"enabled": True})
+        assert res.status_code == 200
+        assert res.json()["policy"]["autonomous"] is True
+
+        # Presence report
+        pres_res = client.post(f"/api/rooms/{room_id}/presence", json={"active": True})
+        assert pres_res.status_code == 200
+        assert pres_res.json()["active"] is True
+
+        # Disable autonomous
+        res_off = client.post(f"/api/rooms/{room_id}/autonomous", json={"enabled": False})
+        assert res_off.status_code == 200
+        assert res_off.json()["policy"]["autonomous"] is False
+
+        # Re-enabling autonomous resets turn count if circuit breaker was reached
+        from uclone_x.room.orchestrator import AUTONOMOUS_CIRCUIT_BREAKER_TURNS
+
+        stack = cast(RoomStack, cast(Any, client.app).state.room_stack)
+        state = stack.store.load(room_id)
+        assert state is not None
+        exhausted = state.turn_state.model_copy(
+            update={"agent_turns_since_human": AUTONOMOUS_CIRCUIT_BREAKER_TURNS}
+        )
+        stack.store.save(state.model_copy(update={"turn_state": exhausted}))
+
+        res_on = client.post(f"/api/rooms/{room_id}/autonomous", json={"enabled": True})
+        assert res_on.status_code == 200
+        reloaded = stack.store.load(room_id)
+        assert reloaded is not None
+        assert reloaded.turn_state.agent_turns_since_human == 0

@@ -171,9 +171,9 @@ from uclone_x.ui.single_flight import SingleFlight
 
 OFFLINE_LLM_DIAGNOSTIC_MESSAGE: str = (
     "⚠️ No active LLM provider connected.\n\n"
-    "Please start Ollama locally ('ollama serve') or on your Mac mini, "
-    "or configure API keys (OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY) in your environment.\n"
-    "Check connection status with './ucx llm status'."
+    "Pick a model in Settings: a local one through Ollama ('ollama serve'), "
+    "or an API key for OpenAI, Anthropic or Gemini.\n"
+    "From a terminal, 'ucx llm status' reports what is reachable."
 )
 
 
@@ -281,7 +281,7 @@ def _is_offline_llm_error(error: Exception | str | None) -> bool:
     ):
         # An unconfigured provider is an LLM condition, not a transport one. It gates the
         # same diagnostic, which is the only text naming `ollama serve` and
-        # `./ucx llm status` — without this the refusal is less actionable than the
+        # `ucx llm status` — without this the refusal is less actionable than the
         # connection error it replaced.
         return True
     keywords = (
