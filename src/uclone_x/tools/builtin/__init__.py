@@ -1,5 +1,9 @@
 """Built-in tool suite for UClone-X runtime."""
 
+from uclone_x.tools.builtin.character import (
+    CharacterSheetParams,
+    CharacterSheetTool,
+)
 from uclone_x.tools.builtin.comfy_client import (
     ComfyClient,
     ComfyTimeoutError,
@@ -60,6 +64,8 @@ from uclone_x.tools.registry import (
 
 __all__ = [
     "BashRunTool",
+    "CharacterSheetParams",
+    "CharacterSheetTool",
     "ComfyClient",
     "ComfyImageGenParams",
     "ComfyImageGenTool",

@@ -24,7 +24,7 @@ from typing import Final, cast
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from uclone_x.errors import SpeakerSelectionError, UnknownRoomParticipantError
-from uclone_x.llm.models import ChatMessage, LLMRequest, MessageRole
+from uclone_x.llm.models import ChatMessage, FinishReason, LLMRequest, MessageRole
 from uclone_x.llm.protocols import LLMProviderProtocol
 from uclone_x.room.models import (
     Participant,
@@ -440,6 +440,7 @@ when the agents are repeating each other, or when the last message needs no answ
 message or an agent's open collaborative question is still unanswered.
 - Never choose a human participant, and never choose the agent that spoke last unless it was asked a direct follow-up question.
 - Do not answer the conversation yourself. Emit only the JSON object.
+- Do not think, deliberate, or output conversational commentary. Output the raw JSON object immediately.
 
 Reply with exactly this JSON object and nothing else:
 {"speaker_id": "<participant id, or null for nobody>", "confidence": <0.0-1.0>, \
@@ -518,15 +519,17 @@ class LLMSpeakerSelector:
             ) from exc
 
         speaker_source = response.content
-        if (
-            (speaker_source is None or "{" not in speaker_source)
-            and response.thinking
-            and "{" in response.thinking
-        ):
+        has_json_in_thinking = bool(response.thinking and "{" in response.thinking)
+        has_json_in_content = bool(speaker_source and "{" in speaker_source)
+
+        if not has_json_in_content and has_json_in_thinking:
             speaker_source = response.thinking
-        elif speaker_source is None or not speaker_source.strip():
-            if response.thinking:
-                speaker_source = response.thinking
+        elif response.finish_reason is FinishReason.LENGTH and not has_json_in_content:
+            raise SpeakerSelectionError(
+                f"Selector {self.name!r} token budget was exhausted ({self._max_tokens} tokens) "
+                f"for room {request.room_id!r} before a JSON decision could be emitted by model "
+                f"{response.model_name!r}"
+            )
 
         speaker_id, confidence, reasoning = self._parse(
             speaker_source, request.room_id, response.model_name

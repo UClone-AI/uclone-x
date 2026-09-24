@@ -54,6 +54,8 @@ from uclone_x.room.models import (
     RoomMessageKind,
     RoomPolicy,
     RoomState,
+    SelectionVerdict,
+    SpeakerDecision,
 )
 from uclone_x.room.orchestrator import (
     AUTONOMOUS_CIRCUIT_BREAKER_TURNS,
@@ -503,7 +505,25 @@ class RoomStack:
                 raise
             except Exception as exc:
                 logger.warning("Room %s stopped mid-cascade: %s", room_id, exc, exc_info=True)
-                await self._announce_failure(room_id, reader_facing_reason(exc))
+                reason = reader_facing_reason(exc)
+                await self._announce_failure(room_id, reason)
+                try:
+                    failed_state = self.store.load(room_id)
+                    if failed_state is not None:
+                        err_decision = SpeakerDecision(
+                            verdict=SelectionVerdict.SILENCE,
+                            selector="orchestrator",
+                            reasoning=f"cascade stopped: {reason}",
+                        )
+                        self.store.save(
+                            failed_state.model_copy(update={"last_decision": err_decision})
+                        )
+                except Exception:
+                    logger.debug(
+                        "Could not record cascade failure decision for room %s",
+                        room_id,
+                        exc_info=True,
+                    )
             finally:
                 group = self._running.get(room_id)
                 if group is not None:
@@ -1001,7 +1021,17 @@ def register_room_routes(app: FastAPI, stack: RoomStack) -> None:
         state = _room(room_id)
         active = bool(req.get("active", True))
         stack.note_presence(state, active)
-        if active and state.policy.autonomous and not stack.turn_in_flight(room_id):
+        was_presence_paused = (
+            state.last_decision is not None
+            and state.last_decision.verdict is SelectionVerdict.SILENCE
+            and "autonomous discussion paused" in (state.last_decision.reasoning or "")
+        )
+        if (
+            active
+            and state.policy.autonomous
+            and was_presence_paused
+            and not stack.turn_in_flight(room_id)
+        ):
             orch = stack.orchestrator(state)
             last_seq = state.transcript[-1].seq if state.transcript else 0
             stack.drive(room_id, lambda: orch.resume(room_id, last_seq))

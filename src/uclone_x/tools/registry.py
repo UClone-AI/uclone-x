@@ -139,6 +139,7 @@ def create_default_registry(
     mcp_config_path: Path | None = None,
 ) -> ToolRegistry:
     """Create a ToolRegistry populated with the default builtin tool suite and configured MCP tools."""
+    from uclone_x.tools.builtin.character import CharacterSheetTool
     from uclone_x.tools.builtin.filesystem import (
         DirectoryListTool,
         FileEditTool,
@@ -173,6 +174,7 @@ def create_default_registry(
             WebFetchTool(),
             WebSearchTool(),
             GenerateImageTool(),
+            CharacterSheetTool(),
             InstallPackageTool(),
             PlanUpdateTool(),
             SubagentDelegationTool(),

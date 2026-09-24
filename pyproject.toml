@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "uclone-x"
-version = "0.2.0"
+version = "0.2.1"
 description = "Next-Generation Event-Driven AI Agent Core & High-Performance Collaboration Framework"
 readme = "README.md"
 requires-python = ">=3.11"

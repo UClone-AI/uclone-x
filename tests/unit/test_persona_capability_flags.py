@@ -337,6 +337,7 @@ def test_the_ruling_s_classification_of_every_shipped_tool() -> None:
         "web_fetch": False,
         "web_search": False,
         "generate_image": True,
+        "character_sheet": True,
         "install_package": True,
         "update_plan": False,
         "delegate_subagent": False,

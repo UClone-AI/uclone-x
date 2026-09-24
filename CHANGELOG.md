@@ -13,6 +13,39 @@ names does.
 Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Each date is
 the date that version was published.
 
+## [0.2.1] - 2026-09-24
+
+### Added
+
+- A one-line install. `curl -fsSL https://raw.githubusercontent.com/UClone-AI/uclone-x/main/install.sh | bash`
+  asks its questions on the terminal even when piped, puts a `ucx` command in
+  `~/.local/bin` (and says how to add that folder to `PATH` when it is not there), and
+  ends by offering to start UClone-X. `--no-start` skips that last question.
+- Autonomous discussion in group chats. A toggle in the conversation header lets the
+  clones keep talking among themselves. It pauses while you are not viewing the
+  conversation, resumes when you come back, and stops after 20 turns in a row without you.
+- While a clone runs a tool, the conversation shows which one instead of "Thinking...".
+- The artist clone can remember characters: a `character_sheet` tool saves each
+  character's look (tags, description, seed) as a file under `characters/` in the
+  workspace, reuses it in later images, and combines several saved characters into one
+  scene prompt. It now writes image prompts in English and chooses the aspect ratio from
+  the subject.
+- In a group chat, the model that picks the next speaker is now told to let another clone
+  answer a question one clone asks, instead of ending the exchange, and to start a
+  discussion when you ask the clones to talk among themselves.
+- With developer mode on, a turn shows the model calls it made: model, tokens, duration
+  and tools called for each, and on expanding one, the request, the tools offered and the
+  response.
+
+### Fixed
+
+- Choosing the next speaker in a group chat now asks Ollama to turn a reasoning model's
+  thinking off (for example Qwen3), so it replies without spending its budget on
+  reasoning first. A selector that runs out of tokens now says so instead of reporting a
+  missing JSON object.
+- The message shown when no model is available points to Settings, and to `ucx llm status`
+  from a terminal, instead of a `./ucx` command that does not exist in an installed copy.
+
 ## [0.2.0] - 2026-09-24
 
 ### Added

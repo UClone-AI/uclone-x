@@ -474,7 +474,7 @@ def test_the_real_tool_registry_and_mcp_client_satisfy_protocols() -> None:
     assert _web_fetch_tool.name == "web_fetch"
     assert _web_search_tool.name == "web_search"
     assert isinstance(_ddg_provider, SearchProviderProtocol)
-    assert len(_default_registry.list_tools()) == 14
+    assert len(_default_registry.list_tools()) == 15
 
 
 def test_the_real_llm_subsystem_satisfies_protocols_at_runtime() -> None:

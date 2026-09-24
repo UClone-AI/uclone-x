@@ -189,52 +189,6 @@ export interface TopologyData {
   edges: TopologyEdge[];
 }
 
-export interface ToolCall {
-  id?: string;
-  name?: string;
-  tool_name?: string;
-  arguments: Record<string, unknown>;
-  output?: unknown;
-  status?: 'success' | 'error' | string;
-  error?: string | null;
-  duration_ms?: number;
-  latency_ms?: number;
-  provenance?: {
-    component: string;
-    producer: string;
-    content_hash: string;
-    degraded: boolean;
-  };
-}
-
-export type ToolCallTrace = ToolCall;
-
-export interface ToolExecution {
-  tool_call_id?: string;
-  tool_name: string;
-  arguments: Record<string, unknown>;
-  output?: unknown;
-  /** `stopped`: the turn was cancelled and nothing recorded how this call ended (#1031). */
-  status: 'success' | 'error' | 'stopped' | string;
-  error?: string | null;
-  /** Absent when nothing timed the call -- a `0` here would be a figure nobody measured. */
-  duration_ms?: number;
-  provenance?: {
-    component: string;
-    producer: string;
-    content_hash: string;
-    degraded: boolean;
-  };
-}
-
-export interface DebugInfo {
-  active_invariants?: string[];
-  /** Input tokens the turn booked; `null` when it booked none (#939). */
-  prompt_tokens_used?: number | null;
-  system_prompt_excerpt?: string;
-  [key: string]: unknown;
-}
-
 export interface DurabilityInfo {
   persisted: boolean;
   error?: string | null;
@@ -285,9 +239,6 @@ export interface ChatMessage {
   tokensUsed?: number;
   /** Whose count `tokensUsed` is. Absent means nothing says it was counted (#939). */
   tokenCountSource?: 'provider' | 'estimate';
-  toolCalls?: ToolCall[];
-  toolExecutions?: ToolExecution[];
-  debugInfo?: DebugInfo;
   provenance?: MessageProvenance;
   durability?: DurabilityInfo;
   isStopped?: boolean;

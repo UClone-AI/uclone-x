@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -135,10 +135,16 @@ class RebuiltRequest:
     snapshot_id: str
     request: LLMRequest
     verified: bool
+    layers: RequestLayers | None = None
 
 
 def rebuild_requests(
-    store: SessionStoreProtocol, state: SessionState, events: Iterable[Mapping[str, Any]]
+    store: SessionStoreProtocol,
+    state: SessionState,
+    events: Iterable[Mapping[str, Any]],
+    *,
+    select: Callable[[Mapping[str, Any]], bool] | None = None,
+    on_error: Callable[[int, RequestRecordError], None] | None = None,
 ) -> list[RebuiltRequest]:
     """Every request the session log records, rebuilt exactly as it was assembled.
 
@@ -148,12 +154,25 @@ def rebuild_requests(
     Each `REQUEST_CONTEXT` event extends the conversation of the one before it in the log
     by `kept_message_count` and `appended_messages`, and names the snapshot in `state` that
     holds the rest. An event whose `base_request` is not the request before it in the log
-    means a request is missing from the log, and the rebuild stops there rather than
-    guessing.
+    means a request is missing from the log: every request folded on top of the gap would
+    be a guess, so none of them is rebuilt. A request that keeps nothing of the one before
+    it (`kept_message_count` 0: after a restart, or the first request after a rollback)
+    carries its whole conversation, so it starts the chain again and the requests from
+    there on rebuild.
+
+    When `select` is given, conversation is folded for every event up to the last
+    selected one, but requests are only assembled and validated for events where
+    `select(event)` is `True`. Nothing after the last selected event is read, so a gap
+    later in the log does not touch the selected requests (#1490).
+
+    When `on_error` is given, a request that cannot be rebuilt -- a gap before it, a
+    missing snapshot or body, a pre-#1421 record, a record that does not parse -- is
+    reported to it as `(step, RequestRecordError)` and the rebuild goes on with the next
+    one. Without it the first such request raises.
 
     Raises:
-        RequestRecordError: A snapshot, a body or a request the chain depends on is
-            missing from the record.
+        RequestRecordError: Without `on_error`: a snapshot, a body or a request the chain
+            depends on is missing from the record, or a record does not parse.
     """
     snapshots = {snapshot.snapshot_id: snapshot for snapshot in state.context_snapshots}
     bodies: dict[str, str] = {}
@@ -172,32 +191,109 @@ def rebuild_requests(
             body_intact[digest] = content_digest(text) == digest
         return bodies[digest]
 
+    requests = [event for event in events if event.get("type") == "REQUEST_CONTEXT"]
+    if select is not None:
+        chosen = [i for i, event in enumerate(requests) if select(event)]
+        if not chosen:
+            return []
+        requests = requests[: chosen[-1] + 1]
+        chosen_ids = {id(requests[i]) for i in chosen}
+    else:
+        chosen_ids = {id(event) for event in requests}
+
     rebuilt: list[RebuiltRequest] = []
     conversation: list[dict[str, Any]] = []
     previous_seq: int | None = None
-    for event in events:
-        if event.get("type") != "REQUEST_CONTEXT":
-            continue
+    # Set once the chain is broken, and cleared by a request that restates everything.
+    broken: RequestRecordError | None = None
+    for event in requests:
         base = event.get("base_request")
-        if base is not None and base != previous_seq:
-            raise RequestRecordError(
+        delta = _conversation_delta(event)
+        if isinstance(delta, RequestRecordError):
+            broken = delta
+        elif delta[0] == 0:
+            # Keeps nothing from before: its conversation is all in this event, so a gap
+            # behind it cannot reach it (a restart, or the first turn after a rollback).
+            broken = None
+        elif base is not None and base != previous_seq:
+            broken = RequestRecordError(
                 "Part of this conversation's record is missing, so a request in it cannot "
                 "be rebuilt.",
                 detail=f"request {event.get('request')} extends {base}, last seen {previous_seq}",
             )
-        kept = int(event["kept_message_count"])
-        conversation = conversation[:kept] + list(event["appended_messages"])
+        if not isinstance(delta, RequestRecordError):
+            kept, appended = delta
+            conversation = conversation[:kept] + appended
         previous_seq = event.get("request")
-        snapshot_id = str(event["snapshot"])
-        snapshot = snapshots.get(snapshot_id)
-        if snapshot is None:
-            raise RequestRecordError(
-                "Part of this conversation's record is missing, so a request in it cannot "
-                "be rebuilt.",
-                detail=f"no context snapshot {snapshot_id}",
-            )
-        rebuilt.append(_rebuild_one(event, snapshot, conversation, body, body_intact))
+
+        if id(event) not in chosen_ids:
+            continue
+
+        step = _step_of(event)
+        try:
+            if broken is not None:
+                raise broken
+            rebuilt.append(_rebuild_selected(event, snapshots, conversation, body, body_intact))
+        except RequestRecordError as err:
+            if on_error is None:
+                raise
+            on_error(step, err)
     return rebuilt
+
+
+def _step_of(event: Mapping[str, Any]) -> int:
+    try:
+        return int(event.get("step", 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _conversation_delta(
+    event: Mapping[str, Any],
+) -> tuple[int, list[dict[str, Any]]] | RequestRecordError:
+    """What `event` keeps of the conversation before it and what it adds, or why not."""
+    try:
+        kept = int(event["kept_message_count"])
+        appended = list(event["appended_messages"])
+    except (KeyError, TypeError, ValueError):
+        return RequestRecordError(
+            "Part of this conversation's record could not be read, so a request in it "
+            "cannot be rebuilt.",
+            detail=f"request {event.get('request')} has no readable conversation delta",
+        )
+    return kept, appended
+
+
+def _rebuild_selected(
+    event: Mapping[str, Any],
+    snapshots: Mapping[str, ContextSnapshot],
+    conversation: list[dict[str, Any]],
+    body: Any,
+    body_intact: dict[str, bool],
+) -> RebuiltRequest:
+    if event.get("snapshot") is None:
+        raise RequestRecordError(
+            "Part of this conversation's record is missing, so a request in it cannot be rebuilt.",
+            detail="request recorded before request capture (#1421)",
+        )
+    snapshot_id = str(event["snapshot"])
+    snapshot = snapshots.get(snapshot_id)
+    if snapshot is None:
+        raise RequestRecordError(
+            "Part of this conversation's record is missing, so a request in it cannot be rebuilt.",
+            detail=f"no context snapshot {snapshot_id}",
+        )
+    try:
+        return _rebuild_one(event, snapshot, conversation, body, body_intact)
+    except (ValueError, TypeError, KeyError) as exc:
+        # A body or a message that does not parse: pydantic's ValidationError and
+        # json's JSONDecodeError are both ValueErrors. Named by kind only -- the
+        # exception text can quote the record, which is the reader's to open, not ours.
+        raise RequestRecordError(
+            "Part of this conversation's record could not be read, so a request in it "
+            "cannot be rebuilt.",
+            detail=f"request {event.get('request')} could not be read ({type(exc).__name__})",
+        ) from exc
 
 
 def _rebuild_one(
@@ -245,4 +341,5 @@ def _rebuild_one(
         snapshot_id=snapshot.snapshot_id,
         request=request,
         verified=verified,
+        layers=layers,
     )

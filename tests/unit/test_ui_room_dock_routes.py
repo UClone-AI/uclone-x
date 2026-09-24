@@ -15,6 +15,7 @@ What they pin, in order of what it would cost to get wrong:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import time
@@ -27,7 +28,8 @@ from fastapi.testclient import TestClient
 from pydantic import BaseModel, Field
 
 from uclone_x.agent.base import BaseAgent
-from uclone_x.agent.models import AgentConfig, ToolExecutionRecord
+from uclone_x.agent.models import AgentConfig, AgentContext, ToolExecutionRecord
+from uclone_x.agent.session import SessionState
 from uclone_x.llm import MockLLMConnector
 from uclone_x.llm.models import LLMRequest, ModelResponse, ToolCallRequest
 from uclone_x.ontology.models import OntologyRelation
@@ -82,6 +84,7 @@ def _utterance(
     tools_recorded: bool,
     error: str | None = None,
     completed: bool = True,
+    persist_error: str | None = None,
 ) -> RoomMessage:
     return RoomMessage(
         seq=seq,
@@ -91,6 +94,7 @@ def _utterance(
         tools_recorded=tools_recorded,
         error=error,
         completed=completed,
+        persist_error=persist_error,
     )
 
 
@@ -1693,3 +1697,451 @@ def _absence_claim(text: str) -> bool:
             re.IGNORECASE,
         )
     )
+
+
+class TestRoomDockTurnTraceRoutes:
+    """Covers #1490 GET /api/rooms/{room_id}/turns/{seq}/trace and step detail routes."""
+
+    def test_trace_turn_not_found_returns_404(self, client: TestClient) -> None:
+        """Killed by: src/uclone_x/ui/room_dock.py :: "message": f"Turn {seq} was not found in conversation {room_id}.",
+        Becomes: "message": f"Turn {seq} was found in conversation {room_id}.",
+        """
+        room_id = _create(client, ["scout"])
+        resp = client.get(f"/api/rooms/{room_id}/turns/999/trace")
+        assert resp.status_code == 404
+        assert resp.json()["detail"]["code"] == "turn_not_found"
+        assert (
+            resp.json()["detail"]["message"] == f"Turn 999 was not found in conversation {room_id}."
+        )
+
+    def test_trace_not_an_agent_turn(self, client: TestClient) -> None:
+        """A person's row -- no turn id -- from the seated human.
+
+        Killed by: src/uclone_x/ui/room_dock.py :: return participant.kind == ParticipantKind.AGENT
+        Becomes: return True
+        """
+        room_id = _create(client, ["scout"])
+        _seed(
+            client,
+            room_id,
+            transcript=(_utterance(1, "user", turn_id=None, tools_recorded=False),),
+        )
+        resp = client.get(f"/api/rooms/{room_id}/turns/1/trace")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["trace"] is None
+        assert body["reason"]["code"] == "not_an_agent_turn"
+
+    def test_trace_turn_not_linked(self, client: TestClient) -> None:
+        """Killed by: src/uclone_x/ui/room_dock.py :: return _TRACE_REASONS["turn_not_linked"]
+        Becomes: return None
+        """
+        room_id = _create(client, ["scout"])
+        _seed(
+            client,
+            room_id,
+            transcript=(_utterance(1, "scout", turn_id=None, tools_recorded=False),),
+        )
+        resp = client.get(f"/api/rooms/{room_id}/turns/1/trace")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["trace"] is None
+        assert body["reason"]["code"] == "turn_not_linked"
+
+    def test_trace_turn_not_saved(self, client: TestClient) -> None:
+        """A row whose save failed, and whose seat has no saved session, says so.
+
+        Killed by: src/uclone_x/ui/room_dock.py :: return _TRACE_REASONS["turn_not_saved" if unsaved else "session_not_found"]
+        Becomes: return _TRACE_REASONS["session_not_found"]
+        """
+        room_id = _create(client, ["scout"])
+        _seed(
+            client,
+            room_id,
+            transcript=(
+                _utterance(
+                    1, "scout", turn_id="t1", tools_recorded=False, persist_error="disk full"
+                ),
+            ),
+        )
+        resp = client.get(f"/api/rooms/{room_id}/turns/1/trace")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["trace"] is None
+        assert body["reason"]["code"] == "turn_not_saved"
+
+    def test_trace_session_not_found(self, client: TestClient) -> None:
+        """Killed by: src/uclone_x/ui/room_dock.py :: if session_state is None:
+        Becomes: if False:
+        """
+        room_id = _create(client, ["scout"])
+        _seed(
+            client,
+            room_id,
+            transcript=(_utterance(1, "scout", turn_id="t1", tools_recorded=True),),
+        )
+        resp = client.get(f"/api/rooms/{room_id}/turns/1/trace")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["trace"] is None
+        assert body["reason"]["code"] == "session_not_found"
+
+    def test_trace_log_missing(self, client: TestClient) -> None:
+        """Killed by: src/uclone_x/ui/room_dock.py :: if log_path is None or not log_path.exists():
+        Becomes: if log_path is None:
+        """
+        room_id = _create(client, ["scout"])
+        room = client.get(f"/api/rooms/{room_id}").json()
+        session_id = next(p["session_id"] for p in room["participants"] if p["id"] == "scout")
+        stack = _stack(client)
+        store = stack.session_manager().core_store
+        store.save(SessionState(session_id=session_id, agent_id="scout"))
+        _seed(
+            client,
+            room_id,
+            transcript=(_utterance(1, "scout", turn_id="t1", tools_recorded=True),),
+        )
+        resp = client.get(f"/api/rooms/{room_id}/turns/1/trace")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["trace"] is None
+        assert body["reason"]["code"] == "log_missing"
+
+    def test_trace_log_unreadable(self, client: TestClient) -> None:
+        """Should-fix (c): the reader gets a plain sentence and a stable code, no path or
+        exception text; the route is not gated on developer mode.
+
+        Killed by: src/uclone_x/ui/room_dock.py :: return {**_TRACE_REASONS["log_unreadable"], "detail": _log_failure_kind(exc)}
+        Becomes: return {"code": "log_unreadable", "message": str(exc)}
+        Killed by: src/uclone_x/ui/room_dock.py :: return "malformed_log"
+        Becomes: return "unexpected"
+        """
+        room_id = _create(client, ["scout"])
+        room = client.get(f"/api/rooms/{room_id}").json()
+        session_id = next(p["session_id"] for p in room["participants"] if p["id"] == "scout")
+        stack = _stack(client)
+        store = stack.session_manager().core_store
+        store.save(SessionState(session_id=session_id, agent_id="scout"))
+        log_path = store.event_log_path(session_id)
+        assert log_path is not None
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text("{bad json\n", encoding="utf-8")
+        _seed(
+            client,
+            room_id,
+            transcript=(_utterance(1, "scout", turn_id="t1", tools_recorded=True),),
+        )
+        resp = client.get(f"/api/rooms/{room_id}/turns/1/trace")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["trace"] is None
+        assert body["reason"] == {
+            "code": "log_unreadable",
+            "message": "This seat's session log could not be read, so the turn cannot be traced.",
+            "detail": "malformed_log",
+        }
+        step = client.get(f"/api/rooms/{room_id}/turns/1/trace/steps/1")
+        assert step.status_code == 200
+        assert step.json()["reason"] == body["reason"]
+        for leaked in (str(log_path.parent), log_path.name, "JSON", "Expecting", "bad json"):
+            assert leaked not in resp.text and leaked not in step.text, leaked
+
+    def test_trace_success_and_step_detail(self, client: TestClient) -> None:
+        """Killed by: src/uclone_x/ui/room_dock.py :: return {**head, "trace": outcome}
+        Becomes: return {**head, "trace": None}
+        """
+        room_id = _create(client, ["scout"])
+        room = client.get(f"/api/rooms/{room_id}").json()
+        session_id = next(p["session_id"] for p in room["participants"] if p["id"] == "scout")
+        stack = _stack(client)
+        store = stack.session_manager().core_store
+        store.save(SessionState(session_id=session_id, agent_id="scout"))
+        log_path = store.event_log_path(session_id)
+        assert log_path is not None
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        header = {"schema": "uclone_x.log.v0", "version": "0.1.0-dev", "session_id": session_id}
+        events = [
+            header,
+            {
+                "type": "TURN_START",
+                "turn_index": 1,
+                "caller_turn_id": "t1",
+                "at": "2026-09-23T10:00:00Z",
+            },
+            {"type": "MODEL_RESPONSE", "turn_index": 1, "step": 1, "content": "hello trace"},
+            {
+                "type": "TURN_END",
+                "turn_index": 1,
+                "outcome": "completed",
+                "at": "2026-09-23T10:00:01Z",
+            },
+        ]
+        log_path.write_text("\n".join(json.dumps(e) for e in events) + "\n", encoding="utf-8")
+        _seed(
+            client,
+            room_id,
+            transcript=(_utterance(1, "scout", turn_id="t1", tools_recorded=True),),
+        )
+
+        resp = client.get(f"/api/rooms/{room_id}/turns/1/trace")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["trace"] is not None
+        assert body["trace"]["turn_index"] == 1
+        assert len(body["trace"]["steps"]) == 1
+        assert body["trace"]["steps"][0]["response"]["content"] == "hello trace"
+
+        # Step detail route
+        step_resp = client.get(f"/api/rooms/{room_id}/turns/1/trace/steps/1")
+        assert step_resp.status_code == 200
+        step_body = step_resp.json()
+        assert step_body["step"] == 1
+        assert step_body["response"]["content"] == "hello trace"
+
+        # Step not found
+        step_404 = client.get(f"/api/rooms/{room_id}/turns/1/trace/steps/99")
+        assert step_404.status_code == 404
+        assert step_404.json()["detail"]["code"] == "step_not_found"
+        assert step_body["reason"] is None
+
+    @staticmethod
+    def _scout_session(client: TestClient, room_id: str) -> str:
+        room = client.get(f"/api/rooms/{room_id}").json()
+        return str(next(p["session_id"] for p in room["participants"] if p["id"] == "scout"))
+
+    def _real_turns(self, client: TestClient, room_id: str, count: int = 3) -> tuple[Any, Path]:
+        """`count` one-step turns by the real agent loop, in the room's own session store."""
+        session_id = self._scout_session(client, room_id)
+        store = _stack(client).session_manager().core_store
+        agent = BaseAgent(
+            config=AgentConfig(agent_id="scout", name="Scout"),
+            llm=MockLLMConnector(responses=[f"reply {n}" for n in range(1, count + 1)]),
+            context=AgentContext(session_id=session_id, agent_id="scout"),
+            store=store,
+        )
+
+        async def run() -> None:
+            await agent.start()
+            for n in range(1, count + 1):
+                assert (await agent.execute_turn(f"turn {n}", caller_turn_id=f"t{n}")).is_completed
+            agent.persist_session()
+
+        asyncio.run(run())
+        log_path = store.event_log_path(session_id)
+        assert log_path is not None and log_path.exists()
+        _seed(
+            client,
+            room_id,
+            transcript=tuple(
+                _utterance(n, "scout", turn_id=f"t{n}", tools_recorded=True)
+                for n in range(1, count + 1)
+            ),
+        )
+        return store, log_path
+
+    @staticmethod
+    def _drop_request(log_path: Path, request: int) -> None:
+        lines = log_path.read_text(encoding="utf-8").splitlines()
+        kept = [
+            line
+            for line in lines
+            if not (
+                json.loads(line).get("type") == "REQUEST_CONTEXT"
+                and json.loads(line).get("request") == request
+            )
+        ]
+        assert len(kept) == len(lines) - 1
+        log_path.write_text("\n".join(kept) + "\n", encoding="utf-8")
+
+    def test_a_gap_before_the_turn_is_a_stated_reason_on_its_step(self, client: TestClient) -> None:
+        """Blocker 2, through the route: a request missing before the turn is not a 500.
+
+        Killed by: src/uclone_x/agent/request_record.py :: on_error(step, err)
+        Becomes: raise
+        """
+        room_id = _create(client, ["scout"])
+        _, log_path = self._real_turns(client, room_id)
+        self._drop_request(log_path, 1)
+        tolerant = TestClient(client.app, raise_server_exceptions=False)
+
+        resp = tolerant.get(f"/api/rooms/{room_id}/turns/2/trace")
+        assert resp.status_code == 200, resp.text
+        (step,) = resp.json()["trace"]["steps"]
+        assert step["request_status"] == "unavailable"
+        assert step["request_reason"] == "request 2 extends 1, last seen None"
+        assert step["response"]["content"] == "reply 2"
+
+        detail = tolerant.get(f"/api/rooms/{room_id}/turns/2/trace/steps/1")
+        assert detail.status_code == 200, detail.text
+        assert detail.json()["reason"] is None
+        assert detail.json()["request"] is None
+        assert detail.json()["request_reason"] == "request 2 extends 1, last seen None"
+
+    def test_a_gap_after_the_turn_is_not_read(self, client: TestClient) -> None:
+        """Blocker 2: a gap after the traced turn, and the request built on it, cost it nothing.
+
+        Request 3 is gone, so request 4 extends a request the log does not hold; the
+        traced turn 2 is step 1 of its turn, as request 4 is of its own.
+
+        Also killed by one compound mutant that restores the #1490 defect (a later gap
+        aborting the fold), in `src/uclone_x/agent/request_record.py`: drop the truncation
+        `requests = requests[: chosen[-1] + 1]`, and make the unselected-request `continue`
+        under `if id(event) not in chosen_ids:` raise `broken` when it is set.
+        """
+        room_id = _create(client, ["scout"])
+        _, log_path = self._real_turns(client, room_id, count=4)
+        self._drop_request(log_path, 3)
+
+        resp = client.get(f"/api/rooms/{room_id}/turns/2/trace")
+        assert resp.status_code == 200
+        (step,) = resp.json()["trace"]["steps"]
+        assert (step["request_status"], step["verified"]) == ("ok", True)
+        detail = client.get(f"/api/rooms/{room_id}/turns/2/trace/steps/1").json()
+        assert detail["verified"] is True and detail["reason"] is None
+
+    def test_a_turn_whose_row_save_failed_is_still_traced_when_its_record_is_there(
+        self, client: TestClient
+    ) -> None:
+        """`persist_error` is the row's save; the seat's log may hold the turn all the same.
+
+        Killed by: src/uclone_x/ui/room_dock.py :: _TRACE_REASONS["turn_not_saved" if unsaved else "turn_not_linked"]
+        Becomes: _TRACE_REASONS["turn_not_saved"]
+        """
+        room_id = _create(client, ["scout"])
+        self._real_turns(client, room_id)
+        _seed(
+            client,
+            room_id,
+            transcript=(
+                _utterance(1, "scout", turn_id="t1", tools_recorded=True, persist_error="disk"),
+                _utterance(2, "scout", turn_id="t9", tools_recorded=True),
+                _utterance(3, "scout", turn_id="t8", tools_recorded=True, persist_error="disk"),
+            ),
+        )
+
+        assert client.get(f"/api/rooms/{room_id}/turns/1/trace").json()["trace"] is not None
+        unlinked = client.get(f"/api/rooms/{room_id}/turns/2/trace").json()
+        assert unlinked["reason"]["code"] == "turn_not_linked"
+        unsaved = client.get(f"/api/rooms/{room_id}/turns/3/trace").json()
+        assert unsaved["reason"]["code"] == "turn_not_saved"
+        step = client.get(f"/api/rooms/{room_id}/turns/2/trace/steps/1")
+        assert step.status_code == 200
+        assert step.json()["reason"]["code"] == "turn_not_linked"
+
+    def test_the_step_route_gives_the_trace_routes_reasons(self, client: TestClient) -> None:
+        """Should-fix (a): only a step the turn lacks is `step_not_found`.
+
+        Killed by: src/uclone_x/ui/room_dock.py :: return {**empty, "reason": outcome}
+        Becomes: raise HTTPException(status_code=404, detail={"code": "step_not_found"})
+        Killed by: src/uclone_x/ui/room_dock.py :: return {**empty, "reason": reason}
+        Becomes: raise HTTPException(status_code=404, detail={"code": "step_not_found"})
+        """
+        room_id = _create(client, ["scout"])
+        _seed(
+            client,
+            room_id,
+            transcript=(
+                _utterance(1, "user", turn_id=None, tools_recorded=False),
+                _utterance(2, "scout", turn_id=None, tools_recorded=False),
+                _utterance(3, "scout", turn_id="t1", tools_recorded=True),
+            ),
+        )
+        for seq, code in (
+            (1, "not_an_agent_turn"),
+            (2, "turn_not_linked"),
+            (3, "session_not_found"),
+        ):
+            trace = client.get(f"/api/rooms/{room_id}/turns/{seq}/trace")
+            step = client.get(f"/api/rooms/{room_id}/turns/{seq}/trace/steps/1")
+            assert step.status_code == 200, (seq, step.text)
+            assert trace.json()["reason"]["code"] == code
+            assert step.json()["reason"] == trace.json()["reason"]
+            assert step.json()["request"] is None and step.json()["response"] is None
+        missing = client.get(f"/api/rooms/{room_id}/turns/404/trace/steps/1")
+        assert missing.status_code == 404
+        assert missing.json()["detail"]["code"] == "turn_not_found"
+
+    def test_an_agent_that_left_the_room_is_still_an_agent(self, client: TestClient) -> None:
+        """Should-fix (b): the row answers for itself once its seat is gone.
+
+        Killed by: src/uclone_x/ui/room_dock.py :: linked = message.turn_id is not None or
+        Becomes: linked = False or
+        """
+        room_id = _create(client, ["scout", "helper"])
+        _stack(client).service.remove_participant(room_id, "helper")
+        _seed(
+            client,
+            room_id,
+            transcript=(
+                _utterance(1, "helper", turn_id="t1", tools_recorded=True),
+                _utterance(2, "someone", turn_id=None, tools_recorded=False),
+            ),
+        )
+
+        left = client.get(f"/api/rooms/{room_id}/turns/1/trace").json()
+        assert left["participant_id"] == "helper"
+        assert left["reason"]["code"] == "session_not_found"
+        person = client.get(f"/api/rooms/{room_id}/turns/2/trace").json()
+        assert person["reason"]["code"] == "not_an_agent_turn"
+
+    def test_an_unknown_event_type_is_named_by_kind(self, client: TestClient) -> None:
+        """Killed by: src/uclone_x/ui/room_dock.py :: return "unknown_event_type"
+        Becomes: return "unexpected"
+        """
+        room_id = _create(client, ["scout"])
+        session_id = self._scout_session(client, room_id)
+        store = _stack(client).session_manager().core_store
+        store.save(SessionState(session_id=session_id, agent_id="scout"))
+        log_path = store.event_log_path(session_id)
+        assert log_path is not None
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        header = {"schema": "uclone_x.log.v0", "version": "0.1.0-dev", "session_id": session_id}
+        log_path.write_text(
+            json.dumps(header) + "\n" + json.dumps({"type": "NOT_AN_EVENT_TYPE"}) + "\n",
+            encoding="utf-8",
+        )
+        _seed(
+            client,
+            room_id,
+            transcript=(_utterance(1, "scout", turn_id="t1", tools_recorded=True),),
+        )
+
+        resp = client.get(f"/api/rooms/{room_id}/turns/1/trace")
+        assert resp.json()["reason"]["detail"] == "unknown_event_type"
+        assert "NOT_AN_EVENT_TYPE" not in resp.text and str(log_path.parent) not in resp.text
+
+    def test_an_unreadable_session_or_a_failing_trace_is_a_stated_reason(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """P6: nothing leaves the routes as a bare 500, and no exception text leaves them.
+
+        Killed by: src/uclone_x/ui/room_dock.py :: return "reason", _TRACE_REASONS["trace_failed"]
+        Becomes: raise
+        Killed by: src/uclone_x/ui/room_dock.py :: return _TRACE_REASONS["session_unreadable"]
+        Becomes: raise
+        """
+        import uclone_x.ui.room_dock as room_dock
+
+        room_id = _create(client, ["scout"])
+        _, log_path = self._real_turns(client, room_id)
+        tolerant = TestClient(client.app, raise_server_exceptions=False)
+        secret = f"boom at {log_path}"
+
+        def failing(*args: Any, **kwargs: Any) -> Any:
+            raise RuntimeError(secret)
+
+        monkeypatch.setattr(room_dock, "trace_turn", failing)
+        monkeypatch.setattr(room_dock, "trace_step", failing)
+        for url in ("trace", "trace/steps/1"):
+            resp = tolerant.get(f"/api/rooms/{room_id}/turns/1/{url}")
+            assert resp.status_code == 200, resp.text
+            assert resp.json()["reason"]["code"] == "trace_failed"
+            assert "boom" not in resp.text
+
+        store = _stack(client).session_manager().core_store
+        monkeypatch.setattr(store, "load", failing)
+        for url in ("trace", "trace/steps/1"):
+            resp = tolerant.get(f"/api/rooms/{room_id}/turns/1/{url}")
+            assert resp.status_code == 200, resp.text
+            assert resp.json()["reason"]["code"] == "session_unreadable"
+            assert "boom" not in resp.text

@@ -11,6 +11,7 @@ import {
 } from '../../lib/roomDock';
 import { classifyTool, parseArgs, argsRecord } from '../../lib/toolLabels';
 import { readDeveloperMode } from '../../lib/developerMode';
+import { ModelCalls } from './ModelCalls';
 
 export interface TurnDetailProps {
   /** The conversation on screen, or `null` when none is. */
@@ -48,6 +49,8 @@ const NOTABLE_LABELS: Record<string, string> = {
  * 3. "Changed": Modified documents with Open in Docs action, and unnamed writes.
  * 4. Model line: Answered by {served_by}. Collapsed behind disclosure unless notable is non-empty.
  * 5. Error/refusal: Plain words; raw error visible only in developer mode.
+ * 6. Model calls (developer mode only, §4.4.4, #1492): each request as sent and its response.
+ *    Not mounted with the mode off, so no trace is requested.
  */
 export const TurnDetail: React.FC<TurnDetailProps> = ({
   room,
@@ -523,6 +526,9 @@ export const TurnDetail: React.FC<TurnDetailProps> = ({
           )}
         </div>
       ) : null}
+
+      {/* 6. Model calls: developer mode only; with it off nothing is mounted and nothing read */}
+      {devMode ? <ModelCalls key={`${room.room_id}:${seq}`} roomId={room.room_id} seq={seq} /> : null}
     </div>
   );
 };

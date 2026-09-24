@@ -571,4 +571,45 @@ describe('TurnDetail', () => {
       expect(fetchCount).toBe(3);
     });
   });
+
+  // Killed by: frontend/src/components/layout/TurnDetail.tsx :: {devMode ? <ModelCalls
+  // Becomes: {true ? <ModelCalls
+  it('with developer mode off, shows no Model calls and requests no trace (#1492)', async () => {
+    const urls: string[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string) => {
+        urls.push(String(url));
+        return new Response(JSON.stringify(defaultSummary()), { status: 200 });
+      }),
+    );
+    render(<TurnDetail seq={1} room={room([message()])} developerMode={false} />);
+    await waitFor(() => expect(urls.length).toBeGreaterThan(0));
+    expect(screen.queryByTestId('model-calls')).toBeNull();
+    expect(urls.filter((url) => url.includes('/trace'))).toEqual([]);
+    vi.unstubAllGlobals();
+  });
+
+  it('with developer mode on, offers Model calls and reads the trace only when expanded (#1492)', async () => {
+    const urls: string[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string) => {
+        urls.push(String(url));
+        return new Response(JSON.stringify(defaultSummary()), { status: 200 });
+      }),
+    );
+    render(<TurnDetail seq={1} room={room([message()])} developerMode={true} />);
+    await waitFor(() => expect(urls.length).toBeGreaterThan(0));
+    expect(screen.getByTestId('model-calls')).toBeInTheDocument();
+    expect(urls.filter((url) => url.includes('/trace'))).toEqual([]);
+
+    fireEvent.click(screen.getByTestId('model-calls-toggle'));
+    await waitFor(() =>
+      expect(urls.filter((url) => url.includes('/trace'))).toEqual([
+        '/api/rooms/room_1/turns/1/trace',
+      ]),
+    );
+    vi.unstubAllGlobals();
+  });
 });

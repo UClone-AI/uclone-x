@@ -1726,3 +1726,105 @@ class TestHistoryIsRefusedWhileSomebodyIsAnswering:
         reloaded = stack.store.load(room_id)
         assert reloaded is not None
         assert reloaded.turn_state.agent_turns_since_human == 0
+
+    def test_presence_does_not_loop_when_not_presence_paused(self, client: TestClient) -> None:
+        """POST /api/rooms/{id}/presence only resumes when previously paused due to inactive presence."""
+        from unittest.mock import MagicMock
+
+        from uclone_x.room.models import SelectionVerdict, SpeakerDecision
+
+        room_id = _create(client).json()["room_id"]
+        client.post(f"/api/rooms/{room_id}/autonomous", json={"enabled": True})
+
+        stack = cast(RoomStack, cast(Any, client.app).state.room_stack)
+        state = stack.store.load(room_id)
+        assert state is not None
+
+        # Set last_decision to normal silence
+        normal_silence = SpeakerDecision(
+            verdict=SelectionVerdict.SILENCE,
+            selector="orchestrator",
+            reasoning="conversation reached natural resting point",
+        )
+        stack.store.save(state.model_copy(update={"last_decision": normal_silence}))
+
+        # Mock drive to verify it is NOT called on normal presence heartbeat
+        orig_drive = stack.drive
+        stack.drive = MagicMock()
+        try:
+            res = client.post(f"/api/rooms/{room_id}/presence", json={"active": True})
+            assert res.status_code == 200
+            stack.drive.assert_not_called()
+        finally:
+            stack.drive = orig_drive
+
+    def test_presence_resumes_when_presence_paused(self, client: TestClient) -> None:
+        """POST /api/rooms/{id}/presence resumes when previously paused due to user being away."""
+        from unittest.mock import MagicMock
+
+        from uclone_x.room.models import SelectionVerdict, SpeakerDecision
+
+        room_id = _create(client).json()["room_id"]
+        stack = cast(RoomStack, cast(Any, client.app).state.room_stack)
+        state = stack.store.load(room_id)
+        assert state is not None
+
+        # Directly configure policy with autonomous=True and last_decision to presence paused
+        presence_paused = SpeakerDecision(
+            verdict=SelectionVerdict.SILENCE,
+            selector="orchestrator",
+            reasoning="autonomous discussion paused: user is not actively viewing the room",
+        )
+        stack.store.save(
+            state.model_copy(
+                update={
+                    "policy": state.policy.model_copy(update={"autonomous": True}),
+                    "last_decision": presence_paused,
+                }
+            )
+        )
+
+        orig_drive = stack.drive
+        stack.drive = MagicMock()
+        try:
+            res = client.post(f"/api/rooms/{room_id}/presence", json={"active": True})
+            assert res.status_code == 200
+            stack.drive.assert_called_once()
+        finally:
+            stack.drive = orig_drive
+
+    @pytest.mark.asyncio
+    async def test_drive_records_cascade_failure_decision(self) -> None:
+        """A cascade failure records a SILENCE last_decision explaining the stop."""
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import MagicMock
+
+        from uclone_x.errors import SpeakerSelectionError
+        from uclone_x.room.models import RoomPolicy, RoomState, SelectionVerdict, TurnState
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            session_mgr = MagicMock()
+            session_mgr.storage_dir = Path(tmpdir)
+            session_mgr.bus = MagicMock()
+            stack = RoomStack(session_mgr=session_mgr)
+
+            state = RoomState(
+                room_id="r_fail",
+                policy=RoomPolicy(),
+                turn_state=TurnState(),
+            )
+            stack.store.save(state)
+
+            async def failing_cascade() -> None:
+                raise SpeakerSelectionError("Selector test failed")
+
+            stack.drive("r_fail", failing_cascade)
+            # Give background task time to run
+            await asyncio.sleep(0.05)
+
+            reloaded = stack.store.load("r_fail")
+            assert reloaded is not None
+            assert reloaded.last_decision is not None
+            assert reloaded.last_decision.verdict == SelectionVerdict.SILENCE
+            assert "cascade stopped" in reloaded.last_decision.reasoning

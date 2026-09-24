@@ -137,25 +137,26 @@ def test_create_default_registry_contains_all_core_tools() -> None:
         "web_fetch",
         "web_search",
         "generate_image",
+        "character_sheet",
         "install_package",
     }
     assert expected_names.issubset(tool_names)
     assert "delegate_subagent" in tool_names
     assert "tool_result_read" in tool_names
-    assert len(tools) == 14
+    assert len(tools) == 15
 
     for name in expected_names:
         assert registry.get(name) is not None
 
     # Test alias
     reg_alias = create_default_tool_registry(enable_mcp=False)
-    assert len(reg_alias.list_tools()) == 14
+    assert len(reg_alias.list_tools()) == 15
 
     # Test classmethod factories
     reg_builtins = ToolRegistry.with_builtins(enable_mcp=False)
-    assert len(reg_builtins.list_tools()) == 14
+    assert len(reg_builtins.list_tools()) == 15
     reg_default = ToolRegistry.default(enable_mcp=False)
-    assert len(reg_default.list_tools()) == 14
+    assert len(reg_default.list_tools()) == 15
 
 
 def test_create_default_registry_with_mcp_auto_wiring(tmp_path: Path) -> None:
@@ -187,7 +188,7 @@ def test_create_default_registry_with_mcp_auto_wiring(tmp_path: Path) -> None:
     assert "web_fetch" in tool_names
     assert "web_search" in tool_names
     assert "custom_mcp_action" in tool_names
-    assert len(registry.list_tools()) == 15
+    assert len(registry.list_tools()) == 16
 
 
 def test_create_default_registry_graceful_on_broken_mcp(tmp_path: Path) -> None:
@@ -214,7 +215,7 @@ def test_create_default_registry_graceful_on_broken_mcp(tmp_path: Path) -> None:
     )
 
     # All built-in tools remain registered despite MCP failure
-    assert len(registry.list_tools()) == 14
+    assert len(registry.list_tools()) == 15
     assert registry.get("file_read") is not None
     assert registry.get("bash_run") is not None
     assert registry.get("web_fetch") is not None

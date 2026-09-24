@@ -314,8 +314,8 @@ def test_a_one_to_one_clones_stored_anchor_is_the_identity_its_request_sends(
 async def test_every_request_of_a_session_is_rebuilt_from_its_record(tmp_path: Path) -> None:
     """Messages, tools, model and settings of each request, across turns and a restart.
 
-    Killed by: src/uclone_x/agent/request_record.py :: conversation = conversation[:kept] + list(event["appended_messages"])
-    Becomes: conversation = list(event["appended_messages"])
+    Killed by: src/uclone_x/agent/request_record.py :: conversation = conversation[:kept] + appended
+    Becomes: conversation = appended
     Killed by: src/uclone_x/agent/base.py :: turn_context_digest=content_digest(layers.turn_context),
     Becomes: turn_context_digest=content_digest(""),
     """

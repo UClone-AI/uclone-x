@@ -20,20 +20,31 @@ Kept out of `rooms.py`, which already holds the room's write surface and its sta
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import stat as stat_mode
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from fastapi import FastAPI, HTTPException
 
+from uclone_x.agent.turn_trace import (
+    StepDetail,
+    StepNotFoundError,
+    TurnNotLinkedError,
+    trace_step,
+    trace_turn,
+)
 from uclone_x.core.agent_home import AgentHomeError
 from uclone_x.errors import (
+    LogHeaderError,
     MemoryStoreUnreadableError,
     PathTraversalError,
     SeatKnowledgeUnreadableError,
+    UnknownLogEventError,
 )
+from uclone_x.log import read_session_log
 from uclone_x.memory.store import read_saved_facts
 from uclone_x.room.models import (
     Participant,
@@ -43,6 +54,7 @@ from uclone_x.room.models import (
     RoomState,
     RoomToolUse,
 )
+from uclone_x.room.service import participant_session_id
 from uclone_x.room.turn_summary import TurnNotFoundError, summarize_turn
 from uclone_x.sandbox.path_validator import PathValidator
 from uclone_x.ui.knowledge import (
@@ -53,6 +65,7 @@ from uclone_x.ui.knowledge import (
 from uclone_x.ui.rooms import _http_error, seated_agents  # pyright: ignore[reportPrivateUsage]
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle; the app imports this module
+    from uclone_x.agent.session import SessionState
     from uclone_x.ui.rooms import RoomStack
 
 __all__ = ["register_room_dock_routes"]
@@ -331,6 +344,87 @@ def _saved_memory(seat: Participant) -> dict[str, Any]:
     return {"saved_facts": listed, "saved_facts_reason": reason}
 
 
+#: Why a turn cannot be traced (the turn-inspection design, §4.4.3). The code is for
+#: tests and the UI's logic; the message is what the UI prints. None of them carries a
+#: path or an exception's text: the routes are not gated on developer mode (§8 Q1).
+_TRACE_REASONS: dict[str, dict[str, str]] = {
+    code: {"code": code, "message": message}
+    for code, message in (
+        ("not_an_agent_turn", "This turn was spoken by a person, not an agent."),
+        (
+            "turn_not_linked",
+            "This turn was recorded before turns were linked to their session (#1489), "
+            "so its model calls cannot be found.",
+        ),
+        (
+            "turn_not_saved",
+            "This turn's record was not saved, so its model calls cannot be shown.",
+        ),
+        ("session_not_found", "No saved session was found for this seat."),
+        (
+            "session_unreadable",
+            "This seat's saved session could not be read, so the turn cannot be traced.",
+        ),
+        ("log_missing", "No session log was found for this seat."),
+        (
+            "log_unreadable",
+            "This seat's session log could not be read, so the turn cannot be traced.",
+        ),
+        (
+            "trace_failed",
+            "This turn's record could not be read back, so its model calls cannot be shown.",
+        ),
+    )
+}
+
+
+def _log_failure_kind(exc: BaseException) -> str:
+    """A stable name for why `read_session_log` failed, safe to send to the client."""
+    if isinstance(exc, UnknownLogEventError):
+        return "unknown_event_type"
+    if isinstance(exc, LogHeaderError):
+        return "malformed_log"
+    if isinstance(exc, UnicodeDecodeError):
+        return "not_text"
+    if isinstance(exc, OSError):
+        return "read_failed"
+    return "unexpected"
+
+
+def _spoken_by_agent(state: RoomState, message: RoomMessage) -> bool:
+    """Whether `message` is an agent's turn, from the room's record rather than its roster.
+
+    A seat still in the room answers by its kind. A seat that left is no longer in
+    `participants` (`remove_participant` drops it), and its rows then answer for
+    themselves: only an agent's turn carries a turn id, a speaker decision or a
+    provenance -- a person's row and a membership row carry none of them.
+    """
+    if not message.is_utterance:
+        return False
+    participant = next((p for p in state.participants if p.id == message.sender_id), None)
+    if participant is not None:
+        return participant.kind == ParticipantKind.AGENT
+    linked = message.turn_id is not None or message.decision is not None
+    return linked or message.provenance is not None
+
+
+def _turn_not_found(room_id: str, seq: int) -> HTTPException:
+    """The 404 for a seq the room's transcript does not hold."""
+    return HTTPException(
+        status_code=404,
+        detail={
+            "code": "turn_not_found",
+            "message": f"Turn {seq} was not found in conversation {room_id}.",
+        },
+    )
+
+
+def _turn_not_linked_reason(message: RoomMessage) -> dict[str, str]:
+    """Why a turn with an id has no record: its row's save failed, or the log lacks it."""
+    unsaved = message.persist_error is not None
+    return _TRACE_REASONS["turn_not_saved" if unsaved else "turn_not_linked"]
+
+
 def register_room_dock_routes(app: FastAPI, stack: RoomStack) -> None:
     """Mount the dock's room-scoped reads under `/api/rooms/{room_id}`."""
     service = stack.service
@@ -352,13 +446,7 @@ def register_room_dock_routes(app: FastAPI, stack: RoomStack) -> None:
         try:
             summary = summarize_turn(state, seq)
         except TurnNotFoundError as exc:
-            raise HTTPException(
-                status_code=404,
-                detail={
-                    "code": "turn_not_found",
-                    "message": f"Turn {seq} was not found in conversation {room_id}.",
-                },
-            ) from exc
+            raise _turn_not_found(room_id, seq) from exc
         return summary.model_dump(mode="json")
 
     @app.get("/api/rooms/{room_id}/seats/{participant_id}/history")
@@ -431,6 +519,149 @@ def register_room_dock_routes(app: FastAPI, stack: RoomStack) -> None:
                 else _no_turns_reason(state, seat.display_name, unsaved, in_progress)
             ),
         }
+
+    def _traced_message(room_id: str, seq: int) -> tuple[RoomState, RoomMessage]:
+        state = _room(room_id)
+        message = next((m for m in state.transcript if m.seq == seq), None)
+        if message is None:
+            raise _turn_not_found(room_id, seq)
+        return state, message
+
+    def _unlinked_reason(state: RoomState, message: RoomMessage) -> dict[str, str] | None:
+        """Why this row cannot be traced before any record is read, or None."""
+        if not _spoken_by_agent(state, message):
+            return _TRACE_REASONS["not_an_agent_turn"]
+        if message.turn_id is None:
+            return _TRACE_REASONS["turn_not_linked"]
+        return None
+
+    def _read_trace_inputs(
+        message: RoomMessage, session_id: str
+    ) -> tuple[Any, SessionState, list[dict[str, Any]]] | dict[str, str]:
+        """The seat's store, saved session and log events, or the reason one is missing.
+
+        Blocking file I/O: callers run it in a thread. A row whose save failed
+        (`persist_error`) and whose record is absent reports `turn_not_saved`, not the
+        absence: the failed save is why it is absent.
+        """
+        unsaved = message.persist_error is not None
+        store = stack.session_manager().core_store
+        try:
+            session_state = store.load(session_id)
+        except Exception:
+            logger.warning("Saved session %s could not be read", session_id, exc_info=True)
+            return _TRACE_REASONS["session_unreadable"]
+        if session_state is None:
+            return _TRACE_REASONS["turn_not_saved" if unsaved else "session_not_found"]
+        log_path = store.event_log_path(session_id)
+        if log_path is None or not log_path.exists():
+            return _TRACE_REASONS["turn_not_saved" if unsaved else "log_missing"]
+        try:
+            events = list(read_session_log(log_path))
+        except Exception as exc:
+            # The exception text names the file and quotes the line: it goes to the
+            # server log, and the reader gets a stable code for what kind of failure.
+            logger.warning("Session log of %s could not be read", session_id, exc_info=True)
+            return {**_TRACE_REASONS["log_unreadable"], "detail": _log_failure_kind(exc)}
+        return store, session_state, events
+
+    async def _off_loop(
+        work: Any, session_id: str
+    ) -> tuple[Literal["read", "reason", "no_step"], dict[str, Any]]:
+        """Run `work` in a thread; an unexpected failure is a stated reason, not a 500.
+
+        `work` answers `("read", payload)`, `("reason", reason)` or `("no_step", {})`.
+        """
+        try:
+            return await asyncio.to_thread(work)
+        except Exception:
+            logger.exception("Tracing a turn of session %s failed", session_id)
+            return "reason", _TRACE_REASONS["trace_failed"]
+
+    @app.get("/api/rooms/{room_id}/turns/{seq}/trace")
+    async def read_turn_trace(room_id: str, seq: int) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
+        """Full trace of one turn's model calls, requests, and tool results (#1490).
+
+        Reconstructs the trace from the session log and context bodies.
+        Returns 200 with the trace, or with `trace: null` and a reason (§4.4.3 of
+        the turn-inspection design). Raises 404 if the turn seq does not exist.
+        """
+        state, message = _traced_message(room_id, seq)
+        participant_id = message.sender_id
+        session_id = participant_session_id(room_id, participant_id)
+        head: dict[str, Any] = {
+            "room_id": room_id,
+            "seq": seq,
+            "turn_id": message.turn_id,
+            "participant_id": participant_id,
+            "session_id": session_id,
+        }
+        reason = _unlinked_reason(state, message)
+        if reason is not None:
+            return {**head, "trace": None, "reason": reason}
+        turn_id = message.turn_id
+        assert turn_id is not None  # _unlinked_reason refused a row without one
+
+        def _load_and_trace() -> tuple[Literal["read", "reason"], dict[str, Any]]:
+            inputs = _read_trace_inputs(message, session_id)
+            if isinstance(inputs, dict):
+                return "reason", inputs
+            store, session_state, events = inputs
+            try:
+                trace = trace_turn(store, session_state, events, caller_turn_id=turn_id)
+            except TurnNotLinkedError:
+                return "reason", _turn_not_linked_reason(message)
+            return "read", trace.model_dump(mode="json")
+
+        kind, outcome = await _off_loop(_load_and_trace, session_id)
+        if kind == "read":
+            return {**head, "trace": outcome}
+        return {**head, "trace": None, "reason": outcome}
+
+    @app.get("/api/rooms/{room_id}/turns/{seq}/trace/steps/{step}")
+    async def read_turn_step_detail(room_id: str, seq: int, step: int) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
+        """One step's full request and response for developer inspection (#1490).
+
+        Returns 200 with {step, request, request_reason, verified, layers, response,
+        response_reason, reason}. `reason` is null when the step was read, and otherwise
+        carries the same code the trace route gives for the turn, with the other fields
+        null. Raises 404 turn_not_found for an unknown seq and step_not_found for a step
+        the turn does not have.
+        """
+        state, message = _traced_message(room_id, seq)
+        session_id = participant_session_id(room_id, message.sender_id)
+        empty = StepDetail(step=step).model_dump(mode="json")
+        reason = _unlinked_reason(state, message)
+        if reason is not None:
+            return {**empty, "reason": reason}
+        turn_id = message.turn_id
+        assert turn_id is not None  # _unlinked_reason refused a row without one
+
+        def _load_and_trace_step() -> tuple[Literal["read", "reason", "no_step"], dict[str, Any]]:
+            inputs = _read_trace_inputs(message, session_id)
+            if isinstance(inputs, dict):
+                return "reason", inputs
+            store, session_state, events = inputs
+            try:
+                detail = trace_step(store, session_state, events, caller_turn_id=turn_id, step=step)
+            except TurnNotLinkedError:
+                return "reason", _turn_not_linked_reason(message)
+            except StepNotFoundError:
+                return "no_step", {}
+            return "read", detail.model_dump(mode="json")
+
+        kind, outcome = await _off_loop(_load_and_trace_step, session_id)
+        if kind == "no_step":
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "code": "step_not_found",
+                    "message": f"Step {step} was not found for turn {seq}.",
+                },
+            )
+        if kind == "read":
+            return {**outcome, "reason": None}
+        return {**empty, "reason": outcome}
 
     @app.get("/api/rooms/{room_id}/artifacts")
     async def read_room_artifacts(room_id: str) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]

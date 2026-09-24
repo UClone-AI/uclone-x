@@ -15,7 +15,7 @@ import pytest
 
 from uclone_x.errors import SpeakerSelectionError, UnknownRoomParticipantError
 from uclone_x.llm.connectors.mock import MockLLMConnector
-from uclone_x.llm.models import LLMRequest, ModelResponse
+from uclone_x.llm.models import FinishReason, LLMRequest, ModelResponse
 from uclone_x.room.models import (
     Participant,
     ParticipantKind,
@@ -910,3 +910,21 @@ class TestLLMSelectorAutonomousAndThinking:
         decision = await LLMSpeakerSelector(llm).select(request)
         assert decision.verdict is SelectionVerdict.SPEAK
         assert decision.speaker_id == "scout"
+
+    @pytest.mark.asyncio
+    async def test_llm_selector_raises_budget_exhausted_on_length_truncation(self) -> None:
+        class TruncatedLLM(MockLLMConnector):
+            async def generate(self, request: LLMRequest) -> ModelResponse:
+                resp = await super().generate(request)
+                return resp.model_copy(
+                    update={
+                        "content": "",
+                        "thinking": "Thinking about Alice and Scout and... (truncated)",
+                        "finish_reason": FinishReason.LENGTH,
+                    }
+                )
+
+        llm = TruncatedLLM()
+        request = _request(ALICE, SCOUT, CRITIC)
+        with pytest.raises(SpeakerSelectionError, match="token budget was exhausted"):
+            await LLMSpeakerSelector(llm).select(request)
