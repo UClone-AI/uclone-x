@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 from uclone_x.agent.base import BaseAgent
 from uclone_x.agent.hooks import BaseHook, HookRunner
@@ -30,6 +30,9 @@ from uclone_x.skills.protocols import SkillRegistryProtocol
 from uclone_x.telemetry.protocols import TracerProtocol
 from uclone_x.tools.protocols import ToolRegistryProtocol
 from uclone_x.tools.tool_scoper import ToolScoperProtocol
+
+if TYPE_CHECKING:
+    from uclone_x.a2a.protocols import A2ATransportProtocol
 
 
 class MissingCapabilityError(Exception):
@@ -88,6 +91,10 @@ class HostDependencies:
     sandbox: SandboxRunnerProtocol | None = None
     isolation_floor: IsolationLevel | None = IsolationLevel.WORKSPACE
     available_isolation: frozenset[IsolationLevel] = AVAILABLE_ISOLATION_LEVELS
+    #: How this agent's `a2a_call` reaches peer personas (#1558), or `None` when it may
+    #: call no one. An agent built to answer a peer call is given `None`, which is what
+    #: holds such calls to one level deep; a sub-agent is not given it either.
+    a2a_transport: A2ATransportProtocol | None = None
 
     @property
     def capabilities(self) -> frozenset[Capability]:
@@ -100,7 +107,15 @@ class HostDependencies:
 # persona of its own and no cross-session memory, and gets a hook runner of its own seeded
 # with its parent's hooks (so its hook events carry its own sender id).
 SUBAGENT_EXCLUDED_HOST_FIELDS: frozenset[str] = frozenset(
-    {"memory", "hook_runner", "persona", "persona_name", "persona_store", "persona_definitions"}
+    {
+        "memory",
+        "hook_runner",
+        "persona",
+        "persona_name",
+        "persona_store",
+        "persona_definitions",
+        "a2a_transport",
+    }
 )
 
 
@@ -169,4 +184,5 @@ def build_agent(
         persona_name=host.persona_name,
         personas=host.persona_definitions,
         host=cast("HostProtocol", host),
+        a2a_transport=host.a2a_transport,
     )

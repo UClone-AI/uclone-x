@@ -12,7 +12,7 @@ from typing import Any, ClassVar, Generic, TypeVar, get_args, get_origin
 from pydantic import BaseModel, ValidationError
 
 from uclone_x.core.provenance import Provenance
-from uclone_x.errors import PathTraversalError
+from uclone_x.errors import PathTraversalError, PlainRefusalError
 from uclone_x.sandbox.path_validator import PathValidator
 from uclone_x.tools.models import ToolContext, ToolResult
 from uclone_x.tools.protocols import ToolProtocol
@@ -59,6 +59,29 @@ def tool_spawns_subagents(tool: object) -> bool:
     return declared is True
 
 
+def tool_opens_story(tool: object) -> bool:
+    """Whether a successful call of `tool` can change which story its conversation has open.
+
+    Declared, and **undeclared means no**: a tool that says nothing cannot move a
+    conversation's story. A declaring tool names the story in its output under
+    `uclone_x.story.OPEN_STORY_KEY`, and the runtime reads that key only from a tool that
+    declares this (#1555) -- the shape of an output is not a capability.
+    """
+    declared: object = getattr(tool, "opens_story", False)
+    return declared is True
+
+
+def tool_needs_room(tool: object) -> bool:
+    """Whether `tool` refuses every call made outside a conversation (a room).
+
+    Declared, and undeclared means no. An agent running outside a room is not offered such
+    a tool: its schema would cost every request room in the window for a call that can
+    only be refused (#1556).
+    """
+    declared: object = getattr(tool, "needs_room", False)
+    return declared is True
+
+
 def drop_shadowed_aliases(tools: Sequence[TTool]) -> list[TTool]:
     """`tools` without any alias whose canonical tool is also in it (#1424).
 
@@ -84,6 +107,11 @@ class BaseTool(abc.ABC, Generic[TParams]):
     writes_files: ClassVar[bool] = True
     #: Whether executing this tool starts another agent. See `tool_spawns_subagents`.
     spawns_subagents: ClassVar[bool] = False
+    #: Whether a successful call can change the conversation's open story. See
+    #: `tool_opens_story`.
+    opens_story: ClassVar[bool] = False
+    #: Whether the tool can only run inside a conversation (a room). See `tool_needs_room`.
+    needs_room: ClassVar[bool] = False
     #: What a call refused on its arguments did *not* do, in words the model reads next to
     #: the refusal. A refusal that names only a field and a type leaves the model to guess
     #: whether anything happened, and one model guessed that it had (#1375). A tool whose
@@ -279,6 +307,19 @@ class BaseTool(abc.ABC, Generic[TParams]):
             return ToolResult(
                 success=True,
                 output=output,
+                execution_time_ms=elapsed_ms,
+                isolation_level=actual_context.isolation.level,
+                provenance=Provenance.primary(
+                    provider="local.builtin",
+                    model=tool_identifier,
+                ),
+            )
+        except PlainRefusalError as e:
+            # Already written for a person: passed on as it is, without a class name.
+            elapsed_ms = (time.perf_counter() - start_time) * 1000.0
+            return ToolResult(
+                success=False,
+                error=str(e),
                 execution_time_ms=elapsed_ms,
                 isolation_level=actual_context.isolation.level,
                 provenance=Provenance.primary(

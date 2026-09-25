@@ -1,0 +1,28 @@
+id: kishotenketsu
+title: Kishotenketsu
+description: Introduction, development, twist and reconciliation; change comes from contrast rather than conflict.
+acts:
+  - id: ki
+    title: Introduction
+    beats:
+      - id: introduction
+        title: Introduction
+        purpose: Introduce the characters, the setting and the situation.
+  - id: sho
+    title: Development
+    beats:
+      - id: development
+        title: Development
+        purpose: Deepen the situation without a major change.
+  - id: ten
+    title: Twist
+    beats:
+      - id: twist
+        title: Twist
+        purpose: An unexpected turn or new element that recasts what came before.
+  - id: ketsu
+    title: Reconciliation
+    beats:
+      - id: reconciliation
+        title: Reconciliation
+        purpose: Bring the first half and the twist together into a new understanding.

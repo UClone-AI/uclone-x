@@ -211,6 +211,33 @@ describe('PersonaManager', () => {
     );
   });
 
+  it('keeps who a persona may call when the editor saves it', async () => {
+    // The editor has no field for `a2a_peers` (#1558), so a draft rebuilt from the fields it
+    // shows would save the writer's persona without its Artist and the call would be refused.
+    const props = renderManager({
+      personas: [
+        makePersonaInfo({
+          name: 'writer',
+          role: 'Writer',
+          system_prompt: 'You write.',
+          a2a_peers: ['artist'],
+        }),
+      ],
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: `${PERSONA_EDITOR_COPY.edit} writer` }));
+    fireEvent.click(screen.getByRole('button', { name: PERSONA_EDITOR_COPY.save }));
+
+    // Killed by: frontend/src/lib/personaDraft.ts :: a2a_peers: [...(persona.a2a_peers ?? [])],
+    // Becomes: a2a_peers: [],
+    await waitFor(() =>
+      expect(props.onSave).toHaveBeenCalledWith(
+        expect.objectContaining({ name: 'writer', a2a_peers: ['artist'] }),
+        'edit',
+      ),
+    );
+  });
+
   it('keeps the editor open with the refusal when the server refuses the save', async () => {
     renderManager({
       onSave: vi.fn(async (): Promise<PersonaSaveResult> => ({ ok: false, message: 'Refused: reason.' })),

@@ -82,6 +82,7 @@ class PersonaDraft(BaseModel):
     max_tokens: int | None = Field(default=None, gt=0)
     enable_write_tools: bool = False
     enable_subagent_tools: bool = False
+    a2a_peers: list[str] = Field(default_factory=list[str])
 
 
 def split_appended_default_prompt(prompt: str) -> tuple[str, bool]:
@@ -158,7 +159,7 @@ def _file_contents(draft: PersonaDraft) -> dict[str, Any]:
         llm_config["model_name"] = draft.model_name
     if draft.max_tokens is not None:
         llm_config["max_tokens"] = draft.max_tokens
-    return {
+    contents: dict[str, Any] = {
         "name": draft.name,
         "role": draft.role,
         "description": draft.description,
@@ -169,6 +170,10 @@ def _file_contents(draft: PersonaDraft) -> dict[str, Any]:
         "enable_write_tools": draft.enable_write_tools,
         "enable_subagent_tools": draft.enable_subagent_tools,
     }
+    if draft.a2a_peers:
+        # Written only when set, so a persona that calls no one keeps the file it had.
+        contents["a2a_peers"] = list(draft.a2a_peers)
+    return contents
 
 
 @runtime_checkable
@@ -269,6 +274,13 @@ class YamlFilePersonaStore:
             data["allowed_tools"] = tuple(str(x) for x in allowed_seq)
         elif allowed is None:
             data["allowed_tools"] = ()
+
+        peers: object = data.get("a2a_peers")
+        if isinstance(peers, (list, tuple)):
+            peer_seq = cast(Sequence[object], peers)
+            data["a2a_peers"] = tuple(str(x) for x in peer_seq)
+        elif peers is None:
+            data["a2a_peers"] = ()
 
         raw_name: object = data.get("name") or data.get("id") or file_path.stem
         persona_name = str(raw_name)
@@ -473,6 +485,7 @@ class InMemoryPersonaStore:
             llm_config=AgentLLMConfig(**llm_dict),
             enable_write_tools=draft.enable_write_tools,
             enable_subagent_tools=draft.enable_subagent_tools,
+            a2a_peers=tuple(draft.a2a_peers),
         )
         if draft.append_default_prompt:
             persona = _with_default_prompt(persona)

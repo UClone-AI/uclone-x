@@ -27,6 +27,8 @@ export interface PersonaDraft {
   max_tokens: number | null;
   enable_write_tools: boolean;
   enable_subagent_tools: boolean;
+  /** Not editable here; carried so an edit does not drop who the persona may call. */
+  a2a_peers: string[];
 }
 
 export type PersonaEditMode = 'create' | 'edit';
@@ -56,6 +58,7 @@ export const emptyPersonaDraft = (): PersonaDraft => ({
   max_tokens: null,
   enable_write_tools: false,
   enable_subagent_tools: false,
+  a2a_peers: [],
 });
 
 /** The draft an edit starts from: exactly what the catalogue says the persona is. */
@@ -72,6 +75,7 @@ export const draftFromPersona = (persona: PersonaInfo): PersonaDraft => ({
   max_tokens: persona.max_tokens ?? null,
   enable_write_tools: persona.enable_write_tools ?? false,
   enable_subagent_tools: persona.enable_subagent_tools ?? false,
+  a2a_peers: [...(persona.a2a_peers ?? [])],
 });
 
 /**

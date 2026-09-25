@@ -1,0 +1,45 @@
+genre: mystery
+title: Mystery
+slots:
+  - slot: character
+    entries:
+      - a retired detective who solves crimes by crossword
+      - a night-shift pharmacist who notices every refill
+      - a court stenographer who remembers every word
+      - a locksmith with a criminal past
+      - a journalist chasing a story her editor killed
+      - a small-town librarian who knows everyone's overdue books
+      - an insurance adjuster who distrusts accidents
+      - a forensic accountant afraid of blood
+      - a translator who overhears too much
+      - a hotel concierge who sees every guest leave
+  - slot: place
+    entries:
+      - a snowed-in mountain lodge
+      - a luxury train stopped between stations
+      - a lighthouse with a locked keeper's room
+      - an island book festival
+      - a family vineyard during harvest
+      - a museum on the night of a gala
+      - a boarding school closed for the holidays
+      - a ferry crossing in heavy fog
+  - slot: conflict
+    entries:
+      - the victim was already declared dead years ago
+      - every witness tells the same story word for word
+      - the murder weapon is missing from a locked room
+      - a will is changed the night before a death
+      - the detective is the prime suspect
+      - a painting has been replaced with a perfect forgery
+      - a message arrives predicting the next crime
+      - the only witness is a child who will not speak
+  - slot: twist
+    entries:
+      - the victim staged their own death and it went wrong
+      - two crimes were committed by two different people the same night
+      - the detective's client is the culprit
+      - the clue everyone ignored was a deliberate plant
+      - the timeline is wrong because a clock was changed
+      - the missing person never existed
+      - the real target was the witness
+      - the confession is true, but for a different crime

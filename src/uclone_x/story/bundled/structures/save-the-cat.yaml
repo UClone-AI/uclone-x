@@ -1,0 +1,58 @@
+id: save-the-cat
+title: Save the Cat
+description: Fifteen beats from Blake Snyder's screenwriting structure, spread over three acts.
+acts:
+  - id: act-1
+    title: Thesis
+    beats:
+      - id: opening-image
+        title: Opening Image
+        purpose: A snapshot of the protagonist's life before the change.
+      - id: theme-stated
+        title: Theme Stated
+        purpose: Someone hints at the lesson the protagonist has yet to learn.
+      - id: setup
+        title: Setup
+        purpose: The protagonist's world, flaws and what they think they want.
+      - id: catalyst
+        title: Catalyst
+        purpose: The event that upends the status quo.
+      - id: debate
+        title: Debate
+        purpose: The protagonist hesitates and weighs whether to act.
+  - id: act-2
+    title: Antithesis
+    beats:
+      - id: break-into-two
+        title: Break into Two
+        purpose: The protagonist chooses to enter the new world.
+      - id: b-story
+        title: B Story
+        purpose: A secondary relationship that carries the theme.
+      - id: fun-and-games
+        title: Fun and Games
+        purpose: The promise of the premise; the new world explored.
+      - id: midpoint
+        title: Midpoint
+        purpose: A false victory or false defeat raises the stakes.
+      - id: bad-guys-close-in
+        title: Bad Guys Close In
+        purpose: Outside pressure and inner flaws tighten around the protagonist.
+      - id: all-is-lost
+        title: All Is Lost
+        purpose: The lowest point; something or someone is lost.
+      - id: dark-night-of-the-soul
+        title: Dark Night of the Soul
+        purpose: The protagonist sits with the loss and finds the lesson.
+  - id: act-3
+    title: Synthesis
+    beats:
+      - id: break-into-three
+        title: Break into Three
+        purpose: The protagonist sees the solution that combines both worlds.
+      - id: finale
+        title: Finale
+        purpose: The protagonist acts on the lesson and confronts the problem.
+      - id: final-image
+        title: Final Image
+        purpose: A mirror of the opening image that shows the change.

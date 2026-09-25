@@ -19,7 +19,7 @@ import logging
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from typing import Any, Final
+from typing import Any, Final, cast
 
 from uclone_x.agent.models import ToolExecutionRecord
 from uclone_x.agent.protocols import BaseAgentProtocol
@@ -55,6 +55,7 @@ from uclone_x.room.protocols import (
     RoomStoreProtocol,
     SpeakerSelectorProtocol,
 )
+from uclone_x.story import story_after
 from uclone_x.tools.models import ToolResultStatus
 
 __all__ = ["RoomOrchestrator"]
@@ -156,6 +157,14 @@ def _record_tools(
       that failed may have written first. Its writes are counted, not propagated: the
       delegation result does not carry the helper's tool records, and reading them from
       its session would be a second, unsynchronised source.
+
+    One call can name several files: an output's `paths` list is recorded alongside its
+    `path`, each file once (#1558), in `RoomToolUse.written_paths` and as one
+    `RoomWrittenFile` each. That is how a peer called through `a2a_call` reports what it
+    wrote, and how an image call that made several pictures reports all of them.
+    `RoomToolUse.written_path` stays the first of them. A writing call whose output says
+    `unnamed_writes: true` -- a peer that may have written something it did not name -- is
+    counted as a possible unnamed write too, as a helper is.
     """
     uses: list[RoomToolUse] = []
     written: list[RoomWrittenFile] = []
@@ -163,10 +172,17 @@ def _record_tools(
         succeeded = execution.status is ToolResultStatus.SUCCESS
         output = execution.output
         mapping: dict[str, Any] = dict(output) if isinstance(output, dict) else {}
-        written_path: str | None = None
-        path = mapping.get("path")
-        if execution.writes_files and succeeded and isinstance(path, str) and path:
-            written_path = path
+        named: list[str] = []
+        if execution.writes_files and succeeded:
+            path = mapping.get("path")
+            listed: object = mapping.get("paths")
+            candidates: list[object] = [path]
+            if isinstance(listed, list | tuple):
+                candidates.extend(cast(Sequence[object], listed))
+            for candidate in candidates:
+                if isinstance(candidate, str) and candidate and candidate not in named:
+                    named.append(candidate)
+        written_path: str | None = named[0] if named else None
         subagent_id: str | None = None
         child = mapping.get("subagent_id")
         if execution.spawns_subagents and succeeded and isinstance(child, str) and child:
@@ -186,21 +202,23 @@ def _record_tools(
                 output_preview=result,
                 truncated=cut_arguments or cut_result,
                 written_path=written_path,
+                written_paths=tuple(named),
                 wrote_unnamed=(written_path is None and execution.writes_files)
+                or (execution.writes_files and mapping.get("unnamed_writes") is True)
                 or execution.spawns_subagents,
                 subagent_id=subagent_id,
             )
         )
-        if written_path is not None:
-            written.append(
-                RoomWrittenFile(
-                    path=written_path,
-                    participant_id=speaker.id,
-                    tool_name=execution.tool_name,
-                    turn_id=turn_id,
-                    tool_call_id=execution.tool_call_id,
-                )
+        written.extend(
+            RoomWrittenFile(
+                path=one,
+                participant_id=speaker.id,
+                tool_name=execution.tool_name,
+                turn_id=turn_id,
+                tool_call_id=execution.tool_call_id,
             )
+            for one in named
+        )
     return tuple(uses), tuple(written)
 
 
@@ -795,6 +813,10 @@ class RoomOrchestrator:
                 prompt,
                 stream_callback=self._stream_callback(room_id, speaker.id, turn_id),
                 caller_turn_id=turn_id,
+                # Every seat gets the room's id and the room's story, so two seats in one
+                # room resolve the same story and hold its lease as one writer (#1555).
+                room_id=room_id,
+                story_id=state.story_id,
             )
         )
         self._active_turns[room_id] = (turn_id, turn_task)
@@ -918,6 +940,12 @@ class RoomOrchestrator:
                 # cannot disagree about whether this turn happened (P8).
                 "tool_uses": (*state.tool_uses, *uses),
                 "written_files": (*state.written_files, *written),
+                # The story a `story_library` call in this turn opened, created or closed
+                # (#1555). Read from the records whether or not the turn then failed: the
+                # lease moved when the call succeeded, and a room that forgot it would
+                # hold a lease it does not know it has. A turn that raised has no records,
+                # and keeps the story it had.
+                "story_id": story_after(executions, state.story_id),
                 # What `written_files` cannot see, counted where it happens and kept
                 # past any clear or rewind that removes the rows above (#1366).
                 "file_record": state.file_record.model_copy(

@@ -1,0 +1,45 @@
+genre: horror
+title: Horror
+slots:
+  - slot: character
+    entries:
+      - a night nurse in a ward that should be empty
+      - a folklorist collecting songs no one will sing twice
+      - a real-estate agent who cannot sell one house
+      - a child who draws people before they arrive
+      - a radio host who takes one caller too many
+      - a caretaker of a closed amusement park
+      - a sleep researcher whose subjects share a dream
+      - a funeral director who hears knocking
+      - a lighthouse keeper's replacement
+      - a grandmother who never lets anyone into the attic
+  - slot: place
+    entries:
+      - a village that is not on any map
+      - a motel with one more room than doors
+      - an underground parking garage with no exit sign
+      - a family cabin at the end of a flooded road
+      - a school reopened after forty years
+      - a hospital wing sealed after an outbreak
+      - a cornfield that grows back overnight
+      - an apartment where the neighbours never leave
+  - slot: conflict
+    entries:
+      - someone keeps returning from the dead a little wrong
+      - the house rearranges itself to trap one person
+      - a ritual must be completed before dawn
+      - the town agrees to forget something every year
+      - a recording plays a voice that has not spoken yet
+      - everyone else has started to smile the same way
+      - the reflection moves a moment too late
+      - a debt was promised in blood by an ancestor
+  - slot: twist
+    entries:
+      - the protagonist has been dead from the start
+      - the monster is protecting the town from something worse
+      - the safe room is where it lives
+      - the survivor is not the person who went in
+      - the curse passes to whoever tells the story
+      - the haunting is a memory the house is trying to show
+      - the rescuers are the ones who sealed the door
+      - it was invited in by the narrator

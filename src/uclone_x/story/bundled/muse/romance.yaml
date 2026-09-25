@@ -1,0 +1,45 @@
+genre: romance
+title: Romance
+slots:
+  - slot: character
+    entries:
+      - a wedding planner who does not believe in marriage
+      - a chef who lost her sense of taste
+      - a rival bookseller across the street
+      - a ghostwriter for a famous love-letter columnist
+      - a widowed beekeeper
+      - a translator hired by the person she once rejected
+      - a pilot grounded for a season
+      - a violinist in an orchestra about to fold
+      - a landlord who secretly loves his tenants' garden
+      - a matchmaker on her hundredth failed match
+  - slot: place
+    entries:
+      - a seaside town in the off-season
+      - a night bus that crosses the same bridge every night
+      - a bakery that opens at four in the morning
+      - a rooftop garden above a busy city
+      - a snowbound airport terminal
+      - a community theatre in its last season
+      - a vineyard inherited by two strangers
+      - a bookshop with a letter drop for anonymous notes
+  - slot: conflict
+    entries:
+      - they must pretend to be engaged for a month
+      - they are competing for the same job
+      - one of them is leaving at the end of the summer
+      - their families have feuded for three generations
+      - they have been writing to each other without knowing it
+      - a promise to someone else stands between them
+      - one of them is writing a book about the other
+      - they share custody of a very demanding dog
+  - slot: twist
+    entries:
+      - the anonymous letters were from the least likely person
+      - the fake relationship began as a real one years ago
+      - the rival was helping all along
+      - the person they are leaving for asks them to stay
+      - the old flame arrives with the truth about the past
+      - the meddling friend is in love with one of them
+      - the job they fought for turns out to be the same job
+      - the letter that broke them up was never sent

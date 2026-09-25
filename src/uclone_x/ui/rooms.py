@@ -14,16 +14,19 @@ has landed and a route that awaited it would hold one request across several mod
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 import uuid
 from collections.abc import Callable, Coroutine, Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
+from uclone_x.a2a.in_memory import A2AInMemoryTransport
 from uclone_x.agent.composition import MissingCapabilityError
 from uclone_x.core.session_diagnostics import DEFAULT_MAX_CONVERSATION_TURNS
 from uclone_x.errors import (
@@ -45,6 +48,7 @@ from uclone_x.errors import (
 )
 from uclone_x.llm.context_window import OLLAMA_CONTEXT_WINDOWS, published_context_window
 from uclone_x.ontology.engine import OntologyEngine
+from uclone_x.room.a2a_handlers import register_persona_handlers
 from uclone_x.room.knowledge import SEAT_KNOWLEDGE_SUBDIR
 from uclone_x.room.knowledge_store import SeatKnowledgeStore
 from uclone_x.room.models import (
@@ -65,6 +69,7 @@ from uclone_x.room.resolver import RoomAgentResolver
 from uclone_x.room.selectors import build_selector_chain
 from uclone_x.room.service import RoomService
 from uclone_x.room.store import RoomStore
+from uclone_x.story.library import StoryLibrary
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle; the app imports this module
     from uclone_x.agent.base import BaseAgent
@@ -273,8 +278,11 @@ class RoomStack:
         existing = self._rooms.get(state.room_id)
         if existing is not None:
             return existing.orchestrator
+        # A persona a seat may call through `a2a_call` answers here, in this process, with an
+        # agent built for the one call from the same host as the seats (#1558).
+        transport = A2AInMemoryTransport()
         resolver = RoomAgentResolver(
-            self._host(),
+            dataclasses.replace(self._host(), a2a_transport=transport),
             # Each participant induces into its own graph (P7, G4). Without this the
             # resolver refuses every seated agent, because the host carries one shared
             # engine and handing it to all of them merges what each learned separately.
@@ -293,6 +301,15 @@ class RoomStack:
             workspace_root=self._session_mgr.workspace_dir,
             read_roots=lambda: self._session_mgr.read_roots,
             knowledge=self.knowledge,  # read before a seat's first turn (#1367)
+        )
+        register_persona_handlers(
+            transport,
+            # Read per call, so a connector replaced in Settings reaches the callee too.
+            host_factory=lambda: resolver.host,
+            persona_registry=resolver.persona_registry,
+            workspace_root=resolver.workspace_root,
+            llm_config=resolver.llm_config,
+            read_roots=resolver.read_roots,
         )
         built = RoomOrchestrator(
             store=self.store,
@@ -792,9 +809,14 @@ def register_room_routes(app: FastAPI, stack: RoomStack) -> None:
 
         A record that is there and will not load is still removed (#1440). Deleting is the
         one thing a reader can do with it, and it needs nothing from inside the record.
+
+        The story the conversation had open is not part of it and is left where it is
+        (#1555); only its writing lease is given back, so the next conversation to open
+        the story can write it without taking it over.
         """
+        story_id: str | None = None
         try:
-            service.get(room_id)
+            story_id = service.get(room_id).story_id
         except UnreadableRoomRecordError:  # deleted anyway (#1440)
             logger.warning("Deleting room %r, whose record will not load", room_id)
         except Exception as exc:
@@ -804,6 +826,8 @@ def register_room_routes(app: FastAPI, stack: RoomStack) -> None:
             service.delete(room_id)
         except Exception as exc:
             raise _http_error(exc) from exc
+        if story_id is not None:
+            _release_story(stack.session_manager().workspace_dir, story_id, room_id)
 
     @app.post("/api/rooms/{room_id}/participants")
     async def add_participant(room_id: str, req: dict[str, Any]) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
@@ -1419,6 +1443,25 @@ def _reseat_after_history_change(stack: RoomStack, state: RoomState) -> tuple[st
                 exc_info=True,
             )
     return tuple(kept_stale)
+
+
+def _release_story(workspace: Path, story_id: str, room_id: str) -> None:
+    """Give back a deleted room's lease on its story, if the room still holds it.
+
+    After the room is gone, so a failure here cannot leave a room behind. A lease that is
+    not given back is not lost work: the story is intact, and the next conversation opens
+    it read-only and can take it over. So a failure is logged and the delete stands.
+    """
+    try:
+        StoryLibrary(workspace).release(story_id, room_id)
+    except Exception:
+        logger.warning(
+            "Room %s was deleted, but its writing lease on story %r was not given back; "
+            "the next conversation to open that story can take it over",
+            room_id,
+            story_id,
+            exc_info=True,
+        )
 
 
 def _roll_back(service: RoomService, room_id: str, cause: Exception) -> None:

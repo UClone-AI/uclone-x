@@ -7,8 +7,10 @@ from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from rich.console import Console
 from typer.testing import CliRunner
 
+from uclone_x.cli.commands import llm as llm_module
 from uclone_x.cli.commands.llm import _check_ollama_endpoint, _check_vllm_endpoint
 from uclone_x.cli.main import app
 from uclone_x.errors import LLMProviderError
@@ -217,12 +219,22 @@ def test_check_ollama_endpoint_non_200() -> None:
 # vLLM's row in `ucx llm status` (#1304)
 # ======================================================================================
 
+
 # Wide enough that Rich does not fold the variable names and the `vllm serve` advice this
 # table's whole purpose is to hand the reader; at the default 80 columns the last column is
 # narrow enough to break them mid-token.
-_WIDE = {"COLUMNS": "200"}
+#
+# The width is fixed on the module's console, not asked for through `COLUMNS`: the console
+# is built at import, and whether it then honours a `COLUMNS` passed to `runner.invoke`
+# depends on what the process looked like when it was built. Public CI on Python 3.12
+# rendered these tables at exactly 80 columns with `COLUMNS=200` in the invocation's
+# environment, and both assertions on the folded names failed there.
+@pytest.fixture
+def _wide_console(monkeypatch: pytest.MonkeyPatch) -> None:  # pyright: ignore[reportUnusedFunction]
+    monkeypatch.setattr(llm_module, "console", Console(width=200))
 
 
+@pytest.mark.usefixtures("_wide_console")
 def test_llm_status_names_the_variable_when_no_vllm_endpoint_is_configured(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -241,7 +253,7 @@ def test_llm_status_names_the_variable_when_no_vllm_endpoint_is_configured(
         patch("uclone_x.cli.commands.llm._check_ollama_endpoint", return_value=[]),
         patch("uclone_x.cli.commands.llm._check_vllm_endpoint") as probe,
     ):
-        result = runner.invoke(app, ["llm", "status"], env=_WIDE)
+        result = runner.invoke(app, ["llm", "status"])
 
     assert result.exit_code == 0
     assert "vLLM" in result.output
@@ -251,6 +263,7 @@ def test_llm_status_names_the_variable_when_no_vllm_endpoint_is_configured(
     probe.assert_not_called()
 
 
+@pytest.mark.usefixtures("_wide_console")
 def test_llm_status_reports_a_configured_vllm_endpoint_and_the_model_it_serves(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -271,7 +284,7 @@ def test_llm_status_reports_a_configured_vllm_endpoint_and_the_model_it_serves(
             return_value=["qwen2.5-coder-32b-instruct"],
         ) as probe,
     ):
-        result = runner.invoke(app, ["llm", "status"], env=_WIDE)
+        result = runner.invoke(app, ["llm", "status"])
 
     assert result.exit_code == 0
     assert "ONLINE" in result.output
@@ -280,6 +293,7 @@ def test_llm_status_reports_a_configured_vllm_endpoint_and_the_model_it_serves(
     probe.assert_called_once_with("http://gpu-box.invalid:8000/v1")
 
 
+@pytest.mark.usefixtures("_wide_console")
 def test_llm_status_separates_an_unreachable_vllm_endpoint_from_an_unconfigured_one(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -296,7 +310,7 @@ def test_llm_status_separates_an_unreachable_vllm_endpoint_from_an_unconfigured_
         patch("uclone_x.cli.commands.llm._check_ollama_endpoint", return_value=[]),
         patch("uclone_x.cli.commands.llm._check_vllm_endpoint", return_value=None),
     ):
-        result = runner.invoke(app, ["llm", "status"], env=_WIDE)
+        result = runner.invoke(app, ["llm", "status"])
 
     assert result.exit_code == 0
     assert "UNREACHABLE" in result.output

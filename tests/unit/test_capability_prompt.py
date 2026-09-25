@@ -50,8 +50,15 @@ from uclone_x.ui.app import AgentSessionManager
 _SNAKE_CASE = re.compile(r"\b[a-z][a-z0-9]*(?:_[a-z0-9]+)+\b")
 
 #: Snake-case words a prompt may use that are not tool names. Each is a field of a tool's
-#: result the prompt tells the model to read, not something it can call.
-_NOT_TOOL_NAMES = frozenset({"relative_url"})
+#: result or arguments, or one of its actions, that the prompt names; none is something
+#: the model can call.
+_NOT_TOOL_NAMES = frozenset(
+    {
+        "relative_url",
+        "for_scene",  # a story_context action (#1556)
+        "session_summary",  # a story_manuscript argument (#1556)
+    }
+)
 
 
 class _RecordingConnector(MockLLMConnector):

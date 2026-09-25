@@ -916,4 +916,4 @@ def test_default_tool_registry_registration() -> None:
 
     # Convenience classmethod
     reg2 = ToolRegistry.with_builtins()
-    assert len(reg2.list_tools()) == 15
+    assert len(reg2.list_tools()) == 22

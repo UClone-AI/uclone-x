@@ -132,6 +132,8 @@ export interface PersonaInfo {
   max_tokens?: number;
   enable_write_tools?: boolean;
   enable_subagent_tools?: boolean;
+  /** Personas this one may call through `a2a_call` (#1558); kept through an edit. */
+  a2a_peers?: string[];
   /** The persona's own prompt, without the appended default prompt (#892). */
   system_prompt?: string;
   /** Whether the runtime's default prompt is appended after `system_prompt`. */

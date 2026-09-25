@@ -1,0 +1,45 @@
+genre: science-fiction
+title: Science Fiction
+slots:
+  - slot: character
+    entries:
+      - a colony AI that has started keeping a diary
+      - a salvage pilot with a borrowed body
+      - a xenolinguist who dreams in an alien grammar
+      - a clone who remembers a life their original never lived
+      - a generation-ship janitor who knows every hatch
+      - a terraformer who regrets the planet's first rain
+      - a courier carrying data they are forbidden to read
+      - an android asking for a funeral
+      - a time-lagged soldier returning from a war that ended
+      - a biologist who is the last of her species' crew
+  - slot: place
+    entries:
+      - a generation ship halfway to nowhere
+      - a mining station inside a hollow asteroid
+      - a drowned megacity under a floating grid
+      - an orbital elevator stuck at midpoint
+      - a quarantine moon
+      - a research base on the dark side of a tidally locked world
+      - a derelict alien vessel that is still warm
+      - a city whose weather is sold by subscription
+  - slot: conflict
+    entries:
+      - the ship's oxygen is rationed by lottery
+      - first contact happens through a hacked advertisement
+      - a memory upload leaves two versions of the same person
+      - the colony's charter expires tomorrow
+      - a signal repeats the crew's own words back to them
+      - the corporation owns the air in everyone's lungs
+      - an experiment slowed time inside one room
+      - the rescue ship arrives a century late
+  - slot: twist
+    entries:
+      - the aliens are future humans
+      - the ship never left orbit
+      - the AI has been protecting the crew from the truth
+      - the crew are the experiment
+      - the distress signal is a warning, not a plea
+      - the planet is alive and has been listening
+      - the hero's memories were purchased
+      - the enemy is a copy of the protagonist

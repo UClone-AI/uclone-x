@@ -555,7 +555,14 @@ class RoomToolUse(BaseModel):
     written_path: str | None = Field(
         default=None,
         description="The workspace-relative path the call wrote, when the tool declares "
-        "that it writes, succeeded, and named a `path` in its output.",
+        "that it writes, succeeded, and named a `path` in its output. The first of "
+        "`written_paths` when the call named several.",
+    )
+    written_paths: tuple[str, ...] = Field(
+        default_factory=tuple,
+        description="Every path the call wrote, by the same rule as `written_path`, from "
+        "its output's `path` and `paths` (#1558). One call can name several: an `a2a_call` "
+        "reports the files the persona it asked wrote, an image call each picture it made.",
     )
     wrote_unnamed: bool = Field(
         default=False,
@@ -719,6 +726,13 @@ class RoomState(BaseModel):
         default_factory=RoomFileRecord,
         description="The known reasons `written_files` may be missing a write (#1366). "
         "Never a proof that it is complete: see `RoomFileRecord`.",
+    )
+    story_id: str | None = Field(
+        default=None,
+        description="The story this conversation has open (#1555), or None. A story is a "
+        "workspace artifact under `stories/<story_id>/`, not part of the room: deleting the "
+        "room leaves it. Every seat's tools receive this id, so the room's seats work on "
+        "one story. Moved only by a successful call of a tool declaring `opens_story`.",
     )
     created_at: str = Field(default_factory=_now_iso)
     updated_at: str = Field(default_factory=_now_iso)

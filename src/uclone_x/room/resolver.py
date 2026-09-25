@@ -145,6 +145,29 @@ class RoomAgentResolver:
         #: P7 keeps apart and `is not` proves nothing about them.
         self._namespaces: dict[str, str] = {}
 
+    @property
+    def host(self) -> HostDependencies:
+        """The host every seat is built with, including a connector replaced since (#1446)."""
+        return self._host
+
+    @property
+    def persona_registry(self) -> PersonaRegistry:
+        """Where this resolver looks a seat's persona up."""
+        return self._persona_registry
+
+    @property
+    def workspace_root(self) -> Path:
+        return self._workspace_root
+
+    @property
+    def llm_config(self) -> AgentLLMConfig | None:
+        """The installation-wide model override, or `None` for each persona's own."""
+        return self._llm_config
+
+    @property
+    def read_roots(self) -> Callable[[], tuple[Path, ...]]:
+        return self._read_roots
+
     async def resolve(self, participant: Participant) -> BaseAgentProtocol:
         """Return the live agent for `participant`, constructing it on first use.
 

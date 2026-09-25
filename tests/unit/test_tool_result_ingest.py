@@ -1034,8 +1034,9 @@ async def test_the_turns_after_a_refused_step_stay_within_the_window(
     assert "[Undone Attempt]" not in (llm.requests[2].messages[-1].content or "")
 
 
-def _three_near_cap_reads(workspace: Path) -> list[ToolCallRequest]:
-    names = ["a.txt", "b.txt", "c.txt"]
+def _near_cap_reads(workspace: Path) -> list[ToolCallRequest]:
+    """Five reads just under the cap: ~10K tokens, more than the 8K window holds whole."""
+    names = ["a.txt", "b.txt", "c.txt", "d.txt", "e.txt"]
     for name in names:
         _near_cap_file(workspace, name)
     return [
@@ -1045,10 +1046,16 @@ def _three_near_cap_reads(workspace: Path) -> list[ToolCallRequest]:
 
 
 def _budget_agent(
-    workspace: Path, llm: MockLLMConnector, *, max_tokens: int | None = None
+    workspace: Path,
+    llm: MockLLMConnector,
+    *,
+    max_tokens: int | None = None,
 ) -> BaseAgent:
-    from uclone_x.tools.registry import create_default_registry
+    from uclone_x.tools.builtin.filesystem import FileReadTool
 
+    # Only the tools the step uses. Every schema is part of the request, so with the
+    # default suite the room left in the 8K window shrank with each tool added until a
+    # step could no longer be fitted at all; the step's own size is what goes over it.
     return BaseAgent(
         config=AgentConfig(
             agent_id="ingest",
@@ -1059,7 +1066,7 @@ def _budget_agent(
             ),
         ),
         llm=llm,
-        tools=create_default_registry(workspace_root=workspace, enable_mcp=False),
+        tools=ToolRegistry(tools=[FileReadTool(), ToolResultReadTool()]),
     )
 
 
@@ -1075,9 +1082,9 @@ async def test_a_fitted_step_leaves_room_for_the_reply_the_agent_asks_for(
     """
     from uclone_x.llm.compactor import estimate_request_tokens
 
-    llm = _ScriptedLLM([_three_near_cap_reads(tmp_path)])
+    llm = _ScriptedLLM([_near_cap_reads(tmp_path)])
     agent = _budget_agent(tmp_path, llm, max_tokens=1_500)
-    result = await agent.execute_turn("read all three")
+    result = await agent.execute_turn("read all five")
 
     assert result.is_completed, result.error
     assert len(llm.requests) == 2
@@ -1095,9 +1102,9 @@ async def test_a_fitted_step_leaves_room_for_a_reply_when_no_length_is_set(
     """
     from uclone_x.llm.compactor import estimate_request_tokens
 
-    llm = _ScriptedLLM([_three_near_cap_reads(tmp_path)])
+    llm = _ScriptedLLM([_near_cap_reads(tmp_path)])
     agent = _budget_agent(tmp_path, llm)
-    result = await agent.execute_turn("read all three")
+    result = await agent.execute_turn("read all five")
 
     assert result.is_completed, result.error
     assert len(llm.requests) == 2
@@ -1174,9 +1181,9 @@ async def test_a_step_still_over_the_window_after_cutting_is_refused_not_sent(
         return list(sizes)
 
     monkeypatch.setattr(base_module, "step_result_caps", cut_nothing)
-    llm = _ScriptedLLM([_three_near_cap_reads(tmp_path)])
+    llm = _ScriptedLLM([_near_cap_reads(tmp_path)])
     agent = _budget_agent(tmp_path, llm)
-    result = await agent.execute_turn("read all three")
+    result = await agent.execute_turn("read all five")
 
     assert len(llm.requests) == 1
     assert all(estimate_request_tokens(r) <= 8_192 for r in llm.requests)

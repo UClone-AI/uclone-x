@@ -8,7 +8,7 @@ import subprocess
 import sys
 import tempfile
 from collections.abc import Iterator
-from pathlib import Path
+from pathlib import Path, PosixPath, WindowsPath
 from typing import Any, cast
 
 import pytest
@@ -404,6 +404,12 @@ def _isolate_workspace_dir(  # pyright: ignore[reportUnusedFunction]
     return root
 
 
+if sys.platform == "win32":
+    _CONCRETE_PATH = WindowsPath
+else:
+    _CONCRETE_PATH = PosixPath
+
+
 @pytest.fixture(autouse=True)
 def _isolate_mcp_config_discovery(  # pyright: ignore[reportUnusedFunction]
     request: pytest.FixtureRequest,
@@ -433,7 +439,10 @@ def _isolate_mcp_config_discovery(  # pyright: ignore[reportUnusedFunction]
     stand_in_cwd = tmp_path_factory.mktemp("mcp-cwd")
     invocation_dir = request.config.invocation_params.dir.resolve()
 
-    class _IsolatedPath(Path):
+    # The concrete class, not `Path`: before Python 3.12 a direct `Path` subclass has no
+    # `_flavour` and fails the moment it is instantiated, so on 3.11 every loader call raised
+    # `AttributeError` instead of reading the stand-in directories.
+    class _IsolatedPath(_CONCRETE_PATH):
         @classmethod
         def home(cls) -> _IsolatedPath:
             return cls(home)

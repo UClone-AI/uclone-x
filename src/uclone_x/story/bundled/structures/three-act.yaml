@@ -1,0 +1,37 @@
+id: three-act
+title: Three-Act Structure
+description: Setup, confrontation and resolution, turned by two plot points and a midpoint.
+acts:
+  - id: act-1
+    title: Setup
+    beats:
+      - id: hook
+        title: Hook
+        purpose: Show the protagonist's ordinary world and what is missing from it.
+      - id: inciting-incident
+        title: Inciting Incident
+        purpose: Something happens that the protagonist cannot ignore.
+      - id: first-plot-point
+        title: First Plot Point
+        purpose: The protagonist commits to a goal and leaves the ordinary world behind.
+  - id: act-2
+    title: Confrontation
+    beats:
+      - id: rising-action
+        title: Rising Action
+        purpose: Obstacles grow; allies and enemies take shape.
+      - id: midpoint
+        title: Midpoint
+        purpose: A revelation or reversal changes what the protagonist wants or knows.
+      - id: crisis
+        title: Crisis
+        purpose: Everything falls apart and the goal looks lost.
+  - id: act-3
+    title: Resolution
+    beats:
+      - id: climax
+        title: Climax
+        purpose: The protagonist faces the central conflict directly and decides it.
+      - id: resolution
+        title: Resolution
+        purpose: Show the new normal and what the journey cost or gave.

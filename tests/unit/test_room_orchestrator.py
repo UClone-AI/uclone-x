@@ -3606,8 +3606,8 @@ class TestARoomTurnsToolsAreRecorded:
         A reading tool that names a path is not a write. The flag is the tool's own
         declaration (#1167), never the shape of its output.
 
-        Killed by: src/uclone_x/room/orchestrator.py :: if execution.writes_files and succeeded and isinstance(path, str) and path:
-        Becomes: if isinstance(path, str) and path:
+        Killed by: src/uclone_x/room/orchestrator.py :: if execution.writes_files and succeeded:
+        Becomes: if succeeded:
         """
         from uclone_x.room.store import RoomStore
 
@@ -3661,6 +3661,94 @@ class TestARoomTurnsToolsAreRecorded:
 
         assert saved.written_files == ()
         assert saved.tool_uses[0].error == "disk full"
+        assert saved.tool_uses[0].wrote_unnamed is True
+        assert saved.file_record.unattributed_writes == 1
+
+    @pytest.mark.asyncio
+    async def test_every_file_a_peer_call_names_is_in_the_rooms_file_list(self, built: Any) -> None:
+        """A peer asked through `a2a_call` reports its files as a `paths` list (#1558).
+
+        Each one is a file the conversation wrote, attributed to the seat that asked, and
+        a peer that named everything it wrote is not counted as a possible unnamed write.
+
+        Killed by: src/uclone_x/room/orchestrator.py :: candidates.extend(cast(Sequence[object], listed))
+        Becomes: pass
+        """
+        _, _, agents = built
+        agents["scout"].tool_executions = (
+            _execution(
+                "a2a_call",
+                "call_1",
+                output={
+                    "agent": "artist",
+                    "response": "Drew both.",
+                    "paths": ["images/hero.png", "images/villain.png"],
+                    "unnamed_writes": False,
+                },
+                writes_files=True,
+            ),
+        )
+        orch = _orchestrator(built, [ScriptedSelector("s", [speak("scout")])])
+        saved = await orch.post("r1", "alice", "draw them")
+
+        assert [(f.path, f.participant_id, f.tool_name) for f in saved.written_files] == [
+            ("images/hero.png", "scout", "a2a_call"),
+            ("images/villain.png", "scout", "a2a_call"),
+        ]
+        use = saved.tool_uses[0]
+        assert use.written_paths == ("images/hero.png", "images/villain.png")
+        assert use.written_path == "images/hero.png"
+        assert use.wrote_unnamed is False
+        assert saved.file_record.unattributed_writes == 0
+
+    @pytest.mark.asyncio
+    async def test_a_peer_that_may_have_written_unnamed_files_is_counted(self, built: Any) -> None:
+        """A peer call that succeeded but says it may have written more than it named is
+        counted the way a helper is, so the room does not claim a complete list (#1558).
+
+        Killed by: src/uclone_x/room/orchestrator.py :: or (execution.writes_files and mapping.get("unnamed_writes") is True)
+        Becomes: or False
+        """
+        _, _, agents = built
+        agents["scout"].tool_executions = (
+            _execution(
+                "a2a_call",
+                "call_1",
+                output={"agent": "artist", "paths": ["images/hero.png"], "unnamed_writes": True},
+                writes_files=True,
+            ),
+        )
+        orch = _orchestrator(built, [ScriptedSelector("s", [speak("scout")])])
+        saved = await orch.post("r1", "alice", "draw them")
+
+        assert [f.path for f in saved.written_files] == ["images/hero.png"]
+        assert saved.tool_uses[0].wrote_unnamed is True
+        assert saved.file_record.unattributed_writes == 1
+
+    @pytest.mark.asyncio
+    async def test_a_failed_peer_call_leaves_a_trace(self, built: Any) -> None:
+        """A peer that failed may have written before it stopped; the room counts it (#1558).
+
+        Killed by: src/uclone_x/room/orchestrator.py :: wrote_unnamed=(written_path is None and execution.writes_files)
+        Becomes: wrote_unnamed=(False)
+        """
+        from uclone_x.tools.models import ToolResultStatus
+
+        _, _, agents = built
+        agents["scout"].tool_executions = (
+            _execution(
+                "a2a_call",
+                "call_1",
+                output=None,
+                writes_files=True,
+                status=ToolResultStatus.ERROR,
+                error="'artist' could not do the task: it could not finish.",
+            ),
+        )
+        orch = _orchestrator(built, [ScriptedSelector("s", [speak("scout")])])
+        saved = await orch.post("r1", "alice", "draw them")
+
+        assert saved.written_files == ()
         assert saved.tool_uses[0].wrote_unnamed is True
         assert saved.file_record.unattributed_writes == 1
 

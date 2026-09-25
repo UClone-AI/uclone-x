@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any, Final, Literal, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Final, Literal, TypeVar, cast
 
 from uclone_x.agent.grounding import describe, unsupported_specifics
 from uclone_x.agent.hooks import (
@@ -158,11 +158,14 @@ from uclone_x.sandbox.models import (
 )
 from uclone_x.skills.models import SkillStatus
 from uclone_x.skills.protocols import SkillProtocol, SkillRegistryProtocol
+from uclone_x.story import story_after
 from uclone_x.telemetry.models import SpanStatus
 from uclone_x.telemetry.protocols import TracerProtocol
 from uclone_x.telemetry.tracer import FAILOVER_EVENT_SPAN_NAME, TelemetryTracer
 from uclone_x.tools.base import (
     drop_shadowed_aliases,
+    tool_needs_room,
+    tool_opens_story,
     tool_spawns_subagents,
     tool_writes_files,
 )
@@ -177,6 +180,9 @@ from uclone_x.tools.outcome import (
 from uclone_x.tools.protocols import ToolProtocol, ToolRegistryProtocol
 from uclone_x.tools.registry import ToolRegistry
 from uclone_x.tools.tool_scoper import ToolScoperProtocol
+
+if TYPE_CHECKING:
+    from uclone_x.a2a.protocols import A2ATransportProtocol
 
 logger = logging.getLogger(__name__)
 
@@ -1112,7 +1118,9 @@ class BaseAgent(BaseAgentProtocol):
         host: HostProtocol | None = None,
         memory: CrossSessionMemory | None = None,
         personas: Sequence[PersonaDefinition] = (),
+        a2a_transport: A2ATransportProtocol | None = None,
     ) -> None:
+        self._a2a_transport = a2a_transport
         if host is None:
 
             class _FallbackHost:
@@ -1190,6 +1198,10 @@ class BaseAgent(BaseAgentProtocol):
         # turn. Distinct from `_turn_counter`, the lifetime count the session persists.
         self._run_steps = 0
         self._steps_deducted = False
+        # The conversation and open story of the running turn (#1555), set by
+        # `execute_turn` and given to every tool call's `ToolContext`.
+        self._turn_room_id: str | None = None
+        self._turn_story_id: str | None = None
         self._pending_durable_events: list[dict[str, Any]] = []
         self._semantic_router = semantic_router
         self._tool_scoper = tool_scoper
@@ -1305,6 +1317,21 @@ class BaseAgent(BaseAgentProtocol):
     def persona(self) -> str | None:
         """Name of the governing persona, if configured."""
         return self._persona
+
+    @property
+    def persona_definition(self) -> PersonaDefinition | None:
+        """The persona definition in force, or `None` (see `_resolved_persona`)."""
+        return self._resolved_persona()
+
+    @property
+    def a2a_transport(self) -> A2ATransportProtocol | None:
+        """The transport `a2a_call` reaches peer personas through, or `None` (#1558).
+
+        `None` is the agent that may not call another: an agent a peer call built is given
+        none, which is what holds A2A calls to one level deep. A sub-agent is not given its
+        parent's either (`SUBAGENT_EXCLUDED_HOST_FIELDS`).
+        """
+        return self._a2a_transport
 
     @persona.setter
     def persona(self, value: str | None) -> None:
@@ -3606,8 +3633,16 @@ class BaseAgent(BaseAgentProtocol):
         *,
         stream_callback: Callable[[str, dict[str, Any]], Awaitable[None] | None] | None = None,
         caller_turn_id: str | None = None,
+        room_id: str | None = None,
+        story_id: str | None = None,
     ) -> TurnResult:
         """Execute a single reasoning turn with serialized execution lock (P4, Issue #60).
+
+        `room_id` and `story_id` are the conversation (room) this turn runs in and the
+        story it has open (#1555). A room passes its id and its `story_id` for every seat,
+        and each tool call this turn receives them on its `ToolContext`. A tool declaring
+        `opens_story` that succeeds moves `story_id` for the calls after it in this turn;
+        the room reads the same records to keep the change.
 
         Raises `LLMConnectorNotConfiguredError` when no connector is wired (#136a). The
         method used to answer that case with `f"Ack: {content_input}"`, reported as
@@ -3671,6 +3706,8 @@ class BaseAgent(BaseAgentProtocol):
                 self.transition_to(AgentState.IDLE)
 
             self._turn_counter += 1
+            self._turn_room_id = room_id
+            self._turn_story_id = story_id
             self.transition_to(AgentState.INGESTING)
 
             # The `try` opens here, not after the REASONING transition. Ingestion and
@@ -5184,6 +5221,8 @@ class BaseAgent(BaseAgentProtocol):
                     # records a written file only from a tool that says it writes (#1354).
                     writes_files=tool_writes_files(tool_inst),
                     spawns_subagents=tool_spawns_subagents(tool_inst),
+                    # Only a call that succeeded may move the conversation's story (#1555).
+                    opens_story=res.success and tool_opens_story(tool_inst),
                 )
             except PathTraversalError as exc:
                 duration_ms = (asyncio.get_running_loop().time() - t_start) * 1000.0
@@ -5569,12 +5608,16 @@ class BaseAgent(BaseAgentProtocol):
             isolation=isolation,
             turn_index=self._turn_counter,
             agent_delegate=self,
+            room_id=self._turn_room_id,
+            story_id=self._turn_story_id,
         )
 
         if len(tool_calls) == 1:
             msg, rec = await self._execute_single_tool(
                 tool_calls[0], tool_ctx, stream_callback=stream_callback
             )
+            # A story opened by this step is the one the next step's tools see (#1555).
+            self._turn_story_id = story_after((rec,), self._turn_story_id)
             return [msg], [rec]
 
         # Concurrently execute multiple tool calls (Issue #185)
@@ -5586,6 +5629,7 @@ class BaseAgent(BaseAgentProtocol):
         )
         tool_messages = [r[0] for r in results]
         tool_executions = [r[1] for r in results]
+        self._turn_story_id = story_after(tool_executions, self._turn_story_id)
         return tool_messages, tool_executions
 
     def available_tools(self) -> list[ToolProtocol]:
@@ -5599,6 +5643,8 @@ class BaseAgent(BaseAgentProtocol):
         """
         if self._tools is None:
             return []
+        from uclone_x.tools.builtin.a2a import A2A_CALL_TOOL_NAME as a2a_call_name
+
         allowed = self._config.allowed_tools if self._config.allowed_tools else None
         held: list[ToolProtocol] = []
         for t in drop_shadowed_aliases(self._tools.list_tools(filter_names=allowed)):
@@ -5611,8 +5657,23 @@ class BaseAgent(BaseAgentProtocol):
             # enforcement (#1167).
             if self._capability_refusal(t) is not None:
                 continue
+            # `a2a_call` is offered only to an agent that has someone to call (#1558). The
+            # tool refuses the rest itself; this keeps its schema out of every other turn.
+            if t.name == a2a_call_name and not self._may_call_peers():
+                continue
+            # The story tools work only inside a conversation and refuse every call made
+            # outside one; outside a room their schemas are kept out of the request (#1556).
+            if self._turn_room_id is None and tool_needs_room(t):
+                continue
             held.append(t)
         return held
+
+    def _may_call_peers(self) -> bool:
+        """Whether `a2a_call` could reach anyone: a transport, and a persona naming peers."""
+        if self._a2a_transport is None:
+            return False
+        persona = self._resolved_persona()
+        return persona is not None and bool(persona.a2a_peers)
 
     def memory_share_refusal(self) -> str | None:
         """Why this agent cannot let a sub-agent read its memory, or `None` when it can.

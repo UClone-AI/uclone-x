@@ -74,6 +74,25 @@ class ToolContext(BaseModel):
         "by absolute path. No tool may write under them.",
     )
 
+    room_id: str | None = Field(
+        default=None,
+        description="The conversation this call runs in: the room's id, the same for every "
+        "seat in it. `session_id` is each seat's own, so it cannot say that two seats are "
+        "in one conversation. It is the identity a story's writing lease is checked "
+        "against (#1555). An agent another persona asked with `a2a_call` has no room of "
+        "its own: its calls carry the caller's room id here, sent with the call and set on "
+        "the called agent's turn (#1558), so its story writes are checked as that "
+        "conversation's. `None` outside a conversation, and for an agent asked from outside "
+        "one.",
+    )
+    story_id: str | None = Field(
+        default=None,
+        description="The story the conversation has open, filled from the room for every "
+        "seat (#1555) and, for an agent asked with `a2a_call`, from its caller's call "
+        "(#1558). Story tools compute their paths from it and take none from the "
+        "model; `None` means no story is open, and they refuse with that reason.",
+    )
+
     def require_workspace(self) -> Path:
         """Assert and return the workspace root, failing if none was provided."""
         if self.workspace_root is None:

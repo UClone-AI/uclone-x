@@ -1,0 +1,45 @@
+genre: fantasy
+title: Fantasy
+slots:
+  - slot: character
+    entries:
+      - a cartographer who maps places that do not exist yet
+      - a disgraced knight who kept one oath too many
+      - an apprentice who can hear what metal remembers
+      - a queen who trades her memories for rain
+      - a dragon who has forgotten how to fly
+      - a smuggler of forbidden songs
+      - a healer whose cures take something in return
+      - twin heirs, only one of whom is real
+      - a ferryman who owes the river a debt
+      - a scholar exiled for translating the wrong book
+  - slot: place
+    entries:
+      - a city built on the back of a sleeping giant
+      - a library whose shelves rearrange at night
+      - a border fortress no one remembers garrisoning
+      - a forest where the seasons run backwards
+      - an island that appears once a generation
+      - the ruins of a tower that fell upward
+      - a market held only during eclipses
+      - a monastery carved inside a glacier
+  - slot: conflict
+    entries:
+      - an ancient pact is about to expire
+      - the magic that holds the kingdom together is running out
+      - a prophecy names the wrong person
+      - two gods claim the same worshipper
+      - a stolen crown refuses to be worn
+      - the dead have stopped staying buried
+      - a war can only be ended by a lie
+      - the true name of a friend has been sold
+  - slot: twist
+    entries:
+      - the mentor wrote the prophecy
+      - the monster is the kingdom's missing heir
+      - the quest object was never lost, only hidden by the hero
+      - the villain is trying to prevent a worse fate
+      - the map leads back to where it started
+      - the magic was borrowed, and the lender has come to collect
+      - the hero's shadow has its own agenda
+      - the enemy army is fleeing something behind it

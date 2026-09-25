@@ -9,7 +9,8 @@ from typing import Any, ClassVar, Literal, cast
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
-from uclone_x.errors import UCloneXError
+from uclone_x.errors import PlainRefusalError, UCloneXError
+from uclone_x.story.schemas import CharacterEntry
 from uclone_x.tools.base import BaseTool
 from uclone_x.tools.models import ToolContext
 
@@ -101,7 +102,9 @@ class CharacterSheetTool(BaseTool[CharacterSheetParams]):
     description = (
         "Manage persistent character visual DNA (Danbooru tags, prose descriptions, base seeds) "
         "and compose multi-character scene prompts to ensure character consistency and prevent attribute bleeding. "
-        "Characters are stored in 'characters/<id>.yaml' in the workspace."
+        "Characters are stored in 'characters/<id>.yaml' in the workspace. While a story "
+        "is open, characters are the story's codex characters and their 'visual' block, and "
+        "'save' is refused."
     )
     params_type = CharacterSheetParams
 
@@ -143,6 +146,8 @@ class CharacterSheetTool(BaseTool[CharacterSheetParams]):
     ) -> dict[str, Any]:
         """Execute character sheet action."""
         workspace = context.require_workspace()
+        if context.story_id is not None:
+            return self._run_in_story(params, context, workspace / "characters")
         chars_dir = self._characters_dir(workspace)
 
         match params.action:
@@ -252,79 +257,224 @@ class CharacterSheetTool(BaseTool[CharacterSheetParams]):
                         f"Cannot compose scene: character(s) {missing} not found in characters/."
                     )
 
-                # Derive Root Subject Tag
-                females = sum(1 for c in loaded_chars if c.get("gender") == "female")
-                males = sum(1 for c in loaded_chars if c.get("gender") == "male")
-                others = len(loaded_chars) - females - males
-
-                root_tags: list[str] = []
-                if females > 0 and males == 0 and others == 0:
-                    root_tags.append("1girl" if females == 1 else f"{females}girls")
-                elif males > 0 and females == 0 and others == 0:
-                    root_tags.append("1boy" if males == 1 else f"{males}boys")
-                elif females > 0 and males > 0:
-                    f_tag = "1girl" if females == 1 else f"{females}girls"
-                    m_tag = "1boy" if males == 1 else f"{males}boys"
-                    root_tags.extend([f_tag, m_tag])
-                else:
-                    root_tags.append(f"{len(loaded_chars)}people")
-
-                if len(loaded_chars) == 1:
-                    root_tags.append("solo")
-
-                # Compose Danbooru tags per character with attribute segregation
-                char_danbooru_blocks: list[str] = []
-                for c in loaded_chars:
-                    ctags = c.get("danbooru_tags", "").strip().rstrip(",")
-                    if ctags:
-                        char_danbooru_blocks.append(f"{ctags}")
-
-                # Combine prompt
-                prompt_parts: list[str] = [", ".join(root_tags)]
-                if char_danbooru_blocks:
-                    prompt_parts.append(", ".join(char_danbooru_blocks))
-
-                if params.scene_context:
-                    prompt_parts.append(params.scene_context.strip())
-
-                # Quality tags
-                prompt_parts.append("masterpiece, newest, high quality, cinematic lighting")
-                composed_danbooru_prompt = ", ".join(p for p in prompt_parts if p)
-
-                # Collect negative tags
-                neg_set: set[str] = set()
-                for c in loaded_chars:
-                    cneg = c.get("negative_tags", "")
-                    if cneg:
-                        for t in cneg.split(","):
-                            cleaned_t = t.strip()
-                            if cleaned_t:
-                                neg_set.add(cleaned_t)
-
-                base_neg = "worst quality, bad anatomy, deformed, bad hands, animal, blurry, text, watermark"
-                for t in base_neg.split(","):
-                    neg_set.add(t.strip())
-
-                composed_negative = ", ".join(sorted(neg_set))
-
-                # Recommendation for aspect ratio
-                rec_aspect = "16:9" if len(loaded_chars) >= 2 else "3:4"
-
-                return {
-                    "status": "success",
-                    "action": "compose",
-                    "characters": loaded_chars,
-                    "composed_danbooru_prompt": composed_danbooru_prompt,
-                    "composed_negative_prompt": composed_negative,
-                    "recommended_aspect_ratio": rec_aspect,
-                    "seeds": [
-                        c.get("base_seed") for c in loaded_chars if c.get("base_seed") is not None
-                    ],
-                    "guidance": (
-                        "Multi-character prompt composed. To avoid attribute bleeding in Danbooru/SDXL models, "
-                        "ensure distinct character features and avoid conflicting color keywords. "
-                        f"Recommended aspect ratio: {rec_aspect}."
-                    ),
-                }
+                return _compose(loaded_chars, params.scene_context)
 
         raise CharacterSheetError(f"Unsupported action '{params.action}'.")
+
+    # -- while a story is open (#1556) ------------------------------------------------
+
+    def _run_in_story(
+        self, params: CharacterSheetParams, context: ToolContext, legacy_dir: Path
+    ) -> dict[str, Any]:
+        """The same actions over the open story's codex characters.
+
+        A story's characters are its codex entries, and what they look like is each entry's
+        `visual` block. Sheets in the workspace's `characters/` folder belong to no story:
+        they are shown read-only, with how to bring one into the story. Nothing here writes.
+        """
+        from uclone_x.story.work import StoryWork  # an adapter: loaded only with a story
+
+        if params.action == "save":
+            raise PlainRefusalError(
+                "A story is open, so character sheets are not saved here, and nothing was "
+                "saved. The story's characters are its codex entries: how one looks is the "
+                "'visual' block of its file under codex/characters/ in the story."
+            )
+        codex = StoryWork.open_in(context).codex()
+        story_chars = {
+            item.entry.id: item.entry
+            for item in codex.items
+            if isinstance(item.entry, CharacterEntry)
+        }
+        unreadable = [
+            {"file": u.file, "reason": u.reason}
+            for u in codex.unreadable
+            if u.file.startswith("codex/characters/")
+        ]
+
+        if params.action == "list":
+            result: dict[str, Any] = {
+                "status": "success",
+                "action": "list",
+                "source": "story codex",
+                "characters": [
+                    {
+                        k: v
+                        for k, v in _sheet_of(entry).items()
+                        if k in ("character_id", "name", "gender", "danbooru_tags", "base_seed")
+                    }
+                    for entry in story_chars.values()
+                ],
+                "count": len(story_chars),
+            }
+            legacy = (
+                sorted(p.stem for p in legacy_dir.glob("*.yaml")) if legacy_dir.is_dir() else []
+            )
+            if legacy:
+                result["workspace_sheets_read_only"] = legacy
+                result["migration_hint"] = _MIGRATION_HINT
+            if unreadable:
+                result["unreadable_files"] = unreadable
+            return result
+
+        if params.action == "get":
+            if not params.character_id or not params.character_id.strip():
+                raise PlainRefusalError("Say which character to get, in 'character_id'.")
+            char_id = params.character_id.strip()
+            entry = story_chars.get(char_id)
+            if entry is not None:
+                return {
+                    "status": "success",
+                    "action": "get",
+                    "source": "story codex",
+                    "character_id": char_id,
+                    "character": _sheet_of(entry),
+                    **({} if entry.visual else {"note": _NO_VISUAL}),
+                }
+            legacy_sheet = self._legacy_sheet(legacy_dir, char_id)
+            if legacy_sheet is not None:
+                return {
+                    "status": "not_in_story",
+                    "action": "get",
+                    "character_id": char_id,
+                    "workspace_sheet_read_only": legacy_sheet,
+                    "migration_hint": _MIGRATION_HINT,
+                }
+            result = {
+                "status": "not_found",
+                "action": "get",
+                "character_id": char_id,
+                "message": f"The story's codex has no character '{char_id}'.",
+            }
+            if unreadable:
+                result["unreadable_files"] = unreadable
+            return result
+
+        # compose
+        if not params.character_ids:
+            raise PlainRefusalError("Say which characters to compose, in 'character_ids'.")
+        missing = [cid for cid in params.character_ids if cid not in story_chars]
+        if missing:
+            in_workspace = [
+                cid for cid in missing if self._legacy_sheet(legacy_dir, cid) is not None
+            ]
+            message = (
+                f"The story's codex has no character {', '.join(repr(m) for m in missing)}, "
+                "so no prompt was composed."
+            )
+            if in_workspace:
+                message += " " + _MIGRATION_HINT
+            raise PlainRefusalError(message)
+        return _compose(
+            [_sheet_of(story_chars[cid]) for cid in params.character_ids], params.scene_context
+        )
+
+    def _legacy_sheet(self, legacy_dir: Path, char_id: str) -> dict[str, Any] | None:
+        """A workspace sheet named `char_id`, read only; `None` when there is none."""
+        if not legacy_dir.is_dir():
+            return None
+        try:
+            return self._load_character(legacy_dir, char_id)
+        except CharacterSheetError:
+            return None  # not a name a workspace sheet can have, so there is none
+
+
+_MIGRATION_HINT = (
+    "Sheets in the workspace's characters/ folder belong to no story and are read-only while "
+    "one is open. To use one here, copy its tags into the 'visual' block of a codex entry in "
+    "the story: codex/characters/<id>.yaml."
+)
+_NO_VISUAL = (
+    "This character has no 'visual' block in the story's codex yet, so it has no tags to draw from."
+)
+
+
+def _sheet_of(entry: CharacterEntry) -> dict[str, Any]:
+    """A codex character as the sheet `get` returns, from its `visual` block."""
+    visual = entry.visual
+    return {
+        "character_id": entry.id,
+        "name": entry.name,
+        "gender": (visual.gender if visual else None) or "other",
+        "danbooru_tags": ", ".join(visual.tags) if visual else "",
+        "prose_description": (visual.prose if visual else None) or "",
+        "negative_tags": ", ".join(visual.negative_tags) if visual else "",
+        "base_seed": visual.base_seed if visual else None,
+        "default_style": (visual.default_style if visual else None) or "anime",
+    }
+
+
+def _compose(loaded_chars: list[dict[str, Any]], scene_context: str | None) -> dict[str, Any]:
+    """One prompt for the characters in `loaded_chars`, each a sheet as `get` returns it."""
+    # Derive Root Subject Tag
+    females = sum(1 for c in loaded_chars if c.get("gender") == "female")
+    males = sum(1 for c in loaded_chars if c.get("gender") == "male")
+    others = len(loaded_chars) - females - males
+
+    root_tags: list[str] = []
+    if females > 0 and males == 0 and others == 0:
+        root_tags.append("1girl" if females == 1 else f"{females}girls")
+    elif males > 0 and females == 0 and others == 0:
+        root_tags.append("1boy" if males == 1 else f"{males}boys")
+    elif females > 0 and males > 0:
+        f_tag = "1girl" if females == 1 else f"{females}girls"
+        m_tag = "1boy" if males == 1 else f"{males}boys"
+        root_tags.extend([f_tag, m_tag])
+    else:
+        root_tags.append(f"{len(loaded_chars)}people")
+
+    if len(loaded_chars) == 1:
+        root_tags.append("solo")
+
+    # Compose Danbooru tags per character with attribute segregation
+    char_danbooru_blocks: list[str] = []
+    for c in loaded_chars:
+        ctags = c.get("danbooru_tags", "").strip().rstrip(",")
+        if ctags:
+            char_danbooru_blocks.append(f"{ctags}")
+
+    # Combine prompt
+    prompt_parts: list[str] = [", ".join(root_tags)]
+    if char_danbooru_blocks:
+        prompt_parts.append(", ".join(char_danbooru_blocks))
+
+    if scene_context:
+        prompt_parts.append(scene_context.strip())
+
+    # Quality tags
+    prompt_parts.append("masterpiece, newest, high quality, cinematic lighting")
+    composed_danbooru_prompt = ", ".join(p for p in prompt_parts if p)
+
+    # Collect negative tags
+    neg_set: set[str] = set()
+    for c in loaded_chars:
+        cneg = c.get("negative_tags", "")
+        if cneg:
+            for t in cneg.split(","):
+                cleaned_t = t.strip()
+                if cleaned_t:
+                    neg_set.add(cleaned_t)
+
+    base_neg = "worst quality, bad anatomy, deformed, bad hands, animal, blurry, text, watermark"
+    for t in base_neg.split(","):
+        neg_set.add(t.strip())
+
+    composed_negative = ", ".join(sorted(neg_set))
+
+    # Recommendation for aspect ratio
+    rec_aspect = "16:9" if len(loaded_chars) >= 2 else "3:4"
+
+    return {
+        "status": "success",
+        "action": "compose",
+        "characters": loaded_chars,
+        "composed_danbooru_prompt": composed_danbooru_prompt,
+        "composed_negative_prompt": composed_negative,
+        "recommended_aspect_ratio": rec_aspect,
+        "seeds": [c.get("base_seed") for c in loaded_chars if c.get("base_seed") is not None],
+        "guidance": (
+            "Multi-character prompt composed. To avoid attribute bleeding in Danbooru/SDXL models, "
+            "ensure distinct character features and avoid conflicting color keywords. "
+            f"Recommended aspect ratio: {rec_aspect}."
+        ),
+    }

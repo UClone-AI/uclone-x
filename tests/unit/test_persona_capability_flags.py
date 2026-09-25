@@ -338,9 +338,19 @@ def test_the_ruling_s_classification_of_every_shipped_tool() -> None:
         "web_search": False,
         "generate_image": True,
         "character_sheet": True,
+        "story_library": True,
+        "muse_spark": False,
+        "story_outline": True,
+        "story_manuscript": True,
+        "story_codex": False,
+        "story_context": False,
         "install_package": True,
         "update_plan": False,
         "delegate_subagent": False,
+        # A peer asked through it writes with its own tools, and those files are the
+        # call's result; declared, so a persona that may not write cannot have a peer
+        # write for it (#1558).
+        "a2a_call": True,
         "tool_result_read": False,
     }
     agent_local = {

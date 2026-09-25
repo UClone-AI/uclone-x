@@ -141,6 +141,13 @@ class PersonaDefinition(BaseModel):
     enable_subagent_tools: bool = Field(
         default=False, description="Controls recursive sub-agent creation"
     )
+    a2a_peers: tuple[str, ...] = Field(
+        default_factory=tuple,
+        description=(
+            "Persona names this persona may call through the `a2a_call` tool. Empty means"
+            " it may call no one (#1558)."
+        ),
+    )
 
     @property
     def granted_tools(self) -> tuple[str, ...]:
@@ -425,6 +432,12 @@ class ToolExecutionRecord(BaseModel):
         description="The executed tool's own `spawns_subagents` declaration (#1167), "
         "copied at the same site. What lets a room's topology draw a sub-agent a seat "
         "started (#1355, P4) without matching on a tool's name.",
+    )
+    opens_story: bool = Field(
+        default=False,
+        description="The executed tool's own `opens_story` declaration (#1555), copied at "
+        "the same site and only for a call that succeeded. What lets the runtime read the "
+        "conversation's new story from an output without trusting an output's shape.",
     )
 
 

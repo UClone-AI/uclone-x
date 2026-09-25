@@ -74,6 +74,7 @@ __all__ = [
     "OntologyViolationError",
     "ParticipantNotResolvableError",
     "PathTraversalError",
+    "PlainRefusalError",
     "PlanGenerationError",
     "PromotionCriteriaNotMetError",
     "ProvenanceError",
@@ -119,6 +120,15 @@ __all__ = [
 
 class UCloneXError(Exception):
     """Root of every error raised by the UClone-X runtime."""
+
+
+class PlainRefusalError(UCloneXError):
+    """An operation refused for a reason already written for a person.
+
+    Its message is shown as it is: a tool that raises one fails with exactly this text,
+    not with the exception's class name and a prefix around it, so the refusal a
+    conversation shows is plain words (#1555).
+    """
 
 
 class MemoryStoreUnreadableError(UCloneXError):

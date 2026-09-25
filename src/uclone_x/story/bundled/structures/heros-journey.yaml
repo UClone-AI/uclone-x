@@ -1,0 +1,49 @@
+id: heros-journey
+title: Hero's Journey
+description: Twelve stages of departure, initiation and return, after Joseph Campbell and Christopher Vogler.
+acts:
+  - id: departure
+    title: Departure
+    beats:
+      - id: ordinary-world
+        title: Ordinary World
+        purpose: The hero's everyday life and what is lacking in it.
+      - id: call-to-adventure
+        title: Call to Adventure
+        purpose: A problem or challenge presents itself.
+      - id: refusal-of-the-call
+        title: Refusal of the Call
+        purpose: Fear or duty holds the hero back.
+      - id: meeting-the-mentor
+        title: Meeting the Mentor
+        purpose: Someone gives the hero advice, a gift or courage.
+      - id: crossing-the-threshold
+        title: Crossing the Threshold
+        purpose: The hero commits and enters the special world.
+  - id: initiation
+    title: Initiation
+    beats:
+      - id: tests-allies-enemies
+        title: Tests, Allies, Enemies
+        purpose: The hero learns the rules of the special world.
+      - id: approach
+        title: Approach to the Inmost Cave
+        purpose: Preparation for the central ordeal.
+      - id: ordeal
+        title: Ordeal
+        purpose: The hero faces the greatest challenge so far and nearly fails.
+      - id: reward
+        title: Reward
+        purpose: The hero takes what they came for.
+  - id: return
+    title: Return
+    beats:
+      - id: the-road-back
+        title: The Road Back
+        purpose: The hero turns toward home, and the danger follows.
+      - id: resurrection
+        title: Resurrection
+        purpose: A final test proves the hero has changed.
+      - id: return-with-the-elixir
+        title: Return with the Elixir
+        purpose: The hero comes home carrying something that changes the ordinary world.

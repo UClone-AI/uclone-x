@@ -756,6 +756,7 @@ def _persona_payload(registry: PersonaRegistry, persona: PersonaDefinition) -> d
         "max_tokens": persona.llm_config.max_tokens,
         "enable_write_tools": persona.enable_write_tools,
         "enable_subagent_tools": persona.enable_subagent_tools,
+        "a2a_peers": list(persona.a2a_peers),
         "builtin": builtin,
         "overrides_builtin": not builtin and registry.has_builtin(persona.name),
     }
