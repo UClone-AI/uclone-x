@@ -1289,3 +1289,304 @@ def test_the_dead_end_message_is_still_reachable_when_downloading_is_off(
         result = bootstrap.setup_local_image(assume_yes=True, allow_download=False)
 
     assert result.summary_line() == "setup image: unavailable reason=no-checkpoint"
+
+
+# --- Ollama on a connection that drops ------------------------------------------------
+
+
+class _FlakyInstaller:
+    """The official installer, leaving a runnable binary only from run `works_from` on.
+
+    `works_from=None` never leaves one. Every run is counted, so "retried" and "gave up"
+    are assertions about how many times the installer ran, not about a message.
+    """
+
+    def __init__(self, works_from: int | None) -> None:
+        self.works_from = works_from
+        self.runs = 0
+
+    def run(self, *args: object, **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        self.runs += 1
+        return subprocess.CompletedProcess([], 1)
+
+    def binary(self) -> str | None:
+        if self.works_from is not None and self.runs >= self.works_from:
+            return "/usr/local/bin/ollama"
+        return None
+
+
+def _flaky_linux(monkeypatch: pytest.MonkeyPatch, installer: _FlakyInstaller) -> None:
+    monkeypatch.setattr("platform.system", lambda: "Linux")
+    monkeypatch.setattr("shutil.which", _nothing_on_path)
+    monkeypatch.setattr(bootstrap.subprocess, "run", installer.run)
+    monkeypatch.setattr(bootstrap, "ollama_binary", installer.binary)
+    monkeypatch.setattr(bootstrap, "ollama_version", _version_ok)
+    monkeypatch.setattr(bootstrap, "OLLAMA_INSTALL_RETRY_DELAY_S", 0.0)
+
+
+def test_a_dropped_download_is_tried_again_until_ollama_runs(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Two cut-off downloads, then a good one: the install succeeds on the third run.
+
+    Killed by: src/uclone_x/cli/commands/bootstrap.py :: if found is not None or attempt == OLLAMA_INSTALL_ATTEMPTS:
+    Becomes: if True:
+
+    Mutated, the first dropped download is the verdict again, as before the fix.
+    """
+    installer = _FlakyInstaller(works_from=3)
+    _flaky_linux(monkeypatch, installer)
+
+    assert bootstrap.install_ollama_platform() is True
+
+    assert installer.runs == 3
+    out = " ".join(capsys.readouterr().out.split())
+    assert "The Ollama download did not finish" in out
+    assert "Trying again (2 of 3)" in out
+    assert "Trying again (3 of 3)" in out
+    # Plain language: the person reads why and what happens next, not the command line.
+    for internal in ("curl", "install.sh", "Traceback", "Exception", "exit", "returncode"):
+        assert internal not in out.split("✔ Ollama ready")[0], internal
+
+
+def test_ollama_that_never_runs_is_tried_three_times_in_total(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Three attempts in total, then the honest failure -- never a fourth.
+
+    Killed by: src/uclone_x/cli/commands/bootstrap.py :: OLLAMA_INSTALL_ATTEMPTS: Final = 3
+    Becomes: OLLAMA_INSTALL_ATTEMPTS: Final = 4
+    """
+    installer = _FlakyInstaller(works_from=None)
+    _flaky_linux(monkeypatch, installer)
+
+    assert bootstrap.install_ollama_platform() is False
+    assert installer.runs == 3
+
+
+def test_an_installer_that_ran_out_of_time_is_not_run_again(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """After 15 minutes the person has waited enough; a retry would double it.
+
+    Killed by: src/uclone_x/cli/commands/bootstrap.py :: except subprocess.TimeoutExpired:
+    Becomes: except ():
+
+    Mutated, the timeout falls to the generic branch and reports "could not run" instead.
+    """
+    installer = _FlakyInstaller(works_from=None)
+    _flaky_linux(monkeypatch, installer)
+
+    def timing_out(*args: object, **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        installer.runs += 1
+        raise subprocess.TimeoutExpired("installer", 900)
+
+    monkeypatch.setattr(bootstrap.subprocess, "run", timing_out)
+
+    assert bootstrap.install_ollama_platform() is False
+    assert installer.runs == 1
+    out = " ".join(capsys.readouterr().out.split())
+    assert "did not finish in 15 minutes" in out
+    assert "Trying again" not in out
+
+
+# --- the model setup chose becomes the saved default ----------------------------------
+
+
+def _ready_llm_setup(monkeypatch: pytest.MonkeyPatch) -> None:
+    def ready(**kwargs: object) -> bootstrap.LlmSetup:
+        return bootstrap.LlmSetup(True, "qwen3:1.7b", "http://localhost:11434")
+
+    monkeypatch.setattr(bootstrap, "setup_local_llm", ready)
+
+
+def test_setup_saves_the_model_it_made_ready(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`ucx install --yes` then `ucx run` works: the install saves what it set up.
+
+    Killed by: src/uclone_x/cli/commands/bootstrap.py :: remember_local_llm(llm_result)
+    Becomes: pass
+    """
+    from uclone_x.llm.connectors.saved_choice import read_saved_choice
+
+    _ready_llm_setup(monkeypatch)
+
+    bootstrap.run_local_setup(image=False, interactive=False, assume_yes=True)
+
+    saved = read_saved_choice()
+    assert saved is not None
+    assert (saved.provider, saved.model, saved.base_url) == (
+        "ollama",
+        "qwen3:1.7b",
+        "http://localhost:11434",
+    )
+    out = " ".join(capsys.readouterr().out.split())
+    assert "Saved qwen3:1.7b as the default model for `ucx run`, rooms and the dashboard." in out
+
+
+def _save_settings(**values: object) -> None:
+    from uclone_x.llm.connectors.saved_choice import settings_file
+
+    target = settings_file()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(values))
+
+
+def _setup_says(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> str:
+    """Run setup with a ready `qwen3:1.7b` at localhost; what it printed, on single spaces."""
+    _ready_llm_setup(monkeypatch)
+    bootstrap.run_local_setup(image=False, interactive=False, assume_yes=True)
+    out = " ".join(capsys.readouterr().out.split())
+    for internal in ("Traceback", "Error", "llm_provider", "settings.json", "None"):
+        assert internal not in out, internal
+    return out
+
+
+def test_setup_keeps_another_provider_already_saved_and_says_how_to_switch(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Killed by: src/uclone_x/cli/commands/bootstrap.py :: if saved.provider != "ollama" or saved.model not in (None, result.model):
+    Becomes: if False:
+    """
+    from uclone_x.llm.connectors.saved_choice import read_saved_choice
+
+    _save_settings(llm_provider="openai", llm_model="gpt-4o-mini")
+
+    out = _setup_says(monkeypatch, capsys)
+
+    saved = read_saved_choice()
+    assert saved is not None and saved.model == "gpt-4o-mini"
+    assert (
+        "gpt-4o-mini (openai) is already saved as the default model, so it stays the default "
+        "rather than qwen3:1.7b, which setup just prepared. To use qwen3:1.7b instead, run "
+        "`ucx llm use qwen3:1.7b` or choose it in the dashboard's Settings."
+    ) in out
+
+
+def test_setup_names_a_different_saved_ollama_model(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An earlier install saved `qwen3:8b`; this one prepared `qwen3:1.7b`.
+
+    Killed by: src/uclone_x/cli/commands/bootstrap.py :: if saved.provider != "ollama" or saved.model not in (None, result.model):
+    Becomes: if saved.provider != "ollama":
+    """
+    _save_settings(llm_provider="ollama", llm_model="qwen3:8b")
+
+    out = _setup_says(monkeypatch, capsys)
+
+    assert "qwen3:8b is already saved as the default model" in out
+    assert "`ucx llm use qwen3:1.7b`" in out
+
+
+def test_setup_names_a_different_saved_address(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Killed by: src/uclone_x/cli/commands/bootstrap.py :: elif not _same_address(saved.base_url, result.endpoint):
+    Becomes: elif False:
+    """
+    _save_settings(
+        llm_provider="ollama", llm_model="qwen3:1.7b", llm_base_url="http://gpu-box:11434"
+    )
+
+    out = _setup_says(monkeypatch, capsys)
+
+    assert (
+        "The saved default asks for qwen3:1.7b at http://gpu-box:11434, but setup prepared it "
+        "at http://localhost:11434. To use this one, run "
+        "`ucx llm use qwen3:1.7b --base-url http://localhost:11434`."
+    ) in out
+
+
+def test_setup_says_it_kept_the_same_model_saved_by_an_earlier_install(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Not "chosen in Settings": an earlier install is as likely to have saved it.
+
+    Killed by: src/uclone_x/cli/commands/bootstrap.py :: console.print(f"[dim]Kept {model}, the model already saved as the default.[/dim]")
+    Becomes: pass
+    """
+    _save_settings(
+        llm_provider="ollama", llm_model="qwen3:1.7b", llm_base_url="http://localhost:11434/"
+    )
+
+    out = _setup_says(monkeypatch, capsys)
+
+    assert "Kept qwen3:1.7b, the model already saved as the default." in out
+    assert "Settings" not in out
+
+
+def test_a_read_only_session_directory_still_says_kept(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """With the model already saved there is nothing to write, so nothing is opened for writing.
+
+    A session directory left read-only (or owned by root after a `sudo` install) made the
+    lock file impossible to create, and a re-install that changed nothing reported a
+    failure instead of "Kept".
+
+    Two things each keep this passing, so no single mutation fails it: nothing is locked
+    when there is nothing to write (declared on the test below), and a lock that cannot
+    be opened falls back to an unlocked write (declared in `test_llm_saved_choice.py`).
+    """
+    from uclone_x.llm.connectors.saved_choice import lock_file, settings_file
+
+    if os.geteuid() == 0:
+        pytest.skip("root writes into a read-only directory")
+    _save_settings(
+        llm_provider="ollama", llm_model="qwen3:1.7b", llm_base_url="http://localhost:11434/"
+    )
+    directory = settings_file().parent
+    directory.chmod(0o500)
+    try:
+        out = _setup_says(monkeypatch, capsys)
+    finally:
+        directory.chmod(0o700)
+
+    assert "Kept qwen3:1.7b, the model already saved as the default." in out
+    assert not lock_file(settings_file()).exists()
+
+
+def test_a_re_install_that_changes_nothing_does_not_touch_the_lock(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Killed by: src/uclone_x/llm/connectors/saved_choice.py :: if not pending:
+    Becomes: if False:
+    """
+    from uclone_x.llm.connectors.saved_choice import lock_file, settings_file
+
+    _save_settings(
+        llm_provider="ollama", llm_model="qwen3:1.7b", llm_base_url="http://localhost:11434/"
+    )
+
+    out = _setup_says(monkeypatch, capsys)
+
+    assert "Kept qwen3:1.7b, the model already saved as the default." in out
+    assert not lock_file(settings_file()).exists()
+
+
+def test_a_settings_file_that_cannot_be_read_is_reported_plainly(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The setup still finishes, and the message says what to do, not what raised.
+
+    Killed by: src/uclone_x/cli/commands/bootstrap.py :: except (OSError, ValueError):
+    Becomes: except OSError:
+    """
+    from uclone_x.llm.connectors.saved_choice import settings_file
+
+    target = settings_file()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("{half written")
+    _ready_llm_setup(monkeypatch)
+
+    result = bootstrap.run_local_setup(image=False, interactive=False, assume_yes=True)
+
+    assert result.llm is not None and result.llm.ready
+    assert target.read_text() == "{half written"
+    out = " ".join(capsys.readouterr().out.split())
+    assert "Could not save this model as the default" in out
+    assert "--provider ollama --model qwen3:1.7b" in out
+    for internal in ("ValueError", "OSError", "Traceback", "JSON", "could not be read, so"):
+        assert internal not in out, internal

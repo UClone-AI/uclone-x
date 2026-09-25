@@ -87,7 +87,7 @@ ollama serve
 
 **Export `OLLAMA_KEEP_ALIVE` where UClone-X runs too.** UClone-X sends `keep_alive` with every chat request, and a request's value overrides the daemon's own setting. It sends the value of `OLLAMA_KEEP_ALIVE` from its own environment (`-1`, a number of seconds, or a duration such as `1h`). When that is unset it sends `30m`, the default in `src/uclone_x/llm/connectors/ollama.py`. So with `-1` set only in the shell that runs `ollama serve`, models are unloaded after 30 idle minutes.
 
-**Context window.** Ollama picks the window it loads a model with, and it can be smaller than the model supports. UClone-X reads that window from the daemon and compacts a conversation before it fills it. To choose the window yourself, set the agent's `context_limit`: it is sent to Ollama as `num_ctx`, and compaction counts against it.
+**Context window.** Left to itself, Ollama loads a model with a window chosen from the machine's memory -- 4096 tokens on a GPU with under 24 GB -- which one persona's instructions alone can fill. So UClone-X asks for 16384 tokens (`num_ctx`). An agent's own `context_limit` is sent instead when it sets one. Otherwise, `OLLAMA_CONTEXT_LENGTH` is sent when it is set to a positive number in the environment UClone-X runs in. As with `OLLAMA_KEEP_ALIVE`, export it there, not only for `ollama serve`. A model trained for a smaller window is loaded at that smaller window; UClone-X reads the window the daemon actually serves and compacts a conversation before it fills it.
 
 ---
 

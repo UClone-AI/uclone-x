@@ -21,6 +21,8 @@ import type { RoomTurnRefusal } from '../types';
  */
 const REFUSAL_REMEDY: Record<RoomTurnRefusal, string> = {
   budget_exceeded: 'Trying again would be refused too. Start a new conversation to continue.',
+  model_without_tools:
+    'Pick a model that supports tools (for example qwen3:8b) in Settings, then send your message again.',
 };
 
 export const refusalRemedy = (refusal: RoomTurnRefusal): string =>
@@ -29,6 +31,7 @@ export const refusalRemedy = (refusal: RoomTurnRefusal): string =>
 /** Why the Core refused a turn, as the end of a sentence about the seat. */
 const REFUSAL_REASON: Record<RoomTurnRefusal, string> = {
   budget_exceeded: 'it has used all the tokens this conversation allows',
+  model_without_tools: "its model can't use tools, which clones need",
 };
 
 /**

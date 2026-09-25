@@ -960,6 +960,7 @@ def test_a_failed_chat_turn_a_retry_can_get_past_carries_no_refusal(
     ("stop_reason", "refused"),
     [
         ("budget_exceeded", True),
+        ("model_without_tools", True),
         # `run_steps` resets per turn: a retry starts with the whole step budget.
         ("step_budget_exceeded", False),
         ("blocked_by_hook", False),
@@ -977,7 +978,8 @@ def test_only_a_token_or_cost_ceiling_is_a_refusal_a_retry_meets_again(
     """
     from uclone_x.room.models import RoomTurnRefusal, turn_refusal
 
-    assert turn_refusal(stop_reason) == (RoomTurnRefusal.BUDGET_EXCEEDED if refused else None)
+    expected = RoomTurnRefusal(stop_reason) if refused and stop_reason else None
+    assert turn_refusal(stop_reason) == expected
 
 
 def test_only_a_turn_that_reached_an_answer_is_named_by_the_core_s_degraded(

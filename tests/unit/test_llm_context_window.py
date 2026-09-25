@@ -238,7 +238,7 @@ class TestTheCompactionWindow:
         """The connector sends `context_limit` as `num_ctx`, so it is what the daemon will
         serve; a larger figure held from an earlier load does not override it.
 
-        Killed by: src/uclone_x/llm/context_window.py :: return configured_tokens  # sent as num_ctx, so it is what the daemon serves
+        Killed by: src/uclone_x/llm/context_window.py :: return sent  # sent as num_ctx, so it is what the daemon serves
         Becomes: return served
         """
         store = OllamaContextWindows()

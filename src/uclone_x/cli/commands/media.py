@@ -24,6 +24,7 @@ from uclone_x.tools.builtin.image import (
     LocalDiffusersImageEngine,
     diffusers_install_hint,
     expand_checkpoint_path,
+    in_process_device,
 )
 
 media_app = typer.Typer(
@@ -97,6 +98,9 @@ def media_status() -> None:
 
     if report.dependencies_ok:
         console.print("  3. In-process (no daemon): [bold green]dependencies ready[/bold green]")
+        device = in_process_device()
+        if device is not None:
+            console.print(f"     device: [cyan]{device}[/cyan]")
     else:
         console.print(
             "  3. In-process (no daemon): [bold yellow]dependencies missing[/bold yellow]"

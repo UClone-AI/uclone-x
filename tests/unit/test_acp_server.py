@@ -932,6 +932,45 @@ async def test_acp_refused_turn_is_not_reported_completed_with_empty_output() ->
 
 
 @pytest.mark.asyncio
+async def test_acp_model_without_tools_is_answered_with_its_remedy() -> None:
+    """The turn's error for a model without tools names the model and the remedy, and is
+    written for the user, so the client gets it rather than "the turn failed".
+
+    Killed by: src/uclone_x/shells/acp/server.py :: {"step_results_over_window", "model_without_tools"}
+    Becomes: {"step_results_over_window"}
+    Killed by: src/uclone_x/shells/acp/server.py :: "model_without_tools": "Choose it in Settings, then send your message again.",
+    Becomes: "model_without_tools_unused": "Choose it in Settings, then send your message again.",
+    """
+    from uclone_x.errors import ModelLacksToolSupportError
+
+    plain = str(ModelLacksToolSupportError("deepseek-r1:14b"))
+
+    async def refuse(prompt: str) -> TurnResult:
+        return TurnResult(
+            turn_index=1,
+            content="",
+            error=plain,
+            stop_reason="model_without_tools",
+            provenance=Provenance.primary("fake"),
+        )
+
+    agents: list[_FakeSessionAgent] = []
+    server = ACPServer(agent_factory=_fake_factory(agents, refuse))
+    sent = _capture(server)
+
+    await server.dispatch_method("new_session", {"sessionId": "nt"}, req_id=1)
+    await _prompt(server, "nt", "hello", req_id=2)
+
+    final, _ = _final_and_texts(sent, 2)
+    message = final[0]["error"]["message"]
+    assert message == f"{plain} Choose it in Settings, then send your message again."
+    assert "qwen3:8b" in message
+    assert "--model" not in message  # an ACP client has no command line to pass it on
+    for internal in ("Traceback", "status 400", "{", "LLMProviderError"):
+        assert internal not in message, internal
+
+
+@pytest.mark.asyncio
 async def test_acp_turn_error_with_internals_is_answered_plainly() -> None:
     """Any other turn error can carry a provider's text or a path; the client is told
     plainly that the turn failed, and the raw text stays in the log. The partial reply

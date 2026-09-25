@@ -1170,3 +1170,53 @@ describe('SettingsModal failures in plain words (#1436)', () => {
     expect(alert).toHaveTextContent(PERSONA_EDITOR_COPY.loadFailed('The clones folder is missing.'));
   });
 });
+
+describe('SettingsModal API key onboarding', () => {
+  const geminiSettings: RuntimeSettings = {
+    ...baseSettings,
+    llm_provider: 'gemini',
+    llm_model: 'gemini-1.5-pro',
+  };
+
+  it('renders a direct console link when a public provider is selected', async () => {
+    mockFetch({
+      '/api/settings': () => jsonResponse(geminiSettings),
+    });
+    render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
+
+    const link = (await screen.findByTestId('provider-key-console-link')) as HTMLAnchorElement;
+    expect(link).toBeTruthy();
+    expect(link.href).toBe('https://aistudio.google.com/app/apikey');
+    expect(link.textContent).toContain('Google Gemini');
+  });
+
+  it('shows a format warning when a mismatched key is entered', async () => {
+    mockFetch({
+      '/api/settings': () => jsonResponse(geminiSettings),
+    });
+    render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
+
+    await screen.findByTestId('provider-key-console-link');
+    const input = screen.getByPlaceholderText(/Enter API key/i);
+    fireEvent.change(input, { target: { value: 'sk-proj-invalid1234567890' } });
+
+    const warning = await screen.findByTestId('api-key-warning');
+    expect(warning.textContent).toContain('OpenAI');
+  });
+
+  it('shows a valid format badge when a correct key is entered', async () => {
+    mockFetch({
+      '/api/settings': () => jsonResponse(geminiSettings),
+    });
+    render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
+
+    await screen.findByTestId('provider-key-console-link');
+    const input = screen.getByPlaceholderText(/Enter API key/i);
+    fireEvent.change(input, { target: { value: 'AIzaSy' + 'A'.repeat(33) } });
+
+    const validBadge = await screen.findByTestId('api-key-valid');
+    expect(validBadge.textContent).toContain('올바른 Google Gemini 키 형식입니다.');
+  });
+});
+
+

@@ -119,11 +119,18 @@ from uclone_x.evaluation import (
 )
 from uclone_x.llm import create_llm_connector
 from uclone_x.llm.budget import TokenBudgetManager
+from uclone_x.llm.connectors.factory import saved_choice_in_effect
 from uclone_x.llm.connectors.ollama import (
     delete_model,
     pull_model,
     resolve_ollama_base_url,
     resolve_ollama_model,
+)
+from uclone_x.llm.connectors.saved_choice import (
+    SETTINGS_FILE_NAME,
+    key_owner,
+    same_provider,
+    update_settings_file,
 )
 from uclone_x.llm.connectors.vllm import (
     VLLM_MODEL_ENV_VAR,
@@ -1476,13 +1483,16 @@ class AgentSessionManager:
         self._configured_provider: str | None = None
         self._configured_base_url: str | None = None
         self._configured_api_key: str | None = None
+        #: The provider `_configured_api_key` was saved for; `_api_key_for` applies it only there.
+        self._configured_api_key_provider: str | None = None
         self._configured_model: str | None = None
         self._configured_comfyui_url: str | None = os.getenv(
             "COMFYUI_BASE_URL", DEFAULT_COMFYUI_BASE_URL
         )
         #: Folders outside the workspace that clones may read, as the user entered them.
         self._configured_read_roots: tuple[str, ...] = ()
-        self._settings_file: Path = self._storage_dir / "settings.json"
+        # The same file `ucx run` and `ucx install` read and seed (`saved_choice.py`).
+        self._settings_file: Path = self._storage_dir / SETTINGS_FILE_NAME
         self._load_persisted_settings()
         for entry in self._env_read_root_entries():
             if (problem := _read_root_problem(entry, self._storage_dir)) is not None:
@@ -1597,8 +1607,24 @@ class AgentSessionManager:
 
     @property
     def configured_api_key(self) -> str | None:
-        """Configured API key override for the UI session manager."""
-        return self._configured_api_key
+        """Configured API key for the configured provider, when it was saved for that one."""
+        return self._api_key_for(self._configured_provider)
+
+    def _api_key_for(self, provider: str | None) -> str | None:
+        """The configured key, only when it belongs to ``provider`` (see ``key_belongs_to``).
+
+        The settings file keeps one key while the provider changes, so a key saved for
+        OpenAI is still there after a switch to Anthropic -- and must not be sent to it. A
+        key with no known owner (entered before any provider was) goes wherever it is used,
+        as every key did before keys were tagged.
+        """
+        key = self._configured_api_key
+        if not key:
+            return None
+        owner = self._configured_api_key_provider
+        if owner is None or same_provider(owner, provider):
+            return key
+        return None
 
     @property
     def configured_base_url(self) -> str | None:
@@ -1625,6 +1651,8 @@ class AgentSessionManager:
                         self._configured_model = cfg["llm_model"].strip()
                     if "llm_api_key" in cfg and isinstance(cfg["llm_api_key"], str):
                         self._configured_api_key = cfg["llm_api_key"].strip()
+                        owner = key_owner(cfg)
+                        self._configured_api_key_provider = owner.lower() if owner else None
                     if "comfyui_base_url" in cfg and isinstance(cfg["comfyui_base_url"], str):
                         self._configured_comfyui_url = cfg["comfyui_base_url"].strip()
                     raw_roots: object = cfg.get("read_roots")
@@ -1669,18 +1697,21 @@ class AgentSessionManager:
                         ):
                             os.environ["GEMINI_MODEL"] = self._configured_model
 
-                    if self._configured_api_key:
+                    # Only a key saved for this provider is exported: exporting another
+                    # provider's key under this one's variable sends it to the wrong service.
+                    own_key = self._api_key_for(eff_provider)
+                    if own_key:
                         if eff_provider == "openai" and "OPENAI_API_KEY" not in os.environ:
-                            os.environ["OPENAI_API_KEY"] = self._configured_api_key
+                            os.environ["OPENAI_API_KEY"] = own_key
                         elif eff_provider == "vllm" and "VLLM_API_KEY" not in os.environ:
-                            os.environ["VLLM_API_KEY"] = self._configured_api_key
+                            os.environ["VLLM_API_KEY"] = own_key
                         elif eff_provider == "anthropic" and "ANTHROPIC_API_KEY" not in os.environ:
-                            os.environ["ANTHROPIC_API_KEY"] = self._configured_api_key
+                            os.environ["ANTHROPIC_API_KEY"] = own_key
                         elif (
                             eff_provider in ("gemini", "google")
                             and "GEMINI_API_KEY" not in os.environ
                         ):
-                            os.environ["GEMINI_API_KEY"] = self._configured_api_key
+                            os.environ["GEMINI_API_KEY"] = own_key
 
                     if self._llm is None and (
                         self._configured_provider or self._configured_base_url
@@ -1688,7 +1719,7 @@ class AgentSessionManager:
                         try:
                             self._llm = create_llm_connector(
                                 provider=self._configured_provider or None,
-                                api_key=self._configured_api_key or None,
+                                api_key=self._api_key_for(self._configured_provider),
                                 base_url=self._configured_base_url or None,
                                 fallback_to_mock=self._fallback_to_mock,
                             )
@@ -1701,23 +1732,84 @@ class AgentSessionManager:
             except Exception as exc:
                 logger.warning("Failed to read settings file %s: %s", self._settings_file, exc)
 
-    def _save_persisted_settings(self) -> None:
-        """Persist settings to storage directory."""
-        payload: dict[str, Any] = {
+    def _adopt_saved_choice(self) -> None:
+        """Pick up a model choice saved after this dashboard started, while it has none.
+
+        `ucx install` (or `ucx llm use`) can save a choice while a dashboard is already
+        running. That dashboard read the file at start and found nothing; without this it
+        would report no provider, and build nothing from the choice, until restarted. A
+        provider this dashboard was given or saved itself is never replaced, and a choice
+        the environment overrides (`LLM_PROVIDER`, a key, an endpoint) is not adopted --
+        the same test the connector factory applies.
+        """
+        if self._configured_provider:
+            return
+        saved = saved_choice_in_effect(path=self._settings_file)
+        if saved is None:
+            return
+        self._configured_provider = saved.provider
+        self._configured_model = self._configured_model or saved.model
+        self._configured_base_url = self._configured_base_url or saved.base_url
+        if not self._configured_api_key and saved.api_key:
+            # `saved.api_key` is only ever the key saved for `saved.provider`.
+            self._configured_api_key = saved.api_key
+            self._configured_api_key_provider = saved.provider
+        if self._llm is None:
+            try:
+                adopted = create_llm_connector(
+                    provider=saved.provider,
+                    api_key=self._api_key_for(saved.provider),
+                    base_url=self._configured_base_url or None,
+                    fallback_to_mock=self._fallback_to_mock,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to initialize the LLM connector saved in %s: %s",
+                    self._settings_file,
+                    exc,
+                )
+                return
+            self._install_llm(adopted)
+
+    def _install_llm(self, new_llm: LLMProviderProtocol) -> None:
+        """Make ``new_llm`` the connector, and hand it to every open agent and room (#1446).
+
+        A Settings save and a choice adopted after startup both go through here, so a room
+        opened before either picks the new connector up the same way.
+        """
+        self._llm = new_llm
+        for agent in self._agents.values():
+            agent.hot_reload_llm(new_llm, model_name=self._configured_model)
+        for listener in self._llm_listeners:
+            listener(new_llm)
+
+    def _save_persisted_settings(self, changes: dict[str, Any]) -> None:
+        """Merge the settings this save changed into the settings file.
+
+        Only `changes` are written: the file is shared with setup and `ucx llm use`, and
+        rewriting it whole from memory put `"llm_provider": null` back over a model saved
+        after this dashboard started. When the file cannot be read, it is replaced with
+        everything this dashboard holds, as a Settings save always did.
+        """
+        everything: dict[str, Any] = {
             "llm_provider": self._configured_provider,
             "llm_base_url": self._configured_base_url,
             "llm_model": self._configured_model,
             "llm_api_key": self._configured_api_key,
+            "llm_api_key_provider": self._configured_api_key_provider,
             "comfyui_base_url": self._configured_comfyui_url,
             "read_roots": list(self._configured_read_roots),
         }
         try:
-            self._settings_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            update_settings_file(
+                changes, path=self._settings_file, replace_unreadable_with=everything
+            )
         except Exception as exc:
             logger.warning("Failed to write settings file %s: %s", self._settings_file, exc)
 
     def get_settings(self) -> dict[str, Any]:
         """Return active endpoints, configurations, and masked credentials."""
+        self._adopt_saved_choice()
         active_provider = (
             self._configured_provider
             or (getattr(self._llm, "provider_name", None) if self._llm else None)
@@ -1762,7 +1854,7 @@ class AgentSessionManager:
             else:
                 active_model = ""
 
-        raw_key = self._configured_api_key
+        raw_key = self._api_key_for(active_provider)
         if not raw_key and self._llm and hasattr(self._llm, "api_key"):
             raw_key = cast(str | None, getattr(self._llm, "api_key", None))
         if not raw_key:
@@ -1835,6 +1927,7 @@ class AgentSessionManager:
         read_roots: list[str] | None = None,
     ) -> dict[str, Any]:
         """Update configurations, hot-reload LLM connectors and tools across active agents."""
+        self._adopt_saved_choice()
         clean_roots = (
             _validate_read_roots(read_roots, self._storage_dir, self._configured_read_roots)
             if read_roots is not None
@@ -1883,6 +1976,15 @@ class AgentSessionManager:
             clean_key = llm_api_key.strip()
             if clean_key and not clean_key.startswith("***") and "..." not in clean_key:
                 state_updates["_configured_api_key"] = clean_key
+                key_for = (
+                    eff_provider
+                    or (getattr(self._llm, "provider_name", None) if self._llm else None)
+                    or os.getenv("LLM_PROVIDER")
+                )
+                if key_for:
+                    # Recorded with the key, so a later switch to another provider keeps
+                    # the key without sending it there.
+                    state_updates["_configured_api_key_provider"] = str(key_for).strip().lower()
                 if eff_provider == "openai":
                     env_updates["OPENAI_API_KEY"] = clean_key
                 elif eff_provider == "vllm":
@@ -1903,7 +2005,8 @@ class AgentSessionManager:
             # settings path build a localhost connector for a user who had configured
             # nothing, which is the case #533's refusal exists to report.
             provider=eff_provider_for_llm or None,
-            api_key=state_updates.get("_configured_api_key", self._configured_api_key),
+            api_key=state_updates.get("_configured_api_key")
+            or self._api_key_for(eff_provider_for_llm or None),
             base_url=state_updates.get("_configured_base_url", self._configured_base_url) or None,
             fallback_to_mock=self._fallback_to_mock,
         )
@@ -1912,12 +2015,7 @@ class AgentSessionManager:
             os.environ[k] = v
         for k, v in state_updates.items():
             setattr(self, k, v)
-        self._llm = new_llm
-
-        for agent in self._agents.values():
-            agent.hot_reload_llm(new_llm, model_name=self._configured_model)
-        for listener in self._llm_listeners:
-            listener(new_llm)
+        self._install_llm(new_llm)
 
         logger.info(
             "⚙️ [UI Settings] Model/Settings updated: provider=%s, model=%s, base_url=%s",
@@ -1944,7 +2042,22 @@ class AgentSessionManager:
             for agent in self._agents.values():
                 agent.set_read_roots(effective_roots)
 
-        self._save_persisted_settings()
+        changes: dict[str, Any] = {
+            key: getattr(self, attr)
+            for key, attr in (
+                ("llm_provider", "_configured_provider"),
+                ("llm_base_url", "_configured_base_url"),
+                ("llm_model", "_configured_model"),
+                ("llm_api_key", "_configured_api_key"),
+                ("llm_api_key_provider", "_configured_api_key_provider"),
+            )
+            if attr in state_updates
+        }
+        if comfyui_base_url is not None and comfyui_base_url.strip():
+            changes["comfyui_base_url"] = self._configured_comfyui_url
+        if clean_roots is not None:
+            changes["read_roots"] = list(self._configured_read_roots)
+        self._save_persisted_settings(changes)
         return self.get_settings()
 
     def get_session_path(self, session_id: str) -> Path:
@@ -2578,12 +2691,13 @@ class AgentSessionManager:
             ):
                 return self._agents[agent_id]
 
+            self._adopt_saved_choice()
             use_fallback = (
                 fallback_to_mock if fallback_to_mock is not None else self._fallback_to_mock
             )
             llm = self._llm or create_llm_connector(
                 provider=self._configured_provider or None,
-                api_key=self._configured_api_key or None,
+                api_key=self._api_key_for(self._configured_provider),
                 base_url=self._configured_base_url or None,
                 fallback_to_mock=use_fallback,
             )

@@ -242,7 +242,7 @@ class TestShowMakesTheRecordedOutcomesVisible:
         them: retyping the question, which spends a fresh turn budget on a turn that was
         already paid for.
 
-        Killed by: src/uclone_x/cli/commands/room.py :: f"[dim]— retry that turn with:[/dim] ucx room retry {escape(state.room_id)}"
+        Killed by: src/uclone_x/cli/commands/room.py :: f"[dim]— retry that turn with:[/dim] ucx room retry {room_id}"
         Becomes: ""
         """
         from uclone_x.room.models import RoomMessage
@@ -260,6 +260,71 @@ class TestShowMakesTheRecordedOutcomesVisible:
         assert "RuntimeError: boom" in result.output
         assert "room retry" in result.output
         assert "room_fail" in result.output
+
+    def test_a_model_without_tools_is_shown_with_a_retry_on_another_model(
+        self, rooms: RoomStore
+    ) -> None:
+        """`room say` and `room show` render a row the same way: the plain sentence, and a
+        retry that names `--model`, since the same model would refuse again.
+
+        Killed by: src/uclone_x/cli/commands/room.py :: elif last.refusal == RoomTurnRefusal.MODEL_WITHOUT_TOOLS:
+        Becomes: elif False:
+        Killed by: src/uclone_x/cli/commands/room.py :: if last.refusal is None:
+        Becomes: if True:
+        """
+        from uclone_x.errors import ModelLacksToolSupportError
+        from uclone_x.room.models import RoomMessage, RoomTurnRefusal
+
+        _seed(
+            rooms,
+            "room_nt",
+            RoomMessage(seq=1, sender_id="alice", content="caching?"),
+            RoomMessage(
+                seq=2,
+                sender_id="scout",
+                content="",
+                error=str(ModelLacksToolSupportError("deepseek-r1:14b")),
+                refusal=RoomTurnRefusal.MODEL_WITHOUT_TOOLS,
+            ),
+        )
+
+        result = _run("show", "room_nt")
+
+        assert result.exit_code == 0, result.output
+        output = " ".join(result.output.split())
+        assert "The model deepseek-r1:14b can't use tools" in output
+        assert "qwen3:8b" in output
+        assert "ucx room retry room_nt --model <model>" in output
+        assert "retry that turn with: ucx room retry room_nt" not in output
+        assert "Settings" not in output
+        for internal in ("Traceback", "status 400", "{", "LLMProviderError"):
+            assert internal not in output, internal
+
+    def test_a_spent_budget_is_offered_no_retry(self, rooms: RoomStore) -> None:
+        """A retry of a turn refused for its usage budget is refused the same way.
+
+        Killed by: src/uclone_x/cli/commands/room.py :: if last.refusal is None:
+        Becomes: if True:
+        """
+        from uclone_x.room.models import RoomMessage, RoomTurnRefusal
+
+        _seed(
+            rooms,
+            "room_budget",
+            RoomMessage(seq=1, sender_id="alice", content="caching?"),
+            RoomMessage(
+                seq=2,
+                sender_id="scout",
+                content="",
+                error="The usage limit for this clone is spent.",
+                refusal=RoomTurnRefusal.BUDGET_EXCEEDED,
+            ),
+        )
+
+        result = _run("show", "room_budget")
+
+        assert result.exit_code == 0, result.output
+        assert "room retry" not in result.output
 
     def test_show_does_not_offer_a_retry_when_nothing_failed(self, rooms: RoomStore) -> None:
         """An offer the Core would refuse is worse than no offer."""

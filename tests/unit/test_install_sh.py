@@ -35,7 +35,13 @@ if [ "$1" = "venv" ]; then
     fi
     for last; do :; done
     mkdir -p "$last/bin"
-    printf '#!/bin/sh\\nexit 0\\n' > "$last/bin/python"
+    # The venv's python answers the image engine's import check the way the test asks:
+    # a real uv can exit 0 having installed nothing, so the script must not trust it.
+    cat > "$last/bin/python" <<'EOP'
+#!/bin/sh
+case "$*" in *"import "*) echo "venv-python import" >> "$STUB_LOG"; exit "${STUB_MEDIA_IMPORT_EXIT:-0}" ;; esac
+exit 0
+EOP
     cat > "$last/bin/ucx" <<'EOU'
 #!/bin/sh
 echo "ucx $*" >> "$STUB_LOG"
@@ -413,9 +419,59 @@ def test_run_outside_a_checkout_installs_the_published_package(machine: Machine)
     calls = machine.calls()
     assert f"uv venv --python {py} {venv}" in calls
     assert any(c.endswith("uclone-x[cli,http]") for c in calls)
-    # The published package has no image extra; installing it would be a silent no-op.
-    assert not any(c.endswith("uclone-x[media]") for c in calls)
-    assert "image engine  not in the published package" in result.stdout
+    # The published package declares `media` (0.2.1's METADATA), so the one-line install
+    # offers the image engine exactly as a checkout does. A guard that said otherwise
+    # skipped it on every published install.
+    assert any(c.endswith("uclone-x[media]") for c in calls)
+    assert "image engine  installed" in result.stdout
+    assert "not in the published package" not in result.stdout
+
+
+def test_the_published_install_offers_the_image_engine_under_yes(machine: Machine) -> None:
+    """The README's `curl ... | bash -s -- --yes`: the image engine comes along.
+
+    Measured on two fresh machines with 0.2.1: the one-liner printed "The image engine is
+    not in the published package yet" and installed no engine, although the wheel declares
+    the `media` extra -- so it also narrowed the models step to `--no-image`.
+
+    Mutation, checked by hand with `--pre-release` (the kill-declaration harness does not
+    pass that flag, so it would see this test skipped and report an escape): installing
+    `"$SOURCE[$SEED_EXTRAS]"` in place of `"$SOURCE[$IMAGE_EXTRAS]"` for the image engine
+    fails this test.
+    """
+    _ready(machine)
+    result = machine.run("--yes", image=None, standalone=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+    calls = machine.calls()
+    assert any(c.startswith("uv pip install") and c.endswith("uclone-x[media]") for c in calls)
+    assert "venv-python import" in calls
+    assert "image engine  installed" in result.stdout
+    assert "ucx install --yes" in calls
+    assert "ucx install --yes --no-image" not in calls
+
+
+def test_an_image_engine_that_does_not_import_is_not_reported_installed(
+    machine: Machine,
+) -> None:
+    """uv exits 0 having installed nothing for an extra it cannot find; the import decides.
+
+    Mutation, checked by hand with `--pre-release` (see the test above for why it is not a
+    declaration): replacing the `import PIL, diffusers, torch, transformers` probe with
+    `true` fails this test. With the import check gone, the summary reads `installed` over an engine that is not
+    there, and the models step fetches a 6.9 GB checkpoint nothing can load.
+    """
+    _ready(machine)
+    result = machine.run(
+        "--with-image", "--with-models", image=None, env_extra={"STUB_MEDIA_IMPORT_EXIT": "1"}
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "image engine  failed" in result.stdout
+    assert "ucx install --yes --no-image" in machine.calls()
+    # Plain language: the person reads what happened and what to run, not the probe.
+    assert "The image engine did not install completely" in result.stdout
+    assert "ucx media status" in result.stdout
+    for internal in ("import PIL", "diffusers", "torch", "Traceback", "exit status"):
+        assert internal not in result.stdout + result.stderr, internal
 
 
 # --- the command and the first start ------------------------------------------

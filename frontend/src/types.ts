@@ -678,7 +678,7 @@ export interface RoomSpeakerDecision {
 }
 
 /** `RoomTurnRefusal`: why a failed turn would fail the same way if retried (#969). */
-export type RoomTurnRefusal = 'budget_exceeded';
+export type RoomTurnRefusal = 'budget_exceeded' | 'model_without_tools';
 
 export interface RoomTranscriptMessage {
   seq: number;

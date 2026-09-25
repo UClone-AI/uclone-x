@@ -116,6 +116,7 @@ BASE_PERSONA_TOOLS: tuple[str, ...] = (
     "file_search",
     "directory_list",
     "tool_result_read",
+    "load_skill",
 )
 
 
@@ -440,6 +441,7 @@ TurnStopReason = Literal[
     "step_results_over_window",
     "budget_exceeded",
     "provider_timeout",
+    "model_without_tools",
     "cancelled",
 ]
 """How a turn's step run ended: the vocabulary of `TURN_END.stop_reason` and `TurnResult`.
@@ -458,6 +460,11 @@ connector's ceiling and a probe whose host was not running both reached the repo
 distribution. A consumer that must not count a cut-off turn as the model's failure needs
 a field it can test, not a phrase it can grep. It is not a refusal -- `turn_refusal`
 leaves it `None` -- because a retry at a longer ceiling is exactly the right response.
+
+`model_without_tools` is a provider's refusal of the chosen model because it cannot take
+tool definitions, which every clone turn sends. Its `error` is a plain sentence naming the
+model and the remedy, written to be shown as is. It is a refusal: a retry on the same model
+is refused the same way, so `turn_refusal` maps it to `RoomTurnRefusal.MODEL_WITHOUT_TOOLS`.
 """
 
 

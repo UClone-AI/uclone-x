@@ -3347,6 +3347,41 @@ class TestARealAgentsFailuresInTheRoom:
         assert RoomMessage.model_validate_json(json.dumps(old)).refusal is None
 
     @pytest.mark.asyncio
+    async def test_a_model_without_tools_lands_as_a_refusal_in_plain_words(
+        self, built: Any
+    ) -> None:
+        """The room row states the refusal and its remedy, and none of the plumbing.
+
+        Killed by: src/uclone_x/room/models.py :: return RoomTurnRefusal.MODEL_WITHOUT_TOOLS
+        Becomes: return None
+        """
+        from uclone_x.errors import ModelLacksToolSupportError
+        from uclone_x.llm import MockLLMConnector
+        from uclone_x.llm.models import LLMRequest, ModelResponse
+        from uclone_x.room.models import RoomTurnRefusal
+
+        class NoTools(MockLLMConnector):
+            async def generate(self, request: LLMRequest) -> ModelResponse:
+                raise ModelLacksToolSupportError("deepseek-r1:14b")
+
+        _, _, agents = built
+        _cap(built, 1)
+        agents["scout"] = _real_agent(SCOUT, NoTools(responses=[]))
+
+        row = (
+            await _orchestrator(built, [ScriptedSelector("s", [speak("scout")])]).post(
+                "r1", "alice", "discuss"
+            )
+        ).transcript[-1]
+
+        assert row.refusal is RoomTurnRefusal.MODEL_WITHOUT_TOOLS
+        assert row.error is not None
+        assert row.error.startswith("The model deepseek-r1:14b can't use tools")
+        assert "qwen3:8b" in row.error
+        for internal in ("Traceback", "status 400", "{", "LLMProviderError"):
+            assert internal not in row.error, internal
+
+    @pytest.mark.asyncio
     async def test_the_landed_event_carries_the_refusal(self, built: Any) -> None:
         """A head listening on the topic learns the refusal where it learns the failure.
 

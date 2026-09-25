@@ -13,7 +13,12 @@ import httpx
 
 from uclone_x.core.immutable import unwrap_immutable
 from uclone_x.core.provenance import Provenance
-from uclone_x.errors import LLMProviderError, LLMTimeoutError, UnmappableChatMessageError
+from uclone_x.errors import (
+    LLMProviderError,
+    LLMTimeoutError,
+    ModelLacksToolSupportError,
+    UnmappableChatMessageError,
+)
 from uclone_x.llm.connectors.base import (
     BaseLLMConnector,
     parse_dict_payload,
@@ -23,6 +28,7 @@ from uclone_x.llm.connectors.base import (
 from uclone_x.llm.context_window import (
     OLLAMA_CONTEXT_WINDOWS,
     OllamaContextWindows,
+    default_ollama_num_ctx,
     ollama_model_key,
 )
 from uclone_x.llm.models import (
@@ -94,6 +100,27 @@ def _chat_transport_failure(
     if isinstance(exc, httpx.TimeoutException) and not isinstance(exc, httpx.ConnectTimeout):
         return LLMTimeoutError(_chat_timeout_message(seconds, exc), seconds=seconds)
     return LLMProviderError(f"{unreachable_prefix}: {describe_transport_error(exc)}")
+
+
+#: The phrase Ollama's 400 body uses when the model's template has no tool support, as in
+#: `{"error":"registry.ollama.ai/library/deepseek-r1:14b does not support tools"}`.
+_NO_TOOL_SUPPORT_PHRASE = "does not support tools"
+
+
+def _chat_status_failure(
+    model: str, status_code: int, body: str, *, prefix: str
+) -> LLMProviderError:
+    """The error to raise when `/api/chat` answers with a status other than 200.
+
+    Shared by `generate` and `stream` for the reason `_chat_transport_failure` is. A model
+    that cannot take tools gets an error of its own, worded for the person who chose the
+    model, because a clone turn always sends tools and so the status and body would
+    otherwise be all they see of a problem only a different model fixes. Any other status
+    keeps the diagnostic wording, which existing tests pin.
+    """
+    if status_code == 400 and _NO_TOOL_SUPPORT_PHRASE in body:
+        return ModelLacksToolSupportError(model)
+    return LLMProviderError(f"{prefix} {status_code}: {body}")
 
 
 def normalize_ollama_base_url(url: str) -> str:
@@ -302,7 +329,7 @@ class OllamaConnector(BaseLLMConnector):
         self._windows = context_windows if context_windows is not None else OLLAMA_CONTEXT_WINDOWS
         # The `num_ctx` last sent for each model. A request that names no window is sent
         # the same one: Ollama reloads a model whose options change, so a request without
-        # it (a summary, a nudge) would reload the model at the daemon's default and the
+        # it (a summary, a nudge) would reload the model at another window and the
         # next turn would reload it back, re-reading the conversation cold both times.
         self._num_ctx: dict[str, int] = {}
         # Models sent a `num_ctx` the daemon has not been asked about since.
@@ -414,15 +441,15 @@ class OllamaConnector(BaseLLMConnector):
         than coerced, so the distinction survives on the wire: a message with no recorded
         content sends no `content` field, and one holding `""` sends `"content": ""`.
 
-        **Ollama `think` Parameter Decision (#695)**:
-        Recent Ollama versions support a `think` parameter to control whether reasoning
-        models produce chain-of-thought tokens. We explicitly do NOT inject `"think": false`
-        into the request payload, because disabling reasoning by default would degrade
-        model performance on complex reasoning tasks and contradict user expectations. Nor
-        do we force `"think": true`, as non-reasoning models or older Ollama versions might
-        reject or misinterpret the parameter. Instead, we let Ollama and the model template
-        govern reasoning activation natively, and capture the resulting `thinking` channel
-        in `ModelResponse.thinking` and `StreamChunk.delta_thinking`.
+        **Ollama `think` parameter (#695)**: sent only when the caller sets
+        `LLMRequest.thinking`, as that value. A request that leaves it `None` -- every agent
+        turn -- sends no `think` key, so Ollama and the model template decide whether a
+        reasoning model thinks, and the resulting `thinking` channel is captured in
+        `ModelResponse.thinking` and `StreamChunk.delta_thinking`. Callers that need a bare
+        answer set it to `False` explicitly (the room's speaker selector does), which sends
+        `"think": false`. The connector never chooses a value itself: disabling reasoning by
+        default would degrade complex turns, and forcing it on can be rejected by
+        non-reasoning models.
 
         Raises:
             UnmappableChatMessageError: a message has no faithful Ollama
@@ -461,16 +488,20 @@ class OllamaConnector(BaseLLMConnector):
         options: dict[str, Any] = {"temperature": request.temperature}
         if request.max_tokens is not None:
             options["num_predict"] = request.max_tokens
-        # The window, when the caller configured one (#1372): sent, so the daemon serves
-        # the window the compaction trigger counts against instead of choosing its own.
+        # The window, always sent, so the daemon serves the window the compaction trigger
+        # counts against instead of choosing its own (#1372): the caller's when it names
+        # one, else the one last sent for this model, else `default_ollama_num_ctx()` --
+        # `OLLAMA_CONTEXT_LENGTH` when set, then `DEFAULT_OLLAMA_NUM_CTX`. The daemon's
+        # own choice is 4096 under 24 GB of VRAM, which one persona's request alone
+        # outgrew on a 16 GB GPU.
         window_key = ollama_model_key(model)
-        if request.context_window is not None:
-            if self._num_ctx.get(window_key) != request.context_window:
-                self._unconfirmed.add(window_key)
-            self._num_ctx[window_key] = request.context_window
-        num_ctx = self._num_ctx.get(window_key)
-        if num_ctx is not None:
-            options["num_ctx"] = num_ctx
+        num_ctx = request.context_window
+        if num_ctx is None:
+            num_ctx = self._num_ctx.get(window_key, default_ollama_num_ctx())
+        if self._num_ctx.get(window_key) != num_ctx:
+            self._unconfirmed.add(window_key)
+        self._num_ctx[window_key] = num_ctx
+        options["num_ctx"] = num_ctx
 
         payload: dict[str, Any] = {
             "model": model,
@@ -507,8 +538,11 @@ class OllamaConnector(BaseLLMConnector):
         try:
             resp = await client.post(url, json=payload, timeout=self.timeout)
             if resp.status_code != 200:
-                raise LLMProviderError(
-                    f"Ollama provider returned status {resp.status_code}: {resp.text}"
+                raise _chat_status_failure(
+                    str(payload["model"]),
+                    resp.status_code,
+                    resp.text,
+                    prefix="Ollama provider returned status",
                 )
             data: dict[str, Any] = resp.json()
         except httpx.RequestError as exc:
@@ -614,8 +648,11 @@ class OllamaConnector(BaseLLMConnector):
             async with client.stream("POST", url, json=payload, timeout=self.timeout) as resp:
                 if resp.status_code != 200:
                     err_body = await resp.aread()
-                    raise LLMProviderError(
-                        f"Ollama streaming returned status {resp.status_code}: {err_body.decode('utf-8', errors='replace')}"
+                    raise _chat_status_failure(
+                        model_name,
+                        resp.status_code,
+                        err_body.decode("utf-8", errors="replace"),
+                        prefix="Ollama streaming returned status",
                     )
 
                 async for line in resp.aiter_lines():

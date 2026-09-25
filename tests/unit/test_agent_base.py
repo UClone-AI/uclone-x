@@ -29,7 +29,11 @@ from uclone_x.agent.models import (
     PersonaDefinition,
     TurnResult,
 )
-from uclone_x.agent.prompts import HERMES_STEERABILITY_POLICY, STEERABILITY_POLICY
+from uclone_x.agent.prompts import (
+    HERMES_STEERABILITY_POLICY,
+    QWEN_STEERABILITY_POLICY,
+    STEERABILITY_POLICY,
+)
 from uclone_x.agent.session import AnchorAuthor, AnchorProvenance, SessionState, SessionStore
 from uclone_x.core.provenance import ExecutionPath, Provenance, ServiceRef
 from uclone_x.engine.event_bus import EventBus, EventType
@@ -1970,13 +1974,21 @@ async def test_hot_reloading_back_off_a_family_reframes_the_system_message_actua
     )
     assert HERMES_STEERABILITY_POLICY in (agent.history[0].content or "")
 
-    agent.hot_reload_llm(model_name="qwen3:8b")
+    agent.hot_reload_llm(model_name="llama3.2")
     assert (await agent.execute_turn("hello")).is_completed is True
 
     sent = _system_sent(wire.requests[-1])
     assert STEERABILITY_POLICY in sent
     assert HERMES_STEERABILITY_POLICY not in sent
     assert sent == agent.effective_system_prompt
+
+    # Hot reloading to Qwen applies QWEN_STEERABILITY_POLICY
+    agent.hot_reload_llm(model_name="qwen3:8b")
+    assert (await agent.execute_turn("hello again")).is_completed is True
+    sent_qwen = _system_sent(wire.requests[-1])
+    assert QWEN_STEERABILITY_POLICY in sent_qwen
+    assert HERMES_STEERABILITY_POLICY not in sent_qwen
+    assert sent_qwen == agent.effective_system_prompt
 
     # The stored anchor is left exactly as it was: the record of what earlier turns were
     # seeded with is not edited to claim framing those turns never carried.

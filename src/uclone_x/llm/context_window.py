@@ -6,17 +6,22 @@ obvious sources for one are wrong in ways that are invisible on screen.
 **The Ollama trap, measured.** `GET /api/show` reports the window the model was *trained*
 for -- `llama.context_length: 131072` for `llama3.2:1b` on this machine. `GET /api/ps`
 reports the window the daemon *actually gave* the same model when it loaded it:
-`context_length: 32768`. Unless an agent configures `context_limit` -- which the Ollama
-connector then sends as `num_ctx` (#1372) -- nothing in this runtime chooses the window,
-so the second number is the server's own choice and it is the one a turn is truncated
-against. Drawing a ring
-against the first would have shown a seat holding 30,000 tokens as a quarter full while it
-was in fact about to lose its earliest turns. That is the plausible substituted value P6
-forbids, arrived at from a real endpoint returning a real number.
+`context_length: 32768`. The second number is the one a turn is truncated against. Drawing
+a ring against the first would have shown a seat holding 30,000 tokens as a quarter full
+while it was in fact about to lose its earliest turns. That is the plausible substituted
+value P6 forbids, arrived at from a real endpoint returning a real number.
 
-So the rule here is: **a locally served model's window is read from the server, for the
-model it has loaded, or it is not known.** There is no table of local models, because a
-table cannot know what the daemon decided.
+**This runtime chooses the window it asks for.** The Ollama connector sends `num_ctx` on
+every request: an agent's `context_limit` when one is configured (#1372), else the
+daemon's own `OLLAMA_CONTEXT_LENGTH` when it is set where UClone-X runs, and otherwise
+`DEFAULT_OLLAMA_NUM_CTX`. Left to itself the daemon picks from the machine's VRAM -- 4096
+tokens under 24 GB -- and a fresh-machine test on a 16 GB GPU found one persona's request
+alone at 5,186 tokens, so the first tool result of a turn had nowhere to go.
+
+So the rule here is: **a locally served model's window is what the daemon serves, which is
+the `num_ctx` sent, clamped by the window the model was trained for -- and the clamp is read
+from the server, for the model it has loaded.** There is no table of local models, because
+a table cannot know what the daemon decided.
 
 **Hosted providers are the opposite case.** An Anthropic or OpenAI model's window is a
 published figure the API enforces exactly; there is no per-installation choice to observe,
@@ -28,14 +33,16 @@ resolver `BaseAgent` uses for the trigger and for the step result budget. It use
 128,000 while the daemon served 32,768, and between the two every turn was cut from the
 front by the daemon with no compaction and no ledger.
 
-Neither path has a provider default: a context window that is somewhat wrong is a ring
-drawn to the wrong fraction, and the reader cannot tell. An unrecognised model returns
-`None`, and the surface says it does not know.
+The hosted path has no provider default: a context window that is somewhat wrong is a ring
+drawn to the wrong fraction, and the reader cannot tell. An unrecognised hosted model
+returns `None`, and the surface says it does not know. `DEFAULT_OLLAMA_NUM_CTX` is not such
+a default: it is the figure this runtime sends, so it is what the daemon is asked to serve.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, Literal, cast
 
 import httpx
@@ -45,15 +52,52 @@ from uclone_x.llm.compactor import resolve_model_context_limit
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "DEFAULT_OLLAMA_NUM_CTX",
     "PUBLISHED_CONTEXT_WINDOWS",
     "ContextWindow",
     "OllamaContextWindows",
     "OLLAMA_CONTEXT_WINDOWS",
     "SERVED_WINDOW_PROVIDERS",
     "compaction_window",
+    "default_ollama_num_ctx",
     "ollama_model_key",
     "published_context_window",
 ]
+
+#: The `num_ctx` the Ollama connector sends when no agent configures `context_limit`.
+#:
+#: The daemon's own choice is 4096 on a machine with under 24 GB of VRAM, and the artist
+#: persona's request alone measured 5,186 tokens on such a machine, so one tool result
+#: failed the turn. 16384 holds that request, a 1024-token reply reserve and several tool
+#: results. Its cost is KV cache, which grows linearly with the window: `qwen3:8b` (36
+#: layers, 8 KV heads of 128, float16) holds 144 KiB per token, so 2.25 GiB at 16384 on top
+#: of about 5.2 GB of weights -- about 7.5 GB, inside a 12 GB GPU. `qwen3:1.7b`, the model
+#: for 8 GB Macs, holds 112 KiB per token: 1.75 GiB, about 3.2 GB with its weights. A model
+#: trained for less is clamped by the daemon, and `compaction_window` reads the clamp.
+DEFAULT_OLLAMA_NUM_CTX = 16_384
+
+#: The daemon's own variable for the window it loads models with. A request's `num_ctx`
+#: overrides it, so it is read here as well, the way `OLLAMA_KEEP_ALIVE` is.
+OLLAMA_CONTEXT_LENGTH_ENV = "OLLAMA_CONTEXT_LENGTH"
+
+
+def default_ollama_num_ctx() -> int:
+    """The `num_ctx` sent when no agent configures `context_limit`.
+
+    `OLLAMA_CONTEXT_LENGTH` when it holds a positive integer, else
+    `DEFAULT_OLLAMA_NUM_CTX`. Without this, an operator who set the variable for the
+    daemon -- to 32768 for a long-context model, or to 8192 to fit a small GPU -- would
+    have it replaced by 16384 on every request, the same trap `resolve_ollama_keep_alive`
+    avoids for `OLLAMA_KEEP_ALIVE`. Anything else in the variable is ignored rather than
+    sent, because the daemon would reject or misread it.
+    """
+    raw = (os.getenv(OLLAMA_CONTEXT_LENGTH_ENV) or "").strip()
+    try:
+        tokens = int(raw)
+    except ValueError:
+        return DEFAULT_OLLAMA_NUM_CTX
+    return tokens if tokens > 0 else DEFAULT_OLLAMA_NUM_CTX
+
 
 #: Where a window figure came from. The head turns these into a sentence; the Core does
 #: not write the sentence, because which words a reader sees is the head's (P8).
@@ -272,16 +316,15 @@ def compaction_window(
 ) -> int | None:
     """The window an agent's compaction trigger and step budget count against (#1372).
 
-    For a provider in `SERVED_WINDOW_PROVIDERS`:
-
-    * `configured` (the agent's `context_limit`) when set. The connector sends it as
-      `num_ctx`, so the daemon loads the model at that window and the request and the limit
-      agree by construction. The one exception is a smaller figure the daemon reports for
-      the model: Ollama clamps `num_ctx` to the window the model was trained for, and then
-      the reported figure is what a turn is cut against.
-    * otherwise the window the daemon reported for the model it loaded, or `None` when it
-      has not reported one. **Never the model table**: a table figure here is a claim about
-      the operator's machine, and it is the figure that let the daemon truncate silently.
+    For a provider in `SERVED_WINDOW_PROVIDERS`, the `num_ctx` the connector sends:
+    `configured` (the agent's `context_limit`) when set, else `default_ollama_num_ctx()`
+    (`OLLAMA_CONTEXT_LENGTH`, then `DEFAULT_OLLAMA_NUM_CTX`).
+    The daemon loads the model at that window, so the request and the limit agree by
+    construction. The one exception is a smaller figure the daemon reports for the model:
+    Ollama clamps `num_ctx` to the window the model was trained for, and then the reported
+    figure is what a turn is cut against. **Never the model table**: a table figure here is
+    a claim about the operator's machine, and it is the figure that let the daemon truncate
+    silently.
 
     For any other provider, `configured` when set, else `MODEL_CONTEXT_WINDOWS`, as before.
     """
@@ -289,11 +332,10 @@ def compaction_window(
     if (provider or "").strip().lower() in SERVED_WINDOW_PROVIDERS:
         windows = store if store is not None else OLLAMA_CONTEXT_WINDOWS
         served = windows.get(base_url, model) if base_url else None
-        if configured_tokens is None:
-            return served  # the daemon's figure, or unknown: never the table
-        if served is not None and served < configured_tokens:
+        sent = configured_tokens if configured_tokens is not None else default_ollama_num_ctx()
+        if served is not None and served < sent:
             return served  # the daemon clamped `num_ctx` to the trained window
-        return configured_tokens  # sent as num_ctx, so it is what the daemon serves
+        return sent  # sent as num_ctx, so it is what the daemon serves
     if configured_tokens is not None:
         return configured_tokens
     return resolve_model_context_limit(model)

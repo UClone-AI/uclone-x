@@ -77,8 +77,15 @@ BLOCKED_MESSAGE: Final[str] = (
     "A rule set up for this agent stopped this message before it was answered. Sending "
     "it again is likely to be stopped the same way."
 )
-_PLAIN_ERROR_STOP_REASONS: Final[frozenset[str]] = frozenset({"step_results_over_window"})
+_PLAIN_ERROR_STOP_REASONS: Final[frozenset[str]] = frozenset(
+    {"step_results_over_window", "model_without_tools"}
+)
 """Stop reasons whose `TurnResult.error` is written for the user and is sent as is."""
+_PLAIN_ERROR_REMEDIES: Final[dict[str, str]] = {
+    "model_without_tools": "Choose it in Settings, then send your message again.",
+}
+"""Where to act on a plain error, for an ACP client: the Core's sentence says what to pick
+and leaves where to this head, and here the model is chosen in Settings, not by a flag."""
 _STOP_REASON_MESSAGES: Final[dict[str, str]] = {
     "budget_exceeded": USAGE_LIMIT_MESSAGE,
     "step_budget_exceeded": TOO_MANY_STEPS_MESSAGE,
@@ -788,7 +795,8 @@ class ACPServer:
             if turn_result.error is not None:
                 stop_reason = turn_result.stop_reason or ""
                 if stop_reason in _PLAIN_ERROR_STOP_REASONS:
-                    failure = turn_result.error
+                    remedy = _PLAIN_ERROR_REMEDIES.get(stop_reason)
+                    failure = f"{turn_result.error} {remedy}" if remedy else turn_result.error
                 else:
                     logger.error(
                         "Turn for ACP session %s failed (%s): %s",

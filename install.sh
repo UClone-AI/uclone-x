@@ -292,14 +292,10 @@ fi
 # Step 0d — the image engine. Offered, metered, and allowed to fail.
 # ------------------------------------------------------------------------------
 IMAGE_OK="skipped"
-# The published package has no image extra yet, and uv installs a missing extra
-# as nothing while exiting 0 — so a "success" here would be a false one.
-if [ "$SOURCE" != "$REPO_ROOT" ] && [ "$IMAGE_MODE" != "no" ]; then
-    say ""
-    say "  The image engine is not in the published package yet; skipping it."
-    IMAGE_MODE="no"
-    IMAGE_OK="not in the published package"
-fi
+# The published package declares the `media` extra (read from 0.2.1's METADATA), so the
+# one-line install offers the engine exactly as a checkout does. uv still installs an extra a
+# package does not declare as nothing while exiting 0, which is why the install below is
+# judged by importing the engine's packages, never by the installer's exit status.
 if [ "$IMAGE_MODE" = "ask" ]; then
     step "Image generation is optional and large"
     say "  The image engine adds about 1.0 GB of packages. It downloads no weights:"
@@ -327,9 +323,13 @@ if [ "$IMAGE_MODE" = "yes" ]; then
         if [ "$DRY_RUN" = "yes" ]; then
             IMAGE_OK="would install"
             ok "Image engine resolves (dry run — nothing was written)."
-        else
+        elif "$VENV_PY" -c "import PIL, diffusers, torch, transformers" >/dev/null 2>&1; then
             IMAGE_OK="installed"
             ok "Image engine installed."
+        else
+            IMAGE_OK="failed"
+            warn "The image engine did not install completely, although the installer reported success."
+            say  "  The core is fine and the dashboard will start. Run \`ucx media status\` to see what is missing."
         fi
     else
         IMAGE_OK="failed"

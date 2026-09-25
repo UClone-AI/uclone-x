@@ -1,6 +1,7 @@
 # pyright: reportUnknownMemberType=false, reportUnknownVariableType=false, reportUnknownArgumentType=false
 """Unit tests for interactive and non-interactive agent REPL execution and provider resolution (Issues #54, #141)."""
 
+import logging
 import os
 import pty
 import subprocess
@@ -544,6 +545,60 @@ def test_a_failed_single_shot_turn_exits_non_zero_with_the_error_on_stderr(
     # The session is still written -- the user's message was said -- but no assistant
     # message carries the failure as if the agent had replied with it.
     assert not any(_TURN_FAILURE in text for text in _assistant_texts(store, "sess_failing-agent"))
+
+
+_NO_TOOLS_SENTENCE = (
+    "The model deepseek-r1:14b can't use tools, which UClone-X clones need. Pick a "
+    "model that supports tools, for example qwen3:8b. Choose it with --model."
+)
+
+
+def _ollama_refusing_tools() -> OllamaConnector:
+    """A real Ollama connector whose daemon refuses the model's tools, as Ollama does."""
+    import httpx
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/chat":
+            return httpx.Response(
+                400,
+                text='{"error":"registry.ollama.ai/library/deepseek-r1:14b does not support tools"}',
+            )
+        return httpx.Response(200, json={"models": []})
+
+    return OllamaConnector(http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+
+
+def test_a_model_without_tools_is_reported_in_plain_words_on_the_cli(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """`ucx run` on a model without tool support says so, names the remedy, and nothing else.
+
+    It printed the connector's `LLMProviderError` text -- a status code and Ollama's JSON
+    body -- after a logged traceback. The model name and the remedy are all a user can act
+    on, and a traceback for a choice of model reads as a crash.
+
+    Killed by: src/uclone_x/agent/base.py :: logger.info("Turn for agent %s refused: %s", agent_id, lacking_tools)
+    Becomes: logger.exception("Error executing turn for agent %s", agent_id)
+    """
+    _isolated_run_env(monkeypatch, tmp_path)
+    _use_connector(monkeypatch, _ollama_refusing_tools())  # type: ignore[arg-type]
+
+    result = runner.invoke(
+        main.app,
+        ["run", "failing-agent", "--prompt", "hello", "--cwd", str(tmp_path)]
+        + ["--model", "deepseek-r1:14b"],
+    )
+
+    assert result.exit_code == run.FAILED_TURN_EXIT_CODE, result.output
+    stderr = " ".join(result.stderr.split())  # Rich wraps long lines
+    assert _NO_TOOLS_SENTENCE in stderr
+    assert "Settings" not in stderr  # the command line has a flag, not a Settings page
+    for internal in ("Traceback", "status 400", "{", "LLMProviderError", "LLMStreamInterrupted"):
+        assert internal not in result.output, internal
+    # The traceback went to the log, and with no handler configured Python prints a
+    # WARNING-or-worse record, traceback and all, on the terminal.
+    loud = [r for r in caplog.records if r.levelno >= logging.WARNING or r.exc_info]
+    assert not loud, [r.getMessage() for r in loud]
 
 
 def test_a_failed_single_shot_turn_is_not_printed_where_the_reply_goes(
@@ -1207,8 +1262,8 @@ def test_a_step_budget_refusal_with_partial_content_exits_1_with_nothing_on_stdo
 ) -> None:
     """The step budget returns `error` with the partial reply as content; that is no answer.
 
-    Killed by: src/uclone_x/cli/commands/run.py :: failure = result.error
-    Becomes: failure = result.error if not result.content else None
+    Killed by: src/uclone_x/cli/commands/run.py :: failure = _turn_failure(result)
+    Becomes: failure = _turn_failure(result) if not result.content else None
     """
     store = _isolated_run_env(monkeypatch, tmp_path)
     call = ToolCallRequest(id="c1", name="no_such_tool", arguments={})
@@ -1234,8 +1289,8 @@ def test_a_hook_blocked_repl_turn_is_labelled_and_not_shown_as_a_reply(
 ) -> None:
     """The REPL labels a hook block the same way, and never shows it as the reply.
 
-    Killed by: src/uclone_x/cli/commands/run.py :: failure_in_turn = result.error
-    Becomes: failure_in_turn = result.error if not result.content else None
+    Killed by: src/uclone_x/cli/commands/run.py :: failure_in_turn = _turn_failure(result)
+    Becomes: failure_in_turn = _turn_failure(result) if not result.content else None
     """
     _isolated_run_env(monkeypatch, tmp_path)
     _use_connector(monkeypatch, _mock_llm())

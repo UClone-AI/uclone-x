@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "uclone-x"
-version = "0.2.1"
+version = "0.2.2"
 description = "Next-Generation Event-Driven AI Agent Core & High-Performance Collaboration Framework"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -101,8 +101,14 @@ ontology = [
 # `ucx media status` reporting ready for an engine that would fail on `import torch`.
 # The floors here are the same ones `IN_PROCESS_REQUIREMENTS` checks at runtime, so a
 # beginner who installs this extra and a beginner who follows the hint end up equivalent.
+#
+# `accelerate` is what `enable_model_cpu_offload` needs. It is not a runtime requirement
+# (MPS and CPU never offload, and a CUDA card with room loads the whole pipeline), so it is
+# not in `IN_PROCESS_REQUIREMENTS`; it is here so an NVIDIA card whose memory is shared
+# with a resident Ollama model can still run SDXL instead of running out of memory.
 media = [
     "pillow>=10.0.0",
+    "accelerate>=0.31.0",
     "diffusers>=0.31.0",
     "torch>=2.2.0",
     "transformers>=4.40.0",

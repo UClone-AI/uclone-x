@@ -124,7 +124,9 @@ def eval_run(
     ] = "all",
     model: Annotated[
         str | None,
-        typer.Option("--model", "-m", help="Target model identifier override (e.g. qwen3:1.7b)"),
+        typer.Option(
+            "--model", "-m", help="Target model identifier override (e.g. qwen3:8b, hermes3:8b)"
+        ),
     ] = None,
     provider: Annotated[
         str | None,

@@ -503,11 +503,8 @@ async def test_the_rail_lists_the_most_recently_active_conversation_first(
 
         assert await _rail_order(page) == [newest, middle, oldest]
         first = await page.locator(f"[data-testid='conversation-{newest}']").inner_text()
-        assert "5 minutes ago" in first, f"the top row does not say when it was active: {first!r}"
-        assert (
-            "3 days ago"
-            in await page.locator(f"[data-testid='conversation-{middle}']").inner_text()
-        )
+        assert "5m" in first, f"the top row does not say when it was active: {first!r}"
+        assert "3d" in await page.locator(f"[data-testid='conversation-{middle}']").inner_text()
 
         await page.click(f"[data-testid='conversation-{oldest}']")
         await page.wait_for_selector("[data-testid='room-conversation']", timeout=15000)
@@ -526,7 +523,7 @@ async def test_the_rail_lists_the_most_recently_active_conversation_first(
         )
         assert await _rail_order(page) == [oldest, newest, middle]
         used = await page.locator(f"[data-testid='conversation-{oldest}']").inner_text()
-        assert "just now" in used, f"the conversation just used does not say so: {used!r}"
+        assert "now" in used, f"the conversation just used does not say so: {used!r}"
 
         assert not errors, f"the rail raised in the browser: {errors}"
         await browser.close()

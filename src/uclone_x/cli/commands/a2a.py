@@ -82,11 +82,15 @@ def start_a2a_server(
     from uclone_x.agent.composition import HostDependencies, compose_agent
     from uclone_x.agent.session import SessionStore
     from uclone_x.cli.agent_memory import memory_for_agent_id
-    from uclone_x.llm.connectors.factory import create_llm_connector
+    from uclone_x.llm.connectors.factory import create_llm_connector, saved_choice_notice
     from uclone_x.shells.a2a_server import A2AServer
     from uclone_x.telemetry import TelemetryTracer
     from uclone_x.tools.registry import create_default_registry
 
+    saved_notice = saved_choice_notice()
+    if saved_notice is not None:
+        # stderr, as ACP does: what the server says to its caller stays on its own channel.
+        Console(stderr=True).print(saved_notice, markup=False, highlight=False)
     llm = create_llm_connector(fallback_to_mock=True)
     memory = memory_for_agent_id(agent_config.agent_id)
 

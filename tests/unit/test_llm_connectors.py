@@ -9,6 +9,7 @@ import time
 from collections.abc import AsyncIterator, Callable, Sequence
 from pathlib import Path
 from typing import Any, cast
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -21,6 +22,7 @@ from uclone_x.errors import (
     LLMProviderNotConfiguredError,
     LLMTimeoutError,
     MalformedToolCallArgumentsError,
+    ModelLacksToolSupportError,
     UnmappableChatMessageError,
 )
 from uclone_x.llm import (
@@ -60,6 +62,7 @@ from uclone_x.llm.connectors.vllm import (
     VLLM_ENDPOINT_ENV_VARS,
     VLLMConnector,
 )
+from uclone_x.llm.context_window import DEFAULT_OLLAMA_NUM_CTX, OllamaContextWindows
 
 
 def _make_mock_client(handler: Callable[[httpx.Request], httpx.Response]) -> httpx.AsyncClient:
@@ -357,6 +360,75 @@ async def test_ollama_connector_errors() -> None:
 
     with pytest.raises(LLMProviderError, match="Ollama provider returned status 500"):
         await connector.generate(LLMRequest(messages=()))
+
+
+_NO_TOOLS_BODY = '{"error":"registry.ollama.ai/library/deepseek-r1:14b does not support tools"}'
+_INTERNALS = ("Traceback", "status 400", "{", "LLMProviderError", "registry.ollama.ai")
+
+
+def _refuse_tools(request: httpx.Request) -> httpx.Response:
+    return httpx.Response(400, text=_NO_TOOLS_BODY)
+
+
+def _assert_plain_no_tools(exc: ModelLacksToolSupportError) -> None:
+    message = str(exc)
+    assert message == (
+        "The model deepseek-r1:14b can't use tools, which UClone-X clones need. Pick a "
+        "model that supports tools, for example qwen3:8b."
+    )
+    assert exc.model == "deepseek-r1:14b"
+    for internal in _INTERNALS:
+        assert internal not in message, internal
+
+
+@pytest.mark.asyncio
+async def test_ollama_generate_turns_a_model_without_tools_into_a_plain_sentence() -> None:
+    """Ollama's 400 for a model without tool support names the model and the remedy.
+
+    It stays an `LLMProviderError`, so every existing handler still catches it.
+
+    Killed by: src/uclone_x/llm/connectors/ollama.py :: if status_code == 400 and _NO_TOOL_SUPPORT_PHRASE in body:
+    Becomes: if False:
+    """
+    connector = OllamaConnector(http_client=_make_mock_client(_refuse_tools))
+
+    with pytest.raises(ModelLacksToolSupportError) as caught:
+        await connector.generate(LLMRequest(messages=(), model="deepseek-r1:14b"))
+
+    assert isinstance(caught.value, LLMProviderError)
+    _assert_plain_no_tools(caught.value)
+
+
+@pytest.mark.asyncio
+async def test_ollama_stream_turns_a_model_without_tools_into_a_plain_sentence() -> None:
+    """The streaming path, which every agent turn uses, raises the same plain error.
+
+    Killed by: src/uclone_x/llm/connectors/ollama.py :: return ModelLacksToolSupportError(model)
+    Becomes: return LLMProviderError(f"{prefix} {status_code}: {body}")
+    """
+    connector = OllamaConnector(http_client=_make_mock_client(_refuse_tools))
+
+    with pytest.raises(ModelLacksToolSupportError) as caught:
+        async for _ in connector.stream(  # pragma: no branch
+            LLMRequest(messages=(), model="deepseek-r1:14b")
+        ):
+            pass
+
+    _assert_plain_no_tools(caught.value)
+
+
+@pytest.mark.asyncio
+async def test_ollama_other_400s_keep_the_diagnostic_wording() -> None:
+    """Only the tool-support refusal is reworded; any other 400 still says what came back."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, text='{"error":"invalid options"}')
+
+    connector = OllamaConnector(http_client=_make_mock_client(handler))
+
+    with pytest.raises(LLMProviderError, match="returned status 400") as caught:
+        await connector.generate(LLMRequest(messages=()))
+    assert not isinstance(caught.value, ModelLacksToolSupportError)
 
 
 @pytest.mark.asyncio
@@ -5680,23 +5752,99 @@ def test_ollama_keep_alive_follows_the_daemons_variable_and_then_the_caller(
 
 def test_ollama_sends_the_configured_window_as_num_ctx_and_keeps_sending_it() -> None:
     """A request naming no window, to a model that was sent one, is sent the same one:
-    Ollama reloads a model whose options change, and a summary request without `num_ctx`
-    would reload it at the daemon's default and the next turn would reload it back.
+    Ollama reloads a model whose options change, and a summary request with another
+    `num_ctx` would reload it at that window and the next turn would reload it back.
 
     Killed by: src/uclone_x/llm/connectors/ollama.py :: options["num_ctx"] = num_ctx
     Becomes: options["num_ctx_unused"] = num_ctx
-    Killed by: src/uclone_x/llm/connectors/ollama.py :: num_ctx = self._num_ctx.get(window_key)
-    Becomes: num_ctx = request.context_window
+    Killed by: src/uclone_x/llm/connectors/ollama.py :: num_ctx = self._num_ctx.get(window_key, default_ollama_num_ctx())
+    Becomes: num_ctx = default_ollama_num_ctx()
     """
     connector = OllamaConnector(base_url="http://localhost:11434")
 
-    first = _ollama_body(connector, model="llama3.2:1b", context_window=16_384)
+    first = _ollama_body(connector, model="llama3.2:1b", context_window=32_768)
     later = _ollama_body(connector, model="llama3.2:1b")
-    other = _ollama_body(connector, model="qwen3:8b")
 
-    assert first["options"]["num_ctx"] == 16_384
-    assert later["options"]["num_ctx"] == 16_384
-    assert "num_ctx" not in other["options"]
+    assert first["options"]["num_ctx"] == 32_768
+    assert later["options"]["num_ctx"] == 32_768
+
+
+def test_ollama_sends_the_default_window_when_nothing_configures_one() -> None:
+    """Fresh-machine E2E: the daemon's own 4096 under 24 GB of VRAM failed a turn whose
+    request alone was 5,186 tokens. With nothing configured, the default is sent.
+
+    Killed by: src/uclone_x/llm/context_window.py :: DEFAULT_OLLAMA_NUM_CTX = 16_384
+    Becomes: DEFAULT_OLLAMA_NUM_CTX = 4_096
+    """
+    connector = OllamaConnector(base_url="http://localhost:11434")
+
+    body = _ollama_body(connector, model="qwen3:8b")
+
+    assert body["options"]["num_ctx"] == 16_384
+
+
+def test_ollama_sends_the_daemons_context_length_before_the_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An operator who set `OLLAMA_CONTEXT_LENGTH` for the daemon keeps that window:
+    a request's `num_ctx` overrides the daemon's setting, as `keep_alive` does.
+
+    Killed by: src/uclone_x/llm/context_window.py :: return tokens if tokens > 0 else DEFAULT_OLLAMA_NUM_CTX
+    Becomes: return DEFAULT_OLLAMA_NUM_CTX
+    """
+    monkeypatch.setenv("OLLAMA_CONTEXT_LENGTH", " 32768 ")
+
+    body = _ollama_body(OllamaConnector(base_url="http://localhost:11434"), model="qwen3:8b")
+
+    assert body["options"]["num_ctx"] == 32_768
+
+
+def test_a_configured_window_wins_over_the_daemons_context_length(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OLLAMA_CONTEXT_LENGTH", "32768")
+
+    body = _ollama_body(
+        OllamaConnector(base_url="http://localhost:11434"),
+        model="qwen3:8b",
+        context_window=8_192,
+    )
+
+    assert body["options"]["num_ctx"] == 8_192
+
+
+@pytest.mark.parametrize("value", ["", "0", "-4096", "16k", "lots"])
+def test_an_unusable_context_length_falls_back_to_the_default(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    """Killed by: src/uclone_x/llm/context_window.py :: return DEFAULT_OLLAMA_NUM_CTX
+    Becomes: return 4_096
+    """
+    monkeypatch.setenv("OLLAMA_CONTEXT_LENGTH", value)
+
+    body = _ollama_body(OllamaConnector(base_url="http://localhost:11434"), model="qwen3:8b")
+
+    assert body["options"]["num_ctx"] == DEFAULT_OLLAMA_NUM_CTX
+
+
+@pytest.mark.asyncio
+async def test_ollama_rereads_the_served_window_after_sending_the_default() -> None:
+    """The first send of the default is unconfirmed, so the next observation asks the
+    daemon -- which may have clamped it to the model's trained window.
+
+    Killed by: src/uclone_x/llm/connectors/ollama.py :: self._unconfirmed.add(window_key)
+    Becomes: self._unconfirmed.discard(window_key)
+    """
+    store = OllamaContextWindows()
+    store.remember("http://localhost:11434", "gemma:2b", 4_096)  # a load from before
+    connector = OllamaConnector(base_url="http://localhost:11434", context_windows=store)
+    refresh = AsyncMock()
+    store.refresh = refresh  # type: ignore[method-assign]
+
+    _ollama_body(connector, model="gemma:2b")
+    await connector.observe_context_window("gemma:2b")
+
+    refresh.assert_awaited_once()
 
 
 def test_ollama_sends_think_parameter_when_thinking_is_specified() -> None:

@@ -564,7 +564,7 @@ def test_a_sub_agent_of_a_tool_scoped_persona_gets_only_the_parent_s_tools_edits
         def offered_to_a_child(parent: BaseAgent) -> list[str]:
             child = portal.call(parent.spawn_subagent, "helper", "help")
             portal.call(parent.delegate_task, child, "go")
-            return [t.name for t in llm.requests[-1].tools]
+            return [t.name for t in llm.requests[-1].tools if t.name not in BASE_PERSONA_TOOLS]
 
         assert offered_to_a_child(parent) == ["map_area"]
 

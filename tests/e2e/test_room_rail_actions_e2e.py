@@ -6,12 +6,10 @@ good under whatever its first message happened to say.
 
 What only a browser can check, and so what these cases are for:
 
-* **The controls are drawn without hover.** jsdom applies no stylesheet, so a component
-  test can only read class names; here the computed style is read with the pointer nowhere
-  near the row. uclone2's hover-only trash icon was the defect this guards against: a
-  touch screen could never reach it.
-* **Each input reaches them**: touch (a tap in a touch-enabled context), keyboard (focus and
-  Enter, Tab, Escape) and pointer.
+* **The controls are revealed on hover and focus.** Space is preserved for titles
+  until hovered or focused.
+* **Each input reaches them**: touch/pointer (hover and tap/click) and keyboard (focus and
+  Enter, Tab, Escape).
 * **A refusal arrives in the Core's own words** through the real route, not a fixture.
 """
 
@@ -76,11 +74,16 @@ async def test_a_conversation_is_renamed_by_touch_and_a_blank_title_is_refused_i
 
         rename = page.locator(f"[data-testid='rename-conversation-{room_id}']")
         delete = page.locator(f"[data-testid='delete-conversation-{room_id}']")
-        # The pointer has not been near the rail: nothing here is hovered.
-        assert await _drawn(rename), "Rename is not drawn until something hovers the row"
-        assert await _drawn(delete), "Delete is not drawn until something hovers the row"
+        # The pointer has not been near the rail: controls are hidden to preserve title space.
+        assert not await _drawn(rename), "Rename is drawn even when unhovered"
+        assert not await _drawn(delete), "Delete is drawn even when unhovered"
 
-        await rename.tap()
+        await row.hover()
+        await page.wait_for_timeout(200)
+        assert await _drawn(rename), "Rename is not drawn when row is hovered"
+        assert await _drawn(delete), "Delete is not drawn when row is hovered"
+
+        await rename.click()
         title = page.get_by_role("textbox", name="Conversation title")
         await title.fill("   ")
         await title.press("Enter")

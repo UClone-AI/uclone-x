@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any, Final, Literal, cast
+from typing import Any, Final, Literal, TypeVar, cast
 
 from uclone_x.agent.grounding import describe, unsupported_specifics
 from uclone_x.agent.hooks import (
@@ -101,6 +101,7 @@ from uclone_x.errors import (
     LLMConnectorNotConfiguredError,
     LLMStreamInterruptedError,
     LLMTimeoutError,
+    ModelLacksToolSupportError,
     PathTraversalError,
     SessionMutationDuringTurnError,
     SessionStoreNotConfiguredError,
@@ -246,24 +247,61 @@ class _StreamProgress:
         return "".join(self.thinking_chunks) if self.thinking_chunks else None
 
 
-def _is_provider_timeout(exc: BaseException) -> bool:
-    """Whether a turn failed because a provider ran past the ceiling the caller set.
+_ChainedError = TypeVar("_ChainedError", bound=BaseException)
+
+
+def _in_cause_chain(exc: BaseException, kind: type[_ChainedError]) -> _ChainedError | None:
+    """The first exception of type `kind` in `exc`'s `__cause__` chain, `exc` included.
 
     The chain is walked rather than the exception tested directly, because the streaming
     path does not deliver the connector's error itself: `_invoke_model` raises
     `LLMStreamInterruptedError` with the provider's error chained as `__cause__`. Testing
-    only the outermost type would report a cut-off stream as an ordinary failure, which is
-    the distinction this function exists to make.
+    only the outermost type would report a cut-off stream as an ordinary failure.
     """
     seen = exc
     for _ in range(_MAX_CAUSE_DEPTH):
-        if isinstance(seen, LLMTimeoutError):
-            return True
+        if isinstance(seen, kind):
+            return seen
         cause = seen.__cause__
         if cause is None:
-            return False
+            return None
         seen = cause
-    return False
+    return None
+
+
+def _is_provider_timeout(exc: BaseException) -> bool:
+    """Whether a turn failed because a provider ran past the ceiling the caller set."""
+    return _in_cause_chain(exc, LLMTimeoutError) is not None
+
+
+def _model_lacking_tools(exc: BaseException) -> ModelLacksToolSupportError | None:
+    """The refusal of a model that cannot take tools, if that is why a turn failed.
+
+    The error the turn reports when it is found: its message is written for the user,
+    while the `LLMStreamInterruptedError` wrapping it names classes and a status line.
+    """
+    return _in_cause_chain(exc, ModelLacksToolSupportError)
+
+
+def _turn_failure(
+    exc: BaseException, stop_reason: TurnStopReason, agent_id: str
+) -> tuple[TurnStopReason, str]:
+    """The stop reason and `error` a turn that raised `exc` ends with, logged as it deserves.
+
+    A function of its own because `execute_turn` is at the edge of what the type checker
+    can analyse, and each branch added inline pushes it over.
+    """
+    if _is_provider_timeout(exc):
+        stop_reason = "provider_timeout"
+    lacking_tools = _model_lacking_tools(exc)
+    if lacking_tools is None:
+        logger.exception("Error executing turn for agent %s", agent_id)
+        return stop_reason, str(exc)
+    # A choice of model, not a fault in the code. With no handler set up, Python prints
+    # WARNING and above -- traceback included -- on the user's terminal, beside the plain
+    # sentence the CLI already shows.
+    logger.info("Turn for agent %s refused: %s", agent_id, lacking_tools)
+    return "model_without_tools", str(lacking_tools)
 
 
 class _AnchorWriter(Enum):
@@ -4530,9 +4568,7 @@ class BaseAgent(BaseAgentProtocol):
                 # Named before anything else reads it. `error` carries the same fact as
                 # prose, and prose is not something a caller can branch on without
                 # guessing at a provider's wording (#1277).
-                if _is_provider_timeout(exc):
-                    stop_reason = "provider_timeout"
-                logger.exception("Error executing turn for agent %s", self.agent_id)
+                stop_reason, failure = _turn_failure(exc, stop_reason, self.agent_id)
                 req_model = self._config.llm_config.model_name
 
                 # Execute ON_ERROR hook
@@ -4626,7 +4662,7 @@ class BaseAgent(BaseAgentProtocol):
                     tool_executions=tuple(tool_executions),  # ran before the failure
                     tool_executions_complete=not tools_unreported,  # a failure mid-step
                     is_completed=False,
-                    error=str(exc),
+                    error=failure,
                     stop_reason=stop_reason,
                     correlation_id=correlation_id,
                     provenance=failover_provenance,

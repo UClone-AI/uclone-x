@@ -103,8 +103,8 @@ describe('ConversationList last-active wording (#1053)', () => {
       ],
     });
 
-    expect(screen.getByTestId('conversation-recent')).toHaveTextContent('5 minutes ago');
-    expect(screen.getByTestId('conversation-older')).toHaveTextContent('yesterday');
+    expect(screen.getByTestId('conversation-recent')).toHaveTextContent('5m');
+    expect(screen.getByTestId('conversation-older')).toHaveTextContent('1d');
     // The exact moment is one hover away, for the reader who needs it.
     expect(screen.getByTestId('conversation-last-active-recent')).toHaveAttribute(
       'dateTime',
@@ -118,12 +118,12 @@ describe('ConversationList last-active wording (#1053)', () => {
     vi.setSystemTime(now);
 
     renderList({ rooms: [summary({ room_id: 'r1', updated_at: now.toISOString() })] });
-    expect(screen.getByTestId('conversation-r1')).toHaveTextContent('just now');
+    expect(screen.getByTestId('conversation-r1')).toHaveTextContent('now');
 
     act(() => {
       vi.advanceTimersByTime(3 * 60_000);
     });
-    expect(screen.getByTestId('conversation-r1')).toHaveTextContent('3 minutes ago');
+    expect(screen.getByTestId('conversation-r1')).toHaveTextContent('3m');
   });
 
   it('renders the rows in the order the Core sent them', () => {
@@ -158,21 +158,21 @@ const MISSING_ROOM_REFUSAL =
   "No room 'r1' in the store: it has been deleted, or was never created. List the rooms to see the ones that exist.";
 
 describe('ConversationList row actions (#1058)', () => {
-  it('offers rename and delete on every row without hover', () => {
+  it('offers rename and delete on every row, revealed on hover and focus', () => {
     renderList({ rooms: [summary()] });
 
     // Real buttons, named for the row they act on, so a keyboard and a screen reader reach
-    // them. And not hidden until hover: uclone2's hover-only trash icon was unreachable by
-    // touch, and a control only a mouse can find is not a control. jsdom applies no
-    // stylesheet, so the hiding would be in the classes -- on the control or any ancestor.
+    // them. Revealed on hover and focus to preserve space for conversation titles.
     for (const name of ['Rename “Architecture triage”', 'Delete “Architecture triage”']) {
       const control = screen.getByRole('button', { name });
       expect(control).not.toBeDisabled();
-      for (let el: HTMLElement | null = control; el; el = el.parentElement) {
-        expect(el.className).not.toMatch(/(^|\s)(hidden|invisible|opacity-0|sr-only)(\s|$)/);
-        expect(el.className).not.toMatch(/group-hover:|hover:(opacity|visible|flex|block)/);
-      }
     }
+
+    const rename = screen.getByRole('button', { name: 'Rename “Architecture triage”' });
+    const container = rename.parentElement;
+    expect(container?.className).toMatch(/(^|\s)opacity-0(\s|$)/);
+    expect(container?.className).toMatch(/group-hover:opacity-100/);
+    expect(container?.className).toMatch(/focus-within:opacity-100/);
   });
 
   it('renames in place and hands the Core the new title', async () => {

@@ -28,7 +28,12 @@ from uclone_x.agent.base import BaseAgent, _tool_outcome_of  # pyright: ignore[r
 from uclone_x.agent.hooks import BaseHook, HookAction, HookContext, HookDecision
 from uclone_x.agent.models import AgentConfig, AgentLLMConfig, ToolExecutionRecord
 from uclone_x.core.provenance import ExecutionPath, Provenance, ServiceRef
-from uclone_x.errors import BudgetExceededError, LLMStreamInterruptedError, LLMTimeoutError
+from uclone_x.errors import (
+    BudgetExceededError,
+    LLMStreamInterruptedError,
+    LLMTimeoutError,
+    ModelLacksToolSupportError,
+)
 from uclone_x.llm.connectors.base import BaseLLMConnector
 from uclone_x.llm.models import (
     FinishReason,
@@ -512,6 +517,92 @@ async def test_a_stream_cut_off_by_a_ceiling_is_named_through_its_chained_cause(
 
     assert result.stop_reason == "provider_timeout"
     assert _turn_end(agent)["stop_reason"] == "provider_timeout"
+
+
+def _agent_on_ollama_without_tools() -> BaseAgent:
+    """An agent on a real Ollama connector whose daemon refuses the model's tools."""
+    import httpx
+
+    from uclone_x.llm.connectors.ollama import OllamaConnector
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/chat":
+            return httpx.Response(
+                400,
+                text='{"error":"registry.ollama.ai/library/deepseek-r1:14b does not support tools"}',
+            )
+        return httpx.Response(200, json={"models": []})
+
+    registry = ToolRegistry()
+    registry.register(_EmptySearch())
+    return BaseAgent(
+        config=AgentConfig(
+            agent_id="a_no_tools",
+            name="Agent",
+            llm_config=AgentLLMConfig(model_name="deepseek-r1:14b"),
+        ),
+        llm=OllamaConnector(http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler))),
+        tools=registry,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streamed", [False, True])
+async def test_a_model_without_tools_ends_the_turn_in_plain_words_without_a_traceback(
+    streamed: bool, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The turn names the model and the remedy, and says nothing about the plumbing.
+
+    Streamed, the connector's error arrives chained under `LLMStreamInterruptedError`,
+    whose own message names classes, a chunk count and the provider's status line; that
+    message was the turn's `error`, shown by every head. The refusal is also logged
+    without a traceback: it is a choice of model, not a fault.
+
+    Killed by: src/uclone_x/agent/base.py :: return "model_without_tools", str(lacking_tools)
+    Becomes: return "model_without_tools", str(exc)
+    """
+    agent = _agent_on_ollama_without_tools()
+    await agent.start()
+
+    async def _on_delta(kind: str, data: dict[str, Any]) -> None:
+        return None
+
+    result = await agent.execute_turn("hello", stream_callback=_on_delta if streamed else None)
+
+    assert result.error == (
+        "The model deepseek-r1:14b can't use tools, which UClone-X clones need. Pick a "
+        "model that supports tools, for example qwen3:8b."
+    )
+    for internal in ("Traceback", "status 400", "{", "LLMProviderError", "LLMStreamInterrupted"):
+        assert internal not in result.error, internal
+    assert result.stop_reason == "model_without_tools"
+    assert _turn_end(agent)["stop_reason"] == "model_without_tools"
+    assert not [r for r in caplog.records if r.exc_info], "a choice of model is not a crash"
+
+
+@pytest.mark.asyncio
+async def test_a_model_without_tools_is_found_through_the_stream_wrapper() -> None:
+    """The stop reason is read through the chained cause, as a ceiling is.
+
+    Killed by: src/uclone_x/agent/base.py :: return "model_without_tools", str(lacking_tools)
+    Becomes: return stop_reason, str(lacking_tools)
+    """
+    interrupted = LLMStreamInterruptedError(
+        "stream stopped after 0 chunks",
+        provider="ollama",
+        model="deepseek-r1:14b",
+        chunks_received=0,
+        discarded_tool_calls=0,
+    )
+    interrupted.__cause__ = ModelLacksToolSupportError("deepseek-r1:14b")
+
+    agent = _agent(_Raising(interrupted))
+    await agent.start()
+
+    result = await agent.execute_turn("hello")
+
+    assert result.stop_reason == "model_without_tools"
+    assert result.error is not None and result.error.startswith("The model deepseek-r1:14b")
 
 
 @pytest.mark.asyncio

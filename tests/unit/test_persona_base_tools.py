@@ -41,6 +41,7 @@ from uclone_x.room.resolver import RoomAgentResolver
 from uclone_x.telemetry.tracer import TelemetryTracer
 from uclone_x.tools.base import tool_spawns_subagents, tool_writes_files
 from uclone_x.tools.builtin.filesystem import DirectoryListTool, FileReadTool, FileSearchTool
+from uclone_x.tools.builtin.skill_loader import LoadSkillTool
 from uclone_x.tools.builtin.tool_results import ToolResultReadTool
 from uclone_x.tools.models import ToolResultStatus
 from uclone_x.tools.registry import ToolRegistry, create_default_registry
@@ -57,6 +58,7 @@ _BASE_CLASSES = (
     FileSearchTool,
     DirectoryListTool,
     ToolResultReadTool,
+    LoadSkillTool,
 )
 
 

@@ -18,7 +18,7 @@ from uclone_x.agent.persona_store import DEFAULT_PERSONA_NAME
 from uclone_x.agent.session import SessionStore
 from uclone_x.cli.agent_memory import memory_for_agent_id
 from uclone_x.engine.event_bus import EventBus
-from uclone_x.llm.connectors.factory import create_llm_connector
+from uclone_x.llm.connectors.factory import create_llm_connector, saved_choice_notice
 from uclone_x.shells.acp import ACPServer
 from uclone_x.shells.acp.server import SessionAgentFactory
 from uclone_x.telemetry import TelemetryTracer
@@ -30,6 +30,8 @@ acp_app = typer.Typer(
     no_args_is_help=True,
 )
 console = Console()
+# ACP speaks over stdout, so anything said to the person goes to stderr.
+err_console = Console(stderr=True)
 
 
 def session_agent_factory(config: AgentConfig, host: HostDependencies) -> SessionAgentFactory:
@@ -80,6 +82,9 @@ def start_acp_server(agent_id: str | None = None, persona: str = DEFAULT_PERSONA
     agent_config = agent_config_for_persona(persona_def, agent_id=agent_id)
 
     bus = EventBus()
+    saved_notice = saved_choice_notice()
+    if saved_notice is not None:
+        err_console.print(saved_notice, markup=False, highlight=False)
     llm = create_llm_connector(fallback_to_mock=True)
     store = SessionStore()
     tracer = TelemetryTracer()

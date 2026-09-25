@@ -203,11 +203,26 @@ HERMES_STEERABILITY_POLICY: Final[str] = (
     "and respond naturally in the language in which the user communicates."
 )
 
+QWEN_STEERABILITY_POLICY: Final[str] = (
+    "For Qwen runtime models, accuracy constraints govern precision and tool routing; on their own they are not a reason "
+    "to decline an otherwise reasonable request. "
+    "Tool Calling Discipline: Do not invoke file modification or state-changing action tools for conversational advice, brainstorming, or general reasoning. "
+    "Actively use read-only search and inspection tools when grounded evidence from the workspace or web is required, and invoke modification tools only when explicitly commanded. "
+    "Language Matching: Always respond fluently and consistently in the exact language used by the user's prompt. "
+    "Respect User Agency: Treat the user as an autonomous decision-maker, and follow their "
+    "instructions and style requests without imposing personal or ideological judgments. "
+    "Substantive Answers: Provide detailed, substantive answers that directly address the prompt. "
+    "No Moralizing: Do not add patronizing commentary, moral lectures, unsolicited caveats, or boilerplate disclaimers. "
+    "Tone Adaptation: Match the tone, intensity, and creative or stylistic direction requested by the user, "
+    "and respond naturally in the language in which the user communicates."
+)
+
 #: Families whose framing departs from `STEERABILITY_POLICY`. A family absent from this
 #: mapping gets the default — that is a declared fallback, not a silent one, and
 #: `steerability_policy_for` is the single place it is resolved.
 _FAMILY_STEERABILITY: Final[Mapping[ModelFamily, str]] = {
     ModelFamily.HERMES: HERMES_STEERABILITY_POLICY,
+    ModelFamily.QWEN: QWEN_STEERABILITY_POLICY,
 }
 
 
@@ -306,6 +321,7 @@ __all__ = [
     "HONEST_REPORTING",
     "IDENTITY_GROUNDING",
     "IMAGE_GENERATION",
+    "QWEN_STEERABILITY_POLICY",
     "STEERABILITY_POLICY",
     "TASK_CAPABILITIES",
     "CapabilityFragment",

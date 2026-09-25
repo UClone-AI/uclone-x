@@ -266,6 +266,10 @@ def _isolate_llm_provider(  # pyright: ignore[reportUnusedFunction]
         "ANTHROPIC_MODEL",
         "GEMINI_MODEL",
         "COMFYUI_BASE_URL",
+        # The daemon's own window variable, which the Ollama connector now honours before
+        # its default `num_ctx`: a developer who exported it would change every
+        # default-window assertion.
+        "OLLAMA_CONTEXT_LENGTH",
         # The embedding seam's own configuration (#1097). A developer following
         # `docs/semantic-retrieval.md` and exporting these could not otherwise run the
         # suite: the default-resolution tests read exactly these two names.

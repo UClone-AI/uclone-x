@@ -530,7 +530,7 @@ def test_diffusers_install_command_prefers_uv_where_both_installers_exist() -> N
     Killed by: src/uclone_x/core/environment_install.py :: uv_bin = shutil.which("uv")
     Becomes: uv_bin = None
     """
-    from uclone_x.tools.builtin.image import IN_PROCESS_REQUIREMENTS
+    from uclone_x.tools.builtin.image import IN_PROCESS_INSTALL_REQUIREMENTS
 
     with (
         patch("shutil.which", _uv_on_path),
@@ -544,14 +544,14 @@ def test_diffusers_install_command_prefers_uv_where_both_installers_exist() -> N
         "install",
         "--python",
         bootstrap.sys.executable,
-        *(requirement for _, requirement, _ in IN_PROCESS_REQUIREMENTS),
+        *(requirement for _, requirement, _ in IN_PROCESS_INSTALL_REQUIREMENTS),
     ]
 
 
 def test_diffusers_install_command_installs_torch_and_transformers_too() -> None:
     """Installing `diffusers` alone leaves the engine importable and unable to generate.
 
-    Killed by: src/uclone_x/cli/commands/bootstrap.py :: packages = [requirement for _, requirement, _ in IN_PROCESS_REQUIREMENTS]
+    Killed by: src/uclone_x/cli/commands/bootstrap.py :: packages = [requirement for _, requirement, _ in IN_PROCESS_INSTALL_REQUIREMENTS]
     Becomes: packages = ["diffusers"]
     """
     with (
@@ -565,9 +565,25 @@ def test_diffusers_install_command_installs_torch_and_transformers_too() -> None
     assert any(part.startswith("transformers") for part in command)
 
 
+def test_diffusers_install_command_installs_accelerate_for_cuda_offload() -> None:
+    """Installed, not required: readiness ignores it, but a fresh install should have it.
+
+    Killed by: src/uclone_x/cli/commands/bootstrap.py :: packages = [requirement for _, requirement, _ in IN_PROCESS_INSTALL_REQUIREMENTS]
+    Becomes: packages = [requirement for _, requirement, _ in IN_PROCESS_INSTALL_REQUIREMENTS[:-1]]
+    """
+    with (
+        patch("shutil.which", _uv_on_path),
+        patch("importlib.util.find_spec", return_value=MagicMock()),
+    ):
+        command = bootstrap.diffusers_install_command()
+
+    assert command is not None
+    assert "accelerate>=0.31.0" in command
+
+
 def test_diffusers_install_command_falls_back_to_pip_when_uv_is_absent() -> None:
     """pip is still the second choice, not no choice: a pip-only machine installs."""
-    from uclone_x.tools.builtin.image import IN_PROCESS_REQUIREMENTS
+    from uclone_x.tools.builtin.image import IN_PROCESS_INSTALL_REQUIREMENTS
 
     with (
         patch("shutil.which", _nothing_on_path),
@@ -580,7 +596,7 @@ def test_diffusers_install_command_falls_back_to_pip_when_uv_is_absent() -> None
         "-m",
         "pip",
         "install",
-        *(requirement for _, requirement, _ in IN_PROCESS_REQUIREMENTS),
+        *(requirement for _, requirement, _ in IN_PROCESS_INSTALL_REQUIREMENTS),
     ]
 
 
@@ -604,9 +620,9 @@ def test_the_two_in_process_install_paths_never_choose_different_installers() ->
     Becomes: return [sys.executable, "-m", "pip", "install", *packages]
     """
     from uclone_x.core.environment_install import installer_command
-    from uclone_x.tools.builtin.image import IN_PROCESS_REQUIREMENTS
+    from uclone_x.tools.builtin.image import IN_PROCESS_INSTALL_REQUIREMENTS
 
-    packages = [requirement for _, requirement, _ in IN_PROCESS_REQUIREMENTS]
+    packages = [requirement for _, requirement, _ in IN_PROCESS_INSTALL_REQUIREMENTS]
     # Every combination of (uv on `PATH`, pip importable). The divergence was invisible in
     # three of the four: only the last row holds both installers.
     availability = [

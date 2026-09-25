@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from contextlib import AbstractContextManager
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -45,6 +46,35 @@ def _resolution(
     engine = MagicMock()
     engine.checkpoint_resolution.return_value = CheckpointResolution(state, path, source)
     return patch.object(media, "LocalDiffusersImageEngine", return_value=engine)
+
+
+@pytest.fixture(autouse=True)
+def _no_torch_probe() -> Iterator[MagicMock]:  # pyright: ignore[reportUnusedFunction]
+    """Keep `media status` from importing this machine's torch to name its device."""
+    with patch.object(media, "in_process_device", return_value=None) as probe:
+        yield probe
+
+
+def test_media_status_names_the_device_the_in_process_engine_would_use(
+    capsys: pytest.CaptureFixture[str], _no_torch_probe: MagicMock
+) -> None:
+    """A CUDA machine is told its GPU will run SDXL, not left to guess (fresh-machine E2E).
+
+    Killed by: src/uclone_x/cli/commands/media.py :: if device is not None:
+    Becomes: if False:
+    """
+    _no_torch_probe.return_value = "cuda (NVIDIA GeForce RTX 5070 Ti), float16"
+    report = _report(deps_ok=True, checkpoint="/models/c.safetensors")
+
+    with (
+        patch.object(media, "probe_image_engines", return_value=report),
+        _resolution("present", "/models/c.safetensors"),
+        patch.object(media, "local_checkpoints", return_value=[("/models/c.safetensors", 10)]),
+    ):
+        media.media_status()
+
+    out = " ".join(capsys.readouterr().out.split())
+    assert "device: cuda (NVIDIA GeForce RTX 5070 Ti), float16" in out
 
 
 def test_human_bytes_switches_unit_at_a_gigabyte() -> None:

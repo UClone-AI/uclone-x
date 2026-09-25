@@ -328,8 +328,8 @@ def test_the_engines_the_image_pipeline_replacement_removed_can_no_longer_be_ins
     succeeded, and retry into the same failure -- the loop reproduced through the refusal
     message rather than the prompt (reviewer, PR #1096).
 
-    Killed by: src/uclone_x/core/environment_install.py :: {"diffusers", "torch", "transformers", "pillow"}
-    Becomes: {"diffusers", "torch", "transformers", "pillow", "mflux", "mlx"}
+    Killed by: src/uclone_x/core/environment_install.py :: {"diffusers", "torch", "transformers", "pillow", "accelerate"}
+    Becomes: {"diffusers", "torch", "transformers", "pillow", "accelerate", "mflux", "mlx"}
     """
     for gone in ("mflux", "mlx"):
         requirements, reason = resolve_installable(gone)

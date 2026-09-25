@@ -260,7 +260,10 @@ class LLMRequest(BaseModel):
         description="The window the caller configured and counts this request against "
         "(`AgentLLMConfig.context_limit`). A connector whose server picks its own window "
         "sends it -- Ollama as `num_ctx` -- so the window served and the window counted "
-        "agree (#1372). `None` leaves the choice to the server.",
+        "agree (#1372). `None` leaves the choice to the connector: Ollama sends the "
+        "`num_ctx` it last sent for the model, else `OLLAMA_CONTEXT_LENGTH` when that is a "
+        "positive integer, else `DEFAULT_OLLAMA_NUM_CTX` (16384). The order is "
+        "context_limit > OLLAMA_CONTEXT_LENGTH > 16384.",
     )
     thinking: bool | None = Field(
         default=None,

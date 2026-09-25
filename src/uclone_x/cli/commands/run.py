@@ -40,7 +40,12 @@ from uclone_x.errors import (
     PathTraversalError,
     SessionIdCollisionError,
 )
-from uclone_x.llm.connectors.factory import create_llm_connector
+from uclone_x.llm.connectors.factory import (
+    create_llm_connector,
+    model_env_override,
+    saved_choice_in_effect,
+)
+from uclone_x.llm.connectors.saved_choice import describe_saved_choice
 from uclone_x.llm.models import MessageRole
 from uclone_x.llm.protocols import LLMProviderProtocol
 from uclone_x.sandbox.models import NoIsolation, WorkspaceIsolation
@@ -123,6 +128,18 @@ def _blocked_by_hook(result: TurnResult) -> bool:
     relabelled every hook block, and a failure whose content read alike became one.
     """
     return result.stop_reason == "blocked_by_hook"
+
+
+#: Where to act on a model without tool support, on the command line. The Core's sentence
+#: says which model to pick and leaves where to the head (P8); here it is the flag.
+MODEL_WITHOUT_TOOLS_REMEDY = "Choose it with --model."
+
+
+def _turn_failure(result: TurnResult) -> str | None:
+    """The turn's error as this head reports it, with the command-line remedy when one fits."""
+    if result.error is not None and result.stop_reason == "model_without_tools":
+        return f"{result.error} {MODEL_WITHOUT_TOOLS_REMEDY}"
+    return result.error
 
 
 def _report_unsaved_session(save_error: str) -> None:
@@ -274,6 +291,29 @@ def get_default_llm(provider: str | None = None) -> LLMProviderProtocol:
     return create_llm_connector(provider=provider, fallback_to_mock=False)
 
 
+def apply_saved_model(provider: str | None, model: str | None) -> tuple[str | None, str | None]:
+    """The model a terminal command should ask for, and the line saying where it came from.
+
+    Returns ``(model, notice)``. When the connector is built from the saved choice
+    (``saved_choice_in_effect`` -- the factory's own test), a command given no ``--model``
+    asks for the saved model rather than a built-in default: setup may have picked
+    ``qwen3:1.7b`` for a small machine, and asking that daemon for ``qwen3:8b`` fails.
+    ``notice`` is ``None`` unless the saved choice is in effect, and then names it and the
+    file, so the person can see why this provider answered (P6).
+    """
+    saved = saved_choice_in_effect(provider)
+    if saved is None:
+        return model, None
+    if model is None:
+        # `OLLAMA_MODEL` / `VLLM_MODEL` outrank the saved model, as in the factory.
+        variable = model_env_override(saved.provider)
+        if variable is not None:
+            chosen = os.environ[variable].strip()
+            return chosen, describe_saved_choice(saved, chosen, model_from=variable)
+    chosen = model or saved.model
+    return chosen, describe_saved_choice(saved, chosen)
+
+
 async def run_agent_repl_async(
     agent_name: str = "default",
     provider: str | None = None,
@@ -296,12 +336,22 @@ async def run_agent_repl_async(
     name.
     """
     bus = EventBus()
+    # Read before the connector is built, from the same test the factory applies, and said
+    # before building it: when the saved provider then fails (an OpenAI choice with no
+    # key), the person has already been told which saved choice was tried.
+    saved_model, saved_notice = apply_saved_model(provider, model)
+    # With `--prompt`, stdout carries the reply and nothing else (#960), so the notices a
+    # person reads -- resumed, reset, compacted, the spinner -- go to stderr. The REPL is
+    # read by a person only, and keeps everything on stdout.
+    notices = err_console if prompt else console
+    if saved_notice is not None:
+        notices.print(f"[dim]{escape(saved_notice)}[/dim]")
     llm = create_llm_connector(provider=provider, fallback_to_mock=False)
     active_tools = tools if tools is not None else create_default_registry()
     exporter = create_telemetry_exporter()
     tracer = TelemetryTracer()
 
-    effective_model = model or DEFAULT_CLI_MODEL
+    effective_model = saved_model or DEFAULT_CLI_MODEL
 
     # `compose_system_prompt`, not a hand-rolled sentence (#1206): the composed default
     # is the only place `HONEST_REPORTING` / `ARTIFACT_REPORTING` / `IMAGE_GENERATION` /
@@ -355,11 +405,6 @@ async def run_agent_repl_async(
     )
     agent = compose_agent(config=config, host=host, context=context)
 
-    # With `--prompt`, stdout carries the reply and nothing else (#960), so the notices a
-    # person reads -- resumed, reset, compacted, the spinner -- go to stderr. The REPL is
-    # read by a person only, and keeps everything on stdout.
-    notices = err_console if prompt else console
-
     # Resume before starting: `switch_session` and the bus subscription are bound at
     # `start()`, and a hydrate that replaced history afterwards would race the loop.
     hydrated = agent.hydrate_session()
@@ -409,7 +454,7 @@ async def run_agent_repl_async(
                 # `execute_turn` returns most failures rather than raising them: an
                 # unreachable provider arrives as `error` with empty `content`, which
                 # printed `(No response content)` as the reply and exited 0.
-                failure = result.error
+                failure = _turn_failure(result)
                 blocked = _blocked_by_hook(result)
                 if failure is None:
                     reply_text = result.content
@@ -731,7 +776,7 @@ async def run_agent_repl_async(
                         },
                     ):
                         result = await agent.execute_turn(clean_input)
-                    failure_in_turn = result.error
+                    failure_in_turn = _turn_failure(result)
                     blocked = _blocked_by_hook(result)
                     if failure_in_turn is None:
                         reply_text = result.content or "(No response content)"

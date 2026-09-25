@@ -164,12 +164,11 @@ export const ConversationList: React.FC<ConversationListProps> = ({
               cancelIcon={icons.cancelRename}
             />
           ) : (
-            // Rename and Delete sit beside the row, always drawn: a control that appears on
-            // hover is one a touch screen never reaches (#1058). Siblings, not children -- a
-            // button may not contain another.
+            // Rename and Delete sit beside the row, revealed on hover and focus to
+            // preserve title space. Siblings, not children -- a button may not contain another.
             <div
               key={room.room_id}
-              className={`flex items-start rounded-lg transition-colors border ${
+              className={`group relative flex items-center rounded-lg transition-colors border ${
                 room.room_id === currentRoomId
                   ? 'bg-blue-950/40 text-blue-200 border-blue-500/30 font-medium'
                   : 'text-slate-400 hover:bg-slate-900/60 hover:text-slate-200 border-transparent'
@@ -183,7 +182,7 @@ export const ConversationList: React.FC<ConversationListProps> = ({
               >
                 {/* The order is the caller's -- the Core sends the most recently active first
                     (#1053) -- so it is rendered as it arrives and not re-sorted here. */}
-                <span className="flex items-baseline justify-between gap-2">
+                <span className="flex items-baseline justify-between gap-1.5">
                   <span className="truncate">{room.title || room.room_id}</span>
                   <LastActive
                     updatedAt={room.updated_at}
@@ -194,8 +193,8 @@ export const ConversationList: React.FC<ConversationListProps> = ({
                 </span>
                 {/* A count that is always "1" is noise, so a single agent shows its name. Faces
                     before names: who's in the room is the thing a glance should answer first. */}
-                <span className="flex items-center gap-1 mt-0.5">
-                  {room.agent_ids.length > 0 ? (
+                {room.agent_ids.length > 0 ? (
+                  <span className="flex items-center gap-1 mt-0.5">
                     <span className="flex items-center -space-x-1 shrink-0">
                       {room.agent_ids.slice(0, ROSTER_PREVIEW_MAX).map((agentId) => (
                         <Avatar
@@ -208,16 +207,22 @@ export const ConversationList: React.FC<ConversationListProps> = ({
                         />
                       ))}
                     </span>
-                  ) : null}
-                  <span className="truncate text-[11px] text-slate-500">
-                    {room.agent_ids.join(', ')}
-                    {room.agent_ids.length > ROSTER_PREVIEW_MAX
-                      ? ` +${room.agent_ids.length - ROSTER_PREVIEW_MAX}`
-                      : ''}
+                    <span className="truncate text-[11px] text-slate-500">
+                      {room.agent_ids.join(', ')}
+                      {room.agent_ids.length > ROSTER_PREVIEW_MAX
+                        ? ` +${room.agent_ids.length - ROSTER_PREVIEW_MAX}`
+                        : ''}
+                    </span>
                   </span>
-                </span>
+                ) : null}
               </button>
-              <span className="flex shrink-0 items-center pt-1 pr-0.5">
+              <span
+                className={`absolute right-1 top-1/2 -translate-y-1/2 z-10 flex items-center rounded-md px-0.5 opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 focus-within:opacity-100 transition-opacity ${
+                  room.room_id === currentRoomId
+                    ? 'bg-blue-950 text-blue-200'
+                    : 'bg-slate-900 text-slate-400'
+                }`}
+              >
                 <Button
                   variant="quiet"
                   size="compact"
@@ -248,10 +253,10 @@ export const ConversationList: React.FC<ConversationListProps> = ({
           <div
             key={`unreadable-${roomId}`}
             data-testid={`unreadable-conversation-${roomId}`}
-            className="flex items-start rounded-lg border border-transparent text-slate-500"
+            className="group relative flex items-center rounded-lg border border-transparent text-slate-500 hover:bg-slate-900/60"
           >
             <span className="flex-1 min-w-0 px-2 py-1.5 italic">{copy.unreadableTitle}</span>
-            <span className="flex shrink-0 items-center pt-1 pr-0.5">
+            <span className="absolute right-1 top-1/2 -translate-y-1/2 z-10 flex items-center rounded-md px-0.5 opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 focus-within:opacity-100 transition-opacity bg-slate-900 text-slate-400">
               <Button
                 variant="quiet"
                 size="compact"

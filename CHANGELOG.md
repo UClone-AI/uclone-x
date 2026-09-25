@@ -13,6 +13,95 @@ names does.
 Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Each date is
 the date that version was published.
 
+## [0.2.2] - 2026-09-24
+
+### Added
+
+- `ucx install` and `ucx start` now save the model they set up as the default, so
+  `ucx run`, `ucx room`, `ucx loop`, `ucx acp` and `ucx a2a` use it without `--provider`
+  or `--model`, and say which saved model they are using (`ucx acp` and `ucx a2a` on
+  stderr). A model already saved, for example in the dashboard's Settings, is kept; when
+  it differs from the one setup just prepared, setup says both and how to switch. A
+  dashboard that was started with no model picks up a default saved later.
+- `ucx llm use <model>` (with `--provider` and `--base-url`) changes the saved default.
+  It is the same setting as the dashboard's Settings. Command-line flags and environment
+  variables such as `LLM_PROVIDER`, `OLLAMA_MODEL` or a provider's API key variable still
+  come first, and `ucx llm use` says when one of them is set and takes priority.
+- In Settings, the API key field for OpenAI, Anthropic and Gemini links to the page where
+  that provider issues keys, warns when a key does not look like one for the chosen
+  provider or confirms that its format is right, and removes spaces and one pair of quotes
+  from the ends of a pasted key.
+- `ucx key list` shows whether `GEMINI_API_KEY` (or `GOOGLE_API_KEY`),
+  `ANTHROPIC_API_KEY` and `OPENAI_API_KEY` are set. `ucx key setup` opens the provider's
+  key page and writes the key you paste to a `.env` file: the nearest one in this folder
+  or above it, looking no higher than the top of the enclosing git checkout, where it
+  creates one if none is found. Outside a git checkout, it creates one in this folder if
+  none is found above. UClone-X does not read that file itself; load it into your shell,
+  or enter the key in Settings, for the key to be used.
+- Every clone may load the skills approved for it, without `load_skill` in its tool list,
+  and Scout can read web pages as well as search.
+
+### Changed
+
+- Ollama requests now ask for a 16K-token context window, unless `context_limit` or
+  `OLLAMA_CONTEXT_LENGTH` sets another, instead of leaving the size to Ollama, whose own
+  default was 4K on the machine the README's figures come from. A clone's request with
+  tool results then fits. It costs memory: for `qwen3:8b`, about 1.8 GB more than a 4K
+  window (an estimate, not a measurement).
+- The built-in clones Scout, Pioneer, Guardian and Writer have rewritten instructions,
+  now written entirely in English; they still answer in the language you write in. With
+  a Qwen model, clones are also told not to use tools that change files or other state
+  for advice, brainstorming or general reasoning unless you ask for that change, to use
+  read-only search and inspection tools when an answer needs evidence from the workspace
+  or the web, and to answer in the language of the question. They are told that accuracy
+  requirements alone are no reason to decline a reasonable request, to follow your
+  instructions and style without imposing their own judgments, to give substantive
+  answers, and not to add moral lectures, unsolicited caveats or boilerplate disclaimers.
+- The conversation list shows compact times ("now", "5m", "1d", "2w"), and a row's
+  rename and delete buttons appear when you point at the row or move keyboard focus to
+  it, so titles have more room.
+
+### Fixed
+
+- Local image generation on an NVIDIA card now runs on the GPU in half precision, where
+  0.2.1 ran it on the CPU. The engine tries CUDA, then Apple's MPS, then the CPU;
+  `ucx media status` names the device it will use, and image results name the GPU.
+- When less than about 10 GB of GPU memory is free (an estimate), for example because
+  Ollama is keeping a model loaded on the same card, the image engine keeps SDXL's parts
+  in system memory, moves each onto the card only while it runs, and decodes the image in
+  tiles. This needs `accelerate`, which is now installed with the image engine. It is
+  slower and can still run out of memory; if it does, the image request fails with a
+  plain message and the memory is released, and when `accelerate` is missing the message
+  says how to add it.
+- Under WSL2, the free GPU memory used for that decision now counts memory held by other
+  processes (read with NVML or `nvidia-smi`), so the image engine switches to the
+  low-memory mode when another program holds the card. When neither can be read, it uses
+  the low-memory mode.
+- A model that Ollama cannot give tools to (for example `deepseek-r1:14b`) now ends the
+  turn with a short message naming the model and suggesting one that can use tools, such
+  as `qwen3:8b`, plus where to change it: `--model` for `ucx run`,
+  `ucx room retry <id> --model <model>` in a room, and Settings in the dashboard and in an
+  ACP client. The dashboard gives that remedy instead of offering a Retry that would fail
+  the same way.
+- The one-line install now offers the image engine, which the published package
+  includes; 0.2.1 skipped it. When the installer reports success but the engine's core
+  packages (Pillow, diffusers, torch and transformers) cannot be imported, it says so
+  instead of reporting the engine installed. That check does not cover `accelerate`.
+- Setting up Ollama runs its official installer up to 3 times when the download is cut
+  off, with a message between attempts. An attempt that runs out the 15-minute limit is
+  not repeated.
+- A saved API key is used only with the provider it was saved for, and changing provider
+  with `ucx llm use` keeps it.
+
+### Compatibility
+
+- `settings.json` written by 0.2.2 can carry `llm_api_key_provider`, which 0.2.1
+  ignores: 0.2.1 applies a saved API key to whichever provider is saved, and a Settings
+  save in 0.2.1 removes the field. 0.2.1's terminal commands also do not read the saved
+  default.
+- A conversation that contains a turn refused because its model cannot use tools records
+  a reason 0.2.1 does not know, so 0.2.1 may not open it.
+
 ## [0.2.1] - 2026-09-24
 
 ### Added

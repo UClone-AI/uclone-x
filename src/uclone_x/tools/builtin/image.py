@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import hashlib
 import inspect
 import json
@@ -10,6 +11,8 @@ import logging
 import os
 import platform
 import secrets
+import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -63,6 +66,31 @@ DEFAULT_CHECKPOINTS = (
 )
 DIFFUSERS_STEPS = 20
 DIFFUSERS_GUIDANCE = 7.0
+#: Free CUDA memory below which the SDXL pipeline is offloaded to the CPU instead of being
+#: loaded onto the card whole. An estimate, not a measurement: SDXL's float16 weights are
+#: about 7 GB (UNet ~5.1 GB, both text encoders ~1.6 GB, VAE ~0.2 GB), and denoising plus
+#: the float32 VAE decode at up to 1024 px was budgeted at about 3 GB more. A 16 GB card
+#: with qwen3:8b resident in Ollama at a 16K window has roughly 8 GB free, so it offloads.
+CUDA_RESIDENT_MIN_FREE_BYTES = 10 * 1024**3
+#: Where WSL2 puts the host driver's user-space tools, `nvidia-smi` among them. It is
+#: usually on PATH there too; this is the fallback when a login shell did not add it.
+WSL_NVIDIA_SMI = "/usr/lib/wsl/lib/nvidia-smi"
+#: The whole-device memory query, in MiB with no header or units: one `used, total` line
+#: per GPU.
+NVIDIA_SMI_MEMORY_QUERY = (
+    "--query-gpu=memory.used,memory.total",
+    "--format=csv,noheader,nounits",
+)
+#: How long the `nvidia-smi` query may take before its figure is treated as unknown. It
+#: answers in well under a second on a working driver; a wedged one must not hold up the
+#: image load, and an unknown figure only costs the slower offloaded path.
+NVIDIA_SMI_TIMEOUT_SECONDS = 5.0
+#: What a person is told when the graphics card runs out of memory. Plain copy on purpose:
+#: torch's own text names allocator internals and byte counts, which help nobody decide.
+GPU_OUT_OF_MEMORY_MESSAGE = (
+    "The graphics card ran out of memory while making the image. Close other programs "
+    "using the graphics card, or try a smaller image, then ask again."
+)
 
 
 def expand_checkpoint_path(path: str) -> str:
@@ -111,6 +139,16 @@ IN_PROCESS_REQUIREMENTS: tuple[tuple[str, str, tuple[int, ...]], ...] = (
     ("diffusers", "diffusers>=0.31.0", (0, 31)),
     ("torch", "torch>=2.2.0", (2, 2)),
     ("transformers", "transformers>=4.40.0", (4, 40)),
+)
+
+#: What an install of the in-process engine asks for: every readiness requirement, plus
+#: `accelerate`. It is installed but not required: the engine generates without it, and
+#: only a CUDA card short of memory needs it, for `enable_model_cpu_offload` (see
+#: `place_pipeline`). Were it in `IN_PROCESS_REQUIREMENTS`, an MPS or CPU engine that
+#: worked before an upgrade would report itself not ready after it.
+IN_PROCESS_INSTALL_REQUIREMENTS: tuple[tuple[str, str, tuple[int, ...]], ...] = (
+    *IN_PROCESS_REQUIREMENTS,
+    ("accelerate", "accelerate>=0.31.0", (0, 31)),
 )
 
 
@@ -237,7 +275,7 @@ def diffusers_install_hint() -> str:
     A uv-created environment has no pip, so `pip install ...` is not an answer there; naming
     the interpreter keeps the packages landing where `ucx` imports from.
     """
-    packages = " ".join(f"'{requirement}'" for _, requirement, _ in IN_PROCESS_REQUIREMENTS)
+    packages = " ".join(f"'{requirement}'" for _, requirement, _ in IN_PROCESS_INSTALL_REQUIREMENTS)
     return (
         "Install them into the environment running UClone-X: re-run `ucx start` and accept "
         f"the image generator, or run `uv pip install --python {sys.executable} {packages}`."
@@ -434,6 +472,249 @@ class RemoteCudaImageEngine(BaseImageEngine):
         )
 
 
+def select_torch_device(torch: Any) -> tuple[str, Any]:
+    """The device and dtype the in-process engine loads SDXL onto: CUDA, then MPS, then CPU.
+
+    Until the fresh-machine test on an RTX 5070 Ti, only MPS was checked, so an NVIDIA
+    machine with a working CUDA build of torch ran SDXL on its CPU in float32 while
+    reporting nothing wrong. Half precision is used on either accelerator; the CPU keeps
+    float32, because most CPU kernels have no fast float16 path.
+    """
+    cuda = getattr(torch, "cuda", None)
+    if cuda is not None and cuda.is_available():
+        return "cuda", torch.float16
+    mps = getattr(getattr(torch, "backends", None), "mps", None)
+    if mps is not None and mps.is_available():
+        return "mps", torch.float16
+    return "cpu", torch.float32
+
+
+def describe_torch_device(torch: Any, device: str) -> str:
+    """What `device_info` says about the device a pipeline was loaded onto.
+
+    A CUDA device is named by its GPU, because "cuda (x86_64)" says which architecture
+    the host CPU has and nothing about the card doing the work. Everything else keeps the
+    host processor, which *is* the hardware for MPS (the SoC) and for the CPU.
+    """
+    if device == "cuda":
+        try:
+            return f"cuda ({torch.cuda.get_device_name(0)})"
+        except Exception:
+            return "cuda"
+    return f"{device} ({platform.processor() or platform.machine()})"
+
+
+def in_process_device() -> str | None:
+    """The device the in-process engine would load onto, or None when torch cannot say.
+
+    Read the same way `_ensure_pipeline_loaded` chooses, so `ucx media status` names the
+    device a generation would actually use rather than the one this module once assumed.
+    """
+    try:
+        import importlib
+
+        torch: Any = importlib.import_module("torch")
+        device, dtype = select_torch_device(torch)
+        precision = "float16" if dtype == torch.float16 else "float32"
+        return f"{describe_torch_device(torch, device)}, {precision}"
+    except Exception:
+        return None
+
+
+def running_under_wsl(
+    osrelease: Path = Path("/proc/sys/kernel/osrelease"),
+    version: Path = Path("/proc/version"),
+    dxg: Path = Path("/dev/dxg"),
+) -> bool:
+    """Whether this is a Linux running under Windows' WSL2.
+
+    The kernel names itself "microsoft" / "WSL" in its release string there, and the GPU
+    reaches the guest through the `/dev/dxg` paravirtual device. Either is enough: a
+    custom kernel can drop the name, and a WSL without GPU support has no `/dev/dxg`
+    but then has no CUDA either.
+    """
+    for source in (osrelease, version):
+        try:
+            text = source.read_text(encoding="utf-8", errors="replace").lower()
+        except OSError:
+            continue
+        if "microsoft" in text or "wsl" in text:
+            return True
+    return dxg.exists()
+
+
+def parse_nvidia_smi_free_bytes(output: str) -> int | None:
+    """The least free memory of any GPU in `nvidia-smi`'s `used, total` MiB lines.
+
+    None when there is no line or any line does not parse (`[N/A]`, an error message on
+    stdout): a figure that cannot be read is unknown, never ample. With several cards the
+    least free one is taken, because `nvidia-smi` numbers GPUs without regard to
+    `CUDA_VISIBLE_DEVICES` and so cannot say which of them torch's device 0 is; the
+    tightest card can only send the load down the slower offloaded path.
+    """
+    free: list[int] = []
+    for line in output.splitlines():
+        if not line.strip():
+            continue
+        try:
+            used_mib, total_mib = (int(field.strip()) for field in line.split(","))
+        except ValueError:
+            return None  # an unreadable line makes the whole reading unknown
+        free.append(max(total_mib - used_mib, 0) * 1024**2)
+    return min(free, default=None)
+
+
+def nvidia_smi_output() -> str | None:
+    """`nvidia-smi`'s whole-device memory query, or None when it cannot be run."""
+    executable = shutil.which("nvidia-smi") or WSL_NVIDIA_SMI
+    try:
+        completed = subprocess.run(
+            [executable, *NVIDIA_SMI_MEMORY_QUERY],
+            capture_output=True,
+            text=True,
+            timeout=NVIDIA_SMI_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0:
+        return None
+    return completed.stdout
+
+
+def nvml_free_bytes() -> int | None:
+    """The least free memory of any GPU, read through NVML, or None when NVML is absent.
+
+    `nvidia-ml-py` (imported as `pynvml`) is not an in-process requirement, so it is used
+    when present and otherwise `nvidia-smi` -- a front end to the same library -- is.
+    Free is taken as total minus used, the figures `nvidia-smi` shows.
+    """
+    try:
+        import importlib
+
+        pynvml: Any = importlib.import_module("pynvml")
+        pynvml.nvmlInit()
+    except Exception:
+        return None
+    try:
+        free: list[int] = []
+        for index in range(int(pynvml.nvmlDeviceGetCount())):
+            memory = pynvml.nvmlDeviceGetMemoryInfo(pynvml.nvmlDeviceGetHandleByIndex(index))
+            free.append(max(int(memory.total) - int(memory.used), 0))
+        return min(free) if free else None
+    except Exception:
+        return None
+    finally:
+        try:
+            pynvml.nvmlShutdown()
+        except Exception:
+            pass
+
+
+def device_wide_free_bytes() -> int | None:
+    """Free GPU memory as the driver counts it for the whole device, or None if unknown."""
+    free_bytes = nvml_free_bytes()
+    if free_bytes is not None:
+        return free_bytes
+    output = nvidia_smi_output()
+    return None if output is None else parse_nvidia_smi_free_bytes(output)
+
+
+def cuda_has_room_for_sdxl(torch: Any) -> bool:
+    """Whether the CUDA card has enough free memory to hold the whole SDXL pipeline.
+
+    Read from `torch.cuda.mem_get_info`, which on native Linux and Windows counts what
+    *other* processes hold too -- an Ollama model kept resident is exactly the case this
+    exists for. When the figure cannot be read, the answer is no: offloading is slower,
+    but it does not run out.
+
+    Under WSL2 that reading is not trusted alone. On an RTX 5070 Ti 16 GB it reported
+    14.66 GiB free while `nvidia-smi` showed 8115 MiB held by a resident qwen3:8b, so SDXL
+    was loaded whole and peaked at 15860 of 16303 MiB. There the driver's whole-device
+    figure (NVML, else `nvidia-smi`) is read as well and the smaller of the two is used;
+    when neither can be read, free memory is unknown and the pipeline offloads.
+
+    Native Linux keeps the torch figure alone, by decision: there `cudaMemGetInfo` is the
+    driver's device-wide counter, the one NVML reports, so a second reading adds a
+    subprocess per load and nothing observed -- and it would have to guess which
+    `nvidia-smi` GPU is torch's device 0, which `CUDA_VISIBLE_DEVICES` renumbers.
+    """
+    try:
+        free_bytes, _total = torch.cuda.mem_get_info()
+    except Exception:
+        free_bytes = 0
+    if running_under_wsl():
+        device_free = device_wide_free_bytes()
+        free_bytes = min(int(free_bytes), device_free) if device_free is not None else 0
+    return int(free_bytes) >= CUDA_RESIDENT_MIN_FREE_BYTES
+
+
+def place_pipeline(pipeline: Any, torch: Any, device: str) -> tuple[Any, bool]:
+    """Put the pipeline on `device`, offloading to the CPU when the card is short of memory.
+
+    Returns the pipeline and whether it was offloaded. Offload keeps each sub-model on the
+    card only while it runs, and VAE tiling decodes the image in pieces; together they fit
+    SDXL beside a resident Ollama model where `.to("cuda")` ran out of memory. Tiling is
+    the VAE's own switch (`AutoencoderKL.enable_tiling`); diffusers 0.40 has no
+    pipeline-level `enable_vae_tiling`. Offload needs `accelerate`, which is an in-process
+    requirement; if diffusers still refuses it (an `ImportError`, as for a version below
+    its floor), the whole pipeline is loaded onto the card and a card that is then too
+    small is reported by the out-of-memory handling.
+    """
+    if device == "cuda" and not cuda_has_room_for_sdxl(torch):
+        try:
+            pipeline.enable_model_cpu_offload()
+        except ImportError:
+            logger.info("accelerate is not installed; loading SDXL onto the card whole")
+        else:
+            pipeline.vae.enable_tiling()
+            return pipeline, True
+    return pipeline.to(device), False
+
+
+#: Added to the out-of-memory message when the card is CUDA and `accelerate` is absent,
+#: because then the pipeline could not offload and was loaded onto the card whole.
+#: diffusers checks for `accelerate` once, when it is imported, so installing it takes
+#: effect only in a fresh process.
+ACCELERATE_MISSING_SENTENCE = (
+    "The package that lets image generation share the graphics card, accelerate, is not "
+    "installed. Call install_package with package='accelerate' to add it; it takes effect "
+    "after UClone-X restarts."
+)
+
+
+def accelerate_is_installed() -> bool:
+    """Whether `accelerate`, which CUDA model offload needs, can be imported here."""
+    import importlib.util
+
+    try:
+        return importlib.util.find_spec("accelerate") is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def out_of_memory_message(device: str | None) -> str:
+    """The plain out-of-memory message, naming `accelerate` only when its absence mattered."""
+    if device == "cuda" and not accelerate_is_installed():
+        return f"{GPU_OUT_OF_MEMORY_MESSAGE} {ACCELERATE_MISSING_SENTENCE}"
+    return GPU_OUT_OF_MEMORY_MESSAGE
+
+
+def torch_out_of_memory_types(torch: Any) -> tuple[type[BaseException], ...]:
+    """The exception classes torch raises when a device runs out of memory.
+
+    `torch.OutOfMemoryError` arrived in torch 2.5; older builds only have
+    `torch.cuda.OutOfMemoryError`. Both are collected, and whichever is absent is skipped.
+    """
+    candidates = (
+        getattr(torch, "OutOfMemoryError", None),
+        getattr(getattr(torch, "cuda", None), "OutOfMemoryError", None),
+    )
+    return tuple(
+        kind for kind in candidates if isinstance(kind, type) and issubclass(kind, BaseException)
+    )
+
+
 class LocalDiffusersImageEngine(BaseImageEngine):
     """In-process generation from a single-file SDXL checkpoint, with no daemon (#1095).
 
@@ -446,7 +727,9 @@ class LocalDiffusersImageEngine(BaseImageEngine):
     def __init__(self, checkpoint_path: str | None = None) -> None:
         self._configured = checkpoint_path
         self._pipeline: Any = None
-        self._device: str = "cpu"
+        self._device: str = f"cpu ({platform.processor() or platform.machine()})"
+        #: The torch device the loaded pipeline was placed on ("cuda", "mps", "cpu").
+        self._torch_device: str | None = None
         self._lock = threading.Lock()
 
     def checkpoint_resolution(self) -> CheckpointResolution:
@@ -495,7 +778,7 @@ class LocalDiffusersImageEngine(BaseImageEngine):
         return self.resolve_checkpoint() is not None
 
     def _ensure_pipeline_loaded(self) -> Any:
-        """Lazily build the SDXL pipeline, on MPS where the platform offers it."""
+        """Lazily build the SDXL pipeline on the fastest device `select_torch_device` finds."""
         if self._pipeline is not None:
             return self._pipeline
 
@@ -526,25 +809,51 @@ class LocalDiffusersImageEngine(BaseImageEngine):
                     f"{exc}. " + in_process_install_remedy()
                 ) from exc
 
-            device = (
-                "mps"
-                if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available()
-                else "cpu"
-            )
-            dtype = torch.float16 if device == "mps" else torch.float32
+            device, dtype = select_torch_device(torch)
             logger.info("Loading SDXL checkpoint %s onto %s...", checkpoint, device)
+            pipeline: Any = None
+            offloaded = False
+            out_of_memory = False
             try:
-                pipeline: Any = diffusers.StableDiffusionXLPipeline.from_single_file(
+                pipeline = diffusers.StableDiffusionXLPipeline.from_single_file(
                     checkpoint, torch_dtype=dtype
                 )
-                pipeline = pipeline.to(device)
+                pipeline, offloaded = place_pipeline(pipeline, torch, device)
             except Exception as exc:
-                raise ImageGenerationError(
-                    f"Failed to load SDXL checkpoint '{checkpoint}': {exc}"
-                ) from exc
+                if not isinstance(exc, torch_out_of_memory_types(torch)):
+                    raise ImageGenerationError(
+                        f"Failed to load SDXL checkpoint '{checkpoint}': {exc}"
+                    ) from exc
+                logger.info("Ran out of memory loading SDXL onto %s: %s", device, str(exc))
+                out_of_memory = True
+            if out_of_memory:
+                # Outside the `except`: there the exception's traceback still holds the
+                # frames that reference the half-placed pipeline, and empty_cache would
+                # free nothing.
+                del pipeline  # the half-placed one
+                self._release_after_out_of_memory(torch)
+                raise ImageGenerationError(out_of_memory_message(device)) from None
             self._pipeline = pipeline
-            self._device = device
+            self._torch_device = device
+            described = describe_torch_device(torch, device)
+            self._device = f"{described}, offloading to CPU" if offloaded else described
             return pipeline
+
+    def _release_after_out_of_memory(self, torch: Any) -> None:
+        """Drop the pipeline and hand its CUDA memory back after an out-of-memory error.
+
+        Called outside the `except` block, once the caller has deleted its own reference,
+        so that nothing but garbage still points at the pipeline when the cache is emptied.
+        Keeping a half-placed pipeline would make every later request fail the same way,
+        and the memory torch caches would stay taken from Ollama, which shares the card.
+        The next request builds the pipeline again and re-reads how much memory is free.
+        """
+        self._pipeline = None
+        gc.collect()
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            logger.debug("torch.cuda.empty_cache failed after running out of memory")
 
     def _run_in_process_generation(
         self,
@@ -559,10 +868,11 @@ class LocalDiffusersImageEngine(BaseImageEngine):
         import io
 
         pipeline: Any = self._ensure_pipeline_loaded()
+        torch: Any = None
         try:
             import importlib
 
-            torch: Any = importlib.import_module("torch")
+            torch = importlib.import_module("torch")
             generator: Any = torch.Generator(device="cpu").manual_seed(seed)
             output: Any = pipeline(
                 prompt=style_guided_prompt(prompt, style),
@@ -582,7 +892,15 @@ class LocalDiffusersImageEngine(BaseImageEngine):
         except Exception as exc:
             if isinstance(exc, ImageGenerationError):
                 raise
-            raise ImageGenerationError(f"In-process image generation failed: {exc}") from exc
+            if torch is None or not isinstance(exc, torch_out_of_memory_types(torch)):
+                raise ImageGenerationError(f"In-process image generation failed: {exc}") from exc
+            logger.info("Ran out of memory generating an image: %s", str(exc))
+        # Only an out-of-memory error reaches here: the `try` returns and every other
+        # failure raises. The release runs outside the `except` so the traceback no
+        # longer keeps the pipeline alive.
+        del pipeline  # the one that ran out
+        self._release_after_out_of_memory(torch)
+        raise ImageGenerationError(out_of_memory_message(self._torch_device)) from None
 
     async def generate(
         self,
@@ -609,7 +927,7 @@ class LocalDiffusersImageEngine(BaseImageEngine):
             image_bytes=img_bytes,
             seed=seed,
             engine_name="diffusers-sdxl",
-            device_info=f"{getattr(self, '_device', 'cpu')} ({platform.processor() or platform.machine()})",
+            device_info=self._device,
             duration_seconds=round(duration, 3),
             width=width,
             height=height,

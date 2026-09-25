@@ -58,7 +58,7 @@ INSTALLABLE_EXTRAS: Final[frozenset[str]] = frozenset(
 #: set behind, so `install_package(package='torch')` -- the repair the engine's own
 #: remedy text leads a model to -- was refused and pointed at `mflux` (reviewer, PR #1096).
 INSTALLABLE_PACKAGES: Final[frozenset[str]] = frozenset(
-    {"diffusers", "torch", "transformers", "pillow"}
+    {"diffusers", "torch", "transformers", "pillow", "accelerate"}
 )
 
 PROJECT_DISTRIBUTION: Final[str] = "uclone-x"

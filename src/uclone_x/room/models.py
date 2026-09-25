@@ -161,17 +161,23 @@ class RoomTurnRefusal(StrEnum):
     #: retry too; a new conversation starts with budgets of its own.
     BUDGET_EXCEEDED = "budget_exceeded"
 
+    #: The speaker's model cannot use tools, which every clone turn sends. A retry on the
+    #: same model is refused the same way; choosing another model is the remedy.
+    MODEL_WITHOUT_TOOLS = "model_without_tools"
+
 
 def turn_refusal(stop_reason: str | None) -> RoomTurnRefusal | None:
     """The refusal a failed turn's `TurnResult.stop_reason` states, if it states one (#969).
 
     The one mapping, shared by the room orchestrator and the chat head's `/api/chat`, so
-    the two heads cannot disagree about which failures a retry is refused on. Only the
-    token ceiling qualifies: `step_budget_exceeded` is not a refusal, since
-    `run_steps` resets per turn and a retry starts with the whole step budget.
+    the two heads cannot disagree about which failures a retry is refused on. The token
+    ceiling and a model without tool support qualify: `step_budget_exceeded` is not a
+    refusal, since `run_steps` resets per turn and a retry starts with the whole step budget.
     """
     if stop_reason == "budget_exceeded":
         return RoomTurnRefusal.BUDGET_EXCEEDED
+    if stop_reason == "model_without_tools":
+        return RoomTurnRefusal.MODEL_WITHOUT_TOOLS
     return None
 
 

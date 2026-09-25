@@ -60,8 +60,15 @@ async def _run_loop_agent(
     effective_cwd = workspace_dir or Path.cwd().resolve()
     bus = EventBus()
     tools = create_default_registry()
+    # Imported here, as `room` does: `ucx --help` imports this module, and `run` is kept
+    # out of that path on purpose, by a fitness check on what `--help` reaches.
+    from uclone_x.cli.commands.run import apply_saved_model
+
+    saved_model, saved_notice = apply_saved_model(provider, model)
+    if saved_notice is not None:
+        console.print(f"[dim]{escape(saved_notice)}[/dim]")
     llm = create_llm_connector(provider=provider, fallback_to_mock=False)
-    effective_model = model or getattr(llm, "default_model", "qwen3:8b")
+    effective_model = saved_model or getattr(llm, "default_model", "qwen3:8b")
 
     store = SessionStore()
     effective_session_id = session_id or f"loop_{agent_name}"

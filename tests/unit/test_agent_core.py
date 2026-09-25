@@ -42,7 +42,7 @@ from uclone_x.errors import (
 from uclone_x.llm import context_window as context_window_module
 from uclone_x.llm.compactor import estimate_message_tokens, resolve_model_context_limit
 from uclone_x.llm.connectors.ollama import OllamaConnector
-from uclone_x.llm.context_window import OllamaContextWindows
+from uclone_x.llm.context_window import DEFAULT_OLLAMA_NUM_CTX, OllamaContextWindows
 from uclone_x.llm.models import (
     ChatMessage,
     FinishReason,
@@ -1064,9 +1064,12 @@ async def test_compact_session_records_absorbed_publish_failure(tmp_path: Path) 
 
 _OLLAMA_BASE = "http://served-window.test:11434"
 _LLAMA = "llama3.2:1b"
-#: The table figure the issue reports for `llama3*`, and the served one it measured.
+#: The table figure the issue reports for `llama3*`, and a served one below it. The
+#: connector now always sends `num_ctx` (`DEFAULT_OLLAMA_NUM_CTX` when nothing is
+#: configured), so a served figure differs from the sent one only when the daemon clamps
+#: it to a smaller trained window -- which the fake daemon models by default here.
 _TABLE_WINDOW = 128_000
-_SERVED_WINDOW = 32_768
+_SERVED_WINDOW = 8_192
 
 
 class _FakeOllamaDaemon:
@@ -1077,7 +1080,7 @@ class _FakeOllamaDaemon:
     that. `loaded` may be seeded to model a daemon that already has the model loaded.
     """
 
-    def __init__(self, *, default_ctx: int = _SERVED_WINDOW, trained_ctx: int = 131_072) -> None:
+    def __init__(self, *, default_ctx: int = 4_096, trained_ctx: int = _SERVED_WINDOW) -> None:
         self.default_ctx = default_ctx
         self.trained_ctx = trained_ctx
         self.loaded: dict[str, int] = {}
@@ -1175,18 +1178,57 @@ def test_an_ollama_model_is_compacted_against_the_served_window_not_the_table(
     assert agent._should_compact_session("s", history, request=request) is True  # pyright: ignore[reportPrivateUsage]
 
 
-def test_an_ollama_window_the_daemon_has_not_reported_is_unknown_not_the_table(
+def test_an_ollama_window_the_daemon_has_not_reported_is_the_one_sent_not_the_table(
     served_windows: OllamaContextWindows,
 ) -> None:
-    """No figure from the daemon is no figure: the table's is a claim about another
-    machine, and it is the one that let the daemon truncate silently (P6).
+    """Before the daemon reports a figure, the window is the `num_ctx` the connector
+    sends -- never the table's, which is a claim about another machine and the one that
+    let the daemon truncate silently (P6).
 
-    Killed by: src/uclone_x/llm/context_window.py :: return served  # the daemon's figure, or unknown: never the table
-    Becomes: return served or resolve_model_context_limit(model)
+    Killed by: src/uclone_x/llm/context_window.py :: sent = configured_tokens if configured_tokens is not None else default_ollama_num_ctx()
+    Becomes: sent = configured_tokens if configured_tokens is not None else resolve_model_context_limit(model)
     """
     agent = _ollama_agent(served_windows, model_name=_LLAMA)
 
-    assert agent._context_window() is None  # pyright: ignore[reportPrivateUsage]
+    assert agent._context_window() == DEFAULT_OLLAMA_NUM_CTX  # pyright: ignore[reportPrivateUsage]
+
+
+def test_the_compaction_window_follows_the_daemons_context_length_like_the_request(
+    served_windows: OllamaContextWindows, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The trigger counts against what the connector sends, and with
+    `OLLAMA_CONTEXT_LENGTH` set that is the variable's window, not the default.
+
+    Killed by: src/uclone_x/llm/context_window.py :: sent = configured_tokens if configured_tokens is not None else default_ollama_num_ctx()
+    Becomes: sent = configured_tokens if configured_tokens is not None else DEFAULT_OLLAMA_NUM_CTX
+    """
+    monkeypatch.setenv("OLLAMA_CONTEXT_LENGTH", "8192")
+    agent = _ollama_agent(served_windows, model_name=_LLAMA)
+
+    assert agent._context_window() == 8_192  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_with_nothing_configured_the_default_window_is_sent_served_and_counted(
+    served_windows: OllamaContextWindows,
+) -> None:
+    """Fresh-machine E2E: a daemon left to choose served 4096 tokens on a 16 GB GPU and a
+    turn failed after its first tool result. With no `context_limit`, the default is sent,
+    the daemon loads the model at it, and the trigger counts against the same figure.
+
+    Killed by: src/uclone_x/llm/connectors/ollama.py :: options["num_ctx"] = num_ctx
+    Becomes: options["num_ctx_unused"] = num_ctx
+    """
+    daemon = _FakeOllamaDaemon(default_ctx=4_096, trained_ctx=40_960)
+    agent = _ollama_agent(served_windows, daemon, model_name="qwen3:8b")
+
+    result = await agent.execute_turn("hi")
+    await agent._observe_context_window()  # pyright: ignore[reportPrivateUsage]
+
+    assert result.error is None
+    assert [b["options"].get("num_ctx") for b in daemon.chat_bodies] == [DEFAULT_OLLAMA_NUM_CTX]
+    assert daemon.loaded == {"qwen3:8b": DEFAULT_OLLAMA_NUM_CTX}
+    assert agent._context_window() == DEFAULT_OLLAMA_NUM_CTX  # pyright: ignore[reportPrivateUsage]
 
 
 def test_the_window_of_an_unnamed_model_is_the_one_the_connector_sends_it_to(
@@ -1232,16 +1274,18 @@ async def test_a_configured_context_limit_is_sent_as_num_ctx_and_is_the_limit(
     Killed by: src/uclone_x/agent/base.py :: if (self._config.llm_config.context_limit or 0) > 0
     Becomes: if (self._config.llm_config.context_limit or 0) > 10**9
     """
-    daemon = _FakeOllamaDaemon()
-    agent = _ollama_agent(served_windows, daemon, model_name=_LLAMA, context_limit=16_384)
+    daemon = _FakeOllamaDaemon(trained_ctx=131_072)
+    # Not `DEFAULT_OLLAMA_NUM_CTX`: a configured limit equal to the default would read the
+    # same whether or not the configuration reached the request.
+    agent = _ollama_agent(served_windows, daemon, model_name=_LLAMA, context_limit=32_768)
 
     result = await agent.execute_turn("hi")
     await agent._observe_context_window()  # pyright: ignore[reportPrivateUsage]
 
     assert result.error is None
-    assert [b["options"].get("num_ctx") for b in daemon.chat_bodies] == [16_384]
-    assert daemon.loaded == {_LLAMA: 16_384}
-    assert agent._context_window() == 16_384  # pyright: ignore[reportPrivateUsage]
+    assert [b["options"].get("num_ctx") for b in daemon.chat_bodies] == [32_768]
+    assert daemon.loaded == {_LLAMA: 32_768}
+    assert agent._context_window() == 32_768  # pyright: ignore[reportPrivateUsage]
 
 
 @pytest.mark.asyncio
@@ -1252,7 +1296,7 @@ async def test_a_num_ctx_the_daemon_clamps_is_read_back_and_the_smaller_figure_w
     daemon's default, so the store holds a figure from before the request; the reload
     must be read again, and the clamped figure -- not the configured one -- is the limit.
 
-    Killed by: src/uclone_x/llm/context_window.py :: if served is not None and served < configured_tokens:
+    Killed by: src/uclone_x/llm/context_window.py :: if served is not None and served < sent:
     Becomes: if served is not None and served < 0:
     Killed by: src/uclone_x/llm/connectors/ollama.py :: if self._windows.get(base, name) is None or name in self._unconfirmed:
     Becomes: if self._windows.get(base, name) is None:

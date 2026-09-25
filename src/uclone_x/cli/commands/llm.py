@@ -11,6 +11,7 @@ import urllib.request
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
 
 from uclone_x.errors import LLMProviderError
@@ -261,3 +262,69 @@ def llm_rm(
     except LLMProviderError as e:
         console.print(f"[bold red]Failed to remove model {model}:[/bold red] {e}")
         raise typer.Exit(code=1) from e
+
+
+@llm_app.command("use")
+def llm_use(
+    model: str = typer.Argument(..., help="Model to make the default, e.g. 'qwen3:1.7b'"),
+    provider: str = typer.Option(
+        "ollama", "--provider", help="Provider that serves it: ollama, vllm, openai, ..."
+    ),
+    base_url: str | None = typer.Option(
+        None, "--base-url", help="Address of the server, when it is not the usual one"
+    ),
+) -> None:
+    """Make MODEL the default for `ucx run`, rooms and the dashboard.
+
+    Saved where the dashboard's Settings keep the choice, so both change the same thing.
+    Without `--base-url`, an address already saved for the same provider is kept. A saved
+    API key is kept too, for the provider it was saved for.
+    """
+    from uclone_x.llm.connectors.factory import model_env_override, what_outranks_saved_choice
+    from uclone_x.llm.connectors.saved_choice import (
+        SAVED_PROVIDERS,
+        read_saved_choice,
+        save_choice,
+        settings_file,
+    )
+
+    chosen = provider.strip().lower()
+    if chosen not in SAVED_PROVIDERS:
+        known = ", ".join(sorted(SAVED_PROVIDERS))
+        console.print(
+            f"[red]{escape(provider)} is not a provider this version knows: {known}.[/red]"
+        )
+        raise typer.Exit(code=2)
+    try:
+        before = read_saved_choice()
+        address = base_url
+        if address is None and before is not None and before.provider == chosen:
+            address = before.base_url
+        save_choice(provider=chosen, model=model, base_url=address)
+    except (OSError, ValueError):
+        console.print(
+            f"[red]Could not save {escape(model)} as the default: {escape(str(settings_file()))} "
+            "could not be read or written. Choose it in the dashboard's Settings instead, "
+            f"or pass --model {escape(model)} to each command.[/red]"
+        )
+        raise typer.Exit(code=1) from None
+    # Saved is not the same as in use: a variable outranks the file, so say which one.
+    winner = what_outranks_saved_choice()
+    model_variable = model_env_override(chosen)
+    if winner is not None:
+        console.print(
+            f"[yellow]Saved {escape(model)} ({chosen}) as the default, but it is not used yet: "
+            f"{winner} is set in this shell, and it takes priority over the saved default. "
+            f"Unset {winner} to use {escape(model)}.[/yellow]"
+        )
+    elif model_variable is not None:
+        console.print(
+            f"[yellow]Saved {escape(model)} ({chosen}) as the default, but {model_variable} is "
+            f"set in this shell and names another model, which is used instead. "
+            f"Unset {model_variable} to use {escape(model)}.[/yellow]"
+        )
+    else:
+        console.print(
+            f"[green]✔ {escape(model)} ({chosen}) is now the default model for `ucx run`, "
+            "rooms and the dashboard.[/green]"
+        )

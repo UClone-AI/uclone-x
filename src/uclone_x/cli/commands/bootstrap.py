@@ -370,6 +370,24 @@ def ollama_installer_env() -> dict[str, str]:
     return env
 
 
+#: How many times the official Ollama installer is run before giving up. Its download is
+#: a single ~1 GB archive with no resume, and a reset connection at 95% (measured on a Mac
+#: on a flaky network: `curl: (56) Recv failure: Connection reset by peer`) otherwise
+#: ends the whole setup at "not runnable".
+OLLAMA_INSTALL_ATTEMPTS: Final = 3
+#: Seconds to wait before running the installer again, multiplied by the attempt number.
+OLLAMA_INSTALL_RETRY_DELAY_S: float = 5.0
+
+
+def _ollama_runnable() -> tuple[str, str] | None:
+    """``(binary, version)`` when an ollama can be found and run, else ``None``."""
+    binary = ollama_binary()
+    version = ollama_version(binary)
+    if binary is None or version is None:
+        return None
+    return binary, version
+
+
 def install_ollama_platform() -> bool:
     """Install Ollama, then verify by running it — never by trusting the exit code.
 
@@ -380,30 +398,50 @@ def install_ollama_platform() -> bool:
     on the measured Mac mini (its `sudo ln` fails) while leaving a perfectly usable app
     behind, so exit code and reality disagree in both directions and only one of them can
     be measured.
+
+    The official installer is run up to ``OLLAMA_INSTALL_ATTEMPTS`` times while the binary
+    is still not runnable afterwards, because the usual cause is a download cut off part
+    way. A run that hits the 15-minute timeout is not repeated: another 15 minutes on the
+    same connection is not a remedy, and the person has already waited.
     """
     os_type = platform.system()
     if os_type == "Darwin" and shutil.which("brew"):
         console.print("[bold cyan]📦 Installing Ollama via Homebrew...[/bold cyan]")
         subprocess.run(["brew", "install", "ollama"], check=False, stdin=subprocess.DEVNULL)
+        found = _ollama_runnable()
     elif os_type in ("Darwin", "Linux"):
-        console.print("[bold cyan]📦 Installing Ollama via official install script...[/bold cyan]")
-        try:
-            subprocess.run(
-                "curl -fsSL https://ollama.com/install.sh | sh",
-                shell=True,
-                check=False,
-                stdin=subprocess.DEVNULL,
-                env=ollama_installer_env(),
-                timeout=900,
-            )
-        except subprocess.TimeoutExpired:
+        found = None
+        for attempt in range(1, OLLAMA_INSTALL_ATTEMPTS + 1):
+            if attempt == 1:
+                console.print(
+                    "[bold cyan]📦 Installing Ollama via official install script...[/bold cyan]"
+                )
+            try:
+                subprocess.run(
+                    "curl -fsSL https://ollama.com/install.sh | sh",
+                    shell=True,
+                    check=False,
+                    stdin=subprocess.DEVNULL,
+                    env=ollama_installer_env(),
+                    timeout=900,
+                )
+            except subprocess.TimeoutExpired:
+                console.print(
+                    "[bold red]✖ The Ollama installer did not finish in 15 minutes.[/bold red]"
+                )
+                return False
+            except Exception as exc:
+                console.print(f"[bold red]✖ Could not run the Ollama installer: {exc}[/bold red]")
+                return False
+            found = _ollama_runnable()
+            if found is not None or attempt == OLLAMA_INSTALL_ATTEMPTS:
+                break
             console.print(
-                "[bold red]✖ The Ollama installer did not finish in 15 minutes.[/bold red]"
+                f"[yellow]The Ollama download did not finish, which usually means the "
+                f"connection dropped. Trying again ({attempt + 1} of "
+                f"{OLLAMA_INSTALL_ATTEMPTS})...[/yellow]"
             )
-            return False
-        except Exception as exc:
-            console.print(f"[bold red]✖ Could not run the Ollama installer: {exc}[/bold red]")
-            return False
+            time.sleep(OLLAMA_INSTALL_RETRY_DELAY_S * attempt)
     else:
         console.print(
             f"[bold red]✖ No automated Ollama install for {escape(os_type)}. "
@@ -411,14 +449,13 @@ def install_ollama_platform() -> bool:
         )
         return False
 
-    binary = ollama_binary()
-    version = ollama_version(binary)
-    if binary is None or version is None:
+    if found is None:
         console.print(
             "[bold red]✖ Ollama is still not runnable after the install.[/bold red] "
             "Looked on PATH and at " + escape(", ".join(OLLAMA_APP_BINARIES)) + "."
         )
         return False
+    binary, version = found
     console.print(f"[bold green]✔ Ollama ready:[/bold green] {escape(binary)} ({escape(version)})")
     return True
 
@@ -675,9 +712,9 @@ def diffusers_install_command() -> list[str] | None:
     that stops at `diffusers` leaves the engine unable to generate (#1095).
     """
     from uclone_x.core.environment_install import installer_command
-    from uclone_x.tools.builtin.image import IN_PROCESS_REQUIREMENTS
+    from uclone_x.tools.builtin.image import IN_PROCESS_INSTALL_REQUIREMENTS
 
-    packages = [requirement for _, requirement, _ in IN_PROCESS_REQUIREMENTS]
+    packages = [requirement for _, requirement, _ in IN_PROCESS_INSTALL_REQUIREMENTS]
     return installer_command(*packages)
 
 
@@ -1223,6 +1260,76 @@ class LocalSetupResult(NamedTuple):
         return [part.summary_line() for part in (self.llm, self.image) if part is not None]
 
 
+def _same_address(saved: str | None, prepared: str | None) -> bool:
+    """Whether a saved Ollama address reaches the daemon setup prepared.
+
+    No saved address means the connector resolves the usual one, which is the one setup
+    checked, so it counts as the same.
+    """
+    if saved is None or prepared is None:
+        return True
+    return saved.rstrip("/") == prepared.rstrip("/")
+
+
+def remember_local_llm(result: LlmSetup) -> None:
+    """Save the model setup just made ready as the default, unless one is already saved.
+
+    Without this, `ucx install --yes` printed `setup llm: ready model=...` and the next
+    `ucx run` refused with "No LLM provider is configured": nothing setup did was anywhere
+    the terminal commands looked. The choice goes to the file the dashboard's Settings
+    already keep, so there is one saved choice for every head. A choice already saved --
+    by the person in Settings, or by an earlier install -- is kept; setup only fills in
+    what is missing.
+
+    What is printed is read back from the file after the write, not assumed from it: when
+    the saved default is not what setup just prepared, the person is told both, and how to
+    switch. A failure to save is reported and does not fail the setup: the model is still
+    ready, and `--provider`/`--model` or the dashboard still reach it.
+    """
+    from uclone_x.llm.connectors.saved_choice import read_saved_choice, remember_choice_if_unset
+
+    model = escape(result.model)
+    try:
+        written, _before = remember_choice_if_unset(
+            provider="ollama", model=result.model, base_url=result.endpoint
+        )
+        saved = read_saved_choice()
+    except (OSError, ValueError):
+        console.print(
+            "[yellow]Could not save this model as the default, so `ucx run` will not pick "
+            "it up on its own. Choose it in the dashboard's Settings, or pass "
+            f"--provider ollama --model {model}.[/yellow]"
+        )
+        return
+    if saved is None:
+        return
+    switch = (
+        f"To use {model} instead, run `ucx llm use {model}` or choose it in the "
+        "dashboard's Settings."
+    )
+    if saved.provider != "ollama" or saved.model not in (None, result.model):
+        what = escape(saved.model or saved.provider)
+        if saved.provider != "ollama":
+            what = f"{what} ({escape(saved.provider)})"
+        console.print(
+            f"[yellow]{what} is already saved as the default model, so it stays the "
+            f"default rather than {model}, which setup just prepared. {switch}[/yellow]"
+        )
+    elif not _same_address(saved.base_url, result.endpoint):
+        console.print(
+            f"[yellow]The saved default asks for {model} at {escape(saved.base_url or '')}, "
+            f"but setup prepared it at {escape(result.endpoint)}. To use this one, run "
+            f"`ucx llm use {model} --base-url {escape(result.endpoint)}`.[/yellow]"
+        )
+    elif written:
+        console.print(
+            f"[green]✔ Saved {model} as the default model for `ucx run`, "
+            "rooms and the dashboard.[/green]"
+        )
+    else:
+        console.print(f"[dim]Kept {model}, the model already saved as the default.[/dim]")
+
+
 def run_local_setup(
     *,
     llm: bool = True,
@@ -1238,8 +1345,11 @@ def run_local_setup(
     copy of this sequence inline; two copies of "prepare the local models" is how one of
     them silently stops matching the other.
     """
+    llm_result = setup_local_llm(interactive=interactive, assume_yes=assume_yes) if llm else None
+    if llm_result is not None and llm_result.ready:
+        remember_local_llm(llm_result)
     return LocalSetupResult(
-        llm=(setup_local_llm(interactive=interactive, assume_yes=assume_yes) if llm else None),
+        llm=llm_result,
         image=(
             setup_local_image(
                 interactive=interactive,

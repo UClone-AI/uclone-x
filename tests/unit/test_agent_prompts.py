@@ -17,6 +17,7 @@ from uclone_x.agent.persona_registry import get_default_persona_registry
 from uclone_x.agent.prompts import (
     HERMES_STEERABILITY_POLICY,
     IDENTITY_GROUNDING,
+    QWEN_STEERABILITY_POLICY,
     STEERABILITY_POLICY,
     TASK_CAPABILITIES,
     ModelFamily,
@@ -143,7 +144,17 @@ def test_hermes_composition_swaps_only_the_steerability_section() -> None:
     assert hermes != DEFAULT_SYSTEM_PROMPT
 
 
-@pytest.mark.parametrize("model_name", ["qwen2.5:14b", "llama3.2", "gemma2:9b", None])
+def test_qwen_composition_swaps_only_the_steerability_section() -> None:
+    """Qwen family composition frames for tool discipline and language matching."""
+    qwen = compose_system_prompt("qwen3:8b")
+    assert IDENTITY_GROUNDING in qwen
+    assert TASK_CAPABILITIES in qwen
+    assert QWEN_STEERABILITY_POLICY in qwen
+    assert STEERABILITY_POLICY not in qwen
+    assert qwen != DEFAULT_SYSTEM_PROMPT
+
+
+@pytest.mark.parametrize("model_name", ["llama3.2", "mistral-nemo", "gemma2:9b", None])
 def test_families_without_their_own_framing_get_the_default_prompt_unchanged(
     model_name: str | None,
 ) -> None:
@@ -155,10 +166,17 @@ def test_adapt_reframes_a_persona_prompt_without_touching_its_own_preamble() -> 
     """Personas embed the default components, so adaptation reaches them too."""
     pioneer = get_default_persona_registry().get_persona("pioneer")
     assert pioneer is not None
-    adapted = adapt_system_prompt(agent_config_for_persona(pioneer).system_prompt, "hermes3:8b")
-    assert adapted.startswith("You are Pioneer")
-    assert HERMES_STEERABILITY_POLICY in adapted
-    assert STEERABILITY_POLICY not in adapted
+    adapted_hermes = adapt_system_prompt(
+        agent_config_for_persona(pioneer).system_prompt, "hermes3:8b"
+    )
+    assert adapted_hermes.startswith("You are Pioneer")
+    assert HERMES_STEERABILITY_POLICY in adapted_hermes
+    assert STEERABILITY_POLICY not in adapted_hermes
+
+    adapted_qwen = adapt_system_prompt(agent_config_for_persona(pioneer).system_prompt, "qwen3:8b")
+    assert adapted_qwen.startswith("You are Pioneer")
+    assert QWEN_STEERABILITY_POLICY in adapted_qwen
+    assert STEERABILITY_POLICY not in adapted_qwen
 
 
 def test_adapt_returns_an_operator_written_prompt_byte_identical() -> None:
@@ -231,11 +249,15 @@ def test_re_framing_away_from_a_family_restores_the_default_framing() -> None:
     assert HERMES_STEERABILITY_POLICY in hermes
     assert STEERABILITY_POLICY not in hermes
 
-    back = adapt_system_prompt(hermes, "qwen3:8b")
+    back = adapt_system_prompt(hermes, "llama3.2")
 
     assert back == DEFAULT_SYSTEM_PROMPT
     assert STEERABILITY_POLICY in back
     assert HERMES_STEERABILITY_POLICY not in back
+
+    to_qwen = adapt_system_prompt(hermes, "qwen3:8b")
+    assert QWEN_STEERABILITY_POLICY in to_qwen
+    assert HERMES_STEERABILITY_POLICY not in to_qwen
 
 
 def test_re_framing_is_idempotent_and_round_trips() -> None:

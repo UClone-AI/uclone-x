@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import weakref
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -11,9 +13,12 @@ import pytest
 
 from uclone_x.tools.builtin.comfy_client import COMFY_DEFAULT_CHECKPOINT
 from uclone_x.tools.builtin.image import (
+    ACCELERATE_MISSING_SENTENCE,
     COMFY_URL_ENV,
     DEFAULT_CHECKPOINTS,
+    GPU_OUT_OF_MEMORY_MESSAGE,
     IMAGE_CHECKPOINT_ENV,
+    IN_PROCESS_INSTALL_REQUIREMENTS,
     IN_PROCESS_REQUIREMENTS,
     CheckpointResolution,
     ComfyUIImageEngine,
@@ -24,13 +29,26 @@ from uclone_x.tools.builtin.image import (
     ImagePipelineDispatcher,
     LocalDiffusersImageEngine,
     RemoteCudaImageEngine,
+    accelerate_is_installed,
     compute_deterministic_seed,
+    device_wide_free_bytes,
     diffusers_install_hint,
     expand_checkpoint_path,
     in_process_dependency_problems,
+    out_of_memory_message,
+    parse_nvidia_smi_free_bytes,
     resolve_aspect_dimensions,
+    running_under_wsl,
+    select_torch_device,
     style_guided_prompt,
+    torch_out_of_memory_types,
     version_release,
+)
+from uclone_x.tools.builtin.image import (
+    nvidia_smi_output as real_nvidia_smi_output,
+)
+from uclone_x.tools.builtin.image import (
+    nvml_free_bytes as real_nvml_free_bytes,
 )
 from uclone_x.tools.models import ToolContext
 
@@ -1126,6 +1144,51 @@ def test_install_hint_names_every_requirement_with_its_floor() -> None:
         assert requirement in hint
 
 
+def test_a_missing_accelerate_leaves_a_working_engine_ready(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An MPS or CPU engine that generated before an upgrade must still report ready.
+
+    `accelerate` only lets a CUDA card short of memory offload; the engine runs without it.
+    """
+    _fake_environment(monkeypatch, {**_ALL_PRESENT})
+
+    assert in_process_dependency_problems() == ()
+    assert "accelerate" not in {module for module, _, _ in IN_PROCESS_REQUIREMENTS}
+
+
+def test_the_install_list_adds_accelerate_to_the_requirements() -> None:
+    """Killed by: src/uclone_x/tools/builtin/image.py :: ("accelerate", "accelerate>=0.31.0", (0, 31)),
+    Becomes: ("diffusers", "diffusers>=0.31.0", (0, 31)),
+    """
+    requirements = [requirement for _, requirement, _ in IN_PROCESS_INSTALL_REQUIREMENTS]
+
+    assert requirements == [
+        *(requirement for _, requirement, _ in IN_PROCESS_REQUIREMENTS),
+        "accelerate>=0.31.0",
+    ]
+
+
+def test_the_install_hint_installs_accelerate_too() -> None:
+    """Killed by: src/uclone_x/tools/builtin/image.py :: f"'{requirement}'" for _, requirement, _ in IN_PROCESS_INSTALL_REQUIREMENTS
+    Becomes: f"'{requirement}'" for _, requirement, _ in IN_PROCESS_REQUIREMENTS
+    """
+    assert "'accelerate>=0.31.0'" in diffusers_install_hint()
+
+
+def test_accelerate_is_installed_reads_this_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Killed by: src/uclone_x/tools/builtin/image.py :: return importlib.util.find_spec("accelerate") is not None
+    Becomes: return importlib.util.find_spec("accelerate") is None
+    """
+    _fake_environment(monkeypatch, {"accelerate": "1.15.0"})
+    assert accelerate_is_installed()
+
+    _fake_environment(monkeypatch, {})
+    assert not accelerate_is_installed()
+
+
 @pytest.mark.asyncio
 async def test_diagnostics_lists_the_missing_in_process_packages(
     monkeypatch: pytest.MonkeyPatch,
@@ -1305,7 +1368,7 @@ async def test_local_diffusers_image_engine_run_in_process_generation(tmp_path: 
 
     # Create dummy PIL image to return from pipeline
     pil_img = Image.new("RGB", (64, 64), color="blue")
-    mock_pipeline = MagicMock()
+    mock_pipeline = _sdxl_pipeline()
     mock_pipeline.return_value = MagicMock(images=[pil_img])
 
     with patch.object(engine, "_ensure_pipeline_loaded", return_value=mock_pipeline):
@@ -1319,3 +1382,793 @@ async def test_local_diffusers_image_engine_run_in_process_generation(tmp_path: 
         )
 
     assert png_bytes.startswith(b"\x89PNG")
+
+
+class _FakeOutOfMemoryError(RuntimeError):
+    """Stands in for `torch.OutOfMemoryError`, with torch's own allocator wording."""
+
+
+_RAW_OOM_TEXT = (
+    "CUDA out of memory. Tried to allocate 1.50 GiB. GPU 0 has a total capacity of "
+    "15.99 GiB of which 812.00 MiB is free. See /opt/torch/docs PYTORCH_CUDA_ALLOC_CONF"
+)
+
+
+class _SdxlVaeSpec:
+    """The `AutoencoderKL` methods the engine calls, named as in diffusers 0.40."""
+
+    def enable_tiling(self) -> None: ...
+
+
+class _SdxlPipelineSpec:
+    """The `StableDiffusionXLPipeline` surface the engine calls, named as in diffusers 0.40.
+
+    A mock specced from this raises `AttributeError` for any other name, which is how a
+    call to the nonexistent `enable_vae_tiling` would have failed here instead of on
+    every offloaded load. `test_the_pipeline_spec_names_only_what_diffusers_has` checks
+    each name against the installed diffusers.
+    """
+
+    def to(self, device: str) -> _SdxlPipelineSpec: ...
+
+    def enable_model_cpu_offload(self) -> None: ...
+
+    def __call__(self, **kwargs: Any) -> Any: ...
+
+
+@pytest.fixture(autouse=True)
+def no_real_gpu_readings(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No test here reads this machine's kernel, NVML or `nvidia-smi` (P8).
+
+    The WSL detection reads `/proc` and `/dev/dxg`, and on WSL the free-memory check runs
+    `nvidia-smi`. Pinned to native with no whole-device source; a test that needs WSL or a
+    reading sets its own.
+    """
+    import uclone_x.tools.builtin.image as image_module
+
+    def no_reading() -> None:
+        raise AssertionError("a unit test reached a real GPU memory source")
+
+    monkeypatch.setattr(image_module, "running_under_wsl", lambda: False)
+    monkeypatch.setattr(image_module, "nvml_free_bytes", no_reading)
+    monkeypatch.setattr(image_module, "nvidia_smi_output", no_reading)
+
+
+def _sdxl_pipeline() -> MagicMock:
+    """A specced SDXL pipeline whose `.to` returns itself, as diffusers' does."""
+    pipeline = MagicMock(spec=_SdxlPipelineSpec)
+    pipeline.vae = MagicMock(spec=_SdxlVaeSpec)
+    pipeline.to.return_value = pipeline
+    return pipeline
+
+
+def test_the_pipeline_spec_names_only_what_diffusers_has() -> None:
+    """The specs above are only as good as their agreement with the real classes."""
+    diffusers = pytest.importorskip("diffusers")
+    import inspect
+
+    sdxl = diffusers.StableDiffusionXLPipeline
+    for name in ("to", "enable_model_cpu_offload", "__call__"):
+        assert callable(getattr(sdxl, name)), name
+    assert callable(sdxl.from_single_file)
+    vae = inspect.signature(sdxl.__init__).parameters["vae"]
+    assert vae.annotation is diffusers.AutoencoderKL
+    assert callable(diffusers.AutoencoderKL.enable_tiling)
+    assert not hasattr(sdxl, "enable_vae_tiling")
+
+
+class _FakeTorch:
+    """Just enough of `torch` for device selection and placement.
+
+    Two dtype sentinels, two availability probes, the free-memory reading, and the
+    out-of-memory class. The default free memory is ample, so a test that does not name
+    it gets the plain `.to("cuda")` placement.
+    """
+
+    float16 = "float16"
+    float32 = "float32"
+    OutOfMemoryError = _FakeOutOfMemoryError
+
+    def __init__(
+        self,
+        *,
+        cuda: bool,
+        mps: bool,
+        gpu_name: str = "NVIDIA GeForce RTX 5070 Ti",
+        free_bytes: int = 15 * 1024**3,
+    ):
+        self.cuda = MagicMock()
+        self.cuda.is_available.return_value = cuda
+        self.cuda.get_device_name.return_value = gpu_name
+        self.cuda.mem_get_info.return_value = (free_bytes, 16 * 1024**3)
+        self.cuda.OutOfMemoryError = _FakeOutOfMemoryError
+        self.Generator = MagicMock()
+        self.backends = MagicMock()
+        self.backends.mps.is_available.return_value = mps
+
+
+def test_select_torch_device_prefers_cuda_in_half_precision() -> None:
+    """The fresh-machine E2E defect: an RTX 5070 Ti ran SDXL on its CPU in float32.
+
+    Killed by: src/uclone_x/tools/builtin/image.py :: if cuda is not None and cuda.is_available():
+    Becomes: if False:
+    """
+    assert select_torch_device(_FakeTorch(cuda=True, mps=False)) == ("cuda", "float16")
+
+
+def test_select_torch_device_prefers_cuda_over_mps() -> None:
+    assert select_torch_device(_FakeTorch(cuda=True, mps=True)) == ("cuda", "float16")
+
+
+def test_select_torch_device_keeps_mps_in_half_precision() -> None:
+    """Killed by: src/uclone_x/tools/builtin/image.py :: return "mps", torch.float16
+    Becomes: return "mps", torch.float32
+    """
+    assert select_torch_device(_FakeTorch(cuda=False, mps=True)) == ("mps", "float16")
+
+
+def test_select_torch_device_falls_back_to_cpu_in_full_precision() -> None:
+    """Killed by: src/uclone_x/tools/builtin/image.py :: return "cpu", torch.float32
+    Becomes: return "cpu", torch.float16
+    """
+    assert select_torch_device(_FakeTorch(cuda=False, mps=False)) == ("cpu", "float32")
+
+
+@pytest.mark.parametrize(
+    ("cuda", "mps", "device", "dtype"),
+    [
+        (True, False, "cuda", "float16"),
+        (False, True, "mps", "float16"),
+        (False, False, "cpu", "float32"),
+    ],
+)
+def test_pipeline_loads_onto_the_selected_device_and_reports_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cuda: bool,
+    mps: bool,
+    device: str,
+    dtype: str,
+) -> None:
+    """The load uses the chosen device and dtype, and `device_info` names what ran.
+
+    Killed by: src/uclone_x/tools/builtin/image.py :: return pipeline.to(device), False
+    Becomes: return pipeline, False
+    """
+    import sys
+
+    import uclone_x.tools.builtin.image as image_module
+
+    checkpoint = tmp_path / "c.safetensors"
+    checkpoint.write_bytes(b"x")
+    fake_torch = _FakeTorch(cuda=cuda, mps=mps)
+    pipeline = _sdxl_pipeline()
+    fake_diffusers = MagicMock()
+    fake_diffusers.StableDiffusionXLPipeline.from_single_file.return_value = pipeline
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setitem(sys.modules, "diffusers", fake_diffusers)
+    monkeypatch.setattr(image_module, "in_process_dependency_problems", lambda: ())
+    engine = LocalDiffusersImageEngine(checkpoint_path=str(checkpoint))
+
+    engine._ensure_pipeline_loaded()  # pyright: ignore[reportPrivateUsage]
+
+    fake_diffusers.StableDiffusionXLPipeline.from_single_file.assert_called_once_with(
+        str(checkpoint), torch_dtype=dtype
+    )
+    pipeline.to.assert_called_once_with(device)
+    pipeline.enable_model_cpu_offload.assert_not_called()
+    device_info = engine._device  # pyright: ignore[reportPrivateUsage]
+    if device == "cuda":
+        assert device_info == "cuda (NVIDIA GeForce RTX 5070 Ti)"
+    else:
+        assert device_info.startswith(f"{device} (")
+
+
+def _engine_with_fakes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fake_torch: _FakeTorch,
+    pipeline: MagicMock | None,
+    make_pipeline: Callable[[], MagicMock] | None = None,
+) -> LocalDiffusersImageEngine:
+    """An in-process engine whose `torch` and `diffusers` imports are the given fakes.
+
+    `make_pipeline`, when given, builds the pipeline at load time, so the fake diffusers
+    holds no reference to it (a `return_value` would keep it alive for the whole test).
+    """
+    import sys
+
+    import uclone_x.tools.builtin.image as image_module
+
+    checkpoint = tmp_path / "c.safetensors"
+    checkpoint.write_bytes(b"x")
+    fake_diffusers = MagicMock()
+    from_single_file = fake_diffusers.StableDiffusionXLPipeline.from_single_file
+    if make_pipeline is not None:
+
+        def build(*_args: object, **_kwargs: object) -> MagicMock:
+            return make_pipeline()
+
+        from_single_file.side_effect = build
+    else:
+        from_single_file.return_value = pipeline
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setitem(sys.modules, "diffusers", fake_diffusers)
+    monkeypatch.setattr(image_module, "in_process_dependency_problems", lambda: ())
+    # Pinned: whether this machine has `accelerate` must not change the message asserted.
+    monkeypatch.setattr(image_module, "accelerate_is_installed", lambda: True)
+    return LocalDiffusersImageEngine(checkpoint_path=str(checkpoint))
+
+
+def _assert_plain_out_of_memory(message: str, tmp_path: Path) -> None:
+    assert message == GPU_OUT_OF_MEMORY_MESSAGE
+    for internal in (
+        "CUDA out of memory",
+        "GiB",
+        "PYTORCH",
+        "OutOfMemoryError",
+        "/",
+        str(tmp_path),
+    ):
+        assert internal not in message
+
+
+def test_a_card_short_of_memory_offloads_sdxl_to_the_cpu(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A 16 GB card with qwen3:8b resident has ~8 GB free; `.to("cuda")` ran out there.
+
+    Killed by: src/uclone_x/tools/builtin/image.py :: if device == "cuda" and not cuda_has_room_for_sdxl(torch):
+    Becomes: if False:
+    """
+    pipeline = _sdxl_pipeline()
+    fake_torch = _FakeTorch(cuda=True, mps=False, free_bytes=8 * 1024**3)
+    engine = _engine_with_fakes(tmp_path, monkeypatch, fake_torch, pipeline)
+
+    assert engine._ensure_pipeline_loaded() is pipeline  # pyright: ignore[reportPrivateUsage]
+
+    pipeline.enable_model_cpu_offload.assert_called_once_with()
+    pipeline.vae.enable_tiling.assert_called_once_with()
+    pipeline.to.assert_not_called()
+    device_info = engine._device  # pyright: ignore[reportPrivateUsage]
+    assert device_info == "cuda (NVIDIA GeForce RTX 5070 Ti), offloading to CPU"
+
+
+def test_offload_decodes_the_image_in_tiles(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Killed by: src/uclone_x/tools/builtin/image.py :: pipeline.vae.enable_tiling()
+    Becomes: pass
+    """
+    pipeline = _sdxl_pipeline()
+    fake_torch = _FakeTorch(cuda=True, mps=False, free_bytes=4 * 1024**3)
+    engine = _engine_with_fakes(tmp_path, monkeypatch, fake_torch, pipeline)
+
+    engine._ensure_pipeline_loaded()  # pyright: ignore[reportPrivateUsage]
+
+    pipeline.vae.enable_tiling.assert_called_once_with()
+
+
+def test_an_unreadable_free_memory_figure_offloads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Killed by: src/uclone_x/tools/builtin/image.py :: free_bytes = 0
+    Becomes: free_bytes = CUDA_RESIDENT_MIN_FREE_BYTES
+    """
+    pipeline = _sdxl_pipeline()
+    fake_torch = _FakeTorch(cuda=True, mps=False)
+    fake_torch.cuda.mem_get_info.side_effect = RuntimeError("no context")
+    engine = _engine_with_fakes(tmp_path, monkeypatch, fake_torch, pipeline)
+
+    engine._ensure_pipeline_loaded()  # pyright: ignore[reportPrivateUsage]
+
+    pipeline.enable_model_cpu_offload.assert_called_once_with()
+    pipeline.to.assert_not_called()
+
+
+_GIB = 1024**3
+#: What torch reported on the WSL2 host: 14.66 GiB free with qwen3:8b resident.
+_WSL_TORCH_FREE = int(14.66 * _GIB)
+
+
+def _on_wsl(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    nvml: int | None = None,
+    smi: str | None = None,
+) -> None:
+    import uclone_x.tools.builtin.image as image_module
+
+    monkeypatch.setattr(image_module, "running_under_wsl", lambda: True)
+    monkeypatch.setattr(image_module, "nvml_free_bytes", lambda: nvml)
+    monkeypatch.setattr(image_module, "nvidia_smi_output", lambda: smi)
+
+
+def test_on_wsl_the_device_wide_reading_overrides_torch_and_offloads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The WSL2 E2E: torch said 14.66 GiB free, `nvidia-smi` 8115 of 16303 MiB used.
+
+    Killed by: src/uclone_x/tools/builtin/image.py :: free_bytes = min(int(free_bytes), device_free) if device_free is not None else 0
+    Becomes: free_bytes = int(free_bytes) if device_free is not None else 0
+    """
+    _on_wsl(monkeypatch, smi="8115, 16303\n")
+    pipeline = _sdxl_pipeline()
+    fake_torch = _FakeTorch(cuda=True, mps=False, free_bytes=_WSL_TORCH_FREE)
+    engine = _engine_with_fakes(tmp_path, monkeypatch, fake_torch, pipeline)
+
+    engine._ensure_pipeline_loaded()  # pyright: ignore[reportPrivateUsage]
+
+    pipeline.enable_model_cpu_offload.assert_called_once_with()
+    pipeline.to.assert_not_called()
+
+
+def test_on_wsl_the_wsl_check_is_what_brings_in_the_device_wide_reading(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Killed by: src/uclone_x/tools/builtin/image.py :: if running_under_wsl():
+    Becomes: if False:
+    """
+    _on_wsl(monkeypatch, nvml=8 * _GIB)
+    pipeline = _sdxl_pipeline()
+    fake_torch = _FakeTorch(cuda=True, mps=False, free_bytes=_WSL_TORCH_FREE)
+    engine = _engine_with_fakes(tmp_path, monkeypatch, fake_torch, pipeline)
+
+    engine._ensure_pipeline_loaded()  # pyright: ignore[reportPrivateUsage]
+
+    pipeline.enable_model_cpu_offload.assert_called_once_with()
+
+
+def test_on_wsl_with_no_device_wide_source_the_pipeline_offloads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Neither NVML nor `nvidia-smi`: free memory is unknown, and unknown is not ample.
+
+    Killed by: src/uclone_x/tools/builtin/image.py :: free_bytes = min(int(free_bytes), device_free) if device_free is not None else 0
+    Becomes: free_bytes = min(int(free_bytes), device_free) if device_free is not None else free_bytes
+    """
+    _on_wsl(monkeypatch)
+    pipeline = _sdxl_pipeline()
+    fake_torch = _FakeTorch(cuda=True, mps=False, free_bytes=_WSL_TORCH_FREE)
+    engine = _engine_with_fakes(tmp_path, monkeypatch, fake_torch, pipeline)
+
+    engine._ensure_pipeline_loaded()  # pyright: ignore[reportPrivateUsage]
+
+    pipeline.enable_model_cpu_offload.assert_called_once_with()
+    pipeline.to.assert_not_called()
+
+
+def test_on_wsl_an_unparseable_nvidia_smi_reading_offloads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Killed by: src/uclone_x/tools/builtin/image.py :: free_bytes = min(int(free_bytes), device_free) if device_free is not None else 0
+    Becomes: free_bytes = min(int(free_bytes), device_free) if device_free is not None else free_bytes
+    """
+    _on_wsl(monkeypatch, smi="Failed to initialize NVML: Unknown Error\n")
+    pipeline = _sdxl_pipeline()
+    fake_torch = _FakeTorch(cuda=True, mps=False, free_bytes=_WSL_TORCH_FREE)
+    engine = _engine_with_fakes(tmp_path, monkeypatch, fake_torch, pipeline)
+
+    engine._ensure_pipeline_loaded()  # pyright: ignore[reportPrivateUsage]
+
+    pipeline.enable_model_cpu_offload.assert_called_once_with()
+    pipeline.to.assert_not_called()
+
+
+def test_on_wsl_nvml_is_read_before_nvidia_smi(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Killed by: src/uclone_x/tools/builtin/image.py :: if free_bytes is not None:
+    Becomes: if False:
+    """
+    _on_wsl(monkeypatch, nvml=3 * _GIB, smi="0, 16303\n")
+
+    assert device_wide_free_bytes() == 3 * _GIB
+
+
+def test_native_linux_with_ample_free_memory_loads_whole_without_asking_the_driver(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Native: torch's figure alone; the autouse fixture fails any whole-device read."""
+    pipeline = _sdxl_pipeline()
+    fake_torch = _FakeTorch(cuda=True, mps=False, free_bytes=15 * _GIB)
+    engine = _engine_with_fakes(tmp_path, monkeypatch, fake_torch, pipeline)
+
+    engine._ensure_pipeline_loaded()  # pyright: ignore[reportPrivateUsage]
+
+    pipeline.to.assert_called_once_with("cuda")
+    pipeline.enable_model_cpu_offload.assert_not_called()
+
+
+def test_on_wsl_with_room_on_the_device_the_pipeline_loads_whole(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The WSL branch does not offload a card that really is empty."""
+    _on_wsl(monkeypatch, smi="500, 16303\n")
+    pipeline = _sdxl_pipeline()
+    fake_torch = _FakeTorch(cuda=True, mps=False, free_bytes=15 * _GIB)
+    engine = _engine_with_fakes(tmp_path, monkeypatch, fake_torch, pipeline)
+
+    engine._ensure_pipeline_loaded()  # pyright: ignore[reportPrivateUsage]
+
+    pipeline.to.assert_called_once_with("cuda")
+
+
+def test_nvidia_smi_output_is_read_in_mib_per_card() -> None:
+    """Killed by: src/uclone_x/tools/builtin/image.py :: free.append(max(total_mib - used_mib, 0) * 1024**2)
+    Becomes: free.append(max(total_mib - used_mib, 0) * 1024**3)
+    """
+    assert parse_nvidia_smi_free_bytes("8115, 16303\n") == (16303 - 8115) * 1024**2
+
+
+def test_nvidia_smi_output_with_several_cards_takes_the_tightest() -> None:
+    """Killed by: src/uclone_x/tools/builtin/image.py :: return min(free, default=None)
+    Becomes: return max(free, default=None)
+    """
+    assert parse_nvidia_smi_free_bytes("8115, 16303\n100, 16303\n") == 8188 * 1024**2
+
+
+@pytest.mark.parametrize(
+    "output",
+    ["", "Failed to initialize NVML: Unknown Error\n", "8115, 16303\n[N/A], [N/A]\n"],
+)
+def test_nvidia_smi_output_that_does_not_parse_is_unknown(output: str) -> None:
+    """One unreadable line voids the reading, even beside a readable one.
+
+    Killed by: src/uclone_x/tools/builtin/image.py :: return None  # an unreadable line makes the whole reading unknown
+    Becomes: continue  # an unreadable line makes the whole reading unknown
+    """
+    assert parse_nvidia_smi_free_bytes(output) is None
+
+
+def test_nvidia_smi_is_run_with_a_timeout_and_a_failed_run_is_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No real process: `subprocess.run` is replaced and its call is recorded.
+
+    Killed by: src/uclone_x/tools/builtin/image.py :: if completed.returncode != 0:
+    Becomes: if False:
+    """
+    import subprocess
+
+    import uclone_x.tools.builtin.image as image_module
+
+    calls: list[dict[str, Any]] = []
+
+    def fake_run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        calls.append({"argv": argv, **kwargs})
+        return subprocess.CompletedProcess(argv, 9, stdout="8115, 16303\n", stderr="")
+
+    monkeypatch.setattr(image_module.subprocess, "run", fake_run)
+
+    def not_on_path(_name: str) -> None:
+        return None
+
+    monkeypatch.setattr(image_module.shutil, "which", not_on_path)
+
+    assert real_nvidia_smi_output() is None
+    assert calls[0]["argv"][0] == "/usr/lib/wsl/lib/nvidia-smi"
+    assert calls[0]["timeout"] == 5.0
+
+
+def test_a_hung_nvidia_smi_is_unknown(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Killed by: src/uclone_x/tools/builtin/image.py :: except (OSError, subprocess.SubprocessError):
+    Becomes: except (OSError, ArithmeticError):
+    """
+    import subprocess
+
+    import uclone_x.tools.builtin.image as image_module
+
+    def hung(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+
+    monkeypatch.setattr(image_module.subprocess, "run", hung)
+
+    def on_path(_name: str) -> str:
+        return "/usr/bin/nvidia-smi"
+
+    monkeypatch.setattr(image_module.shutil, "which", on_path)
+
+    assert real_nvidia_smi_output() is None
+
+
+def test_nvml_reports_total_minus_used_of_the_tightest_card(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fake `pynvml` module; nothing here loads the real library.
+
+    Killed by: src/uclone_x/tools/builtin/image.py :: free.append(max(int(memory.total) - int(memory.used), 0))
+    Becomes: free.append(max(int(memory.total) - 0, 0))
+    """
+    import sys
+    from types import SimpleNamespace
+
+    memories = [
+        SimpleNamespace(total=16303 * 1024**2, used=8115 * 1024**2),
+        SimpleNamespace(total=16303 * 1024**2, used=100 * 1024**2),
+    ]
+    fake = MagicMock()
+    fake.nvmlDeviceGetCount.return_value = 2
+
+    def handle_by_index(index: int) -> int:
+        return index
+
+    def memory_info(handle: int) -> SimpleNamespace:
+        return memories[handle]
+
+    fake.nvmlDeviceGetHandleByIndex.side_effect = handle_by_index
+    fake.nvmlDeviceGetMemoryInfo.side_effect = memory_info
+    monkeypatch.setitem(sys.modules, "pynvml", fake)
+
+    assert real_nvml_free_bytes() == 8188 * 1024**2
+    fake.nvmlShutdown.assert_called_once_with()
+
+
+def test_without_pynvml_nvml_is_unknown(monkeypatch: pytest.MonkeyPatch) -> None:
+    import sys
+
+    monkeypatch.setitem(sys.modules, "pynvml", None)
+
+    assert real_nvml_free_bytes() is None
+
+
+def test_wsl_is_recognised_by_its_kernel_release(tmp_path: Path) -> None:
+    """Killed by: src/uclone_x/tools/builtin/image.py :: if "microsoft" in text or "wsl" in text:
+    Becomes: if False:
+    """
+    osrelease = tmp_path / "osrelease"
+    osrelease.write_text("6.6.87.2-microsoft-standard-WSL2\n")
+
+    assert running_under_wsl(osrelease, tmp_path / "absent", tmp_path / "dxg")
+
+
+def test_wsl_is_recognised_by_its_gpu_device_alone(tmp_path: Path) -> None:
+    """Killed by: src/uclone_x/tools/builtin/image.py :: return dxg.exists()
+    Becomes: return False
+    """
+    (tmp_path / "dxg").touch()
+
+    assert running_under_wsl(tmp_path / "absent", tmp_path / "absent", tmp_path / "dxg")
+
+
+def test_a_native_linux_kernel_is_not_wsl(tmp_path: Path) -> None:
+    osrelease = tmp_path / "osrelease"
+    osrelease.write_text("6.8.0-45-generic\n")
+    version = tmp_path / "version"
+    version.write_text("Linux version 6.8.0-45-generic (buildd@lcy02-amd64-075) (gcc 13.2.0)\n")
+
+    assert not running_under_wsl(osrelease, version, tmp_path / "dxg")
+
+
+def test_without_accelerate_the_pipeline_is_loaded_whole(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pipeline = _sdxl_pipeline()
+    pipeline.enable_model_cpu_offload.side_effect = ImportError("accelerate")
+    fake_torch = _FakeTorch(cuda=True, mps=False, free_bytes=4 * 1024**3)
+    engine = _engine_with_fakes(tmp_path, monkeypatch, fake_torch, pipeline)
+
+    engine._ensure_pipeline_loaded()  # pyright: ignore[reportPrivateUsage]
+
+    pipeline.to.assert_called_once_with("cuda")
+    device_info = engine._device  # pyright: ignore[reportPrivateUsage]
+    assert device_info == "cuda (NVIDIA GeForce RTX 5070 Ti)"
+
+
+def test_running_out_of_memory_while_loading_is_reported_in_plain_words(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Killed by: src/uclone_x/tools/builtin/image.py :: if not isinstance(exc, torch_out_of_memory_types(torch)):
+    Becomes: if True:
+    """
+    pipeline = _sdxl_pipeline()
+    pipeline.to.side_effect = _FakeOutOfMemoryError(_RAW_OOM_TEXT)
+    fake_torch = _FakeTorch(cuda=True, mps=False)
+    engine = _engine_with_fakes(tmp_path, monkeypatch, fake_torch, pipeline)
+
+    with pytest.raises(ImageGenerationError) as caught:
+        engine._ensure_pipeline_loaded()  # pyright: ignore[reportPrivateUsage]
+
+    _assert_plain_out_of_memory(str(caught.value), tmp_path)
+    fake_torch.cuda.empty_cache.assert_called_once_with()
+    assert engine._pipeline is None  # pyright: ignore[reportPrivateUsage]
+
+
+def test_running_out_of_memory_while_generating_drops_the_pipeline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The next request must rebuild, re-reading free memory, not reuse a broken pipeline.
+
+    Killed by: src/uclone_x/tools/builtin/image.py :: if torch is None or not isinstance(exc, torch_out_of_memory_types(torch)):
+    Becomes: if True:
+    """
+    import uclone_x.tools.builtin.image as image_module
+
+    pipeline = _sdxl_pipeline()
+    pipeline.side_effect = _FakeOutOfMemoryError(_RAW_OOM_TEXT)
+    fake_torch = _FakeTorch(cuda=True, mps=False)
+    collected: list[bool] = []
+    monkeypatch.setattr(image_module.gc, "collect", lambda: collected.append(True) or 0)
+    engine = _engine_with_fakes(tmp_path, monkeypatch, fake_torch, pipeline)
+
+    with pytest.raises(ImageGenerationError) as caught:
+        engine._run_in_process_generation(  # pyright: ignore[reportPrivateUsage]
+            prompt="a cat",
+            negative_prompt="",
+            width=768,
+            height=768,
+            seed=1,
+            style="photorealistic",
+        )
+
+    _assert_plain_out_of_memory(str(caught.value), tmp_path)
+    assert engine._pipeline is None  # pyright: ignore[reportPrivateUsage]
+    assert collected == [True]
+    fake_torch.cuda.empty_cache.assert_called_once_with()
+
+
+def test_out_of_memory_release_drops_the_pipeline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Killed by: src/uclone_x/tools/builtin/image.py :: self._pipeline = None
+    Becomes: pass
+    """
+    pipeline = _sdxl_pipeline()
+    fake_torch = _FakeTorch(cuda=True, mps=False)
+    engine = _engine_with_fakes(tmp_path, monkeypatch, fake_torch, pipeline)
+    engine._ensure_pipeline_loaded()  # pyright: ignore[reportPrivateUsage]
+
+    engine._release_after_out_of_memory(fake_torch)  # pyright: ignore[reportPrivateUsage]
+
+    assert engine._pipeline is None  # pyright: ignore[reportPrivateUsage]
+    fake_torch.cuda.empty_cache.assert_called_once_with()
+
+
+def test_the_pipeline_is_collected_before_the_cache_is_emptied_after_a_failed_load(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Released inside the `except`, the traceback kept the pipeline alive (#1541 review).
+
+    `empty_cache` can only return memory nothing references, so the pipeline must be
+    garbage by then.
+
+    Killed by: src/uclone_x/tools/builtin/image.py :: del pipeline  # the half-placed one
+    Becomes: pass
+    """
+    refs: list[weakref.ref[MagicMock]] = []
+
+    def make_pipeline() -> MagicMock:
+        pipeline = _sdxl_pipeline()
+        pipeline.to.side_effect = _FakeOutOfMemoryError(_RAW_OOM_TEXT)
+        refs.append(weakref.ref(pipeline))
+        return pipeline
+
+    fake_torch = _FakeTorch(cuda=True, mps=False)
+    collected_first: list[bool] = []
+    fake_torch.cuda.empty_cache.side_effect = lambda: collected_first.append(refs[0]() is None)
+    engine = _engine_with_fakes(tmp_path, monkeypatch, fake_torch, None, make_pipeline)
+
+    with pytest.raises(ImageGenerationError) as caught:
+        engine._ensure_pipeline_loaded()  # pyright: ignore[reportPrivateUsage]
+
+    assert collected_first == [True]
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+
+
+def test_the_pipeline_is_collected_before_the_cache_is_emptied_after_a_failed_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Killed by: src/uclone_x/tools/builtin/image.py :: del pipeline  # the one that ran out
+    Becomes: pass
+    """
+    refs: list[weakref.ref[MagicMock]] = []
+
+    def make_pipeline() -> MagicMock:
+        pipeline = _sdxl_pipeline()
+        pipeline.side_effect = _FakeOutOfMemoryError(_RAW_OOM_TEXT)
+        refs.append(weakref.ref(pipeline))
+        return pipeline
+
+    fake_torch = _FakeTorch(cuda=True, mps=False)
+    collected_first: list[bool] = []
+    fake_torch.cuda.empty_cache.side_effect = lambda: collected_first.append(refs[0]() is None)
+    engine = _engine_with_fakes(tmp_path, monkeypatch, fake_torch, None, make_pipeline)
+
+    with pytest.raises(ImageGenerationError) as caught:
+        engine._run_in_process_generation(  # pyright: ignore[reportPrivateUsage]
+            prompt="a cat",
+            negative_prompt="",
+            width=768,
+            height=768,
+            seed=1,
+            style="photorealistic",
+        )
+
+    assert collected_first == [True]
+    assert caught.value.__context__ is None
+
+
+def test_out_of_memory_on_cuda_without_accelerate_says_how_to_add_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without `accelerate` the card could not offload, so that is the remedy to name.
+
+    Killed by: src/uclone_x/tools/builtin/image.py :: if device == "cuda" and not accelerate_is_installed():
+    Becomes: if False:
+    """
+    import uclone_x.tools.builtin.image as image_module
+
+    pipeline = _sdxl_pipeline()
+    pipeline.to.side_effect = _FakeOutOfMemoryError(_RAW_OOM_TEXT)
+    fake_torch = _FakeTorch(cuda=True, mps=False)
+    engine = _engine_with_fakes(tmp_path, monkeypatch, fake_torch, pipeline)
+    monkeypatch.setattr(image_module, "accelerate_is_installed", lambda: False)
+
+    with pytest.raises(ImageGenerationError) as caught:
+        engine._ensure_pipeline_loaded()  # pyright: ignore[reportPrivateUsage]
+
+    message = str(caught.value)
+    assert message == f"{GPU_OUT_OF_MEMORY_MESSAGE} {ACCELERATE_MISSING_SENTENCE}"
+    assert "install_package with package='accelerate'" in message
+    for internal in ("CUDA out of memory", "GiB", "PYTORCH", "OutOfMemoryError", "/"):
+        assert internal not in message
+
+
+def test_out_of_memory_with_accelerate_installed_does_not_mention_it() -> None:
+    """Killed by: src/uclone_x/tools/builtin/image.py :: if device == "cuda" and not accelerate_is_installed():
+    Becomes: if device == "cuda":
+    """
+    with patch("uclone_x.tools.builtin.image.accelerate_is_installed", return_value=True):
+        assert out_of_memory_message("cuda") == GPU_OUT_OF_MEMORY_MESSAGE
+
+
+def test_out_of_memory_off_cuda_does_not_mention_accelerate() -> None:
+    """Offload is a CUDA remedy; an MPS or CPU run gains nothing from `accelerate`.
+
+    Killed by: src/uclone_x/tools/builtin/image.py :: if device == "cuda" and not accelerate_is_installed():
+    Becomes: if not accelerate_is_installed():
+    """
+    with patch("uclone_x.tools.builtin.image.accelerate_is_installed", return_value=False):
+        for device in ("mps", "cpu", None):
+            assert out_of_memory_message(device) == GPU_OUT_OF_MEMORY_MESSAGE
+
+
+def test_out_of_memory_while_generating_on_cuda_without_accelerate_says_how_to_add_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The generate path names the device the pipeline was loaded onto.
+
+    Killed by: src/uclone_x/tools/builtin/image.py :: self._torch_device = device
+    Becomes: pass
+    """
+    import uclone_x.tools.builtin.image as image_module
+
+    pipeline = _sdxl_pipeline()
+    pipeline.side_effect = _FakeOutOfMemoryError(_RAW_OOM_TEXT)
+    fake_torch = _FakeTorch(cuda=True, mps=False)
+    engine = _engine_with_fakes(tmp_path, monkeypatch, fake_torch, pipeline)
+    monkeypatch.setattr(image_module, "accelerate_is_installed", lambda: False)
+
+    with pytest.raises(ImageGenerationError) as caught:
+        engine._run_in_process_generation(  # pyright: ignore[reportPrivateUsage]
+            prompt="a cat",
+            negative_prompt="",
+            width=768,
+            height=768,
+            seed=1,
+            style="photorealistic",
+        )
+
+    assert str(caught.value) == f"{GPU_OUT_OF_MEMORY_MESSAGE} {ACCELERATE_MISSING_SENTENCE}"
+
+
+def test_older_torch_out_of_memory_class_is_recognised() -> None:
+    """torch before 2.5 has only `torch.cuda.OutOfMemoryError`."""
+
+    class _OldCudaOom(RuntimeError):
+        pass
+
+    old_torch = MagicMock(spec=["cuda"])
+    old_torch.cuda = MagicMock()
+    old_torch.cuda.OutOfMemoryError = _OldCudaOom
+
+    assert torch_out_of_memory_types(old_torch) == (_OldCudaOom,)

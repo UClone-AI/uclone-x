@@ -64,6 +64,7 @@ __all__ = [
     "MemoryStoreUnreadableError",
     "MissingDependencyError",
     "MissingProvenanceError",
+    "ModelLacksToolSupportError",
     "NothingToRetryError",
     "OntologyContradictionError",
     "OntologyError",
@@ -659,6 +660,26 @@ class LLMTimeoutError(LLMProviderError):
     def __init__(self, message: str, *, seconds: float) -> None:
         super().__init__(message)
         self.seconds = seconds
+
+
+class ModelLacksToolSupportError(LLMProviderError):
+    """The chosen model cannot take tool definitions, so no clone turn can run on it.
+
+    Ollama refuses such a request with a 400 whose body says the model "does not support
+    tools" (a reasoning model such as `deepseek-r1:14b`, for one). Every clone turn sends
+    tools, so a retry meets the same refusal until the model changes. The message is
+    written for the person who picked the model: it names the model and what to pick
+    instead, and carries no status code, response body or class name, so a surface may
+    show `str()` as is. *Where* to pick it is the head's to say (P8) -- `--model` on the
+    command line, Settings on the dashboard and in an ACP client -- so it is not here.
+    """
+
+    def __init__(self, model: str) -> None:
+        super().__init__(
+            f"The model {model} can't use tools, which UClone-X clones need. Pick a "
+            "model that supports tools, for example qwen3:8b."
+        )
+        self.model = model
 
 
 class LLMStreamInterruptedError(LLMError):

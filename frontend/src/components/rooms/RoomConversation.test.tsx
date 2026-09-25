@@ -1705,6 +1705,36 @@ describe('RoomConversation stops and failures', () => {
     );
   });
 
+  it('names the model remedy when the model cannot use tools, and no internals', () => {
+    // Killed by: frontend/src/lib/turnOutcome.ts :: model_without_tools: "its model can't use tools, which clones need",
+    // Becomes: model_without_tools: 'the app refused to run it',
+    renderRoom({
+      room: room({
+        transcript: [
+          message({
+            seq: 1,
+            sender_id: 'scout',
+            content: '',
+            error:
+              "The model deepseek-r1:14b can't use tools, which UClone-X clones need. Pick a model that supports tools (for example qwen3:8b) in Settings, or pass --model.",
+            refusal: 'model_without_tools',
+          }),
+        ],
+      }),
+    });
+
+    const row = screen.getByTestId('row-error-1');
+    expect(row).toHaveTextContent("Scout couldn't finish this turn: its model can't use tools, which clones need.");
+    expect(screen.queryByTestId('retry-turn')).toBeNull();
+    expect(screen.getByTestId('row-remedy-1')).toHaveTextContent(
+      'Pick a model that supports tools (for example qwen3:8b) in Settings, then send your message again.',
+    );
+    for (const internal of ['Traceback', 'status 400', '{', 'LLMProviderError']) {
+      expect(row).not.toHaveTextContent(internal);
+      expect(screen.getByTestId('row-remedy-1')).not.toHaveTextContent(internal);
+    }
+  });
+
   it('keeps Retry on a failure that carries no refusal (#969)', () => {
     renderRoom({
       room: room({

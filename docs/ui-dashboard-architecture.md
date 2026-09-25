@@ -532,9 +532,9 @@ conversations. What the order is taken from, precisely:
 
 Pinned by `tests/unit/test_room_service.py` :: `test_list_rooms_*`.
 
-Each row also says **when it was last active**, in words: "just now", "5 minutes ago",
-"yesterday", "last week" (`frontend/src/lib/relativeTime.ts`). Under a day that counts
-elapsed time; from a day on it counts calendar days in local time, so "yesterday" is the day
+Each row also says **when it was last active**, in compact form: "now", "5m",
+"1d", "1w" (`frontend/src/lib/relativeTime.ts`). Under a day that counts
+elapsed time; from a day on it counts calendar days in local time, so "1d" is the day
 before today and not "24 to 48 hours ago". The wording is re-read every minute, and the exact
 time is the row's tooltip. The rail re-reads the listing after every message the user sends,
 so the conversation just used moves to the top without a reload. It does **not** re-read on an

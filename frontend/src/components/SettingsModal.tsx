@@ -23,7 +23,9 @@ import {
   Trash2,
   Wrench,
   FolderOpen,
+  ExternalLink,
 } from 'lucide-react';
+import { getProviderMeta, validateKeyFormat, sanitizeApiKey } from '../lib/providerRegistry';
 import { RuntimeSettings, ConnectionTestResult, PersonaCatalog } from '../types';
 import { PersonaManager } from './personas/PersonaManager';
 import { SkillsSection } from './settings/SkillsSection';
@@ -259,7 +261,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         target: 'all',
         llm_provider: llmProvider,
         llm_base_url: llmBaseUrl.trim() || undefined,
-        llm_api_key: llmApiKey.trim() || undefined,
+        llm_api_key: sanitizeApiKey(llmApiKey) || undefined,
         comfyui_base_url: comfyuiBaseUrl.trim() || undefined,
       };
       const res = await fetch('/api/settings/test', {
@@ -301,7 +303,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         llm_provider: llmProvider,
         llm_base_url: llmBaseUrl.trim(),
         llm_model: llmModel.trim(),
-        llm_api_key: llmApiKey.trim() || undefined,
+        llm_api_key: sanitizeApiKey(llmApiKey) || undefined,
         comfyui_base_url: comfyuiBaseUrl.trim(),
         read_roots: readRootsChanged ? readRoots : undefined,
       };
@@ -710,47 +712,86 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             )}
 
             {/* API Key (if cloud provider) */}
-            {llmProvider !== 'mock' && (
-              <div className="pt-1">
-                <label className="block text-xs font-medium text-slate-300 mb-1.5 flex items-center justify-between">
-                  <span className="flex items-center gap-1.5">
-                    <Key className="w-3.5 h-3.5 text-amber-400" />
-                    API Key
-                    {llmProvider === 'vllm' && (
-                      <span className="text-[10px] font-normal text-slate-500" data-testid="vllm-key-optional">
-                        optional — only if you started the server with --api-key
-                      </span>
-                    )}
-                  </span>
-                  {currentSettings?.llm_api_key_set && (
-                    <span className="text-[11px] text-emerald-400 font-mono bg-emerald-950/60 px-2 py-0.5 rounded border border-emerald-800/60">
-                      Configured: {currentSettings.llm_api_key_masked}
+            {llmProvider !== 'mock' && (() => {
+              const providerMeta = getProviderMeta(llmProvider);
+              const keyValidation = providerMeta && llmApiKey ? validateKeyFormat(llmProvider, llmApiKey) : null;
+              return (
+                <div className="pt-1">
+                  <label className="block text-xs font-medium text-slate-300 mb-1.5 flex items-center justify-between">
+                    <span className="flex items-center gap-1.5">
+                      <Key className="w-3.5 h-3.5 text-amber-400" />
+                      API Key
+                      {llmProvider === 'vllm' && (
+                        <span className="text-[10px] font-normal text-slate-500" data-testid="vllm-key-optional">
+                          optional — only if you started the server with --api-key
+                        </span>
+                      )}
                     </span>
+                    <div className="flex items-center gap-2">
+                      {providerMeta && (
+                        <a
+                          href={providerMeta.keyConsoleUrl}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="inline-flex items-center gap-1 text-[11px] text-cyan-400 hover:text-cyan-300 transition-colors font-sans"
+                          data-testid="provider-key-console-link"
+                          title={`${providerMeta.displayName} 콘솔에서 API Key 발급받기`}
+                        >
+                          <span>{providerMeta.displayName} 키 발급받기</span>
+                          <ExternalLink className="w-3 h-3" />
+                        </a>
+                      )}
+                      {currentSettings?.llm_api_key_set && (
+                        <span className="text-[11px] text-emerald-400 font-mono bg-emerald-950/60 px-2 py-0.5 rounded border border-emerald-800/60">
+                          Configured: {currentSettings.llm_api_key_masked}
+                        </span>
+                      )}
+                    </div>
+                  </label>
+                  <div className="relative">
+                    <input
+                      type={showApiKey ? 'text' : 'password'}
+                      value={llmApiKey}
+                      onChange={(e) => setLlmApiKey(e.target.value)}
+                      onBlur={() => setLlmApiKey(sanitizeApiKey(llmApiKey))}
+                      placeholder={
+                        currentSettings?.llm_api_key_set
+                          ? 'Leave blank to keep current key, or enter new key'
+                          : providerMeta
+                          ? `Enter API key (e.g. ${providerMeta.placeholder})`
+                          : 'Enter API key (e.g. sk-...)'
+                      }
+                      className="w-full bg-slate-950/90 border border-slate-800 rounded-xl px-3 py-2 pr-10 text-xs text-white placeholder-slate-600 focus:outline-none focus:border-cyan-500/80 font-mono transition-colors"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setShowApiKey(!showApiKey)}
+                      className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-500 hover:text-slate-300"
+                      title={showApiKey ? 'Hide key' : 'Show key'}
+                    >
+                      {showApiKey ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                    </button>
+                  </div>
+                  {keyValidation && !keyValidation.valid && keyValidation.warning && (
+                    <div className="mt-1.5 flex items-center gap-1.5 text-[11px] text-amber-400" data-testid="api-key-warning">
+                      <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
+                      <span>{keyValidation.warning}</span>
+                    </div>
                   )}
-                </label>
-                <div className="relative">
-                  <input
-                    type={showApiKey ? 'text' : 'password'}
-                    value={llmApiKey}
-                    onChange={(e) => setLlmApiKey(e.target.value)}
-                    placeholder={
-                      currentSettings?.llm_api_key_set
-                        ? 'Leave blank to keep current key, or enter new key'
-                        : 'Enter API key (e.g. sk-...)'
-                    }
-                    className="w-full bg-slate-950/90 border border-slate-800 rounded-xl px-3 py-2 pr-10 text-xs text-white placeholder-slate-600 focus:outline-none focus:border-cyan-500/80 font-mono transition-colors"
-                  />
-                  <button
-                    type="button"
-                    onClick={() => setShowApiKey(!showApiKey)}
-                    className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-500 hover:text-slate-300"
-                    title={showApiKey ? 'Hide key' : 'Show key'}
-                  >
-                    {showApiKey ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
-                  </button>
+                  {keyValidation && keyValidation.valid && llmApiKey.trim().length > 0 && (
+                    <div className="mt-1.5 flex items-center gap-1.5 text-[11px] text-emerald-400" data-testid="api-key-valid">
+                      <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
+                      <span>올바른 {providerMeta?.displayName} 키 형식입니다.</span>
+                    </div>
+                  )}
+                  {providerMeta && (
+                    <div className="mt-1 text-[10px] text-slate-400 font-sans leading-normal">
+                      💡 {providerMeta.costTip}
+                    </div>
+                  )}
                 </div>
-              </div>
-            )}
+              );
+            })()}
           </div>
 
           <hr className="border-slate-800/80" />

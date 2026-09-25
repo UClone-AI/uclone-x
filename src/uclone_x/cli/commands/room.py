@@ -31,6 +31,7 @@ from uclone_x.room.models import (
     RoomMessage,
     RoomPolicy,
     RoomState,
+    RoomTurnRefusal,
     SelectionVerdict,
 )
 from uclone_x.room.orchestrator import RoomOrchestrator
@@ -76,12 +77,17 @@ def build_orchestrator(
     from uclone_x.agent.models import AgentLLMConfig
     from uclone_x.agent.persona_registry import get_default_persona_registry
     from uclone_x.agent.session import SessionStore
-    from uclone_x.cli.commands.run import get_default_llm
+    from uclone_x.cli.commands.run import apply_saved_model, get_default_llm
     from uclone_x.engine.event_bus import EventBus
     from uclone_x.memory.store import default_cross_session_memory
     from uclone_x.telemetry import TelemetryTracer
     from uclone_x.tools.registry import create_default_registry
 
+    # With no `--model`, the room asks for the saved model when the connector comes from
+    # the saved choice, and says so -- the same rule `ucx run` applies.
+    model, saved_notice = apply_saved_model(provider, model)
+    if saved_notice is not None:
+        console.print(f"[dim]{escape(saved_notice)}[/dim]")
     llm = get_default_llm(provider)
     host = HostDependencies(
         bus=EventBus(),
@@ -643,7 +649,20 @@ def _render_new_rows(before: RoomState, after: RoomState) -> None:
 
 
 def _offer_retry(state: RoomState) -> None:
-    """Name the remedy when the room's last utterance is a failed turn."""
+    """Name the remedy when the room's last utterance is a failed turn.
+
+    A plain retry is not offered for a refusal: it is refused the same way. A model without
+    tools is the one refusal a retry can cure, with another model, so that retry is named
+    with `--model`. A spent usage budget is not cured by retrying at all, so nothing is.
+    """
     last = state.last_utterance
-    if last is not None and last.error is not None:
-        console.print(f"[dim]— retry that turn with:[/dim] ucx room retry {escape(state.room_id)}")
+    if last is None or last.error is None:
+        return
+    room_id = escape(state.room_id)
+    if last.refusal is None:
+        console.print(f"[dim]— retry that turn with:[/dim] ucx room retry {room_id}")
+    elif last.refusal == RoomTurnRefusal.MODEL_WITHOUT_TOOLS:
+        console.print(
+            "[dim]— retry that turn on a model that supports tools with:[/dim] "
+            f"ucx room retry {room_id} --model <model>"
+        )

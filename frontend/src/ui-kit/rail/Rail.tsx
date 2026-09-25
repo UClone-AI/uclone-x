@@ -661,7 +661,7 @@ export const Rail: React.FC<RailProps> = ({
                               <div
                                 key={session.room_id}
                                 data-testid={`clone-session-item-${session.room_id}`}
-                                className={`group flex items-center justify-between gap-1 px-2 py-1.5 rounded-lg text-xs cursor-pointer transition-colors border ${
+                                className={`group relative flex items-center justify-between gap-1 px-2 py-1.5 rounded-lg text-xs cursor-pointer transition-colors border ${
                                   isSessionActive
                                     ? 'bg-blue-950/40 text-blue-200 border-blue-500/30 font-medium'
                                     : 'text-slate-400 hover:bg-slate-900/60 hover:text-slate-200 border-transparent'
@@ -691,7 +691,13 @@ export const Rail: React.FC<RailProps> = ({
                                     copy={copy.conversations}
                                   />
                                 </button>
-                                <span className="flex shrink-0 items-center gap-0.5">
+                                <span
+                                  className={`absolute right-1 top-1/2 -translate-y-1/2 z-10 flex items-center gap-0.5 rounded-md px-0.5 opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 focus-within:opacity-100 transition-opacity ${
+                                    isSessionActive
+                                      ? 'bg-blue-950 text-blue-200'
+                                      : 'bg-slate-900 text-slate-400'
+                                  }`}
+                                >
                                   {RenameIcon && (
                                     <button
                                       type="button"
