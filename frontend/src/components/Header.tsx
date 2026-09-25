@@ -6,6 +6,7 @@ import {
   PanelRightClose,
   PanelRightOpen,
   Settings,
+  FolderOpen,
 } from 'lucide-react';
 import { Button } from './ui/Button';
 import { StatusDot } from './ui/StatusDot';
@@ -21,6 +22,8 @@ interface HeaderProps {
   isDockOpen?: boolean;
   onToggleDock?: () => void;
   onOpenSettings?: () => void;
+  /** Opens the Files screen: every file the clones saved, across conversations (#1554). */
+  onOpenFiles?: () => void;
 }
 
 /**
@@ -41,6 +44,7 @@ export const Header: React.FC<HeaderProps> = ({
   isDockOpen = false,
   onToggleDock,
   onOpenSettings,
+  onOpenFiles,
 }) => {
   return (
     <header className="border-b border-slate-800/80 bg-slate-900/90 backdrop-blur-md px-3.5 py-2 flex items-center justify-between gap-2 shrink-0 select-none z-30">
@@ -98,6 +102,19 @@ export const Header: React.FC<HeaderProps> = ({
         >
           <RefreshCw className={`w-3.5 h-3.5 ${isRefreshing ? 'animate-spin text-cyan-400' : ''}`} />
         </Button>
+
+        {onOpenFiles && (
+          <Button
+            variant="bordered"
+            data-testid="open-artifact-library"
+            onClick={onOpenFiles}
+            aria-label="Files"
+            title="Files the clones saved, across every conversation"
+          >
+            <FolderOpen className="w-3.5 h-3.5" />
+            <span className="hidden lg:inline">Files</span>
+          </Button>
+        )}
 
         {onOpenSettings && (
           <Button

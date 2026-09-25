@@ -3333,6 +3333,12 @@ def create_ui_app(
 
     register_clone_routes(app, session_mgr, room_stack)
 
+    # The Files screen: the artifact folders across every conversation, including deleted
+    # ones, apart from the room-scoped Docs dock (#1554).
+    from uclone_x.ui.artifacts import register_artifact_routes
+
+    register_artifact_routes(app, room_stack)
+
     @app.get("/api/health")
     async def health() -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
         """Health check and absorbed failure accounting endpoint (#198)."""

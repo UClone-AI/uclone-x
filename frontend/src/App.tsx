@@ -35,6 +35,9 @@ import {
 } from './lib/rail';
 import { readDeveloperMode, storeDeveloperMode } from './lib/developerMode';
 import { SettingsModal } from './components/SettingsModal';
+import { ArtifactLibrary } from './components/artifacts/ArtifactLibrary';
+import { artifactLibraryApi } from './lib/artifactLibrary';
+import { CoreFailure } from './lib/coreFailure';
 import { OpenInDocsContext, defaultSeat } from './lib/roomDock';
 import { savePersona } from './lib/personasApi';
 import { PERSONA_EDITOR_COPY } from './lib/personaCopy';
@@ -158,6 +161,8 @@ export function App() {
   };
   const [isDockOpen, setIsDockOpen] = useState<boolean>(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState<boolean>(false);
+  // The Files screen (#1554): a user feature, so not behind developer mode.
+  const [isFilesOpen, setIsFilesOpen] = useState<boolean>(false);
   const [activeDockSurface, setActiveDockSurface] = useState<DockSurface>('artifacts');
   // Developer mode, off by default (owner ruling 2026-09-22): whether the dock offers its
   // developer instruments. A head preference kept in this browser, like the rail's open state.
@@ -680,6 +685,47 @@ export function App() {
   );
 
   /**
+   * "Open in a new conversation" from the Files screen (#1554): a new conversation titled
+   * after the story, with the story open in it. A conversation whose story could not be
+   * opened is removed again, so a refusal leaves nothing half-made behind; the refusal
+   * propagates to the Files screen, which shows it. The Core's note -- that another
+   * conversation is still writing the story -- is shown once the conversation is open.
+   */
+  const handleOpenStoryInNewRoom = useCallback(
+    async (storyId: string, title: string) => {
+      // The guard New takes, held through an alias so that this release is a line of its
+      // own: App.test.tsx declares a kill on New's release by its exact text.
+      const guard = createInFlightRef;
+      guard.current = true;
+      try {
+        let created: RoomState;
+        try {
+          created = await roomsApi.create(title, selectedAgent ? [selectedAgent] : []);
+        } catch (err) {
+          console.error('Files: a conversation for the story could not be made', err);
+          throw new CoreFailure(0, `Could not start a conversation: ${roomFailureReason(err)}`);
+        }
+        let note: string | null;
+        try {
+          note = (await artifactLibraryApi.openStory(storyId, created.room_id)).note;
+        } catch (err) {
+          await roomsApi.delete(created.room_id).catch((cleanup: unknown) => {
+            console.error('Files: the unused conversation could not be removed', cleanup);
+          });
+          await fetchRooms();
+          throw err;
+        }
+        await fetchRooms();
+        await openRoom(created.room_id);
+        if (note) setRoomNotice(note);
+      } finally {
+        guard.current = false;
+      }
+    },
+    [fetchRooms, openRoom, selectedAgent],
+  );
+
+  /**
    * Rename from the rail. A refusal propagates to the row, which shows its message: the
    * Core's own words, or a plain sentence when the Core gave none (#1411). Only the title
    * is taken from the answer: the open transcript may have moved on since the Core wrote
@@ -1144,6 +1190,7 @@ export function App() {
         isDockOpen={isDockOpen}
         onToggleDock={() => setIsDockOpen(!isDockOpen)}
         onOpenSettings={() => setIsSettingsOpen(true)}
+        onOpenFiles={() => setIsFilesOpen(true)}
       />
 
       {/* Workspace body: rail, conversation, dock. The conversation is not a tab and has no
@@ -1424,6 +1471,11 @@ export function App() {
       </div>
 
       {/* Settings & Hot-Reload Modal */}
+      <ArtifactLibrary
+        isOpen={isFilesOpen}
+        onClose={() => setIsFilesOpen(false)}
+        onOpenStory={handleOpenStoryInNewRoom}
+      />
       <SettingsModal
         isOpen={isSettingsOpen}
         onClose={() => setIsSettingsOpen(false)}

@@ -157,6 +157,12 @@ let requests: { url: string; method: string; body?: string }[];
 /** What `GET /api/rooms/{id}/seats/{seat}/history` reports, beyond its identity. */
 let seatHistoryOnServer: { turns: unknown[]; tool_uses: unknown[] };
 let created: number;
+/**
+ * What `POST /api/artifacts/library/stories/{id}/open` refuses with, when it refuses (#1554):
+ * the Files screen's "Open in a new conversation" makes the conversation first, so a refusal
+ * here is the case where `App` has a conversation to take back.
+ */
+let storyOpenRefusal: { status: number; detail: string } | null;
 
 /**
  * Answers withheld until the test releases them, keyed by `METHOD path`.
@@ -193,6 +199,26 @@ const turnOnDeveloperMode = async () => {
   await settle();
 };
 
+/** The one story the Files screen lists in these cases (#1554). */
+const STORY_ENTRY = {
+  path: 'stories/night-train',
+  original_path: 'stories/night-train',
+  name: 'night-train',
+  kind: 'story',
+  archived: false,
+  managed: true,
+  size_bytes: 10,
+  modified_at: '2026-09-22T10:00:00Z',
+  conversations: [],
+  story: {
+    story_id: 'night-train',
+    title: 'Night Train',
+    unreadable_reason: null,
+    writer: null,
+    files: [],
+  },
+};
+
 const sent = (method: string, path: string) =>
   requests.filter((r) => r.method === method && r.url.split('?')[0] === path);
 
@@ -221,6 +247,7 @@ beforeEach(() => {
   requests = [];
   seatHistoryOnServer = { turns: [], tool_uses: [] };
   created = 0;
+  storyOpenRefusal = null;
   gates = new Map();
   openers = new Map();
   vi.stubGlobal('EventSource', SilentEventSource);
@@ -259,6 +286,25 @@ beforeEach(() => {
               unattributed_writes: 0,
               unattributed_note: null,
               reason: 'Nobody has written a file in this conversation yet.',
+            }),
+          );
+        }
+        if (path === '/api/artifacts/library' && method === 'GET') {
+          return Promise.resolve(answer({ entries: [STORY_ENTRY], scope_note: 'All the files.', record_gaps: [] }));
+        }
+        const storyOpen = /^\/api\/artifacts\/library\/stories\/([^/]+)\/open$/.exec(path);
+        if (storyOpen && method === 'POST') {
+          if (storyOpenRefusal !== null) {
+            return Promise.resolve(answer({ detail: storyOpenRefusal.detail }, storyOpenRefusal.status));
+          }
+          const roomId = JSON.parse(String(init?.body)).room_id as string;
+          return Promise.resolve(
+            answer({
+              room_id: roomId,
+              story_id: storyOpen[1],
+              title: 'Night Train',
+              writable: false,
+              note: 'Another conversation is writing this story, so this one can read it but not change it.',
             }),
           );
         }
@@ -668,6 +714,81 @@ describe('App opens a conversation by itself (#1208)', () => {
 
     await waitFor(() => expect(sent('GET', '/api/rooms/r1')).toHaveLength(1));
     await openedConversation();
+  });
+});
+
+/**
+ * "Open in a new conversation" on the Files screen (#1554).
+ *
+ * `App` makes the conversation, asks the Core to give it the story, and opens it. What only
+ * `App` can be held to is the part between: a refusal must take back the conversation it
+ * made, rather than leave an empty one in the rail, and the create guard it borrows from New
+ * must be given back whichever way the open ends.
+ */
+describe('App opens a story from Files in a new conversation (#1554)', () => {
+  const openStoryFromFiles = async () => {
+    fireEvent.click(screen.getByTestId('open-artifact-library'));
+    fireEvent.click(await screen.findByTestId('files-open-story'));
+    await settle();
+  };
+
+  it('opens the new conversation and says what the Core noted', async () => {
+    render(<App />);
+    await openedConversation();
+
+    await openStoryFromFiles();
+
+    expect(sent('POST', '/api/rooms')).toHaveLength(1);
+    expect(sent('POST', '/api/artifacts/library/stories/night-train/open').map((r) => r.body)).toEqual([
+      JSON.stringify({ room_id: 'new-1' }),
+    ]);
+    await waitFor(() => expect(sent('GET', '/api/rooms/new-1')).toHaveLength(1));
+    expect(await screen.findByTestId('room-notice')).toHaveTextContent(
+      'Another conversation is writing this story, so this one can read it but not change it.',
+    );
+    expect(screen.queryByTestId('artifact-library')).toBeNull();
+  });
+
+  it('takes back the conversation it made when the Core will not give it the story', async () => {
+    // Killed by: frontend/src/App.tsx :: await roomsApi.delete(created.room_id).catch((cleanup: unknown) => {
+    // Becomes: await Promise.resolve().catch((cleanup: unknown) => {
+    storyOpenRefusal = { status: 409, detail: 'That story could not be read, so it was not opened.' };
+    render(<App />);
+    await openedConversation();
+
+    await openStoryFromFiles();
+
+    expect(sent('POST', '/api/rooms')).toHaveLength(1);
+    expect(sent('DELETE', '/api/rooms/new-1')).toHaveLength(1);
+    expect(roomsOnServer.has('new-1')).toBe(false);
+    // The refusal is shown where the user asked, in the Core's words, and nothing opened.
+    expect(await screen.findByTestId('files-notice')).toHaveTextContent(
+      'That story could not be read, so it was not opened.',
+    );
+    expect(sent('GET', '/api/rooms/new-1')).toHaveLength(0);
+    expect(screen.queryByTestId('conversation-new-1')).toBeNull();
+  });
+
+  it('gives back the create guard after a refusal, so the page still opens a conversation', async () => {
+    // Killed by: frontend/src/App.tsx :: guard.current = false;
+    // Becomes:
+    //
+    // The auto-open is held on the agent list while the story open is refused. The guard
+    // the handler took must be free by the time that list lands, or the effect reads "a
+    // create is in flight" for the rest of the session and nothing is ever opened.
+    storyOpenRefusal = { status: 409, detail: 'That story could not be read, so it was not opened.' };
+    hold('GET /api/agents');
+    render(<App />);
+    await settle();
+
+    await openStoryFromFiles();
+    expect(await screen.findByTestId('files-notice')).toHaveTextContent(
+      'That story could not be read, so it was not opened.',
+    );
+    expect(sent('GET', '/api/rooms/r1')).toHaveLength(0);
+
+    await release('GET /api/agents');
+    await waitFor(() => expect(sent('GET', '/api/rooms/r1')).toHaveLength(1));
   });
 });
 

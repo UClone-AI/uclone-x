@@ -364,6 +364,21 @@ class RoomService:
         state = self.get(room_id)
         return self._store.save(state.model_copy(update={"title": cleaned}))
 
+    def set_story(self, room_id: str, story_id: str | None) -> RoomState:
+        """Make `story_id` the story this room has open, or clear it with None (#1554).
+
+        For a head that opens a story into a conversation from outside it -- the Files
+        screen's "open in a new conversation". Inside a turn the story moves only through a
+        tool declaring `opens_story`; this is the same field, set by the person instead.
+        The story's writing lease is the story library's business and is not touched here.
+
+        Raises:
+            RoomNotFoundError: No room under that id.
+            StaleRoomWriteError: Another writer moved the room first.
+        """
+        state = self.get(room_id)
+        return self._store.save(state.model_copy(update={"story_id": story_id}))
+
     def delete(self, room_id: str) -> bool:
         """Remove the room; return whether one was there to remove."""
         return self._store.delete(room_id)

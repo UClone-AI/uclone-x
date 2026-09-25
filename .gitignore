@@ -100,5 +100,10 @@ evals/reports/*.json
 # `artifacts/images/...`, and the UI reads a session's tool output from
 # `.sandbox/tool_artifacts/<session>/`. Fifty such PNGs were staged by a `git add -A` before
 # a gate run, and the check that classifies every tracked file refused them.
-artifacts/
+# Anchored to the root, where that output lands. Unanchored, `artifacts/` also matched the
+# source directories that share the name (`src/uclone_x/artifacts/`,
+# `frontend/src/components/artifacts/`, #1554), and the public export's commit silently left
+# the frontend one's ten files out. Anchoring covers any later directory of that name too,
+# which per-directory negations did not; `oss.export` now refuses a commit that drops a file.
+/artifacts/
 .sandbox/
