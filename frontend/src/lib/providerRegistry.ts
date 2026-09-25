@@ -8,6 +8,8 @@ export interface ProviderKeyMetadata {
   placeholder: string;
   costTip: string;
   defaultModel: string;
+  defaultBaseUrl: string;
+  curatedModels: string[];
 }
 
 export const PROVIDER_REGISTRY: Record<string, ProviderKeyMetadata> = {
@@ -21,6 +23,8 @@ export const PROVIDER_REGISTRY: Record<string, ProviderKeyMetadata> = {
     placeholder: 'AIzaSy...',
     costTip: 'Google AI Studio에서 신용카드 등록 없이 분당 15회 무료(Free Tier) 키를 발급받을 수 있습니다.',
     defaultModel: 'gemini-1.5-pro',
+    defaultBaseUrl: 'https://generativelanguage.googleapis.com/v1beta',
+    curatedModels: ['gemini-1.5-flash', 'gemini-1.5-pro', 'gemini-2.0-flash-exp'],
   },
   anthropic: {
     id: 'anthropic',
@@ -31,6 +35,8 @@ export const PROVIDER_REGISTRY: Record<string, ProviderKeyMetadata> = {
     placeholder: 'sk-ant-api03-...',
     costTip: 'Anthropic Console의 API Keys 메뉴에서 키를 발급받을 수 있습니다 (Credit 충전 필요).',
     defaultModel: 'claude-3-5-sonnet-20241022',
+    defaultBaseUrl: 'https://api.anthropic.com',
+    curatedModels: ['claude-3-5-sonnet-20241022', 'claude-3-5-haiku-20241022', 'claude-3-opus-20240229'],
   },
   openai: {
     id: 'openai',
@@ -41,8 +47,24 @@ export const PROVIDER_REGISTRY: Record<string, ProviderKeyMetadata> = {
     placeholder: 'sk-proj-...',
     costTip: 'OpenAI Platform의 API Keys 메뉴에서 비밀 키를 생성할 수 있습니다.',
     defaultModel: 'gpt-4o',
+    defaultBaseUrl: 'https://api.openai.com/v1',
+    curatedModels: ['gpt-4o', 'gpt-4o-mini', 'o1-mini', 'o3-mini'],
   },
 };
+
+/**
+ * Whether the provider is a managed public cloud provider requiring an API key.
+ */
+export function isCloudProvider(providerId: string): boolean {
+  return providerId in PROVIDER_REGISTRY;
+}
+
+/**
+ * Returns curated model presets for a provider, or empty array if none.
+ */
+export function getCuratedModels(providerId: string): string[] {
+  return PROVIDER_REGISTRY[providerId]?.curatedModels ?? [];
+}
 
 /**
  * Clean up an API key by trimming whitespace and stripping surrounding quotes.

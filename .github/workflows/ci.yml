@@ -165,24 +165,18 @@ jobs:
       # drive a source checkout and are registered only from one. Asserted on
       # the artifact because the gate that decides it -- whether the running
       # module sits inside a checkout -- is always true where the suite runs.
+      #
+      # The command list is read from the installed command group, not grepped
+      # out of `ucx --help`: Rich forces styled output under GitHub Actions, so
+      # every name in the help arrives inside escape sequences and a box, and a
+      # pattern over that text reported `run` missing from a help screen that
+      # listed it. The help is still printed, for whoever reads this log.
       - name: Installed build is a user build
         run: |
           set -euo pipefail
           cd "$RUNNER_TEMP"
-          help="$("$RUNNER_TEMP/cli/bin/ucx" --help 2>&1)"
-          echo "$help"
-
-          for user_command in run ui llm status version; do
-            grep -qE "^[^A-Za-z]*$user_command\\b" <<<"$help" \
-              || { echo "::error::user command '$user_command' missing from the installed build" >&2; exit 1; }
-          done
-
-          for maintainer_command in test dev setup; do
-            if grep -qE "^[^A-Za-z]*$maintainer_command\\b" <<<"$help"; then
-              echo "::error::maintainer command '$maintainer_command' is exposed to users" >&2
-              exit 1
-            fi
-          done
+          "$RUNNER_TEMP/cli/bin/ucx" --help
+          "$RUNNER_TEMP/cli/bin/python" "$GITHUB_WORKSPACE/.github/scripts/check_user_build.py"
 
       # Reaching for one anyway is a usage error, and it has to read as one.
       - name: An absent maintainer command fails cleanly

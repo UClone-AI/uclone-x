@@ -25,7 +25,13 @@ import {
   FolderOpen,
   ExternalLink,
 } from 'lucide-react';
-import { getProviderMeta, validateKeyFormat, sanitizeApiKey } from '../lib/providerRegistry';
+import {
+  getProviderMeta,
+  validateKeyFormat,
+  sanitizeApiKey,
+  isCloudProvider,
+  getCuratedModels,
+} from '../lib/providerRegistry';
 import { RuntimeSettings, ConnectionTestResult, PersonaCatalog } from '../types';
 import { PersonaManager } from './personas/PersonaManager';
 import { SkillsSection } from './settings/SkillsSection';
@@ -41,6 +47,24 @@ import { SETTINGS_FAILURE } from '../lib/settingsCopy';
 const PERSONA_ICONS = { add: Plus, edit: Pencil, save: Save, cancel: X, spinner: Loader2 };
 import { Badge } from './ui/Badge';
 import { Button } from './ui/Button';
+
+export type SettingsTabId = 'all' | 'llm' | 'tools' | 'folders' | 'clones' | 'skills' | 'diagnostics';
+
+interface SettingsTabItem {
+  id: SettingsTabId;
+  label: string;
+  icon: React.ComponentType<{ className?: string }>;
+}
+
+const SETTINGS_TABS: SettingsTabItem[] = [
+  { id: 'all', label: '전체', icon: Settings },
+  { id: 'llm', label: 'LLM & 모델', icon: Server },
+  { id: 'tools', label: '이미지 도구', icon: ImageIcon },
+  { id: 'folders', label: '폴더 권한', icon: FolderOpen },
+  { id: 'clones', label: '페르소나/클론', icon: Users },
+  { id: 'skills', label: '스킬 & MCP', icon: Wrench },
+  { id: 'diagnostics', label: '진단', icon: CheckCircle2 },
+];
 
 /**
  * Whether a rejected `fetch` was cancelled rather than broken.
@@ -81,6 +105,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const [saving, setSaving] = useState<boolean>(false);
   const [testing, setTesting] = useState<boolean>(false);
   const [currentSettings, setCurrentSettings] = useState<RuntimeSettings | null>(null);
+  const [activeTab, setActiveTab] = useState<SettingsTabId>('all');
 
   // Form Fields
   const [llmProvider, setLlmProvider] = useState<string>('ollama');
@@ -203,49 +228,38 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const handleProviderSelect = (newProvider: string) => {
     setLlmProvider(newProvider);
     setTestResults(null);
+    setIsCustomModel(false);
     if (newProvider === 'vllm') {
-      // Deliberately no defaults. A vLLM server is launched per model on a port chosen at
-      // the command line, so there is no endpoint or model this panel could pre-fill that
-      // is not a guess at somebody else's `vllm serve` arguments — and a guess that is
-      // wrong is saved as configuration and then reported as a refused connection or a 404
-      // about a model the operator never chose. What another provider left behind is
-      // cleared, because `https://api.openai.com/v1` pointing at a local deployment is the
-      // one wrong value worse than an empty field.
-      //
-      // Cleared on any change of provider, not by a list of values: the denylist this
-      // replaced named what the panel pre-fills, and the panel can hold more than that —
-      // `gpt-4o-mini`, `o1-mini` and `o3-mini` are all in `ui/app.py`'s model list, and an
-      // Ollama endpoint on a port other than 11434 is still an Ollama endpoint. Each
-      // survived the switch and was saved as `VLLM_MODEL` / `VLLM_BASE_URL`. Re-selecting
-      // vLLM changes no provider, so it keeps what the operator typed — this panel is the
-      // only source of those two values.
       if (llmProvider !== 'vllm') {
         setLlmBaseUrl('');
         setLlmModel('');
       }
     } else if (newProvider === 'ollama') {
-      if (!llmBaseUrl || llmBaseUrl.includes('api.openai.com') || llmBaseUrl.includes('api.anthropic.com')) {
+      if (!llmBaseUrl || llmBaseUrl.includes('api.openai.com') || llmBaseUrl.includes('api.anthropic.com') || llmBaseUrl.includes('googleapis.com')) {
         setLlmBaseUrl('http://localhost:11434');
       }
-      if (!llmModel || llmModel === 'gpt-4o' || llmModel.startsWith('claude')) {
+      if (!llmModel || llmModel === 'gpt-4o' || llmModel.startsWith('claude') || llmModel.startsWith('gemini')) {
         setLlmModel('qwen3:8b');
       }
     } else if (newProvider === 'openai') {
-      if (!llmBaseUrl || llmBaseUrl.includes('11434')) {
-        setLlmBaseUrl('https://api.openai.com/v1');
+      if (llmBaseUrl.includes('11434') || llmBaseUrl.includes('googleapis.com') || llmBaseUrl.includes('api.anthropic.com')) {
+        setLlmBaseUrl(() => '');
       }
-      if (!llmModel || llmModel.includes('qwen') || llmModel.startsWith('claude')) {
+      if (!llmModel || llmModel.includes('qwen') || llmModel.startsWith('claude') || llmModel.startsWith('gemini')) {
         setLlmModel('gpt-4o');
       }
     } else if (newProvider === 'anthropic') {
-      if (!llmBaseUrl || llmBaseUrl.includes('11434')) {
-        setLlmBaseUrl('https://api.anthropic.com');
+      if (llmBaseUrl.includes('11434') || llmBaseUrl.includes('googleapis.com') || llmBaseUrl.includes('api.openai.com')) {
+        setLlmBaseUrl(() => '');
       }
-      if (!llmModel || llmModel.includes('qwen') || llmModel === 'gpt-4o') {
+      if (!llmModel || llmModel.includes('qwen') || llmModel === 'gpt-4o' || llmModel.startsWith('gemini')) {
         setLlmModel('claude-3-5-sonnet-20241022');
       }
     } else if (newProvider === 'gemini') {
-      if (!llmModel || llmModel.includes('qwen')) {
+      if (llmBaseUrl.includes('11434') || llmBaseUrl.includes('api.openai.com') || llmBaseUrl.includes('api.anthropic.com')) {
+        setLlmBaseUrl(() => '');
+      }
+      if (!llmModel || llmModel.includes('qwen') || llmModel === 'gpt-4o' || llmModel.startsWith('claude')) {
         setLlmModel('gemini-1.5-pro');
       }
     } else if (newProvider === 'mock') {
@@ -435,7 +449,11 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     }
   };
 
-  const detectedModels = currentSettings?.available_models || testResults?.llm?.models || [];
+  const detectedModels =
+    (currentSettings?.llm_provider === llmProvider ? currentSettings?.available_models : null) ||
+    testResults?.llm?.models ||
+    [];
+  const curatedModels = getCuratedModels(llmProvider);
 
   if (!isOpen) return null;
 
@@ -480,6 +498,33 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           </Button>
         </div>
 
+        {/* Navigation Tabs Bar */}
+        <div
+          data-testid="settings-tabs-bar"
+          className="px-6 py-2 bg-slate-950/40 border-b border-slate-800/80 flex items-center gap-1.5 overflow-x-auto scrollbar-none"
+        >
+          {SETTINGS_TABS.map((tab) => {
+            const Icon = tab.icon;
+            const isActive = activeTab === tab.id;
+            return (
+              <button
+                key={tab.id}
+                type="button"
+                onClick={() => setActiveTab(tab.id)}
+                data-testid={`settings-tab-${tab.id}`}
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium whitespace-nowrap transition-colors ${
+                  isActive
+                    ? 'bg-cyan-500/10 text-cyan-400 border border-cyan-500/30 font-semibold'
+                    : 'text-slate-400 hover:text-slate-200 hover:bg-slate-900 border border-transparent'
+                }`}
+              >
+                <Icon className="w-3.5 h-3.5" />
+                <span>{tab.label}</span>
+              </button>
+            );
+          })}
+        </div>
+
         {/* Modal Body */}
         <div className="flex-1 overflow-y-auto p-6 space-y-6 text-sm text-slate-200">
           {feedbackMessage && (
@@ -500,9 +545,10 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             </div>
           )}
 
-          <DiagnosticsPanel />
+          {(activeTab === 'all' || activeTab === 'diagnostics') && <DiagnosticsPanel />}
 
           {/* Section 1: LLM Provider */}
+          {(activeTab === 'all' || activeTab === 'llm') && (
           <div className="space-y-4">
             <div className="flex items-center justify-between">
               <label className="text-xs font-semibold uppercase tracking-wider text-slate-400 flex items-center gap-1.5">
@@ -559,6 +605,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                       ? 'http://localhost:11434'
                       : llmProvider === 'vllm'
                       ? 'required — no default'
+                      : isCloudProvider(llmProvider)
+                      ? 'optional proxy'
                       : 'e.g. proxy / host'}
                   </span>
                 </label>
@@ -573,10 +621,19 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                       ? 'http://<host>:8000/v1 — where you ran `vllm serve`'
                       : llmProvider === 'openai'
                       ? 'https://api.openai.com/v1'
+                      : llmProvider === 'anthropic'
+                      ? 'https://api.anthropic.com'
+                      : llmProvider === 'gemini'
+                      ? 'https://generativelanguage.googleapis.com/v1beta'
                       : 'Endpoint URL'
                   }
                   className="w-full bg-slate-950/90 border border-slate-800 rounded-xl px-3 py-2 text-xs text-white placeholder-slate-600 focus:outline-none focus:border-cyan-500/80 font-mono transition-colors"
                 />
+                {isCloudProvider(llmProvider) && (
+                  <p className="text-[10px] text-slate-500 mt-1">
+                    기본적으로 {getProviderMeta(llmProvider)?.displayName} 공식 API에 직접 연결됩니다. 커스텀 프록시 사용 시에만 입력하세요.
+                  </p>
+                )}
               </div>
 
               <div>
@@ -619,13 +676,34 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                     )}
                   </div>
                 ) : (
-                  <input
-                    type="text"
-                    value={llmModel}
-                    onChange={(e) => setLlmModel(e.target.value)}
-                    placeholder="e.g. qwen3:8b, hermes3:8b, gpt-4o"
-                    className="w-full bg-slate-950/90 border border-slate-800 rounded-xl px-3 py-2 text-xs text-white placeholder-slate-600 focus:outline-none focus:border-cyan-500/80 font-mono transition-colors"
-                  />
+                  <div>
+                    <input
+                      type="text"
+                      value={llmModel}
+                      onChange={(e) => setLlmModel(e.target.value)}
+                      placeholder="e.g. qwen3:8b, hermes3:8b, gpt-4o"
+                      className="w-full bg-slate-950/90 border border-slate-800 rounded-xl px-3 py-2 text-xs text-white placeholder-slate-600 focus:outline-none focus:border-cyan-500/80 font-mono transition-colors"
+                    />
+                    {curatedModels.length > 0 && (
+                      <div className="flex flex-wrap items-center gap-1.5 mt-2" data-testid="curated-models-pills">
+                        <span className="text-[10px] text-slate-500">추천:</span>
+                        {curatedModels.map((m) => (
+                          <button
+                            key={m}
+                            type="button"
+                            onClick={() => setLlmModel(m)}
+                            className={`px-2 py-0.5 rounded text-[10px] font-mono border transition-colors ${
+                              llmModel === m
+                                ? 'bg-cyan-950/80 text-cyan-300 border-cyan-500/60'
+                                : 'bg-slate-900/60 text-slate-400 border-slate-800 hover:text-slate-200 hover:border-slate-700'
+                            }`}
+                          >
+                            {m}
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
                 )}
               </div>
             </div>
@@ -711,10 +789,11 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               </div>
             )}
 
-            {/* API Key (if cloud provider) */}
-            {llmProvider !== 'mock' && (() => {
+            {/* API Key (if cloud provider or vLLM) */}
+            {llmProvider !== 'mock' && llmProvider !== 'ollama' && (() => {
               const providerMeta = getProviderMeta(llmProvider);
               const keyValidation = providerMeta && llmApiKey ? validateKeyFormat(llmProvider, llmApiKey) : null;
+              const isKeyConfiguredForThisProvider = currentSettings?.llm_provider === llmProvider && currentSettings?.llm_api_key_set;
               return (
                 <div className="pt-1">
                   <label className="block text-xs font-medium text-slate-300 mb-1.5 flex items-center justify-between">
@@ -741,7 +820,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                           <ExternalLink className="w-3 h-3" />
                         </a>
                       )}
-                      {currentSettings?.llm_api_key_set && (
+                      {isKeyConfiguredForThisProvider && (
                         <span className="text-[11px] text-emerald-400 font-mono bg-emerald-950/60 px-2 py-0.5 rounded border border-emerald-800/60">
                           Configured: {currentSettings.llm_api_key_masked}
                         </span>
@@ -755,7 +834,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                       onChange={(e) => setLlmApiKey(e.target.value)}
                       onBlur={() => setLlmApiKey(sanitizeApiKey(llmApiKey))}
                       placeholder={
-                        currentSettings?.llm_api_key_set
+                        isKeyConfiguredForThisProvider
                           ? 'Leave blank to keep current key, or enter new key'
                           : providerMeta
                           ? `Enter API key (e.g. ${providerMeta.placeholder})`
@@ -793,219 +872,229 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               );
             })()}
           </div>
+          )}
 
-          <hr className="border-slate-800/80" />
+          {activeTab === 'all' && <hr className="border-slate-800/80" />}
 
           {/* Section 2: ComfyUI Endpoint */}
-          <div className="space-y-3">
-            <div className="flex items-center justify-between">
-              <label className="text-xs font-semibold uppercase tracking-wider text-slate-400 flex items-center gap-1.5">
-                <ImageIcon className="w-3.5 h-3.5 text-indigo-400" />
-                ComfyUI Image Generation Endpoint
-              </label>
-              <span className="text-[10px] text-slate-500 font-mono">
-                Used by &apos;generate_image&apos; tool
-              </span>
-            </div>
+          {(activeTab === 'all' || activeTab === 'tools') && (
+            <div className="space-y-3">
+              <div className="flex items-center justify-between">
+                <label className="text-xs font-semibold uppercase tracking-wider text-slate-400 flex items-center gap-1.5">
+                  <ImageIcon className="w-3.5 h-3.5 text-indigo-400" />
+                  ComfyUI Image Generation Endpoint
+                </label>
+                <span className="text-[10px] text-slate-500 font-mono">
+                  Used by &apos;generate_image&apos; tool
+                </span>
+              </div>
 
-            <div>
-              <input
-                type="text"
-                value={comfyuiBaseUrl}
-                onChange={(e) => setComfyuiBaseUrl(e.target.value)}
-                placeholder="http://127.0.0.1:8188"
-                className="w-full bg-slate-950/90 border border-slate-800 rounded-xl px-3 py-2 text-xs text-white placeholder-slate-600 focus:outline-none focus:border-cyan-500/80 font-mono transition-colors"
-              />
-              <p className="text-[11px] text-slate-500 mt-1">
-                Points to local or LAN GPU workstation running ComfyUI with standard txt2img workflows.
-              </p>
+              <div>
+                <input
+                  type="text"
+                  value={comfyuiBaseUrl}
+                  onChange={(e) => setComfyuiBaseUrl(e.target.value)}
+                  placeholder="http://127.0.0.1:8188"
+                  className="w-full bg-slate-950/90 border border-slate-800 rounded-xl px-3 py-2 text-xs text-white placeholder-slate-600 focus:outline-none focus:border-cyan-500/80 font-mono transition-colors"
+                />
+                <p className="text-[11px] text-slate-500 mt-1">
+                  Points to local or LAN GPU workstation running ComfyUI with standard txt2img workflows.
+                </p>
+              </div>
             </div>
-          </div>
+          )}
 
-          <hr className="border-slate-800/80" />
+          {activeTab === 'all' && <hr className="border-slate-800/80" />}
 
           {/* Section 3: Folders clones can read */}
-          <div className="space-y-3" data-testid="settings-read-roots">
-            <label className="text-xs font-semibold uppercase tracking-wider text-slate-400 flex items-center gap-1.5">
-              <FolderOpen className="w-3.5 h-3.5 text-cyan-400" />
-              Folders Clones Can Read
-            </label>
+          {(activeTab === 'all' || activeTab === 'folders') && (
+            <div className="space-y-3" data-testid="settings-read-roots">
+              <label className="text-xs font-semibold uppercase tracking-wider text-slate-400 flex items-center gap-1.5">
+                <FolderOpen className="w-3.5 h-3.5 text-cyan-400" />
+                Folders Clones Can Read
+              </label>
 
-            <div>
-              <span className="block text-xs font-medium text-slate-300 mb-1.5">Workspace folder</span>
-              <div
-                className="px-3 py-2 bg-slate-950/60 border border-slate-800 rounded-xl text-xs font-mono text-slate-300 truncate"
-                data-testid="settings-workspace-dir"
-              >
-                {currentSettings?.workspace_dir || 'Not reported by the server'}
-              </div>
-              <p className="text-[11px] text-slate-500 mt-1">
-                Clones read and write their files here.
-              </p>
-            </div>
-
-            <div className="space-y-2">
-              <span className="block text-xs font-medium text-slate-300">Other folders (read only)</span>
-              <p className="text-[11px] text-slate-500">
-                Clones' file tools can open files in these folders but not change or delete
-                them. A clone that can run shell commands is not limited by this list.
-              </p>
-              {readRoots.length > 0 ? (
-                <ul className="space-y-1" aria-label="Read-only folders">
-                  {readRoots.map((root) => (
-                    <li
-                      key={root}
-                      className="flex items-center justify-between px-2.5 py-1.5 bg-slate-950/60 border border-slate-800 rounded-lg text-[11px] font-mono text-slate-300"
-                    >
-                      <span className="truncate">{root}</span>
-                      <span className="flex items-center gap-2 shrink-0 ml-2">
-                        {missingReadRoots.has(root) && (
-                          <span className="font-sans text-amber-400" title="Clones cannot read this folder">
-                            not usable
-                          </span>
-                        )}
-                        <button
-                          type="button"
-                          onClick={() => setReadRoots(readRoots.filter((r) => r !== root))}
-                          title={`Remove ${root}`}
-                          aria-label={`Remove ${root}`}
-                          className="text-slate-500 hover:text-rose-400"
-                        >
-                          <Trash2 className="w-3.5 h-3.5" />
-                        </button>
-                      </span>
-                    </li>
-                  ))}
-                </ul>
-              ) : (
-                <p className="text-[11px] text-slate-400" data-testid="settings-read-roots-empty">
-                  No other folders added here.
+              <div>
+                <span className="block text-xs font-medium text-slate-300 mb-1.5">Workspace folder</span>
+                <div
+                  className="px-3 py-2 bg-slate-950/60 border border-slate-800 rounded-xl text-xs font-mono text-slate-300 truncate"
+                  data-testid="settings-workspace-dir"
+                >
+                  {currentSettings?.workspace_dir || 'Not reported by the server'}
+                </div>
+                <p className="text-[11px] text-slate-500 mt-1">
+                  Clones read and write their files here.
                 </p>
-              )}
-              {envReadRoots.length > 0 && (
-                <div data-testid="settings-read-roots-env">
-                  <p className="text-[11px] text-slate-500">
-                    Also readable, set by UCLONE_READ_ROOTS when the app started:
-                  </p>
-                  <ul className="space-y-1 mt-1" aria-label="Read-only folders from the environment">
-                    {envReadRoots.map((root) => (
+              </div>
+
+              <div className="space-y-2">
+                <span className="block text-xs font-medium text-slate-300">Other folders (read only)</span>
+                <p className="text-[11px] text-slate-500">
+                  Clones' file tools can open files in these folders but not change or delete
+                  them. A clone that can run shell commands is not limited by this list.
+                </p>
+                {readRoots.length > 0 ? (
+                  <ul className="space-y-1" aria-label="Read-only folders">
+                    {readRoots.map((root) => (
                       <li
                         key={root}
-                        className="px-2.5 py-1.5 bg-slate-950/40 border border-slate-800 rounded-lg text-[11px] font-mono text-slate-400 truncate"
+                        className="flex items-center justify-between px-2.5 py-1.5 bg-slate-950/60 border border-slate-800 rounded-lg text-[11px] font-mono text-slate-300"
                       >
-                        {root}
+                        <span className="truncate">{root}</span>
+                        <span className="flex items-center gap-2 shrink-0 ml-2">
+                          {missingReadRoots.has(root) && (
+                            <span className="font-sans text-amber-400" title="Clones cannot read this folder">
+                              not usable
+                            </span>
+                          )}
+                          <button
+                            type="button"
+                            onClick={() => setReadRoots(readRoots.filter((r) => r !== root))}
+                            title={`Remove ${root}`}
+                            aria-label={`Remove ${root}`}
+                            className="text-slate-500 hover:text-rose-400"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                        </span>
                       </li>
                     ))}
                   </ul>
+                ) : (
+                  <p className="text-[11px] text-slate-400" data-testid="settings-read-roots-empty">
+                    No other folders added here.
+                  </p>
+                )}
+                {envReadRoots.length > 0 && (
+                  <div data-testid="settings-read-roots-env">
+                    <p className="text-[11px] text-slate-500">
+                      Also readable, set by UCLONE_READ_ROOTS when the app started:
+                    </p>
+                    <ul className="space-y-1 mt-1" aria-label="Read-only folders from the environment">
+                      {envReadRoots.map((root) => (
+                        <li
+                          key={root}
+                          className="px-2.5 py-1.5 bg-slate-950/40 border border-slate-800 rounded-lg text-[11px] font-mono text-slate-400 truncate"
+                        >
+                          {root}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+                {envReadRootsIgnored.map((reason) => (
+                  <p key={reason} className="text-[11px] text-amber-400" data-testid="settings-read-roots-env-ignored">
+                    Ignored: {reason}
+                  </p>
+                ))}
+                <div className="flex items-center gap-2">
+                  <input
+                    type="text"
+                    value={newReadRoot}
+                    onChange={(e) => setNewReadRoot(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') handleAddReadRoot();
+                    }}
+                    placeholder="e.g. ~/Documents/notes"
+                    aria-label="Folder to add"
+                    className="flex-1 bg-slate-950/90 border border-slate-800 rounded-xl px-3 py-2 text-xs text-white placeholder-slate-600 focus:outline-none focus:border-cyan-500/80 font-mono transition-colors"
+                  />
+                  <Button
+                    variant="bordered"
+                    onClick={handleAddReadRoot}
+                    disabled={!newReadRoot.trim()}
+                    className="px-3 py-2 rounded-xl bg-slate-800/80 border-slate-700/80 text-slate-200 hover:text-slate-200 shrink-0"
+                  >
+                    <Plus className="w-3.5 h-3.5 text-cyan-400" />
+                    Add folder
+                  </Button>
                 </div>
-              )}
-              {envReadRootsIgnored.map((reason) => (
-                <p key={reason} className="text-[11px] text-amber-400" data-testid="settings-read-roots-env-ignored">
-                  Ignored: {reason}
-                </p>
-              ))}
-              <div className="flex items-center gap-2">
-                <input
-                  type="text"
-                  value={newReadRoot}
-                  onChange={(e) => setNewReadRoot(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter') handleAddReadRoot();
-                  }}
-                  placeholder="e.g. ~/Documents/notes"
-                  aria-label="Folder to add"
-                  className="flex-1 bg-slate-950/90 border border-slate-800 rounded-xl px-3 py-2 text-xs text-white placeholder-slate-600 focus:outline-none focus:border-cyan-500/80 font-mono transition-colors"
-                />
-                <Button
-                  variant="bordered"
-                  onClick={handleAddReadRoot}
-                  disabled={!newReadRoot.trim()}
-                  className="px-3 py-2 rounded-xl bg-slate-800/80 border-slate-700/80 text-slate-200 hover:text-slate-200 shrink-0"
-                >
-                  <Plus className="w-3.5 h-3.5 text-cyan-400" />
-                  Add folder
-                </Button>
+                {readRootsChanged && (
+                  <p className="text-[11px] text-slate-500" data-testid="settings-read-roots-unsaved">
+                    Folder changes take effect when you save.
+                  </p>
+                )}
               </div>
-              {readRootsChanged && (
-                <p className="text-[11px] text-slate-500" data-testid="settings-read-roots-unsaved">
-                  Folder changes take effect when you save.
-                </p>
-              )}
             </div>
-          </div>
+          )}
 
-          <hr className="border-slate-800/80" />
+          {activeTab === 'all' && <hr className="border-slate-800/80" />}
 
           {/* Section 4: Agents (persona files) */}
-          <div className="space-y-3" data-testid="settings-personas">
-            <label className="text-xs font-semibold uppercase tracking-wider text-slate-400 flex items-center gap-1.5">
-              <Users className="w-3.5 h-3.5 text-cyan-400" />
-              {PERSONA_EDITOR_COPY.sectionTitle}
-            </label>
-            {personaCatalog || personaLoadError !== null ? (
-              <PersonaManager
-                personas={personaCatalog?.personas ?? []}
-                availableTools={personaCatalog?.available_tools ?? []}
-                availableModels={detectedModels}
-                personasDir={personaCatalog ? personaCatalog.personas_dir : null}
-                loadError={personaLoadError}
-                copy={PERSONA_EDITOR_COPY}
-                icons={PERSONA_ICONS}
-                onSave={handleSavePersona}
-              />
-            ) : null}
-          </div>
-
-          <hr className="border-slate-800/80" />
-
-          {/* Section 4: Skills -- the installation's skill catalogue, beside its clones (#1358) */}
-          <SkillsSection />
-
-          <hr className="border-slate-800/80" />
-
-          {/* External tool servers (MCP) -- tools clones can use, beside the skills they have */}
-          <McpServersSection />
-
-          <hr className="border-slate-800/80" />
-
-          {/* Section 5: Developer mode -- a head preference, applied at once, not saved to the runtime */}
-          <div className="space-y-2" data-testid="settings-developer-mode">
-            <div className="flex items-center justify-between gap-4">
-              <label
-                htmlFor="developer-mode-switch"
-                className="text-xs font-semibold uppercase tracking-wider text-slate-400 flex items-center gap-1.5"
-              >
-                <Wrench className="w-3.5 h-3.5 text-cyan-400" />
-                Developer mode
+          {(activeTab === 'all' || activeTab === 'clones') && (
+            <div className="space-y-3" data-testid="settings-personas">
+              <label className="text-xs font-semibold uppercase tracking-wider text-slate-400 flex items-center gap-1.5">
+                <Users className="w-3.5 h-3.5 text-cyan-400" />
+                {PERSONA_EDITOR_COPY.sectionTitle}
               </label>
-              <button
-                id="developer-mode-switch"
-                type="button"
-                role="switch"
-                aria-checked={developerMode}
-                data-testid="developer-mode-switch"
-                onClick={() => onDeveloperModeChange(!developerMode)}
-                className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full border transition-colors ${
-                  developerMode ? 'bg-cyan-700 border-cyan-600' : 'bg-slate-800 border-slate-700'
-                }`}
-              >
-                <span
-                  className={`inline-block h-3.5 w-3.5 rounded-full bg-slate-100 transition-transform ${
-                    developerMode ? 'translate-x-4' : 'translate-x-0.5'
-                  }`}
+              {personaCatalog || personaLoadError !== null ? (
+                <PersonaManager
+                  personas={personaCatalog?.personas ?? []}
+                  availableTools={personaCatalog?.available_tools ?? []}
+                  availableModels={detectedModels}
+                  personasDir={personaCatalog ? personaCatalog.personas_dir : null}
+                  loadError={personaLoadError}
+                  copy={PERSONA_EDITOR_COPY}
+                  icons={PERSONA_ICONS}
+                  onSave={handleSavePersona}
                 />
-              </button>
+              ) : null}
             </div>
-            <p className="text-[11px] text-slate-500">
-              Adds a drawer of developer tools to the workspace dock (Knowledge Graph, DAG,
-              EventBus and Ontology) and a Diagnostics section below (ACP and Evals). Takes effect
-              at once and is kept in this browser.
-            </p>
-          </div>
+          )}
 
-          {/* Section 6: Diagnostics -- the build's ACP report and evaluation scorecard, in
-              developer mode only, directly under the switch that reveals it (#1358) */}
-          {developerMode && <DiagnosticsSection />}
+          {activeTab === 'all' && <hr className="border-slate-800/80" />}
+
+          {/* Section 5: Skills & MCP Tools */}
+          {(activeTab === 'all' || activeTab === 'skills') && (
+            <div className="space-y-6">
+              <SkillsSection />
+              <hr className="border-slate-800/80" />
+              <McpServersSection />
+            </div>
+          )}
+
+          {activeTab === 'all' && <hr className="border-slate-800/80" />}
+
+          {/* Section 6: Developer mode & Diagnostics */}
+          {(activeTab === 'all' || activeTab === 'diagnostics') && (
+            <div className="space-y-6">
+              <div className="space-y-2" data-testid="settings-developer-mode">
+                <div className="flex items-center justify-between gap-4">
+                  <label
+                    htmlFor="developer-mode-switch"
+                    className="text-xs font-semibold uppercase tracking-wider text-slate-400 flex items-center gap-1.5"
+                  >
+                    <Wrench className="w-3.5 h-3.5 text-cyan-400" />
+                    Developer mode
+                  </label>
+                  <button
+                    id="developer-mode-switch"
+                    type="button"
+                    role="switch"
+                    aria-checked={developerMode}
+                    data-testid="developer-mode-switch"
+                    onClick={() => onDeveloperModeChange(!developerMode)}
+                    className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full border transition-colors ${
+                      developerMode ? 'bg-cyan-700 border-cyan-600' : 'bg-slate-800 border-slate-700'
+                    }`}
+                  >
+                    <span
+                      className={`inline-block h-3.5 w-3.5 rounded-full bg-slate-100 transition-transform ${
+                        developerMode ? 'translate-x-4' : 'translate-x-0.5'
+                      }`}
+                    />
+                  </button>
+                </div>
+                <p className="text-[11px] text-slate-500">
+                  Adds a drawer of developer tools to the workspace dock (Knowledge Graph, DAG,
+                  EventBus and Ontology) and a Diagnostics section below (ACP and Evals). Takes effect
+                  at once and is kept in this browser.
+                </p>
+              </div>
+
+              {developerMode && <DiagnosticsSection />}
+            </div>
+          )}
 
           {/* Connectivity Test Diagnostics Card */}
           {testResults && (

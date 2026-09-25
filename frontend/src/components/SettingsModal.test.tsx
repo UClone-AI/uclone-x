@@ -1217,6 +1217,64 @@ describe('SettingsModal API key onboarding', () => {
     const validBadge = await screen.findByTestId('api-key-valid');
     expect(validBadge.textContent).toContain('올바른 Google Gemini 키 형식입니다.');
   });
+
+  it('clears localhost:11434 when switching from Ollama to Gemini and offers curated model pills', async () => {
+    mockFetch({
+      '/api/settings': () =>
+        jsonResponse({
+          ...baseSettings,
+          llm_provider: 'ollama',
+          llm_base_url: 'http://localhost:11434',
+          llm_model: 'qwen3:8b',
+        }),
+    });
+    render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
+
+    const endpoint = (await screen.findByPlaceholderText('http://localhost:11434')) as HTMLInputElement;
+    expect(endpoint.value).toBe('http://localhost:11434');
+
+    fireEvent.click(screen.getByRole('button', { name: /Gemini/ }));
+
+    expect(endpoint.value).toBe('');
+    const pills = await screen.findByTestId('curated-models-pills');
+    expect(pills.textContent).toContain('gemini-1.5-pro');
+    expect(pills.textContent).toContain('gemini-1.5-flash');
+  });
+
+  it('does not display previous provider configured key badge when switching to Gemini', async () => {
+    mockFetch({
+      '/api/settings': () =>
+        jsonResponse({
+          ...baseSettings,
+          llm_provider: 'openai',
+          llm_base_url: 'https://api.openai.com/v1',
+          llm_model: 'gpt-4o',
+          llm_api_key_set: true,
+          llm_api_key_masked: 'sk-...1234',
+        }),
+    });
+    render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
+
+    await screen.findByText('Configured: sk-...1234');
+
+    fireEvent.click(screen.getByRole('button', { name: /Gemini/ }));
+
+    expect(screen.queryByText('Configured: sk-...1234')).toBeNull();
+    expect(screen.getByPlaceholderText(/AIzaSy/i)).toBeTruthy();
+  });
+
+  it('switches visible sections when tabs are clicked', async () => {
+    mockFetch({
+      '/api/settings': () => jsonResponse(geminiSettings),
+    });
+    render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
+
+    await screen.findByTestId('settings-tabs-bar');
+    expect(screen.getByTestId('settings-tab-llm')).toBeTruthy();
+
+    fireEvent.click(screen.getByTestId('settings-tab-llm'));
+    expect(screen.getByRole('button', { name: /Gemini/ })).toBeTruthy();
+  });
 });
 
 

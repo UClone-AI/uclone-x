@@ -86,6 +86,22 @@ _SCRUBBED_GIT_ENV: dict[str, str] = {
     name: os.environ.pop(name) for name in list(os.environ) if name.startswith(_GIT_ENV_PREFIX)
 }
 
+# ---------------------------------------------------------------------------
+# Inherited colour forcing: scrubbed for the whole session, at import.
+# ---------------------------------------------------------------------------
+#
+# Typer hands Rich `force_terminal=True` whenever `GITHUB_ACTIONS`, `FORCE_COLOR` or
+# `PY_COLORS` is set, read once when `typer.rich_utils` is imported. Every help screen and
+# every pretty traceback then arrives wrapped in escape sequences, and a test that looks
+# for `--interval` or `Traceback (most recent call last)` in it fails -- in the public CI,
+# where GitHub sets `GITHUB_ACTIONS` on every step, and in any shell that exports
+# `FORCE_COLOR`, while passing everywhere else. Nothing in the suite asserts styled output,
+# so the session runs as a plain, non-terminal process would, and so do its children,
+# which inherit this environment. `typer` is not imported by anything above this point.
+_COLOUR_FORCING_ENV = ("GITHUB_ACTIONS", "FORCE_COLOR", "PY_COLORS")
+for _name in _COLOUR_FORCING_ENV:
+    os.environ.pop(_name, None)
+
 # `TestClient` addresses the app as `http://127.0.0.1`, not Starlette's `http://testserver`.
 # A dashboard bound to loopback refuses any request whose `Host` is not a loopback name --
 # the DNS-rebinding defence of #1413 -- and `testserver` is not one. Defaulted here, for

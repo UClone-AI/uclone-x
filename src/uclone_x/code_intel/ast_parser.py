@@ -37,6 +37,24 @@ def _clean_docstring(raw: str | None) -> str | None:
     return cleaned if cleaned else None
 
 
+def _docstring_node(statement: Any) -> Any:
+    """The `string` node a Python statement consists of, or None if it is not a bare string.
+
+    The two grammars this module loads disagree on the shape. The legacy
+    `tree_sitter_languages` bundle wraps a docstring in an `expression_statement`; the
+    tree-sitter-python that `tree-sitter-language-pack` ships puts the `string` directly
+    in the block. Reading only the wrapped form lost every docstring, and the module
+    symbol with them, once the `code-intel` extra switched grammars (#1100).
+    """
+    if statement.type == "string":
+        return statement
+    if statement.type == "expression_statement" and statement.children:
+        first = statement.children[0]
+        if first.type == "string":
+            return first
+    return None
+
+
 def _extract_preceding_comments(lines: list[str], start_row: int) -> str | None:
     """Extract doc comments immediately preceding a declaration line (0-indexed start_row)."""
     doc_lines: list[str] = []
@@ -157,9 +175,16 @@ class ASTParser(ASTParserProtocol):
         """
         try:
             import tree_sitter
-            import tree_sitter_languages
 
-            ts_dir = Path(tree_sitter_languages.__file__).parent
+            # Imported by name for the same reason as the language pack above, and more so:
+            # no extra installs this distribution any more, so a static import is unresolved
+            # in every environment synced from the lock file (#1100).
+            bundle = importlib.import_module("tree_sitter_languages")
+            # A namespace package has no `__file__`, and then there is no directory to search.
+            if bundle.__file__ is None:
+                return None
+
+            ts_dir = Path(bundle.__file__).parent
             so_files = (
                 list(ts_dir.glob("*.so"))
                 + list(ts_dir.glob("*.dylib"))
@@ -243,41 +268,37 @@ class ASTParser(ASTParserProtocol):
         symbols: list[SymbolNode] = []
 
         # Check module docstring
-        if root.children:
-            first = root.children[0]
-            if first.type == "expression_statement" and first.children:
-                sub = first.children[0]
-                if sub.type == "string":
-                    raw_text: str = sub.text.decode("utf-8", errors="replace")
-                    doc = raw_text.strip("\"' \t\r\n")
-                    if doc:
-                        loc = SymbolLocation(
-                            file_path=file_path,
-                            start_line=1,
-                            start_col=0,
-                            end_line=max(1, len(lines)),
-                            end_col=len(lines[-1]) if lines else 0,
-                        )
-                        symbols.append(
-                            SymbolNode(
-                                name=file_path.stem,
-                                kind=SymbolKind.MODULE,
-                                location=loc,
-                                docstring=doc,
-                            )
-                        )
+        module_doc = _docstring_node(root.children[0]) if root.children else None
+        if module_doc is not None:
+            raw_text: str = module_doc.text.decode("utf-8", errors="replace")
+            doc = raw_text.strip("\"' \t\r\n")
+            if doc:
+                loc = SymbolLocation(
+                    file_path=file_path,
+                    start_line=1,
+                    start_col=0,
+                    end_line=max(1, len(lines)),
+                    end_col=len(lines[-1]) if lines else 0,
+                )
+                symbols.append(
+                    SymbolNode(
+                        name=file_path.stem,
+                        kind=SymbolKind.MODULE,
+                        location=loc,
+                        docstring=doc,
+                    )
+                )
 
         def _get_ts_docstring(node: Any) -> str | None:
             body = node.child_by_field_name("body")
             if not body or not body.children:
                 return None
             for child in body.children:
-                if child.type == "expression_statement" and child.children:
-                    sub = child.children[0]
-                    if sub.type == "string":
-                        raw: str = sub.text.decode("utf-8", errors="replace")
-                        return _clean_docstring(raw.strip("\"' \t\r\n"))
-                elif child.type not in {"comment"}:
+                sub = _docstring_node(child)
+                if sub is not None:
+                    raw: str = sub.text.decode("utf-8", errors="replace")
+                    return _clean_docstring(raw.strip("\"' \t\r\n"))
+                if child.type not in {"comment"}:
                     break
             return None
 

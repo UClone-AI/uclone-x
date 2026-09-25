@@ -4,6 +4,8 @@ import {
   getProviderMeta,
   detectKeyProvider,
   validateKeyFormat,
+  isCloudProvider,
+  getCuratedModels,
 } from './providerRegistry';
 
 describe('providerRegistry', () => {
@@ -21,6 +23,7 @@ describe('providerRegistry', () => {
   describe('getProviderMeta', () => {
     it('returns metadata for known public providers', () => {
       expect(getProviderMeta('gemini')?.displayName).toBe('Google Gemini');
+      expect(getProviderMeta('gemini')?.defaultBaseUrl).toBe('https://generativelanguage.googleapis.com/v1beta');
       expect(getProviderMeta('anthropic')?.displayName).toBe('Anthropic Claude');
       expect(getProviderMeta('openai')?.displayName).toBe('OpenAI');
     });
@@ -29,6 +32,32 @@ describe('providerRegistry', () => {
       expect(getProviderMeta('ollama')).toBeNull();
       expect(getProviderMeta('vllm')).toBeNull();
       expect(getProviderMeta('mock')).toBeNull();
+    });
+  });
+
+  describe('isCloudProvider', () => {
+    it('returns true for public cloud providers', () => {
+      expect(isCloudProvider('gemini')).toBe(true);
+      expect(isCloudProvider('openai')).toBe(true);
+      expect(isCloudProvider('anthropic')).toBe(true);
+    });
+
+    it('returns false for local or custom providers', () => {
+      expect(isCloudProvider('ollama')).toBe(false);
+      expect(isCloudProvider('vllm')).toBe(false);
+      expect(isCloudProvider('mock')).toBe(false);
+    });
+  });
+
+  describe('getCuratedModels', () => {
+    it('returns curated models for gemini, openai, and anthropic', () => {
+      expect(getCuratedModels('gemini')).toContain('gemini-1.5-pro');
+      expect(getCuratedModels('openai')).toContain('gpt-4o');
+      expect(getCuratedModels('anthropic')).toContain('claude-3-5-sonnet-20241022');
+    });
+
+    it('returns empty array for local providers', () => {
+      expect(getCuratedModels('ollama')).toEqual([]);
     });
   });
 

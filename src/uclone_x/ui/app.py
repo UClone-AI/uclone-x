@@ -88,6 +88,10 @@ from uclone_x.core.failure_journal import (
     set_consent,
 )
 from uclone_x.core.immutable import unwrap_immutable
+from uclone_x.core.remote_worker import (
+    SSHTunnelManager,
+    probe_remote_host,
+)
 from uclone_x.core.session_diagnostics import (
     DEFAULT_MAX_CONVERSATION_TURNS,
     count_active_turns,
@@ -3245,6 +3249,8 @@ def create_ui_app(
         config_path=session_mgr.storage_dir / "mcp_servers.json",
         workspace_root=session_mgr.workspace_dir,
     )
+    tunnel_manager = SSHTunnelManager()
+    _previous_remote_settings: dict[str, Any] = {}
 
     @asynccontextmanager
     async def _app_lifespan(app_inst: FastAPI) -> AsyncGenerator[None, None]:
@@ -3258,6 +3264,8 @@ def create_ui_app(
             await mcp_start
         # Local servers are child processes; left running they outlive the app.
         await mcp_manager.close()
+        with contextlib.suppress(BaseException):
+            await tunnel_manager.close()
         evt: asyncio.Event | None = getattr(app_inst.state, "shutdown_event", None)
         if evt is not None:
             evt.set()
@@ -3280,6 +3288,7 @@ def create_ui_app(
     app.state.eval_reports_dir = session_mgr.eval_reports_dir
     app.state.shutdown_event = active_shutdown_event
     app.state.mcp_manager = mcp_manager
+    app.state.tunnel_manager = tunnel_manager
 
     # Per app, not per module: two `create_ui_app` calls in one process — which is
     # every test session — must not share a model's in-flight pull (#1233). Also on
@@ -3777,6 +3786,103 @@ def create_ui_app(
             "status": "ok" if all_ok else "error",
             "results": results,
         }
+
+    @app.post("/api/settings/remote-gpu/probe")
+    async def probe_remote_gpu_endpoint(request: Request, req: dict[str, Any]) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
+        """Probe an SSH remote host for GPU capabilities and AI services."""
+        _refuse_unless_local(request)
+        host = str(req.get("host", "")).strip()
+        timeout = float(req.get("timeout", 6.0))
+        if not host:
+            raise HTTPException(
+                status_code=400,
+                detail="Field 'host' is required",
+            )
+        inspection = await probe_remote_host(host, timeout=timeout)
+        return inspection.to_dict()
+
+    @app.post("/api/settings/remote-gpu/connect")
+    async def connect_remote_gpu_endpoint(request: Request, req: dict[str, Any]) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
+        """Establish an SSH tunnel to the remote GPU worker and optionally activate endpoints."""
+        _refuse_unless_local(request)
+        host = str(req.get("host", "")).strip()
+        apply_settings = bool(req.get("apply_settings", True))
+        timeout = float(req.get("timeout", 10.0))
+        if not host:
+            raise HTTPException(
+                status_code=400,
+                detail="Field 'host' is required",
+            )
+        tunnel_status = await tunnel_manager.connect(host=host, timeout=timeout)
+        if not tunnel_status.connected:
+            return {
+                "status": "error",
+                "connected": False,
+                "error": tunnel_status.error or "Failed to connect tunnel",
+                "tunnel": tunnel_status.to_dict(),
+            }
+
+        changes: dict[str, Any] = {}
+        if apply_settings:
+            cur = session_mgr.get_settings()
+            _previous_remote_settings.clear()
+            _previous_remote_settings["llm_provider"] = cur.get("llm_provider")
+            _previous_remote_settings["llm_base_url"] = cur.get("llm_base_url")
+            _previous_remote_settings["comfyui_base_url"] = cur.get("comfyui_base_url")
+
+            # Map forwarded local ports into active runtime settings
+            for m in tunnel_status.mappings:
+                if m.service_name == "ollama":
+                    session_mgr.update_settings(
+                        llm_provider="ollama",
+                        llm_base_url=f"http://127.0.0.1:{m.local_port}",
+                    )
+                    changes["llm_provider"] = "ollama"
+                    changes["llm_base_url"] = f"http://127.0.0.1:{m.local_port}"
+                elif m.service_name == "comfyui":
+                    session_mgr.update_settings(
+                        comfyui_base_url=f"http://127.0.0.1:{m.local_port}",
+                    )
+                    changes["comfyui_base_url"] = f"http://127.0.0.1:{m.local_port}"
+
+        return {
+            "status": "ok",
+            "connected": True,
+            "tunnel": tunnel_status.to_dict(),
+            "applied_changes": changes,
+        }
+
+    @app.post("/api/settings/remote-gpu/disconnect")
+    async def disconnect_remote_gpu_endpoint(  # pyright: ignore[reportUnusedFunction]
+        request: Request,
+    ) -> dict[str, Any]:
+        """Disconnect the active SSH tunnel session and restore previous endpoints."""
+        _refuse_unless_local(request)
+        await tunnel_manager.disconnect()
+        restored: dict[str, Any] = {}
+        if _previous_remote_settings:
+            session_mgr.update_settings(
+                llm_provider=_previous_remote_settings.get("llm_provider"),
+                llm_base_url=_previous_remote_settings.get("llm_base_url"),
+                comfyui_base_url=_previous_remote_settings.get("comfyui_base_url"),
+            )
+            restored.update(_previous_remote_settings)
+            _previous_remote_settings.clear()
+
+        return {
+            "status": "ok",
+            "connected": False,
+            "restored_settings": restored,
+            "tunnel": tunnel_manager.get_status().to_dict(),
+        }
+
+    @app.get("/api/settings/remote-gpu/status")
+    async def get_remote_gpu_status(  # pyright: ignore[reportUnusedFunction]
+        request: Request,
+    ) -> dict[str, Any]:
+        """Return the current status of the remote GPU tunnel."""
+        _refuse_unless_local(request)
+        return tunnel_manager.get_status().to_dict()
 
     @app.get("/api/agents")
     async def list_agents(session_id: str | None = None) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]

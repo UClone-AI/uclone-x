@@ -526,3 +526,48 @@ def test_module_presence_rejects_a_sys_modules_none_sentinel(
     monkeypatch.setitem(sys.modules, "uclone_x_absent_probe", None)
     assert module_present("uclone_x_absent_probe") is False
     assert module_present("uclone_x.code_intel.ast_parser") is True
+
+
+class _Node:
+    """The two attributes of a tree-sitter node that docstring detection reads."""
+
+    def __init__(self, type_: str, *children: "_Node") -> None:
+        self.type = type_
+        self.children = list(children)
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        pytest.param(_Node("string"), id="language-pack-grammar"),
+        pytest.param(_Node("expression_statement", _Node("string")), id="legacy-bundle-grammar"),
+    ],
+)
+def test_docstring_is_found_in_either_grammar_shape(statement: _Node) -> None:
+    """Both grammars `ASTParser` loads are read, not only the one the dev venv happens to hold.
+
+    The public CI syncs `tree-sitter-language-pack`, whose tree-sitter-python puts a
+    docstring's `string` directly in the block; the legacy bundle wraps it in an
+    `expression_statement`. Reading only the wrapped form dropped every docstring and the
+    module symbol there, while the suite stayed green wherever the legacy bundle was
+    installed, so the shapes are pinned here without either grammar.
+
+    Killed by: src/uclone_x/code_intel/ast_parser.py :: if statement.type == "string":
+    Becomes: if statement.type == "strinG":
+    """
+    from uclone_x.code_intel.ast_parser import (
+        _docstring_node,  # pyright: ignore[reportPrivateUsage]
+    )
+
+    found = _docstring_node(statement)
+    assert found is not None and found.type == "string"
+
+
+def test_a_statement_that_is_not_a_bare_string_has_no_docstring() -> None:
+    """An expression statement that starts with something else is not a docstring."""
+    from uclone_x.code_intel.ast_parser import (
+        _docstring_node,  # pyright: ignore[reportPrivateUsage]
+    )
+
+    assert _docstring_node(_Node("expression_statement", _Node("call"))) is None
+    assert _docstring_node(_Node("assignment")) is None
