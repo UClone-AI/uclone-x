@@ -590,6 +590,24 @@ def test_a_horn_axiom_with_no_structured_predicate_reports_nothing() -> None:
     assert closure.unsupported_axioms == ()
 
 
+def test_a_horn_rule_predicate_is_refused_without_being_listed_as_supported() -> None:
+    """#1601: `hornRule` names no axiom kind -- a Horn rule is only a `rule_expression`.
+
+    The refusal used to list every schema predicate as "supported", `hornRule` among them,
+    so it contradicted itself.
+
+    Killed by: src/uclone_x/ontology/rules.py :: f"(supported: {', '.join(sorted(set(_KIND_ALIASES.values())))})"
+    Becomes: f"(supported: {', '.join(sorted(SCHEMA_PREDICATES))})"
+    """
+    closure = materialize([triple("a", "p", "b")], [axiom("R", "Task", "hornRule", "Agent")])
+    assert len(closure.unsupported_axioms) == 1
+    reason = closure.unsupported_axioms[0].reason
+    assert "is not a supported axiom kind" in reason
+    supported = reason.split("(supported: ", 1)[1].rstrip(")").split(", ")
+    assert "hornRule" not in supported
+    assert "subClassOf" in supported
+
+
 def test_a_validator_style_constraint_axiom_is_refused_not_reinterpreted() -> None:
     """`teach_axiom("R", "Task", "status", "done")` is record validation, not entailment."""
     closure = materialize([type_of("t", "Task")], [axiom("R", "Task", "status", "done")])

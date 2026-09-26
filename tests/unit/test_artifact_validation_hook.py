@@ -122,3 +122,49 @@ async def test_artifact_validation_hook_allows_existing_files(tmp_path: Path) ->
 
     decision = await hook.on_post_turn(ctx)
     assert decision.action == HookAction.ALLOW
+
+
+def test_a_link_with_the_workspace_directory_for_a_host_is_re_rooted(tmp_path: Path) -> None:
+    """The fresh-HOME Artist reply linked `https://<workspace dir>/work/api/artifacts/...` (#1618).
+
+    The UI serves the rooted path on whatever host it was opened from, so the prefix is
+    dropped, for an inline image and for a plain link alike. A prefixed link to a file that
+    does not exist is still treated as a missing image, not passed through.
+
+    Killed by: src/uclone_x/agent/hooks/artifact_validation.py :: return _rooted(match, "!")
+    Becomes: return match.group(0)
+    Killed by: src/uclone_x/agent/hooks/artifact_validation.py :: return _rooted(match, "")
+    Becomes: return match.group(0)
+    Killed by: src/uclone_x/agent/hooks/artifact_validation.py :: clean_url = rooted_artifact_url(raw_url) or raw_url.strip()
+    Becomes: clean_url = raw_url.strip()
+    """
+    img_dir = tmp_path / "artifacts" / "images"
+    img_dir.mkdir(parents=True)
+    (img_dir / "img_1.png").write_bytes(b"PNG")
+    host = "https://ucx-fresh-test2-pypi022/work"
+    content = (
+        f"![Night]({host}/api/artifacts/content?path=artifacts/images/img_1.png)\n"
+        f"[Open it](ucx-fresh-test2-pypi022/work/api/artifacts/content?path=artifacts/images/img_1.png)\n"
+        f"![Gone]({host}/api/artifacts/content?path=artifacts/images/img_gone.png)"
+    )
+
+    sanitized, count = sanitize_hallucinated_artifacts(content, tmp_path)
+
+    assert count == 3
+    assert "ucx-fresh-test2-pypi022" not in sanitized
+    assert "![Night](/api/artifacts/content?path=artifacts/images/img_1.png)" in sanitized
+    assert "[Open it](/api/artifacts/content?path=artifacts/images/img_1.png)" in sanitized
+    assert "img_gone.png]*" in sanitized
+
+
+def test_a_rooted_link_and_an_unrelated_url_are_left_as_written(tmp_path: Path) -> None:
+    """Only a prefixed link to our own endpoint is rewritten; nothing else is touched."""
+    img_dir = tmp_path / "artifacts" / "images"
+    img_dir.mkdir(parents=True)
+    (img_dir / "img_1.png").write_bytes(b"PNG")
+    content = (
+        "![Night](/api/artifacts/content?path=artifacts/images/img_1.png)\n"
+        "[Docs](https://example.com/api/artifacts/list)"
+    )
+
+    assert sanitize_hallucinated_artifacts(content, tmp_path) == (content, 0)

@@ -23,9 +23,26 @@ MD_LINK_RE = re.compile(r"(?<!!)\[(.*?)\]\((.*?)\)")
 ARTIFACT_ENDPOINT = "/api/artifacts/content"
 
 
+def rooted_artifact_url(raw_url: str) -> str | None:
+    """Return the served `/api/artifacts/content?...` form of a link to that endpoint.
+
+    The UI serves artifacts at the rooted path, on whatever host it was opened from, so a
+    reply that prefixes one -- `https://ucx-fresh-test2-pypi022/work/api/artifacts/...`,
+    the workspace directory read as a host (#1618) -- links nowhere. Any prefix before the
+    endpoint is dropped: the rooted form can only reach this workspace's own files, and the
+    missing-file check below then applies to it like any other artifact link. Returns None
+    for a URL that does not name the endpoint.
+    """
+    clean_url = raw_url.strip()
+    base, sep, query = clean_url.partition("?")
+    if not (base.endswith(ARTIFACT_ENDPOINT) or base == ARTIFACT_ENDPOINT.lstrip("/")):
+        return None
+    return f"{ARTIFACT_ENDPOINT}{sep}{query}"
+
+
 def extract_artifact_rel_path(raw_url: str) -> str | None:
     """Extract relative workspace path if raw_url targets artifacts storage."""
-    clean_url = raw_url.strip()
+    clean_url = rooted_artifact_url(raw_url) or raw_url.strip()
     if clean_url.startswith(ARTIFACT_ENDPOINT):
         parsed = urlparse(clean_url)
         params = parse_qs(parsed.query)
@@ -60,10 +77,23 @@ def is_artifact_missing(rel_path: str, workspace_root: Path | None) -> bool:
 def sanitize_hallucinated_artifacts(content: str, workspace_root: Path | None) -> tuple[str, int]:
     """Replace nonexistent artifact image references with a reader-facing notice banner.
 
+    A link to an artifact that does exist but was written with a host or directory before
+    the endpoint is re-rooted to the served path (#1618), and counts as a replacement.
+
     Returns:
         tuple of (sanitized_content, replacement_count)
     """
     replacements = 0
+
+    def _rooted(match: re.Match[str], prefix: str) -> str:
+        """The link as written, or re-rooted when a host or directory was put before it."""
+        nonlocal replacements
+        raw_url = match.group(2)
+        rooted = rooted_artifact_url(raw_url)
+        if rooted is None or rooted == raw_url.strip():
+            return match.group(0)
+        replacements += 1
+        return f"{prefix}[{match.group(1)}]({rooted})"
 
     def _replace_image(match: re.Match[str]) -> str:
         nonlocal replacements
@@ -76,7 +106,7 @@ def sanitize_hallucinated_artifacts(content: str, workspace_root: Path | None) -
                 replacements += 1
                 filename = Path(rel_path).name or rel_path
                 return f"> ⚠️ *[이미지 생성 도구가 실행되지 않아 이미지가 표시되지 않습니다: {filename}]*"
-        return match.group(0)
+        return _rooted(match, "!")
 
     def _replace_link(match: re.Match[str]) -> str:
         nonlocal replacements
@@ -89,7 +119,7 @@ def sanitize_hallucinated_artifacts(content: str, workspace_root: Path | None) -
                 replacements += 1
                 filename = Path(rel_path).name or rel_path
                 return f"*[생성되지 않은 이미지 링크: {filename}]*"
-        return match.group(0)
+        return _rooted(match, "")
 
     # First replace markdown images
     sanitized = MD_IMAGE_RE.sub(_replace_image, content)
@@ -136,7 +166,7 @@ class ArtifactValidationHook(BaseHook):
             )
             return HookDecision(
                 action=HookAction.MODIFY,
-                reason=f"Sanitized {count} nonexistent artifact link(s)",
+                reason=f"Sanitized {count} artifact link(s)",
                 modified_payload={"content": sanitized},
             )
 

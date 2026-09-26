@@ -645,9 +645,11 @@ def interpret_axioms(
                 UnsupportedAxiom(
                     source=axiom.name,
                     tier=axiom.tier,
+                    # The kinds a predicate may name: `hornRule` is a schema predicate but
+                    # not one of them, since a Horn rule is only a `rule_expression` (#1601).
                     reason=(
                         f"predicate '{axiom.predicate}' is not a supported axiom kind "
-                        f"(supported: {', '.join(sorted(SCHEMA_PREDICATES))})"
+                        f"(supported: {', '.join(sorted(set(_KIND_ALIASES.values())))})"
                     ),
                 )
             )

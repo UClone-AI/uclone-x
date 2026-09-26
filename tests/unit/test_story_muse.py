@@ -122,8 +122,8 @@ def test_the_result_carries_a_digest_that_changes_when_the_table_does(tmp_path: 
 def test_an_unknown_genre_draws_nothing_and_names_the_genres_there_are(tmp_path: Path) -> None:
     """P6: no default table stands in for a genre that has none.
 
-    Killed by: src/uclone_x/story/muse.py :: if table is None:
-    Becomes: if table is True:
+    Killed by: src/uclone_x/story/muse.py :: if found is None:
+    Becomes: if found is True:
     """
     result = asyncio.run(
         MuseSparkTool().execute(
@@ -185,8 +185,8 @@ def test_a_broken_table_is_refused_naming_the_file_in_its_root_and_the_field(
 def test_a_genre_matches_however_it_is_spaced_or_cased(tmp_path: Path, spelling: str) -> None:
     """The model writes a genre as a person would; the table's id uses hyphens.
 
-    Killed by: src/uclone_x/story/muse.py :: table = tables.get(normalize_genre(params.genre))
-    Becomes: table = tables.get(params.genre)
+    Killed by: src/uclone_x/story/muse.py :: found = tables.get(normalize_genre(genre))
+    Becomes: found = tables.get(genre)
     """
     tool = MuseSparkTool()
     drawn = _draw(tool, tmp_path, genre=spelling, seed=5, count=2)
@@ -196,11 +196,27 @@ def test_a_genre_matches_however_it_is_spaced_or_cased(tmp_path: Path, spelling:
     assert drawn["cards"] == canonical["cards"]
 
 
-def test_the_description_names_the_bundled_genres() -> None:
-    """The model can only pick a genre it has been told about."""
-    assert "Genres: fantasy, horror, mystery, romance, science-fiction." in (
-        MuseSparkTool().description
-    )
+def test_the_description_says_how_to_list_genres_instead_of_listing_them(
+    tmp_path: Path,
+) -> None:
+    """A list written into the description at start-up goes stale once a skill adds a
+    genre (#1572), so the description sends the model to 'genres', which reads the tables
+    the draw reads."""
+    tool = MuseSparkTool()
+    assert "Call 'genres'" in tool.description
+    assert "science-fiction" not in tool.description
+
+    listed = asyncio.run(tool.execute({"action": "genres"}, _context(tmp_path)))
+    assert listed.success, listed.error
+    assert listed.output == {
+        "genres": [
+            {"genre": "fantasy", "title": "Fantasy", "source": "bundled"},
+            {"genre": "horror", "title": "Horror", "source": "bundled"},
+            {"genre": "mystery", "title": "Mystery", "source": "bundled"},
+            {"genre": "romance", "title": "Romance", "source": "bundled"},
+            {"genre": "science-fiction", "title": "Science Fiction", "source": "bundled"},
+        ]
+    }
 
 
 # --- the bundled data -------------------------------------------------------------------
@@ -292,8 +308,8 @@ def test_a_file_that_is_not_yaml_is_named(tmp_path: Path) -> None:
 def test_a_later_root_replaces_a_table_and_adds_a_genre(tmp_path: Path) -> None:
     """How a skill supplies data: same id replaces, a new id adds.
 
-    Killed by: src/uclone_x/story/skill_data.py :: loaded[path.stem] = _load_file(root, path, model, id_field)
-    Becomes: loaded.setdefault(path.stem, _load_file(root, path, model, id_field))
+    Killed by: src/uclone_x/story/skill_data.py :: loaded[path.stem] = Sourced(item, _source(root))
+    Becomes: loaded.setdefault(path.stem, Sourced(item, _source(root)))
     """
     _write(
         tmp_path / "muse" / "fantasy.yaml",
@@ -313,7 +329,7 @@ def test_a_later_root_replaces_a_table_and_adds_a_genre(tmp_path: Path) -> None:
 def test_a_root_that_does_not_exist_is_an_error_not_an_empty_set(tmp_path: Path) -> None:
     """A mistyped skill path would otherwise load nothing, silently.
 
-    Killed by: src/uclone_x/story/skill_data.py :: if not root.is_dir():
+    Killed by: src/uclone_x/story/skill_data.py :: if not _is_folder(root, root):
     Becomes: if False:
     """
     missing = tmp_path / "nowhere"

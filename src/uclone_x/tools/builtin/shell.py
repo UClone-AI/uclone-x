@@ -4,22 +4,41 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
 import signal
+import tempfile
 import time
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, ClassVar
 
 from uclone_x.core.provenance import Provenance
+from uclone_x.errors import PlainRefusalError
 from uclone_x.sandbox.models import is_secret_env_name
 from uclone_x.sandbox.path_validator import PathValidator
 from uclone_x.sandbox.protocols import PathValidatorProtocol
+from uclone_x.sandbox.story_jail import (
+    JAIL_SETUP_REFUSAL,
+    jailed_shell,
+    story_library_jail,
+)
 from uclone_x.tools.models import ToolContext, ToolResult
 from uclone_x.tools.protocols import ToolProtocol
 
 __all__ = [
+    "STORY_LIBRARY_SHELL_NOTE",
     "BashRunTool",
 ]
+
+#: What macOS prints for a write the story-library jail refused, among other refusals.
+_NOT_PERMITTED = "Operation not permitted"
+
+#: Added to a failed command's error when the system refused something, so the model
+#: knows one likely reason and what to use instead (#1589).
+STORY_LIBRARY_SHELL_NOTE = (
+    "(The shell cannot change files in the story library, 'stories/'. Stories are changed "
+    "with the story tools: story_manuscript, story_outline and story_codex.)"
+)
 
 
 class BashRunTool:
@@ -32,6 +51,8 @@ class BashRunTool:
     - Process tree termination: kills the entire process group if execution times out.
     - Output buffer truncation: caps stdout and stderr to `max_output_bytes`.
     - In-band provenance tracking conforming to Principle 6.
+    - On macOS, the command cannot write the workspace's story library
+      (`sandbox.story_jail`, #1589). Elsewhere nothing stops it.
     """
 
     #: A shell can write any file the process can (`echo > f`, `rm f`), so
@@ -294,23 +315,56 @@ class BashRunTool:
 
         is_daemon = bool(params.get("is_daemon"))
 
+        # The story library is changed only by the story tools (#1589). Where the system
+        # has a jail for it, the command runs inside one; `story_library_jail` refuses
+        # rather than run without it on a system that should have one.
+        try:
+            jail = story_library_jail(context.workspace_root)
+        except PlainRefusalError as refusal:
+            return ToolResult(
+                success=False,
+                output={"stdout": "", "stderr": "", "exit_code": -1},
+                error=str(refusal),
+                execution_time_ms=round((time.monotonic() - start_time) * 1000, 3),
+                isolation_level=context.isolation.level,
+                provenance=prov,
+            )
+
         # 5. Spawn subprocess with isolated process group
         preexec = getattr(os, "setsid", None)
         timed_out = False
+        # Created by the jailed shell before it runs the command, so a missing file means
+        # the jail never started it (`jailed_shell`).
+        started_dir: Path | None = None
+        started = False
         exit_code = 0
         stdout_str = ""
         stderr_str = ""
         truncated = False
 
         try:
-            proc = await asyncio.create_subprocess_shell(
-                command,
-                cwd=str(safe_cwd),
-                env=child_env,
-                stdout=asyncio.subprocess.PIPE if not is_daemon else asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.PIPE if not is_daemon else asyncio.subprocess.DEVNULL,
-                preexec_fn=preexec,
-            )
+            stdout_target = asyncio.subprocess.PIPE if not is_daemon else asyncio.subprocess.DEVNULL
+            stderr_target = asyncio.subprocess.PIPE if not is_daemon else asyncio.subprocess.DEVNULL
+            if jail:
+                if not is_daemon:
+                    started_dir = Path(tempfile.mkdtemp(prefix="ucx-jail-"))
+                proc = await asyncio.create_subprocess_exec(
+                    *jailed_shell(jail, command, started_dir / "started" if started_dir else None),
+                    cwd=str(safe_cwd),
+                    env=child_env,
+                    stdout=stdout_target,
+                    stderr=stderr_target,
+                    preexec_fn=preexec,
+                )
+            else:
+                proc = await asyncio.create_subprocess_shell(
+                    command,
+                    cwd=str(safe_cwd),
+                    env=child_env,
+                    stdout=stdout_target,
+                    stderr=stderr_target,
+                    preexec_fn=preexec,
+                )
 
             if is_daemon:
                 self._daemons[proc.pid] = proc
@@ -354,6 +408,9 @@ class BashRunTool:
 
                 exit_code = proc.returncode
 
+            if started_dir is not None:
+                started = (started_dir / "started").exists()
+
             # 6. Output buffer truncation
             stdout_text, out_trunc = self._truncate_output(stdout_bytes, max_output_bytes)
             stderr_text, err_trunc = self._truncate_output(stderr_bytes, max_output_bytes)
@@ -381,6 +438,10 @@ class BashRunTool:
                 isolation_level=context.isolation.level,
                 provenance=prov,
             )
+        finally:
+            if started_dir is not None:
+                # Only the marker the shell may have created is in it.
+                shutil.rmtree(started_dir, ignore_errors=True)
 
         duration_ms = (time.monotonic() - start_time) * 1000.0
 
@@ -404,10 +465,22 @@ class BashRunTool:
                 provenance=prov,
             )
 
+        if jail and not started:
+            return ToolResult(
+                success=False,
+                output=output_data,
+                error=JAIL_SETUP_REFUSAL,
+                execution_time_ms=round(duration_ms, 3),
+                isolation_level=context.isolation.level,
+                provenance=prov,
+            )
+
         if exit_code != 0:
             err_msg = f"Command failed with exit code {exit_code}"
             if stderr_str.strip():
                 err_msg += f": {stderr_str.strip()}"
+            if jail and _NOT_PERMITTED in stderr_str:
+                err_msg += f" {STORY_LIBRARY_SHELL_NOTE}"
             return ToolResult(
                 success=False,
                 output=output_data,

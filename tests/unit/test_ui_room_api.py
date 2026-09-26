@@ -104,6 +104,50 @@ def _wait_for_transcript(client: TestClient, room_id: str, rows: int) -> dict[st
     raise AssertionError(f"room never reached {rows} rows; last was {latest}")
 
 
+def _wait_for_cascade_to_settle(stack: RoomStack, room_id: str) -> None:
+    """Block until no cascade this stack started is still running in the room, or fail loudly.
+
+    Enabling autonomous mode answers 200 and leaves a `resume` running behind it, and that
+    run saves the room. A test that loads the record and writes it back through the store
+    while the run is still going holds a revision the run is about to pass, and the store
+    rightly refuses the write with `StaleRoomWriteError` (#1593). Waiting here is what makes
+    the test's own load the latest one; the revision check is not the thing to relax.
+    """
+    deadline = time.monotonic() + 10.0
+    while stack.turn_in_flight(room_id):
+        if time.monotonic() >= deadline:
+            raise AssertionError(f"room {room_id} still had a cascade running after 10s")
+        time.sleep(0.01)
+
+
+class _SelfDiscardingTask:
+    """A task that leaves the room's running set while it is being asked whether it is
+    done -- what the loop thread's `discard` does to a reader on another thread."""
+
+    def __init__(self, running: set[Any]) -> None:
+        self._running = running
+
+    def done(self) -> bool:
+        self._running.discard(self)
+        return True
+
+
+def test_turn_in_flight_reads_a_copy_of_the_running_set() -> None:
+    """A task leaving the set mid-read does not end the read in "Set changed size during
+    iteration": `_wait_for_cascade_to_settle` polls from the test thread while the loop
+    thread discards finished tasks (#1602).
+
+    Killed by: src/uclone_x/ui/rooms.py :: self._running.get(room_id, set()).copy())
+    Becomes: self._running.get(room_id, set()))
+    """
+    running: set[Any] = set()
+    running.update({_SelfDiscardingTask(running), _SelfDiscardingTask(running)})
+    stack = cast(RoomStack, type("_Stack", (), {"_running": {"room": running}})())
+
+    assert RoomStack.turn_in_flight(stack, "room") is False
+    assert running == set()
+
+
 class TestCreateAndList:
     def test_a_created_room_is_seated_and_listed(self, client: TestClient) -> None:
 
@@ -728,7 +772,12 @@ class TestACascadeFailureIsAnnouncedWithoutLeaking:
         stack = RoomStack(
             cast(
                 Any,
-                SimpleNamespace(storage_dir=tmp_path, bus=DownBus(), on_llm_replaced=ignore_llm),
+                SimpleNamespace(
+                    storage_dir=tmp_path,
+                    workspace_dir=tmp_path / "workspace",
+                    bus=DownBus(),
+                    on_llm_replaced=ignore_llm,
+                ),
             )
         )
 
@@ -1714,6 +1763,7 @@ class TestHistoryIsRefusedWhileSomebodyIsAnswering:
         from uclone_x.room.orchestrator import AUTONOMOUS_CIRCUIT_BREAKER_TURNS
 
         stack = cast(RoomStack, cast(Any, client.app).state.room_stack)
+        _wait_for_cascade_to_settle(stack, room_id)
         state = stack.store.load(room_id)
         assert state is not None
         exhausted = state.turn_state.model_copy(
@@ -1737,6 +1787,7 @@ class TestHistoryIsRefusedWhileSomebodyIsAnswering:
         client.post(f"/api/rooms/{room_id}/autonomous", json={"enabled": True})
 
         stack = cast(RoomStack, cast(Any, client.app).state.room_stack)
+        _wait_for_cascade_to_settle(stack, room_id)
         state = stack.store.load(room_id)
         assert state is not None
 

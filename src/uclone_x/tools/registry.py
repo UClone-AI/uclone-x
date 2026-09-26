@@ -142,6 +142,7 @@ def create_default_registry(
     from uclone_x.story.muse import MuseSparkTool
     from uclone_x.story.tool import StoryLibraryTool
     from uclone_x.story.tools import (
+        StoryAuditTool,
         StoryCodexTool,
         StoryContextTool,
         StoryManuscriptTool,
@@ -190,6 +191,7 @@ def create_default_registry(
             StoryCodexTool(),
             StoryManuscriptTool(),
             StoryContextTool(),
+            StoryAuditTool(),
             InstallPackageTool(),
             PlanUpdateTool(),
             SubagentDelegationTool(),

@@ -37,6 +37,8 @@ import type { PersonaDetailCopy } from '../../ui-kit';
 
 interface PersonaDetailProps {
   persona: PersonaInfo;
+  /** The running clone's tools that it is given only inside a conversation (#1595). */
+  toolsNeedingConversation?: readonly string[];
 }
 
 /**
@@ -60,6 +62,12 @@ export const describeWriteAccess = (enabled: boolean | undefined): string =>
 export const describeSubagentAccess = (enabled: boolean | undefined): string =>
   enabled ? 'Can spawn sub-agents' : 'Cannot spawn sub-agents';
 
+/**
+ * Leads the tools the clone is not given outside a conversation. The story tools are the
+ * ones today: a clone run on its own, with no conversation, is not offered them (#1595).
+ */
+export const ONLY_IN_CONVERSATION = 'Only available inside a conversation:';
+
 /** Every word the persona card shows, as this head words it. */
 export const PERSONA_DETAIL_COPY: PersonaDetailCopy = {
   model: 'Model',
@@ -68,10 +76,15 @@ export const PERSONA_DETAIL_COPY: PersonaDetailCopy = {
   tools: 'Tools',
   notSet: 'not set',
   noTools: NO_TOOLS_CAUSE,
+  onlyInConversation: ONLY_IN_CONVERSATION,
   writeAccess: describeWriteAccess,
   subagentAccess: describeSubagentAccess,
 };
 
-export const PersonaDetail: React.FC<PersonaDetailProps> = ({ persona }) => (
-  <KitPersonaDetail persona={persona} copy={PERSONA_DETAIL_COPY} />
+export const PersonaDetail: React.FC<PersonaDetailProps> = ({ persona, toolsNeedingConversation }) => (
+  <KitPersonaDetail
+    persona={persona}
+    copy={PERSONA_DETAIL_COPY}
+    toolsNeedingConversation={toolsNeedingConversation}
+  />
 );

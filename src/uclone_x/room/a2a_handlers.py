@@ -12,9 +12,10 @@ What makes the agent one-off, and why each part is there:
   memory tools in its list -- the rule `spawn_subagent` applies to a child (#1431).
 * **One level deep.** The agent is given no A2A transport, and `a2a_call` is taken out of
   its persona's tools, so it cannot call anyone in turn. A message that says it is deeper
-  than one level is refused before anything is built.
+  than one level, or does not say how deep it is, is refused before anything is built.
 * **The caller's budget (P4).** The agent's step ceiling is what the caller has left, sent
-  as `step_budget`, and its steps are reported back for the caller to be charged.
+  as `step_budget`, and its steps are reported back for the caller to be charged. When it
+  uses them all, the caller is told it ran out of steps.
 * **The caller's conversation and story** (#1555). The conversation and open story the
   caller sent are the ones the agent's turn runs in, so its tool calls see them on their
   `ToolContext`: the same story folder as the caller, and story writes checked against the
@@ -38,6 +39,7 @@ from typing import Any
 
 from uclone_x.a2a.in_memory import A2AInMemoryTransport
 from uclone_x.a2a.models import TaskMessage, TaskResult, TaskStatus
+from uclone_x.agent.base import BaseAgent
 from uclone_x.agent.bootstrap import agent_config_for_persona
 from uclone_x.agent.composition import HostDependencies, compose_agent
 from uclone_x.agent.hooks import HookAction, HookContext, HookDecision, HookEvent, HookRunner
@@ -69,6 +71,10 @@ __all__ = ["PersonaTaskHandler", "register_persona_handlers"]
 #: Attribution for an answer this handler wrote itself -- a refusal, or a failure it can
 #: name -- as opposed to one the called agent's model produced.
 _HANDLER_PROVIDER = "local.a2a"
+
+#: The `stop_reason` of a turn that used every step it was given -- here, the caller's
+#: remaining budget -- so the caller hears that rather than a bare "could not finish".
+_STEP_CEILING = "step_budget_exceeded"
 
 
 def _handler_provenance(persona: str) -> Provenance:
@@ -219,8 +225,69 @@ class PersonaTaskHandler:
             if name not in BASE_MEMORY_TOOLS and name != A2A_CALL_TOOL_NAME
         )
 
+    def _compose(
+        self,
+        message: TaskMessage,
+        persona: PersonaDefinition,
+        runner: _DeferredApprovalRunner,
+        scratch: Path,
+    ) -> BaseAgent:
+        """Build the one-off agent for this task, under the caller's step budget."""
+        base = self._host_factory()
+        inherited = tuple(base.hooks or ()) + (
+            base.hook_runner.hooks if base.hook_runner is not None else ()
+        )
+        host = dataclasses.replace(
+            base,
+            store=SessionStore(storage_dir=scratch),
+            memory=None,
+            ontology=None,
+            hooks=inherited or None,
+            hook_runner=runner,
+            a2a_transport=None,
+            persona=persona.name,
+            persona_name=persona.name,
+            persona_definitions=(persona,),
+        )
+        config = agent_config_for_persona(
+            persona,
+            agent_id=persona.name,
+            name=persona.name,
+            system_prompt=DEFAULT_SYSTEM_PROMPT,
+            llm_config=self._llm_config or persona.llm_config,
+            workspace_dir=self._workspace_root,
+            read_roots=self._read_roots(),
+        )
+        update: dict[str, Any] = {"allowed_tools": self._callee_tools(persona)}
+        budget = _step_budget(message)
+        if budget is not None:
+            update |= {"max_steps": budget, "max_turns": budget}
+        config = config.model_copy(update=update)
+        if persona.allowed_tools and not config.allowed_tools:
+            # Permitted only memory tools: an empty list would permit everything.
+            host = dataclasses.replace(host, tools=ToolRegistry(), skills=None)
+        return compose_agent(
+            config=config,
+            host=host,
+            context=AgentContext(
+                session_id=f"a2a_{message.task_id}",
+                agent_id=persona.name,
+                workspace_root=self._workspace_root,
+                parent_agent_id=message.sender_agent_id,
+                depth=1,
+            ),
+        )
+
     async def __call__(self, message: TaskMessage) -> TaskResult:
-        depth = message.metadata.get(A2A_DEPTH_KEY, "1")
+        depth = message.metadata.get(A2A_DEPTH_KEY)
+        if depth is None:
+            # Only `a2a_call` sends here, and it always says how deep the call is. A
+            # message that does not say is not taken as the shallowest one (#1570).
+            return self._refuse(
+                message,
+                "This task did not give its call depth (how many personas passed it on), "
+                "so it was not taken.",
+            )
         if depth != "1":
             return self._refuse(
                 message, "A task from another persona cannot be passed on to a third one."
@@ -231,66 +298,36 @@ class PersonaTaskHandler:
         persona = self._callee_persona(found)
 
         runner = _DeferredApprovalRunner()
-        base = self._host_factory()
-        inherited = tuple(base.hooks or ()) + (
-            base.hook_runner.hooks if base.hook_runner is not None else ()
-        )
-        with tempfile.TemporaryDirectory(prefix="ucx-a2a-") as scratch:
-            host = dataclasses.replace(
-                base,
-                store=SessionStore(storage_dir=Path(scratch)),
-                memory=None,
-                ontology=None,
-                hooks=inherited or None,
-                hook_runner=runner,
-                a2a_transport=None,
-                persona=persona.name,
-                persona_name=persona.name,
-                persona_definitions=(persona,),
-            )
-            config = agent_config_for_persona(
-                persona,
-                agent_id=persona.name,
-                name=persona.name,
-                system_prompt=DEFAULT_SYSTEM_PROMPT,
-                llm_config=self._llm_config or persona.llm_config,
-                workspace_dir=self._workspace_root,
-                read_roots=self._read_roots(),
-            )
-            update: dict[str, Any] = {"allowed_tools": self._callee_tools(persona)}
-            budget = _step_budget(message)
-            if budget is not None:
-                update |= {"max_steps": budget, "max_turns": budget}
-            config = config.model_copy(update=update)
-            if persona.allowed_tools and not config.allowed_tools:
-                # Permitted only memory tools: an empty list would permit everything.
-                host = dataclasses.replace(host, tools=ToolRegistry(), skills=None)
-            agent = compose_agent(
-                config=config,
-                host=host,
-                context=AgentContext(
-                    session_id=f"a2a_{message.task_id}",
-                    agent_id=persona.name,
-                    workspace_root=self._workspace_root,
-                    parent_agent_id=message.sender_agent_id,
-                    depth=1,
-                ),
-            )
-            try:
+        agent: BaseAgent | None = None
+        try:
+            with tempfile.TemporaryDirectory(prefix="ucx-a2a-") as scratch:
+                # Built inside the `try`: a host or config that cannot be set up must
+                # reach the caller as a sentence, not as the exception's name (#1570).
+                agent = self._compose(message, persona, runner, Path(scratch))
                 turn = await agent.execute_turn(
                     _prompt(message),
                     room_id=_forwarded(message, A2A_ROOM_KEY),
                     story_id=_forwarded(message, A2A_STORY_KEY),
                 )
-            except Exception as exc:  # the caller gets a sentence, the log gets the cause
-                logger.warning("a2a: %s failed a task: %s", persona.name, exc, exc_info=True)
-                return TaskResult(
-                    task_id=message.task_id,
-                    status=TaskStatus.FAILED,
-                    output_data={"steps": agent.run_steps, "paths": [], "unnamed_writes": True},
-                    error=f"{persona.name} ran into a problem and could not finish.",
-                    provenance=_handler_provenance(persona.name),
+        except Exception as exc:  # the caller gets a sentence, the log gets the cause
+            if agent is None:
+                logger.warning(
+                    "a2a: %s could not be set up for a task: %s", persona.name, exc, exc_info=True
                 )
+                return self._refuse(
+                    message,
+                    f"{persona.name} could not be started for this task, so nothing was done.",
+                )
+            logger.warning(
+                "a2a: %s failed while doing a task: %s", persona.name, exc, exc_info=True
+            )
+            return TaskResult(
+                task_id=message.task_id,
+                status=TaskStatus.FAILED,
+                output_data={"steps": agent.run_steps, "paths": [], "unnamed_writes": True},
+                error=f"{persona.name} ran into a problem and could not finish.",
+                provenance=_handler_provenance(persona.name),
+            )
 
         steps = agent.run_steps
         paths = _written_paths(turn)
@@ -310,11 +347,10 @@ class PersonaTaskHandler:
                 provenance=turn.provenance or _handler_provenance(persona.name),
             )
         if turn.provenance is None or turn.error or not turn.is_completed:
-            reason = (
-                "it ran out of steps"
-                if not turn.error and not turn.is_completed
-                else "it could not finish"
+            out_of_steps = turn.stop_reason == _STEP_CEILING or (
+                not turn.error and not turn.is_completed
             )
+            reason = "it ran out of steps" if out_of_steps else "it could not finish"
             return TaskResult(
                 task_id=message.task_id,
                 status=TaskStatus.FAILED,

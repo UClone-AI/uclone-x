@@ -27,18 +27,19 @@ What the tool enforces, in the order it checks:
 from __future__ import annotations
 
 import logging
+import re
 import time
 import uuid
 from collections.abc import Mapping, Sequence
 from typing import Any, ClassVar, cast
 
-from pydantic import BaseModel, Field, JsonValue
+from pydantic import BaseModel, Field, JsonValue, ValidationError
 
 from uclone_x.a2a.models import TaskMessage, TaskStatus
 from uclone_x.core.immutable import unwrap_immutable
 from uclone_x.core.provenance import Provenance
 from uclone_x.errors import MissingProvenanceError, TaskNotFoundError
-from uclone_x.tools.base import BaseTool
+from uclone_x.tools.base import BaseTool, describe_invalid_arguments
 from uclone_x.tools.models import ToolContext, ToolResult
 
 logger = logging.getLogger(__name__)
@@ -90,6 +91,17 @@ def _refusal(message: str, context: ToolContext, start: float, tool: str) -> Too
     )
 
 
+def _names(text: str, persona: str) -> bool:
+    """Whether `text` is a sentence about `persona`: it starts with the name, or quotes it.
+
+    As a whole word, not inside a longer name. A reason that merely uses the name as a
+    word elsewhere is not about the persona -- for one named "a", "it needed a person's
+    approval" -- and keeps the lead that says who stopped (#1602).
+    """
+    name = re.escape(persona)
+    return re.match(rf"{name}(?![\w-])", text) is not None or f"'{persona}'" in text
+
+
 def _reported_steps(output: Mapping[str, Any]) -> int:
     steps = output.get("steps")
     return steps if isinstance(steps, int) and not isinstance(steps, bool) and steps > 0 else 0
@@ -119,6 +131,7 @@ class A2ACallTool(BaseTool[A2ACallParams]):
         "that is theirs, such as asking the artist for a picture."
     )
     params_type = A2ACallParams
+    not_run_note: ClassVar[str] = "Nothing was asked of another persona."
 
     async def execute(
         self,
@@ -141,9 +154,17 @@ class A2ACallTool(BaseTool[A2ACallParams]):
             )
         try:
             call = A2ACallParams.model_validate(raw)
-        except Exception as exc:
+        except ValidationError as exc:
             return _refusal(
-                f"The request to another persona was not understood, so nothing was asked. {exc}",
+                describe_invalid_arguments(tool, exc, A2ACallParams, self.not_run_note),
+                ctx,
+                start,
+                tool,
+            )
+        except Exception:
+            logger.warning("a2a_call: its arguments could not be checked", exc_info=True)
+            return _refusal(
+                f"The arguments of the call could not be checked. {self.not_run_note}",
                 ctx,
                 start,
                 tool,
@@ -219,10 +240,13 @@ class A2ACallTool(BaseTool[A2ACallParams]):
         if result.status is not TaskStatus.COMPLETED:
             if result.status is TaskStatus.INPUT_REQUIRED:
                 reason = result.error or "it needed a person's approval"
-                error = f"'{call.agent}' stopped before finishing: {reason}"
+                lead = f"'{call.agent}' stopped before finishing"
             else:
                 reason = result.error or "no reason was given"
-                error = f"'{call.agent}' could not do the task: {reason}"
+                lead = f"'{call.agent}' could not do the task"
+            # A reason that already names the persona is a whole sentence about it; a lead
+            # naming it again would read "'artist' could not do the task: artist stopped".
+            error = reason if _names(reason, call.agent) else f"{lead}: {reason}"
             return ToolResult(
                 success=False,
                 error=error,

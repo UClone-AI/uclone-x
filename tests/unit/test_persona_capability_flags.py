@@ -342,8 +342,10 @@ def test_the_ruling_s_classification_of_every_shipped_tool() -> None:
         "muse_spark": False,
         "story_outline": True,
         "story_manuscript": True,
-        "story_codex": False,
+        # `propose` and `apply` write the story's proposals and codex (#1557).
+        "story_codex": True,
         "story_context": False,
+        "story_audit": False,
         "install_package": True,
         "update_plan": False,
         "delegate_subagent": False,
@@ -528,8 +530,8 @@ async def test_an_executed_tools_declarations_are_carried_on_its_record() -> Non
     without it, the room would have to guess from an output's shape, and `file_read`
     returns a `path` too.
 
-    Killed by: src/uclone_x/agent/base.py :: writes_files=tool_writes_files(tool_inst),
-    Becomes: writes_files=False,
+    Killed by: src/uclone_x/agent/base.py :: declared_writes = tool_call_writes_files(tool_inst, unwrapped_args)
+    Becomes: declared_writes = False
     """
     agent = _agent(_Writer(), _Reader(), enable_write_tools=True)
 

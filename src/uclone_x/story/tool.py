@@ -84,6 +84,8 @@ class StoryLibraryTool(BaseTool[StoryLibraryParams]):
     # It writes `story.yaml`: a new story, and the lease that says who writes it.
     writes_files: ClassVar[bool] = True
     opens_story: ClassVar[bool] = True
+    # 'list' works outside a conversation, but nothing there can open what it lists, so
+    # the tool is kept out of such a turn like the other story tools (#1576).
     needs_room: ClassVar[bool] = True
 
     def __init__(self) -> None:
@@ -169,7 +171,7 @@ class StoryLibraryTool(BaseTool[StoryLibraryParams]):
         }
         if previous != conversation:
             result["path"] = _story_file(story_id)
-        result.update(self._session_opened(library, story_id, conversation))
+        result.update(self._session_opened(library, story_id, conversation, taken_from=previous))
         return result
 
     @staticmethod
@@ -205,14 +207,17 @@ class StoryLibraryTool(BaseTool[StoryLibraryParams]):
         return {"released": current, **noted} if released else noted
 
     @staticmethod
-    def _session_opened(library: StoryLibrary, story_id: str, conversation: str) -> dict[str, Any]:
+    def _session_opened(
+        library: StoryLibrary, story_id: str, conversation: str, *, taken_from: str | None = None
+    ) -> dict[str, Any]:
         """Start this conversation's entry in `sessions.yaml`, for a later recap.
 
+        After a take-over, the entry of the conversation it was taken from is closed too.
         The story is open either way; a record that could not be written is said in the
         result rather than dropped (P6).
         """
         try:
-            StoryWork(library, story_id).note_session(conversation)
+            StoryWork(library, story_id).note_session(conversation, taken_from=taken_from)
         except (StoryError, StoryFileError) as exc:
             return {"session_not_recorded": str(exc)}
         return {}

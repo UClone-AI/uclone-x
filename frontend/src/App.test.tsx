@@ -131,7 +131,7 @@ let roomReadFault: Map<string, 'no-answer' | 'bare-500'>;
 let routeFault: Map<string, 'no-answer' | 'bare-500'>;
 /** A conversation's rows, by room id; empty where unnamed. */
 let transcriptsOnServer: Map<string, unknown[]>;
-let agentsOnServer: { id: string; name: string }[];
+let agentsOnServer: { id: string; name: string; capabilities_needing_room?: string[] }[];
 let personasOnServer: { name: string }[];
 let modelsOnServer: string[];
 let currentModelOnServer: string;
@@ -1635,6 +1635,24 @@ describe('App opens the picked clone (#1300)', () => {
 
     expect(screen.getByTestId('artifacts-dock')).toBeInTheDocument();
     expect(screen.getByTestId('clone-profile-surveyor')).toBeInTheDocument();
+  });
+
+  it('names the tools the picked clone is given only inside a conversation (#1595)', async () => {
+    // Killed by: frontend/src/App.tsx :: agents.find((a) => a.id === selectedAgent)?.capabilities_needing_room
+    // Becomes: agents.find((a) => a.id !== selectedAgent)?.capabilities_needing_room
+    personasOnServer = [{ name: 'champion' }, { name: 'surveyor' }];
+    agentsOnServer = [
+      { id: 'champion', name: 'champion', capabilities_needing_room: [] },
+      { id: 'surveyor', name: 'surveyor', capabilities_needing_room: ['story_outline'] },
+    ];
+    render(<App />);
+    await openedConversation();
+
+    fireEvent.click(await screen.findByTestId('clone-avatar-surveyor'));
+
+    expect(screen.getByTestId('persona-tools-conversation-only-surveyor')).toHaveTextContent(
+      'Only available inside a conversation: story_outline',
+    );
   });
 
   it('opens the dock on that clone in edit mode when clicking settings', async () => {

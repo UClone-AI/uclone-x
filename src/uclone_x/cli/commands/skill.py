@@ -12,6 +12,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from uclone_x.errors import SkillAuditError
 from uclone_x.skills.auditor import (
     SkillAuditor,
     SkillRegistry,
@@ -204,7 +205,12 @@ def skill_approve(
 
     # Run auditor check
     auditor = SkillAuditor(policy=AutoApprovalPolicy.SAFE_ONLY)
-    report = asyncio.run(auditor.audit_skill(skill_dir))
+    try:
+        report = asyncio.run(auditor.audit_skill(skill_dir))
+    except SkillAuditError as exc:
+        # The skill stays as it was on disk: an audit that could not finish approves nothing.
+        console.print(f"[bold red]✖ Cannot approve skill '{name}':[/bold red] {exc}")
+        raise typer.Exit(code=1) from exc
 
     if report.recommendation is AuditVerdict.REJECT and not force:
         console.print(

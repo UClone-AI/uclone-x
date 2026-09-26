@@ -203,6 +203,26 @@ describe('ArtifactLibrary, the Files screen (#1554)', () => {
     expect(posts('/delete')).toEqual([]);
   });
 
+  // Killed by: frontend/src/components/artifacts/ArtifactLibrary.tsx :: setNotice(note ? `${done} ${note}` : done);
+  // Becomes: setNotice(done);
+  it.each([
+    ['archive', 'files-archive', { path: '.archive/stories/night-train' }, FILES_COPY.archived('night-train')],
+    ['delete', 'files-delete', { deleted: 'stories/night-train' }, FILES_COPY.deleted('night-train')],
+  ])(
+    'a story %sd while some of its conversations could not be updated says so beside the result (#1578)',
+    async (action, button, body, done) => {
+      const note = 'Some conversations that had this story open could not be updated, so they may still show it as open.';
+      answers[LIST] = [ok(survey([STORY])), ok(survey([]))];
+      answers[`POST /api/artifacts/library/${action}`] = ok({ ...body, note });
+      renderLibrary();
+
+      fireEvent.click(within(await rowFor('stories/night-train')).getByTestId(button));
+      if (action === 'delete') fireEvent.click(screen.getByTestId('files-confirm-delete'));
+
+      expect(await screen.findByTestId('files-notice')).toHaveTextContent(`${done} ${note}`);
+    },
+  );
+
   // Killed by: frontend/src/components/artifacts/ArtifactLibrary.tsx :: if (inUse && inUse.kind === 'in-use' && isStoryInUse(err)) {
   // Becomes: if (false) {
   it('a story a conversation is writing shows the reason, and going ahead releases the writer', async () => {
@@ -227,6 +247,76 @@ describe('ArtifactLibrary, the Files screen (#1554)', () => {
     ]);
   });
 
+  // Checked by hand (#1578): with the button label back to `{FILES_COPY.goAhead}` alone, or
+  // with `retry: releaseWriter` in `archive` replaced by `retry: false`, this case fails.
+  it('after going ahead is refused too, the button says it is trying again', async () => {
+    const writing =
+      'The conversation “Writing room” is writing this story. Delete that conversation first, or go ahead anyway to stop it writing to this story.';
+    const answering =
+      'The conversation “Writing room” is answering right now, so it cannot be stopped from writing this story yet. Wait for the answer to finish, then try again.';
+    answers[LIST] = [ok(survey([STORY])), ok(survey([]))];
+    answers['POST /api/artifacts/library/archive'] = [
+      { status: 409, body: { detail: writing } },
+      { status: 409, body: { detail: answering } },
+      ok({ path: '.archive/stories/night-train' }),
+    ];
+    renderLibrary();
+
+    fireEvent.click(within(await rowFor('stories/night-train')).getByTestId('files-archive'));
+    expect(await screen.findByText(writing)).toBeInTheDocument();
+    expect(screen.getByTestId('files-go-ahead')).toHaveTextContent(FILES_COPY.goAhead);
+
+    fireEvent.click(screen.getByTestId('files-go-ahead'));
+    expect(await screen.findByText(answering)).toBeInTheDocument();
+    expect(screen.getByTestId('files-go-ahead')).toHaveTextContent('Try going ahead again');
+
+    fireEvent.click(screen.getByTestId('files-go-ahead'));
+    expect(await screen.findByTestId('files-notice')).toHaveTextContent('night-train was archived.');
+    expect(posts('/archive').map((c) => c.body)).toEqual([
+      { path: 'stories/night-train', release_writer: false },
+      { path: 'stories/night-train', release_writer: true },
+      { path: 'stories/night-train', release_writer: true },
+    ]);
+  });
+
+  // Checked by hand (#1578): with `retry: releaseWriter` in `remove` replaced by
+  // `retry: false`, this case fails.
+  it('a delete refused again after going ahead also says it is trying again', async () => {
+    const writing =
+      'The conversation “Writing room” is writing this story. Delete that conversation first, or go ahead anyway to stop it writing to this story.';
+    const answering =
+      'The conversation “Writing room” is answering right now, so it cannot be stopped from writing this story yet. Wait for the answer to finish, then try again.';
+    answers[LIST] = ok(survey([STORY]));
+    answers['POST /api/artifacts/library/delete'] = [
+      { status: 409, body: { detail: writing } },
+      { status: 409, body: { detail: answering } },
+    ];
+    renderLibrary();
+
+    fireEvent.click(within(await rowFor('stories/night-train')).getByTestId('files-delete'));
+    fireEvent.click(screen.getByTestId('files-confirm-delete'));
+    expect(await screen.findByText(writing)).toBeInTheDocument();
+    expect(screen.getByTestId('files-go-ahead')).toHaveTextContent(FILES_COPY.goAhead);
+
+    fireEvent.click(screen.getByTestId('files-go-ahead'));
+    expect(await screen.findByText(answering)).toBeInTheDocument();
+    expect(screen.getByTestId('files-go-ahead')).toHaveTextContent('Try going ahead again');
+    expect(posts('/delete').map((c) => c.body)).toEqual([
+      { path: 'stories/night-train', confirm: true, release_writer: false },
+      { path: 'stories/night-train', confirm: true, release_writer: true },
+    ]);
+  });
+
+  // Checked by hand (#1578): with `notLinked` back to 'Not linked to a conversation that
+  // still exists', this case fails.
+  it('a file no conversation links says it has no recorded writer, not that the writer is gone', async () => {
+    answers[LIST] = ok(survey([entry({})]));
+    renderLibrary();
+
+    expect(within(await rowFor('artifacts/report.md')).getByText('No recorded writer')).toBeInTheDocument();
+    expect(screen.queryByText(/no longer exists|still exists/)).toBeNull();
+  });
+
   it('restores an archived file', async () => {
     const archived = entry({ path: '.archive/artifacts/report.md', archived: true });
     answers[LIST] = [ok(survey([archived])), ok(survey([entry({})]))];
@@ -249,6 +339,22 @@ describe('ArtifactLibrary, the Files screen (#1554)', () => {
 
     await waitFor(() => expect(onOpenStory).toHaveBeenCalledWith('night-train', 'Night Train'));
     await waitFor(() => expect(onClose).toHaveBeenCalled());
+  });
+
+  it("shows a story's view in place of the list, and goes back to the list (#1560)", async () => {
+    answers[LIST] = ok(survey([STORY]));
+    answers['GET /api/artifacts/library/stories/night-train'] = { status: 404, body: { detail: 'There is no story called night-train any more.' } };
+    renderLibrary();
+
+    fireEvent.click(within(await rowFor('stories/night-train')).getByTestId('files-view-story'));
+
+    expect(await screen.findByTestId('story-view')).toBeInTheDocument();
+    expect(screen.queryByTestId('files-entry')).not.toBeInTheDocument();
+    expect(await screen.findByRole('alert')).toHaveTextContent('There is no story called night-train any more.');
+
+    fireEvent.click(screen.getByTestId('story-view-back'));
+    expect(await rowFor('stories/night-train')).toBeInTheDocument();
+    expect(screen.queryByTestId('story-view')).not.toBeInTheDocument();
   });
 
   it('a list that could not be read says so plainly', async () => {

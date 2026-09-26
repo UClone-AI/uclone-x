@@ -263,6 +263,47 @@ async def test_hook_runner_aggregate_modify() -> None:
 
 
 @pytest.mark.asyncio
+async def test_hook_runner_ask_after_modify_asks_about_the_rewritten_call() -> None:
+    """#1601: an ASK after a MODIFY carries the rewrite, so the approved call is the one asked about.
+
+    The call's fixed keys stay as the agent built them.
+
+    Killed by: src/uclone_x/agent/hooks/runner.py :: if decision.action == HookAction.ASK and modified:
+    Becomes: if False:
+
+    Killed by: src/uclone_x/agent/hooks/runner.py :: asked = _with_fixed_keys(asked, fixed)
+    Becomes: asked = asked
+    """
+
+    class Rewrite(BaseHook):
+        async def on_pre_tool_use(self, context: HookContext) -> HookDecision:
+            args = dict(context.payload.get("arguments", {}))
+            args["a"] = 1
+            return HookDecision(
+                action=HookAction.MODIFY,
+                modified_payload={"arguments": args, "tool_name": "other_tool"},
+            )
+
+    class Ask(BaseHook):
+        async def on_pre_tool_use(self, context: HookContext) -> HookDecision:
+            return HookDecision(action=HookAction.ASK, reason="check with the person")
+
+    runner = HookRunner(hooks=[Rewrite(), Ask()])
+    ctx = HookContext(
+        agent_id="a1",
+        event_type=HookEvent.PRE_TOOL_USE,
+        payload={"tool_name": "echo", "arguments": {"orig": 0}},
+    )
+
+    decision = await runner.run_hooks(HookEvent.PRE_TOOL_USE, ctx)
+    assert decision.action == HookAction.ASK
+    assert decision.reason == "check with the person"
+    assert decision.modified_payload is not None
+    assert decision.modified_payload["arguments"] == {"orig": 0, "a": 1}
+    assert decision.modified_payload["tool_name"] == "echo"
+
+
+@pytest.mark.asyncio
 async def test_hook_runner_exception_handling_fail_open_vs_closed() -> None:
     """HookRunner must handle hook exceptions per failure policy."""
 

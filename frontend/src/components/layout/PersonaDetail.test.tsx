@@ -1,6 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import { render, screen } from '@testing-library/react';
-import { PersonaDetail, NO_TOOLS_CAUSE, describeWriteAccess, describeSubagentAccess } from './PersonaDetail';
+import {
+  PersonaDetail,
+  NO_TOOLS_CAUSE,
+  ONLY_IN_CONVERSATION,
+  describeWriteAccess,
+  describeSubagentAccess,
+} from './PersonaDetail';
 import { makePersonaInfo } from '../../test/fixtures';
 
 /**
@@ -49,6 +55,26 @@ describe('PersonaDetail', () => {
 
     expect(screen.getByTestId('persona-tools-empty-cause-reader')).toHaveTextContent(NO_TOOLS_CAUSE);
     expect(screen.queryByTestId('persona-tools-reader')).not.toBeInTheDocument();
+  });
+
+  it('says in words which tools the clone is given only inside a conversation (#1595)', () => {
+    // Killed by: frontend/src/ui-kit/rail/PersonaDetail.tsx :: toolsNeedingConversation.length > 0 ?
+    // Becomes: false ?
+    render(
+      <PersonaDetail
+        persona={makePersonaInfo({ allowed_tools: [] })}
+        toolsNeedingConversation={['story_outline', 'story_codex']}
+      />,
+    );
+
+    const note = screen.getByTestId('persona-tools-conversation-only-reader');
+    expect(note).toHaveTextContent(`${ONLY_IN_CONVERSATION} story_outline, story_codex`);
+    expect(note).not.toHaveTextContent(/room|needs_room|capabilities/);
+  });
+
+  it('adds no conversation-only note when the clone has no such tool', () => {
+    render(<PersonaDetail persona={makePersonaInfo({ allowed_tools: ['read_file'] })} toolsNeedingConversation={[]} />);
+    expect(screen.queryByTestId('persona-tools-conversation-only-reader')).not.toBeInTheDocument();
   });
 
   it('reads the write-tools flag as a capability sentence, never a bare boolean', () => {

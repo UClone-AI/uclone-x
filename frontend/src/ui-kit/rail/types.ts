@@ -78,6 +78,8 @@ export interface PersonaDetailCopy {
   notSet: string;
   /** An empty `allowed_tools`, as a sentence rather than a blank list. */
   noTools: string;
+  /** Leads the names of the tools a clone is given only inside a conversation. */
+  onlyInConversation: string;
   /** `enable_write_tools` as a capability sentence, never a bare boolean. */
   writeAccess: (enabled: boolean | undefined) => string;
   /** `enable_subagent_tools` as a capability sentence, never a bare boolean. */

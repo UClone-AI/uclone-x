@@ -168,6 +168,8 @@ export interface ArtifactsDockProps {
   onCloneModeChange?: (mode: 'view' | 'edit' | 'create') => void;
   /** Available tools from runtime. */
   availableTools?: readonly string[];
+  /** The picked clone's tools that it is given only inside a conversation (#1595). */
+  cloneToolsNeedingConversation?: readonly string[];
   /** Available models from runtime. */
   availableModels?: readonly string[];
   /** Whether the workspace directory is writable. */
@@ -219,6 +221,7 @@ export const ArtifactsDock: React.FC<ArtifactsDockProps> = ({
   cloneMode = 'view',
   onCloneModeChange,
   availableTools,
+  cloneToolsNeedingConversation,
   availableModels,
   canWritePersonas,
   onSavePersona,
@@ -465,6 +468,7 @@ export const ArtifactsDock: React.FC<ArtifactsDockProps> = ({
               mode={cloneMode}
               onModeChange={onCloneModeChange}
               availableTools={availableTools}
+              toolsNeedingConversation={cloneToolsNeedingConversation}
               availableModels={availableModels}
               existingNames={personas.map((p) => p.name)}
               canWrite={canWritePersonas}

@@ -52,6 +52,7 @@ flowchart TD
 > but does **not** mediate or sandbox arbitrary shell command strings (e.g. `touch ../outside.txt`, shell redirects, or `rm -rf`).
 > `WorkspaceSandboxRunner` provides argument path validation for structured `ExecutionRequest` calls, but is not wired into `BashRunTool`
 > and does not provide an OS-level filesystem jail. True write-path containment requires `ContainerIsolation` (Docker/Podman) or disposable checkouts.
+> The one exception is the story library: on macOS the command runs under `sandbox-exec`, which refuses writes there (#1589; §10 item 10).
 
 `IsolationLevel` is a `StrEnum` with members `NONE` / `WORKSPACE` / `CONTAINER` /
 `WASM` (values `"none"` / `"workspace"` / `"container"` / `"wasm"`).
@@ -628,6 +629,23 @@ Stated so the shipped state is not mistaken for the specified one.
    `WorkspaceSandboxRunner` validates argument paths for structured `ExecutionRequest` calls, but is
    not used by `BashRunTool` and does not provide an OS filesystem jail. Strong write containment
    requires `ContainerIsolation` or disposable execution checkouts.
+10. **The story library is read-only to the shell and local MCP servers on macOS only (#1583,
+   #1589).** `file_write`, `file_edit`, both `generate_image` tools and `character_sheet` resolve
+   their target with `BaseTool.resolve_write_path`, which refuses a path in `<workspace>/stories`
+   (`tools.base.in_story_library`). `bash_run`/`run_command` and stdio MCP servers cannot be checked
+   that way (item 9: the command string is not parsed; an MCP proxy cannot tell a read from a write),
+   so on macOS they run under `sandbox-exec` with a profile that denies every write in the library
+   and the renaming of the workspace or any folder above it (`sandbox.story_jail`). A missing
+   `sandbox-exec`, or one that cannot apply the profile, refuses the command rather than running it
+   unjailed. `sandbox-exec` is marked DEPRECATED in its macOS manual page (Apple points apps to the
+   App Sandbox); it still ships, and if a later macOS drops it, every shell command and local MCP
+   server is refused rather than run unprotected. Still open: Linux and Windows (no jail; a shell
+   command or MCP filesystem server can write a story without its lease, digest or approval); MCP
+   servers reached over HTTP; a local MCP server loaded from `mcp.json` whose `workspace_root` is
+   not the app's workspace (its own `workspace_root`, the loader's root, or the current folder),
+   whose jail protects that root's library rather than the real one; a hardlink to a story file
+   made before the process started; and a jailed process asking an unjailed one (the local API,
+   another application) to write for it.
 
 ---
 

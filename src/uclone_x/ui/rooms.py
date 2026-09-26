@@ -19,7 +19,6 @@ import logging
 import uuid
 from collections.abc import Callable, Coroutine, Mapping
 from dataclasses import dataclass
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 from fastapi import FastAPI, HTTPException
@@ -188,7 +187,7 @@ class RoomStack:
     def __init__(self, session_mgr: AgentSessionManager) -> None:
         self._session_mgr = session_mgr
         self.store = RoomStore(session_mgr.storage_dir / "rooms")
-        self.service = RoomService(self.store)
+        self.service = RoomService(self.store, stories=StoryLibrary(session_mgr.workspace_dir))
         #: Every seat's knowledge, written by each room's orchestrator after a turn and
         #: loaded by its resolver before the seat's first one (#1367). One store for all
         #: rooms: a file is named by the seat's session id, which is already unique per
@@ -330,7 +329,9 @@ class RoomStack:
         orchestrator's own floor, because this is the question the route is asking — a
         cascade between turns holds no floor and is still about to write.
         """
-        return any(not task.done() for task in self._running.get(room_id, set()))
+        # A copy: a caller on another thread (a test polling for a settled cascade) reads
+        # this while the loop thread discards a finished task from the same set (#1602).
+        return any(not task.done() for task in self._running.get(room_id, set()).copy())
 
     def turn_unlanded(self, room_id: str) -> bool:
         """Whether this room's orchestrator has a turn counted as started and not yet saved.
@@ -810,15 +811,13 @@ def register_room_routes(app: FastAPI, stack: RoomStack) -> None:
         A record that is there and will not load is still removed (#1440). Deleting is the
         one thing a reader can do with it, and it needs nothing from inside the record.
 
-        The story the conversation had open is not part of it and is left where it is
-        (#1555); only its writing lease is given back, so the next conversation to open
-        the story can write it without taking it over.
+        The story the conversation had open is left where it is, and `RoomService.delete`
+        gives back its writing lease (#1565).
         """
-        story_id: str | None = None
         try:
-            story_id = service.get(room_id).story_id
+            service.get(room_id)
         except UnreadableRoomRecordError:  # deleted anyway (#1440)
-            logger.warning("Deleting room %r, whose record will not load", room_id)
+            pass  # the service logs it
         except Exception as exc:
             raise _http_error(exc) from exc
         stack.forget(room_id)
@@ -826,8 +825,6 @@ def register_room_routes(app: FastAPI, stack: RoomStack) -> None:
             service.delete(room_id)
         except Exception as exc:
             raise _http_error(exc) from exc
-        if story_id is not None:
-            _release_story(stack.session_manager().workspace_dir, story_id, room_id)
 
     @app.post("/api/rooms/{room_id}/participants")
     async def add_participant(room_id: str, req: dict[str, Any]) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
@@ -1443,25 +1440,6 @@ def _reseat_after_history_change(stack: RoomStack, state: RoomState) -> tuple[st
                 exc_info=True,
             )
     return tuple(kept_stale)
-
-
-def _release_story(workspace: Path, story_id: str, room_id: str) -> None:
-    """Give back a deleted room's lease on its story, if the room still holds it.
-
-    After the room is gone, so a failure here cannot leave a room behind. A lease that is
-    not given back is not lost work: the story is intact, and the next conversation opens
-    it read-only and can take it over. So a failure is logged and the delete stands.
-    """
-    try:
-        StoryLibrary(workspace).release(story_id, room_id)
-    except Exception:
-        logger.warning(
-            "Room %s was deleted, but its writing lease on story %r was not given back; "
-            "the next conversation to open that story can take it over",
-            room_id,
-            story_id,
-            exc_info=True,
-        )
 
 
 def _roll_back(service: RoomService, room_id: str, cause: Exception) -> None:

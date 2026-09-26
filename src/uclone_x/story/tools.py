@@ -9,9 +9,12 @@ file changed by hand after it was read is not overwritten.
 
 from __future__ import annotations
 
+import logging
+import re
+from datetime import UTC, datetime
 from typing import Any, ClassVar, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError
 
 from uclone_x.story.context import (
     CodexIndex,
@@ -21,28 +24,66 @@ from uclone_x.story.context import (
     scene_context,
 )
 from uclone_x.story.library import StoryError, StoryLibrary
+from uclone_x.story.proposals import apply_proposal, check_applies, reject_proposal
+from uclone_x.story.quotes import MIN_QUOTE_CHARACTERS, quote_found, quote_too_short
 from uclone_x.story.schemas import (
     CODEX_KINDS,
+    ENTRY_ID_PATTERN,
+    CodexEntry,
     CodexKind,
     Outline,
+    Proposal,
     SessionsFile,
     StoryFileError,
     describe_invalid,
 )
-from uclone_x.story.work import OUTLINE_FILE, SESSIONS_FILE, StoryWork, manuscript_file
+from uclone_x.story.skill_data import (
+    SkillDataError,
+    Sourced,
+    StructureTemplate,
+    data_roots,
+    load_structure_templates_sourced,
+)
+from uclone_x.story.work import (
+    OUTLINE_FILE,
+    SESSIONS_FILE,
+    StoryWork,
+    manuscript_file,
+    proposal_file,
+)
 from uclone_x.tools.base import BaseTool
 from uclone_x.tools.models import ToolContext
 
+logger = logging.getLogger(__name__)
+
 __all__ = [
+    "StoryAuditTool",
     "StoryCodexTool",
     "StoryContextTool",
     "StoryManuscriptTool",
     "StoryOutlineTool",
+    "propose_visual",
 ]
 
 #: A model's JSON arguments: unknown keys are refused by name; not strict, since a JSON
 #: decoder gives lists where a strict tuple would be refused (#1375).
 _ARGUMENTS = ConfigDict(frozen=True, extra="forbid")
+_ENTRY_ID = re.compile(ENTRY_ID_PATTERN)
+
+#: What an unanswered `apply` says (#1557). The desktop app does not ask during a
+#: conversation, so there every apply ends with this sentence; a person decides the
+#: proposal in the story's view instead (#1560). No story or file tool reaches that view;
+#: a persona with an unconfined shell (Clone's `bash_run`) can call its local API (#1589).
+#:
+#: The runtime says it before the tool runs, for every shell and every proposal id, so it
+#: claims nothing that depends on either (#1584): not that the proposal exists and is
+#: kept -- the id may name none -- and not that this shell is the desktop app.
+APPLY_NOT_APPROVED_NOTE = (
+    "The change was not applied, and nothing in the story changed: applying a proposal "
+    "needs a person to approve the call, and no one did. Where the app does not ask during "
+    "a conversation, as the desktop app does not, a person approves or rejects proposals "
+    "in the story's view, under Files."
+)
 
 
 def _meta(work: StoryWork, room_id: str | None) -> dict[str, Any]:
@@ -70,14 +111,22 @@ class StoryOutlineParams(BaseModel):
 
     model_config = _ARGUMENTS
 
-    action: Literal["get", "init", "set_scene", "move"] = Field(
-        description="'get' the outline; 'init' a new one from 'chapter_titles'; 'set_scene' "
+    action: Literal["get", "init", "set_scene", "move", "structures"] = Field(
+        description="'get' the outline; 'init' a new one from 'chapter_titles' or from a "
+        "'structure'; 'structures' lists the structures 'init' can start from; 'set_scene' "
         "adds a scene (give 'chapter_id' and 'title') or changes one (give 'scene_id' and "
         "the fields to change); 'move' puts 'scene_id' in 'chapter_id', before 'before' or "
         "at the end."
     )
     chapter_titles: list[str] | None = Field(
         default=None, description="For 'init': the chapters' titles, in order."
+    )
+    structure: str | None = Field(
+        default=None,
+        description="For 'init', instead of 'chapter_titles': a structure's id from "
+        "'structures'. The outline gets one chapter per act and one scene per beat, titled "
+        "with the beat and summarised with what it is for, to be rewritten as the story's "
+        "own.",
     )
     scene_id: str | None = Field(
         default=None,
@@ -121,10 +170,13 @@ class StoryOutlineTool(BaseTool[StoryOutlineParams]):
     description = (
         "Read or change the open story's outline: its chapters and scenes in reading order. "
         "Each scene has a fixed id, a title, a summary, beats and the codex ids of its "
-        "characters and places. Start with 'init'; add and change scenes with 'set_scene'."
+        "characters and places. Start with 'init', from chapter titles or from a structure "
+        "such as three acts ('structures' lists them); add and change scenes with "
+        "'set_scene'."
     )
     params_type = StoryOutlineParams
     writes_files: ClassVar[bool] = True
+    read_actions: ClassVar[frozenset[str]] = frozenset({"get"})
     needs_room: ClassVar[bool] = True
     not_run_note: ClassVar[str] = "The outline was not changed."
 
@@ -134,6 +186,19 @@ class StoryOutlineTool(BaseTool[StoryOutlineParams]):
         )
 
     async def run(self, params: StoryOutlineParams, context: ToolContext) -> dict[str, Any]:
+        if params.action == "structures":
+            return {
+                "structures": [
+                    {
+                        "id": template_id,
+                        "title": found.item.title,
+                        "description": found.item.description,
+                        "beats": sum(len(act.beats) for act in found.item.acts),
+                        "source": found.source,
+                    }
+                    for template_id, found in sorted(_structures(context).items())
+                ]
+            }
         if params.action == "get":
             work = StoryWork.open_in(context)
             outline, _ = work.require_outline()
@@ -161,9 +226,25 @@ class StoryOutlineTool(BaseTool[StoryOutlineParams]):
                     "The story already has an outline, so it was not replaced. Change it "
                     "with 'set_scene' and 'move'."
                 )
+            if params.structure is not None:
+                if params.chapter_titles:
+                    raise StoryError(
+                        "Give either 'chapter_titles' or a 'structure', not both, so the "
+                        "outline was not created."
+                    )
+                found = self._structure(params.structure, context)
+                outline = self._validated(_outline_from(found.item))
+                work.save_outline(outline, room_id=room_id, expected_digest=None)
+                return {
+                    **self._saved(work, outline, "created"),
+                    "structure": found.item.id,
+                    "source": found.source,
+                }
             titles = [t.strip() for t in params.chapter_titles or [] if t.strip()]
             if not titles:
-                raise StoryError("Give the chapters' titles in 'chapter_titles'.")
+                raise StoryError(
+                    "Give the chapters' titles in 'chapter_titles', or a 'structure' to start from."
+                )
             data: dict[str, Any] = {
                 "chapters": [
                     {"id": f"ch{i:02d}", "title": t, "scenes": []}
@@ -186,6 +267,17 @@ class StoryOutlineTool(BaseTool[StoryOutlineParams]):
         changed = self._validated(data)
         work.save_outline(changed, room_id=room_id, expected_digest=digest)
         return self._saved(work, changed, done)
+
+    @staticmethod
+    def _structure(requested: str, context: ToolContext) -> Sourced[StructureTemplate]:
+        templates = _structures(context)
+        found = templates.get(_structure_id(requested))
+        if found is None:
+            raise StoryError(
+                f"There is no structure '{requested}', so the outline was not created. "
+                f"Structures: {', '.join(sorted(templates))}."
+            )
+        return found
 
     @staticmethod
     def _validated(data: dict[str, Any]) -> Outline:
@@ -290,19 +382,67 @@ class StoryOutlineTool(BaseTool[StoryOutlineParams]):
         return f"scene '{scene['id']}' moved to chapter '{target['id']}', {where}"
 
 
+def _structure_id(requested: str) -> str:
+    """`"Save the Cat"` and `"save_the_cat"` name the template `save-the-cat`."""
+    return re.sub(r"[\s_]+", "-", requested.strip().lower())
+
+
+def _structures(context: ToolContext) -> dict[str, Sourced[StructureTemplate]]:
+    """The bundled structure templates and those of the calling agent's active skills.
+
+    Read on every call, like the muse tables: a skill approved since the last call counts,
+    and a damaged template is refused by file and field rather than skipped (P6).
+    """
+    try:
+        return load_structure_templates_sourced(data_roots(context.skill_dirs))
+    except SkillDataError as exc:
+        logger.warning("story_outline could not load its structures: %s", exc)
+        raise StoryError(
+            f"The story structures could not be loaded, so the outline was not changed: "
+            f"{exc.plain}."
+        ) from exc
+
+
+def _outline_from(template: StructureTemplate) -> dict[str, Any]:
+    """One chapter per act, one scene per beat: the beat's title, and its purpose as summary."""
+    return {
+        "chapters": [
+            {
+                "id": f"ch{number:02d}",
+                "title": act.title,
+                "act": act.id,
+                "scenes": [
+                    {
+                        "id": f"ch{number:02d}.s{beat_number:02d}",
+                        "title": beat.title,
+                        "summary": beat.purpose,
+                    }
+                    for beat_number, beat in enumerate(act.beats, start=1)
+                ],
+            }
+            for number, act in enumerate(template.acts, start=1)
+        ]
+    }
+
+
 # -- story_codex -------------------------------------------------------------------------
 
 
 class StoryCodexParams(BaseModel):
-    """What to look up in the story's codex."""
+    """What to look up in the story's codex, or what change to propose, apply or reject."""
 
     model_config = _ARGUMENTS
 
-    action: Literal["get", "search"] = Field(
+    action: Literal["get", "search", "proposals", "propose", "apply", "reject"] = Field(
         description="'get' one entry by 'entry_id'; 'search' the entries by 'query', or list "
-        "them all without one."
+        "them all without one; 'proposals' lists the proposed changes; 'propose' a change to "
+        "an entry that a scene shows ('entry_id', 'at', 'quote', and 'set' or tags); 'apply' "
+        "or 'reject' a proposal by 'proposal_id'. Applying runs only once the person approves "
+        "it when asked; saying it in chat is not approval."
     )
-    entry_id: str | None = Field(default=None, description="For 'get': the entry's id.")
+    entry_id: str | None = Field(
+        default=None, description="For 'get' and 'propose': the entry's id."
+    )
     kind: CodexKind | None = Field(
         default=None,
         description="Only entries of this kind: characters, places, items or threads.",
@@ -311,26 +451,74 @@ class StoryCodexParams(BaseModel):
         default=None,
         description="For 'search': text to find in an entry's id, name, aliases or profile.",
     )
+    at: str | None = Field(
+        default=None,
+        description="For 'propose': the scene after which the change is true.",
+    )
+    set: dict[str, JsonValue] | None = Field(
+        default=None,
+        description='For \'propose\': state values the change sets, e.g. {"status": "dead"}; '
+        "null removes one.",
+    )
+    add_tags: list[str] | None = Field(
+        default=None, description="For 'propose' on a character: visual tags it gains."
+    )
+    remove_tags: list[str] | None = Field(
+        default=None, description="For 'propose' on a character: visual tags it loses."
+    )
+    note: str | None = Field(default=None, description="For 'propose': why, in a sentence.")
+    quote: str | None = Field(
+        default=None,
+        description="For 'propose': the words of scene 'at' that show the change, copied "
+        "exactly as whole words. A proposal without one is refused.",
+    )
+    proposal_id: str | None = Field(
+        default=None, description="For 'apply' and 'reject': the proposal, e.g. 'p003'."
+    )
+    reason: str | None = Field(default=None, description="For 'reject': why, in a sentence.")
+
+
+_DECIDE = (
+    "A person decides: they approve or reject it in the story's view, under Files, or "
+    "story_codex 'apply' asks them where the app can ask, and 'reject' drops it."
+)
+
+
+def _proposal_line(proposal: Proposal) -> dict[str, Any]:
+    return proposal.model_dump(mode="json", exclude_defaults=True, exclude={"entry_digest"})
 
 
 class StoryCodexTool(BaseTool[StoryCodexParams]):
-    """The story's characters, places, items and threads."""
+    """The story's characters, places, items and threads, and the changes proposed to them."""
 
     name = "story_codex"
     description = (
         "Look up the open story's codex: its characters, places, items and threads, each "
         "kept in the story as its own file. 'get' reads one entry in full; 'search' finds "
-        "entries by name, alias or profile."
+        "entries by name, alias or profile. When a scene changes an entry (a death, a lost "
+        "sword, a new scar), 'propose' the change with the quote that shows it; a person "
+        "decides: 'apply' asks them for approval, and 'reject' drops it."
     )
     params_type = StoryCodexParams
-    writes_files: ClassVar[bool] = False
+    writes_files: ClassVar[bool] = True
+    read_actions: ClassVar[frozenset[str]] = frozenset({"get", "search", "proposals"})
     needs_room: ClassVar[bool] = True
-    not_run_note: ClassVar[str] = "Nothing was looked up."
+    approval_actions: ClassVar[frozenset[str]] = frozenset({"apply"})
+    approval_timeout_note: ClassVar[str | None] = APPLY_NOT_APPROVED_NOTE
+    not_run_note: ClassVar[str] = "Nothing was looked up or changed."
 
     def __init__(self) -> None:
         super().__init__(name=self.name, description=self.description, params_type=StoryCodexParams)
 
     async def run(self, params: StoryCodexParams, context: ToolContext) -> dict[str, Any]:
+        if params.action == "propose":
+            return self._propose(params, context)
+        if params.action == "apply":
+            return self._apply(params, context)
+        if params.action == "reject":
+            return self._reject(params, context)
+        if params.action == "proposals":
+            return self._list_proposals(context)
         codex = StoryWork.open_in(context).codex()
         result: dict[str, Any]
         if params.action == "get":
@@ -391,8 +579,300 @@ class StoryCodexTool(BaseTool[StoryCodexParams]):
         if not codex.unreadable:
             return ""
         return (
-            f" {len(codex.unreadable)} codex file(s) could not be read, and it may be one "
-            "of them: search the codex to see which and why."
+            f" {len(codex.unreadable)} codex file(s) or folder(s) could not be read, and it "
+            "may be one of them: search the codex to see which and why."
+        )
+
+    # -- proposals ------------------------------------------------------------------
+
+    def _list_proposals(self, context: ToolContext) -> dict[str, Any]:
+        work = StoryWork.open_in(context)
+        proposals, unreadable = work.proposals()
+        result: dict[str, Any] = {
+            "pending": [_proposal_line(p) for p, _ in proposals if p.status == "pending"],
+            "decided": [
+                {"id": p.id, "status": p.status, "entry_id": p.entry_id}
+                for p, _ in proposals
+                if p.status != "pending"
+            ],
+        }
+        if unreadable:
+            result["unreadable_files"] = [{"file": u.file, "reason": u.reason} for u in unreadable]
+        return result
+
+    def _propose(self, params: StoryCodexParams, context: ToolContext) -> dict[str, Any]:
+        work, room_id = _writer(context)
+        entry_id = (params.entry_id or "").strip()
+        if not entry_id:
+            raise StoryError("Say which entry the change is to, in 'entry_id'.")
+        kind, entry, digest = _one_entry(work, entry_id, params.kind)
+        scene_id = (params.at or "").strip()
+        if not scene_id:
+            raise StoryError(
+                "Say after which scene the change is true, in 'at', so nothing was proposed."
+            )
+        outline, _ = work.require_outline()
+        if outline.find(scene_id) is None:
+            raise StoryError(f"The outline has no scene '{scene_id}', so nothing was proposed.")
+        quote = (params.quote or "").strip()
+        if not quote:
+            raise StoryError(
+                "A proposal needs a quote from the scene that shows the change, so nothing "
+                "was proposed."
+            )
+        if quote_too_short(quote):
+            raise StoryError(
+                f"The quote is too short to show the change: it needs at least "
+                f"{MIN_QUOTE_CHARACTERS} letters, so nothing was proposed."
+            )
+        text = work.manuscript(scene_id)
+        if text is None:
+            raise StoryError(f"Scene '{scene_id}' has no text yet, so nothing was proposed.")
+        if not quote_found(quote, text.text):
+            raise StoryError(
+                f"The quote is not in scene '{scene_id}', so nothing was proposed. Copy "
+                "whole words exactly as the scene has them."
+            )
+        change: dict[str, Any] = {}
+        if params.set:
+            change["progression"] = {"at": scene_id, "set": params.set, "note": params.note}
+        if params.add_tags or params.remove_tags:
+            change["visual_progression"] = {
+                "at": scene_id,
+                "add_tags": params.add_tags or [],
+                "remove_tags": params.remove_tags or [],
+                "note": params.note,
+            }
+        if not change:
+            raise StoryError(
+                "Say what changes, in 'set' or in 'add_tags' and 'remove_tags', so nothing "
+                "was proposed."
+            )
+        draft = _draft(
+            kind=kind,
+            entry_id=entry.id,
+            change=change,
+            evidence=[{"scene_id": scene_id, "quote": quote}],
+            room_id=room_id,
+            context=context,
+            entry_digest=digest,
+        )
+        check_applies(kind, entry, draft)
+        saved = work.add_proposal(draft, room_id=room_id)
+        return {
+            "proposed": saved.id,
+            "proposal": _proposal_line(saved),
+            "path": work.workspace_path(proposal_file(saved.id)),
+            "next": _DECIDE,
+        }
+
+    def _apply(self, params: StoryCodexParams, context: ToolContext) -> dict[str, Any]:
+        proposal_id = self._proposal_id(params)
+        if not context.approved_by_person:
+            raise StoryError(
+                f"Applying proposal '{proposal_id}' needs a person's approval, and this call "
+                "was not approved, so the codex was not changed."
+            )
+        work, room_id = _writer(context)
+        applied = apply_proposal(work, proposal_id, room_id=room_id, decided_in="conversation")
+        result: dict[str, Any] = {
+            "applied": proposal_id,
+            "entry": {"kind": applied.kind, "id": applied.entry_id},
+            "path": work.workspace_path(applied.entry_path),
+        }
+        if applied.notes:
+            result["notes"] = applied.notes
+        return result
+
+    def _reject(self, params: StoryCodexParams, context: ToolContext) -> dict[str, Any]:
+        proposal_id = self._proposal_id(params)
+        work, room_id = _writer(context)
+        relative = reject_proposal(
+            work, proposal_id, room_id=room_id, reason=params.reason, decided_in="conversation"
+        )
+        return {"rejected": proposal_id, "path": work.workspace_path(relative)}
+
+    @staticmethod
+    def _proposal_id(params: StoryCodexParams) -> str:
+        if params.proposal_id is None or not params.proposal_id.strip():
+            raise StoryError("Say which proposal, in 'proposal_id'.")
+        return params.proposal_id.strip()
+
+
+def _now() -> str:
+    return datetime.now(UTC).isoformat(timespec="seconds")
+
+
+def _one_entry(
+    work: StoryWork, entry_id: str, kind: CodexKind | None
+) -> tuple[CodexKind, CodexEntry, str]:
+    """The one entry `entry_id` (of `kind` when given), with its kind and digest."""
+    if not _ENTRY_ID.fullmatch(entry_id):
+        raise StoryError(
+            f"'{entry_id}' is not an entry id: use lowercase letters and digits, joined by "
+            "'.', '_' or '-'. Nothing was proposed."
+        )
+    found: list[tuple[CodexKind, CodexEntry, str]] = []
+    for candidate in (kind,) if kind is not None else CODEX_KINDS:
+        loaded = work.entry(candidate, entry_id)
+        if loaded is not None:
+            found.append((candidate, loaded[0], loaded[1]))
+    if not found:
+        where = f"{kind}" if kind is not None else "codex"
+        raise StoryError(
+            f"The story's {where} has no entry '{entry_id}', so nothing was proposed. Add the "
+            "entry to the codex first."
+        )
+    if len(found) > 1:
+        kinds = ", ".join(k for k, _, _ in found)
+        raise StoryError(
+            f"'{entry_id}' is an entry in more than one kind ({kinds}). Say which, in 'kind'."
+        )
+    return found[0]
+
+
+def propose_visual(
+    context: ToolContext, character_id: str, visual: dict[str, Any]
+) -> dict[str, Any]:
+    """Propose new values for a codex character's `visual` block; `character_sheet save`.
+
+    Needs the story's lease, like every story write. A person applies the proposal with
+    story_codex 'apply', as any other.
+    """
+    work, room_id = _writer(context)
+    if not visual:
+        raise StoryError(
+            "Say what to change about how the character looks, so nothing was proposed."
+        )
+    kind, entry, digest = _one_entry(work, character_id, "characters")
+    draft = _draft(
+        kind=kind,
+        entry_id=entry.id,
+        change={"visual": visual},
+        evidence=[],
+        room_id=room_id,
+        context=context,
+        entry_digest=digest,
+    )
+    check_applies(kind, entry, draft)
+    saved = work.add_proposal(draft, room_id=room_id)
+    return {
+        "proposed": saved.id,
+        "proposal": _proposal_line(saved),
+        "path": work.workspace_path(proposal_file(saved.id)),
+        "next": _DECIDE,
+    }
+
+
+def _draft(
+    *,
+    kind: CodexKind,
+    entry_id: str,
+    change: dict[str, Any],
+    evidence: list[dict[str, Any]],
+    room_id: str,
+    context: ToolContext,
+    entry_digest: str,
+) -> Proposal:
+    """A proposal to save, numbered when it is saved; a change that does not fit is refused."""
+    data: dict[str, Any] = {
+        "id": "p000",
+        "kind": kind,
+        "entry_id": entry_id,
+        "change": change,
+        "evidence": evidence,
+        "proposed_at": _now(),
+        "room_id": room_id,
+        "agent_id": context.agent_id,
+        "entry_digest": entry_digest,
+    }
+    try:
+        return Proposal.model_validate(data)
+    except ValidationError as exc:
+        raise StoryError(describe_invalid("The proposal", exc)) from exc
+
+
+# -- story_audit -------------------------------------------------------------------------
+
+
+class AuditFact(BaseModel):
+    """One fact read from the scene."""
+
+    model_config = _ARGUMENTS
+
+    subject: str = Field(description="Who or what it is about, e.g. 'Vane'.")
+    predicate: str = Field(
+        description="What is said of it, e.g. 'status', 'possesses', 'located_in'."
+    )
+    object: str = Field(description="The value, e.g. 'alive', 'the moon sword'.")
+    quote: str | None = Field(
+        default=None,
+        description="The words of the scene the fact is read from, copied exactly as whole "
+        "words. A fact without one is not checked.",
+    )
+
+
+class StoryAuditParams(BaseModel):
+    """Which scene to check, and the facts read from it."""
+
+    model_config = _ARGUMENTS
+
+    action: Literal["check"] = Field(
+        description="'check' the facts read from 'scene_id' against the codex and the "
+        "story's rules."
+    )
+    scene_id: str = Field(description="The scene the facts are read from.")
+    facts: list[AuditFact] = Field(
+        default_factory=list[AuditFact],
+        description="The facts the scene states or shows, each with its quote.",
+    )
+
+
+class StoryAuditTool(BaseTool[StoryAuditParams]):
+    """Checks a scene's facts against what the story says was true when it happens."""
+
+    name = "story_audit"
+    description = (
+        "Check a written scene for continuity errors. Read the scene, list the facts it "
+        "states or shows (who is alive or dead, who has what, where someone is), each with "
+        "the exact words it comes from, and 'check' them: they are compared with the codex "
+        "as it stands at that point of the story, under the story's rules. A contradiction "
+        "names every fact involved and where it came from. Nothing is changed."
+    )
+    params_type = StoryAuditParams
+    writes_files: ClassVar[bool] = False
+    needs_room: ClassVar[bool] = True
+    not_run_note: ClassVar[str] = "Nothing was checked."
+
+    def __init__(self) -> None:
+        super().__init__(name=self.name, description=self.description, params_type=StoryAuditParams)
+
+    async def run(self, params: StoryAuditParams, context: ToolContext) -> dict[str, Any]:
+        from uclone_x.story.audit import SubmittedFact, audit_scene  # the reasoner, when asked
+
+        work = StoryWork.open_in(context)
+        scene_id = params.scene_id.strip()
+        outline, _ = work.require_outline()
+        if outline.find(scene_id) is None:
+            raise StoryError(f"The outline has no scene '{scene_id}', so nothing was checked.")
+        text = work.manuscript(scene_id)
+        if text is None:
+            raise StoryError(f"Scene '{scene_id}' has no text yet, so there is nothing to check.")
+        if not params.facts:
+            raise StoryError(
+                "Give the facts the scene states, each with its quote, in 'facts'. Nothing "
+                "was checked."
+            )
+        axioms, defaults = work.axioms()
+        return audit_scene(
+            story_id=work.story_id,
+            outline=outline,
+            scene_id=scene_id,
+            scene_text=text.text,
+            codex=work.codex(),
+            facts=[SubmittedFact(f.subject, f.predicate, f.object, f.quote) for f in params.facts],
+            axioms=axioms,
+            axioms_are_defaults=defaults,
         )
 
 
@@ -435,6 +915,7 @@ class StoryManuscriptTool(BaseTool[StoryManuscriptParams]):
     )
     params_type = StoryManuscriptParams
     writes_files: ClassVar[bool] = True
+    read_actions: ClassVar[frozenset[str]] = frozenset({"read", "list"})
     needs_room: ClassVar[bool] = True
     not_run_note: ClassVar[str] = "No scene was written."
 

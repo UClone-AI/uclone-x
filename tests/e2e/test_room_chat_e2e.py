@@ -14,13 +14,14 @@ flaky gate and there is no CI here to re-run it.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import pytest
-from playwright.async_api import Page, Response, async_playwright
+from playwright.async_api import Page, Response, Route, async_playwright
 
 pytestmark = pytest.mark.e2e
 
@@ -276,8 +277,17 @@ async def test_new_starts_a_conversation_that_its_first_message_names(
             f"adopted {adopted!r}, so the conversation read below is not the one set up here"
         )
 
-        await page.wait_for_selector("[data-testid='room-conversation']", timeout=15000)
+        conversation = page.locator("[data-testid='room-conversation']")
+        await conversation.wait_for(timeout=15000)
         assert not dialogs, f"starting a conversation asked for input in a dialog: {dialogs}"
+        # The other half of the tie. `seated` above is a claim about the conversation the
+        # create answered with; everything below reads the one on screen. Those were only
+        # ever the same room by the head not having opened another, which on a fresh install
+        # it could (#1288). Asserted rather than assumed.
+        assert await conversation.get_attribute("data-room-id") == body["room_id"], (
+            f"the conversation on screen is not the one New created ({body['room_id']!r}), "
+            f"so the assertions below are about a different room"
+        )
 
         # On screen as well as in the record: the conversation shows who it seated.
         strip = page.locator("[data-testid='participant-strip']")
@@ -305,6 +315,141 @@ async def test_new_starts_a_conversation_that_its_first_message_names(
         await rail.first.wait_for(timeout=10000)
 
         assert not errors, f"the conversation raised in the browser: {errors}"
+        await browser.close()
+
+
+async def _next_frame(page: Page) -> None:
+    """Let the page run what a delivered response queued, and paint it."""
+    await page.evaluate(
+        "() => new Promise(r => requestAnimationFrame("
+        "() => requestAnimationFrame(() => setTimeout(r, 0))))"
+    )
+
+
+@pytest.mark.asyncio
+async def test_new_on_a_fresh_install_starts_one_conversation_and_not_two(
+    fresh_ui_server: str,
+) -> None:
+    """The first thing a new user does, with the load still finishing underneath it (#1288).
+
+    Every other case in this module runs on the module server, where three conversations
+    already exist: the head reopens one, `currentRoomId` is set before the user can reach
+    New, and the window this case is about has closed before the page is even interactive.
+    A fresh install is the one run where it is open -- and it is the run a new user makes.
+
+    The head auto-opens a conversation once both lists have landed, and `handleNewRoom` is
+    what it calls when there are none. Between a user's click on New and `openRoom` setting
+    `currentRoomId` there are two awaits, and the load finishes inside them: the effect then
+    reads *no conversation open, nothing on its way* and starts a second conversation beside
+    the one already being created. The rail ends up holding an empty `New conversation` the
+    user never asked for.
+
+    What closes that window is `createInFlightRef` (`App.tsx`, #1288): taken synchronously on
+    entry to `handleNewRoom`, read as a third term in the auto-open effect's guard, released
+    in `finally`. Both halves are load-bearing here and each is checked below on its own.
+
+    Nothing here decides content. The first `GET /api/rooms` and the create are answered by
+    the real server; the test owns only *when* the page receives them, which is what puts the
+    finish of the load inside the create rather than before or after it. Held from the
+    browser rather than slowed on the server, because the window is sub-frame on a warm
+    localhost and a sleep would only make it likely.
+
+    Recovered from the closed, unmerged `task/1288-builder-dev-ui-1` (PR #1299, `f1ea1b6f`)
+    per #1301. That version held `GET /api/sessions`, which #1374 took out of the load, so it
+    held nothing: at `ae75e25e` it failed its own precondition 5 of 5 runs, never reaching
+    the window. It now holds the listing read, the other flag the auto-open waits on.
+
+    Mutation-checked by hand rather than as a kill declaration, because the lethality ratchet
+    runs a browser test against the **committed bundle** without rebuilding it, so a
+    declaration naming `frontend/src` reads as escaped there (the reason
+    `tests/e2e/test_rail_responsive_e2e.py` records). Measured at `ae75e25e` with the bundle
+    rebuilt for each: each mutation below failed this case 5 of 5 standalone runs and in a
+    full-file run (`1 failed, 8 passed`), always at the two-creates assertion. So did
+    removing #1288's own lines from `handleNewRoom` and the guard. A wholesale revert of
+    `App.tsx` to `8cf40d0f` no longer compiles against the rest of `frontend/src`, so it
+    was not run.
+    `Killed by:` frontend/src/App.tsx ::
+    `if (currentRoomId !== null || autoOpenRef.current || createInFlightRef.current) return;`
+    becoming `if (currentRoomId !== null || autoOpenRef.current) return;`
+    `Killed by:` frontend/src/App.tsx ::
+    `createInFlightRef.current = true;` becoming `createInFlightRef.current = false;`
+    """
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(headless=True)
+        page: Page = await browser.new_page(viewport={"width": 1600, "height": 900})
+        errors: list[str] = []
+        page.on("pageerror", lambda err: errors.append(str(err)))
+
+        # The auto-open waits on two flags: `roomsListed`, set once the first
+        # `GET /api/rooms` settles, and `metadataListed`, set once `fetchAllMetadata`
+        # settles. The listing read is held, so the load is still unfinished when the user
+        # clicks New, and its finish can then be put inside the create.
+        finish_the_load = asyncio.Event()
+        # `handleNewRoom`'s own `POST /api/rooms`, held so the create is still in flight when
+        # the load finishes. A create that has already returned is not the case under test:
+        # `openRoom` has set `currentRoomId` by then, which is the guard the effect reads.
+        finish_the_create = asyncio.Event()
+        listing_reads: list[str] = []
+        creates: list[str] = []
+
+        async def hold_the_rooms_route(route: Route) -> None:
+            if route.request.method == "POST":
+                creates.append(route.request.url)
+                await finish_the_create.wait()
+            else:
+                # Every read before the load is let finish is the load's own; the create's
+                # list re-read comes after the create, which is held past that point, so
+                # it is never held here.
+                listing_reads.append(route.request.url)
+                await finish_the_load.wait()
+            await route.continue_()
+
+        await page.route("**/api/rooms", hold_the_rooms_route)
+
+        await page.goto(fresh_ui_server, wait_until="commit")
+        new_control = page.locator("[data-testid='new-conversation-button']")
+        await new_control.wait_for(timeout=15000)
+        # The rail saying which name it has adopted is the agent list applied; the header's
+        # refresh control is disabled while `fetchAllMetadata` runs and re-enabled in the
+        # same commit that sets `metadataListed`. Both together say the metadata half of
+        # the load is done, so what is still outstanding is the held listing read alone.
+        await page.locator(ADOPTED_NAME_ROW).first.wait_for(timeout=15000)
+        await page.locator("button[title='Refresh runtime state']:enabled").wait_for(timeout=15000)
+        # The hold has to hold something. This case once held a read the page had stopped
+        # making (#1374 removed `/api/sessions` from the load), and then the load finished
+        # before the click and the window it is about never opened.
+        assert listing_reads, "the page never asked for its conversation list, so no hold"
+        assert not creates, (
+            "the head started a conversation before its load had finished, so this case "
+            "never reaches the window it is about"
+        )
+
+        await new_control.click()
+        await _next_frame(page)
+        assert len(creates) == 1, f"New did not start a conversation: {creates}"
+
+        # The load finishes while that create is still owed, and the page is given frames to
+        # act on it. This is the moment the head used to start a second conversation.
+        finish_the_load.set()
+        await _next_frame(page)
+        await _next_frame(page)
+        finish_the_create.set()
+
+        await page.wait_for_selector("[data-testid='room-conversation']", timeout=15000)
+        await _next_frame(page)
+
+        assert len(creates) == 1, (
+            f"New started {len(creates)} conversations, so the head raced the user's own "
+            f"click: {creates}"
+        )
+        # On screen, not only in the request record: one row in the rail, not the user's
+        # conversation with an empty `New conversation` sitting beside it.
+        rows = page.locator("[data-testid='sessions-list'] button[data-testid^='conversation-']")
+        assert await rows.count() == 1, (
+            f"the rail holds {await rows.count()} conversations after one click on New"
+        )
+
+        assert not errors, f"the first run raised in the browser: {errors}"
         await browser.close()
 
 

@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { X, FileText, Image as ImageIcon, BookOpen, File, RefreshCw } from 'lucide-react';
 import { Button } from '../ui/Button';
 import { MarkdownRenderer } from '../MarkdownRenderer';
+import { StoryView } from './StoryView';
 import { useEscapeOwner } from '../../lib/escapePrecedence';
 import { plainFailure } from '../../lib/coreFailure';
 import {
@@ -23,6 +24,12 @@ import {
  * says the list is complete; it shows the Core's `scope_note` and each `record_gaps` line.
  */
 
+/** The plain `note` an archive or delete answered with, if any (#1578). */
+const noteOf = (result: unknown): string | null =>
+  typeof result === 'object' && result !== null && 'note' in result && typeof result.note === 'string'
+    ? result.note
+    : null;
+
 export const FILES_COPY = {
   title: 'Files',
   loading: 'Loading the files…',
@@ -31,11 +38,15 @@ export const FILES_COPY = {
   actionFailed: 'That did not work.',
   noneListed: 'No files are listed.',
   noneMatch: 'No listed file matches these filters.',
-  notLinked: 'Not linked to a conversation that still exists',
+  // A file with no link may be a deleted conversation's, or a live one's that went unrecorded
+  // (a shell command, say), so this never claims its writer is gone (#1578).
+  notLinked: 'No recorded writer',
   unmanaged:
     'Saved outside the artifacts and stories folders, so it can be opened here but not archived or deleted.',
   confirmDelete: (name: string) => `Delete ${name} for good? This cannot be undone.`,
   goAhead: 'Go ahead anyway',
+  /** After going ahead was itself refused: the same request again, and it says so (#1578). */
+  tryAgain: 'Try going ahead again',
   archived: (name: string) => `${name} was archived. Show archived files to restore it.`,
   restored: (name: string) => `${name} was restored.`,
   deleted: (name: string) => `${name} was deleted.`,
@@ -47,7 +58,7 @@ export const FILES_COPY = {
 } as const;
 
 type KindFilter = 'all' | ArtifactKind;
-/** `''` is every conversation; `'none'` is files linked to none that still exists. */
+/** `''` is every conversation; `'none'` is files with no recorded writer. */
 type ConversationFilter = string;
 
 const KIND_LABELS: Record<KindFilter, string> = {
@@ -83,7 +94,14 @@ interface ArtifactLibraryProps {
 
 type Pending =
   | { kind: 'delete'; entry: ArtifactEntry }
-  | { kind: 'in-use'; entry: ArtifactEntry; action: 'archive' | 'delete'; reason: string };
+  | {
+      kind: 'in-use';
+      entry: ArtifactEntry;
+      action: 'archive' | 'delete';
+      reason: string;
+      /** The refused request was already a go-ahead, so offering one again is a retry. */
+      retry: boolean;
+    };
 
 export const ArtifactLibrary: React.FC<ArtifactLibraryProps> = ({ isOpen, onClose, onOpenStory }) => {
   const [survey, setSurvey] = useState<ArtifactSurvey | null>(null);
@@ -97,6 +115,8 @@ export const ArtifactLibrary: React.FC<ArtifactLibraryProps> = ({ isOpen, onClos
   const [pending, setPending] = useState<Pending | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  /** The story whose view is on screen in place of the list (#1560), or `null`. */
+  const [viewing, setViewing] = useState<string | null>(null);
 
   useEscapeOwner('dialog', isOpen, onClose);
 
@@ -119,6 +139,7 @@ export const ArtifactLibrary: React.FC<ArtifactLibraryProps> = ({ isOpen, onClos
     setOpenError(null);
     setPending(null);
     setNotice(null);
+    setViewing(null);
     void load();
   }, [isOpen, load]);
 
@@ -155,14 +176,20 @@ export const ArtifactLibrary: React.FC<ArtifactLibraryProps> = ({ isOpen, onClos
     }
   };
 
-  const act = async (run: () => Promise<unknown>, done: string, inUse?: Pending) => {
+  const act = async (
+    run: () => Promise<unknown>,
+    done: string,
+    inUse?: Pending,
+  ) => {
     setBusy(true);
     setNotice(null);
     try {
-      await run();
+      const result = await run();
       setPending(null);
       setOpened(null);
-      setNotice(done);
+      // The change happened; a step after it that did not is said beside it, not dropped (#1578).
+      const note = noteOf(result);
+      setNotice(note ? `${done} ${note}` : done);
       await load();
     } catch (err) {
       console.error('Files: an action failed', err);
@@ -182,14 +209,14 @@ export const ArtifactLibrary: React.FC<ArtifactLibraryProps> = ({ isOpen, onClos
     act(
       () => artifactLibraryApi.archive(entry.path, releaseWriter),
       FILES_COPY.archived(entry.name),
-      { kind: 'in-use', entry, action: 'archive', reason: '' },
+      { kind: 'in-use', entry, action: 'archive', reason: '', retry: releaseWriter },
     );
 
   const remove = (entry: ArtifactEntry, releaseWriter = false) =>
     act(
       () => artifactLibraryApi.remove(entry.path, releaseWriter),
       FILES_COPY.deleted(entry.name),
-      { kind: 'in-use', entry, action: 'delete', reason: '' },
+      { kind: 'in-use', entry, action: 'delete', reason: '', retry: releaseWriter },
     );
 
   const restore = (entry: ArtifactEntry) =>
@@ -235,128 +262,142 @@ export const ArtifactLibrary: React.FC<ArtifactLibraryProps> = ({ isOpen, onClos
           </div>
         </div>
 
-        <div className="flex flex-wrap items-center gap-2 px-4 py-2 border-b border-slate-800 text-xs">
-          <label className="flex items-center gap-1 text-slate-400">
-            Kind
-            <select
-              data-testid="files-kind-filter"
-              className="bg-slate-950 border border-slate-700 rounded px-1 py-0.5 text-slate-200"
-              value={kind}
-              onChange={(e) => setKind(e.target.value as KindFilter)}
-            >
-              {(Object.keys(KIND_LABELS) as KindFilter[]).map((k) => (
-                <option key={k} value={k}>
-                  {KIND_LABELS[k]}
-                </option>
-              ))}
-            </select>
-          </label>
-          <label className="flex items-center gap-1 text-slate-400">
-            Conversation
-            <select
-              data-testid="files-conversation-filter"
-              className="bg-slate-950 border border-slate-700 rounded px-1 py-0.5 text-slate-200 max-w-[16rem]"
-              value={conversation}
-              onChange={(e) => setConversation(e.target.value)}
-            >
-              <option value="">All conversations</option>
-              <option value="none">{FILES_COPY.notLinked}</option>
-              {conversations.map(([id, title]) => (
-                <option key={id} value={id}>
-                  {title}
-                </option>
-              ))}
-            </select>
-          </label>
-          <label className="flex items-center gap-1 text-slate-400">
-            <input
-              type="checkbox"
-              data-testid="files-show-archived"
-              checked={showArchived}
-              onChange={(e) => setShowArchived(e.target.checked)}
-            />
-            Show archived files
-          </label>
-        </div>
-
-        {notice && (
-          <p role="status" data-testid="files-notice" className="px-4 py-2 text-xs text-amber-200 border-b border-slate-800">
-            {notice}
-          </p>
+        {viewing !== null && (
+          <StoryView
+            storyId={viewing}
+            onBack={() => {
+              setViewing(null);
+              void load();
+            }}
+          />
         )}
+        {viewing === null && (
+          <>
+          <div className="flex flex-wrap items-center gap-2 px-4 py-2 border-b border-slate-800 text-xs">
+            <label className="flex items-center gap-1 text-slate-400">
+              Kind
+              <select
+                data-testid="files-kind-filter"
+                className="bg-slate-950 border border-slate-700 rounded px-1 py-0.5 text-slate-200"
+                value={kind}
+                onChange={(e) => setKind(e.target.value as KindFilter)}
+              >
+                {(Object.keys(KIND_LABELS) as KindFilter[]).map((k) => (
+                  <option key={k} value={k}>
+                    {KIND_LABELS[k]}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="flex items-center gap-1 text-slate-400">
+              Conversation
+              <select
+                data-testid="files-conversation-filter"
+                className="bg-slate-950 border border-slate-700 rounded px-1 py-0.5 text-slate-200 max-w-[16rem]"
+                value={conversation}
+                onChange={(e) => setConversation(e.target.value)}
+              >
+                <option value="">All conversations</option>
+                <option value="none">{FILES_COPY.notLinked}</option>
+                {conversations.map(([id, title]) => (
+                  <option key={id} value={id}>
+                    {title}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="flex items-center gap-1 text-slate-400">
+              <input
+                type="checkbox"
+                data-testid="files-show-archived"
+                checked={showArchived}
+                onChange={(e) => setShowArchived(e.target.checked)}
+              />
+              Show archived files
+            </label>
+          </div>
 
-        <div className="flex-1 min-h-0 grid grid-cols-1 md:grid-cols-2">
-          <div className="min-h-0 overflow-y-auto border-r border-slate-800">
-            {loading && !survey && <p className="p-4 text-xs text-slate-400">{FILES_COPY.loading}</p>}
-            {listError && (
-              <div className="p-4 text-xs text-rose-300" role="alert">
-                <p>{listError}</p>
-                <Button variant="outline" className="mt-2" onClick={() => void load()}>
-                  Try again
-                </Button>
-              </div>
-            )}
-            {survey && (
-              <>
-                <p data-testid="files-scope-note" className="px-4 pt-3 text-[11px] text-slate-400">
-                  {survey.scope_note}
-                </p>
-                {survey.record_gaps.length > 0 && (
-                  <ul data-testid="files-record-gaps" className="px-4 pt-1 text-[11px] text-amber-300 list-disc list-inside">
-                    {survey.record_gaps.map((gap) => (
-                      <li key={gap}>{gap}</li>
+          {notice && (
+            <p role="status" data-testid="files-notice" className="px-4 py-2 text-xs text-amber-200 border-b border-slate-800">
+              {notice}
+            </p>
+          )}
+
+          <div className="flex-1 min-h-0 grid grid-cols-1 md:grid-cols-2">
+            <div className="min-h-0 overflow-y-auto border-r border-slate-800">
+              {loading && !survey && <p className="p-4 text-xs text-slate-400">{FILES_COPY.loading}</p>}
+              {listError && (
+                <div className="p-4 text-xs text-rose-300" role="alert">
+                  <p>{listError}</p>
+                  <Button variant="outline" className="mt-2" onClick={() => void load()}>
+                    Try again
+                  </Button>
+                </div>
+              )}
+              {survey && (
+                <>
+                  <p data-testid="files-scope-note" className="px-4 pt-3 text-[11px] text-slate-400">
+                    {survey.scope_note}
+                  </p>
+                  {survey.record_gaps.length > 0 && (
+                    <ul data-testid="files-record-gaps" className="px-4 pt-1 text-[11px] text-amber-300 list-disc list-inside">
+                      {survey.record_gaps.map((gap) => (
+                        <li key={gap}>{gap}</li>
+                      ))}
+                    </ul>
+                  )}
+                  {visible.length === 0 && (
+                    <p data-testid="files-empty" className="p-4 text-xs text-slate-400">
+                      {survey.entries.length === 0 ? FILES_COPY.noneListed : FILES_COPY.noneMatch}
+                    </p>
+                  )}
+                  <ul className="p-2 space-y-1">
+                    {visible.map((entry) => (
+                      <EntryRow
+                        key={entry.path}
+                        entry={entry}
+                        busy={busy}
+                        pending={pending?.entry.path === entry.path ? pending : null}
+                        onOpen={() => void openFile(entry.path)}
+                        onOpenInner={(path) => void openFile(path)}
+                        onArchive={(release) => void archive(entry, release)}
+                        onRestore={() => void restore(entry)}
+                        onAskDelete={() => setPending({ kind: 'delete', entry })}
+                        onDelete={(release) => void remove(entry, release)}
+                        onCancel={() => setPending(null)}
+                        onOpenStory={() => void openStory(entry)}
+                        onViewStory={() => entry.story && setViewing(entry.story.story_id)}
+                      />
                     ))}
                   </ul>
-                )}
-                {visible.length === 0 && (
-                  <p data-testid="files-empty" className="p-4 text-xs text-slate-400">
-                    {survey.entries.length === 0 ? FILES_COPY.noneListed : FILES_COPY.noneMatch}
-                  </p>
-                )}
-                <ul className="p-2 space-y-1">
-                  {visible.map((entry) => (
-                    <EntryRow
-                      key={entry.path}
-                      entry={entry}
-                      busy={busy}
-                      pending={pending?.entry.path === entry.path ? pending : null}
-                      onOpen={() => void openFile(entry.path)}
-                      onOpenInner={(path) => void openFile(path)}
-                      onArchive={(release) => void archive(entry, release)}
-                      onRestore={() => void restore(entry)}
-                      onAskDelete={() => setPending({ kind: 'delete', entry })}
-                      onDelete={(release) => void remove(entry, release)}
-                      onCancel={() => setPending(null)}
-                      onOpenStory={() => void openStory(entry)}
-                    />
-                  ))}
-                </ul>
-              </>
-            )}
+                </>
+              )}
+            </div>
+            <div className="min-h-0 overflow-y-auto p-4" data-testid="files-preview">
+              {openError && (
+                <p role="alert" className="text-xs text-rose-300">
+                  {openError}
+                </p>
+              )}
+              {!openError && !opened && <p className="text-xs text-slate-500">{FILES_COPY.pickFile}</p>}
+              {opened && (
+                <div>
+                  <p className="text-xs font-mono text-slate-400 mb-2">{opened.path}</p>
+                  {opened.kind === 'image' ? (
+                    <img src={imageUrl(opened.path)} alt={opened.name} className="max-w-full rounded" />
+                  ) : opened.path.toLowerCase().endsWith('.md') ? (
+                    <MarkdownRenderer content={opened.text ?? ''} />
+                  ) : (
+                    <pre data-testid="files-preview-text" className="text-xs whitespace-pre-wrap text-slate-200">
+                      {opened.text}
+                    </pre>
+                  )}
+                </div>
+              )}
+            </div>
           </div>
-          <div className="min-h-0 overflow-y-auto p-4" data-testid="files-preview">
-            {openError && (
-              <p role="alert" className="text-xs text-rose-300">
-                {openError}
-              </p>
-            )}
-            {!openError && !opened && <p className="text-xs text-slate-500">{FILES_COPY.pickFile}</p>}
-            {opened && (
-              <div>
-                <p className="text-xs font-mono text-slate-400 mb-2">{opened.path}</p>
-                {opened.kind === 'image' ? (
-                  <img src={imageUrl(opened.path)} alt={opened.name} className="max-w-full rounded" />
-                ) : opened.path.toLowerCase().endsWith('.md') ? (
-                  <MarkdownRenderer content={opened.text ?? ''} />
-                ) : (
-                  <pre data-testid="files-preview-text" className="text-xs whitespace-pre-wrap text-slate-200">
-                    {opened.text}
-                  </pre>
-                )}
-              </div>
-            )}
-          </div>
-        </div>
+          </>
+        )}
       </div>
     </div>
   );
@@ -374,6 +415,7 @@ interface EntryRowProps {
   onDelete: (releaseWriter: boolean) => void;
   onCancel: () => void;
   onOpenStory: () => void;
+  onViewStory: () => void;
 }
 
 const EntryRow: React.FC<EntryRowProps> = ({
@@ -388,6 +430,7 @@ const EntryRow: React.FC<EntryRowProps> = ({
   onDelete,
   onCancel,
   onOpenStory,
+  onViewStory,
 }) => {
   const Icon = KIND_ICONS[entry.kind];
   const story = entry.story;
@@ -452,7 +495,7 @@ const EntryRow: React.FC<EntryRowProps> = ({
               data-testid="files-go-ahead"
               onClick={() => (pending.action === 'archive' ? onArchive(true) : onDelete(true))}
             >
-              {FILES_COPY.goAhead}
+              {pending.retry ? FILES_COPY.tryAgain : FILES_COPY.goAhead}
             </Button>
             <Button variant="outline" disabled={busy} onClick={onCancel}>
               Cancel
@@ -466,6 +509,11 @@ const EntryRow: React.FC<EntryRowProps> = ({
           {entry.kind !== 'story' && (
             <Button variant="outline" disabled={busy} data-testid="files-open" onClick={onOpen}>
               Open
+            </Button>
+          )}
+          {story && !entry.archived && story.title !== null && (
+            <Button variant="outline" disabled={busy} data-testid="files-view-story" onClick={onViewStory}>
+              View story
             </Button>
           )}
           {story && !entry.archived && story.title !== null && (

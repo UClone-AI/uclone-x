@@ -26,7 +26,7 @@ import httpx
 from pydantic import BaseModel, ConfigDict, Field
 
 from uclone_x.errors import UCloneXError
-from uclone_x.tools.base import BaseTool
+from uclone_x.tools.base import BaseTool, artifact_content_url, replace_file
 from uclone_x.tools.builtin.comfy_client import (
     DEFAULT_COMFYUI_BASE_URL,
     ComfyClient,
@@ -1281,15 +1281,16 @@ class GenerateImageTool(BaseTool[GenerateImageParams]):
                     p = Path(params.output_path)
                     candidate = p.parent / f"{p.stem}_{i + 1}{p.suffix or '.png'}"
                     clean_rel = str(candidate).lstrip("/\\")
-                    dest_path = self.resolve_safe_path(clean_rel, context.require_workspace())
+                    workspace = context.require_workspace()
+                    dest_path = self.resolve_write_path(clean_rel, workspace)
                     meta_candidate = p.parent / f"{p.stem}_{i + 1}.json"
                     meta_rel = str(meta_candidate).lstrip("/\\")
-                    meta_path = self.resolve_safe_path(meta_rel, context.require_workspace())
+                    meta_path = self.resolve_write_path(meta_rel, workspace)
                 else:
                     default_rel = f"artifacts/images/img_{batch_id}_{i + 1}.png"
                     dest_path = self.resolve_safe_path(default_rel, context.require_workspace())
                     meta_rel = f"artifacts/images/img_{batch_id}_{i + 1}.json"
-                    meta_path = self.resolve_safe_path(meta_rel, context.require_workspace())
+                    meta_path = self.resolve_write_path(meta_rel, context.require_workspace())
 
                 gen_result = await self._dispatcher.dispatch(
                     prompt=params.prompt,
@@ -1301,8 +1302,10 @@ class GenerateImageTool(BaseTool[GenerateImageParams]):
                 last_engine = gen_result.engine_name
                 last_device = gen_result.device_info
 
+                # Named apart from the single-image writes, so a test can pin these two.
+                batch_image = gen_result.image_bytes
                 dest_path.parent.mkdir(parents=True, exist_ok=True)
-                dest_path.write_bytes(gen_result.image_bytes)
+                replace_file(dest_path, batch_image)
 
                 try:
                     rel_path = str(dest_path.relative_to(context.require_workspace().resolve()))
@@ -1336,18 +1339,15 @@ class GenerateImageTool(BaseTool[GenerateImageParams]):
                     "recipe_hash": recipe_hash,
                     "created_at": datetime.now(UTC).isoformat(),
                 }
+                batch_meta = json.dumps(meta_data, indent=2, ensure_ascii=False).encode()
                 meta_path.parent.mkdir(parents=True, exist_ok=True)
-                meta_path.write_text(
-                    json.dumps(meta_data, indent=2, ensure_ascii=False), encoding="utf-8"
-                )
+                replace_file(meta_path, batch_meta)
 
                 images.append(
                     {
                         "path": rel_path,
-                        "absolute_path": str(dest_path),
                         "meta_path": rel_meta_path,
-                        "meta_absolute_path": str(meta_path),
-                        "relative_url": f"/api/artifacts/content?path={rel_path}",
+                        "relative_url": artifact_content_url(rel_path),
                         "seed": curr_seed,
                         "recipe_hash": recipe_hash,
                         "bytes_written": len(gen_result.image_bytes),
@@ -1384,16 +1384,16 @@ class GenerateImageTool(BaseTool[GenerateImageParams]):
         # 1. Resolve safe destination path
         if params.output_path is not None:
             clean_rel = params.output_path.lstrip("/\\") or f"artifacts/images/img_{short_id}.png"
-            dest_path = self.resolve_safe_path(clean_rel, context.require_workspace())
+            dest_path = self.resolve_write_path(clean_rel, context.require_workspace())
             p = Path(clean_rel)
             meta_candidate = p.parent / f"{p.stem}.json"
             meta_rel = str(meta_candidate).lstrip("/\\")
-            meta_path = self.resolve_safe_path(meta_rel, context.require_workspace())
+            meta_path = self.resolve_write_path(meta_rel, context.require_workspace())
         else:
             default_rel = f"artifacts/images/img_{short_id}.png"
             dest_path = self.resolve_safe_path(default_rel, context.require_workspace())
             meta_rel = f"artifacts/images/img_{short_id}.json"
-            meta_path = self.resolve_safe_path(meta_rel, context.require_workspace())
+            meta_path = self.resolve_write_path(meta_rel, context.require_workspace())
 
         # 2. Dispatch generation
         gen_result = await self._dispatcher.dispatch(
@@ -1406,7 +1406,7 @@ class GenerateImageTool(BaseTool[GenerateImageParams]):
 
         # 3. Write image artifact securely
         dest_path.parent.mkdir(parents=True, exist_ok=True)
-        dest_path.write_bytes(gen_result.image_bytes)
+        replace_file(dest_path, gen_result.image_bytes)
 
         try:
             rel_path = str(dest_path.relative_to(context.require_workspace().resolve()))
@@ -1439,15 +1439,13 @@ class GenerateImageTool(BaseTool[GenerateImageParams]):
             "created_at": datetime.now(UTC).isoformat(),
         }
         meta_path.parent.mkdir(parents=True, exist_ok=True)
-        meta_path.write_text(json.dumps(meta_data, indent=2, ensure_ascii=False), encoding="utf-8")
+        replace_file(meta_path, json.dumps(meta_data, indent=2, ensure_ascii=False).encode())
 
         return {
             "status": "success",
             "path": rel_path,
-            "absolute_path": str(dest_path),
             "meta_path": rel_meta_path,
-            "meta_absolute_path": str(meta_path),
-            "relative_url": f"/api/artifacts/content?path={rel_path}",
+            "relative_url": artifact_content_url(rel_path),
             "prompt": params.prompt,
             "style": params.style,
             "aspect_ratio": params.aspect_ratio,

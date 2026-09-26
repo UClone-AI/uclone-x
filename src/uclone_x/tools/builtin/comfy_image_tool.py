@@ -9,7 +9,7 @@ from typing import Any, ClassVar
 from pydantic import BaseModel, ConfigDict, Field
 
 from uclone_x.errors import ComfyUIError
-from uclone_x.tools.base import BaseTool
+from uclone_x.tools.base import BaseTool, artifact_content_url, replace_file
 from uclone_x.tools.builtin.comfy_client import (
     COMFY_CHECKPOINT_ENV,
     COMFY_DEFAULT_CHECKPOINT,
@@ -219,7 +219,7 @@ class ComfyImageGenTool(BaseTool[ComfyImageGenParams]):
 
         # 1. Path containment check: resolve safe path before queuing workflow
         if params.output_path is not None:
-            dest_path = self.resolve_safe_path(params.output_path, context.require_workspace())
+            dest_path = self.resolve_write_path(params.output_path, context.require_workspace())
         else:
             default_rel = f"artifacts/images/{actual_seed}_{uuid.uuid4().hex[:8]}.png"
             dest_path = self.resolve_safe_path(default_rel, context.require_workspace())
@@ -254,7 +254,7 @@ class ComfyImageGenTool(BaseTool[ComfyImageGenParams]):
 
         # 5. Persist artifact safely within workspace
         dest_path.parent.mkdir(parents=True, exist_ok=True)
-        dest_path.write_bytes(image_bytes)
+        replace_file(dest_path, image_bytes)
 
         try:
             rel_path = str(dest_path.relative_to(context.require_workspace().resolve()))
@@ -263,7 +263,7 @@ class ComfyImageGenTool(BaseTool[ComfyImageGenParams]):
 
         return {
             "path": rel_path,
-            "absolute_path": str(dest_path),
+            "relative_url": artifact_content_url(rel_path),
             "prompt_id": prompt_id,
             "filename": primary_filename,
             "width": params.width,

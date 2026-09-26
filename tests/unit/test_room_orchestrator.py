@@ -832,6 +832,42 @@ class TestInterjectionIsNotSkipped:
         )
 
 
+class TestARenameDuringATurnKeepsTheReply:
+    """#1578 item 7: renaming a conversation while it answers must not lose the answer.
+
+    The rename route and the turn share one event loop, and `rename` reads and saves with no
+    `await` between. The turn's landing re-reads the room just before its own save, so the
+    rename's revision bump is its base rather than a stale write, and both changes stand.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_reply_lands_and_the_new_title_stays(self, built: Any) -> None:
+        """Killed by: src/uclone_x/room/orchestrator.py :: state = self._require_room(room_id)  # the landing's own read
+        Becomes: state = state
+        """
+        from uclone_x.room.service import RoomService
+
+        store, _, agents = built
+        _cap(built, 1)
+        orch = _orchestrator(built, [ScriptedSelector("s", [speak("scout")])])
+        rooms = RoomService(store)
+        agents["scout"].release = asyncio.Event()
+
+        async def rename_mid_turn() -> None:
+            await agents["scout"].turn_started.wait()
+            rooms.rename("r1", "Renamed while answering")
+            agents["scout"].release.set()
+
+        await asyncio.gather(orch.post("r1", "alice", "what is the TTL?"), rename_mid_turn())
+
+        final = store.load("r1")
+        assert final is not None
+        assert final.title == "Renamed while answering"
+        replies = [m for m in final.transcript if m.sender_id == "scout"]
+        assert [m.content for m in replies] == ["scout says TTL"]
+        assert replies[0].error is None
+
+
 class TestPostRejectsNonHumans:
     @pytest.mark.asyncio
     async def test_an_agent_cannot_post_and_reset_the_turn_budget(self, built: Any) -> None:
@@ -2336,7 +2372,10 @@ class TestTheHeadCanFollowAlong:
                 cast(
                     Any,
                     SimpleNamespace(
-                        storage_dir=tmp_path / "stack", bus=bus, on_llm_replaced=ignore_llm
+                        storage_dir=tmp_path / "stack",
+                        workspace_dir=tmp_path / "workspace",
+                        bus=bus,
+                        on_llm_replaced=ignore_llm,
                     ),
                 )
             )

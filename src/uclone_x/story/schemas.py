@@ -17,9 +17,16 @@ from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError, m
 
 from uclone_x.errors import PlainRefusalError
 
+# The folder under a workspace that holds the story library. It lives here, in a pure
+# module, so the general file tools can refuse writes into it without importing the
+# library (#1583).
+STORIES_DIRNAME = "stories"
+
 __all__ = [
     "CODEX_KINDS",
+    "DEFAULT_AXIOMS",
     "ENTRY_ID_PATTERN",
+    "STORIES_DIRNAME",
     "Chapter",
     "CharacterEntry",
     "CodexEntry",
@@ -29,6 +36,12 @@ __all__ = [
     "PlaceEntry",
     "ItemEntry",
     "Progression",
+    "Proposal",
+    "ProposalChange",
+    "ProposalEvidence",
+    "StoryAxiom",
+    "StoryAxioms",
+    "VisualChange",
     "Revision",
     "RevisionLog",
     "Scene",
@@ -38,10 +51,12 @@ __all__ = [
     "ThreadEntry",
     "Visual",
     "VisualProgression",
+    "changed_entry",
     "describe_invalid",
     "dump_file",
     "entry_model",
     "parse_file",
+    "story_axioms",
 ]
 
 #: An id a person or the model gives an outline scene or a codex entry: lowercase letters
@@ -74,7 +89,9 @@ class Scene(_Shape):
     places: list[EntryId] = Field(default_factory=list[str])
     beats: list[str] = Field(default_factory=list[str])
     #: When the scene happens in the story, as opposed to where it sits in the book.
-    #: Kept for the phase that applies progressions; nothing orders by it yet.
+    #: Progressions are applied in this order (`uclone_x.story.timeline`), so a flashback
+    #: sees the world as it was then. A scene without one takes the time of the scene
+    #: before it in reading order, and the context says so.
     story_time: str | int | None = None
 
 
@@ -122,7 +139,10 @@ class Outline(_Shape):
 
 
 class Progression(_Shape):
-    """A change to an entry's state from a scene on. Stored now, applied by a later phase."""
+    """A change to an entry's state, in force once the scene `at` has ended.
+
+    `set` replaces each named state value; a value of `null` removes it.
+    """
 
     at: EntryId
     set: dict[str, JsonValue] = Field(default_factory=dict[str, JsonValue])
@@ -130,7 +150,7 @@ class Progression(_Shape):
 
 
 class VisualProgression(_Shape):
-    """A change to how a character looks from a scene on. Stored now, applied later."""
+    """A change to how a character looks, in force once the scene `at` has ended."""
 
     at: EntryId
     add_tags: list[str] = Field(default_factory=list[str])
@@ -197,6 +217,155 @@ _ENTRY_MODELS: dict[CodexKind, type[CodexEntry]] = {
 def entry_model(kind: CodexKind) -> type[CodexEntry]:
     """The shape of a codex entry of `kind`."""
     return _ENTRY_MODELS[kind]
+
+
+# -- story.yaml `axioms` ----------------------------------------------------------------
+
+
+class StoryAxiom(_Shape):
+    """One rule the story's facts are checked against, from `story.yaml`'s `axioms` list.
+
+    `kind` is an ontology schema predicate (`disjointWith`, `inverseFunctional`,
+    `functional`, `subClassOf`, ...); `subject` is the class or property it is about and
+    `object` its other side, where the kind has one. A kind the reasoner cannot act on is
+    reported by the audit, not dropped.
+    """
+
+    kind: str = Field(min_length=1)
+    subject: str = Field(min_length=1)
+    object: str = ""
+    note: str | None = None
+
+
+class StoryAxioms(_Shape):
+    """The `axioms` list of `story.yaml`, validated on its own (the rest of the file is not)."""
+
+    axioms: list[StoryAxiom] = Field(default_factory=list[StoryAxiom])
+
+
+#: The rules a story is checked under when its `story.yaml` names none.
+DEFAULT_AXIOMS: tuple[StoryAxiom, ...] = (
+    StoryAxiom(
+        kind="disjointWith",
+        subject="Alive",
+        object="Dead",
+        note="Nobody is alive and dead at the same time.",
+    ),
+    StoryAxiom(
+        kind="inverseFunctional",
+        subject="possesses",
+        note="One thing has one owner at a time.",
+    ),
+)
+
+
+def story_axioms(raw: object, *, present: bool, where: str) -> tuple[list[StoryAxiom], bool]:
+    """The story's rules, and whether they are the defaults.
+
+    `raw` is the `axioms` value of `story.yaml`, and `present` whether the file has the
+    key. With no key the defaults apply, and the result says so; a list -- even an empty
+    one -- is the story's choice and is used as it is.
+
+    Raises:
+        StoryFileError: the list does not fit; the message names `where` and the field.
+    """
+    if not present:
+        return list(DEFAULT_AXIOMS), True
+    try:
+        parsed = StoryAxioms.model_validate({"axioms": raw})
+    except ValidationError as exc:
+        raise StoryFileError(describe_invalid(where, exc)) from exc
+    return list(parsed.axioms), False
+
+
+# -- proposals/<id>.yaml ---------------------------------------------------------------
+
+
+class VisualChange(_Shape):
+    """New values for a character's `visual` block; a field left out is not changed."""
+
+    tags: list[str] | None = None
+    prose: str | None = None
+    negative_tags: list[str] | None = None
+    base_seed: int | None = Field(default=None, ge=0, le=2**32 - 1)
+    gender: Literal["female", "male", "other"] | None = None
+    default_style: Literal["photorealistic", "anime", "artistic", "diagram"] | None = None
+
+
+class ProposalChange(_Shape):
+    """What a proposal would add to or change in one codex entry."""
+
+    progression: Progression | None = None
+    visual_progression: VisualProgression | None = None
+    visual: VisualChange | None = None
+
+    @model_validator(mode="after")
+    def _changes_something(self) -> ProposalChange:
+        if self.progression is None and self.visual_progression is None and self.visual is None:
+            raise ValueError("the change is empty")
+        return self
+
+
+class ProposalEvidence(_Shape):
+    """The manuscript text a proposal rests on: a quote found in one scene."""
+
+    scene_id: EntryId
+    quote: str = Field(min_length=1)
+
+
+class Proposal(_Shape):
+    """`proposals/<id>.yaml`: a change to the codex the model proposed and a person decides.
+
+    `entry_digest` is the digest of the entry file when the proposal was made; applying
+    is refused once the entry has changed since, so a person never approves a change
+    against a version of the entry they did not see.
+    """
+
+    id: EntryId
+    kind: CodexKind
+    entry_id: EntryId
+    change: ProposalChange
+    evidence: list[ProposalEvidence] = Field(default_factory=list[ProposalEvidence])
+    status: Literal["pending", "applied", "rejected"] = "pending"
+    proposed_at: str = Field(min_length=1)
+    room_id: str = Field(min_length=1)
+    agent_id: str | None = None
+    entry_digest: str = Field(min_length=1)
+    decided_at: str | None = None
+    #: Where it was decided: in the conversation (`story_codex`), or in the story view.
+    decided_in: Literal["conversation", "story_view"] | None = None
+    reason: str | None = None
+
+
+def changed_entry(entry: CodexEntry, change: ProposalChange) -> dict[str, Any]:
+    """The fields of `entry` once `change` is made, for the caller to validate as a file.
+
+    A progression is added after the entry's own; a visual change replaces only the
+    fields it names and keeps the entry's visual progressions.
+
+    Raises:
+        StoryFileError: the change is to how a character looks, and `entry` is not one.
+    """
+    data: dict[str, Any] = entry.model_dump(mode="json", exclude_defaults=True)
+    if change.progression is not None:
+        data["progressions"] = [
+            *data.get("progressions", []),
+            change.progression.model_dump(mode="json", exclude_defaults=True),
+        ]
+    if change.visual_progression is None and change.visual is None:
+        return data
+    if not isinstance(entry, CharacterEntry):
+        raise StoryFileError(f"'{entry.id}' is not a character, so it has no looks to change.")
+    visual: dict[str, Any] = dict(data.get("visual") or {})
+    if change.visual is not None:
+        visual.update(change.visual.model_dump(mode="json", exclude_none=True))
+    if change.visual_progression is not None:
+        visual["progressions"] = [
+            *visual.get("progressions", []),
+            change.visual_progression.model_dump(mode="json", exclude_defaults=True),
+        ]
+    data["visual"] = visual
+    return data
 
 
 # -- sessions.yaml and the manuscript's revision log ------------------------------------
@@ -321,10 +490,14 @@ def parse_file(model: type[_M], text: str, where: str) -> _M:
         raise StoryFileError(describe_invalid(where, exc)) from exc
 
 
-def dump_file(model: BaseModel) -> str:
-    """`model` as the YAML text of its file, fields in declaration order."""
+def dump_file(model: BaseModel, *, compact: bool = False) -> str:
+    """`model` as the YAML text of its file, fields in declaration order.
+
+    `compact` leaves out every field still at its default, for a file a person reads and
+    edits by hand (a codex entry, a proposal).
+    """
     return yaml.safe_dump(
-        model.model_dump(mode="json", exclude_defaults=False),
+        model.model_dump(mode="json", exclude_defaults=compact),
         sort_keys=False,
         allow_unicode=True,
     )

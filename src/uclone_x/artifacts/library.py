@@ -9,25 +9,35 @@ for good; and how to open a story in a new conversation.
 `scope_note` saying which folders it walked and a `record_gaps` list naming each part it
 could not read. A file is linked to a conversation only while that conversation exists,
 because the link is the room's own record of what it wrote, and a deleted room takes that
-record with it; a file with no conversation is "not linked to one that still exists",
-never "written by nobody".
+record with it; a file with no conversation has "no recorded writer", never "written by
+nobody". Names that start with a dot are not listed, and the scope note says so.
 
 **Operations stay inside the artifact folders.** Every path is resolved through
 `PathValidator.resolve_safe_path`, the one containment guard, first against the workspace
 and then against the folder it names. Archive moves a file or a story folder under
 `<workspace>/.archive/`, keeping its relative path, and restore moves it back; neither
-overwrites anything. Delete removes for good and needs `confirm=True`.
+overwrites anything. Delete removes for good and needs `confirm` to be exactly `True`.
+Both act on one file or one whole story; any other folder is refused, since the list
+never offers one and removing it whole would take files nobody chose (#1578).
 
 **A story being written is not taken silently.** A story's `story.yaml` names the
 conversation holding its writing lease. Archiving or deleting that story while the holder
 still exists is refused with `StoryInUseError`, which names the conversation, unless the
 caller passes `release_writer=True`, in which case the lease is given back and the
 conversation's open story is cleared first -- but never while that conversation is
-answering, because clearing it changes the room under the running turn and its reply would
-be refused on save and lost. A lease whose holder no longer exists is stale and is released
-without asking. A story is recognised by its folder on disk, not by the name as typed, so a
-differently cased path on a disk that ignores case is still that story, lease and all.
-Neither archive nor restore moves anything through a link.
+answering, because the running turn was given the story when it started and keeps it until
+it finishes, so its story tools would go on working on a story that was just released,
+moved or deleted. A lease whose holder no longer exists is stale and is released without
+asking. Once the story has moved, every conversation that had it open to read has it
+cleared too. A story is recognised by its folder on disk, not by the name as typed, so any
+spelling the disk takes to be that folder -- another case, or `ſ` for `s` -- is still that
+story, lease and all. Where more than one entry is that same file (hard links), the one
+whose name matches the spelling is chosen. Neither archive nor restore moves anything
+through a link. Once a story has moved, clearing it from the conversations that had it open
+comes after the move, so a failure there cannot be reported as the move failing. It is
+logged, and the result carries a plain `note` saying some conversations may still show
+the story as open. Only a store failure is handled that way; any other error is a defect
+and propagates (#1578).
 """
 
 from __future__ import annotations
@@ -36,6 +46,7 @@ import logging
 import os
 import re
 import shutil
+import unicodedata
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -48,6 +59,7 @@ from uclone_x.errors import (
     PathTraversalError,
     PlainRefusalError,
     RoomNotFoundError,
+    StaleRoomWriteError,
     UnreadableRoomRecordError,
 )
 from uclone_x.room.models import RoomState
@@ -70,12 +82,14 @@ __all__ = [
     "SCOPE_NOTE",
     "ArtifactContent",
     "ArtifactEntry",
+    "ArtifactChanged",
     "ArtifactError",
     "ArtifactLibrary",
     "ArtifactNotFoundError",
     "ArtifactSurvey",
     "ConversationRef",
     "DeleteNotConfirmedError",
+    "READERS_NOT_CLEARED_NOTE",
     "StoryFileEntry",
     "StoryInUseError",
     "StoryInfo",
@@ -94,7 +108,15 @@ SCOPE_NOTE = (
     "This list shows the files in the workspace's artifacts and stories folders, and files "
     "a current conversation saved by name somewhere else. A file saved somewhere else by a "
     "conversation that was since deleted, or written by a shell command, may not appear "
-    "here. A file is linked to a conversation only while that conversation exists."
+    "here. A file is linked to a conversation only while that conversation exists. Files "
+    "and folders whose names start with a dot are not listed."
+)
+
+#: The note an archive or delete carries when the conversations that had the story open
+#: could not all be cleared (#1578). The move itself happened; this says what did not.
+READERS_NOT_CLEARED_NOTE = (
+    "Some conversations that had this story open could not be updated, so they may still "
+    "show it as open."
 )
 
 #: The largest file `open_file` returns as text.
@@ -217,6 +239,19 @@ class ArtifactContent(BaseModel):
     text: str | None
 
 
+class ArtifactChanged(BaseModel):
+    """What an archive or delete did: where the entry is now, and anything left undone."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    path: str = Field(description="Where it is now; for a delete, the path that was removed.")
+    note: str | None = Field(
+        default=None,
+        description="A plain sentence about a step after the change that did not complete; "
+        "None when everything did.",
+    )
+
+
 class StoryOpened(BaseModel):
     """A story opened into a conversation."""
 
@@ -267,6 +302,33 @@ def _is_story_folder(folder: Path) -> bool:
     )
 
 
+def _same_entry(entry: Path, candidate: Path) -> bool:
+    """Whether the directory entry `entry` is the file `candidate` names, links unfollowed.
+
+    Not following links is the point: a link beside the story folder names the same
+    folder when followed, and a story reached through it is not recognised as one.
+    """
+    try:
+        return os.path.samestat(os.lstat(entry), os.lstat(candidate))
+    except OSError:
+        return False
+
+
+def _fold(name: str) -> str:
+    """`name` as a disk that ignores case and normalisation compares it."""
+    return unicodedata.normalize("NFD", unicodedata.normalize("NFD", name).casefold())
+
+
+def _pick_entry(part: str, same: list[str]) -> str:
+    """Of the entries that are the file `part` names, the one spelled like `part`.
+
+    More than one entry is the same file only through hard links. Choosing among those by
+    sort order would act on a different name from the one asked for (#1578).
+    """
+    spelled = [entry for entry in same if _fold(entry) == _fold(part)]
+    return (spelled or same)[0]
+
+
 class ArtifactLibrary:
     """The artifact folders of one workspace, and the conversations that wrote into them."""
 
@@ -279,9 +341,7 @@ class ArtifactLibrary:
     ) -> None:
         """`turn_in_flight(room_id)` says whether that conversation is answering now.
 
-        It is required, not defaulted: releasing a writer mid-turn changes the room under
-        the turn, whose reply is then refused on save and lost, so the caller must say
-        how it knows (the UI passes `RoomStack.turn_in_flight`).
+        It is required, not defaulted, so the caller must say how it knows.
         """
         self._workspace = workspace.resolve()
         self._rooms = rooms
@@ -588,11 +648,12 @@ class ArtifactLibrary:
 
     # -- archive, restore, delete -----------------------------------------------------------
 
-    def archive(self, path: str, *, release_writer: bool = False) -> str:
-        """Move a file or story folder under `.archive/`; return where it is now."""
+    def archive(self, path: str, *, release_writer: bool = False) -> ArtifactChanged:
+        """Move a file or story folder under `.archive/`; say where it is now."""
         located = self._locate(path)
         if located.archived:
             raise ArtifactError(f"{located.name} is already archived.")
+        self._refuse_plain_folder(located)
         target = self._workspace / ARCHIVE_DIRNAME / located.relative
         self._check_destination(target, located.name)
         if target.exists() or target.is_symlink():
@@ -604,7 +665,10 @@ class ArtifactLibrary:
             self._settle_lease(located.story_id, release_writer)
         target.parent.mkdir(parents=True, exist_ok=True)
         os.replace(located.absolute, target)
-        return self._display(target)
+        note = None
+        if located.story_id is not None:
+            note = self._forget_story(located.story_id, "archived")
+        return ArtifactChanged(path=self._display(target), note=note)
 
     def restore(self, path: str) -> str:
         """Move an archived file or story folder back; return where it is now."""
@@ -621,19 +685,55 @@ class ArtifactLibrary:
         os.replace(located.absolute, target)
         return located.original
 
-    def delete(self, path: str, *, confirm: bool, release_writer: bool = False) -> None:
+    def delete(self, path: str, *, confirm: bool, release_writer: bool = False) -> ArtifactChanged:
         """Remove a file or story folder for good. Needs `confirm=True`."""
-        if not confirm:
+        if confirm is not True:
             raise DeleteNotConfirmedError(
                 "Deleting cannot be undone, so it needs your confirmation. Nothing was deleted."
             )
         located = self._locate(path)
-        if located.story_id is not None and not located.archived:
-            self._settle_lease(located.story_id, release_writer)
+        self._refuse_plain_folder(located)
+        leaving = None if located.archived else located.story_id
+        if leaving is not None:
+            self._settle_lease(leaving, release_writer)
         if located.absolute.is_dir():
             shutil.rmtree(located.absolute)
         else:
             located.absolute.unlink()
+        note = None
+        if leaving is not None:
+            note = self._forget_story(leaving, "deleted")
+        return ArtifactChanged(path=located.relative, note=note)
+
+    @staticmethod
+    def _refuse_plain_folder(located: _Located) -> None:
+        """Refuse a folder that is not a story: it would go whole, with files nobody chose."""
+        if located.story_id is None and located.absolute.is_dir():
+            raise ArtifactError(
+                f"{located.name} is a folder. Only a single file or a whole story can be "
+                "archived or deleted here, so nothing was changed."
+            )
+
+    def _forget_story(self, story_id: str, done: Literal["archived", "deleted"]) -> str | None:
+        """Clear a story that has just left from the conversations that had it open.
+
+        The archive or delete has already happened, so a failure here must not read as it
+        failing ("refresh and try again" for something done). It is logged, and returned as
+        a note for the result to carry, so the person is told as well as the log (#1578).
+        Only what `forget_story` raises for a store it could not read or write is handled so:
+        any other error is a defect, and a defect caught here would be a warning nobody reads.
+        """
+        try:
+            self._rooms.forget_story(story_id)
+        except (StaleRoomWriteError, OSError):
+            logger.warning(
+                "Story %r was %s, but the conversations that had it open were not all updated",
+                story_id,
+                done,
+                exc_info=True,
+            )
+            return READERS_NOT_CLEARED_NOTE
+        return None
 
     def _check_destination(self, target: Path, name: str) -> None:
         """Refuse a move whose destination is reached through a link.
@@ -659,7 +759,9 @@ class ArtifactLibrary:
 
         On a disk that ignores case, `stories/NIGHT-TRAIN` reaches `stories/night-train`,
         and a check made on the name as typed would not see the story, or its lease. Each
-        part that exists is replaced by the directory entry that is the same file.
+        part that exists is replaced by the directory entry that is the same file. The
+        entry is chosen by what it is, never by comparing names: APFS also takes
+        `stories/ſunſet` to be `stories/sunset`, which `str.lower()` does not (#1578).
         """
         current = self._workspace
         spelled: list[str] = []
@@ -667,12 +769,11 @@ class ArtifactLibrary:
             candidate = current / part
             name = part
             if candidate.exists():
-                entries = os.listdir(current)
+                entries = sorted(os.listdir(current))
                 if part not in entries:
-                    for entry in entries:
-                        if entry.lower() == part.lower() and (current / entry).samefile(candidate):
-                            name = entry
-                            break
+                    same = [e for e in entries if _same_entry(current / e, candidate)]
+                    if same:
+                        name = _pick_entry(part, same)
             spelled.append(name)
             current = current / name
         return tuple(spelled)
@@ -764,8 +865,8 @@ class ArtifactLibrary:
                 title=title,
             )
         if exists and self._turn_in_flight(holder):
-            # Releasing now would change the room under the running turn, and its reply
-            # would be refused on save and lost.
+            # The running turn keeps this story until it finishes, and its story tools
+            # would go on working on a story that was just released, moved or deleted.
             raise StoryInUseError(
                 f"The conversation {name} is answering right now, so it cannot be stopped "
                 "from writing this story yet. Wait for the answer to finish, then try again.",

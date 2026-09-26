@@ -392,8 +392,8 @@ def test_a_save_refused_on_its_arguments_says_nothing_was_saved(tmp_path: Path) 
     and never says that the fact is not in memory. The model went on to tell the user it
     had saved the colour.
 
-    Killed by: src/uclone_x/tools/base.py :: {self.not_run_note}
-    Becomes: {''}
+    Killed by: src/uclone_x/tools/base.py :: tool_identifier, e, model_cls, self.not_run_note
+    Becomes: tool_identifier, e, model_cls, ""
     """
     agent, memory = _agent_with_memory(tmp_path)
 

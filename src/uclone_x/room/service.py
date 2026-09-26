@@ -49,7 +49,7 @@ from uclone_x.room.models import (
     RoomPolicy,
     RoomState,
 )
-from uclone_x.room.protocols import RoomStoreProtocol
+from uclone_x.room.protocols import RoomStoreProtocol, StoryLeaseProtocol
 
 __all__ = [
     "ONTOLOGY_NAMESPACE_ROOT",
@@ -277,8 +277,16 @@ def _by_recency(summaries: Iterable[RoomSummary]) -> list[RoomSummary]:
 class RoomService:
     """Creates rooms and edits their rosters. The Core half of `ucx room`."""
 
-    def __init__(self, store: RoomStoreProtocol) -> None:
+    def __init__(
+        self, store: RoomStoreProtocol, *, stories: StoryLeaseProtocol | None = None
+    ) -> None:
+        """`stories` gives back a deleted room's lease on its story (#1565).
+
+        Without it, deleting a room that has a story open is refused rather than leaving
+        the lease held by a conversation that no longer exists.
+        """
         self._store = store
+        self._stories = stories
 
     # -- rooms -------------------------------------------------------------------------
 
@@ -379,9 +387,77 @@ class RoomService:
         state = self.get(room_id)
         return self._store.save(state.model_copy(update={"story_id": story_id}))
 
+    def forget_story(self, story_id: str) -> tuple[str, ...]:
+        """Clear `story_id` from every room that has it open; return those rooms' ids.
+
+        For a story that has just left the library, archived or deleted (#1578). A room
+        that only read it, never holding its lease, would otherwise keep naming a story
+        that is not there. A room whose record will not load is not changed: its turns
+        refuse on that same read, so it cannot reach the story either.
+
+        Raises:
+            StaleRoomWriteError: Another writer moved a room first.
+        """
+        cleared: list[str] = []
+        for summary in self.survey_rooms().rooms:
+            try:
+                state = self.get(summary.room_id)
+            except (RoomNotFoundError, UnreadableRoomRecordError):
+                continue  # deleted, or broken, since the listing
+            if state.story_id == story_id:
+                self._store.save(state.model_copy(update={"story_id": None}))
+                cleared.append(state.room_id)
+        return tuple(cleared)
+
     def delete(self, room_id: str) -> bool:
-        """Remove the room; return whether one was there to remove."""
-        return self._store.delete(room_id)
+        """Remove the room; return whether one was there to remove.
+
+        The story the room had open is not part of it and stays where it is (#1555). Only
+        its writing lease is given back, so the next conversation to open the story can
+        write it without taking it over (#1565). A record that is there and will not load
+        is removed all the same (#1440); which story it had open cannot be read from it.
+
+        Raises:
+            RoomError: The room has a story open and this service was built without
+                `stories`. Nothing was deleted.
+        """
+        story_id: str | None = None
+        try:
+            state = self._store.load(room_id)
+        except UnreadableRoomRecordError as unreadable:
+            logger.warning("Deleting room %r, whose record will not load: %s", room_id, unreadable)
+        else:
+            story_id = state.story_id if state is not None else None
+        if story_id is not None and self._stories is None:
+            raise RoomError(
+                "This conversation has a story open, and the story cannot be closed from "
+                "here, so the conversation was not deleted."
+            )
+        removed = self._store.delete(room_id)
+        if story_id is not None and self._stories is not None:
+            self._release_story(self._stories, story_id, room_id)
+        return removed
+
+    @staticmethod
+    def _release_story(stories: StoryLeaseProtocol, story_id: str, room_id: str) -> None:
+        """Give back a deleted room's lease on its story, if the room still holds it.
+
+        After the room is gone, so a failure here cannot leave a room behind. A lease that
+        is not given back is not lost work: the story is intact, and the next conversation
+        opens it read-only and can take it over. So a failure is logged and the delete
+        stands.
+        """
+        try:
+            stories.release(story_id, room_id)
+        except Exception:
+            logger.warning(
+                "Room %s was deleted, but its writing lease on story %r was not given back; "
+                "if that story is still there, the next conversation to open it can take it "
+                "over",
+                room_id,
+                story_id,
+                exc_info=True,
+            )
 
     def list_rooms(self) -> tuple[RoomSummary, ...]:
         """The rooms that load, as `survey_rooms` lists them."""

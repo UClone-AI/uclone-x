@@ -889,7 +889,14 @@ class RoomOrchestrator:
         # back into the seat's engine after a restart (#1367).
         knowledge_persist_error = self._persist_knowledge(agent, speaker)
 
-        state = self._require_room(room_id)
+        # Re-read, with no `await` from here to the save: a change this server's event loop
+        # made while the turn ran -- a rename, a story released from the Files screen -- is
+        # carried into the landing rather than refused as a stale write that loses the reply
+        # (#1578). The state read when the turn started is the wrong base for this save.
+        # This holds within one process only: `RoomStore.save` checks the revision and then
+        # replaces the file without a lock, so a second server on the same store can still
+        # race this save.
+        state = self._require_room(room_id)  # the landing's own read
         # A human has spoken beyond the span this turn saw: the selection that gave
         # `speaker` the floor answered a message that has since been superseded, so
         # `decision` is a stale judgement of it -- the same rule `_interjected` already

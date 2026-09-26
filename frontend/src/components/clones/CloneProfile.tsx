@@ -31,6 +31,8 @@ export interface CloneProfileProps {
   onEdit?: (cloneId: string) => void;
   /** Available tools from runtime. */
   availableTools?: readonly string[];
+  /** The running clone's tools that it is given only inside a conversation (#1595). */
+  toolsNeedingConversation?: readonly string[];
   /** Available models from runtime. */
   availableModels?: readonly string[];
   /** Existing persona names to prevent duplicate names on create. */
@@ -79,6 +81,7 @@ export const CloneProfile: React.FC<CloneProfileProps> = ({
   onModeChange,
   onEdit,
   availableTools = [],
+  toolsNeedingConversation,
   availableModels = [],
   existingNames = [],
   canWrite = true,
@@ -301,7 +304,7 @@ export const CloneProfile: React.FC<CloneProfileProps> = ({
       </div>
 
       {persona ? (
-        <PersonaDetail persona={persona} />
+        <PersonaDetail persona={persona} toolsNeedingConversation={toolsNeedingConversation} />
       ) : (
         // A clone can be running with no file installed under its name -- the rail builds a
         // row from the live instance in that case. Saying so is the point: "this clone has no

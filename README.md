@@ -12,6 +12,20 @@
 
 ---
 
+## What it looks like
+
+Ask a clone a question. Here the default **clone** answers with a structured
+summary on a local model (`ollama:qwen3:8b`):
+
+![A clone answering "Find latest AI technology in september" with a structured list of AI trends](docs/assets/screenshots/research-conversation.webp)
+
+Or ask the **artist** clone for a picture. The image appears in the conversation,
+with links to open it in the browser or in Docs:
+
+![The artist clone showing a generated image for "beautiful girl with beautiful background"](docs/assets/screenshots/image-generation.webp)
+
+---
+
 ## Install
 
 On macOS or Linux, paste this into a terminal:

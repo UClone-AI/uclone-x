@@ -164,6 +164,9 @@ from uclone_x.telemetry.protocols import TracerProtocol
 from uclone_x.telemetry.tracer import FAILOVER_EVENT_SPAN_NAME, TelemetryTracer
 from uclone_x.tools.base import (
     drop_shadowed_aliases,
+    tool_approval_timeout_note,
+    tool_call_needs_approval,
+    tool_call_writes_files,
     tool_needs_room,
     tool_opens_story,
     tool_spawns_subagents,
@@ -179,6 +182,7 @@ from uclone_x.tools.outcome import (
 )
 from uclone_x.tools.protocols import ToolProtocol, ToolRegistryProtocol
 from uclone_x.tools.registry import ToolRegistry
+from uclone_x.tools.schema import advertised_parameters_schema
 from uclone_x.tools.tool_scoper import ToolScoperProtocol
 
 if TYPE_CHECKING:
@@ -188,6 +192,22 @@ logger = logging.getLogger(__name__)
 
 # Upper bound on failures retained by `BaseAgent.processing_errors`.
 _MAX_RECORDED_ERRORS = 100
+
+
+def _modified_arguments(modified_payload: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    """The call arguments a hook's `modified_payload` sets, read as execution reads them.
+
+    `{"arguments": {...}}` sets them; a payload naming neither `arguments` nor `tool_name`
+    is itself the arguments; anything else sets none.
+    """
+    if not modified_payload:
+        return None
+    arguments: object = modified_payload.get("arguments")
+    if isinstance(arguments, Mapping):
+        return cast(dict[str, Any], unwrap_immutable(cast(Mapping[str, Any], arguments)))
+    if "tool_name" not in modified_payload and "arguments" not in modified_payload:
+        return cast(dict[str, Any], unwrap_immutable(modified_payload))
+    return None
 
 
 def _now_iso() -> str:
@@ -1578,6 +1598,23 @@ class BaseAgent(BaseAgentProtocol):
     def loaded_skills(self) -> frozenset[str]:
         """Names of skills loaded into session context (P9)."""
         return frozenset(self._loaded_skills)
+
+    def active_skill_dirs(self) -> tuple[Path, ...]:
+        """The package folders of this agent's active skills, for `ToolContext.skill_dirs`.
+
+        Read from the registry each time, so a skill approved or reloaded between steps
+        counts from the next one. A skill with no folder on disk is left out.
+        """
+        if self._skills is None:
+            return ()
+        dirs: list[Path] = []
+        for skill in self._skills.list_skills():
+            if skill.manifest.status != SkillStatus.ACTIVE:
+                continue
+            directory: object = getattr(skill, "directory", None)
+            if isinstance(directory, Path):
+                dirs.append(directory)
+        return tuple(dirs)
 
     async def reload_skills(self) -> tuple[SkillProtocol, ...]:
         """Hot-reload approved skills from disk into the agent's active registry (P9)."""
@@ -3842,14 +3879,7 @@ class BaseAgent(BaseAgentProtocol):
                 tool_defs: list[ToolDefinition] = []
                 scoping_notice = ""
                 if self._tools is not None:
-                    for t in self.available_tools():
-                        tool_defs.append(
-                            ToolDefinition(
-                                name=t.name,
-                                description=t.description,
-                                parameters=t.parameters_schema,
-                            )
-                        )
+                    tool_defs = self.advertised_tool_definitions()
                     # Layer 2: tool scoping. A withheld tool is a withheld capability,
                     # so the notice travels with the turn (P6); scoping in silence is
                     # indistinguishable from a registry that never held the tool.
@@ -4886,6 +4916,11 @@ class BaseAgent(BaseAgentProtocol):
         if pre_tool is not None:
             pre_payload["writes_files"] = tool_writes_files(pre_tool)
             pre_payload["spawns_subagents"] = tool_spawns_subagents(pre_tool)
+            # A call that runs only once a person approves it: the hook runner answers
+            # `ASK` for it whatever the hooks say (#1557).
+            pre_payload["needs_approval"] = tool_call_needs_approval(
+                pre_tool, pre_payload["arguments"]
+            )
         pre_ctx = HookContext(
             agent_id=self.agent_id,
             session_id=self._context.session_id,
@@ -4894,6 +4929,9 @@ class BaseAgent(BaseAgentProtocol):
             payload=pre_payload,
         )
         pre_decision = await self._hook_runner.run_hooks(HookEvent.PRE_TOOL_USE, pre_ctx)
+        # Whether a person answered this call's approval request with yes. Only that sets
+        # `ToolContext.approved_by_person`; a hook's ALLOW does not (#1557).
+        approved_by_person = False
 
         if pre_decision.action == HookAction.ASK:
             request_id = f"appr_{uuid.uuid4().hex[:8]}"
@@ -4902,7 +4940,14 @@ class BaseAgent(BaseAgentProtocol):
             if self._bus is not None:
                 sub = self._bus.subscribe({f"session.{self._context.session_id}"})
 
-            approval_arguments = cast(dict[str, Any], unwrap_immutable(tc.arguments))
+            # The call as the hooks left it: an `ASK` that follows a hook's `MODIFY` carries
+            # the rewrite, and the person is asked about -- and approves -- that call (#1584).
+            hook_arguments = _modified_arguments(pre_decision.modified_payload)
+            approval_arguments = (
+                hook_arguments
+                if hook_arguments is not None
+                else cast(dict[str, Any], unwrap_immutable(tc.arguments))
+            )
             if self._bus is not None:
                 req_evt = AgentEvent(
                     type=EventType.TOOL_APPROVAL_REQUEST,
@@ -4966,17 +5011,39 @@ class BaseAgent(BaseAgentProtocol):
                 # Override pre_decision with human decision
                 from uclone_x.agent.hooks.models import HookDecision
 
+                # The person's own rewrite wins; otherwise what they approved is the call as
+                # the hooks left it, not the model's original (#1584). Tested against `None`,
+                # never for truth: an empty rewrite, `{}`, is shown and so is what runs.
+                approved_arguments = (
+                    decision.modified_arguments
+                    if decision.modified_arguments is not None
+                    else hook_arguments
+                    if decision.action in (HookAction.ALLOW, HookAction.MODIFY)
+                    else None
+                )
                 pre_decision = HookDecision(
-                    action=decision.action,
+                    action=HookAction.MODIFY
+                    if approved_arguments is not None and decision.action == HookAction.ALLOW
+                    else decision.action,
                     reason=decision.reason,
-                    modified_payload={"arguments": decision.modified_arguments}
-                    if decision.modified_arguments
+                    modified_payload={"arguments": approved_arguments}
+                    if approved_arguments is not None
                     else None,
                 )
+                approved_by_person = decision.action in (HookAction.ALLOW, HookAction.MODIFY)
             except TimeoutError:
                 duration_ms = (asyncio.get_running_loop().time() - t_start) * 1000.0
+                # A call that needed a person says so in the tool's own words: the desktop
+                # app has no approval prompt yet, so there this is every apply's answer.
+                timeout_note = (
+                    tool_approval_timeout_note(pre_tool)
+                    if pre_payload.get("needs_approval") is True
+                    else None
+                )
                 return self._refused_tool_call(
-                    tc, "Approval request timed out (denied fail-closed)", duration_ms
+                    tc,
+                    timeout_note or "Approval request timed out (denied fail-closed)",
+                    duration_ms,
                 )
             finally:
                 if sub is not None:
@@ -5102,11 +5169,17 @@ class BaseAgent(BaseAgentProtocol):
             )
         else:
             # The tool's declarations, read once: a call that raises partway reports
-            # them too, since failing does not undo a write (#1366).
-            declared_writes = tool_writes_files(tool_inst)
+            # them too, since failing does not undo a write (#1366). A call to an action
+            # the tool declares read-only did not write (#1584).
+            declared_writes = tool_call_writes_files(tool_inst, unwrapped_args)
             declared_spawns = tool_spawns_subagents(tool_inst)
+            call_ctx = (
+                tool_ctx.model_copy(update={"approved_by_person": True})
+                if approved_by_person
+                else tool_ctx
+            )
             try:
-                res = await tool_inst.execute(unwrapped_args, tool_ctx)
+                res = await tool_inst.execute(unwrapped_args, call_ctx)
                 duration_ms = (
                     res.execution_time_ms
                     if res.execution_time_ms > 0
@@ -5219,7 +5292,7 @@ class BaseAgent(BaseAgentProtocol):
                     tool_call_id=effective_tc.id,
                     # The tool's declarations, carried to whoever reads the turn: a room
                     # records a written file only from a tool that says it writes (#1354).
-                    writes_files=tool_writes_files(tool_inst),
+                    writes_files=declared_writes,
                     spawns_subagents=tool_spawns_subagents(tool_inst),
                     # Only a call that succeeded may move the conversation's story (#1555).
                     opens_story=res.success and tool_opens_story(tool_inst),
@@ -5605,6 +5678,7 @@ class BaseAgent(BaseAgentProtocol):
             trace_id=self._context.trace_id,
             workspace_root=workspace_root,
             read_roots=self._config.read_roots,
+            skill_dirs=self.active_skill_dirs(),
             isolation=isolation,
             turn_index=self._turn_counter,
             agent_delegate=self,
@@ -5632,14 +5706,47 @@ class BaseAgent(BaseAgentProtocol):
         self._turn_story_id = story_after(tool_executions, self._turn_story_id)
         return tool_messages, tool_executions
 
+    def advertised_tool_definitions(self) -> list[ToolDefinition]:
+        """`available_tools` as the model is sent them, before scoping.
+
+        Each schema goes through `advertised_parameters_schema` (#1542), so every
+        connector sends the same compacted bytes; `parameters_schema` itself stays raw.
+        """
+        return [
+            ToolDefinition(
+                name=t.name,
+                description=t.description,
+                parameters=advertised_parameters_schema(t.parameters_schema),
+            )
+            for t in self.available_tools()
+        ]
+
     def available_tools(self) -> list[ToolProtocol]:
-        """The tools this agent actually has: what a turn offers the model, before scoping.
+        """What a turn offers the model, before scoping: `held_tools`, fitted to the turn.
+
+        A turn outside a conversation (a room) is not offered the tools that declare
+        `needs_room` (see `tool_needs_room`): nothing it could use from them is worth their
+        schemas' room in the window. A per-turn `tool_scoper` may narrow the list further.
+        """
+        offered: list[ToolProtocol] = []
+        for t in self.held_tools():
+            # A tool that declares `needs_room` (the story tools) is kept out of a turn
+            # outside a room, so its schema does not cost that request (#1556, #1576).
+            if self._turn_room_id is None and tool_needs_room(t):
+                continue
+            offered.append(t)
+        return offered
+
+    def held_tools(self) -> list[ToolProtocol]:
+        """The tools this agent actually has, whatever conversation its next turn is in.
 
         `config.allowed_tools` is a list of permissions, not of tools. A name in it may have
         nothing registered behind it -- a memory tool on an agent built without a store, a
         file tool on a registry that has none -- and an empty list permits everything. This
-        is the registry filtered by that list, less what this agent cannot run. A per-turn
-        `tool_scoper` may narrow it further for one turn.
+        is the registry filtered by that list, less what this agent cannot run. It does not
+        depend on the room of the last turn, so what a dashboard lists for an agent that
+        has not yet run in a room still includes the tools it would get there (#1576);
+        `tool_needs_room` says which those are.
         """
         if self._tools is None:
             return []
@@ -5660,10 +5767,6 @@ class BaseAgent(BaseAgentProtocol):
             # `a2a_call` is offered only to an agent that has someone to call (#1558). The
             # tool refuses the rest itself; this keeps its schema out of every other turn.
             if t.name == a2a_call_name and not self._may_call_peers():
-                continue
-            # The story tools work only inside a conversation and refuse every call made
-            # outside one; outside a room their schemas are kept out of the request (#1556).
-            if self._turn_room_id is None and tool_needs_room(t):
                 continue
             held.append(t)
         return held

@@ -21,6 +21,7 @@ from typing import Any
 
 import pytest
 import yaml
+from fastapi.testclient import TestClient
 
 from uclone_x.agent.base import BaseAgent
 from uclone_x.agent.models import AgentConfig, AgentLLMConfig
@@ -40,6 +41,7 @@ from uclone_x.tools.base import BaseTool
 from uclone_x.tools.builtin.character import CharacterSheetTool
 from uclone_x.tools.models import NoIsolation, ToolContext, ToolResult
 from uclone_x.tools.registry import create_default_registry
+from uclone_x.ui.app import AgentSessionManager, create_ui_app
 
 ROOM_A = "room_a"
 ROOM_B = "room_b"
@@ -130,6 +132,9 @@ class TestANewConversationContinuesFromTheRecap:
     ) -> None:
         """Killed by: src/uclone_x/story/work.py :: "summary": summary if summary is not None else entry.summary,
         Becomes: "summary": entry.summary,
+
+        Killed by: src/uclone_x/story/context.py :: recent = list(sessions.sessions[-RECENT_SESSIONS:])
+        Becomes: recent = list(reversed(sessions.sessions[-RECENT_SESSIONS:]))
         """
         story_id = await _new_story(
             tmp_path, genre="fantasy", style_notes="Past tense, close third."
@@ -186,6 +191,46 @@ class TestANewConversationContinuesFromTheRecap:
         assert following["end_of_previous_scene"].endswith("The river went black behind her.")
         assert {e["id"] for e in following["codex"]} == {"mara", "vane"}
         assert "ch01.s02" in recap["how_to_continue"]
+
+        # Room B writes the next scene from the recap alone: the scene to write, what it is
+        # about and who is in it all come from the recap, not from room A's conversation.
+        ctx_b = _ctx(tmp_path, conversation=ROOM_B, story=story_id)
+        scene = following["scene"]
+        cast = " and ".join(e["name"] for e in following["codex"])
+        second = f"{cast} met at the rail. {scene['summary']} The ferry did not stop."
+        written = await _ok(
+            StoryManuscriptTool(),
+            ctx_b,
+            action="write",
+            scene_id=scene["id"],
+            text=second,
+            session_summary="The toll is paid; the crossing is done.",
+        )
+        assert written["scene_id"] == "ch01.s02"
+        await _ok(StoryLibraryTool(), ctx_b, action="close")
+
+        # A third conversation sees both sessions, oldest first and then its own, and the
+        # whole outline written.
+        await _ok(
+            StoryLibraryTool(),
+            _ctx(tmp_path, conversation="room_c"),
+            action="open",
+            story_id=story_id,
+        )
+        after = await _ok(
+            StoryContextTool(),
+            _ctx(tmp_path, conversation="room_c", story=story_id),
+            action="recap",
+        )
+        assert after["progress"] == {"scenes_in_outline": 2, "scenes_written": 2}
+        assert after["last_written_scene"]["scene_id"] == "ch01.s02"
+        assert after["last_written_scene"]["end_of_text"].endswith("The ferry did not stop.")
+        assert [s["room_id"] for s in after["recent_sessions"]] == [ROOM_A, ROOM_B, "room_c"]
+        by_room = {s["room_id"]: s for s in after["recent_sessions"]}
+        assert by_room[ROOM_B]["scenes_written"] == ["ch01.s02"]
+        assert by_room[ROOM_B]["summary"] == "The toll is paid; the crossing is done."
+        assert by_room[ROOM_B]["closed_at"]
+        assert after["next_scene"] is None
 
     async def test_a_story_with_no_outline_says_where_to_start(self, tmp_path: Path) -> None:
         story_id = await _new_story(tmp_path)
@@ -388,6 +433,134 @@ class TestAFileThatDoesNotFit:
 
         [problem] = out["unreadable_files"]
         assert "says its id is 'dock', but the file is named 'ferry'" in problem["reason"]
+
+    async def test_files_and_folders_the_codex_does_not_read_are_reported(
+        self, tmp_path: Path
+    ) -> None:
+        """A person who saved `mara.yml` is told why Mara is missing (#1576).
+
+        Killed by: src/uclone_x/story/work.py :: if name.suffix != ".yaml":
+        Becomes: if False:
+
+        Killed by: src/uclone_x/story/work.py :: for relative in self._library.folders_in(self._story_id, folder):
+        Becomes: for relative in []:
+
+        Killed by: src/uclone_x/story/work.py :: if PurePosixPath(relative).name in CODEX_KINDS:
+        Becomes: if True:
+
+        Killed by: src/uclone_x/story/work.py :: for relative in self._library.files_in(self._story_id, CODEX_DIR):
+        Becomes: for relative in []:
+        """
+        story_id = await _new_story(tmp_path)
+        _codex(tmp_path, story_id, "places", {"id": "dock", "name": "The Dock"})
+        _put(tmp_path, story_id, "codex/characters/mara.yml", "id: mara\nname: Mara\n")
+        _put(tmp_path, story_id, "codex/characters/old/vane.yaml", "id: vane\nname: Vane\n")
+        _put(tmp_path, story_id, "codex/character/pell.yaml", "id: pell\nname: Pell\n")
+        _put(tmp_path, story_id, "codex/notes.md", "loose notes\n")
+        _put(tmp_path, story_id, "codex/characters/.DS_Store", "")
+
+        out = await _ok(StoryCodexTool(), _ctx(tmp_path, story=story_id), action="search")
+
+        assert [e["id"] for e in out["entries"]] == ["dock"]
+        kinds = "codex/characters/, codex/places/, codex/items/, codex/threads/"
+        assert {u["file"]: u["reason"] for u in out["unreadable_files"]} == {
+            "codex/notes.md": "'codex/notes.md' was not read: codex entries are kept in one "
+            f"of the folders {kinds}. Move it into the right one.",
+            "codex/character": "The folder 'codex/character/' was not read: the codex reads "
+            f"only the folders {kinds}. Move its entries into the right one.",
+            "codex/characters/old": "The folder 'codex/characters/old/' was not read: codex "
+            "entries are files directly in 'codex/characters/'. Move its entries up into "
+            "'codex/characters/'.",
+            "codex/characters/mara.yml": "'codex/characters/mara.yml' was not read: codex "
+            "entries are read only from files ending in '.yaml'. If it is an entry, rename "
+            "it to 'mara.yaml'.",
+        }
+        # A lookup of the missing entry points at the report instead of a bare "not found".
+        missing = await _call(
+            StoryCodexTool(), _ctx(tmp_path, story=story_id), action="get", entry_id="mara"
+        )
+        assert missing.error is not None
+        assert "4 codex file(s) or folder(s) could not be read" in missing.error
+
+    async def test_a_rename_is_suggested_only_when_the_name_is_plain_and_free(
+        self, tmp_path: Path
+    ) -> None:
+        """An editor's backup is not told to become `mara.yaml.yaml`, nor to replace the
+        entry it is a copy of (#1595).
+
+        Killed by: src/uclone_x/story/work.py :: if base.suffix in (".yaml", ".yml"):
+        Becomes: if False:
+
+        Killed by: src/uclone_x/story/library.py :: and entry.name.lower() not in _SYSTEM_FILES
+        Becomes: and True
+        """
+        story_id = await _new_story(tmp_path)
+        _codex(tmp_path, story_id, "characters", {"id": "mara", "name": "Mara"})
+        _put(tmp_path, story_id, "codex/characters/mara.yaml~", "id: mara\nname: Mara\n")
+        _put(tmp_path, story_id, "codex/places/dock.yaml.bak", "id: dock\nname: Dock\n")
+        _put(tmp_path, story_id, "codex/items/Old Map.txt", "a map\n")
+        _put(tmp_path, story_id, "codex/characters/Thumbs.db", "")
+        _put(tmp_path, story_id, "codex/places/desktop.ini", "")
+
+        out = await _ok(StoryCodexTool(), _ctx(tmp_path, story=story_id), action="search")
+
+        assert [e["id"] for e in out["entries"]] == ["mara"]
+        ending = "codex entries are read only from files ending in '.yaml'."
+        assert {u["file"]: u["reason"] for u in out["unreadable_files"]} == {
+            "codex/characters/mara.yaml~": f"'codex/characters/mara.yaml~' was not read: "
+            f"{ending} If it is an entry, give it a name ending in '.yaml' that no other "
+            "file in 'codex/characters/' has, even with different capitals.",
+            "codex/places/dock.yaml.bak": f"'codex/places/dock.yaml.bak' was not read: "
+            f"{ending} If it is an entry, rename it to 'dock.yaml'.",
+            "codex/items/Old Map.txt": f"'codex/items/Old Map.txt' was not read: {ending} "
+            "If it is an entry, give it a name ending in '.yaml' that no other file in "
+            "'codex/items/' has, even with different capitals.",
+        }
+
+    async def test_a_rename_never_targets_a_name_taken_in_other_capitals_or_by_a_twin(
+        self, tmp_path: Path
+    ) -> None:
+        """On a Mac, `mv mara.yml mara.yaml` beside `Mara.yaml` replaces it, and two files
+        both told to become `bo.yaml` would have the second replace the first (#1595).
+
+        Killed by: src/uclone_x/story/work.py :: taken = any(name.casefold() == wanted for name in others)
+        Becomes: taken = any(name == target for name in others)
+
+        Killed by: src/uclone_x/story/work.py :: if not taken and not shared:
+        Becomes: if not taken:
+
+        Killed by: src/uclone_x/story/work.py :: if not taken and not shared:
+        Becomes: if not shared:
+
+        Killed by: src/uclone_x/story/work.py :: others = [PurePosixPath(b).name for b in beside if b != relative]
+        Becomes: others = [PurePosixPath(b).name for b in beside]
+        """
+        story_id = await _new_story(tmp_path)
+        _put(tmp_path, story_id, "codex/characters/Mara.yaml", "id: mara\nname: Mara\n")
+        _put(tmp_path, story_id, "codex/characters/mara.yml", "id: mara\nname: Mara\n")
+        _put(tmp_path, story_id, "codex/places/bo.yml", "id: bo\nname: Bo\n")
+        _put(tmp_path, story_id, "codex/places/bo.yaml~", "id: bo\nname: Bo\n")
+        _put(tmp_path, story_id, "codex/items/map.YAML", "id: map\nname: Map\n")
+
+        out = await _ok(StoryCodexTool(), _ctx(tmp_path, story=story_id), action="search")
+
+        reasons = {u["file"]: u["reason"] for u in out["unreadable_files"]}
+        ending = "codex entries are read only from files ending in '.yaml'."
+        no_name = "If it is an entry, give it a name ending in '.yaml' that no other file in "
+        assert reasons["codex/characters/mara.yml"] == (
+            f"'codex/characters/mara.yml' was not read: {ending} {no_name}"
+            "'codex/characters/' has, even with different capitals."
+        )
+        for twin in ("codex/places/bo.yml", "codex/places/bo.yaml~"):
+            assert reasons[twin] == (
+                f"'{twin}' was not read: {ending} {no_name}'codex/places/' has, even with "
+                "different capitals."
+            )
+        # A file differing only in capitals is not in its own way.
+        assert reasons["codex/items/map.YAML"] == (
+            f"'codex/items/map.YAML' was not read: {ending} If it is an entry, rename it to "
+            "'map.yaml'."
+        )
 
     async def test_a_recap_over_a_broken_sessions_file_says_so_and_goes_on(
         self, tmp_path: Path
@@ -645,7 +818,8 @@ class TestASceneContextSaysWhatItLeftOut:
         assert manifest["named_without_an_entry"] == [{"id": "vane", "kind": "characters"}]
         assert out["previous_scene"]["scene_id"] == "ch01.s01"
         assert out["next_scene"] is None
-        assert "progressions_not_applied" not in manifest  # 'debt' is not in the bundle
+        # 'debt' is not in the bundle, so its change at this scene is not listed.
+        assert "changes_in_this_scene" not in manifest
 
     def test_entries_over_the_budget_are_listed_as_left_out(self) -> None:
         """Killed by: src/uclone_x/story/context.py :: if len(entries) >= MAX_ENTRIES:
@@ -667,9 +841,14 @@ class TestASceneContextSaysWhatItLeftOut:
         assert [e["id"] for e in out["manifest"]["left_out"]] == ["p12", "p13"]
         assert out["manifest"]["left_out"][0]["reason"].startswith("over the budget of 12 entries")
 
-    async def test_a_progression_on_an_included_entry_is_named_as_not_applied(
+    async def test_an_earlier_scene_s_change_is_applied_and_this_scene_s_is_listed(
         self, tmp_path: Path
     ) -> None:
+        """Killed by: src/uclone_x/story/context.py :: entries.append(render_entry(item, snapshot))
+        Becomes: entries.append(render_entry(item))
+        Killed by: src/uclone_x/story/context.py :: manifest["changes_in_this_scene"] = in_this_scene
+        Becomes: pass
+        """
         story_id = await _new_story(tmp_path)
         ctx = await _outlined(tmp_path, story_id)
         _codex(
@@ -679,15 +858,33 @@ class TestASceneContextSaysWhatItLeftOut:
             {
                 "id": "mara",
                 "name": "Mara",
-                "state": {"arm": "whole"},
-                "progressions": [{"at": "ch01.s02", "set": {"arm": "broken"}}],
+                "state": {"arm": "whole", "mood": "calm"},
+                "progressions": [
+                    {"at": "ch01.s01", "set": {"mood": "wary"}},
+                    {"at": "ch01.s02", "set": {"arm": "broken"}},
+                ],
             },
         )
         out = await _ok(StoryContextTool(), ctx, action="for_scene", scene_id="ch01.s02")
-        assert out["manifest"]["progressions_not_applied"] == [
-            {"id": "mara", "kind": "characters", "at_scenes": ["ch01.s02"]}
+        assert [e["state"] for e in out["codex"] if e["id"] == "mara"] == [
+            {"arm": "whole", "mood": "wary"}
         ]
-        assert [e["state"] for e in out["codex"] if e["id"] == "mara"] == [{"arm": "whole"}]
+        manifest = out["manifest"]
+        assert manifest["progressions_applied"] == [
+            {
+                "id": "mara",
+                "kind": "characters",
+                "applied": [{"at": "ch01.s01", "kind": "state", "set": {"mood": "wary"}}],
+            }
+        ]
+        assert manifest["changes_in_this_scene"] == [
+            {
+                "id": "mara",
+                "kind": "characters",
+                "changes": [{"at": "ch01.s02", "kind": "state", "set": {"arm": "broken"}}],
+            }
+        ]
+        assert "progressions_not_applied" not in manifest
 
 
 # --------------------------------------------------------------------------------------
@@ -710,6 +907,58 @@ class TestSessionsAreRecorded:
         assert entry["room_id"] == ROOM_A
         assert entry["opened_at"] and entry["closed_at"]
 
+    async def test_a_take_over_closes_the_entry_of_the_conversation_it_was_taken_from(
+        self, tmp_path: Path
+    ) -> None:
+        """Room A can no longer write the story, so it cannot close its own entry (#1576).
+
+        Killed by: src/uclone_x/story/tool.py :: result.update(self._session_opened(library, story_id, conversation, taken_from=previous))
+        Becomes: result.update(self._session_opened(library, story_id, conversation))
+        """
+        story_id = await _new_story(tmp_path)
+        taken = await _ok(
+            StoryLibraryTool(),
+            _ctx(tmp_path, conversation=ROOM_B),
+            action="take_over",
+            story_id=story_id,
+        )
+        assert taken["taken_from_another_conversation"] is True
+        assert "session_not_recorded" not in taken
+
+        sessions = yaml.safe_load(
+            (tmp_path / "stories" / story_id / "sessions.yaml").read_text(encoding="utf-8")
+        )
+        entries = {e["room_id"]: e for e in sessions["sessions"]}
+        assert entries[ROOM_A]["closed_at"]
+        assert entries[ROOM_B]["closed_at"] is None
+
+
+class TestTheLibraryOutsideAConversation:
+    async def test_list_works_and_the_other_actions_are_refused_in_words(
+        self, tmp_path: Path
+    ) -> None:
+        """A direct call of 'list' works outside a room; the tool is not offered there (#1576).
+
+        Killed by: src/uclone_x/story/tool.py :: if params.action == "list":
+        Becomes: if False:
+        """
+        story_id = await _new_story(tmp_path)
+        outside = _ctx(tmp_path, conversation=None)
+
+        listed = await _ok(StoryLibraryTool(), outside, action="list")
+        assert listed["stories"] == [
+            {
+                "story_id": story_id,
+                "title": "The Salt Road",
+                "being_written_by": "another conversation",
+            }
+        ]
+        refused = await _call(StoryLibraryTool(), outside, action="create", title="Another")
+        assert refused.error == (
+            "Stories are opened inside a conversation, and this call is not part of one, "
+            "so nothing was done."
+        )
+
 
 # --------------------------------------------------------------------------------------
 # character_sheet over an open story (1b)
@@ -717,21 +966,29 @@ class TestSessionsAreRecorded:
 
 
 class TestCharacterSheetOverAStory:
-    async def test_save_is_refused_while_a_story_is_open(self, tmp_path: Path) -> None:
-        """Killed by: src/uclone_x/tools/builtin/character.py :: if context.story_id is not None:
-        Becomes: if False:
+    async def test_save_proposes_the_change_instead_of_writing_a_sheet(
+        self, tmp_path: Path
+    ) -> None:
+        """Killed by: src/uclone_x/tools/builtin/character.py :: return _propose_visual(params, context)
+        Becomes: raise PlainRefusalError("no")
         """
         story_id = await _new_story(tmp_path)
-        result = await _call(
+        _codex(tmp_path, story_id, "characters", {"id": "mara", "name": "Mara"})
+        before = (tmp_path / "stories" / story_id / "codex/characters/mara.yaml").read_text()
+        out = await _ok(
             CharacterSheetTool(),
             _ctx(tmp_path, story=story_id),
             action="save",
             character_id="mara",
-            danbooru_tags="red hair",
+            danbooru_tags="red hair, scar",
         )
-        assert not result.success
-        assert result.error is not None
-        assert result.error.startswith("A story is open, so character sheets are not saved here")
+        assert out["status"] == "proposed"
+        assert out["proposal"]["change"] == {"visual": {"tags": ["red hair", "scar"]}}
+        assert (tmp_path / "stories" / story_id / "proposals" / f"{out['proposed']}.yaml").is_file()
+        # Nothing changed until a person applies it, and no workspace sheet was written.
+        assert (
+            tmp_path / "stories" / story_id / "codex/characters/mara.yaml"
+        ).read_text() == before
         assert not (tmp_path / "characters").exists()
 
     async def test_get_and_compose_read_the_codex_visual_block(self, tmp_path: Path) -> None:
@@ -804,8 +1061,9 @@ class _RecordingLLM(MockLLMConnector):
 
 class TestStoryToolsAreOfferedOnlyInARoom:
     async def test_a_turn_outside_a_room_is_not_sent_the_story_tools(self, tmp_path: Path) -> None:
-        """Their schemas would cost every request room in the window for calls that can only
-        be refused; in a room they are offered as before.
+        """Their schemas would cost every request room in the window for calls that are
+        refused there or, for `story_library`'s 'list', of no use there; in a room they are
+        offered as before.
 
         Killed by: src/uclone_x/agent/base.py :: if self._turn_room_id is None and tool_needs_room(t):
         Becomes: if False:
@@ -836,3 +1094,63 @@ class TestStoryToolsAreOfferedOnlyInARoom:
         assert outside & story_tools == set()
         assert story_tools <= inside
         assert "character_sheet" in outside  # not a story tool: it works with no story open
+
+
+class TestTheDashboardListsWhatTheAgentHolds:
+    async def test_an_agent_not_yet_in_a_room_shows_the_story_tools_as_needing_one(
+        self, tmp_path: Path
+    ) -> None:
+        """What `/api/agents` lists does not depend on the room of the last turn (#1576).
+
+        Killed by: src/uclone_x/ui/app.py :: held = ag.held_tools()
+        Becomes: held = ag.available_tools()
+
+        Killed by: src/uclone_x/ui/app.py :: capabilities_needing_room = [tool.name for tool in held if tool_needs_room(tool)]
+        Becomes: capabilities_needing_room = [tool.name for tool in held]
+        """
+        registry = create_default_registry(workspace_root=tmp_path, enable_mcp=False)
+        session_mgr = AgentSessionManager(storage_dir=tmp_path / "sessions", tools=registry)
+        agent = BaseAgent(
+            config=AgentConfig(
+                agent_id="writer",
+                name="Writer",
+                workspace_dir=tmp_path,
+                llm_config=AgentLLMConfig(model_name="mock-model"),
+            ),
+            llm=MockLLMConnector(default_response="ok"),
+            tools=registry,
+        )
+        agents = session_mgr._agents  # pyright: ignore[reportPrivateUsage]
+        agents[f"{agent.agent_id}:{agent.context.session_id}"] = agent
+        client = TestClient(
+            create_ui_app(
+                static_dir=tmp_path / "static",
+                storage_dir=tmp_path / "sessions",
+                llm=MockLLMConnector(),
+                session_manager=session_mgr,
+            )
+        )
+        needing_room = {
+            "story_library",
+            "story_outline",
+            "story_codex",
+            "story_manuscript",
+            "story_context",
+        }
+
+        def row() -> dict[str, Any]:
+            response = client.get("/api/agents")
+            assert response.status_code == 200, response.text
+            [only] = response.json()["agents"]
+            [node] = response.json()["topology"]["nodes"]
+            assert node["capabilities_needing_room"] == only["capabilities_needing_room"]
+            return only
+
+        before = row()
+        assert needing_room <= set(before["capabilities"])
+        assert needing_room <= set(before["capabilities_needing_room"])
+        assert "character_sheet" not in before["capabilities_needing_room"]
+
+        await agent.execute_turn("hello", room_id=ROOM_A)
+        await agent.execute_turn("hello")
+        assert row()["capabilities"] == before["capabilities"]

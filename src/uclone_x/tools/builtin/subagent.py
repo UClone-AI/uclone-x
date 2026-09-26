@@ -3,10 +3,10 @@ import time
 from collections.abc import Mapping
 from typing import Any, ClassVar, cast
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, ValidationError, model_validator
 
 from uclone_x.core.provenance import Provenance, require_provenance
-from uclone_x.tools.base import BaseTool
+from uclone_x.tools.base import BaseTool, describe_invalid_arguments
 from uclone_x.tools.models import ToolContext, ToolResult
 
 logger = logging.getLogger(__name__)
@@ -89,6 +89,7 @@ class SubagentDelegationTool(BaseTool[SubagentDelegationParams]):
         "Allows delegating a specific task or sub-goal to an ephemeral, context-isolated subagent."
     )
     params_type = SubagentDelegationParams
+    not_run_note: ClassVar[str] = "No helper was started, so nothing was done."
 
     async def execute(
         self,
@@ -123,11 +124,26 @@ class SubagentDelegationTool(BaseTool[SubagentDelegationParams]):
 
         try:
             validated_params = SubagentDelegationParams.model_validate(actual_params_dict)
-        except Exception as e:
+        except ValidationError as e:
             elapsed_ms = (time.perf_counter() - start_time) * 1000.0
             return ToolResult(
                 success=False,
-                error=f"Parameter validation failed for tool '{tool_identifier}': {e}",
+                error=describe_invalid_arguments(
+                    tool_identifier, e, SubagentDelegationParams, self.not_run_note
+                ),
+                execution_time_ms=elapsed_ms,
+                isolation_level=actual_context.isolation.level,
+                provenance=Provenance.primary(provider="local.builtin", model=tool_identifier),
+            )
+        except Exception:
+            logger.warning("%s: its arguments could not be checked", tool_identifier, exc_info=True)
+            elapsed_ms = (time.perf_counter() - start_time) * 1000.0
+            return ToolResult(
+                success=False,
+                error=(
+                    f"The arguments of the call to '{tool_identifier}' could not be checked, "
+                    f"so the call was refused. {self.not_run_note}"
+                ),
                 execution_time_ms=elapsed_ms,
                 isolation_level=actual_context.isolation.level,
                 provenance=Provenance.primary(provider="local.builtin", model=tool_identifier),

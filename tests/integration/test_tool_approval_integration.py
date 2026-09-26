@@ -106,7 +106,8 @@ async def test_approval_path_carries_nested_tool_arguments():
     The assertions are on the outcome the fail-closed design promises: a refusal that
     names the timeout, carrying the arguments it refused.
 
-    Killed by: src/uclone_x/agent/base.py :: approval_arguments = cast(dict[str, Any], unwrap_immutable(tc.arguments))
+    Killed by: src/uclone_x/agent/base.py :: else cast(dict[str, Any], unwrap_immutable(tc.arguments))
+    Becomes: else cast(dict[str, Any], tc.arguments)
     Killed by: src/uclone_x/agent/base.py :: arguments=cast(dict[str, Any], unwrap_immutable(tc.arguments)),
     """
     nested_arguments: dict[str, Any] = {

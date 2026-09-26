@@ -55,7 +55,7 @@ describe('CloneProfile (#1300)', () => {
     expect(onStartConversation).toHaveBeenCalledWith('reader');
   });
 
-  // Killed by: frontend/src/components/clones/CloneProfile.tsx ::         <PersonaDetail persona={persona} />
+  // Killed by: frontend/src/components/clones/CloneProfile.tsx ::         <PersonaDetail persona={persona} toolsNeedingConversation={toolsNeedingConversation} />
   // Becomes:         <></>
   it('carries the two permissions a clone is trusted with, as sentences', () => {
     // These moved here from the rail row. They are the fields that are safety boundaries

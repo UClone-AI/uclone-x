@@ -113,6 +113,8 @@ export interface AgentInfo {
   tier: string;
   isolation_level: string;
   capabilities: string[];
+  /** The tools in `capabilities` a turn outside a conversation is not offered (#1576). */
+  capabilities_needing_room?: string[];
   uptime_s: number;
   current_task: string;
   parent_id: string | null;

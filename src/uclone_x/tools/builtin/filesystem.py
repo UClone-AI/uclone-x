@@ -5,14 +5,13 @@ from __future__ import annotations
 import fnmatch
 import os
 import re
-import uuid
 from pathlib import Path
 from typing import Any, ClassVar
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from uclone_x.errors import PathTraversalError
-from uclone_x.tools.base import BaseTool
+from uclone_x.tools.base import BaseTool, replace_file
 from uclone_x.tools.models import ToolContext
 
 # ======================================================================================
@@ -159,7 +158,8 @@ class FileWriteTool(BaseTool[FileWriteParams]):
 
     def run(self, params: FileWriteParams, context: ToolContext) -> dict[str, Any]:
         """Write content to file atomically."""
-        safe_path = self.resolve_safe_path(params.path, context.require_workspace())
+        workspace = context.require_workspace()
+        safe_path = self.resolve_write_path(params.path, workspace)
 
         if safe_path.is_dir():
             raise IsADirectoryError(f"Target path is an existing directory: '{params.path}'")
@@ -177,21 +177,10 @@ class FileWriteTool(BaseTool[FileWriteParams]):
             else:
                 raise FileNotFoundError(f"Parent directory does not exist: '{parent}'")
 
-        # Atomic write via temporary file in same directory
-        tmp_file = parent / f".{safe_path.name}.tmp.{uuid.uuid4().hex}"
-        try:
-            tmp_file.write_text(params.content, encoding=params.encoding)
-            os.replace(tmp_file, safe_path)
-        except Exception:
-            if tmp_file.exists():
-                try:
-                    tmp_file.unlink()
-                except OSError:
-                    pass
-            raise
-
-        rel_path = str(safe_path.relative_to(context.require_workspace().resolve()))
         encoded = params.content.encode(params.encoding)
+        replace_file(safe_path, encoded)
+
+        rel_path = str(safe_path.relative_to(workspace.resolve()))
 
         return {
             "path": rel_path,
@@ -243,14 +232,19 @@ class FileEditTool(BaseTool[FileEditParams]):
 
     def run(self, params: FileEditParams, context: ToolContext) -> dict[str, Any]:
         """Perform exact string replacement in target file."""
-        safe_path = self.resolve_safe_path(params.path, context.require_workspace())
+        safe_path = self.resolve_write_path(params.path, context.require_workspace())
 
         if not safe_path.exists():
             raise FileNotFoundError(f"File not found: '{params.path}'")
         if safe_path.is_dir():
             raise IsADirectoryError(f"Path is a directory, not a file: '{params.path}'")
 
-        content = safe_path.read_text(encoding=params.encoding)
+        # Read without newline translation, so a file whose lines end in CRLF can be
+        # written back with CRLF (#1589 follow-up c). The edit itself is made on the
+        # text with plain `\n` endings, as the model sees it in `file_read`.
+        raw_text = safe_path.read_bytes().decode(params.encoding)
+        crlf = "\r\n" in raw_text
+        content = raw_text.replace("\r\n", "\n").replace("\r", "\n")
 
         # Handle line range scoping if requested
         if params.start_line is not None or params.end_line is not None:
@@ -297,20 +291,10 @@ class FileEditTool(BaseTool[FileEditParams]):
             replacements_made = 1
 
         new_content = before + new_block + after
+        if crlf:
+            new_content = new_content.replace("\r\n", "\n").replace("\n", "\r\n")
 
-        # Atomic write
-        parent = safe_path.parent
-        tmp_file = parent / f".{safe_path.name}.tmp.{uuid.uuid4().hex}"
-        try:
-            tmp_file.write_text(new_content, encoding=params.encoding)
-            os.replace(tmp_file, safe_path)
-        except Exception:
-            if tmp_file.exists():
-                try:
-                    tmp_file.unlink()
-                except OSError:
-                    pass
-            raise
+        replace_file(safe_path, new_content.encode(params.encoding))
 
         rel_path = str(safe_path.relative_to(context.require_workspace().resolve()))
         return {

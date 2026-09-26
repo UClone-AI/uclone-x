@@ -7,6 +7,7 @@ import fnmatch
 import json
 import os
 import re
+import shutil
 import signal
 import time
 import types
@@ -28,6 +29,7 @@ from uclone_x.sandbox.models import (
 )
 from uclone_x.sandbox.path_validator import PathValidator
 from uclone_x.sandbox.protocols import PathValidatorProtocol
+from uclone_x.sandbox.story_jail import story_library_jail
 from uclone_x.tools.models import (
     MCPConnectionConfig,
     MCPTransport,
@@ -35,6 +37,16 @@ from uclone_x.tools.models import (
     ToolResult,
 )
 from uclone_x.tools.protocols import MCPClientProtocol, ToolProtocol
+
+
+def _command_exists(command: str, env: dict[str, str], cwd: str | None) -> bool:
+    """Whether `command` names a program `sandbox-exec` can start with this `PATH` and cwd."""
+    if os.sep in command or (os.altsep is not None and os.altsep in command):
+        path = Path(command)
+        if not path.is_absolute() and cwd is not None:
+            path = Path(cwd) / path
+        return path.is_file() and os.access(path, os.X_OK)
+    return shutil.which(command, path=env.get("PATH", os.defpath)) is not None
 
 
 class MCPTool:
@@ -488,8 +500,19 @@ class MCPClient:
                 cwd_str = str(safe_root) if safe_root is not None else None
 
                 assert self._config.command is not None
+                # A local server is a process the model drives, so it runs where the
+                # system allows in the jail that keeps it from writing the story library,
+                # as `bash_run` does (#1589). `sandbox-exec` starts the command itself,
+                # so a missing command is looked for first: otherwise it would surface as
+                # `sandbox-exec` failing, not as a missing server.
+                jail = story_library_jail(self._config.workspace_root)
+                if jail and not _command_exists(self._config.command, child_env, cwd_str):
+                    raise FileNotFoundError(
+                        f"MCP server executable not found: '{self._config.command}'"
+                    )
                 try:
                     self._process = await asyncio.create_subprocess_exec(
+                        *jail,
                         self._config.command,
                         *self._config.args,
                         stdin=asyncio.subprocess.PIPE,

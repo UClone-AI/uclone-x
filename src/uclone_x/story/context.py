@@ -9,9 +9,11 @@ cut in silence: an entry over the budget is listed as left out (P6).
 did, how far the manuscript has got, and the next scene's bundle, so that a conversation
 with no memory of the last one can continue from the recap alone.
 
-Progressions (a change to an entry from a scene on) are stored but **not applied** in this
-phase: the manifest lists each one, so the Writer knows the state it sees is the entry's
-starting state.
+Progressions (a change to an entry once a scene has ended) are **applied in story-time
+order** (`uclone_x.story.timeline`): the state an entry shows is the one the scene starts
+from, so a flashback sees the world as it was then. The manifest lists what was applied,
+what the scene itself changes, what could not be placed, and which scenes were placed in
+time by assumption because they have no `story_time`.
 
 This module is pure: it is given the files' contents and reads nothing itself.
 """
@@ -32,6 +34,7 @@ from uclone_x.story.schemas import (
     SessionsFile,
     ThreadEntry,
 )
+from uclone_x.story.timeline import EntrySnapshot, assumptions, entry_snapshot, place_scenes
 
 __all__ = [
     "MAX_ENTRIES",
@@ -100,16 +103,23 @@ def tail(text: str, limit: int = TAIL_CHARS) -> str:
     return "..." + cut
 
 
-def render_entry(item: CodexItem) -> dict[str, Any]:
-    """A codex entry as the Writer reads it; empty fields are left out."""
+def render_entry(item: CodexItem, snapshot: EntrySnapshot | None = None) -> dict[str, Any]:
+    """A codex entry as the Writer reads it; empty fields are left out.
+
+    With a `snapshot`, the state (and a character's visual tags) are the ones at that
+    moment of the story rather than the entry's starting ones.
+    """
     entry = item.entry
     out: dict[str, Any] = {"id": entry.id, "kind": item.kind, "name": entry.name}
     if entry.aliases:
         out["aliases"] = list(entry.aliases)
     if entry.profile:
         out["profile"] = entry.profile
-    if entry.state:
-        out["state"] = dict(entry.state)
+    state = snapshot.state if snapshot is not None else dict(entry.state)
+    if state:
+        out["state"] = state
+    if snapshot is not None and snapshot.visual_tags is not None:
+        out["visual_tags"] = list(snapshot.visual_tags)
     if entry.notes:
         out["notes"] = entry.notes
     if isinstance(entry, ThreadEntry):
@@ -181,6 +191,8 @@ def scene_context(
         if _mentions(item.entry, haystack):
             candidates.append((item, "mentioned in the scene or the end of the scene before"))
 
+    placements = place_scenes(outline)
+    snapshots: dict[tuple[str, str], EntrySnapshot] = {}
     seen: set[tuple[str, str]] = set()
     included: list[dict[str, Any]] = []
     entries: list[dict[str, Any]] = []
@@ -199,7 +211,9 @@ def scene_context(
                 }
             )
             continue
-        entries.append(render_entry(item))
+        snapshot = entry_snapshot(item.entry, placements, scene.id, through_scene=False)
+        snapshots[key] = snapshot
+        entries.append(render_entry(item, snapshot))
         included.append({"id": item.entry.id, "kind": item.kind, "reason": reason})
     for item in codex.items:
         if (item.kind, item.entry.id) not in seen:
@@ -211,27 +225,38 @@ def scene_context(
                 }
             )
 
-    in_bundle = {(i["kind"], i["id"]) for i in included}
-    not_applied: list[dict[str, Any]] = []
-    for item in codex.items:
-        if (item.kind, item.entry.id) not in in_bundle:
-            continue
-        ats = [p.at for p in item.entry.progressions]
-        if isinstance(item.entry, CharacterEntry) and item.entry.visual is not None:
-            ats += [p.at for p in item.entry.visual.progressions]
-        if ats:
-            not_applied.append({"id": item.entry.id, "kind": item.kind, "at_scenes": ats})
+    applied: list[dict[str, Any]] = []
+    in_this_scene: list[dict[str, Any]] = []
+    not_placed: list[dict[str, Any]] = []
+    timed_scenes: set[str] = {scene.id}
+    for (kind, entry_id), snapshot in snapshots.items():
+        if snapshot.applied:
+            applied.append({"id": entry_id, "kind": kind, "applied": snapshot.applied})
+        if snapshot.in_this_scene:
+            in_this_scene.append({"id": entry_id, "kind": kind, "changes": snapshot.in_this_scene})
+        if snapshot.not_placed:
+            not_placed.append({"id": entry_id, "kind": kind, "progressions": snapshot.not_placed})
+        timed_scenes.update(p["at"] for p in (*snapshot.applied, *snapshot.in_this_scene))
 
     manifest: dict[str, Any] = {"included": included, "left_out": left_out}
     if named_missing:
         manifest["named_without_an_entry"] = named_missing
-    if not_applied:
-        manifest["progressions_not_applied"] = not_applied
+    if applied:
+        manifest["progressions_applied"] = applied
+    if in_this_scene:
+        manifest["changes_in_this_scene"] = in_this_scene
+    if not_placed:
+        manifest["progressions_not_placed"] = not_placed
+    if applied or in_this_scene or not_placed:
         manifest["progressions_note"] = (
-            "These entries change from the scenes listed. Changes are not applied yet: the "
-            "state shown is each entry's starting state, so follow the manuscript where the "
-            "two differ."
+            "Each entry's state is the one this scene starts from: the changes placed at "
+            "scenes that happen before it in story time are applied. The changes this scene "
+            "makes are under changes_in_this_scene. A change placed at a scene that is not in "
+            "the outline is not applied; it is under progressions_not_placed."
         )
+        placed_by_assumption = [a for a in assumptions(placements) if a["scene_id"] in timed_scenes]
+        if placed_by_assumption:
+            manifest["story_time_assumptions"] = placed_by_assumption
     if codex.unreadable:
         manifest["unreadable_files"] = [
             {"file": u.file, "reason": u.reason} for u in codex.unreadable

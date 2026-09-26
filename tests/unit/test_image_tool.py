@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from uclone_x.core.tool_results import canonical_tool_text
 from uclone_x.tools.builtin.comfy_client import COMFY_DEFAULT_CHECKPOINT
 from uclone_x.tools.builtin.image import (
     ACCELERATE_MISSING_SENTENCE,
@@ -608,6 +609,83 @@ async def test_output_path_leading_slash_normalized_safely(tmp_path: Path) -> No
 
     assert result.success is True
     assert (tmp_path / "artifacts/images/custom_img.png").exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("count", [1, 3])
+async def test_the_result_the_model_reads_names_no_workspace_directory(
+    tmp_path: Path, count: int
+) -> None:
+    """The model is handed the served link and nothing it could turn into a host (#1618).
+
+    In a fresh-HOME run the Artist linked its picture as
+    `https://ucx-fresh-test2-pypi022/work/api/artifacts/...`: the result carried the file's
+    absolute path beside the link, and the model joined the workspace directory onto it.
+    The text the model reads is checked, not the dict, because that is what it copies from.
+    Both the single-image and the batch shape are covered; each carried the path twice.
+
+    Killed by: src/uclone_x/tools/builtin/image.py :: rel_meta_path = str(meta_path.relative_to(context.require_workspace().resolve()))
+    Becomes: rel_meta_path = str(meta_path)
+    """
+    workspace = tmp_path / "ucx-fresh-test2-pypi022" / "work"
+    workspace.mkdir(parents=True)
+    dispatcher = AsyncMock(spec=ImagePipelineDispatcher)
+    dispatcher.dispatch.return_value = ImageGenerationResult(
+        image_bytes=b"png",
+        seed=7,
+        engine_name="mock",
+        device_info="test",
+        duration_seconds=0.1,
+        width=64,
+        height=64,
+    )
+    context = ToolContext(agent_id="artist", workspace_root=workspace, session_id="s")
+
+    result = await GenerateImageTool(dispatcher=dispatcher).execute(
+        params={"prompt": "night train", "count": count}, context=context
+    )
+
+    assert result.success is True
+    text = canonical_tool_text(result.output)
+    assert "ucx-fresh-test2-pypi022" not in text
+    output = cast(dict[str, Any], result.output)
+    links = output["relative_urls"] if count > 1 else [output["relative_url"]]
+    assert len(links) == count
+    for link in links:
+        assert link.startswith("/api/artifacts/content?path=artifacts/images/img_")
+
+
+@pytest.mark.asyncio
+async def test_a_file_name_with_a_space_or_parenthesis_still_makes_one_markdown_link(
+    tmp_path: Path,
+) -> None:
+    """`](... (1).png)` would end the markdown link at the first `)`; the path is encoded.
+
+    Killed by: src/uclone_x/tools/base.py :: quote(rel_path, safe='/')
+    Becomes: rel_path
+    """
+    dispatcher = AsyncMock(spec=ImagePipelineDispatcher)
+    dispatcher.dispatch.return_value = ImageGenerationResult(
+        image_bytes=b"png",
+        seed=7,
+        engine_name="mock",
+        device_info="test",
+        duration_seconds=0.1,
+        width=64,
+        height=64,
+    )
+    context = ToolContext(agent_id="artist", workspace_root=tmp_path, session_id="s")
+
+    result = await GenerateImageTool(dispatcher=dispatcher).execute(
+        params={"prompt": "night train", "output_path": "artifacts/images/night train (1).png"},
+        context=context,
+    )
+
+    assert result.success is True
+    output = cast(dict[str, Any], result.output)
+    assert output["relative_url"] == (
+        "/api/artifacts/content?path=artifacts/images/night%20train%20%281%29.png"
+    )
 
 
 @pytest.mark.asyncio

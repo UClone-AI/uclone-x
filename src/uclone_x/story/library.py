@@ -39,7 +39,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from uclone_x.errors import PathTraversalError, PlainRefusalError
 from uclone_x.sandbox.path_validator import PathValidator
-from uclone_x.story.schemas import describe_invalid
+from uclone_x.story.schemas import STORIES_DIRNAME, describe_invalid
 
 if TYPE_CHECKING:
     from uclone_x.tools.models import ToolContext
@@ -64,12 +64,14 @@ __all__ = [
     "digest_of",
 ]
 
-STORIES_DIRNAME = "stories"
 STORY_FILE = "story.yaml"
 
 _STORY_ID = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 _MAX_ID_LENGTH = 80
 _MAX_SLUG_LENGTH = 40
+#: Files the operating system leaves in a folder it has shown, compared case-insensitively.
+#: They are not the writer's, so they are left out like hidden files (#1595).
+_SYSTEM_FILES = frozenset({"thumbs.db", "ehthumbs.db", "desktop.ini"})
 
 
 class StoryError(PlainRefusalError):
@@ -376,7 +378,8 @@ class StoryLibrary:
     def files_in(self, story_id: str, relative_dir: str) -> list[str]:
         """The story-relative names of the files directly in `relative_dir`, sorted.
 
-        Hidden files (a leading `.`) are left out; a missing directory has none.
+        Hidden files (a leading `.`) and the files an operating system leaves behind
+        (`Thumbs.db`, `desktop.ini`) are left out; a missing directory has none.
         """
         folder = self.root(story_id)
         directory = self._member(folder, relative_dir)
@@ -386,7 +389,25 @@ class StoryLibrary:
         return sorted(
             str(prefix / entry.name)
             for entry in directory.iterdir()
-            if not entry.name.startswith(".") and entry.is_file()
+            if not entry.name.startswith(".")
+            and entry.name.lower() not in _SYSTEM_FILES
+            and entry.is_file()
+        )
+
+    def folders_in(self, story_id: str, relative_dir: str) -> list[str]:
+        """The story-relative names of the folders directly in `relative_dir`, sorted.
+
+        Hidden folders (a leading `.`) are left out; a missing directory has none.
+        """
+        folder = self.root(story_id)
+        directory = self._member(folder, relative_dir)
+        if not directory.is_dir():
+            return []
+        prefix = PurePosixPath(relative_dir)
+        return sorted(
+            str(prefix / entry.name)
+            for entry in directory.iterdir()
+            if not entry.name.startswith(".") and entry.is_dir()
         )
 
     def write_file(

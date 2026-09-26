@@ -106,4 +106,8 @@ evals/reports/*.json
 # the frontend one's ten files out. Anchoring covers any later directory of that name too,
 # which per-directory negations did not; `oss.export` now refuses a commit that drops a file.
 /artifacts/
+# The story library (`stories/`, #1555) and the Files screen's archive (`.archive/`, #1554)
+# land beside it for the same reason, anchored for the same reason (#1578).
+/stories/
+/.archive/
 .sandbox/

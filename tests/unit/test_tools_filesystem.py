@@ -2,11 +2,20 @@
 
 from __future__ import annotations
 
+import os
+import re
+import stat
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Any, cast
+from typing import Annotated, Any, BinaryIO, Literal, cast
+from zoneinfo import ZoneInfo
 
+import pydantic
+import pydantic_core
 import pytest
-from pydantic import BaseModel, Field
+from annotated_types import Predicate
+from pydantic import BaseModel, Field, FilePath, ImportString, ValidationError, field_validator
+from pydantic_core import PydanticCustomError
 
 from uclone_x.sandbox.models import IsolationLevel, WorkspaceIsolation
 from uclone_x.tools import (
@@ -21,6 +30,7 @@ from uclone_x.tools import (
     ToolResultStatus,
     create_default_registry,
 )
+from uclone_x.tools.base import PLAIN_ERROR_PREFIX, describe_invalid_arguments, replace_file
 
 
 @pytest.fixture
@@ -114,27 +124,394 @@ async def test_basetool_async_run_and_context_first(tool_context: ToolContext) -
     assert res_ctx.output == {"inverted": "test_session:payload"}
 
 
+#: What a refusal on arguments must not show: the validator's own report, its links and
+#: type codes, and the name of the class the arguments are checked against (#1570).
+_VALIDATOR_INTERNALS = (
+    "pydantic",
+    "errors.pydantic.dev",
+    "http",
+    "validation error",
+    "Input should",
+    "input_value",
+    "type=",
+    "int_parsing",
+    "greater_than_equal",
+    "DummyParams",
+    "_VariantParams",
+)
+
+
+def _assert_plain(error: str | None) -> str:
+    assert error is not None
+    for internal in _VALIDATOR_INTERNALS:
+        assert internal not in error, (internal, error)
+    return error
+
+
 @pytest.mark.asyncio
 async def test_basetool_parameter_validation_errors(tool_context: ToolContext) -> None:
-    """BaseTool catches parameter validation errors and returns structured error result."""
-    tool = DummyTool()
+    """A call refused on its arguments names the argument, says what was expected and that
+    nothing was done, in plain words -- not pydantic's report (#1570).
 
-    # Missing required parameter 'message'
+    Killed by: src/uclone_x/tools/base.py :: error=describe_invalid_arguments(
+    Becomes: error=str(e) + describe_invalid_arguments(
+    Killed by: src/uclone_x/tools/base.py :: ("ge", "at least"),
+    Becomes: ("ge_", "at least"),
+    Killed by: src/uclone_x/tools/base.py :: "int_parsing": "should be a whole number",
+    Becomes: "int_parsin_": "should be a whole number",
+    """
+    tool = DummyTool()
+    tail = "The tool did not run, so nothing was done."
+
+    # Missing required parameter 'message': the arguments the tool takes are listed.
     res_missing = await tool.execute({"count": 5}, tool_context)
     assert res_missing.success is False
     assert res_missing.status is ToolResultStatus.ERROR
-    assert "Parameter validation failed" in str(res_missing.error)
+    assert _assert_plain(res_missing.error) == (
+        "The call to 'dummy_tool' was refused because its arguments did not fit: 'message' "
+        f"is missing. {tail} It takes: message (required), count. Call it again with the "
+        "arguments corrected."
+    )
     assert res_missing.output is None
 
     # Invalid type for 'count'
     res_invalid = await tool.execute({"message": "test", "count": "not_an_int"}, tool_context)
     assert res_invalid.success is False
-    assert "Parameter validation failed" in str(res_invalid.error)
+    assert _assert_plain(res_invalid.error) == (
+        "The call to 'dummy_tool' was refused because its arguments did not fit: 'count' "
+        f"should be a whole number. {tail} Call it again with the arguments corrected."
+    )
 
-    # Value constraint violation (count < 1)
+    # Value constraint violation (count < 1): the limit is named.
     res_ge = await tool.execute({"message": "test", "count": 0}, tool_context)
     assert res_ge.success is False
-    assert "Parameter validation failed" in str(res_ge.error)
+    assert _assert_plain(res_ge.error) == (
+        "The call to 'dummy_tool' was refused because its arguments did not fit: 'count' "
+        f"should be at least 1. {tail} Call it again with the arguments corrected."
+    )
+
+
+class _BrokenCheckParams(BaseModel):
+    value: str = ""
+
+    @field_validator("value")
+    @classmethod
+    def _broken(cls, value: str) -> str:
+        raise TypeError("checker_socket_91 at /srv/checks.py:7")
+
+
+class _BrokenCheckTool(BaseTool[_BrokenCheckParams]):
+    name = "broken_check"
+    description = "Its argument check itself fails."
+
+    def run(self, params: _BrokenCheckParams, context: ToolContext) -> dict[str, Any]:
+        return {}
+
+
+@pytest.mark.asyncio
+async def test_an_argument_check_that_itself_fails_is_refused_without_its_cause(
+    tool_context: ToolContext,
+) -> None:
+    """A validator raising something pydantic does not turn into a refusal still ends in a
+    plain sentence; the exception's class and message go to the log only (#1570).
+
+    Killed by: src/uclone_x/tools/base.py :: logger.warning("%s: its arguments could not be checked", tool_identifier, exc_info=True)
+    Becomes: raise
+    """
+    res = await _BrokenCheckTool().execute({"value": "x"}, tool_context)
+
+    assert res.success is False
+    assert res.error == (
+        "The arguments of the call to 'broken_check' could not be checked, so the call was "
+        "refused. The tool did not run, so nothing was done."
+    )
+
+
+class _VariantParams(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    mode: Literal["fast", "slow"]
+    size: int | str = 1
+    tags: list[str] = Field(default_factory=list, max_length=2)
+
+
+class _VariantTool(BaseTool[_VariantParams]):
+    name = "variant_tool"
+    description = "Takes a mode, a size and a few tags."
+    not_run_note = "Nothing was changed."
+
+    def run(self, params: _VariantParams, context: ToolContext) -> dict[str, Any]:
+        return {"mode": params.mode}
+
+
+@pytest.mark.asyncio
+async def test_a_refusal_names_the_allowed_values_and_every_argument_that_did_not_fit(
+    tool_context: ToolContext,
+) -> None:
+    """Enough for the model to correct its call: the allowed values of a choice, the item
+    limit of a list, an argument the tool does not take, and a value that fits no member
+    of a union -- whose type names pydantic puts in the error's location -- as one
+    argument, not as `size.int` and `size.str` (#1570).
+
+    Killed by: src/uclone_x/tools/base.py :: return f"should be one of {allowed}"
+    Becomes: return f"should be one of {ctx}"
+    Killed by: src/uclone_x/tools/base.py :: or part.lower() in _UNION_TAGS or part[0].isupper():
+    Becomes: or part.lower() in () or part[0].isupper():
+    Killed by: src/uclone_x/tools/base.py :: "extra_forbidden": "is not an argument this tool takes",
+    Becomes: "extra_forbiddeX": "is not an argument this tool takes",
+    Killed by: src/uclone_x/tools/base.py :: return f"should have at most {_plural(ctx['max_length'], 'item', 'items')}"
+    Becomes: return "should have at most"
+    """
+    res = await _VariantTool().execute(
+        {"mode": "medium", "size": [3], "tags": ["a", "b", "c"], "colour": "red"}, tool_context
+    )
+
+    assert res.success is False
+    assert _assert_plain(res.error) == (
+        "The call to 'variant_tool' was refused because its arguments did not fit: 'mode' "
+        "should be one of 'fast' or 'slow'; 'size' should be a whole number or text; "
+        "'tags' should have at most 2 items; 'colour' is not an argument this tool "
+        "takes. Nothing was changed. It takes: mode (required), size, tags. Call it again "
+        "with the arguments corrected."
+    )
+
+
+class _Sketch(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    kind: Literal["sketch"]
+    lines: int
+
+
+class _Photo(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    kind: Literal["photo"]
+    source: str
+
+
+class _PictureParams(BaseModel):
+    picture: _Sketch | _Photo
+    tagged: Annotated[_Sketch | _Photo, Field(discriminator="kind")] | None = None
+
+
+class _FramedParams(BaseModel):
+    framed: Annotated[_Sketch | _Photo, Field(discriminator="kind")]
+
+
+def _refusal_for(model: type[BaseModel], arguments: dict[str, Any]) -> str:
+    try:
+        model.model_validate(arguments)
+    except ValidationError as error:
+        return _assert_plain(
+            describe_invalid_arguments("picture_tool", error, model, "Nothing was drawn.")
+        )
+    raise AssertionError("the arguments were accepted")
+
+
+def test_a_value_that_fits_no_member_of_a_union_of_models_says_what_each_one_needs() -> None:
+    """One line for the argument, with what each form it can take needed -- not the
+    members' parts run together as if they were one object (#1602). A union with a
+    discriminator names the tags that would do, and its tag is not an argument.
+
+    Killed by: src/uclone_x/tools/base.py :: form = _form_at(loc, names)
+    Becomes: form = None
+    Killed by: src/uclone_x/tools/base.py :: if " or " not in allowed:
+    Becomes: if False:
+    Killed by: src/uclone_x/tools/base.py :: self.forms.update(_tag_values(field.annotation, field.discriminator))
+    Becomes: pass
+    Killed by: src/uclone_x/tools/base.py :: self.forms.update(_tag_values(inner, tag))
+    Becomes: pass
+    Killed by: src/uclone_x/tools/base.py :: if kind == "union_tag_invalid" and "discriminator" in ctx and "expected_tags" in ctx:
+    Becomes: if False:
+    """
+    tail = "Nothing was drawn. It takes: picture (required), tagged. Call it again with the arguments corrected."
+
+    assert _refusal_for(_PictureParams, {"picture": {"kind": "painting"}}) == (
+        "The call to 'picture_tool' was refused because its arguments did not fit: 'picture' "
+        "did not fit any of the forms it can take: either 'picture.kind' should be "
+        "'sketch' and 'picture.lines' is missing, or 'picture.kind' should be 'photo' and "
+        f"'picture.source' is missing. {tail}"
+    )
+    assert _refusal_for(
+        _PictureParams, {"picture": {"kind": "photo", "source": "x"}, "tagged": {"kind": "sketch"}}
+    ) == (
+        "The call to 'picture_tool' was refused because its arguments did not fit: "
+        f"'tagged.lines' is missing. {tail}"
+    )
+    assert _refusal_for(_FramedParams, {"framed": {"kind": "photo"}}) == (
+        "The call to 'picture_tool' was refused because its arguments did not fit: "
+        "'framed.source' is missing. Nothing was drawn. It takes: framed (required). Call "
+        "it again with the arguments corrected."
+    )
+    assert _refusal_for(
+        _PictureParams,
+        {"picture": {"kind": "photo", "source": "x"}, "tagged": {"kind": "secret_tag_77"}},
+    ) == (
+        "The call to 'picture_tool' was refused because its arguments did not fit: 'tagged' "
+        "should have 'kind' set to one of 'sketch', 'photo'. Nothing was drawn. Call it "
+        "again with the arguments corrected."
+    )
+
+
+class _AliasedParams(BaseModel):
+    target: str = Field(alias="Target-Path")
+    Mode: int
+
+
+def test_an_alias_with_a_capital_or_a_hyphen_is_named() -> None:
+    """The argument is named as the tool takes it, even when its alias starts with a
+    capital or holds a hyphen -- not "the arguments should be text" (#1602).
+
+    Killed by: src/uclone_x/tools/base.py :: if part in names.arguments:
+    Becomes: if part in ():
+    """
+    assert _refusal_for(_AliasedParams, {"Target-Path": 3, "Mode": "fast"}) == (
+        "The call to 'picture_tool' was refused because its arguments did not fit: "
+        "'Target-Path' should be text; 'Mode' should be a whole number. Nothing was drawn. "
+        "Call it again with the arguments corrected."
+    )
+
+
+class _TakenNameParams(BaseModel):
+    name: str
+
+    @field_validator("name")
+    @classmethod
+    def _free(cls, value: str) -> str:
+        if value == "hero":
+            raise PydanticCustomError("plain_name_taken", "that name is already taken")
+        raise PydanticCustomError("name_odd", "the name {name} is not allowed", {"name": value})
+
+
+def test_a_custom_error_the_tool_opted_in_keeps_its_own_message() -> None:
+    """A `PydanticCustomError` whose type starts with `PLAIN_ERROR_PREFIX` is the tool's own
+    sentence, passed on as it is -- not "has a value of the wrong kind". One without the
+    prefix keeps the plain fallback, value and all left out (#1602).
+
+    Killed by: src/uclone_x/tools/base.py :: if kind.startswith(PLAIN_ERROR_PREFIX) and error.get("msg"):
+    Becomes: if False and error.get("msg"):
+    Killed by: src/uclone_x/tools/base.py :: if kind.startswith(PLAIN_ERROR_PREFIX) and error.get("msg"):
+    Becomes: if True and error.get("msg"):
+    """
+    assert _refusal_for(_TakenNameParams, {"name": "hero"}) == (
+        "The call to 'picture_tool' was refused because its arguments did not fit: 'name': "
+        "that name is already taken. Nothing was drawn. Call it again with the arguments "
+        "corrected."
+    )
+    assert _refusal_for(_TakenNameParams, {"name": "villain_sk_live_1"}) == (
+        "The call to 'picture_tool' was refused because its arguments did not fit: 'name' "
+        "has a value of the wrong kind. Nothing was drawn. Call it again with the arguments "
+        "corrected."
+    )
+    assert "secret_tag_77" not in _refusal_for(
+        _PictureParams,
+        {"picture": {"kind": "secret_tag_77"}, "tagged": {"kind": "secret_tag_77"}},
+    )
+
+
+class _SequenceParams(BaseModel):
+    value: Sequence[str]
+
+
+class _DigitsParams(BaseModel):
+    value: Annotated[str, Predicate(str.isdigit)]
+
+
+class _ImportParams(BaseModel):
+    value: ImportString[Any]
+
+
+class _ZoneParams(BaseModel):
+    value: ZoneInfo
+
+
+class _FileParams(BaseModel):
+    value: FilePath
+
+
+@pytest.mark.parametrize(
+    ("model", "given"),
+    [
+        (_SequenceParams, "sk_live_SECRET"),
+        (_DigitsParams, "sk_live_SECRET"),
+        (_ImportParams, "sk_live_SECRET"),
+        (_ZoneParams, "sk-live-SECRET"),
+        (_FileParams, "/nowhere/sk_live_SECRET"),
+    ],
+)
+def test_pydantics_own_custom_errors_keep_the_plain_fallback(
+    model: type[BaseModel], given: str
+) -> None:
+    """Pydantic raises `PydanticCustomError` itself, with messages that name its own types
+    ("'str' instances are not allowed as a Sequence value") or repeat the value given
+    ("invalid timezone: ..."). Those are not the tool's words, so they read as the plain
+    fallback and the value is not echoed (#1602 review).
+
+    Killed by: src/uclone_x/tools/base.py :: if kind.startswith(PLAIN_ERROR_PREFIX) and error.get("msg"):
+    Becomes: if True and error.get("msg"):
+    """
+    refusal = _refusal_for(model, {"value": given})
+
+    assert refusal == (
+        "The call to 'picture_tool' was refused because its arguments did not fit: 'value' "
+        "has a value of the wrong kind. Nothing was drawn. Call it again with the arguments "
+        "corrected."
+    )
+    assert "SECRET" not in refusal
+
+
+def test_no_custom_error_pydantic_raises_starts_with_the_plain_prefix() -> None:
+    """The opt-in holds only while pydantic's own custom error types do not start with the
+    prefix. Read from the installed pydantic, so an upgrade that adds one fails here.
+
+    Killed by: src/uclone_x/tools/base.py :: PLAIN_ERROR_PREFIX = "plain_"
+    Becomes: PLAIN_ERROR_PREFIX = "pa"
+    """
+    found: set[str] = set()
+    for package in (pydantic, pydantic_core):
+        for source in Path(cast(str, package.__file__)).parent.rglob("*.py*"):
+            try:
+                text = source.read_text()
+            except (OSError, UnicodeDecodeError):
+                continue
+            found |= set(re.findall(r"PydanticCustomError\(\s*['\"]([A-Za-z_]+)", text))
+
+    assert len(found) > 20, found  # the scan saw pydantic's own raises
+    assert not [kind for kind in found if kind.startswith(PLAIN_ERROR_PREFIX)]
+
+
+class _EitherParams(BaseModel):
+    count: int | _Sketch = 1
+    notes: list[str | _Sketch] = Field(default_factory=list[str | _Sketch])
+
+
+def test_a_union_of_a_value_and_a_model_reads_as_alternatives() -> None:
+    """`int | Sketch` given text fits neither form: one "or", not two `;` lines that read
+    as two things to fix (#1602 review). A value that almost fit the model says what each
+    form needed instead.
+
+    Killed by: src/uclone_x/tools/base.py :: members.insert(0, {where: problems[where]})
+    Becomes: pass
+    Killed by: src/uclone_x/tools/base.py :: if where not in unions:
+    Becomes: if True:
+    Killed by: src/uclone_x/tools/base.py :: if all(set(member) == {where} for member in members):
+    Becomes: if False:
+    """
+    lead = "The call to 'picture_tool' was refused because its arguments did not fit: "
+    tail = "Nothing was drawn. Call it again with the arguments corrected."
+
+    assert _refusal_for(_EitherParams, {"count": "many"}) == (
+        f"{lead}'count' should be a whole number or an object of named values. {tail}"
+    )
+    assert _refusal_for(_EitherParams, {"notes": [3]}) == (
+        f"{lead}'notes[0]' should be text or an object of named values. {tail}"
+    )
+    assert _refusal_for(_EitherParams, {"count": {"kind": "sketch"}}) == (
+        f"{lead}'count' did not fit any of the forms it can take: either 'count' should be "
+        "a whole number, or 'count.lines' is missing. Nothing was drawn. It takes: count, "
+        "notes. Call it again with the arguments corrected."
+    )
 
 
 @pytest.mark.asyncio
@@ -916,4 +1293,171 @@ def test_default_tool_registry_registration() -> None:
 
     # Convenience classmethod
     reg2 = ToolRegistry.with_builtins()
-    assert len(reg2.list_tools()) == 22
+    assert len(reg2.list_tools()) == 23
+
+
+# ======================================================================================
+# replace_file: mode and long names (#1589)
+# ======================================================================================
+
+
+def _mode(path: Path) -> int:
+    return stat.S_IMODE(path.stat().st_mode)
+
+
+@pytest.mark.asyncio
+async def test_file_write_over_a_private_file_keeps_it_private(
+    workspace: Path, tool_context: ToolContext
+) -> None:
+    """Replacing a file used to reset `0600` to the umask default.
+
+    Killed by: src/uclone_x/tools/base.py :: _set_mode(descriptor, tmp_file, mode)
+    Becomes: pass
+    """
+    target = workspace / "secret.txt"
+    target.write_text("old\n", encoding="utf-8")
+    target.chmod(0o600)
+    result = await FileWriteTool().execute(
+        {"path": "secret.txt", "content": "new\n", "overwrite": True}, tool_context
+    )
+    assert result.status == ToolResultStatus.SUCCESS, result.error
+    assert target.read_text(encoding="utf-8") == "new\n"
+    assert _mode(target) == 0o600
+
+
+@pytest.mark.asyncio
+async def test_file_edit_keeps_the_mode_too(workspace: Path, tool_context: ToolContext) -> None:
+    """`file_edit` writes through the same helper, so an executable script stays executable.
+
+    Killed by: src/uclone_x/tools/base.py :: _set_mode(descriptor, tmp_file, mode)
+    Becomes: pass
+    """
+    target = workspace / "run.sh"
+    target.write_text("echo old\n", encoding="utf-8")
+    target.chmod(0o750)
+    result = await FileEditTool().execute(
+        {"path": "run.sh", "target_content": "old", "replacement_content": "new"}, tool_context
+    )
+    assert result.status == ToolResultStatus.SUCCESS, result.error
+    assert target.read_text(encoding="utf-8") == "echo new\n"
+    assert _mode(target) == 0o750
+
+
+@pytest.mark.asyncio
+async def test_a_new_file_gets_the_umask_default(
+    workspace: Path, tool_context: ToolContext
+) -> None:
+    """Killed by: src/uclone_x/tools/base.py :: descriptor = os.open(tmp_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+    Becomes: descriptor = os.open(tmp_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    """
+    previous = os.umask(0o022)
+    try:
+        result = await FileWriteTool().execute({"path": "new.txt", "content": "x"}, tool_context)
+    finally:
+        os.umask(previous)
+    assert result.status == ToolResultStatus.SUCCESS, result.error
+    assert _mode(workspace / "new.txt") == 0o644
+
+
+@pytest.mark.asyncio
+async def test_a_name_near_the_length_limit_is_written_and_overwritten(
+    workspace: Path, tool_context: ToolContext
+) -> None:
+    """The temporary name no longer grows the file's own name past 255 bytes.
+
+    Killed by: src/uclone_x/tools/base.py :: tmp_file = path.parent / f".ucx-{secrets.token_hex(6)}.tmp"
+    Becomes: tmp_file = path.parent / f".{path.name}.tmp.{secrets.token_hex(6)}"
+    """
+    name = "n" * 246 + ".txt"  # 250 bytes: allowed as a name, too long with a suffix
+    for content in ("first\n", "second\n"):
+        result = await FileWriteTool().execute(
+            {"path": name, "content": content, "overwrite": True}, tool_context
+        )
+        assert result.status == ToolResultStatus.SUCCESS, result.error
+    assert (workspace / name).read_text(encoding="utf-8") == "second\n"
+    assert sorted(p.name for p in workspace.iterdir()) == [name]  # no temporary file left
+
+
+def test_the_mode_is_set_before_any_data_is_written(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The new contents of a `0600` file never sit in a file others can read (#1589 a).
+
+    The file object that writes the data is made after the mode is set, so its mode at that
+    moment is the mode every byte is written under.
+
+    Killed by: src/uclone_x/tools/base.py :: _set_mode(descriptor, tmp_file, mode)
+    Becomes: pass
+    """
+    target = workspace / "secret.txt"
+    target.write_text("old\n", encoding="utf-8")
+    target.chmod(0o600)
+    seen: list[int] = []
+    real_fdopen = os.fdopen
+
+    def spy(descriptor: int, mode: str) -> BinaryIO:
+        seen.append(stat.S_IMODE(os.fstat(descriptor).st_mode))
+        return cast(BinaryIO, real_fdopen(descriptor, mode))
+
+    monkeypatch.setattr(os, "fdopen", spy)
+    replace_file(target, b"new\n")
+    assert seen == [0o600]
+    assert target.read_bytes() == b"new\n"
+
+
+def test_a_failure_to_open_the_file_object_closes_the_descriptor(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Killed by: src/uclone_x/tools/base.py :: os.close(descriptor)
+    Becomes: pass
+    """
+    target = workspace / "notes.txt"
+    target.write_text("old\n", encoding="utf-8")
+    opened: list[int] = []
+
+    def failing_fdopen(descriptor: int, *args: Any, **kwargs: Any) -> Any:
+        opened.append(descriptor)
+        raise OSError("no file object")
+
+    monkeypatch.setattr(os, "fdopen", failing_fdopen)
+    with pytest.raises(OSError, match="no file object"):
+        replace_file(target, b"new\n")
+    monkeypatch.undo()
+    assert len(opened) == 1
+    with pytest.raises(OSError):
+        os.fstat(opened[0])  # closed
+    assert sorted(p.name for p in workspace.iterdir()) == ["notes.txt"]
+    assert target.read_text(encoding="utf-8") == "old\n"
+
+
+@pytest.mark.asyncio
+async def test_file_edit_keeps_crlf_line_endings(
+    workspace: Path, tool_context: ToolContext
+) -> None:
+    """A file with CRLF endings used to come back with `\\n` on every line (#1589 c).
+
+    Killed by: src/uclone_x/tools/builtin/filesystem.py :: if crlf:
+    Becomes: if False:
+    """
+    target = workspace / "notes.txt"
+    target.write_bytes(b"first\r\nold\r\nlast\r\n")
+    result = await FileEditTool().execute(
+        {"path": "notes.txt", "target_content": "old", "replacement_content": "new\nextra"},
+        tool_context,
+    )
+    assert result.status == ToolResultStatus.SUCCESS, result.error
+    assert target.read_bytes() == b"first\r\nnew\r\nextra\r\nlast\r\n"
+
+
+@pytest.mark.asyncio
+async def test_file_edit_leaves_lf_endings_as_they_are(
+    workspace: Path, tool_context: ToolContext
+) -> None:
+    target = workspace / "notes.txt"
+    target.write_bytes(b"first\nold\nlast\n")
+    result = await FileEditTool().execute(
+        {"path": "notes.txt", "target_content": "old", "replacement_content": "new"},
+        tool_context,
+    )
+    assert result.status == ToolResultStatus.SUCCESS, result.error
+    assert target.read_bytes() == b"first\nnew\nlast\n"

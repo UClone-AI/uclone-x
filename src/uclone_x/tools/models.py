@@ -73,6 +73,14 @@ class ToolContext(BaseModel):
         description="Folders outside the workspace that read-only file tools may also read, "
         "by absolute path. No tool may write under them.",
     )
+    skill_dirs: tuple[Path, ...] = Field(
+        default=(),
+        description="The package folders of the skills active for the calling agent, read "
+        "from its skill registry for every step, so a skill approved mid-conversation "
+        "counts from the next step. A tool that reads data a skill may carry -- the story "
+        "structure templates and muse tables (#1572) -- looks in them. Empty for an agent "
+        "with no skill registry.",
+    )
 
     room_id: str | None = Field(
         default=None,
@@ -91,6 +99,14 @@ class ToolContext(BaseModel):
         "seat (#1555) and, for an agent asked with `a2a_call`, from its caller's call "
         "(#1558). Story tools compute their paths from it and take none from the "
         "model; `None` means no story is open, and they refuse with that reason.",
+    )
+
+    approved_by_person: bool = Field(
+        default=False,
+        description="True only when a person approved this very call through the runtime's "
+        "approval request (#1557). Set by the agent after the answer arrives, never from "
+        "the call's arguments, so a tool whose action needs approval "
+        "(`tool_call_needs_approval`) can refuse a call nobody approved on any path.",
     )
 
     def require_workspace(self) -> Path:

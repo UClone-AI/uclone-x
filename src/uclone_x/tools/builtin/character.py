@@ -9,9 +9,9 @@ from typing import Any, ClassVar, Literal, cast
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
-from uclone_x.errors import PlainRefusalError, UCloneXError
+from uclone_x.errors import PathTraversalError, PlainRefusalError, UCloneXError
 from uclone_x.story.schemas import CharacterEntry
-from uclone_x.tools.base import BaseTool
+from uclone_x.tools.base import BaseTool, replace_file
 from uclone_x.tools.models import ToolContext
 
 
@@ -66,8 +66,9 @@ class CharacterSheetParams(BaseModel):
         description="Optional base seed for visual consistency across scenes.",
     )
     default_style: Literal["photorealistic", "anime", "artistic", "diagram"] | None = Field(
-        default="anime",
-        description="Default style preset for image generation.",
+        default=None,
+        description="Default style preset for image generation. A new workspace sheet "
+        "without one gets 'anime'.",
     )
     character_ids: list[str] | None = Field(
         default=None,
@@ -104,7 +105,7 @@ class CharacterSheetTool(BaseTool[CharacterSheetParams]):
         "and compose multi-character scene prompts to ensure character consistency and prevent attribute bleeding. "
         "Characters are stored in 'characters/<id>.yaml' in the workspace. While a story "
         "is open, characters are the story's codex characters and their 'visual' block, and "
-        "'save' is refused."
+        "'save' proposes the change to the character's 'visual' block for a person to apply."
     )
     params_type = CharacterSheetParams
 
@@ -116,10 +117,50 @@ class CharacterSheetTool(BaseTool[CharacterSheetParams]):
         )
 
     def _characters_dir(self, workspace_root: Path) -> Path:
-        """Resolve and ensure characters directory within workspace."""
+        """The workspace `characters/` folder, created if it is missing.
+
+        A link named `characters` is left as it is, even one that leads nowhere: creating
+        the folder through it failed with a raw error naming the link's full path, before
+        `save` could check where the link leads (#1589 follow-up b). Reading through a link
+        that leads nowhere finds no sheets; `save` checks the link and creates the folder
+        it leads to (`_sheet_to_write`).
+        """
         chars_dir = workspace_root / "characters"
-        chars_dir.mkdir(parents=True, exist_ok=True)
+        if not chars_dir.is_symlink():
+            try:
+                chars_dir.mkdir(parents=True, exist_ok=True)
+            except FileExistsError:
+                raise PlainRefusalError(
+                    "'characters' in the workspace is a file, not a folder, so no character "
+                    "sheet can be read or saved there."
+                ) from None
         return chars_dir
+
+    def _sheet_to_write(self, workspace: Path, clean_id: str) -> Path:
+        """Where `save` writes `characters/<clean_id>.yaml`, checked as the file tools check.
+
+        The name is fixed, but `characters/` or the sheet can be a link. The path is resolved
+        with `resolve_write_path`, so a link leading out of the workspace is refused, and so
+        is one leading into the story library: a story's characters are its codex, written
+        only by the story tools (#1589). The sheet is then written as a new file
+        (`replace_file`), so a name hardlinked to another file leaves that file unchanged.
+        """
+        rel = f"characters/{clean_id}.yaml"
+        try:
+            sheet = self.resolve_write_path(rel, workspace)
+        except PathTraversalError:
+            raise PlainRefusalError(
+                f"'{rel}' leads outside the workspace through a link, so the character "
+                "sheet was not saved."
+            ) from None
+        # `characters` can be a link to a folder in the workspace that does not exist yet.
+        try:
+            sheet.parent.mkdir(parents=True, exist_ok=True)
+        except (FileExistsError, NotADirectoryError):
+            raise PlainRefusalError(
+                "'characters' leads to a file, not a folder, so the character sheet was not saved."
+            ) from None
+        return sheet
 
     def _load_character(self, chars_dir: Path, char_id: str) -> dict[str, Any] | None:
         """Load character YAML file if it exists."""
@@ -155,7 +196,7 @@ class CharacterSheetTool(BaseTool[CharacterSheetParams]):
                 if not params.character_id:
                     raise CharacterSheetError("character_id is required for 'save' action.")
                 clean_id = sanitize_character_id(params.character_id)
-                char_file = chars_dir / f"{clean_id}.yaml"
+                char_file = self._sheet_to_write(workspace, clean_id)
 
                 existing = self._load_character(chars_dir, clean_id) or {}
                 updated: dict[str, Any] = {
@@ -177,10 +218,10 @@ class CharacterSheetTool(BaseTool[CharacterSheetParams]):
                     or "anime",
                 }
 
-                with open(char_file, "w", encoding="utf-8") as f:
-                    yaml.dump(updated, f, sort_keys=False, allow_unicode=True)
+                sheet_text = yaml.dump(updated, sort_keys=False, allow_unicode=True)
+                replace_file(char_file, sheet_text.encode("utf-8"))
 
-                rel_path = str(char_file.relative_to(workspace))
+                rel_path = str(char_file.relative_to(workspace.resolve()))
                 return {
                     "status": "success",
                     "action": "save",
@@ -270,16 +311,14 @@ class CharacterSheetTool(BaseTool[CharacterSheetParams]):
 
         A story's characters are its codex entries, and what they look like is each entry's
         `visual` block. Sheets in the workspace's `characters/` folder belong to no story:
-        they are shown read-only, with how to bring one into the story. Nothing here writes.
+        they are shown read-only, with how to bring one into the story. `save` writes no
+        sheet: it proposes the change to the entry's `visual` block, which a person applies
+        with story_codex 'apply' (#1557).
         """
         from uclone_x.story.work import StoryWork  # an adapter: loaded only with a story
 
         if params.action == "save":
-            raise PlainRefusalError(
-                "A story is open, so character sheets are not saved here, and nothing was "
-                "saved. The story's characters are its codex entries: how one looks is the "
-                "'visual' block of its file under codex/characters/ in the story."
-            )
+            return _propose_visual(params, context)
         codex = StoryWork.open_in(context).codex()
         story_chars = {
             item.entry.id: item.entry
@@ -331,7 +370,7 @@ class CharacterSheetTool(BaseTool[CharacterSheetParams]):
                     "character": _sheet_of(entry),
                     **({} if entry.visual else {"note": _NO_VISUAL}),
                 }
-            legacy_sheet = self._legacy_sheet(legacy_dir, char_id)
+            legacy_sheet, legacy_problem = self._legacy_sheet(legacy_dir, char_id)
             if legacy_sheet is not None:
                 return {
                     "status": "not_in_story",
@@ -346,6 +385,8 @@ class CharacterSheetTool(BaseTool[CharacterSheetParams]):
                 "character_id": char_id,
                 "message": f"The story's codex has no character '{char_id}'.",
             }
+            if legacy_problem is not None:
+                result["workspace_sheet_unreadable"] = legacy_problem
             if unreadable:
                 result["unreadable_files"] = unreadable
             return result
@@ -356,7 +397,7 @@ class CharacterSheetTool(BaseTool[CharacterSheetParams]):
         missing = [cid for cid in params.character_ids if cid not in story_chars]
         if missing:
             in_workspace = [
-                cid for cid in missing if self._legacy_sheet(legacy_dir, cid) is not None
+                cid for cid in missing if self._legacy_sheet(legacy_dir, cid) != (None, None)
             ]
             message = (
                 f"The story's codex has no character {', '.join(repr(m) for m in missing)}, "
@@ -365,18 +406,45 @@ class CharacterSheetTool(BaseTool[CharacterSheetParams]):
             if in_workspace:
                 message += " " + _MIGRATION_HINT
             raise PlainRefusalError(message)
-        return _compose(
+        composed = _compose(
             [_sheet_of(story_chars[cid]) for cid in params.character_ids], params.scene_context
         )
+        notes = _compose_notes([story_chars[cid] for cid in params.character_ids])
+        if notes:
+            composed["notes"] = notes
+        return composed
 
-    def _legacy_sheet(self, legacy_dir: Path, char_id: str) -> dict[str, Any] | None:
-        """A workspace sheet named `char_id`, read only; `None` when there is none."""
-        if not legacy_dir.is_dir():
-            return None
+    @staticmethod
+    def _legacy_sheet(
+        legacy_dir: Path, char_id: str
+    ) -> tuple[dict[str, Any] | None, dict[str, str] | None]:
+        """A workspace sheet named `char_id`, read only, or why it could not be read.
+
+        `(None, None)` when there is no such sheet -- including for an id no sheet can have.
+        A sheet that is there and does not read is reported by its file and a plain reason,
+        never taken for a missing one (P6).
+        """
         try:
-            return self._load_character(legacy_dir, char_id)
+            clean_id = sanitize_character_id(char_id)
         except CharacterSheetError:
-            return None  # not a name a workspace sheet can have, so there is none
+            return None, None  # not a name a workspace sheet can have, so there is none
+        sheet = legacy_dir / f"{clean_id}.yaml"
+        if not sheet.is_file():
+            return None, None
+        where = f"characters/{clean_id}.yaml"
+        try:
+            raw: object = yaml.safe_load(sheet.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, yaml.YAMLError):
+            return None, {
+                "file": where,
+                "reason": "It could not be read as YAML text, so it was not shown.",
+            }
+        if not isinstance(raw, dict):
+            return None, {
+                "file": where,
+                "reason": "It is not a set of named fields, so it was not shown.",
+            }
+        return {str(k): v for k, v in cast(dict[object, object], raw).items()}, None
 
 
 _MIGRATION_HINT = (
@@ -390,18 +458,72 @@ _NO_VISUAL = (
 
 
 def _sheet_of(entry: CharacterEntry) -> dict[str, Any]:
-    """A codex character as the sheet `get` returns, from its `visual` block."""
+    """A codex character as the sheet `get` returns, from its `visual` block.
+
+    A field the codex does not give is `None`, not a default: the sheet says what the
+    story says and nothing more (#1576).
+    """
     visual = entry.visual
     return {
         "character_id": entry.id,
         "name": entry.name,
-        "gender": (visual.gender if visual else None) or "other",
+        "gender": visual.gender if visual else None,
         "danbooru_tags": ", ".join(visual.tags) if visual else "",
         "prose_description": (visual.prose if visual else None) or "",
         "negative_tags": ", ".join(visual.negative_tags) if visual else "",
         "base_seed": visual.base_seed if visual else None,
-        "default_style": (visual.default_style if visual else None) or "anime",
+        "default_style": visual.default_style if visual else None,
     }
+
+
+def _compose_notes(entries: list[CharacterEntry]) -> list[str]:
+    """What a composed prompt lacks because the codex does not say it, one line each."""
+    notes: list[str] = []
+    for entry in entries:
+        if entry.visual is None:
+            notes.append(
+                f"'{entry.id}' has no 'visual' block in the story's codex, so no tags of its "
+                "own went into the prompt."
+            )
+        elif entry.visual.gender is None:
+            notes.append(
+                f"'{entry.id}' has no gender in its 'visual' block, so the prompt counts it "
+                "as a person rather than a girl or a boy."
+            )
+    return notes
+
+
+def _split_tags(text: str | None) -> list[str] | None:
+    if text is None:
+        return None
+    return [t.strip() for t in text.split(",") if t.strip()]
+
+
+def _propose_visual(params: CharacterSheetParams, context: ToolContext) -> dict[str, Any]:
+    """`save` while a story is open: a proposal to change a codex character's looks."""
+    from uclone_x.story.tools import propose_visual  # an adapter: loaded only with a story
+
+    if not params.character_id or not params.character_id.strip():
+        raise PlainRefusalError("Say which character to change, in 'character_id'.")
+    visual: dict[str, Any] = {
+        "tags": _split_tags(params.danbooru_tags),
+        "prose": params.prose_description,
+        "negative_tags": _split_tags(params.negative_tags),
+        "base_seed": params.base_seed,
+        "gender": params.gender,
+        "default_style": params.default_style,
+    }
+    result = propose_visual(
+        context,
+        params.character_id.strip(),
+        {k: v for k, v in visual.items() if v is not None},
+    )
+    if params.name is not None:
+        result.setdefault("notes", []).append(
+            "The name is not part of how a character looks, so it was not proposed. A "
+            "character's name is the 'name' of its codex entry."
+        )
+    return {"status": "proposed", "action": "save", **result}
 
 
 def _compose(loaded_chars: list[dict[str, Any]], scene_context: str | None) -> dict[str, Any]:

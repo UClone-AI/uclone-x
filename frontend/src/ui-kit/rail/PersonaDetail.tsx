@@ -4,6 +4,11 @@ import type { PersonaDetailCopy, RailPersona } from './types';
 interface PersonaDetailProps {
   persona: RailPersona;
   copy: PersonaDetailCopy;
+  /**
+   * The tools the running clone holds that it is given only inside a conversation, from
+   * `/api/agents`' `capabilities_needing_room` (#1595). Empty, or absent, shows nothing.
+   */
+  toolsNeedingConversation?: readonly string[];
 }
 
 /**
@@ -14,7 +19,11 @@ interface PersonaDetailProps {
  * Inspection only: nothing here can change a persona. Label above value, `text-[10px]
  * uppercase font-sans` section headers, as the head's retired `ToolDetail` drawer laid them out.
  */
-export const PersonaDetail: React.FC<PersonaDetailProps> = ({ persona, copy }) => {
+export const PersonaDetail: React.FC<PersonaDetailProps> = ({
+  persona,
+  copy,
+  toolsNeedingConversation = [],
+}) => {
   return (
     <div
       data-testid={`persona-detail-${persona.name}`}
@@ -64,6 +73,15 @@ export const PersonaDetail: React.FC<PersonaDetailProps> = ({ persona, copy }) =
             {copy.noTools}
           </p>
         )}
+        {toolsNeedingConversation.length > 0 ? (
+          <p
+            data-testid={`persona-tools-conversation-only-${persona.name}`}
+            className="mt-1 text-slate-500 text-[11px] leading-relaxed"
+          >
+            {copy.onlyInConversation}{' '}
+            <span className="font-mono text-slate-400">{toolsNeedingConversation.join(', ')}</span>
+          </p>
+        ) : null}
       </div>
 
       <div className="space-y-1 pt-0.5">

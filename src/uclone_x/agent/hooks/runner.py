@@ -31,7 +31,17 @@ logger = logging.getLogger(__name__)
 #: whatever a hook returns -- only `arguments` from a `MODIFY` reaches execution -- so a
 #: rewrite of these keys would change what later hooks judge and not what runs (#1488).
 #: `run_hooks` therefore restores them before every hook sees the payload.
-_PRE_TOOL_USE_FIXED_KEYS = ("tool_name", "tool_call_id", "writes_files", "spawns_subagents")
+#: `needs_approval` is among them: a call whose tool declares that it needs a person's
+#: approval (`tool_call_needs_approval`) is answered `ASK` whatever the hooks say, unless one
+#: blocks it -- with no hooks at all, too -- so no hook and no model can wave it through
+#: (#1557).
+_PRE_TOOL_USE_FIXED_KEYS = (
+    "tool_name",
+    "tool_call_id",
+    "writes_files",
+    "spawns_subagents",
+    "needs_approval",
+)
 
 
 def _with_fixed_keys(payload: dict[str, Any], fixed: dict[str, Any]) -> dict[str, Any]:
@@ -116,6 +126,24 @@ class HookRunner:
         modifiable: every hook sees them as the agent sent them, so a hook placed later --
         `HumanApprovalHook` above all -- judges the call that will actually run (#1488).
         """
+        needs_approval = (
+            event_type == HookEvent.PRE_TOOL_USE and context.payload.get("needs_approval") is True
+        )
+        decision = await self._run_hooks(event_type, context)
+        if needs_approval and decision.action not in (HookAction.BLOCK, HookAction.ASK):
+            tool = str(context.payload.get("tool_name") or "This tool")
+            # A hook's rewrite of the call is kept (#1584): the person is asked about the
+            # call that will run, and it runs as the hooks left it once they approve.
+            return HookDecision(
+                action=HookAction.ASK,
+                reason=f"{tool} runs this action only when a person approves the call.",
+                modified_payload=(
+                    decision.modified_payload if decision.action == HookAction.MODIFY else None
+                ),
+            )
+        return decision
+
+    async def _run_hooks(self, event_type: HookEvent, context: HookContext) -> HookDecision:
         if not self._hooks:
             return HookDecision(action=HookAction.ALLOW)
 
@@ -161,6 +189,16 @@ class HookRunner:
                 await self._publish_event(
                     EventType.HOOK_EXECUTED, hook.name, event_type, decision, current_context
                 )
+                if decision.action == HookAction.ASK and modified:
+                    # The person is asked about the call as the hooks before this one left
+                    # it, and that call is what runs once they approve (#1601); the asking
+                    # hook's own rewrite, if any, goes on top as a `MODIFY` would.
+                    asked = active_payload | (decision.modified_payload or {})
+                    if fixed is not None:
+                        asked = _with_fixed_keys(asked, fixed)
+                    return HookDecision(
+                        action=HookAction.ASK, reason=decision.reason, modified_payload=asked
+                    )
                 return decision
 
             if decision.action == HookAction.MODIFY and decision.modified_payload:

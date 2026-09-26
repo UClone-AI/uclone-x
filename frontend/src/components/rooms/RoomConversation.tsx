@@ -927,7 +927,14 @@ export const RoomConversation: React.FC<RoomConversationProps> = ({
   };
 
   return (
-    <section data-testid="room-conversation" className="column-scope flex flex-col h-full min-h-0">
+    <section
+      data-testid="room-conversation"
+      // Which conversation this is, not only that there is one. A browser case that starts a
+      // conversation and then reads the surface had no way to say the two were the same room,
+      // so it asserted against whichever one happened to be open (#1288).
+      data-room-id={room.room_id}
+      className="column-scope flex flex-col h-full min-h-0"
+    >
       {/* The header holds more than a narrow pane fits, so the order it gives way in is
           stated rather than left to whichever item happens to be least shrinkable. The
           title keeps a floor and truncates; the controls wrap to their own row and the
@@ -1010,11 +1017,11 @@ export const RoomConversation: React.FC<RoomConversationProps> = ({
           <Button
             data-testid="toggle-autonomous"
             onClick={() => onToggleAutonomous(!isAutonomous)}
-            aria-label={isAutonomous ? '자율 토론 모드 켜짐' : '자율 토론 모드 꺼짐'}
+            aria-label={isAutonomous ? 'Autonomous discussion on' : 'Autonomous discussion off'}
             title={
               isAutonomous
-                ? '자율 토론 활성화됨 (화면을 보고 있는 동안 에이전트 간 연속 대화)'
-                : '자율 토론 켜기 (화면을 보고 있는 동안 에이전트 간 연속 대화)'
+                ? 'Autonomous discussion active (agents converse while you view)'
+                : 'Turn on autonomous discussion (agents converse while you view)'
             }
             className={cn(
               'shrink-0 whitespace-nowrap text-xs flex items-center gap-1.5 transition-colors',
@@ -1024,7 +1031,7 @@ export const RoomConversation: React.FC<RoomConversationProps> = ({
             )}
           >
             <Sparkles className={cn('w-3 h-3', isAutonomous ? 'text-amber-300' : 'text-slate-400')} />
-            <span className="column-icon-only">자율 토론</span>
+            <span className="column-icon-only">Auto discuss</span>
             <span className="text-[10px] uppercase tracking-wider font-semibold opacity-90">
               {isAutonomous ? 'ON' : 'OFF'}
             </span>

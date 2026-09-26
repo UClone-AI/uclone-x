@@ -25,6 +25,7 @@ __all__ = [
     "RoomOrchestratorProtocol",
     "RoomStoreProtocol",
     "SpeakerSelectorProtocol",
+    "StoryLeaseProtocol",
 ]
 
 
@@ -209,4 +210,16 @@ class RoomOrchestratorProtocol(Protocol):
         turn in the transcript with `completed=False` and an error notice, and terminates
         the active turn loop.
         """
+        ...
+
+
+class StoryLeaseProtocol(Protocol):
+    """Gives back a story's writing lease when the conversation holding it is deleted.
+
+    The room kernel names only this, not the story library, which is an adapter: the
+    head that builds a `RoomService` passes the library, and `StoryLibrary` has this shape.
+    """
+
+    def release(self, story_id: str, conversation_id: str) -> bool:
+        """Give up the lease if `conversation_id` holds it; return whether it did."""
         ...

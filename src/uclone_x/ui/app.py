@@ -164,6 +164,7 @@ from uclone_x.sandbox.path_validator import PathValidator
 from uclone_x.shells.ui_process import UI_BIND_HOST_ENV_VAR
 from uclone_x.skills.auditor import SkillRegistry
 from uclone_x.telemetry.tracer import TelemetryTracer
+from uclone_x.tools.base import tool_needs_room
 from uclone_x.tools.builtin.comfy_client import (
     DEFAULT_COMFYUI_BASE_URL,
     ComfyClient,
@@ -3905,8 +3906,13 @@ def create_ui_app(
             allowed_tools = list(ag.config.allowed_tools)
             # What the agent holds, not what it is permitted: a permitted name can have no
             # tool behind it (a memory tool on an agent with no store, #1431), and an empty
-            # permission list permits every registered tool.
-            capabilities = [tool.name for tool in ag.available_tools()]
+            # permission list permits every registered tool. Not what its last turn was
+            # offered either: an agent that has not yet run in a conversation still holds
+            # the tools a turn outside one is not offered (`needs_room`), and those are
+            # named as such (#1576).
+            held = ag.held_tools()
+            capabilities = [tool.name for tool in held]
+            capabilities_needing_room = [tool.name for tool in held if tool_needs_room(tool)]
             role = ag.config.role or "Agent"
             isolation_level = ag.config.isolation.level.value
             subagent_ids = [
@@ -3924,6 +3930,7 @@ def create_ui_app(
                     "isolation_level": isolation_level,
                     "allowed_tools": allowed_tools,
                     "capabilities": capabilities,
+                    "capabilities_needing_room": capabilities_needing_room,
                     "turn_index": ag.context.turn_index,
                     "current_turn": current_turn,
                     "current_task": current_turn,
@@ -3948,6 +3955,7 @@ def create_ui_app(
                 "isolation_level": ag["isolation_level"],
                 "allowed_tools": ag["allowed_tools"],
                 "capabilities": ag["capabilities"],
+                "capabilities_needing_room": ag["capabilities_needing_room"],
                 "current_turn": ag["current_turn"],
                 "current_task": ag["current_task"],
                 "turn_index": ag["turn_index"],

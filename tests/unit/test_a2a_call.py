@@ -200,13 +200,16 @@ def _writer(
     depth: int = 0,
     llm: MockLLMConnector | None = None,
     session_id: str = "sess_writer",
+    max_steps: int | None = None,
 ) -> BaseAgent:
+    ceiling: dict[str, Any] = {} if max_steps is None else {"max_steps": max_steps}
     agent = BaseAgent(
         config=AgentConfig(
             agent_id="writer",
             name="writer",
             enable_write_tools=True,
             llm_config=AgentLLMConfig(model_name="mock-model"),
+            **ceiling,
         ),
         llm=llm or MockLLMConnector(),
         tools=ToolRegistry([A2ACallTool()]),
@@ -341,6 +344,32 @@ class TestWhoMayBeCalled:
         assert result.error == "A task from another persona cannot be passed on to a third one."
         assert draw.runs == 0
 
+    @pytest.mark.asyncio
+    async def test_a_message_that_does_not_say_how_deep_it_is_is_refused(
+        self, tmp_path: Path
+    ) -> None:
+        """No depth key is not taken as depth 1: the handler's check stands on its own
+        rather than trusting whoever sent the message to have been `a2a_call` (#1570). The
+        refusal names what is missing -- the call depth -- not the sender, which is there.
+
+        Killed by: src/uclone_x/room/a2a_handlers.py :: if depth is None:
+        Becomes: if False:
+        Killed by: src/uclone_x/room/a2a_handlers.py :: "This task did not give its call depth (how many personas passed it on), "
+        Becomes: "This task did not say where it came from, "
+        """
+        draw = _Draw(tmp_path)
+        handler = _handler(tmp_path, _draw_llm(), ToolRegistry([draw]))
+        message = _message().model_copy(update={"metadata": {}})
+
+        result = await handler(message)
+
+        assert result.status is TaskStatus.REJECTED
+        assert result.error == (
+            "This task did not give its call depth (how many personas passed it on), "
+            "so it was not taken."
+        )
+        assert draw.runs == 0
+
     def test_a2a_call_is_offered_only_to_an_agent_with_someone_to_call(
         self, tmp_path: Path
     ) -> None:
@@ -368,6 +397,33 @@ class TestWhoMayBeCalled:
 
         assert callee.a2a_peers == ()
         assert A2A_CALL_TOOL_NAME not in callee.allowed_tools
+
+    @pytest.mark.asyncio
+    async def test_a_call_refused_on_its_arguments_says_nothing_was_asked(
+        self, tmp_path: Path
+    ) -> None:
+        """Plain words naming the missing argument and what the tool takes; no pydantic
+        report, no class name (#1570).
+
+        Killed by: src/uclone_x/tools/builtin/a2a.py :: describe_invalid_arguments(tool, exc, A2ACallParams, self.not_run_note),
+        Becomes: str(exc),
+        """
+        recorder = _Recorder()
+        transport = A2AInMemoryTransport()
+        transport.register_handler("artist", recorder)
+        writer = _writer(tmp_path, transport)
+
+        record = await writer.execute_tool_call(A2A_CALL_TOOL_NAME, {"task": "Draw."})
+
+        assert record.status is ToolResultStatus.ERROR
+        assert record.error is not None
+        assert record.error.startswith(
+            "The call to 'a2a_call' was refused because its arguments did not fit: 'agent' "
+            "is missing. Nothing was asked of another persona. It takes: agent (required), "
+        )
+        for internal in ("pydantic", "http", "Field required", "A2ACallParams", "type="):
+            assert internal not in record.error
+        assert recorder.messages == []
 
 
 class TestWhatTheCallerSends:
@@ -443,6 +499,85 @@ class TestTheCallersBudget:
         assert writer.run_steps - before == 2
 
     @pytest.mark.asyncio
+    async def test_a_peer_reason_is_led_by_its_name_only_when_it_does_not_give_it(
+        self, tmp_path: Path
+    ) -> None:
+        """The caller hears the persona's name once: a reason that is a sentence about the
+        persona is passed on as it is (see the budget test), and one that does not name it
+        -- or names only a longer word containing it -- is led by the name (#1570).
+
+        Killed by: src/uclone_x/tools/builtin/a2a.py :: error = reason if _names(reason, call.agent) else f"{lead}: {reason}"
+        Becomes: error = reason if call.agent in reason else f"{lead}: {reason}"
+        """
+        errors: list[str | None] = []
+        for reason in ("it ran out of steps", "the artists' room was closed"):
+            transport = A2AInMemoryTransport()
+            transport.register_handler(
+                "artist",
+                _Recorder(
+                    TaskResult(
+                        task_id="x",
+                        status=TaskStatus.FAILED,
+                        output_data={"steps": 0, "paths": []},
+                        error=reason,
+                        provenance=Provenance.primary(provider="mock", model="mock-model"),
+                    )
+                ),
+            )
+            record = await _writer(tmp_path, transport).execute_tool_call(
+                A2A_CALL_TOOL_NAME, {"agent": "artist", "task": "Draw."}
+            )
+            errors.append(record.error)
+
+        assert errors == [
+            "'artist' could not do the task: it ran out of steps",
+            "'artist' could not do the task: the artists' room was closed",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_only_a_reason_that_starts_with_or_quotes_the_name_drops_the_lead(
+        self, tmp_path: Path
+    ) -> None:
+        """A reason that uses the persona's name as a word somewhere in the middle is not a
+        sentence about the persona, so it keeps the lead naming who stopped; one that
+        starts with the name, or quotes it, is passed on as it is (#1602).
+
+        Killed by: src/uclone_x/tools/builtin/a2a.py :: return re.match(
+        Becomes: return re.search(
+        Killed by: src/uclone_x/tools/builtin/a2a.py :: is not None or f"'{persona}'" in text
+        Becomes: is not None or False
+        """
+        errors: list[str | None] = []
+        for reason in (
+            "the room closed before artist could finish",
+            "artist stopped: the room closed",
+            "There is no persona named 'artist'.",
+        ):
+            transport = A2AInMemoryTransport()
+            transport.register_handler(
+                "artist",
+                _Recorder(
+                    TaskResult(
+                        task_id="x",
+                        status=TaskStatus.FAILED,
+                        output_data={"steps": 0, "paths": []},
+                        error=reason,
+                        provenance=Provenance.primary(provider="mock", model="mock-model"),
+                    )
+                ),
+            )
+            record = await _writer(tmp_path, transport).execute_tool_call(
+                A2A_CALL_TOOL_NAME, {"agent": "artist", "task": "Draw."}
+            )
+            errors.append(record.error)
+
+        assert errors == [
+            "'artist' could not do the task: the room closed before artist could finish",
+            "artist stopped: the room closed",
+            "There is no persona named 'artist'.",
+        ]
+
+    @pytest.mark.asyncio
     async def test_the_handler_reports_the_steps_its_agent_took(self, tmp_path: Path) -> None:
         """Drawing and then answering is two steps, and the result says so.
 
@@ -455,6 +590,33 @@ class TestTheCallersBudget:
 
         assert result.status is TaskStatus.COMPLETED
         assert result.output_data["steps"] == 2
+
+    @pytest.mark.asyncio
+    async def test_the_called_agent_stops_at_what_the_caller_has_left(self, tmp_path: Path) -> None:
+        """P4: a caller with one step left buys the peer one step, not its persona's own
+        ceiling. Drawing and then answering needs two, so the peer stops after drawing,
+        and the caller is told it ran out of steps -- not a bare "could not finish" (#1570),
+        naming the persona once.
+
+        Killed by: src/uclone_x/room/a2a_handlers.py :: update |= {"max_steps": budget, "max_turns": budget}
+        Becomes: pass
+        Killed by: src/uclone_x/room/a2a_handlers.py :: out_of_steps = turn.stop_reason == _STEP_CEILING or (
+        Becomes: out_of_steps = False or (
+        """
+        draw = _Draw(tmp_path)
+        transport = A2AInMemoryTransport()
+        transport.register_handler("artist", _handler(tmp_path, _draw_llm(), ToolRegistry([draw])))
+        writer = _writer(tmp_path, transport, max_steps=1)
+        assert writer.steps_remaining == 1
+
+        record = await writer.execute_tool_call(
+            A2A_CALL_TOOL_NAME, {"agent": "artist", "task": "Draw the hero."}
+        )
+
+        assert draw.runs == 1
+        assert record.status is ToolResultStatus.ERROR
+        assert record.error == "artist stopped before finishing: it ran out of steps."
+        assert writer.run_steps == 1
 
 
 # --------------------------------------------------------------------------------------
@@ -517,7 +679,12 @@ class TestTheCalledAgent:
 
     @pytest.mark.asyncio
     async def test_the_caller_hears_which_tool_needed_approval(self, tmp_path: Path) -> None:
-        """The refusal reaches Writer in plain words, and nothing is resumed."""
+        """The refusal reaches Writer in plain words, naming the persona once, and nothing
+        is resumed.
+
+        Killed by: src/uclone_x/tools/builtin/a2a.py :: error = reason if _names(reason, call.agent) else f"{lead}: {reason}"
+        Becomes: error = f"{lead}: {reason}"
+        """
         draw = _Draw(tmp_path)
         transport = A2AInMemoryTransport()
         transport.register_handler(
@@ -531,11 +698,90 @@ class TestTheCalledAgent:
         )
 
         assert record.status is ToolResultStatus.ERROR
-        assert record.error == (
-            "'artist' stopped before finishing: "
-            "artist needed approval to use draw, so it did not run."
-        )
+        assert record.error == "artist needed approval to use draw, so it did not run."
         assert draw.runs == 0
+
+    @pytest.mark.asyncio
+    async def test_an_artist_that_cannot_be_set_up_is_refused_in_plain_words(
+        self, tmp_path: Path
+    ) -> None:
+        """Building the agent is inside the handler's `try`: a host that fails to come up
+        reaches the caller as a sentence, never as the exception's class, message or
+        traceback -- the agent's generic tool-failure path would show all three (#1570).
+
+        Killed by: src/uclone_x/room/a2a_handlers.py :: except Exception as exc:  # the caller gets a sentence, the log gets the cause
+        Becomes: except ValueError as exc:  # the caller gets a sentence, the log gets the cause
+        Killed by: src/uclone_x/room/a2a_handlers.py :: if agent is None:
+        Becomes: if False:
+        """
+
+        class _HostDown(RuntimeError):
+            pass
+
+        def broken() -> HostDependencies:
+            raise _HostDown("vault_socket_7f3a refused at /srv/internal/host.py:42")
+
+        transport = A2AInMemoryTransport()
+        transport.register_handler(
+            "artist",
+            PersonaTaskHandler(
+                "artist",
+                host_factory=broken,
+                persona_registry=_registry(_artist()),
+                workspace_root=tmp_path,
+            ),
+        )
+        writer = _writer(tmp_path, transport)
+        before = writer.run_steps
+
+        record = await writer.execute_tool_call(
+            A2A_CALL_TOOL_NAME, {"agent": "artist", "task": "Draw the hero."}
+        )
+
+        assert record.status is ToolResultStatus.ERROR
+        assert record.error == "artist could not be started for this task, so nothing was done."
+        for internal in ("_HostDown", "RuntimeError", "vault_socket", "host.py", "Traceback"):
+            assert internal not in record.error
+        assert writer.run_steps == before
+
+    @pytest.mark.asyncio
+    async def test_the_log_tells_a_setup_failure_from_a_turn_failure(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An operator reading the log can tell an agent that never started from one that
+        failed while working; both used to log "failed a task" (#1570).
+
+        Killed by: src/uclone_x/room/a2a_handlers.py :: "a2a: %s could not be set up for a task: %s", persona.name, exc, exc_info=True
+        Becomes: "a2a: %s failed while doing a task: %s", persona.name, exc, exc_info=True
+        """
+
+        def broken() -> HostDependencies:
+            raise RuntimeError("host down")
+
+        async def failing_turn(self: BaseAgent, *args: Any, **kwargs: Any) -> Any:
+            raise RuntimeError("model gone")
+
+        setup = PersonaTaskHandler(
+            "artist",
+            host_factory=broken,
+            persona_registry=_registry(_artist()),
+            workspace_root=tmp_path,
+        )
+        with caplog.at_level("WARNING", logger="uclone_x.room.a2a_handlers"):
+            setup_result = await setup(_message())
+        setup_lines = [r.getMessage() for r in caplog.records]
+        caplog.clear()
+
+        monkeypatch.setattr(BaseAgent, "execute_turn", failing_turn)
+        turn = _handler(tmp_path, _draw_llm(), ToolRegistry([_Draw(tmp_path)]))
+        with caplog.at_level("WARNING", logger="uclone_x.room.a2a_handlers"):
+            turn_result = await turn(_message())
+        turn_lines = [r.getMessage() for r in caplog.records]
+
+        assert setup_result.status is TaskStatus.REJECTED
+        assert turn_result.status is TaskStatus.FAILED
+        assert setup_lines == ["a2a: artist could not be set up for a task: host down"]
+        assert turn_lines == ["a2a: artist failed while doing a task: model gone"]
 
     @pytest.mark.asyncio
     async def test_the_called_artist_cannot_record_a_memory(self, tmp_path: Path) -> None:

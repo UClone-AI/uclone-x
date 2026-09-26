@@ -43,8 +43,16 @@ ucx-agent-skills/
     ├── scripts/             # Helper scripts (Python, Bash, SQL)
     │   └── profile_queries.py
     ├── resources/           # Templates, reference schemas
+    │   └── story/           # Story structures and muse tables the story tools read (#1572)
     └── tests/               # Unit verification tests for the skill
 ```
+
+`resources/story/{structures,muse}/<id>.yaml` is the one resource folder the Core reads
+today: `story_outline` and `muse_spark` add or replace structure templates and genre tables
+by id from every *active* skill that carries it. A data file or data folder whose resolved
+location is outside the skill's own folder is refused, and so is anything but a regular
+file in a data file's place (a folder, FIFO or other special file). The layout and the precedence rules are in
+`design/novel-writer-clone-architecture.md` §8.
 
 `SKILL.md` is the only required file. `load_skill_from_dir` raises `SkillAuditError` if
 the directory is missing, is not a directory, or has no `SKILL.md`. The auditor walks
@@ -129,10 +137,22 @@ class SkillManifest(BaseModel):
 | `content_sha256` | Digest of the package contents at audit time, so a later edit is detectable and **an audit cannot be inherited by different code**. |
 | `approved_by` / `approved_at` / `rejected_by` / `rejected_at` / `rejection_reason` | Promotion and rejection provenance, written by the CLI gate (§7). |
 
-`compute_skill_sha256(dir)` hashes every non-dotfile under the package in sorted order,
-mixing in each POSIX-relative path so a rename changes the digest. It raises
-`SkillAuditError` on a non-existent or non-directory path (a single file is hashed
-directly).
+`compute_skill_sha256(dir)` hashes the regular files it lists under the package whose names
+do not start with a dot, in sorted order, mixing in each POSIX-relative path so a rename
+changes the digest. It raises `SkillAuditError` on a non-existent or non-directory path (a
+single file is hashed directly). It follows a link to a file and does not descend into a
+link to a folder; files under a folder link, FIFOs, sockets, devices and broken links are
+not in the digest. It fails closed: a folder it cannot list, a file it cannot read, or a
+link that loops (under a name that does not start with a dot) raises `SkillAuditError` naming it inside the package, where `rglob` used to
+skip such a folder, and `is_file()` such a link, silently (#1572).
+So `audit_skill` raises and nothing is approved: `./ucx skill approve` prints the reason
+and exits 1 with the skill unchanged, and `reload_approved` does not load the skill.
+`reload_approved` logs at warning level, with the reason, each package that fails to load
+or to be audited, and each skill marked active whose audit does not approve it (#1604);
+a package that is not active, or a folder without a `SKILL.md`, is skipped without a log
+line. On Python 3.14,
+where `Path.is_file()` answers False for every error, the walk stats each entry itself,
+so a file whose stat is refused still fails the audit instead of being left out.
 
 > **Loader subtlety.** The model requires `origin`, but `manifest_from_dict` substitutes
 > `SkillOrigin.SYNTHESIZED` when the frontmatter omits it, and `SkillStatus.PENDING`
@@ -357,7 +377,7 @@ The transitions are **writes to the `SKILL.md` frontmatter on disk**, performed 
 | :--- | :--- |
 | `./ucx skill list [--pending] [--all] [--dir PATH]` | Loads every `<dir>/*/SKILL.md` and tables name, version, origin, status, requested isolation, approver, description. `--pending` filters to `PENDING` and `QUARANTINED`; `REJECTED` is hidden unless `--all`. Unparseable packages are skipped silently. |
 | `./ucx skill audit <name> [--policy safe_only\|never\|always]` | Runs the auditor and prints verdict, `is_safe`, risk score, evaluated policy, content digest and every detected risk. **Read-only** — it changes no status. Exits 1 on an audit error or an invalid policy. |
-| `./ucx skill approve <name> [--approver ID] [--force]` | Re-runs the auditor, then on a non-`REJECT` verdict writes `status: active`, `approved_by`, `approved_at` (UTC ISO-8601), and `content_sha256` **from the fresh report** — binding the approval to the bytes that were just audited. Clears any prior rejection fields. A `REJECT` verdict exits 1 and lists the risks unless `--force` is given. An already-`ACTIVE` skill is a no-op without `--force`. |
+| `./ucx skill approve <name> [--approver ID] [--force]` | Re-runs the auditor, then on a non-`REJECT` verdict writes `status: active`, `approved_by`, `approved_at` (UTC ISO-8601), and `content_sha256` **from the fresh report** — binding the approval to the bytes that were just audited. Clears any prior rejection fields. A `REJECT` verdict exits 1 and lists the risks unless `--force` is given. An already-`ACTIVE` skill is a no-op without `--force`. An audit that cannot finish (`SkillAuditError`, e.g. a folder the hash cannot list) exits 1 with the reason and changes nothing, `--force` included. |
 | `./ucx skill reject <name> [--reason TEXT] [--rejecter ID]` | Writes `status: rejected` plus `rejected_by`, `rejected_at`, `rejection_reason`. Runs **no** audit and has no `--force`; rejection needs no justification from the auditor. |
 
 Reachable states: `PENDING` (the default on disk) → `ACTIVE` via `approve`, or

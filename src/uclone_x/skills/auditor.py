@@ -8,8 +8,11 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import errno
 import hashlib
 import logging
+import os
+import stat
 from pathlib import Path
 from typing import Any, cast
 
@@ -263,7 +266,15 @@ def manifest_from_dict(data: dict[str, Any]) -> SkillManifest:
 
 
 def compute_skill_sha256(skill_dir: Path) -> str:
-    """Compute a deterministic SHA-256 digest of all files in a skill package."""
+    """Compute a deterministic SHA-256 digest of a skill package.
+
+    The walk hashes each regular file it lists whose name does not start with a dot, by
+    its path inside the package and its bytes, in sorted path order. A link to a file is
+    hashed through. A link to a folder is not descended into, so files under it are not in
+    the digest, and neither are FIFOs, sockets, devices or broken links. A folder the walk
+    cannot list, a file it cannot read, or a link that loops under a name that does not
+    start with a dot raises `SkillAuditError` naming it instead of being skipped.
+    """
     hasher = hashlib.sha256()
     if skill_dir.is_file():
         hasher.update(skill_dir.read_bytes())
@@ -272,12 +283,84 @@ def compute_skill_sha256(skill_dir: Path) -> str:
     if not skill_dir.exists() or not skill_dir.is_dir():
         raise SkillAuditError(f"Cannot compute hash for invalid directory: {skill_dir}")
 
-    for path in sorted(skill_dir.rglob("*")):
-        if path.is_file() and not path.name.startswith("."):
-            rel_path = path.relative_to(skill_dir).as_posix()
-            hasher.update(rel_path.encode("utf-8"))
-            hasher.update(path.read_bytes())
+    try:
+        for path in sorted(_package_entries(skill_dir)):
+            if _is_file(path) and not path.name.startswith("."):
+                rel_path = path.relative_to(skill_dir).as_posix()
+                hasher.update(rel_path.encode("utf-8"))
+                hasher.update(path.read_bytes())
+            elif not path.name.startswith(".") and path.is_symlink():
+                _refuse_a_loop(path)
+    except OSError as exc:
+        raise SkillAuditError(
+            f"The skill package could not be read in full, so it cannot be audited: "
+            f"'{_inside(skill_dir, exc.filename)}' could not be read ({exc.strerror})."
+        ) from exc
     return hasher.hexdigest()
+
+
+#: The errors after which `Path.is_file()` on Python 3.11 to 3.13 answers False rather than
+#: raising: the entry is missing, or is a link that loops or leads nowhere.
+_NOT_A_FILE = frozenset({errno.ENOENT, errno.ENOTDIR, errno.EBADF, errno.ELOOP})
+
+
+def _is_file(path: Path) -> bool:
+    """`Path.is_file()` as Python 3.11 to 3.13 answer it, on every version.
+
+    Python 3.14's `is_file()` answers False for any error, so a file whose stat is refused
+    (a folder the walk can list but not search) would be left out of the digest instead of
+    failing the audit. Here only the errors that mean "not a file" answer False; any other
+    is raised, and `compute_skill_sha256` turns it into `SkillAuditError`.
+    """
+    try:
+        return stat.S_ISREG(os.stat(path).st_mode)
+    except OSError as exc:
+        if exc.errno in _NOT_A_FILE:
+            return False
+        raise
+
+
+def _refuse_a_loop(link: Path) -> None:
+    """Raise `ELOOP` for a link that loops; any other link that is not a file is left out.
+
+    `is_file()` answers False for a link that loops, so the walk would leave it out of the
+    digest while the story loader refuses it. Raising here makes the audit refuse it too. A
+    link to a folder or a broken link is still left out, as before, so the digest of every
+    package without a looping link is unchanged.
+    """
+    try:
+        link.stat()
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise
+
+
+def _package_entries(skill_dir: Path) -> list[Path]:
+    """Every entry under `skill_dir`, as `rglob("*")` lists them, but raising on a folder
+    it cannot list where `rglob` would skip it silently. Links to folders are listed and
+    not descended into, as `rglob` does."""
+
+    def _refuse(error: OSError) -> None:
+        raise error
+
+    entries: list[Path] = []
+    for folder, dirnames, filenames in os.walk(skill_dir, onerror=_refuse):
+        entries.extend(Path(folder) / name for name in (*dirnames, *filenames))
+    return entries
+
+
+def _inside(skill_dir: Path, filename: object) -> str:
+    """`filename` as a path inside the package, for a message; never a path outside it."""
+    if isinstance(filename, Path):
+        path = filename
+    elif isinstance(filename, str):
+        path = Path(filename)
+    else:
+        return "."
+    try:
+        return path.relative_to(skill_dir).as_posix()
+    except ValueError:
+        return path.name
 
 
 def serialize_skill_markdown(manifest: SkillManifest, instructions: str) -> str:
@@ -757,6 +840,11 @@ class SkillRegistry:
         reloaded: list[SkillProtocol] = []
         for child in sorted(target_dir.iterdir()):
             if child.is_dir() and (child / "SKILL.md").is_file():
+                # Why a package failed to load or to be audited, or why an active one was
+                # not approved; logged as a warning, not at debug, because an active skill
+                # that stops loading is otherwise invisible and the tools that read its data
+                # quietly lose it (P6). A package that is not active is skipped unlogged.
+                dropped: str | None = None
                 try:
                     skill = load_skill_from_dir(child)
                     if skill.manifest.status == SkillStatus.ACTIVE:
@@ -772,6 +860,15 @@ class SkillRegistry:
                             )
                             self.register(bound_skill, report)
                             reloaded.append(bound_skill)
+                        else:
+                            dropped = (
+                                "it is marked active, but its audit did not approve it "
+                                f"(safe: {report.is_safe}, recommendation: "
+                                f"{report.recommendation.value}, "
+                                f"{len(report.detected_risks)} risk(s) found)"
+                            )
                 except Exception as exc:
-                    logger.debug("Failed to reload skill package %s: %s", child.name, exc)
+                    dropped = str(exc)
+                if dropped is not None:
+                    logger.warning("The skill '%s' was not loaded: %s", child.name, dropped)
         return tuple(reloaded)

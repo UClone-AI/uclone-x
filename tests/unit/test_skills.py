@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+import os
 from pathlib import Path
 
 import pytest
@@ -806,3 +808,207 @@ def test_skill_registry_get_summary() -> None:
     assert s["audit_report"]["skill_name"] == "unit_skill"
     assert s["audit_report"]["is_safe"] is True
     assert registry.get_audit_report("unit_skill") == report
+
+
+_UNLISTABLE = 0o311  # searchable, not listable: a reader passes through, a walk cannot list
+
+
+def _skip_as_root() -> None:
+    if not hasattr(os, "geteuid") or os.geteuid() == 0:
+        pytest.skip("root lists any folder, and the test needs one it cannot")
+
+
+def _skill_with_locked_folder(skills_dir: Path, status: SkillStatus) -> Path:
+    skill_dir = skills_dir / "locked_skill"
+    save_skill(
+        skill_dir,
+        SkillManifest(
+            name="locked_skill",
+            description="Carries data under a folder that cannot be listed",
+            origin=SkillOrigin.HUMAN,
+            status=status,
+        ),
+        "# Locked",
+    )
+    data = skill_dir / "resources" / "story" / "muse" / "western.yaml"
+    data.parent.mkdir(parents=True)
+    data.write_text("genre: western\n", encoding="utf-8")
+    return skill_dir
+
+
+def test_the_hash_refuses_a_folder_it_cannot_list_instead_of_skipping_it(tmp_path: Path) -> None:
+    """`rglob` skipped such a folder silently, so its files were read but never hashed.
+
+    Killed by: src/uclone_x/skills/auditor.py :: for folder, dirnames, filenames in os.walk(skill_dir, onerror=_refuse):
+    Becomes: for folder, dirnames, filenames in os.walk(skill_dir):
+    """
+    _skip_as_root()
+    skill_dir = _skill_with_locked_folder(tmp_path, SkillStatus.PENDING)
+    (skill_dir / "resources").chmod(_UNLISTABLE)
+    try:
+        with pytest.raises(SkillAuditError) as caught:
+            compute_skill_sha256(skill_dir)
+    finally:
+        (skill_dir / "resources").chmod(0o755)
+
+    assert str(caught.value) == (
+        "The skill package could not be read in full, so it cannot be audited: "
+        "'resources' could not be read (Permission denied)."
+    )
+
+
+def test_the_hash_refuses_a_link_that_loops_instead_of_leaving_it_out(tmp_path: Path) -> None:
+    """The story loader refuses a data file that links to itself, so the audit must not pass it.
+
+    Killed by: src/uclone_x/skills/auditor.py :: if exc.errno == errno.ELOOP:
+    Becomes: if False:
+    """
+    skill_dir = _skill_with_locked_folder(tmp_path, SkillStatus.PENDING)
+    loop = skill_dir / "resources" / "story" / "muse" / "loop.yaml"
+    loop.symlink_to("loop.yaml")
+
+    with pytest.raises(SkillAuditError) as caught:
+        compute_skill_sha256(skill_dir)
+
+    assert str(caught.value) == (
+        "The skill package could not be read in full, so it cannot be audited: "
+        "'resources/story/muse/loop.yaml' could not be read (Too many levels of symbolic links)."
+    )
+
+
+def test_a_broken_link_and_a_folder_link_are_still_left_out_of_the_hash(tmp_path: Path) -> None:
+    """Refusing loops must not change the digest of a package that has none.
+
+    Killed by: src/uclone_x/skills/auditor.py :: exc.errno == errno.ELOOP
+    Becomes: True
+    """
+    skill_dir = _skill_with_locked_folder(tmp_path, SkillStatus.PENDING)
+    before = compute_skill_sha256(skill_dir)
+    (skill_dir / "broken.yaml").symlink_to("missing.yaml")
+    (skill_dir / "elsewhere").symlink_to(tmp_path, target_is_directory=True)
+
+    assert compute_skill_sha256(skill_dir) == before
+
+
+def test_the_hash_refuses_a_file_whose_stat_is_refused_on_every_python(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A folder the walk can list but not search leaves its files' stat refused (#1604).
+
+    Python 3.11 to 3.13's `Path.is_file()` raised there, and the audit failed. Python 3.14's
+    answers False for every error, as does its `is_symlink()`, so the file was left out of
+    the digest while the story loader refused it at open. The predicates are replaced here
+    with their 3.14 behaviour, so this runs the 3.14 case on every version.
+
+    Killed by: src/uclone_x/skills/auditor.py :: return stat.S_ISREG(os.stat(path).st_mode)
+    Becomes: return path.is_file()
+    """
+    _skip_as_root()
+
+    def _answer_false_on_error(predicate: str) -> None:
+        original = getattr(Path, predicate)
+
+        def swallowing(self: Path) -> bool:
+            try:
+                return bool(original(self))
+            except OSError:
+                return False
+
+        monkeypatch.setattr(Path, predicate, swallowing)
+
+    _answer_false_on_error("is_file")
+    _answer_false_on_error("is_symlink")
+    skill_dir = _skill_with_locked_folder(tmp_path, SkillStatus.PENDING)
+    muse = skill_dir / "resources" / "story" / "muse"
+    muse.chmod(0o600)  # listable, not searchable
+    try:
+        with pytest.raises(SkillAuditError) as caught:
+            compute_skill_sha256(skill_dir)
+    finally:
+        muse.chmod(0o755)
+
+    assert str(caught.value) == (
+        "The skill package could not be read in full, so it cannot be audited: "
+        "'resources/story/muse/western.yaml' could not be read (Permission denied)."
+    )
+
+
+async def test_an_active_skill_whose_hash_cannot_be_computed_is_not_loaded(
+    tmp_path: Path,
+) -> None:
+    """The registry loads it while every folder lists, and not once one cannot be listed.
+
+    Killed by: src/uclone_x/skills/auditor.py :: raise error
+    Becomes: return None
+    """
+    _skip_as_root()
+    skill_dir = _skill_with_locked_folder(tmp_path, SkillStatus.ACTIVE)
+    loaded = await SkillRegistry(skills_dir=tmp_path).reload_approved()
+    assert [s.manifest.name for s in loaded] == ["locked_skill"]
+
+    (skill_dir / "resources").chmod(_UNLISTABLE)
+    try:
+        registry = SkillRegistry(skills_dir=tmp_path)
+        assert await registry.reload_approved() == ()
+    finally:
+        (skill_dir / "resources").chmod(0o755)
+    assert registry.get("locked_skill") is None
+
+
+async def test_an_active_skill_that_cannot_be_audited_is_dropped_with_a_warning(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """It used to be dropped at debug level, so nobody saw why its data stopped loading (#1604).
+
+    Killed by: src/uclone_x/skills/auditor.py :: logger.warning("The skill '%s' was not loaded: %s", child.name, dropped)
+    Becomes: logger.debug("The skill '%s' was not loaded: %s", child.name, dropped)
+
+    Killed by: src/uclone_x/skills/auditor.py :: dropped = str(exc)
+    Becomes: dropped = None
+    """
+    _skip_as_root()
+    skill_dir = _skill_with_locked_folder(tmp_path, SkillStatus.ACTIVE)
+    (skill_dir / "resources").chmod(_UNLISTABLE)
+    try:
+        with caplog.at_level(logging.WARNING, logger="uclone_x.skills.auditor"):
+            assert await SkillRegistry(skills_dir=tmp_path).reload_approved() == ()
+    finally:
+        (skill_dir / "resources").chmod(0o755)
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert warnings == [
+        "The skill 'locked_skill' was not loaded: The skill package could not be read in "
+        "full, so it cannot be audited: 'resources' could not be read (Permission denied)."
+    ]
+
+
+async def test_an_active_skill_its_audit_does_not_approve_is_dropped_with_a_warning(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A manifest that says `active` is not loaded when the audit disagrees, and that is logged.
+
+    Before #1604 this case was dropped with no log line at all.
+
+    Killed by: src/uclone_x/skills/auditor.py :: dropped = (
+    Becomes: _ = (
+    """
+    save_skill(
+        tmp_path / "risky_skill",
+        SkillManifest(
+            name="risky_skill",
+            description="Asks for a dangerous command",
+            origin=SkillOrigin.HUMAN,
+            status=SkillStatus.ACTIVE,
+        ),
+        "# Risky\n\nRun `rm -rf ~/scratch` first.",
+    )
+
+    with caplog.at_level(logging.WARNING, logger="uclone_x.skills.auditor"):
+        assert await SkillRegistry(skills_dir=tmp_path).reload_approved() == ()
+
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert warnings[0].startswith(
+        "The skill 'risky_skill' was not loaded: it is marked active, but its audit did not "
+        "approve it (safe: False, recommendation: "
+    )

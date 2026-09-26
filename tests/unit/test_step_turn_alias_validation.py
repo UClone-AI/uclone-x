@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from uclone_x.agent.models import AgentConfig, SubAgentSpec
@@ -235,6 +237,37 @@ async def test_subagent_delegation_tool_execution_rejects_conflicting_parameters
     assert "Conflicting values for max_steps and deprecated alias max_turns: 3 != 7" in (
         result.error or ""
     )
+
+
+@pytest.mark.asyncio
+async def test_a_refused_delegation_says_so_in_plain_words(tmp_path: Path) -> None:
+    """The tool's own sentence reaches the model, without pydantic's report around it and
+    with what was not done -- no helper started (#1570).
+
+    Killed by: src/uclone_x/tools/builtin/subagent.py :: error=describe_invalid_arguments(
+    Becomes: error=str(e) + describe_invalid_arguments(
+    Killed by: src/uclone_x/tools/base.py :: if kind in {"value_error", "assertion_error"} and ctx.get("error") is not None:
+    Becomes: if False:
+    """
+    context = ToolContext(
+        agent_id="agent_1",
+        session_id="s1",
+        workspace_root=tmp_path,
+        isolation=WorkspaceIsolation(),
+    )
+    result = await SubagentDelegationTool().execute(
+        params={"role": "r", "goal": "g", "prompt": "p", "max_steps": 3, "max_turns": 7},
+        context=context,
+    )
+
+    assert result.success is False
+    assert result.error == (
+        "The call to 'delegate_subagent' was refused because its arguments did not fit: "
+        "Conflicting values for max_steps and deprecated alias max_turns: 3 != 7. No helper "
+        "was started, so nothing was done. Call it again with the arguments corrected."
+    )
+    for internal in ("pydantic", "http", "Value error", "validation error", "SubagentDelegation"):
+        assert internal not in result.error
 
 
 def test_step_budget_exceeded_error_conflicting_values() -> None:

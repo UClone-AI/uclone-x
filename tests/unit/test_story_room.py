@@ -16,6 +16,7 @@ from fastapi.testclient import TestClient
 
 from uclone_x.agent.models import ToolExecutionRecord, TurnResult
 from uclone_x.agent.session import SessionState
+from uclone_x.errors import RoomError, RoomNotFoundError
 from uclone_x.llm import MockLLMConnector
 from uclone_x.room.models import (
     Participant,
@@ -27,6 +28,7 @@ from uclone_x.room.models import (
     SpeakerRequest,
 )
 from uclone_x.room.orchestrator import RoomOrchestrator
+from uclone_x.room.service import RoomService
 from uclone_x.room.store import RoomStore
 from uclone_x.story import OPEN_STORY_KEY
 from uclone_x.story.library import StoryLibrary
@@ -193,7 +195,7 @@ def client(tmp_path: Path) -> Iterator[TestClient]:
 
 class TestDeletingTheRoom:
     def test_the_story_files_stay_and_the_lease_is_given_back(self, client: TestClient) -> None:
-        """Killed by: src/uclone_x/ui/rooms.py :: _release_story(stack.session_manager().workspace_dir, story_id, room_id)
+        """Killed by: src/uclone_x/room/service.py :: self._release_story(self._stories, story_id, room_id)
         Becomes: pass
         """
         created = client.post("/api/rooms", json={"title": "Novel", "agent_ids": ["scout"]})
@@ -213,3 +215,69 @@ class TestDeletingTheRoom:
         assert client.get(f"/api/rooms/{room_id}").status_code == 404
         assert library.read_file(story, "chapter-01.md").text == "It began."
         assert library.load(story).lease is None
+
+    def test_deleting_through_the_service_gives_the_lease_back(self, tmp_path: Path) -> None:
+        """The Core gives the lease back, so no route has to remember to (#1565).
+
+        Killed by: src/uclone_x/room/service.py :: self._release_story(self._stories, story_id, room_id)
+        Becomes: pass
+        """
+        library = StoryLibrary(tmp_path / "workspace")
+        store = RoomStore(tmp_path / "rooms")
+        service = RoomService(store, stories=library)
+        room_id = service.create("Novel").room_id
+        story = library.create("Tide", room_id).story_id
+        store.save(service.get(room_id).model_copy(update={"story_id": story}))
+
+        assert service.delete(room_id) is True
+
+        assert library.load(story).lease is None
+        with pytest.raises(RoomNotFoundError):
+            service.get(room_id)
+
+    def test_a_service_that_cannot_give_the_lease_back_keeps_the_room(self, tmp_path: Path) -> None:
+        """Deleting would strand the lease, so the room stays and the refusal says why.
+
+        Killed by: src/uclone_x/room/service.py :: if story_id is not None and self._stories is None:
+        Becomes: if False:
+        """
+        library = StoryLibrary(tmp_path / "workspace")
+        store = RoomStore(tmp_path / "rooms")
+        service = RoomService(store)
+        room_id = service.create("Novel").room_id
+        story = library.create("Tide", room_id).story_id
+        store.save(service.get(room_id).model_copy(update={"story_id": story}))
+
+        with pytest.raises(RoomError) as refused:
+            service.delete(room_id)
+
+        assert str(refused.value) == (
+            "This conversation has a story open, and the story cannot be closed from "
+            "here, so the conversation was not deleted."
+        )
+        assert "lease" not in str(refused.value) and room_id not in str(refused.value)
+        assert service.get(room_id).story_id == story
+        assert library.load(story).lease is not None
+
+    def test_a_lease_not_given_back_is_logged_without_promising_the_story(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The story may be gone too, so the log does not say it can be taken over (#1578).
+
+        A failed release is logged and the delete stands; the log hedges on the story still
+        being there, because a story deleted from the Files screen fails the release too.
+        """
+
+        class _Refusing:
+            def release(self, story_id: str, holder: str) -> None:
+                raise OSError("story.yaml is gone")
+
+        store = RoomStore(tmp_path / "rooms")
+        service = RoomService(store, stories=cast(Any, _Refusing()))
+        room_id = service.create("Novel").room_id
+        store.save(service.get(room_id).model_copy(update={"story_id": "tide"}))
+
+        with caplog.at_level("WARNING", logger="uclone_x.room.service"):
+            assert service.delete(room_id) is True
+
+        assert "if that story is still there" in caplog.text

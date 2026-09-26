@@ -1378,7 +1378,7 @@ export function App() {
                   .setAutonomous(currentRoomId, enabled)
                   .then((next) => commitRoomAct(currentRoomId, generation, next))
                   .catch((err) =>
-                    setRoomNotice(`자율 토론 설정 실패: ${roomFailureReason(err)}`),
+                    setRoomNotice(`Could not update autonomous discussion: ${roomFailureReason(err)}`),
                   );
               }}
               // `why ›` on a turn. The dock is opened, not merely switched: a control
@@ -1458,6 +1458,9 @@ export function App() {
             cloneMode={cloneDockMode}
             onCloneModeChange={setCloneDockMode}
             availableTools={availableTools}
+            cloneToolsNeedingConversation={
+              agents.find((a) => a.id === selectedAgent)?.capabilities_needing_room
+            }
             availableModels={availableModels}
             canWritePersonas={personasDir !== null}
             onSavePersona={handleSavePersona}

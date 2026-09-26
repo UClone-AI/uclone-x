@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
+import pytest
 from typer.testing import CliRunner
 
 from uclone_x.cli.main import app
@@ -435,3 +437,42 @@ def test_cli_skill_synthesize_invalid_policy_fails(tmp_path: Path) -> None:
     )
     assert result.exit_code == 1
     assert "Invalid policy" in result.output
+
+
+def test_cli_skill_approve_refuses_a_package_it_cannot_read_in_full(tmp_path: Path) -> None:
+    """An audit that cannot hash the whole package approves nothing, and says why plainly.
+
+    Killed by: src/uclone_x/cli/commands/skill.py :: except SkillAuditError as exc:
+    Becomes: except ZeroDivisionError as exc:
+    """
+    if not hasattr(os, "geteuid") or os.geteuid() == 0:
+        pytest.skip("root lists any folder, and the test needs one it cannot")
+    skill_dir = tmp_path / "locked_skill"
+    save_skill(
+        skill_dir,
+        SkillManifest(
+            name="locked_skill",
+            description="Carries a folder that cannot be listed",
+            origin=SkillOrigin.HUMAN,
+            status=SkillStatus.PENDING,
+        ),
+        "# Locked",
+    )
+    (skill_dir / "resources" / "story").mkdir(parents=True)
+    (skill_dir / "resources").chmod(0o311)
+    try:
+        result = runner.invoke(
+            app,
+            ["skill", "approve", "locked_skill", "--dir", str(tmp_path)],
+            env={"COLUMNS": "400"},
+        )
+    finally:
+        (skill_dir / "resources").chmod(0o755)
+
+    assert result.exit_code == 1
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+    assert " ".join(result.output.split()) == (
+        "✖ Cannot approve skill 'locked_skill': The skill package could not be read in full, "
+        "so it cannot be audited: 'resources' could not be read (Permission denied)."
+    )
+    assert load_skill_from_dir(skill_dir).manifest.status is SkillStatus.PENDING

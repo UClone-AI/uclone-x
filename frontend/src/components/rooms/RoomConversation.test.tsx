@@ -2880,3 +2880,76 @@ describe('RoomConversation failure copy (#1408)', () => {
     expectPlain(notice.textContent);
   });
 });
+
+describe('RoomConversation autonomous discussion toggle', () => {
+  // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: <span className="column-icon-only">Auto discuss</span>
+  // Becomes: <span className="column-icon-only">자율 토론</span>
+  it('renders the autonomous toggle in English with proper accessible labels and invokes callback', () => {
+    const onToggleAutonomous = vi.fn();
+    const { rerender } = renderRoom({
+      onToggleAutonomous,
+      room: room({
+        policy: {
+          max_agent_turns_per_human_message: 3,
+          max_span_messages: 40,
+          transcript_window: 15,
+          hesitation_seconds: 0,
+          default_responder_id: '',
+          autonomous: false,
+        },
+      }),
+    });
+
+    const toggle = screen.getByTestId('toggle-autonomous');
+    expect(toggle).toHaveTextContent('Auto discuss');
+    expect(toggle).toHaveTextContent('OFF');
+    expect(toggle).toHaveAttribute('aria-label', 'Autonomous discussion off');
+    expect(toggle).toHaveAttribute(
+      'title',
+      'Turn on autonomous discussion (agents converse while you view)',
+    );
+
+    fireEvent.click(toggle);
+    expect(onToggleAutonomous).toHaveBeenCalledWith(true);
+
+    rerender(
+      <DraftHost
+        initial=""
+        props={{
+          room: room({
+            policy: {
+              max_agent_turns_per_human_message: 3,
+              max_span_messages: 40,
+              transcript_window: 15,
+              hesitation_seconds: 0,
+              default_responder_id: '',
+              autonomous: true,
+            },
+          }),
+          availableAgents: agents,
+          live: EMPTY_LIVE,
+          onSend: () => {},
+          onStop: () => {},
+          onRetry: () => {},
+          onAddAgent: () => {},
+          onTyping: () => {},
+          onOpenTurn: () => {},
+          onToggleAutonomous,
+        }}
+      />,
+    );
+
+    const onToggle = screen.getByTestId('toggle-autonomous');
+    expect(onToggle).toHaveTextContent('Auto discuss');
+    expect(onToggle).toHaveTextContent('ON');
+    expect(onToggle).toHaveAttribute('aria-label', 'Autonomous discussion on');
+    expect(onToggle).toHaveAttribute(
+      'title',
+      'Autonomous discussion active (agents converse while you view)',
+    );
+
+    fireEvent.click(onToggle);
+    expect(onToggleAutonomous).toHaveBeenCalledWith(false);
+  });
+});
+
