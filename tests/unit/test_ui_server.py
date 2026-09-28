@@ -14,11 +14,12 @@ import pytest
 from fastapi.testclient import TestClient
 from typer.testing import CliRunner
 
+from tests.support.app_clone import app_clone
 from tests.support.vite_diagnosis import answering_as, one_line
 from uclone_x import __version__
 from uclone_x.agent.base import BaseAgent
-from uclone_x.agent.models import AgentState
 from uclone_x.cli import main
+from uclone_x.core.agent_home import AgentHome
 from uclone_x.core.immutable import unwrap_immutable
 from uclone_x.core.provenance import (
     AttemptRecord,
@@ -153,38 +154,6 @@ def test_ui_diagnostics_endpoint(test_client: TestClient) -> None:
 
 
 @pytest.mark.asyncio
-async def test_list_agents_deduplicates_across_sessions(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """`list_agents` deduplicates agents with identical agent_id across sessions (#869).
-
-    Driven through `GET /api/agents` until that route was removed (2026-09-27, #1775);
-    the manager's list still feeds `/api/health`, `/api/diagnostics` and `/api/clones`.
-    """
-    monkeypatch.setenv("LLM_PROVIDER", "mock")
-    session_mgr = AgentSessionManager(storage_dir=tmp_path / "sessions")
-
-    # Spawn root agent in session 1
-    await session_mgr.get_or_create_agent(
-        agent_id="champion",
-        session_id="sess-1",
-    )
-    # Spawn root agent in session 2 (different instance, same agent_id)
-    await session_mgr.get_or_create_agent(
-        agent_id="champion",
-        session_id="sess-2",
-    )
-
-    # Without a session id: deduplicated (exactly 1 champion)
-    assert [ag.agent_id for ag in session_mgr.list_agents()] == ["champion"]
-
-    # With a session id: filtered to that session
-    assert [ag.agent_id for ag in session_mgr.list_agents(session_id="sess-1")] == ["champion"]
-
-    await session_mgr.clear()
-
-
-@pytest.mark.asyncio
 async def test_ui_chat_custom_agent_max_turns_budget() -> None:
     """A custom `AgentConfig.max_turns` bounds a run of steps, not a conversation.
 
@@ -253,7 +222,7 @@ async def test_ui_chat_with_tools_execution(tmp_path: Path) -> None:
         tool_calls=[tool_call],
     )
     session_mgr = AgentSessionManager(storage_dir=tmp_path / "sessions", llm=mock_llm, tools=tools)
-    agent = await session_mgr.get_or_create_agent("agent-tool-user")
+    agent = app_clone(session_mgr, "agent-tool-user")
 
     result = await agent.execute_turn("Analyze test.py")
 
@@ -275,8 +244,6 @@ async def test_ui_chat_with_tools_execution(tmp_path: Path) -> None:
     assert unwrap_immutable(te.output) == {"status": "clean", "symbols": 42}
     assert te.error is None
     assert te.duration_ms == 8.0
-
-    await session_mgr.clear()
 
 
 def test_a_manager_given_no_workspace_does_not_read_the_checkout(
@@ -311,34 +278,11 @@ async def test_agent_session_manager() -> None:
     tools = ToolRegistry()
     manager = AgentSessionManager(bus=bus, llm=mock_llm, tools=tools)
 
+    # Its running-agent cache went with `get_or_create_agent` (#1893); what a clone is
+    # built from is pinned where one is built (`test_one_clone_builder.py`).
     assert manager.bus is bus
     assert manager.tools is tools
     assert manager.llm is mock_llm
-    assert manager.list_agents() == []
-
-    agent = await manager.get_or_create_agent("test-agent-1", session_id="sess-1")
-    assert agent.agent_id == "test-agent-1"
-    assert manager.get_agent("test-agent-1") is agent
-    assert len(manager.list_agents()) == 1
-
-    # Fetching same agent returns cached instance
-    same_agent = await manager.get_or_create_agent("test-agent-1")
-    assert same_agent is agent
-
-    # Stop specific agent
-    await manager.stop_agent("test-agent-1")
-    assert manager.get_agent("test-agent-1") is None
-    assert agent.state == AgentState.TERMINATED
-
-    # Create multiple and clear
-    ag2 = await manager.get_or_create_agent("test-agent-2")
-    ag3 = await manager.get_or_create_agent("test-agent-3")
-    assert len(manager.list_agents()) == 2
-    await manager.clear()
-    assert len(manager.list_agents()) == 0
-    assert ag2.state == AgentState.TERMINATED
-    assert ag3.state == AgentState.TERMINATED
-
     # Test global singleton accessor
     global_mgr = get_ui_session_manager()
     assert global_mgr is not None
@@ -443,42 +387,6 @@ async def test_agent_session_manager_persistence_and_corrupt_files(tmp_path: Pat
 
 
 @pytest.mark.asyncio
-async def test_agent_session_manager_fallback_to_mock_behavior(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from uclone_x.llm.connectors.ollama import OllamaConnector
-
-    # `fallback_to_mock` is the unconfigured-case default, not an override, so the two halves
-    # need different environments and the scoping is the assertion. With a provider named,
-    # the flag must not shadow it; with none named, the flag chooses.
-    monkeypatch.setenv("LLM_PROVIDER", "ollama")
-    mgr_default = AgentSessionManager()
-    assert mgr_default.fallback_to_mock is False
-    ag_default = await mgr_default.get_or_create_agent("default-agent")
-    assert isinstance(ag_default._llm, OllamaConnector)
-    await mgr_default.clear()
-
-    # Explicit fallback_to_mock=True with nothing configured -> MockLLMConnector.
-    # `conftest` pins the suite to `mock`, so this clears it to reach the unconfigured path
-    # the flag is defined over.
-    monkeypatch.delenv("LLM_PROVIDER", raising=False)
-    mgr_mock = AgentSessionManager(fallback_to_mock=True)
-    assert mgr_mock.fallback_to_mock is True
-    ag_mock = await mgr_mock.get_or_create_agent("mock-agent")
-    assert isinstance(ag_mock._llm, MockLLMConnector)
-    await mgr_mock.clear()
-
-    # And with neither a provider nor the flag, the manager surfaces the refusal (#533)
-    # rather than building an agent whose connector cannot work.
-    from uclone_x.errors import LLMProviderNotConfiguredError
-
-    mgr_unconfigured = AgentSessionManager()
-    with pytest.raises(LLMProviderNotConfiguredError):
-        await mgr_unconfigured.get_or_create_agent("unconfigured-agent")
-    await mgr_unconfigured.clear()
-
-
-@pytest.mark.asyncio
 async def test_mock_llm_connector_and_factory() -> None:
     from uclone_x.llm.models import ChatMessage
 
@@ -574,9 +482,16 @@ def test_ui_dispatch_endpoint(test_client: TestClient) -> None:
     assert "error" in err_res.json()
 
 
+def _install_clone(*names: str) -> None:
+    """Give each named clone a home, so the listing a developer-graph read checks has it."""
+    for name in names:
+        assert AgentHome.for_username(name).agent_id()
+
+
 def test_ui_ontology_endpoint_empty(test_client: TestClient) -> None:
     """Assert /api/ontology returns truthful empty structure when unpopulated (P6, P8)."""
-    response = test_client.get("/api/ontology")
+    _install_clone("scout")
+    response = test_client.get("/api/ontology", params={"agent_id": "scout"})
     assert response.status_code == 200
     data = cast(dict[str, Any], response.json())
     assert "concepts" in data
@@ -594,8 +509,16 @@ def test_ui_ontology_endpoint_empty(test_client: TestClient) -> None:
 
 
 def test_ui_ontology_endpoint_populated(tmp_path: Path) -> None:
-    """Assert /api/ontology reflects live concepts, relations, and axioms in OntologyEngine."""
-    ontology_engine = OntologyEngine(agent_id="test-agent")
+    """/api/ontology reads the named clone's own rules engine, and no other clone's (#1869).
+
+    Killed by: src/uclone_x/ui/app.py :: return session_mgr.ontology_for(_developer_graph_clone(agent_id)).export_graph()
+    Becomes: return session_mgr.ontology_for("default").export_graph()
+    """
+    _install_clone("test-agent", "scout")
+    app = create_ui_app(static_dir=tmp_path)
+    manager = cast(AgentSessionManager, app.state.session_manager)
+    ontology_engine = manager.ontology_for("test-agent")
+    assert isinstance(ontology_engine, OntologyEngine)
     ontology_engine.register_entity(
         OntologyConcept(
             name="TestTask",
@@ -630,10 +553,12 @@ def test_ui_ontology_endpoint_populated(tmp_path: Path) -> None:
         )
     )
 
-    app = create_ui_app(static_dir=tmp_path, ontology_engine=ontology_engine)
     client = TestClient(app)
 
-    response = client.get("/api/ontology")
+    other = client.get("/api/ontology", params={"agent_id": "scout"}).json()
+    assert other["total_concepts"] == 0 and other["total_relations"] == 0
+
+    response = client.get("/api/ontology", params={"agent_id": "test-agent"})
     assert response.status_code == 200
     data = cast(dict[str, Any], response.json())
     assert data["total_concepts"] == 2
@@ -1313,7 +1238,7 @@ async def test_chat_endpoint_emits_persona_in_provenance_and_response(tmp_path: 
     session_mgr = AgentSessionManager(storage_dir=tmp_path, llm=mock_llm)
 
     # 1. The clone persona is populated on the result and in its provenance.
-    clone = await session_mgr.get_or_create_agent("clone", "sess_clone_test")
+    clone = app_clone(session_mgr, "clone", "sess_clone_test")
     result = await clone.execute_turn("Hello Clone")
     assert result.error is None, result.error
     assert result.persona == "clone"
@@ -1322,11 +1247,9 @@ async def test_chat_endpoint_emits_persona_in_provenance_and_response(tmp_path: 
     assert result.provenance.served_by.model == "mock-gpt-4o"
 
     # 2. A generic unconfigured agent does NOT fabricate a persona (P6).
-    generic = await session_mgr.get_or_create_agent("generic_custom_agent", "sess_gen_test")
+    generic = app_clone(session_mgr, "generic_custom_agent", "sess_gen_test")
     gen_result = await generic.execute_turn("Hello Generic")
     assert gen_result.persona is None
-
-    await session_mgr.clear()
 
 
 @pytest.mark.asyncio
@@ -1346,7 +1269,7 @@ async def test_chat_diagnostic_path_publishes_a_degraded_provenance() -> None:
         side_effect=LLMProviderError("Connection refused to Ollama at localhost:11434")
     )
     failing_mgr = AgentSessionManager(bus=EventBus(), tracer=tracer, llm=failing_llm)
-    agent = await failing_mgr.get_or_create_agent("prov-agent")
+    agent = app_clone(failing_mgr, "prov-agent")
 
     result = await agent.execute_turn("hi")
 
@@ -1359,8 +1282,6 @@ async def test_chat_diagnostic_path_publishes_a_degraded_provenance() -> None:
     assert provenance.attempts[0].error_class == "LLMProviderError"
     assert provenance.attempts[0].span_id is not None
     assert provenance.attempts[0].span_id.startswith("spn_")
-
-    await failing_mgr.clear()
 
 
 @pytest.mark.asyncio
@@ -1383,7 +1304,7 @@ async def test_chat_diagnostic_path_publishes_failover_notice_ordered_before_rep
     )
     failing_mgr = AgentSessionManager(bus=bus, tracer=tracer, llm=failing_llm)
     notices = bus.subscribe("agent.chat.failover")
-    agent = await failing_mgr.get_or_create_agent("failover-agent")
+    agent = app_clone(failing_mgr, "failover-agent")
 
     result = await agent.execute_turn("failover order test")
 
@@ -1401,8 +1322,6 @@ async def test_chat_diagnostic_path_publishes_failover_notice_ordered_before_rep
     assert result.provenance is not None
     assert notice.provenance.attempts[0].span_id == failover_span.span_id
     assert result.provenance.attempts[0].span_id == failover_span.span_id
-
-    await failing_mgr.clear()
 
 
 @pytest.mark.asyncio
@@ -1446,7 +1365,7 @@ async def test_ui_chat_tool_execution_error_records(tmp_path: Path) -> None:
         tool_calls=[tool_call1, tool_call2],
     )
     session_mgr = AgentSessionManager(storage_dir=tmp_path / "sessions", llm=mock_llm, tools=tools)
-    agent = await session_mgr.get_or_create_agent("agent-tool-err")
+    agent = app_clone(session_mgr, "agent-tool-err")
 
     result = await agent.execute_turn("Run failing tools")
 
@@ -1467,8 +1386,6 @@ async def test_ui_chat_tool_execution_error_records(tmp_path: Path) -> None:
     assert te2.tool_call_id == "tc_not_found"
     assert te2.status == "error"
     assert "not found" in str(te2.error)
-
-    await session_mgr.clear()
 
 
 @pytest.mark.asyncio
@@ -1872,7 +1789,11 @@ async def test_model_routes_admit_the_dashboards_own_dev_server(tmp_path: Path) 
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("builtin_personas_absent")
 async def test_update_settings_hot_reloads_runtime_and_publishes_event(tmp_path: Path) -> None:
-    """POST /api/settings hot-reloads active agent LLM and ComfyUI, broadcasts event (#350)."""
+    """POST /api/settings hot-reloads the LLM and ComfyUI and broadcasts an event (#350).
+
+    A clone built after the save answers on the new connector and model. A room seat
+    built before it is moved over by its resolver (`test_room_llm_replaced.py`).
+    """
     from uclone_x.tools.builtin.comfy_image_tool import ComfyImageGenTool
 
     event_bus = EventBus()
@@ -1892,8 +1813,7 @@ async def test_update_settings_hot_reloads_runtime_and_publishes_event(tmp_path:
     )
 
     session_mgr: AgentSessionManager = app.state.session_manager
-    agent = await session_mgr.get_or_create_agent(agent_id="test-agent", session_id="sess_test")
-    assert agent.llm is initial_llm
+    assert app_clone(session_mgr, "test-agent", "sess_before").llm is initial_llm
 
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
@@ -1917,7 +1837,8 @@ async def test_update_settings_hot_reloads_runtime_and_publishes_event(tmp_path:
     assert updated["comfyui_base_url"] == "http://comfy-gpu:8188"
     assert updated["llm_api_key_set"] is True
 
-    # 1. Hot-reload verified: agent._llm has been swapped without restart
+    # 1. Hot-reload verified: the connector was swapped without a restart
+    agent = app_clone(session_mgr, "test-agent", "sess_test")
     assert agent.llm is not initial_llm
     assert agent.llm is session_mgr.llm
     assert agent.config.llm_config.model_name == "test-model-reload"
@@ -1991,6 +1912,28 @@ def test_update_settings_failed_connector_does_not_poison_environment(
     assert stored["llm_provider"] == "openai"
 
 
+def test_llm_provider_alone_gives_conversations_a_model_with_no_settings_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`LLM_PROVIDER` with no settings file is the provider conversations use (#1899).
+
+    The environment overrides the file and does not need one (settings-single-source S4),
+    and Settings already reported the variable's provider. Only a saved file built the
+    connector, so every conversation had no model while Settings named one.
+
+    Killed by: src/uclone_x/ui/app.py :: if not (self.provider_in_effect or self._configured_base_url):
+    Becomes: if not (self._configured_provider or self._configured_base_url):
+    """
+    monkeypatch.setenv("LLM_PROVIDER", "mock")
+    mgr = AgentSessionManager(storage_dir=tmp_path, fallback_to_mock=False)
+
+    assert not (tmp_path / "settings.json").exists(), "the case is the one with no file"
+    assert mgr.get_settings()["llm_provider_source"] == "env"
+    assert getattr(mgr.llm, "provider_name", None) == "mock"
+    # What a conversation seat is built from, 1:1 or not.
+    assert mgr.app_scope().host.llm is mgr.llm
+
+
 @pytest.mark.asyncio
 async def test_settings_persistence_across_manager_instances(tmp_path: Path) -> None:
     """Settings saved in one session manager instance persist to disk and rehydrate in another (#350)."""
@@ -2046,8 +1989,8 @@ async def test_persisted_settings_initializes_active_llm_connector_on_startup(
     assert os.getenv("OLLAMA_BASE_URL") is None
     assert os.getenv("OLLAMA_MODEL") is None
 
-    # get_or_create_agent should successfully resolve the LLM without raising LLMProviderNotConfiguredError
-    agent = await mgr.get_or_create_agent("scout", session_id="test-session-891")
+    # A clone built from the app scope answers on that connector: no LLMProviderNotConfiguredError.
+    agent = app_clone(mgr, "scout", "test-session-891")
     assert agent is not None
     assert agent.llm == mgr.default_llm
     # The saved model reaches the agent explicitly, not through `OLLAMA_MODEL`.
@@ -2267,8 +2210,14 @@ def test_ui_knowledge_graph_endpoint(tmp_path: Path) -> None:
 
     Killed by: src/uclone_x/ui/knowledge.py :: "subject": r.source_entity,
     Becomes: "subject": "mutated_subject",
+
+    Killed by: src/uclone_x/ui/app.py :: return knowledge_graph(self.ontology_for(agent_id), session_id=session_id)
+    Becomes: return knowledge_graph(self.ontology_for("default"), session_id=session_id)
     """
-    engine = OntologyEngine(agent_id="test-agent")
+    _install_clone("test-agent", "scout")
+    mgr = AgentSessionManager(storage_dir=tmp_path / "sessions", workspace_dir=tmp_path)
+    engine = mgr.ontology_for("test-agent")
+    assert isinstance(engine, OntologyEngine)
     engine.register_entity(
         OntologyConcept(
             name="ArtifactsDock",
@@ -2304,16 +2253,11 @@ def test_ui_knowledge_graph_endpoint(tmp_path: Path) -> None:
         )
     )
 
-    mgr = AgentSessionManager(
-        storage_dir=tmp_path / "sessions",
-        workspace_dir=tmp_path,
-        ontology_engine=engine,
-    )
     app = create_ui_app(session_manager=mgr)
     client = TestClient(app)
 
-    # 1. Unfiltered query
-    res = client.get("/api/knowledge-graph")
+    # 1. Unfiltered query of the clone's engine
+    res = client.get("/api/knowledge-graph?agent_id=test-agent")
     assert res.status_code == 200
     data = cast(dict[str, Any], res.json())
     assert "triples" in data
@@ -2358,23 +2302,119 @@ def test_ui_knowledge_graph_endpoint(tmp_path: Path) -> None:
     assert "SubpanelView" in node_ids
 
     # 2. Session filter: matching session
-    res_sess = client.get("/api/knowledge-graph?session_id=sess_kg_1")
+    res_sess = client.get("/api/knowledge-graph?agent_id=test-agent&session_id=sess_kg_1")
     assert res_sess.status_code == 200
     data_sess = cast(dict[str, Any], res_sess.json())
     sess_triples = data_sess["triples"]
     assert any(t["predicate"] == "renders" for t in sess_triples)
 
     # Session filter: other session
-    res_other = client.get("/api/knowledge-graph?session_id=sess_different")
+    res_other = client.get("/api/knowledge-graph?agent_id=test-agent&session_id=sess_different")
     assert res_other.status_code == 200
     data_other = cast(dict[str, Any], res_other.json())
     assert not any(t["predicate"] == "renders" for t in data_other["triples"])
 
-    # 3. Agent filter
-    res_agent = client.get("/api/knowledge-graph?agent_id=test-agent")
+    # 3. Another clone's engine holds none of it: there is no shared engine (#1869)
+    res_agent = client.get("/api/knowledge-graph?agent_id=scout")
     assert res_agent.status_code == 200
     data_agent = cast(dict[str, Any], res_agent.json())
-    assert data_agent["summary"]["total_triples"] > 0
+    assert data_agent["summary"]["total_triples"] == 0
+
+
+@pytest.mark.parametrize("route", ["/api/ontology", "/api/knowledge-graph"])
+def test_a_developer_graph_route_names_its_clone(tmp_path: Path, route: str) -> None:
+    """With no shared engine, a developer-graph read names a clone, in plain words (#1869).
+
+    No clone named: 400 saying what to add. A name no clone can have: 404.
+
+    Killed by: src/uclone_x/ui/app.py :: raise HTTPException(status_code=400, detail="Name the clone to read with agent_id.")
+    Becomes: agent_id = "default"
+    """
+    client = TestClient(create_ui_app(static_dir=tmp_path))
+
+    unnamed = client.get(route)
+    assert unnamed.status_code == 400
+    assert unnamed.json()["detail"] == "Name the clone to read with agent_id."
+
+    unusable = client.get(route, params={"agent_id": "../Scout"})
+    assert unusable.status_code == 404
+    assert unusable.json()["detail"] == "There is no clone with that name here."
+
+
+@pytest.mark.parametrize("route", ["/api/ontology", "/api/knowledge-graph"])
+def test_a_developer_graph_read_of_an_unknown_clone_is_refused_and_makes_no_engine(
+    tmp_path: Path, route: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A well-formed name that is no clone here is a 404, and no engine is kept for it.
+
+    Before, the name check alone let `nosuchclone0` through: 200 with an empty graph, and
+    an empty engine left in the manager's map for the app's lifetime.
+
+    Killed by: src/uclone_x/ui/app.py :: if agent_id not in readable:
+    Becomes: if False:
+    """
+    _install_clone("scout")
+    app = create_ui_app(static_dir=tmp_path)
+    manager = cast(AgentSessionManager, app.state.session_manager)
+    engines_made_for: list[str] = []
+    real_ontology_for = manager.ontology_for
+
+    def recording_ontology_for(agent_id: str) -> Any:
+        engines_made_for.append(agent_id)
+        return real_ontology_for(agent_id)
+
+    monkeypatch.setattr(manager, "ontology_for", recording_ontology_for)
+    client = TestClient(app)
+
+    unknown = client.get(route, params={"agent_id": "nosuchclone0"})
+    assert unknown.status_code == 404
+    assert unknown.json()["detail"] == "There is no clone with that name here."
+    assert "nosuchclone0" not in engines_made_for
+
+    # The recorder sees the route's reads: an installed clone's read goes through it.
+    assert client.get(route, params={"agent_id": "scout"}).status_code == 200
+    assert engines_made_for == ["scout"]
+
+
+@pytest.mark.parametrize("route", ["/api/ontology", "/api/knowledge-graph"])
+def test_a_developer_graph_read_of_an_unreadable_clone_folder_is_refused(
+    tmp_path: Path, route: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A folder the clone listing marks unreadable is not a clone a graph can be read for.
+
+    The listing shows a folder named `Bad Name`, since a home is reported rather than
+    hidden, but no clone can have that name. Before #1879 the route found the name in the
+    listing, answered 200 and kept an engine for it.
+
+    Killed by: src/uclone_x/ui/app.py :: if clone.status is not CloneStatus.UNREADABLE
+    Becomes: if clone.status is not None
+    """
+    from uclone_x.core.agent_home import list_agent_homes
+
+    _install_clone("scout")
+    (list_agent_homes().root / "Bad Name").mkdir()
+    app = create_ui_app(static_dir=tmp_path)
+    manager = cast(AgentSessionManager, app.state.session_manager)
+    engines_made_for: list[str] = []
+    real_ontology_for = manager.ontology_for
+
+    def recording_ontology_for(agent_id: str) -> Any:
+        engines_made_for.append(agent_id)
+        return real_ontology_for(agent_id)
+
+    monkeypatch.setattr(manager, "ontology_for", recording_ontology_for)
+    client = TestClient(app)
+    listed = client.get("/api/clones").json()["clones"]
+    assert {"name": "Bad Name", "status": "unreadable"}.items() <= next(
+        c for c in listed if c["name"] == "Bad Name"
+    ).items()
+
+    refused = client.get(route, params={"agent_id": "Bad Name"})
+
+    assert refused.status_code == 404
+    assert refused.json()["detail"] == "There is no clone with that name here."
+    assert engines_made_for == []
+    assert client.get(route, params={"agent_id": "scout"}).status_code == 200
 
 
 @pytest.mark.asyncio
@@ -2382,16 +2422,14 @@ async def test_chat_turn_respects_and_logs_requested_model(tmp_path: Path) -> No
     """A requested model override reaches the agent the manager builds.
 
     Driven through `/api/turn` (which echoed it as `model`) until that route was
-    retired; the override is `get_or_create_agent`'s, so it is read off the agent.
+    retired; the override is `build_clone`'s, so it is read off the agent.
     """
     session_mgr = AgentSessionManager(storage_dir=tmp_path / "sessions", llm=MockLLMConnector())
-    agent = await session_mgr.get_or_create_agent("champion", model_name="hermes3:8b")
+    agent = app_clone(session_mgr, "champion", model_name="hermes3:8b")
 
     assert agent.config.llm_config.model_name == "hermes3:8b"
     result = await agent.execute_turn("Hello from hermes test")
     assert result.error is None, result.error
-
-    await session_mgr.clear()
 
 
 @pytest.mark.asyncio
@@ -2416,14 +2454,12 @@ async def test_chat_turn_propagates_model_not_found_error_without_silent_replace
         model="qwen3:8b",
     )
     session_mgr = AgentSessionManager(storage_dir=tmp_path / "sessions", llm=ollama_connector)
-    agent = await session_mgr.get_or_create_agent("champion", model_name="nonexistent-model")
+    agent = app_clone(session_mgr, "champion", model_name="nonexistent-model")
 
     result = await agent.execute_turn("Hello to missing model")
 
     assert result.error is not None
     assert "model 'nonexistent-model' not found" in result.error
-
-    await session_mgr.clear()
 
 
 @pytest.mark.asyncio
@@ -3274,14 +3310,50 @@ class TestTheTwoSettingsModels:
         assert mgr.fast_model == "deep-1"
 
     @pytest.mark.asyncio
-    async def test_a_save_moves_following_agents_and_keeps_an_agents_own_model(
+    async def test_a_save_moves_following_seats_and_keeps_a_personas_own_model(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        mgr = self._manager(tmp_path, monkeypatch)
-        mgr.update_settings(llm_provider="mock", llm_model="deep-1", llm_model_fast="fast-1")
+        """Seats already speaking in a conversation take the saved models, except the slot
+        their persona fills itself (#1893: was pinned on the retired chat-agent cache).
 
-        follower = await mgr.get_or_create_agent("follower", session_id="s1")
-        own = await mgr.get_or_create_agent("own", session_id="s2", model_name="its-own-model")
+        Killed by: src/uclone_x/room/resolver.py :: model_name=deep if deep_follows else None,
+        Becomes: model_name=deep,
+        """
+        from uclone_x.room.models import ParticipantKind
+        from uclone_x.ui.rooms import RoomStack
+
+        for name in _KEY_VARS:
+            monkeypatch.delenv(name, raising=False)
+        workspace = tmp_path / "workspace"
+        personas = workspace / ".uclone" / "personas"
+        personas.mkdir(parents=True)
+        (personas / "own.yaml").write_text(
+            "name: own\n"
+            "role: Tester\n"
+            "description: Names its own deep model.\n"
+            "system_prompt: You are Own.\n"
+            "llm_config:\n"
+            "  model_name: its-own-model\n",
+            encoding="utf-8",
+        )
+        app = create_ui_app(
+            static_dir=tmp_path,
+            fallback_to_mock=True,
+            storage_dir=tmp_path / "sessions",
+            workspace_dir=workspace,
+        )
+        mgr = cast(AgentSessionManager, app.state.session_manager)
+        stack = cast(RoomStack, app.state.room_stack)
+        mgr.update_settings(llm_provider="mock", llm_model="deep-1", llm_model_fast="fast-1")
+        room_id = stack.service.create("Two models").room_id
+        stack.service.add_participant(room_id, "user", kind=ParticipantKind.HUMAN)
+        stack.service.add_participant(room_id, "scout")
+        stack.service.add_participant(room_id, "own")
+        state = stack.store.load(room_id)
+        assert state is not None
+        seats = {p.id: p for p in state.participants}
+        follower = await stack.resolve_agent(state, seats["scout"])
+        own = await stack.resolve_agent(state, seats["own"])
         assert follower.config.llm_config.model_name == "deep-1"
         assert follower.config.llm_config.fast_model == "fast-1"
         assert own.config.llm_config.model_name == "its-own-model"
@@ -3292,5 +3364,3 @@ class TestTheTwoSettingsModels:
         assert follower.config.llm_config.fast_model == "fast-2"
         assert own.config.llm_config.model_name == "its-own-model"
         assert own.config.llm_config.fast_model == "fast-2"
-        await mgr.stop_agent("follower", "s1")
-        await mgr.stop_agent("own", "s2")

@@ -38,11 +38,10 @@ class is its client.
 
 **Since #1731 nothing writes the presentation transcript.** The single-agent chat routes
 that wrote and served it (`/api/turn`, `/api/session/history`) are removed, and every
-conversation is a room (D1 Rev 23). Transcripts already on disk are kept and are still read
-when an agent is resumed: when its Core session record exists, the transcript's messages are
-loaded as they are; only when it does not does `reconstruct_history` rebuild the model's
-history from the transcript (#183; corrected 2026-09-27, #1775). The paragraphs below
-describe what such a file holds.
+conversation is a room (D1 Rev 23). Transcripts already on disk are kept, but an agent is
+resumed from its Core session record alone: the rebuild of model history from a transcript
+with no Core record beside it (`reconstruct_history`) was removed with the chat helper that
+called it (#1893). The paragraphs below describe what such a file holds.
 
 What remained here was the **presentation transcript**: per-message ids, timestamps,
 latency, token counts, the display provenance block, and on a prompt the optional
@@ -57,10 +56,10 @@ mutual overwrite.
 
 A turn that failed is saved in that transcript as a **failure record** -- `role: "failure"`,
 `content` the text the page showed, `error` the turn's own reason -- and not as an assistant
-reply (#969): a failure is not something the agent said. The page shows it, and
-`reconstruct_history` never rebuilds it into model context. A transcript saved before #969
-holds its failures as assistant rows reading `Error: ...` under degraded provenance; those
-are served as they were saved and, by that shape, are also kept out of a rebuilt context.
+reply (#969): a failure is not something the agent said. The page shows it, and it never
+reaches model context: nothing rebuilds a transcript into one (#1893). A transcript saved
+before #969 holds its failures as assistant rows reading `Error: ...` under degraded
+provenance; those are served as they were saved.
 
 **How a turn ended is a structured field, and the head names it from nothing else** (#1007
 item 4). Every saved agent row carries `outcome` (`ChatTurnOutcome`, in
@@ -112,11 +111,9 @@ Path resolution for both the transcript and the Core record goes through the sin
 `uclone_x.core.session.resolve_session_path`. It previously existed twice, and a
 duplicated security control is one that gets fixed in a single copy.
 
-**One P8 gap remains, deliberately**: `get_or_create_agent` still reconstructs
-`ChatMessage` history from the presentation transcript when the Core store holds no
-record for a session. That is conversation-rehydration logic living in the UI, and it is
-kept only so installs with an existing transcript and no Core record still resume. The
-Core record is tried first.
+**The P8 gap this section once listed is closed** (#1893): the UI no longer reconstructs
+`ChatMessage` history from the presentation transcript. A session is resumed from its Core
+record; a conversation with a transcript and no Core record starts its model history afresh.
 
 ---
 
@@ -397,7 +394,7 @@ records what each one replaced:
 | Surface | Reads | What it replaces, and why that could not answer |
 | :--- | :--- | :--- |
 | Docs & Artifacts | `GET /api/rooms/{id}/artifacts` | `GET /api/artifacts`, which lists the whole workspace. The room read lists only the paths its seats wrote through a tool that declares `writes_files` (#1167). `unattributed_writes` counts calls that may have written without naming a path (a shell, a helper); the list never claims that nothing was written |
-| Knowledge Graph (developer drawer) | `GET /api/rooms/{id}/knowledge?agent_id=<seat>` | `GET /api/knowledge-graph`, which reads the manager's shared engine. That engine is never a seat's (P7). A seat not running in this process is read from its saved knowledge (#1367); with none saved the room read answers `status: "not_recorded"` with `null` lists, never an empty graph |
+| Knowledge Graph (developer drawer) | `GET /api/rooms/{id}/knowledge?agent_id=<seat>` | `GET /api/knowledge-graph`, which read the manager's shared engine, never a seat's (P7). There is no shared engine now (#1869): that route reads the clone named by its required `agent_id` and answers 404 for a name that is not a clone here. The room read reports the seat's clone's one rules engine (clone-knowledge-graph §3.1), so its `status` is always `ok`; whether the facts could be read is `facts` / `facts_reason` |
 | Remembers | `facts[]` of the knowledge read, grouped by `learned_here`; `PATCH`/`DELETE /api/agents/{id}/memory/{fact_id}` for Correct and Forget | Nothing: U0 had no view of what a clone knows. The facts are listed on every status; the per-seat record's `status` and `reason` are for the developer graph |
 | Activity & Tools | `GET /api/rooms/{id}/seats/{seat}/history`, live on `room.{id}.tool` | The session's tool trace, which a seat's traces never reach (G2). A turn whose tools were not recorded carries `tools: null` and a reason, never `[]` |
 | DAG (developer drawer) | `GET /api/rooms/{id}/topology` | `GET /api/agents`, which listed the chat manager's agents (2026-09-27: `/api/agents` removed, #1775). A seat was not among them. Every seated agent is a node, including an idle one |

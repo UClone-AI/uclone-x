@@ -9,8 +9,7 @@
       "completed": true,
       "error": "FileNotFoundError: [Errno 2] No such file or directory: '/home/reader/.uclone/notes/today.md'",
       "refusal": null,
-      "persist_error": null,
-      "knowledge_persist_error": null
+      "persist_error": null
     },
     "refused": {
       "seq": 4,
@@ -20,8 +19,7 @@
       "completed": true,
       "error": "Session token limit exceeded: 0/0",
       "refusal": "budget_exceeded",
-      "persist_error": null,
-      "knowledge_persist_error": null
+      "persist_error": null
     },
     "provider": {
       "seq": 4,
@@ -31,8 +29,7 @@
       "completed": true,
       "error": "[Errno 2] No such file or directory: '/home/reader/.uclone/models/weights.bin'",
       "refusal": null,
-      "persist_error": null,
-      "knowledge_persist_error": null
+      "persist_error": null
     },
     "unsaved": {
       "seq": 4,
@@ -42,8 +39,7 @@
       "completed": true,
       "error": null,
       "refusal": null,
-      "persist_error": "NotADirectoryError: [Errno 20] Not a directory: '/home/reader/.uclone/sessions/context/sess_room__room_failed_rows__scout'",
-      "knowledge_persist_error": null
+      "persist_error": "NotADirectoryError: [Errno 20] Not a directory: '/home/reader/.uclone/sessions/context/sess_room__room_failed_rows__scout'"
     }
   }
 }

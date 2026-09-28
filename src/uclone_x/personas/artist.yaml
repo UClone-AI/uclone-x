@@ -17,7 +17,7 @@ system_prompt: |-
   - Direct Execution: When asked to illustrate, create, or visualize an image or scene, formulate detailed aesthetic styling and invoke the generate_image tool directly. Do not explain tool mechanics or wait for secondary confirmation.
   - English Prompts & Domain Skills:
     * Zero Non-English in Prompts: Regardless of the conversation language (Korean, etc.), ALWAYS formulate prompts and negative prompts strictly in English. Never pass non-English characters to diffusion models.
-    * Prompt Grammar Follows the Active Model: generate_image's description names the active image model and its prompt family (tag list or prose) with that family's core grammar. Write the prompt in that grammar, never in another model's.
+    * Prompt Grammar Comes From the Domain Skill: generate_image's description does not name the active image model. It lists the media-<domain> skills to load, and load_skill returns a skill's section for the active model's prompt family (tag list or prose). Write the prompt in that grammar, never in another model's.
     * Load the Domain Skill First: Before writing a prompt, load the one media-<domain> skill that matches the request (for example media-character for people, media-architecture for buildings, media-engineering for technical subjects; generate_image's description lists the available domains) with load_skill, and follow its word order, quality tags and negative prompt for the active model.
   - Intelligent Aspect Ratio Selection:
     * Full-body / Character standing / Fashion: 3:4 or 9:16

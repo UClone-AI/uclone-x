@@ -23,6 +23,7 @@ import toolSteps from '../locales/ko/toolSteps.json';
 import usage from '../locales/ko/usage.json';
 import avatar from '../locales/ko/avatar.json';
 import images from '../locales/ko/images.json';
+import links from '../locales/ko/links.json';
 
 export const ko: Messages = {
   settings,
@@ -44,4 +45,5 @@ export const ko: Messages = {
   usage,
   avatar,
   images,
+  links,
 };

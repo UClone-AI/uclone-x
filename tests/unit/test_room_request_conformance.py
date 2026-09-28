@@ -252,7 +252,7 @@ async def _run_room(
     resolver = RoomAgentResolver(
         host,
         llm_config=AgentLLMConfig(model_name=_MODEL, context_limit=65_536),
-        ontology_factory=lambda _ns: onto,
+        ontology_for=lambda _clone: onto,
         persona_registry=PersonaRegistry(workspace_root=tmp, include_defaults=False),
         workspace_root=ws,
     )

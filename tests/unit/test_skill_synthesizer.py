@@ -15,6 +15,7 @@ from uclone_x.skills.auditor import (
     SkillRegistry,
     compute_skill_sha256,
     load_skill_from_dir,
+    parse_skill_markdown,
     save_skill,
 )
 from uclone_x.skills.models import (
@@ -268,8 +269,8 @@ def test_step_text_cannot_hide_itself_or_pose_as_another_part_of_the_skill() -> 
     list marker would pose as another section or another step; a bidirectional override
     would make a step read differently from what it holds.
 
-    Killed by: src/uclone_x/skills/synthesizer.py :: escaped = _MARKDOWN_PUNCTUATION.sub(r"\\\1", _one_line(text))
-    Becomes: escaped = _one_line(text)
+    Killed by: src/uclone_x/skills/synthesizer.py :: escaped = _MARKDOWN_PUNCTUATION.sub(r"\\\1", one_line(text))
+    Becomes: escaped = one_line(text)
 
     Killed by: src/uclone_x/skills/synthesizer.py :: flat = _BREAKS.sub(" ", text)
     Becomes: flat = text
@@ -368,24 +369,24 @@ async def test_synthesize_skill_invalid_inputs_raises(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_a_description_holding_the_header_delimiter_is_refused(tmp_path: Path) -> None:
-    """`---` in the description would end the `SKILL.md` header early, so it is refused.
+async def test_a_description_holding_the_header_delimiter_round_trips(tmp_path: Path) -> None:
+    """`---` inside the description no longer ends the `SKILL.md` header (#1826).
 
-    Killed by: src/uclone_x/skills/synthesizer.py :: if "---" in given:
-    Becomes: if False:
+    The header ends only at a line that is exactly `---`, so the synthesizer need not refuse
+    the text, and the written file reads back with the description whole.
+
+    Killed by: src/uclone_x/skills/auditor.py :: (?P<yaml>.*?)^---
+    Becomes: (?P<yaml>.*?)---
     """
-    with pytest.raises(ValueError) as refused:
-        await SkillSynthesizer().synthesize_skill(
-            task_name="cutter",
-            workflow_steps=["Step 1"],
-            quarantine_dir=tmp_path,
-            description="Before --- after",
-        )
-
-    assert str(refused.value) == (
-        "The description cannot contain '---', because that marks the end of the skill's header."
+    await SkillSynthesizer().synthesize_skill(
+        task_name="cutter",
+        workflow_steps=["Step 1"],
+        quarantine_dir=tmp_path,
+        description="Before --- after ---",
     )
-    assert not (tmp_path / "cutter").exists()
+
+    data, _ = parse_skill_markdown((tmp_path / "cutter" / "SKILL.md").read_text("utf-8"))
+    assert data["description"] == "Before --- after ---"
 
 
 @pytest.mark.asyncio

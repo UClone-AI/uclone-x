@@ -20,9 +20,10 @@ import hashlib
 import json
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 from uclone_x.agent.session import ContextSnapshot, SessionState, content_digest
+from uclone_x.core.context_state import ContextEntry, ContextEpoch, render_entries
 from uclone_x.core.session_store import SessionStoreProtocol
 from uclone_x.errors import UCloneXError
 from uclone_x.llm.models import ChatMessage, LLMRequest, MessageRole, ToolDefinition
@@ -30,13 +31,30 @@ from uclone_x.llm.models import ChatMessage, LLMRequest, MessageRole, ToolDefini
 __all__ = [
     "RebuiltRequest",
     "RequestLayers",
+    "RecordErrorCode",
     "RequestRecordError",
     "assemble_request_messages",
     "compose_system_message",
+    "epoch_renderer",
     "messages_digest",
     "place_turn_context",
+    "rebuild_epoch_conversations",
     "rebuild_requests",
     "serialize_tools",
+]
+
+
+#: What kind of gap stopped a rebuild, as a stable code a head words in its reader's
+#: language (#1907). A closed set: it names the kind only, never a path, a digest or an
+#: exception's text -- `RequestRecordError.detail` carries the specifics, in English.
+RecordErrorCode = Literal[
+    "body_missing",
+    "snapshot_missing",
+    "log_entry_missing",
+    "chain_broken",
+    "before_capture",
+    "unreadable",
+    "epoch_mismatch",
 ]
 
 
@@ -44,12 +62,13 @@ class RequestRecordError(UCloneXError):
     """A recorded request could not be rebuilt, because part of its record is missing.
 
     The message is for the person reading the record. What is missing is named on the
-    exception's `detail`.
+    exception's `detail`, and what kind of gap it is on its `code`.
     """
 
-    def __init__(self, message: str, *, detail: str) -> None:
+    def __init__(self, message: str, *, detail: str, code: RecordErrorCode) -> None:
         super().__init__(message)
         self.detail = detail
+        self.code: RecordErrorCode = code
 
 
 def compose_system_message(identity: str, slow_context: str) -> str:
@@ -81,8 +100,11 @@ class RequestLayers:
     """The layers of one request's messages, before they are put together.
 
     `identity` is the prompt as sent, already framed for the model family. `conversation`
-    is history without its anchor: the anchor is where the identity was stored, and the
-    identity field is what the request sends in its place.
+    is history without its anchor, as the request renders it (a repeated tool result sent
+    as a back-reference, `core/context_state.render_conversation`): the anchor is where
+    the identity was stored, and the identity field is what the request sends in its
+    place. `shown` is the session log entry and form of each conversation message, for
+    the context state (#1443); a rebuilt request has none.
     """
 
     identity: str
@@ -90,6 +112,7 @@ class RequestLayers:
     system_message: bool
     conversation: tuple[ChatMessage, ...]
     turn_context: str
+    shown: tuple[ContextEntry, ...] = ()
 
 
 def assemble_request_messages(layers: RequestLayers) -> list[ChatMessage]:
@@ -186,6 +209,7 @@ def rebuild_requests(
                     "Part of this conversation's record is missing, so a request in it "
                     "cannot be rebuilt.",
                     detail=f"no context body {digest}",
+                    code="body_missing",  # a layer body a request's snapshot names
                 )
             bodies[digest] = text
             body_intact[digest] = content_digest(text) == digest
@@ -220,6 +244,7 @@ def rebuild_requests(
                 "Part of this conversation's record is missing, so a request in it cannot "
                 "be rebuilt.",
                 detail=f"request {event.get('request')} extends {base}, last seen {previous_seq}",
+                code="chain_broken",
             )
         if not isinstance(delta, RequestRecordError):
             kept, appended = delta
@@ -241,6 +266,82 @@ def rebuild_requests(
     return rebuilt
 
 
+def epoch_renderer(
+    store: SessionStoreProtocol, state: SessionState
+) -> Callable[[ContextEpoch], list[ChatMessage]]:
+    """A function that renders one epoch's conversation from the session log alone (#1848).
+
+    An epoch lists the entries its last request showed and their forms (§5.8); each
+    entry's message is its body in the context-body store, decoded. No `REQUEST_CONTEXT`
+    event and no `messages` is read, so this is the conversation the log and the context
+    state say was sent -- `render_entries` is what the live request renders through too.
+    Bodies are decoded once across the epochs one renderer renders, and each epoch fails
+    on its own: an unreadable body stops only the epochs that list it.
+
+    The returned function raises `RequestRecordError` when the epoch names an entry the
+    log does not have, an entry's body is missing or does not parse, or a message's form
+    is not the one its entry records.
+    """
+    decoded: dict[str, ChatMessage] = {}
+
+    def message_of(entry_id: str) -> ChatMessage:
+        position = int(entry_id[1:]) if entry_id[:1] == "e" and entry_id[1:].isdigit() else -1
+        if not 0 <= position < len(state.session_log):
+            raise RequestRecordError(
+                "Part of this conversation's record is missing, so it cannot be rebuilt.",
+                detail=f"no log entry {entry_id}",
+                code="log_entry_missing",
+            )
+        digest = state.session_log[position].digest
+        if digest not in decoded:
+            text = store.load_context_body(state.session_id, digest)
+            if text is None:
+                raise RequestRecordError(
+                    "Part of this conversation's record is missing, so it cannot be rebuilt.",
+                    detail=f"no context body {digest}",
+                    code="body_missing",  # a log entry's body
+                )
+            try:
+                decoded[digest] = ChatMessage.model_validate_json(text)
+            except ValueError as exc:
+                raise RequestRecordError(
+                    "Part of this conversation's record could not be read, so it cannot be "
+                    "rebuilt.",
+                    detail=f"log entry {entry_id} could not be read ({type(exc).__name__})",
+                    code="unreadable",  # a log entry's body does not parse
+                ) from exc
+        return decoded[digest]
+
+    def render(epoch: ContextEpoch) -> list[ChatMessage]:
+        try:
+            return render_entries(epoch.entries, message_of)
+        except ValueError as exc:
+            # `render_entries` refuses a message whose form is not its entry's.
+            raise RequestRecordError(
+                "Part of this conversation's record could not be read, so it cannot be rebuilt.",
+                detail=f"epoch {epoch.number} does not match its log entries",
+                code="epoch_mismatch",
+            ) from exc
+
+    return render
+
+
+def rebuild_epoch_conversations(
+    store: SessionStoreProtocol, state: SessionState
+) -> list[list[ChatMessage]]:
+    """Each epoch's conversation, rendered from the session log alone (#1848).
+
+    See `epoch_renderer`, which renders one epoch.
+
+    Raises:
+        RequestRecordError: An epoch names an entry or a rendering the log does not have,
+            an entry's body is missing or does not parse, or a message's form is not the
+            one its entry records.
+    """
+    render = epoch_renderer(store, state)
+    return [render(epoch) for epoch in state.context_epochs]
+
+
 def _step_of(event: Mapping[str, Any]) -> int:
     try:
         return int(event.get("step", 0))
@@ -260,6 +361,7 @@ def _conversation_delta(
             "Part of this conversation's record could not be read, so a request in it "
             "cannot be rebuilt.",
             detail=f"request {event.get('request')} has no readable conversation delta",
+            code="unreadable",  # a request's conversation delta
         )
     return kept, appended
 
@@ -275,6 +377,7 @@ def _rebuild_selected(
         raise RequestRecordError(
             "Part of this conversation's record is missing, so a request in it cannot be rebuilt.",
             detail="request recorded before request capture (#1421)",
+            code="before_capture",
         )
     snapshot_id = str(event["snapshot"])
     snapshot = snapshots.get(snapshot_id)
@@ -282,6 +385,7 @@ def _rebuild_selected(
         raise RequestRecordError(
             "Part of this conversation's record is missing, so a request in it cannot be rebuilt.",
             detail=f"no context snapshot {snapshot_id}",
+            code="snapshot_missing",
         )
     try:
         return _rebuild_one(event, snapshot, conversation, body, body_intact)
@@ -293,6 +397,7 @@ def _rebuild_selected(
             "Part of this conversation's record could not be read, so a request in it "
             "cannot be rebuilt.",
             detail=f"request {event.get('request')} could not be read ({type(exc).__name__})",
+            code="unreadable",  # a request's bodies or messages do not parse
         ) from exc
 
 

@@ -44,7 +44,6 @@ SCOUT = Participant(
     display_name="Scout",
     persona_summary="Explores the codebase and reports findings.",
     session_id="sess_room__r1__scout",
-    ontology_namespace="https://uclone-x.ai/ontology/scout",
 )
 CRITIC = Participant(
     id="critic-1",
@@ -53,7 +52,6 @@ CRITIC = Participant(
     persona_summary="Adversarially reviews proposals.",
     aliases=("critic", "reviewer"),
     session_id="sess_room__r1__critic-1",
-    ontology_namespace="https://uclone-x.ai/ontology/critic-1",
 )
 
 

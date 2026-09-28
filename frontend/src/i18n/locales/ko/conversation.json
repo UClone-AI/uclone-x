@@ -1,18 +1,31 @@
 {
   "you": "나",
+  "headRoom": {
+    "run": "이 대화는 터미널의 ucx run에서 이어집니다. 여기서는 읽을 수만 있고 쓸 수는 없습니다.",
+    "loop": "이 대화는 터미널의 ucx loop에서 이어집니다. 여기서는 읽을 수만 있고 쓸 수는 없습니다.",
+    "acp": "이 대화는 대화를 연 편집기에서 이어집니다. 여기서는 읽을 수만 있고 쓸 수는 없습니다.",
+    "a2a": "이 대화는 이 클론을 호출한 에이전트와 이어집니다. 여기서는 읽을 수만 있고 쓸 수는 없습니다.",
+    "other": "이 대화는 다른 프로그램에서 이어집니다. 여기서는 읽을 수만 있고 쓸 수는 없습니다."
+  },
   "row": {
     "retry": "다시 시도",
     "silentFinished": "{label}이(가) 이 턴을 마쳤지만 보낸 글이 없습니다.",
     "silentStopped": "{label}이(가) 이 턴 도중에 멈췄고 보낸 글이 없습니다.",
     "unsaved": "{label}은(는) 다시 시작한 뒤 이 턴을 기억하지 못합니다. 저장하지 못했습니다.",
-    "knowledgeUnsaved": "{label}은(는) 다시 시작한 뒤 이 턴에서 알게 된 것을 알지 못합니다. 저장하지 못했습니다.",
-    "knowledgeSetAside": "이 대화에 대한 {label}의 지식 기록을 읽을 수 없어서 따로 옮겨 보관했습니다.",
+    "sessionSetAside": "이 버전에서는 여기서 나눈 {label}의 이전 대화를 열 수 없었습니다. 이전 대화는 덮어쓰지 않고 보관했으며, {label}은(는) 그 대화 없이 이어서 답했습니다.",
+    "knowledgeLearned": {
+      "one": "{label}은(는) 이 턴에서 1가지를 기억합니다.",
+      "other": "{label}은(는) 이 턴에서 {count}가지를 기억합니다."
+    },
+    "knowledgeExtractFailed": "{label}이(가) 이 턴에서 기억할 내용을 찾아내지 못했습니다.",
     "why": "이유 ›",
     "servedInstead": "{served} ({requested} 요청)"
   },
   "membership": {
     "joined": "{name}이(가) 이 대화에 참여했습니다",
-    "left": "{name}이(가) 이 대화에서 나갔습니다"
+    "left": "{name}이(가) 이 대화에서 나갔습니다",
+    "joinedSelf": "이 대화에 참여했습니다",
+    "leftSelf": "이 대화에서 나갔습니다"
   },
   "header": {
     "writing": "작성 중…",

@@ -19,6 +19,7 @@ import type {
   RoomProvenance,
   RoomSpeakerDecision,
   RoomState,
+  RoomTranscriptMessage,
 } from '../types';
 import type { ReadFault } from './useApiRead';
 
@@ -224,8 +225,22 @@ export interface RoomTopology {
    * some of their calls are not.
    */
   tool_call_gaps: string[];
+  /**
+   * `history_gaps` and `tool_call_gaps` again, one closed code per clause in the same order,
+   * with the count a clause names (#1911). Absent from a Core older than the codes.
+   */
+  history_gap_codes?: RoomTopologyGapCode[];
+  tool_call_gap_codes?: RoomTopologyGapCode[];
   summary: { seats: number; turns: number; tool_calls: number; subagents: number };
   reason: string | null;
+  /** `reason`'s closed code (#1911); absent from a Core older than it. */
+  reason_code?: string | null;
+}
+
+/** One topology gap's code, and the count its clause names (`null` when it names none). */
+export interface RoomTopologyGapCode {
+  code: string;
+  count: number | null;
 }
 
 /** How a fact came to be in the clone's memory (clone-knowledge-graph §3.2). */
@@ -247,37 +262,37 @@ export interface KnownFact {
   created_at: string | null;
 }
 
+/** One statement the clone's rules work out from its facts, and the facts it rests on. */
+export interface WorkedOut {
+  statement: string;
+  /** The `fact_id`s of the facts it rests on; forgetting one may take it with it. */
+  because: string[];
+}
+
 /**
- * `GET /api/rooms/{id}/knowledge?agent_id=<seat>`. Only `ok` carries lists. A seat that is
- * not running is read from its saved knowledge record (#1367): `not_recorded` when there is
- * none, `unreadable` when a record is there and could not be read. The read leaves that
- * record as it is. `reason` is
- * plain copy: where the record is and why it failed are in the log, not here.
+ * `GET /api/rooms/{id}/knowledge?agent_id=<seat>`: what the seat's clone knows, from its
+ * one memory and its one rules engine (clone-knowledge-graph step 6). No seat has a record
+ * of its own any more, so the graph is always there and `status` is always `ok`.
  */
 export type SeatKnowledge = {
   room_id: string;
   participant_id: string;
   session_id: string;
-  status: 'ok' | 'not_recorded' | 'unreadable' | 'no_ontology';
+  status: 'ok';
   reason: string | null;
   /**
-   * What the clone knows, one clone-wide list on every status (#1638 step 3): the facts in
-   * its own memory, each with `learned_here`. `null` when they could not be read;
-   * `facts_reason` says so, and says when none are listed. `status`, `reason` and the
-   * graph fields describe the per-seat record, for the developer graph only.
+   * What the clone knows, one clone-wide list (#1638 step 3): the facts in its own memory,
+   * each with `learned_here`. `null` when they could not be read; `facts_reason` says so,
+   * and says when none are listed.
    */
   facts: KnownFact[] | null;
   facts_reason: string | null;
-} & (
-  | ({ status: 'ok' } & KnowledgeGraphResponse)
-  | {
-      status: 'not_recorded' | 'unreadable' | 'no_ontology';
-      triples: null;
-      nodes: null;
-      edges: null;
-      summary: null;
-    }
-);
+  /**
+   * What the clone's rules work out from those facts, computed on this read and never
+   * saved. `null` when the facts could not be read.
+   */
+  worked_out: WorkedOut[] | null;
+} & KnowledgeGraphResponse;
 
 const enc = encodeURIComponent;
 
@@ -487,6 +502,17 @@ export function useTurnSummary(
 
   return summaryRead;
 }
+
+/**
+ * What makes the dock re-read a conversation's records: its length, plus what its clones
+ * learned from its turns (#1404). Learning lands on a row after the row did, so the length
+ * alone stays put while a clone's memory changes.
+ */
+export const transcriptRefreshKey = (transcript: readonly RoomTranscriptMessage[]): number =>
+  transcript.reduce(
+    (key, m) => key + (m.knowledge_learned?.length ?? 0) + (m.knowledge_extract_error ? 1 : 0),
+    transcript.length,
+  );
 
 /** The agents seated in `room`, in roster order. */
 export const agentSeats = (room: RoomState | null | undefined) =>

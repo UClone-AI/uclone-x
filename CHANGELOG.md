@@ -13,6 +13,52 @@ names does.
 Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Each date is
 the date that version was published.
 
+## [0.3.1] - 2026-09-28
+
+### Added
+
+- Clones build a knowledge list as they talk. After each turn a clone keeps the lasting
+  facts it learned, each clone has one list across all of its conversations, and the
+  relevant facts are recalled at the start of a turn. A fact you told a clone to forget
+  stays forgotten when older conversation knowledge is imported.
+- A local clone can be linked to uClone2 from Settings › Connections › uClone2 and
+  unlinked there; the clone's page says when it is linked. `ucx link run` keeps the links
+  online without the dashboard.
+- Clones can propose new skills. A proposal waits in Settings until a person approves the
+  exact version shown, and a skill is offered only to clones that hold every tool it
+  needs.
+- Each conversation keeps a complete, append-only session log, including full tool
+  results, and the developer trace checks every model request against it.
+- Anthropic prompt caching: requests mark cache breakpoints, and cache reads and writes
+  are counted in token usage, for Gemini as well.
+- Context windows for the current Claude models (Fable 5, Opus 5, Opus 4.5–4.8,
+  Sonnet 4.5/4.6).
+
+### Changed
+
+- One-to-one conversations, from every interface, now run as one-seat rooms, so a clone
+  builds its context the same way in a chat and in a room. Conversations started from
+  another interface open read-only in the app, with one writer per room.
+- Context is no longer compacted between the steps of a single turn, and a result the
+  clone has already seen is referred back to rather than repeated.
+- The Artist uses its case skills in the turn and normalizes Danbooru tags.
+- `pydantic` 2.12 or later is required, and the `http` extra now includes
+  `websockets`.
+
+### Fixed
+
+- A persona edit applies completely or not at all; a failed edit fails the turn instead
+  of leaving the clone half changed, and edits reach clones already seated in a room.
+- A name another participant shares is no longer filed as a fact about you, and names
+  are compared after Unicode normalization.
+- Unreadable records are moved aside instead of overwritten; Settings and the CLI say
+  when that happened, and three set-aside copies are kept.
+- When the setup alone fills the model's window, the clone says so plainly.
+- Setting only `LLM_PROVIDER` picks that provider's default model.
+- Korean text: particles match the name before them, and the trace panel is translated.
+- The PyPI page shows the README screenshots and says that `pip install uclone-x`
+  alone installs the library without the `ucx` command.
+
 ## [0.3.0] - 2026-09-27
 
 ### Added

@@ -14,12 +14,11 @@ What it pins, in order of what it would cost to get wrong:
   participant of a *different* room that happens to share an id. The second is the one that
   was silent: two live agents writing one `SessionState`, refused later by the session
   store's revision precondition with a message about revisions rather than about the room.
-* **A namespace is never handed to two agents.** G4 is not a property of the engine
-  *object*; it is a property of the namespace an engine induces into. Two engines built
-  over one IRI merge exactly the concepts P7 keeps apart.
-* **An agent that carries a namespace is never given the host's shared ontology.** Building
-  the resolver without an `ontology_factory` used to mean every participant in the room got
-  the *same* engine — the one on `HostDependencies` — with its own namespace ignored.
+* **Two clones never share a rules engine, and one clone keeps one.** Since
+  clone-knowledge-graph step 6 a seat's engine is its clone's (`AppScope.ontology_for`,
+  keyed by clone id): the same clone seated in two rooms reads one engine, two clones two.
+* **A host carrying one engine is refused.** Handing it to the resolver would give every
+  seat that one shared engine -- the manager engine step 6 retired.
 * **A human has no agent behind it**, and neither does an agent carrying no session.
 """
 
@@ -32,6 +31,7 @@ from typing import cast
 import pytest
 
 from uclone_x.agent.base import BaseAgent
+from uclone_x.agent.clone_builder import ontology_map
 from uclone_x.agent.composition import HostDependencies
 from uclone_x.agent.models import AgentLLMConfig, PersonaDefinition
 from uclone_x.agent.persona_registry import PersonaRegistry
@@ -41,6 +41,7 @@ from uclone_x.errors import ParticipantNotResolvableError
 from uclone_x.llm.connectors.mock import MockLLMConnector
 from uclone_x.memory.store import CrossSessionMemory
 from uclone_x.ontology.engine import OntologyEngine
+from uclone_x.ontology.models import OntologyRelation
 from uclone_x.ontology.protocols import OntologyEngineProtocol
 from uclone_x.room.models import Participant, ParticipantKind
 from uclone_x.room.resolver import RoomAgentResolver, room_participant_system_prompt
@@ -70,9 +71,7 @@ def host(host_factory: Callable[..., HostDependencies]) -> HostDependencies:
     return host_factory()
 
 
-def agent_participant(
-    participant_id: str, session_id: str, namespace: str = "", persona: str = ""
-) -> Participant:
+def agent_participant(participant_id: str, session_id: str, persona: str = "") -> Participant:
     """An agent participant stamped with the ids `RoomService` would have derived."""
     return Participant(
         id=participant_id,
@@ -80,7 +79,6 @@ def agent_participant(
         display_name=participant_id,
         persona_summary=persona,
         session_id=session_id,
-        ontology_namespace=namespace,
     )
 
 
@@ -203,93 +201,69 @@ class TestSessionIsolation:
 
 
 # --------------------------------------------------------------------------------------
-# G4: no two participants on one ontology
+# G4: one rules engine per clone (clone-knowledge-graph step 6)
 # --------------------------------------------------------------------------------------
 
 
-class TestOntologyIsolation:
+class TestOntologyIsClonesOwn:
     @pytest.mark.asyncio
-    async def test_each_participant_induces_into_its_own_namespace(
+    async def test_two_clones_never_share_an_engine_and_one_clone_keeps_one(
         self, host: HostDependencies
     ) -> None:
-        """The factory is called with the participant's own namespace, once each."""
-        asked: list[str] = []
+        """A seat's engine is its clone's, whichever room it is seated in.
 
-        def factory(namespace: str) -> OntologyEngineProtocol:
-            asked.append(namespace)
-            return OntologyEngine(namespace_iri=namespace)
-
-        resolver = RoomAgentResolver(host, ontology_factory=factory)
-        scout = await resolver.resolve(
-            agent_participant("scout", "sess_room__r1__scout", "https://n/r1/scout")
-        )
-        critic = await resolver.resolve(
-            agent_participant("critic", "sess_room__r1__critic", "https://n/r1/critic")
-        )
-
-        assert asked == ["https://n/r1/scout", "https://n/r1/critic"]
-        assert scout.ontology is not critic.ontology
-
-    @pytest.mark.asyncio
-    async def test_two_participants_sharing_one_namespace_are_refused(
-        self, host: HostDependencies
-    ) -> None:
-        """G4 is a property of the namespace, not of the engine object.
-
-        Two engines built over one IRI are two objects that induce into one graph, so
-        `scout is not critic` proves nothing: the concepts merge anyway, and the per-agent
-        grounding P7 requires is gone. The session half of this obligation was refused from
-        the first commit; the ontology half was not checked at all.
-
-        Killed by: src/uclone_x/room/resolver.py :: if namespace_owner is not None and namespace_owner != participant.id:
-        Becomes: if False:
+        Killed by: src/uclone_x/agent/clone_builder.py :: host = dataclasses.replace(host, ontology=app.ontology_for(clone_id))
+        Becomes: host = dataclasses.replace(host, ontology=app.ontology_for("clone"))
+        Killed by: src/uclone_x/agent/clone_builder.py :: engines[clone_id] = existing
+        Becomes: pass
         """
-        resolver = RoomAgentResolver(
-            host, ontology_factory=lambda ns: OntologyEngine(namespace_iri=ns)
-        )
-        await resolver.resolve(
-            agent_participant("scout", "sess_room__r1__scout", "https://n/shared")
-        )
+        resolver = RoomAgentResolver(host, ontology_for=ontology_map())
+        scout_a = await resolver.resolve(agent_participant("scout", "sess_room__a__scout"))
+        scout_b = await resolver.resolve(agent_participant("scout", "sess_room__b__scout"))
+        critic = await resolver.resolve(agent_participant("critic", "sess_room__a__critic"))
 
-        with pytest.raises(ParticipantNotResolvableError) as caught:
-            await resolver.resolve(
-                agent_participant("critic", "sess_room__r1__critic", "https://n/shared")
-            )
-
-        message = str(caught.value)
-        assert "scout" in message and "critic" in message
-        assert "https://n/shared" in message
+        assert scout_a.ontology is not None and critic.ontology is not None
+        assert scout_a.ontology is not critic.ontology, "two clones on one engine"
+        assert scout_a.ontology is scout_b.ontology, "one clone, two engines in two rooms"
+        assert scout_a is not scout_b, "one agent for two rooms is one session for two"
 
     @pytest.mark.asyncio
-    async def test_a_namespaced_participant_is_refused_the_hosts_shared_ontology(
+    async def test_what_one_clone_is_taught_the_other_does_not_hold(
+        self, host: HostDependencies
+    ) -> None:
+        """Not just two objects: a rule registered on one clone's engine is not the other's."""
+        resolver = RoomAgentResolver(host, ontology_for=ontology_map())
+        scout = await resolver.resolve(agent_participant("scout", "sess_room__a__scout"))
+        critic = await resolver.resolve(agent_participant("critic", "sess_room__a__critic"))
+        assert isinstance(scout.ontology, OntologyEngine)
+        assert isinstance(critic.ontology, OntologyEngine)
+
+        scout.ontology.register_relation(
+            OntologyRelation(source_entity="tide", predicate="part_of", target_entity="sea")
+        )
+
+        assert [r.source_entity for r in scout.ontology.list_relations()] == ["tide"]
+        assert critic.ontology.list_relations() == []
+
+    def test_a_host_carrying_one_engine_is_refused(
         self, host_factory: Callable[..., HostDependencies]
     ) -> None:
-        """Without a factory, every participant used to get the *one* host engine.
+        """One engine on the host would be every seat's: the shared engine step 6 retired.
 
-        Silently: the participant carried its own namespace, the resolver ignored it
-        because it had nothing to build an engine with, and `compose_agent` handed each
-        agent `host.ontology`. Every room agent then induced into one graph — the exact
-        merge G4 forbids, produced by an omission at construction rather than by any
-        roster edit.
-
-        Killed by: src/uclone_x/room/resolver.py :: if self._ontology_factory is None and self._app.host.ontology is not None:
+        Killed by: src/uclone_x/room/resolver.py :: if host.ontology is not None:
         Becomes: if False:
         """
         shared = OntologyEngine(namespace_iri="https://n/host")
-        resolver = RoomAgentResolver(host_factory(shared))
 
-        with pytest.raises(ParticipantNotResolvableError) as caught:
-            await resolver.resolve(
-                agent_participant("scout", "sess_room__r1__scout", "https://n/r1/scout")
-            )
+        with pytest.raises(TypeError) as caught:
+            RoomAgentResolver(host_factory(shared))
 
-        assert "ontology" in str(caught.value)
+        assert "ontology_for" in str(caught.value)
 
     @pytest.mark.asyncio
-    async def test_an_agent_with_no_namespace_runs_without_an_ontology(
+    async def test_with_no_engines_to_hand_out_a_seat_runs_without_one(
         self, host: HostDependencies
     ) -> None:
-        """A host with no ontology and a participant with no namespace share nothing."""
         agent = await RoomAgentResolver(host).resolve(
             agent_participant("scout", "sess_room__r1__scout")
         )
@@ -346,7 +320,7 @@ class TestPerParticipantMemory:
 
     The fix is deliberately not a store on the host. One store there is handed to every
     participant, and each would read back the others' recollections as its own: the exact
-    failure `ontology_factory` already exists to prevent for the knowledge graph.
+    failure `ontology_for` prevents for the knowledge graph, one engine per clone.
 
     Ids that name no persona are used on purpose, so the wiring under test is the only
     thing that can fail here. Whether a persona's allowlist lets the memory tools through

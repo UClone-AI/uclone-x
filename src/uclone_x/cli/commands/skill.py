@@ -156,7 +156,8 @@ def skill_list(
     skill_folders: list[Path] = []
     unopened: list[str] = []
     for child in sorted(root.iterdir()):
-        if not child.is_dir():
+        # A dot-named folder is the store's own: `.pending/` holds clones' proposals (#1827).
+        if not child.is_dir() or child.name.startswith("."):
             continue
         # `_is_file`, not `Path.is_file()`: a folder that can be listed but not searched
         # raises on Python 3.11 to 3.13 and is answered False on 3.14. Either way the person

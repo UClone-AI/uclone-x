@@ -11,7 +11,7 @@ from uclone_x.agent.models import AgentConfig, AgentLLMConfig
 from uclone_x.core.provenance import ExecutionPath, Provenance, ServiceRef
 from uclone_x.llm.models import FinishReason, LLMRequest, ModelResponse, TokenUsage
 from uclone_x.llm.protocols import LLMProviderProtocol
-from uclone_x.ontology.engine import OntologyEngine, SessionKnowledgeExtractor
+from uclone_x.ontology.engine import OntologyEngine
 from uclone_x.ontology.models import (
     OntologyAxiom,
     OntologyInvariant,
@@ -281,42 +281,6 @@ async def test_candidate_rules_become_active_only_after_formal_promotion() -> No
     assert "[Active Domain Ontology Invariants]:" in turn_2_sys_content
     assert "StrictRetryLimit" in turn_2_sys_content
     assert "max_retries <= 3" in turn_2_sys_content
-
-
-def test_session_knowledge_extractor_tier_filtering() -> None:
-    """SessionKnowledgeExtractor.inject_rules_to_prompt respects tier_filter and domain parameters."""
-    engine = OntologyEngine(agent_id="extractor_test")
-    extractor = SessionKnowledgeExtractor(engine=engine)
-
-    engine.teach_axiom(
-        name="AssertedRule",
-        subject_entity="Service",
-        rule_expression="ready == true",
-        domain="core",
-    )
-    engine.induce_axiom(
-        name="CandidateRule",
-        subject_entity="Service",
-        rule_expression="timeout == 5000",
-        domain="core",
-    )
-
-    base_prompt = "You are a service worker."
-
-    # Default: asserted only
-    prompt_asserted = extractor.inject_rules_to_prompt(base_prompt)
-    assert "AssertedRule" in prompt_asserted
-    assert "CandidateRule" not in prompt_asserted
-
-    # Candidate tier
-    prompt_candidate = extractor.inject_rules_to_prompt(base_prompt, tier_filter="candidate")
-    assert "CandidateRule" in prompt_candidate
-    assert "AssertedRule" not in prompt_candidate
-
-    # All tiers
-    prompt_all = extractor.inject_rules_to_prompt(base_prompt, tier_filter="all")
-    assert "AssertedRule" in prompt_all
-    assert "CandidateRule" in prompt_all
 
 
 def test_get_active_invariants_does_not_depend_on_teaching_order() -> None:

@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import ClassVar
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from uclone_x.errors import PlainRefusalError
-from uclone_x.skills.models import SkillStatus
+from uclone_x.skills.models import SkillStatus, missing_required_tools
 from uclone_x.skills.protocols import SkillProtocol, SkillRegistryProtocol
 from uclone_x.tools.base import BaseTool
 from uclone_x.tools.builtin.media_registry import ModelProfile, PromptFamily
@@ -130,11 +130,13 @@ class LoadSkillTool(BaseTool[LoadSkillParams]):
         registry: SkillRegistryProtocol,
         on_load: Callable[[str], None] | None = None,
         profile_provider: ProfileProvider | None = None,
+        tool_scope: Callable[[], Sequence[str]] | None = None,
     ) -> None:
         super().__init__()
         self._registry = registry
         self._on_load = on_load
         self._profile_provider = profile_provider
+        self._tool_scope = tool_scope
 
     def _active_skill(self, name: str) -> SkillProtocol:
         skill = self._registry.get(name)
@@ -142,8 +144,24 @@ class LoadSkillTool(BaseTool[LoadSkillParams]):
             raise ValueError(f"Skill '{name}' is not found or has not been approved.")
         return skill
 
+    def _require_scope(self, skill: SkillProtocol) -> None:
+        """Refuse a skill whose `requires_tools` this agent's tool scope does not grant (#1826).
+
+        The catalog already leaves such a skill out; this closes the path of a name the
+        model recalls or guesses.
+        """
+        if self._tool_scope is None:
+            return
+        missing = missing_required_tools(skill.manifest, self._tool_scope())
+        if missing:
+            raise ValueError(
+                f"Skill '{skill.manifest.name}' needs the tool(s) {', '.join(missing)}, "
+                "which this agent cannot use, so it is not available here."
+            )
+
     async def run(self, params: LoadSkillParams, context: ToolContext) -> str:
         skill = self._active_skill(params.skill_name)
+        self._require_scope(skill)
         if not skill.manifest.family_sections:
             self._record(params.skill_name)
             return skill.instructions_markdown
@@ -193,6 +211,7 @@ class LoadSkillTool(BaseTool[LoadSkillParams]):
                 "and cannot replace the image domain skills whole. Name a skill without "
                 "family sections, or remove `skill_name` from that model's entry."
             )
+        self._require_scope(override)
         return override
 
     @staticmethod

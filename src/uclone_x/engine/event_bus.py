@@ -106,6 +106,8 @@ class EventType(StrEnum):
     HOOK_EXECUTED = "hook.executed"
     HOOK_FAILED = "hook.failed"
     SETTINGS_UPDATED = "settings.updated"
+    KNOWLEDGE_UPDATED = "knowledge.updated"
+    """A clone saved what it learned from a conversation turn, or failed to (#1404)."""
 
 
 class EventSource(StrEnum):

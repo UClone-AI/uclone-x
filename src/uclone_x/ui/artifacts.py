@@ -22,7 +22,7 @@ from uclone_x.artifacts.library import (
     ArtifactNotFoundError,
     StoryInUseError,
 )
-from uclone_x.errors import PlainRefusalError, StaleRoomWriteError
+from uclone_x.errors import HeadRoomWriteError, PlainRefusalError, StaleRoomWriteError
 from uclone_x.story.view import StoryNotFoundError, StoryView, WriterBusyError
 
 if TYPE_CHECKING:
@@ -73,7 +73,8 @@ class _RejectRequest(_DecideRequest):
 
 def _http_error(exc: Exception, *, failed: str = FILES_FAILURE_DETAIL) -> HTTPException:
     """A refusal keeps its sentence; anything else is logged and answered plainly."""
-    if isinstance(exc, (StoryInUseError, WriterBusyError)):
+    if isinstance(exc, (StoryInUseError, WriterBusyError, HeadRoomWriteError)):
+        # A head's room (#1885): its plain sentence says where the conversation continues.
         return HTTPException(status_code=409, detail=str(exc))
     if isinstance(exc, (ArtifactNotFoundError, StoryNotFoundError)):
         return HTTPException(status_code=404, detail=str(exc))

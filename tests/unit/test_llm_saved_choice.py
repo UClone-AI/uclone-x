@@ -727,7 +727,7 @@ def test_a_dashboard_does_not_send_another_services_key(
 def test_a_dashboard_records_which_provider_a_new_key_is_for(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Killed by: src/uclone_x/ui/app.py :: save_api_key(new_key[0], new_key[1], path=self._settings_file)
+    """Killed by: src/uclone_x/ui/app.py :: self._save_key(*new_key, held=held)
     Becomes: pass
     """
     for name in ("OPENAI_API_KEY", "LLM_PROVIDER"):
@@ -779,15 +779,17 @@ async def test_a_dashboard_with_its_own_storage_ignores_the_session_roots_choice
     Becomes: f"{saved_choice_note()} "
 
     Mutated, the factory reads `<session root>/settings.json` and the agent gets the Ollama
-    model saved there, which this dashboard's Settings never showed.
+    model saved there, which this dashboard's Settings never showed. (Read off `build_llm`
+    since the chat helper that called it was retired, #1893.)
     """
     _save(llm_provider="ollama", llm_model="qwen3:1.7b", llm_base_url="http://127.0.0.1:11999")
     dashboard = _dashboard(tmp_path)
     assert dashboard.settings_file != settings_file()
 
-    agent = await dashboard.get_or_create_agent("assistant")
+    dashboard.get_settings()  # adopts a choice saved in this dashboard's own storage
 
-    assert isinstance(agent.llm, MockLLMConnector)
+    assert dashboard.default_llm is None
+    assert isinstance(dashboard.build_llm(provider=None, fallback_to_mock=True), MockLLMConnector)
     # Without the mock default it refuses, naming the file it read, not the session root's.
     with pytest.raises(LLMProviderNotConfiguredError) as caught:
         dashboard.build_llm(provider=None, fallback_to_mock=False)

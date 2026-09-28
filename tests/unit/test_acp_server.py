@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
@@ -19,7 +20,7 @@ from uclone_x.agent.models import AgentLLMConfig, TurnResult
 from uclone_x.agent.persona_registry import PersonaRegistry
 from uclone_x.agent.persona_store import DEFAULT_PERSONA_NAME
 from uclone_x.agent.session import SessionState, SessionStore
-from uclone_x.cli.commands.acp import session_agent_factory
+from uclone_x.cli.commands.acp import one_seat_acp_server
 from uclone_x.core.provenance import ExecutionPath, Provenance, ServiceRef
 from uclone_x.engine.event_bus import AgentEvent, EventBus, EventType
 from uclone_x.llm.connectors.base import BaseLLMConnector
@@ -33,6 +34,10 @@ from uclone_x.llm.models import (
     ToolCallRequest,
 )
 from uclone_x.log.reader import read_session_log
+from uclone_x.room.models import Participant, ParticipantKind
+from uclone_x.room.one_seat import ONE_SEAT_HUMAN_ID, conversation_room_id
+from uclone_x.room.service import participant_session_id
+from uclone_x.room.store import RoomStore
 from uclone_x.shells.acp.models import (
     ACP_PROTOCOL_VERSION,
     INTERNAL_ERROR,
@@ -80,6 +85,7 @@ class _FakeSessionAgent:
         self._fail_saves_after = fail_saves_after
         self.saves: list[str | None] = []
         self.hydrated: list[str | None] = []
+        self.person_names: list[tuple[str, ...]] = []
 
     def persist_session(self, session_id: str | None = None) -> None:
         if self._fail_saves_after is not None and len(self.saves) >= self._fail_saves_after:
@@ -90,7 +96,8 @@ class _FakeSessionAgent:
         self.hydrated.append(session_id)
         return SessionState(session_id=self.session_id, agent_id="fake")
 
-    async def execute_turn(self, prompt: str) -> TurnResult:
+    async def execute_turn(self, prompt: str, *, person_names: tuple[str, ...] = ()) -> TurnResult:
+        self.person_names.append(person_names)
         return await self._execute(prompt)
 
 
@@ -195,7 +202,20 @@ class _EchoTool(BaseTool[_EchoParams]):
         return {"echoed": params.x}
 
 
-def _real_server(store: SessionStore, llm: _RecordingLLM, **kwargs: Any) -> ACPServer:
+def _rooms(store: SessionStore) -> RoomStore:
+    """The room store beside `store`, where `_real_server` keeps its one-seat rooms."""
+    return RoomStore(store.storage_dir.parent / "rooms")
+
+
+def _seat_of(acp_session_id: str, clone_id: str = "acp_agent") -> str:
+    """The stored session an ACP session is kept under: its room seat's (§5.9)."""
+    room_id = conversation_room_id("acp", clone_id, acp_session_id)
+    return participant_session_id(room_id, clone_id)
+
+
+def _real_server(
+    store: SessionStore, llm: _RecordingLLM, *, clone_id: str = "acp_agent", **kwargs: Any
+) -> ACPServer:
     """An `ACPServer` whose sessions get real agents from the CLI's own factory."""
     tools = ToolRegistry()
     tools.register(_EchoTool())
@@ -205,15 +225,13 @@ def _real_server(store: SessionStore, llm: _RecordingLLM, **kwargs: Any) -> ACPS
         workspace_root=Path.cwd(),
         persona_registry=PersonaRegistry(include_defaults=False),
     )
-    return ACPServer(
-        agent_factory=session_agent_factory(
-            app,
-            clone_id="acp_agent",
-            fallback_llm=AgentLLMConfig(model_name="scripted"),
-            config_update={"name": "ACP Agent", "max_steps": 5},
-        ),
+    return one_seat_acp_server(
+        app,
+        clone_id=clone_id,
         bus=bus,
-        store=store,
+        room_store=_rooms(store),
+        fallback_llm=AgentLLMConfig(model_name="scripted"),
+        config_update={"name": "ACP Agent", "max_steps": 5},
         **kwargs,
     )
 
@@ -704,7 +722,7 @@ def test_acp_cli_commands() -> None:
 async def test_acp_turn_with_a_tool_call_is_saved_with_its_events(tmp_path: Path) -> None:
     """A prompt turn that calls a tool leaves its messages and its events in the store.
 
-    Killed by: src/uclone_x/shells/acp/server.py :: agent.persist_session(session_id=session_id)
+    Killed by: src/uclone_x/shells/acp/server.py :: agent.persist_session(session_id=self.stored_session_id(session_id))
     Becomes: pass
     """
     store = SessionStore(tmp_path / "sessions")
@@ -719,7 +737,7 @@ async def test_acp_turn_with_a_tool_call_is_saved_with_its_events(tmp_path: Path
     final = [m for m in sent if m.get("id") == 2]
     assert len(final) == 1 and final[0]["result"]["status"] == "completed", final
 
-    record = store.load("acp_saved")
+    record = store.load(_seat_of("acp_saved"))
     assert record is not None
     roles = [m.role for m in record.messages]
     assert MessageRole.TOOL in roles, roles
@@ -730,7 +748,7 @@ async def test_acp_turn_with_a_tool_call_is_saved_with_its_events(tmp_path: Path
         m.role == MessageRole.ASSISTANT and m.content == "answer 2" for m in record.messages
     ), record.messages
 
-    log_path = store.event_log_path("acp_saved")
+    log_path = store.event_log_path(_seat_of("acp_saved"))
     assert log_path is not None and log_path.is_file(), log_path
     types = [str(e["type"]) for e in read_session_log(log_path)]
     assert "TOOL_CALL" in types and "TOOL_RESULT" in types, types
@@ -764,8 +782,8 @@ async def test_acp_sessions_do_not_share_history(tmp_path: Path) -> None:
     assert "alpha secret" in second_a_request
     assert "bravo secret" not in second_a_request, second_a_request
 
-    a_record = store.load("sess_a")
-    b_record = store.load("sess_b")
+    a_record = store.load(_seat_of("sess_a"))
+    b_record = store.load(_seat_of("sess_b"))
     assert a_record is not None and b_record is not None
     assert "bravo secret" not in [m.content for m in a_record.messages]
     assert "alpha secret" not in [m.content for m in b_record.messages]
@@ -775,8 +793,8 @@ async def test_acp_sessions_do_not_share_history(tmp_path: Path) -> None:
 async def test_acp_load_session_restores_saved_history(tmp_path: Path) -> None:
     """A session reopened by a new server continues its conversation, not a blank one.
 
-    Killed by: src/uclone_x/shells/acp/server.py :: restored = agent.hydrate_session(session_id)
-    Becomes: restored = agent.get_session(session_id)
+    Killed by: src/uclone_x/shells/acp/server.py :: restored = agent.hydrate_session(self.stored_session_id(session_id))
+    Becomes: restored = agent.get_session(self.stored_session_id(session_id))
     """
     store = SessionStore(tmp_path / "sessions")
     first = _real_server(store, _RecordingLLM())
@@ -795,6 +813,283 @@ async def test_acp_load_session_restores_saved_history(tmp_path: Path) -> None:
     request = _request_text(llm.calls[0])
     assert "remember the lighthouse" in request, request
     assert "what did I say?" in request
+
+
+@pytest.mark.asyncio
+async def test_acp_session_is_a_one_seat_room_keyed_by_clone_and_session(tmp_path: Path) -> None:
+    """An ACP session is a stored room seating a person and the clone (§5.9, ruling 3).
+
+    The turn is saved in the clone's seat session in that room, not under the ACP id.
+
+    Killed by: src/uclone_x/cli/commands/acp.py :: return build_clone(app, clone_id=clone_id, session_id=room.session_id, **clone).agent
+    Becomes: return build_clone(app, clone_id=clone_id, session_id=session_id, **clone).agent
+    Killed by: src/uclone_x/cli/commands/acp.py :: seat_session=acp_seat_session(clone_id),
+    Becomes: seat_session=None,
+    """
+    store = SessionStore(tmp_path / "sessions")
+    server = _real_server(store, _RecordingLLM())
+    _capture(server)
+
+    resp = await server.dispatch_method("new_session", {"sessionId": "shaped"}, req_id=1)
+    assert resp is not None and "result" in resp, resp
+    await _prompt(server, "shaped", "hello room", req_id=2)
+
+    room_id = conversation_room_id("acp", "acp_agent", "shaped")
+    assert _rooms(store).list_room_ids() == (room_id,)
+    room = _rooms(store).load(room_id)
+    assert room is not None
+    assert [(p.id, p.kind) for p in room.participants] == [
+        (ONE_SEAT_HUMAN_ID, ParticipantKind.HUMAN),
+        ("acp_agent", ParticipantKind.AGENT),
+    ]
+    assert room.head == "acp"  # the app will not post into it (#1885)
+    record = store.load(participant_session_id(room_id, "acp_agent"))
+    assert record is not None
+    assert "hello room" in [m.content for m in record.messages]
+    assert store.load("shaped") is None
+
+
+@pytest.mark.asyncio
+async def test_acp_prompt_is_in_the_room_transcript(tmp_path: Path) -> None:
+    """An ACP turn lands in its room's transcript, so the app shows it (#1837).
+
+    Killed by: src/uclone_x/cli/commands/acp.py :: turn_recorder=acp_turn_recorder(clone_id, room_store),
+    Becomes: turn_recorder=None,
+    """
+    store = SessionStore(tmp_path / "sessions")
+    server = _real_server(store, _RecordingLLM())
+    _capture(server)
+
+    await server.dispatch_method("new_session", {"sessionId": "told"}, req_id=1)
+    await _prompt(server, "told", "hello transcript", req_id=2)
+
+    room = _rooms(store).load(conversation_room_id("acp", "acp_agent", "told"))
+    assert room is not None
+    spoken = [(m.sender_id, m.content) for m in room.transcript if m.kind == "utterance"]
+    assert [sender for sender, _ in spoken] == [ONE_SEAT_HUMAN_ID, "acp_agent"]
+    assert spoken[0][1] == "hello transcript"
+    assert spoken[1][1]
+
+
+@pytest.mark.asyncio
+async def test_acp_says_it_kept_a_record_it_could_not_open(tmp_path: Path) -> None:
+    """A turn whose save kept a newer build's record aside says so, once (#1877).
+
+    Before, ACP set the record aside and only logged it. The client gets a `notice`
+    update in the words every head uses, and the room's row carries the flag the app
+    renders.
+
+    Killed by: src/uclone_x/shells/acp/server.py :: set_aside = self._took_set_aside(session_id)  # this turn's save
+    Becomes: set_aside = False
+    Killed by: src/uclone_x/cli/commands/acp.py :: turn = replace(turn, session_set_aside=session_set_aside)
+    Becomes: pass
+    """
+    import json
+
+    from uclone_x.agent.session import SessionState
+    from uclone_x.core.set_aside import SESSION_SET_ASIDE_NOTICE
+
+    store = SessionStore(tmp_path / "sessions")
+    server = _real_server(store, _RecordingLLM())
+    sent = _capture(server)
+    resp = await server.dispatch_method("new_session", {"sessionId": "kept"}, req_id=1)
+    assert resp is not None and "result" in resp, resp
+    seat = _seat_of("kept")
+    document = json.loads(SessionState.seed(seat, "acp_agent").model_dump_json())
+    document["a_field_from_a_newer_build"] = True
+    path = store.session_path(seat)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+    await _prompt(server, "kept", "first", req_id=2)
+    await _prompt(server, "kept", "second", req_id=3)
+
+    notices = [
+        m["params"]["update"]
+        for m in sent
+        if m.get("method") == "session_update" and m["params"]["update"]["type"] == "notice"
+    ]
+    assert notices == [{"type": "notice", "content": SESSION_SET_ASIDE_NOTICE}]
+    room = _rooms(store).load(conversation_room_id("acp", "acp_agent", "kept"))
+    assert room is not None
+    rows = [
+        m.session_set_aside
+        for m in room.transcript
+        if m.sender_id == "acp_agent" and m.kind == "utterance"
+    ]
+    assert rows == [True, False]
+
+
+class _HangingLLM(_RecordingLLM):
+    """Never answers: the turn runs until it is cancelled."""
+
+    async def generate(self, request: LLMRequest) -> ModelResponse:
+        self.calls.append(request)
+        await asyncio.sleep(10.0)
+        raise AssertionError("the turn was not cancelled")
+
+
+@pytest.mark.asyncio
+async def test_acp_a_cancelled_turn_also_says_it_kept_a_record_aside(tmp_path: Path) -> None:
+    """The save a cancel makes can set a record aside too; the client is told then as well.
+
+    Killed by: src/uclone_x/shells/acp/server.py :: set_aside = self._took_set_aside(session_id)  # the cancelled turn's save
+    Becomes: set_aside = False
+    """
+    import json
+
+    from uclone_x.agent.session import SessionState
+    from uclone_x.core.set_aside import SESSION_SET_ASIDE_NOTICE
+
+    store = SessionStore(tmp_path / "sessions")
+    llm = _HangingLLM()
+    server = _real_server(store, llm)
+    sent = _capture(server)
+    resp = await server.dispatch_method("new_session", {"sessionId": "stopped"}, req_id=1)
+    assert resp is not None and "result" in resp, resp
+    seat = _seat_of("stopped")
+    document = json.loads(SessionState.seed(seat, "acp_agent").model_dump_json())
+    document["a_field_from_a_newer_build"] = True
+    path = store.session_path(seat)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+    await server.dispatch_method("prompt", {"sessionId": "stopped", "prompt": "hang"}, req_id=2)
+    task = server.get_in_flight_task("stopped")
+    assert task is not None
+    for _ in range(100):  # until the turn is waiting on the model
+        if llm.calls:
+            break
+        await asyncio.sleep(0.01)
+    assert llm.calls
+    await server.dispatch_method("cancel", {"sessionId": "stopped"}, req_id=3)
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+    notices = [
+        m["params"]["update"]
+        for m in sent
+        if m.get("method") == "session_update" and m["params"]["update"]["type"] == "notice"
+    ]
+    assert notices == [{"type": "notice", "content": SESSION_SET_ASIDE_NOTICE}]
+
+
+@pytest.mark.asyncio
+async def test_acp_session_never_prompted_or_failed_to_open_leaves_no_room(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A `session/new` that fails, or a session never prompted, stores no room (#1846).
+
+    Author's choice: the room is written with the session's first turn.
+
+    Killed by: src/uclone_x/cli/commands/acp.py :: room = resolve_one_seat_room(
+    Becomes: room = __import__("uclone_x.room.one_seat", fromlist=["x"]).open_one_seat_room(
+    """
+    from uclone_x.cli.commands import acp as acp_command
+
+    store = SessionStore(tmp_path / "sessions")
+    server = _real_server(store, _RecordingLLM())
+    _capture(server)
+    idle = await server.dispatch_method("new_session", {"sessionId": "idle"}, req_id=1)
+
+    def _unbuildable(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("the clone could not be built")
+
+    monkeypatch.setattr(acp_command, "build_clone", _unbuildable)
+    failed = await server.dispatch_method("new_session", {"sessionId": "broken"}, req_id=2)
+
+    assert idle is not None and "result" in idle, idle
+    assert failed is not None and "error" in failed, failed
+    assert _rooms(store).list_room_ids() == ()
+
+
+@pytest.mark.asyncio
+async def test_acp_two_clones_under_one_session_id_never_share_a_room(tmp_path: Path) -> None:
+    """Two clones served under one ACP session id each get a room of their own (ruling 3).
+
+    Killed by: src/uclone_x/room/one_seat.py :: digest = hashlib.sha256(f"{head}\0{clone_id}\0{conversation_id}".encode()).hexdigest()
+    Becomes: digest = hashlib.sha256(f"{head}\0{conversation_id}".encode()).hexdigest()
+    """
+    store = SessionStore(tmp_path / "sessions")
+    servers = {
+        clone: _real_server(store, _RecordingLLM(), clone_id=clone) for clone in ("ada", "bo")
+    }
+    for req, (clone, server) in enumerate(servers.items()):
+        _capture(server)
+        resp = await server.dispatch_method("new_session", {"sessionId": "shared"}, req_id=req)
+        assert resp is not None and "result" in resp, resp
+        await _prompt(server, "shared", f"{clone} private", req_id=10 + req)
+
+    assert len(_rooms(store).list_room_ids()) == 2
+    for clone, other in (("ada", "bo"), ("bo", "ada")):
+        record = store.load(_seat_of("shared", clone))
+        assert record is not None
+        contents = [m.content for m in record.messages]
+        assert f"{clone} private" in contents
+        assert f"{other} private" not in contents
+
+
+@pytest.mark.asyncio
+async def test_acp_load_session_opens_the_room_and_an_unknown_id_opens_none(
+    tmp_path: Path,
+) -> None:
+    """`load_session` finds the room's seat session; an id never started creates no room.
+
+    Killed by: src/uclone_x/shells/acp/server.py :: data = self._store.load(self.stored_session_id(session_id))
+    Becomes: data = self._store.load(session_id)
+    """
+    store = SessionStore(tmp_path / "sessions")
+    first = _real_server(store, _RecordingLLM())
+    _capture(first)
+    await first.dispatch_method("new_session", {"sessionId": "kept"}, req_id=1)
+    await _prompt(first, "kept", "remember the harbour", req_id=2)
+    rooms_before = _rooms(store).list_room_ids()
+
+    second = _real_server(store, _RecordingLLM())
+    _capture(second)
+    loaded = await second.dispatch_method("load_session", {"sessionId": "kept"}, req_id=3)
+    missing = await second.dispatch_method("load_session", {"sessionId": "never"}, req_id=4)
+
+    assert loaded is not None and loaded.get("result") == {"sessionId": "kept", "mode": "auto"}
+    assert missing is not None and "error" in missing, missing
+    assert _rooms(store).list_room_ids() == rooms_before
+
+
+@pytest.mark.asyncio
+async def test_acp_load_session_refuses_a_room_another_clone_has_joined(
+    tmp_path: Path,
+) -> None:
+    """Once the session's room seats a second clone, `load_session` no longer opens it.
+
+    Killed by: src/uclone_x/room/one_seat.py :: if not is_one_seat(state.participants):
+    Becomes: if False:
+    """
+    store = SessionStore(tmp_path / "sessions")
+    first = _real_server(store, _RecordingLLM())
+    _capture(first)
+    await first.dispatch_method("new_session", {"sessionId": "kept"}, req_id=1)
+    await _prompt(first, "kept", "remember the harbour", req_id=2)
+    # Through the store: `RoomService` now refuses to seat anyone in a head's room (#1885),
+    # and this is a room from before that, or written by another tool.
+    room_id = conversation_room_id("acp", "acp_agent", "kept")
+    room = _rooms(store).load(room_id)
+    assert room is not None
+    champion = Participant(
+        id="champion",
+        kind=ParticipantKind.AGENT,
+        display_name="Champion",
+        session_id=participant_session_id(room_id, "champion"),
+    )
+    _rooms(store).save(room.model_copy(update={"participants": (*room.participants, champion)}))
+    saved = store.load(_seat_of("kept"))
+
+    second = _real_server(store, _RecordingLLM())
+    _capture(second)
+    loaded = await second.dispatch_method("load_session", {"sessionId": "kept"}, req_id=3)
+
+    assert loaded is not None and "error" in loaded, loaded
+    assert "champion" not in str(loaded["error"])
+    assert store.load(_seat_of("kept")) == saved
 
 
 @pytest.mark.asyncio
@@ -1581,3 +1876,118 @@ def test_acp_serve_keeps_an_explicit_agent_id(monkeypatch: pytest.MonkeyPatch) -
     """
     opened = _memory_ids_opened(monkeypatch, ["acp", "serve", "--agent-id", "editor-clone"])
     assert opened == ["editor-clone"]
+
+
+def _recorded_server(
+    raise_on_reply: BaseException,
+) -> tuple[ACPServer, list[tuple[str, str, object]]]:
+    """A fake-agent server whose completed reply cannot be sent, with its recorded turns."""
+    recorded: list[tuple[str, str, object]] = []
+    agents: list[_FakeSessionAgent] = []
+    server = ACPServer(
+        agent_factory=_fake_factory(agents),
+        turn_recorder=lambda sid, prompt, outcome, _set_aside: recorded.append(
+            (sid, prompt, outcome)
+        ),
+    )
+    raised: list[bool] = []
+
+    async def send(msg: dict[str, Any]) -> None:
+        if msg.get("result", {}).get("status") == "completed" and not raised:
+            raised.append(True)
+            raise raise_on_reply
+
+    server.send_response = send  # type: ignore[method-assign]
+    return server, recorded
+
+
+@pytest.mark.asyncio
+async def test_acp_a_reply_that_cannot_be_sent_does_not_record_the_turn_twice() -> None:
+    """A turn already recorded is not recorded again as failed when its reply fails (#1837).
+
+    Turning the `if not recorded:` guard under `except Exception` into `if True:`
+    also kills it. The declaration names the one line that guard and the cancel guard read.
+
+    Killed by: src/uclone_x/shells/acp/server.py :: recorded = True
+    Becomes: recorded = False
+    """
+    server, recorded = _recorded_server(RuntimeError("client went away"))
+    await server.dispatch_method("new_session", {"sessionId": "once"}, req_id=1)
+
+    await _prompt(server, "once", "hello", req_id=2)
+
+    assert [(sid, prompt, type(outcome)) for sid, prompt, outcome in recorded] == [
+        ("once", "hello", TurnResult)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_acp_a_turn_cancelled_after_it_was_recorded_is_not_recorded_again() -> None:
+    """A cancel that lands while the reply is sent leaves the recorded turn alone (#1837).
+
+    Turning the `if not recorded:` guard under `except asyncio.CancelledError` into `if True:`
+    also kills it. The declaration names the one line that guard and the failure guard read.
+
+    Killed by: src/uclone_x/shells/acp/server.py :: recorded = True
+    Becomes: recorded = False
+    """
+    server, recorded = _recorded_server(asyncio.CancelledError())
+    await server.dispatch_method("new_session", {"sessionId": "once"}, req_id=1)
+
+    with pytest.raises(asyncio.CancelledError):
+        await _prompt(server, "once", "hello", req_id=2)
+
+    assert [(sid, prompt, type(outcome)) for sid, prompt, outcome in recorded] == [
+        ("once", "hello", TurnResult)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_acp_turn_is_given_the_person_s_names_for_its_session() -> None:
+    """Read per turn with the session's id; a reader that fails gives none, not a failed turn.
+
+    Killed by: src/uclone_x/shells/acp/server.py :: prompt_text, person_names=self._turn_person_names(session_id)
+    Becomes: prompt_text
+    Killed by: src/uclone_x/shells/acp/server.py :: return self._person_names(session_id)
+    Becomes: return (session_id,)
+    """
+    agents: list[_FakeSessionAgent] = []
+
+    def names(session_id: str) -> tuple[str, ...]:
+        if session_id == "broken":
+            raise OSError("room record unreadable")
+        return ("user", f"Kenny of {session_id}")
+
+    server = ACPServer(agent_factory=_fake_factory(agents), person_names=names)
+    _capture(server)
+    for n, session_id in enumerate(("one", "broken")):
+        await server.dispatch_method("new_session", {"sessionId": session_id}, req_id=2 * n + 1)
+        await _prompt(server, session_id, "hello", req_id=2 * n + 2)
+
+    assert [a.person_names for a in agents] == [[("user", "Kenny of one")], [()]]
+
+
+@pytest.mark.asyncio
+async def test_acp_cli_server_reads_the_names_from_the_session_s_room(tmp_path: Path) -> None:
+    """The person seated as "Kenny" in the session's room is who the next turn is told of.
+
+    Killed by: src/uclone_x/cli/commands/acp.py :: person_names=acp_person_names(clone_id, room_store),
+    Becomes: person_names=None,
+    """
+    store = SessionStore(tmp_path / "sessions")
+    server = _real_server(store, _RecordingLLM())
+    _capture(server)
+    await server.dispatch_method("new_session", {"sessionId": "named"}, req_id=1)
+    await _prompt(server, "named", "hello", req_id=2)
+    rooms = _rooms(store)
+    room = rooms.load(conversation_room_id("acp", "acp_agent", "named"))
+    assert room is not None
+    seats = tuple(
+        p.model_copy(update={"display_name": "Kenny"}) if p.id == ONE_SEAT_HUMAN_ID else p
+        for p in room.participants
+    )
+    rooms.save(room.model_copy(update={"participants": seats}))
+
+    names = server._turn_person_names("named")  # pyright: ignore[reportPrivateUsage]
+
+    assert names == (ONE_SEAT_HUMAN_ID, "Kenny")

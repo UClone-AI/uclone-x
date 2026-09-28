@@ -24,6 +24,7 @@ import pytest
 from pydantic import BaseModel, ValidationError
 from typer.testing import CliRunner
 
+from tests.support.app_clone import app_clone
 from uclone_x.agent import BaseAgent
 from uclone_x.agent.base import VALID_TRANSITIONS
 from uclone_x.agent.bootstrap import agent_config_for_persona, bootstrap_session
@@ -71,6 +72,7 @@ from uclone_x.llm.models import (
 )
 from uclone_x.llm.protocols import ContextCompactorProtocol, LLMProviderProtocol
 from uclone_x.ontology.protocols import OntologyEngineProtocol
+from uclone_x.room.service import participant_session_id
 from uclone_x.ui.app import AgentSessionManager
 
 SYSTEM_PROMPT = "You are a careful assistant."
@@ -805,6 +807,14 @@ def test_on_disk_record_is_a_readable_json_object(tmp_path: Path) -> None:
         # request can be rebuilt from the record. A record written before it has no such
         # key and loads with none; `tests/unit/test_context_snapshot.py` covers that.
         "context_snapshots",
+        # Added by #1443: every message that entered the history, append-only, each naming
+        # its body in the context body store. A record written before it loads with its
+        # messages backfilled as `migrated` entries; `tests/unit/test_session_log.py`.
+        "session_log",
+        # Added by #1443 (2 of 3): per epoch, which log entries each request showed and
+        # in which form. A record written before it loads with none;
+        # `tests/unit/test_context_state.py`.
+        "context_epochs",
     }
     assert raw["anchor_provenance"] is None
     assert raw["messages"][0]["role"] == "system"
@@ -3824,6 +3834,9 @@ async def test_a_failing_compaction_is_reported_as_a_failed_turn(tmp_path: Path)
 async def test_a_failing_compaction_leaves_memory_and_disk_agreeing(tmp_path: Path) -> None:
     """Compaction is destructive and unrecoverable, so it commits atomically or not at all.
 
+    Killed by: src/uclone_x/agent/compaction_driver.py :: del live.session_log[self.log_length :]
+    Becomes: pass
+
     The previous order replaced `live.messages` before persisting, so one failed `save`
     left the process believing a 25-message session was 6 messages long while the record
     still held 25 — with nothing in the exception to say so.
@@ -3833,6 +3846,7 @@ async def test_a_failing_compaction_leaves_memory_and_disk_agreeing(tmp_path: Pa
     agent.load_history(_bulky_dialogue(), turn_counter=9)
     agent.persist_session()
     before = len(agent.history)
+    log_before = agent.get_session().session_log
     on_disk_before = store.load("sess_agent-compact")
     assert on_disk_before is not None
 
@@ -3841,9 +3855,79 @@ async def test_a_failing_compaction_leaves_memory_and_disk_agreeing(tmp_path: Pa
         await agent.compact_session()
 
     assert len(agent.history) == before, "in-memory session was compacted despite the failure"
+    # The compacted history was logged to build the record; the failed write takes that
+    # back too, so the log still describes the history the session holds (#1848).
+    assert agent.get_session().session_log == log_before
     on_disk_after = store.load("sess_agent-compact")
     assert on_disk_after is not None
     assert len(on_disk_after.messages) == len(on_disk_before.messages)
+
+
+class _BodyExplodingStore(SessionStore):
+    """A store whose body writes fail once armed, standing in for a full context dir."""
+
+    def __init__(self, storage_dir: Path) -> None:
+        super().__init__(storage_dir=storage_dir)
+        self.armed = False
+
+    def save_context_body(self, session_id: str, digest: str, body: str) -> None:
+        if self.armed:
+            raise OSError(28, "No space left on device")
+        super().save_context_body(session_id, digest, body)
+
+
+@pytest.mark.asyncio
+async def test_a_failing_compaction_leaves_no_body_of_its_own_waiting(tmp_path: Path) -> None:
+    """The compacted history's new log entries are taken back when the write fails, and
+    so are their bodies: every body still waiting to be written is one the log names
+    (#1848). Without that, the next save writes the body of an entry no record holds.
+
+    Killed by: src/uclone_x/agent/compaction_driver.py :: live.pending_bodies = self.pending_bodies
+    Becomes: pass
+    """
+    store = _BodyExplodingStore(tmp_path)
+    agent = _threshold_agent(60_000, store=store)
+    agent.load_history(_bulky_dialogue(), turn_counter=9)
+    agent.persist_session()
+    live = agent._sessions["sess_agent-compact"]  # pyright: ignore[reportPrivateUsage]
+    assert live.pending_bodies == {}
+
+    store.armed = True
+    with pytest.raises(OSError):
+        await agent.compact_session()
+
+    logged = {entry.digest for entry in live.session_log}
+    assert live.pending_bodies.keys() <= logged, "a body of the undone compaction waits"
+
+
+@pytest.mark.asyncio
+async def test_a_failing_compaction_leaves_no_entries_or_cause_for_the_next_save(
+    tmp_path: Path,
+) -> None:
+    """A compaction whose write fails derived no entries and opened no epoch: the next
+    record saved carries neither its derived entries nor its `compaction` cause (#1848).
+
+    Killed by: src/uclone_x/agent/compaction_driver.py :: live.compacted_entries = self.compacted_entries
+    Becomes: pass
+    Killed by: src/uclone_x/agent/compaction_driver.py :: live.epoch_causes = self.epoch_causes
+    Becomes: pass
+    """
+    store = _ExplodingStore(tmp_path)
+    agent = _threshold_agent(60_000, store=store)
+    agent.load_history(_bulky_dialogue(), turn_counter=9)
+    agent.persist_session()
+
+    store.armed = True
+    with pytest.raises(OSError):
+        await agent.compact_session()
+    store.armed = False
+    agent.persist_session()
+
+    saved = store.load("sess_agent-compact")
+    assert saved is not None
+    assert saved.compacted_entries == ()
+    # `load_history` declared its own cause, which the next request still records.
+    assert saved.epoch_causes == ("history_replaced",)
 
 
 # --------------------------------------------------------------------------------------
@@ -3951,17 +4035,16 @@ async def test_clearing_a_ui_session_goes_through_the_core_reset(tmp_path: Path)
     manager = AgentSessionManager(
         storage_dir=tmp_path, llm=MockLLMConnector(), fallback_to_mock=True
     )
-    agent = await manager.get_or_create_agent(agent_id="agent-a", session_id="sess_a")
+    agent = app_clone(manager, "agent-a", "sess_a")
     agent.load_history(_dialogue(), turn_counter=4, session_id="sess_a")
 
-    manager.clear_session_history(agent_id="agent-a", session_id="sess_a")
+    manager.clear_session_history(agent_id="agent-a", session_id="sess_a", agent=agent)
 
     state = agent.get_session("sess_a")
     assert state.turn_counter == 0
     assert len(state.messages) == 1
     assert state.messages[0].role == MessageRole.SYSTEM
     assert state.messages[0].content == agent.config.system_prompt
-    await manager.stop_agent("agent-a", "sess_a")
 
 
 def test_clearing_a_session_with_no_live_agent_deletes_the_persisted_record(
@@ -3973,7 +4056,7 @@ def test_clearing_a_session_with_no_live_agent_deletes_the_persisted_record(
     agent's `config.system_prompt` to re-seed, and with no agent constructed there is
     nothing authoritative to read it from. Resetting with the empty default would
     persist a session carrying no system prompt, which is worse than no record —
-    deleting lets the next `get_or_create_agent` seed correctly from config.
+    deleting lets the next clone built for it seed correctly from config.
     """
     manager = AgentSessionManager(storage_dir=tmp_path, fallback_to_mock=True)
     manager.core_store.save(
@@ -4029,7 +4112,8 @@ def test_cli_session_id_resumes_the_conversation_it_had(
     # `SessionStore()` with no argument, so the test resolves the path the way the CLI
     # does rather than reconstructing it — a reconstruction is what hid the collision.
     store = SessionStore()
-    saved = store.load("sess_x")
+    # A run is a one-seat room named by `--session-id`; the clone keeps the seat's session.
+    saved = store.load(participant_session_id("sess_x", "cli_bot"))
     assert saved is not None
     assert saved.turn_counter == 1
     assert any("remember this" == (m.content or "") for m in saved.messages)
@@ -4042,7 +4126,12 @@ def test_cli_reset_flag_clears_the_persisted_session(
     runner = CliRunner()
     store = SessionStore()
     store.save(
-        SessionState(session_id="sess_y", agent_id="cli_bot", messages=_dialogue(), turn_counter=7)
+        SessionState(
+            session_id=participant_session_id("sess_y", "cli_bot"),
+            agent_id="cli_bot",
+            messages=_dialogue(),
+            turn_counter=7,
+        )
     )
 
     result = runner.invoke(
@@ -4062,7 +4151,7 @@ def test_cli_reset_flag_clears_the_persisted_session(
 
     assert result.exit_code == 0
     assert "reset" in result.output
-    saved = store.load("sess_y")
+    saved = store.load(participant_session_id("sess_y", "cli_bot"))
     assert saved is not None
     # Reset zeroed it, then the single prompt ran one turn.
     assert saved.turn_counter == 1
@@ -4076,7 +4165,7 @@ def test_cli_compact_flag_runs_a_compaction(
     store = SessionStore()
     store.save(
         SessionState(
-            session_id="sess_z",
+            session_id=participant_session_id("sess_z", "cli_bot"),
             agent_id="cli_bot",
             messages=_bulky_dialogue(),
             turn_counter=12,
@@ -4100,7 +4189,7 @@ def test_cli_compact_flag_runs_a_compaction(
 
     assert result.exit_code == 0
     assert "Compacted" in result.output
-    saved = store.load("sess_z")
+    saved = store.load(participant_session_id("sess_z", "cli_bot"))
     assert saved is not None
     assert any(m.compaction_ledger for m in saved.messages)
 
@@ -4184,7 +4273,7 @@ async def test_a_failing_core_reset_leaves_the_transcript_intact(
     """
     monkeypatch.setenv(SESSION_STORAGE_DIR_ENV_VAR, str(tmp_path))
     manager = AgentSessionManager(llm=MockLLMConnector(), fallback_to_mock=True)
-    agent = await manager.get_or_create_agent(agent_id="agent-a", session_id="sess_a")
+    agent = app_clone(manager, "agent-a", "sess_a")
     agent.load_history(_dialogue(), turn_counter=2, session_id="sess_a")
     transcript = _write_transcript(
         manager, session_id="sess_a", agent_id="agent-a", messages=[{"sender": "user"}]
@@ -4197,10 +4286,9 @@ async def test_a_failing_core_reset_leaves_the_transcript_intact(
     monkeypatch.setattr(agent, "reset_session", _boom)
 
     with pytest.raises(OSError):
-        manager.clear_session_history(agent_id="agent-a", session_id="sess_a")
+        manager.clear_session_history(agent_id="agent-a", session_id="sess_a", agent=agent)
 
     assert transcript.is_file(), "transcript was deleted before the Core reset succeeded"
-    await manager.stop_agent("agent-a", "sess_a")
 
 
 def test_the_autouse_fixture_keeps_session_writes_out_of_the_real_home() -> None:
@@ -4227,11 +4315,18 @@ def test_the_autouse_fixture_keeps_session_writes_out_of_the_real_home() -> None
 async def test_core_first_hydration_is_actually_used(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Disabling Core-first hydration entirely (`if False and ...`) passed the suite.
+    """A seat resumes from its Core record before its first turn (P8).
 
-    The legacy transcript path would then silently take over, which is the P8 violation
-    the Core record exists to retire.
+    Disabling Core-first hydration once passed the suite. It was pinned on the chat
+    helper's hydrate branch until that helper was retired with its transcript rebuild
+    (#1893); a seat is resumed by the room resolver, so it is pinned there.
+
+    Killed by: src/uclone_x/room/resolver.py :: agent.hydrate_session()
+    Becomes: agent.get_session()
     """
+    from uclone_x.room.models import Participant, ParticipantKind
+    from uclone_x.room.resolver import RoomAgentResolver
+
     monkeypatch.setenv(SESSION_STORAGE_DIR_ENV_VAR, str(tmp_path))
     SessionStore().save(
         SessionState(
@@ -4245,12 +4340,14 @@ async def test_core_first_hydration_is_actually_used(
         )
     )
     manager = AgentSessionManager(llm=MockLLMConnector(), fallback_to_mock=True)
+    seat = Participant(
+        id="agent-a", kind=ParticipantKind.AGENT, display_name="agent-a", session_id="sess_a"
+    )
 
-    agent = await manager.get_or_create_agent(agent_id="agent-a", session_id="sess_a")
+    agent = cast(BaseAgent, await RoomAgentResolver(manager.app_scope()).resolve(seat))
 
     assert agent.get_session("sess_a").turn_counter == 7
     assert any("only in the core record" == (m.content or "") for m in agent.history)
-    await manager.stop_agent("agent-a", "sess_a")
 
 
 def test_the_ui_guard_resolves_under_the_transcript_subdir(tmp_path: Path) -> None:
@@ -4290,7 +4387,7 @@ def test_the_repl_persists_the_session_on_exit(
     )
 
     assert result.exit_code == 0
-    saved = SessionStore().load("sess_persist")
+    saved = SessionStore().load(participant_session_id("sess_persist", "repl_bot"))
     assert saved is not None, "the REPL exited without persisting its session"
     assert saved.turn_counter == 1
 
@@ -4317,7 +4414,7 @@ def test_the_repl_session_is_durable_before_it_exits(
             observed.append(None)  # first call: no turn has run yet
             return "Hello world"
         # Second call: one turn has completed and the REPL has NOT exited.
-        mid = SessionStore().load("sess_midflight")
+        mid = SessionStore().load(participant_session_id("sess_midflight", "repl_bot"))
         observed.append(None if mid is None else mid.turn_counter)
         return "/exit"
 
@@ -4372,7 +4469,9 @@ def test_a_transient_per_turn_persist_failure_is_recovered_at_exit(
     assert result.exit_code == 0
     assert "not saved" in result.output, "the failed per-turn persist was not reported"
     monkeypatch.undo()
-    saved = SessionStore(storage_dir=tmp_path / CORE_RECORD_SUBDIR).load("sess_transient")
+    saved = SessionStore(storage_dir=tmp_path / CORE_RECORD_SUBDIR).load(
+        participant_session_id("sess_transient", "repl_bot")
+    )
     assert saved is not None, "the exit persist did not recover the transient failure"
     assert saved.turn_counter == 1
 
@@ -4562,7 +4661,7 @@ async def test_the_cli_and_the_ui_no_longer_lose_each_others_turns(
     """
     monkeypatch.setenv(SESSION_STORAGE_DIR_ENV_VAR, str(tmp_path))
     ui = AgentSessionManager(llm=MockLLMConnector(), fallback_to_mock=True)
-    ui_agent = await ui.get_or_create_agent(agent_id="agent-a", session_id="sess_shared")
+    ui_agent = app_clone(ui, "agent-a", "sess_shared")
     ui_agent.load_history(_dialogue(), turn_counter=1, session_id="sess_shared")
     ui_agent.persist_session("sess_shared")
 
@@ -4608,7 +4707,6 @@ async def test_the_cli_and_the_ui_no_longer_lose_each_others_turns(
     third = ui_agent.persist_session("sess_shared")
     assert third.turn_counter == 3
     assert third.revision > final.revision
-    await ui.stop_agent("agent-a", "sess_shared")
 
 
 # --------------------------------------------------------------------------------------
@@ -4930,12 +5028,12 @@ def test_the_cli_reports_an_unusable_session_id_instead_of_resuming_another_sess
     """`ucx run --session-id SESSA` printed "Resumed session 'SessA'" and overwrote it.
 
     The same usage-error class as a traversal id and a different cause: this id is legal
-    and this filesystem cannot tell it from one that already exists.
+    and this filesystem cannot tell it from one that already exists. `SESSA` names a
+    one-seat room, so the id that collides is its seat's session.
     """
     monkeypatch.setenv(SESSION_STORAGE_DIR_ENV_VAR, str(tmp_path))
-    _write_raw_record(
-        tmp_path / CORE_RECORD_SUBDIR / "SESSA.json", session_id="SessA", turn_counter=9
-    )
+    record = tmp_path / CORE_RECORD_SUBDIR / f"{participant_session_id('SESSA', 'cli_bot')}.json"
+    _write_raw_record(record, session_id=participant_session_id("SessA", "cli_bot"), turn_counter=9)
     runner = CliRunner()
 
     result = runner.invoke(
@@ -4948,9 +5046,9 @@ def test_the_cli_reports_an_unusable_session_id_instead_of_resuming_another_sess
     assert "Traceback" not in result.output
     assert "Resumed session" not in result.output
     # The other session's record is untouched, which is the consequence under test.
-    on_disk = json.loads((tmp_path / CORE_RECORD_SUBDIR / "SESSA.json").read_text("utf-8"))
+    on_disk = json.loads(record.read_text("utf-8"))
     assert on_disk["turn_counter"] == 9
-    assert on_disk["session_id"] == "SessA"
+    assert on_disk["session_id"] == participant_session_id("SessA", "cli_bot")
 
 
 def test_list_session_ids_reports_real_ids_because_nothing_is_encoded(tmp_path: Path) -> None:
@@ -5140,9 +5238,12 @@ def test_every_id_addressed_record_door_delegates_to_the_identity_check() -> Non
     src_root = Path(__file__).resolve().parents[2] / "src" / "uclone_x"
     #: door -> the callee through which it reaches `verify_record_identity`.
     expected: dict[tuple[str, str], str] = {
-        ("agent/session.py", "load"): "verify_record_identity",
-        ("agent/session.py", "save"): "load",
-        ("agent/session.py", "delete"): "load",
+        # One reader behind all three, so a record that will not load is set aside by
+        # the writers rather than read as absent and replaced (#1844).
+        ("agent/session.py", "_read"): "verify_record_identity",
+        ("agent/session.py", "load"): "_read",
+        ("agent/session.py", "save"): "_read",
+        ("agent/session.py", "delete"): "_read",
         ("ui/app.py", "load_session_record"): "verify_record_identity",
         ("ui/app.py", "clear_session_history"): "load_session_record",
     }

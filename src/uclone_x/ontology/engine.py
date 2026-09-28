@@ -22,7 +22,6 @@ from uclone_x.errors import (
     PromotionCriteriaNotMetError,
     UnparseableDirectiveError,
 )
-from uclone_x.llm.models import ChatMessage
 from uclone_x.ontology.models import (
     EvidenceRecord,
     OntologyAxiom,
@@ -34,7 +33,6 @@ from uclone_x.ontology.models import (
     tier_to_precedence,
     utc_now_iso,
 )
-from uclone_x.tools.models import ToolResult
 
 
 def _slugify_axiom_name(raw: str, max_len: int = 60) -> str:
@@ -1841,118 +1839,3 @@ class OntologyEngine:
 
 # Alias for OntologyEngine
 OntologyService = OntologyEngine
-
-
-class OntologyInducer:
-    """Autonomous entity and relation extraction from turns."""
-
-    def __init__(self, engine: OntologyEngine | None = None) -> None:
-        self._engine = engine or OntologyEngine()
-
-    @property
-    def engine(self) -> OntologyEngine:
-        return self._engine
-
-    async def induce_from_turn(
-        self,
-        turn_text: str,
-        tool_results: tuple[ToolResult, ...],
-    ) -> tuple[OntologyConcept, ...]:
-        """Extract candidate entities and constraints from successful turns."""
-        candidates: list[OntologyConcept] = []
-
-        pattern = re.compile(r"\b[A-Z][a-zA-Z0-9_]{2,}\b")
-        seen: set[str] = set()
-        for match in pattern.finditer(turn_text):
-            w = match.group(0)
-            if w not in seen and len(w) > 3:
-                seen.add(w)
-                concept = self._engine.induce_concept(
-                    name=w,
-                    description="Candidate entity extracted from turn context",
-                    confidence=0.85,
-                )
-                candidates.append(concept)
-
-        return tuple(candidates)
-
-
-class SessionKnowledgeExtractor:
-    """Autonomous knowledge induction and rule extraction from dialogue sessions (P7)."""
-
-    def __init__(self, engine: OntologyEngine | None = None) -> None:
-        self._engine = engine or OntologyEngine()
-
-    @property
-    def engine(self) -> OntologyEngine:
-        return self._engine
-
-    def extract_from_session(
-        self,
-        messages: list[ChatMessage] | tuple[ChatMessage, ...],
-        session_id: str = "session",
-        model_id: str = "uclone_x",
-    ) -> tuple[OntologyConcept, ...]:
-        """Extract domain concepts and invariants from session turns and stage as Candidate tier."""
-        candidates: list[OntologyConcept] = []
-        seen: set[str] = set()
-
-        for msg in messages:
-            content = msg.content or ""
-            # Extract capitalized domain concepts
-            pattern = re.compile(r"\b[A-Z][a-zA-Z0-9_]{2,}\b")
-            for match in pattern.finditer(content):
-                name = match.group(0)
-                if name not in seen and len(name) > 3:
-                    seen.add(name)
-                    # Check if already exists in engine
-                    existing = self._engine.get_concept(name)
-                    if existing is None:
-                        c = self._engine.induce_concept(
-                            name=name,
-                            description=f"Auto-induced domain concept from session turn ({msg.role.value})",
-                            confidence=0.85,
-                            source_session=session_id,
-                            model_id=model_id,
-                        )
-                        candidates.append(c)
-
-        return tuple(candidates)
-
-    def inject_rules_to_prompt(
-        self,
-        base_system_prompt: str = "",
-        domain: str | None = None,
-        tier_filter: Literal["asserted", "candidate", "all"] = "asserted",
-    ) -> str:
-        """Inject active Asserted and Enforcing ontology concepts/axioms into system prompt (P7, P8)."""
-        active_axioms = self._engine.get_active_invariants(domain=domain, tier_filter=tier_filter)
-        if tier_filter == "asserted":
-            active_concepts = [
-                c
-                for c in self._engine.list_concepts()
-                if c.tier
-                in (
-                    OntologyTier.ASSERTED,
-                    OntologyTier.ASSERTED_CORE,
-                    OntologyTier.ASSERTED_DOMAIN,
-                    OntologyTier.INDUCED_ENFORCING,
-                )
-            ]
-        elif tier_filter == "candidate":
-            active_concepts = [
-                c for c in self._engine.list_concepts() if c.tier == OntologyTier.INDUCED_CANDIDATE
-            ]
-        else:
-            active_concepts = self._engine.list_concepts()
-
-        if not active_axioms and not active_concepts:
-            return base_system_prompt
-
-        lines = [base_system_prompt.strip(), "\n\n[Active Domain Ontology Invariants]:"]
-        for c in active_concepts:
-            lines.append(f"- Concept: {c.name} ({c.description or 'No description'})")
-        for a in active_axioms:
-            lines.append(f"- Rule ({a.tier.value}): {a.name} -> {a.rule_expression or a.predicate}")
-
-        return "\n".join(lines)

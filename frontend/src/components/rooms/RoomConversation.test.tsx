@@ -4,7 +4,6 @@ import { render, screen, fireEvent, act, waitFor } from '@testing-library/react'
 import { RoomConversation, TYPING_REPORT_INTERVAL_MS } from './RoomConversation';
 import type { CloneChoice, RoomContext, RoomState, RoomTranscriptMessage } from '../../types';
 import { EMPTY_LIVE, RoomSendError, RoomsApiError, RoomsNoAnswerError } from '../../lib/rooms';
-import { ABSENCE_CLAIM } from '../../lib/absenceGuard';
 import { makeCloneChoice } from '../../test/fixtures';
 import { expectPlain } from '../../test/plainCopy';
 import failedRows from '../../test/room-failed-rows.json';
@@ -127,8 +126,38 @@ describe('RoomConversation attribution', () => {
       room: room({ transcript: [message({ seq: 1, sender_id: 'user', kind: 'join', content: '' })] }),
     });
 
-    expect(screen.getByTestId('membership-1').textContent).toContain('you');
+    expect(screen.getByTestId('membership-1').textContent).toBe('You joined this conversation');
     expect(screen.getByTestId('membership-1').textContent).not.toContain('Kenny');
+  });
+
+  it('gives the reader their own roster sentence in Korean, and each name a particle that fits it (#1900)', () => {
+    // The Korean row read "나이(가) 이 대화에 참여했습니다": the third-person template, with
+    // its paired particle, around the reader's name for themselves.
+    // Killed by: frontend/src/components/rooms/RoomConversation.tsx ::   const ownRow = senderKind(room, message.sender_id) === 'human';
+    // Becomes:   const ownRow = senderKind(room, message.sender_id) === 'agent';
+    renderRoom(
+      {
+        room: room({
+          participants: [
+            { id: 'user', kind: 'human', display_name: 'Kenny' },
+            { id: 'minji', kind: 'agent', display_name: '민지' },
+            { id: 'jihun', kind: 'agent', display_name: '지훈' },
+          ],
+          transcript: [
+            message({ seq: 1, sender_id: 'user', kind: 'join', content: '' }),
+            message({ seq: 2, sender_id: 'minji', kind: 'join', content: '' }),
+            message({ seq: 3, sender_id: 'jihun', kind: 'leave', content: '' }),
+            message({ seq: 4, sender_id: 'user', kind: 'leave', content: '' }),
+          ],
+        }),
+      },
+      { korean: true },
+    );
+
+    expect(screen.getByTestId('membership-1').textContent).toBe('이 대화에 참여했습니다');
+    expect(screen.getByTestId('membership-2').textContent).toBe('민지가 이 대화에 참여했습니다');
+    expect(screen.getByTestId('membership-3').textContent).toBe('지훈이 이 대화에서 나갔습니다');
+    expect(screen.getByTestId('membership-4').textContent).toBe('이 대화에서 나갔습니다');
   });
 
   it('shows a /loop note as the note it is, not as a roster change or as speech', () => {
@@ -1533,63 +1562,109 @@ describe('RoomConversation stops and failures', () => {
     expect(screen.queryByTestId('row-error-1')).toBeNull();
   });
 
-  // What the clone learned in a turn could not be saved: said on its own line, apart from
-  // the session's, because the two records are lost independently (#1367, P6).
-  // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: {message.knowledge_persist_error ? (
-  // Becomes: {false && message.knowledge_persist_error ? (
-  it('says, under a reply, that what the clone learned in it was not saved', () => {
+  // The per-seat knowledge record is retired (clone-knowledge-graph step 6): its two row
+  // notices went with it. A row saved before carries the fields on disk still; the
+  // conversation reads neither, so an old row shows its reply and no knowledge-record line.
+  it('says nothing about the retired knowledge record on a row saved before step 6', () => {
+    renderRoom({
+      room: room({
+        transcript: [
+          {
+            ...message({ seq: 1, sender_id: 'scout', content: 'here it is' }),
+            knowledge_persist_error: 'OSError: disk full',
+            knowledge_set_aside: true,
+          } as ReturnType<typeof message>,
+        ],
+      }),
+    });
+
+    const row = screen.getByTestId('row-body-1');
+    expect(row).toHaveTextContent('here it is');
+    const page = document.body.textContent ?? '';
+    expect(page).not.toMatch(/knowledge record|what it learned in this turn|disk full/);
+    expect(screen.queryByTestId('row-unsaved-1')).toBeNull();
+  });
+
+  // The speaker's own saved record of this conversation could not be opened by this version
+  // and was kept aside rather than written over: said on the row of the turn that set it
+  // aside, and on no other, in plain words with no internals (#1844, P6).
+  // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: {message.session_set_aside ? (
+  // Becomes: {false && message.session_set_aside ? (
+  // Killed by: frontend/src/i18n/locales/en/conversation.json :: "sessionSetAside": "This version could not open {label}'s earlier conversation here. It was kept, not written over, and {label} carried on without it.",
+  // Becomes: "sessionSetAside": "{label} started this conversation over.",
+  it('says, under a reply, that an earlier conversation this version could not open was kept', () => {
+    renderRoom({
+      room: room({
+        transcript: [
+          message({ seq: 1, sender_id: 'scout', content: 'hello', session_set_aside: true }),
+          message({ seq: 2, sender_id: 'scout', content: 'hello again' }),
+        ],
+      }),
+    });
+
+    const notice = screen.getByTestId('row-session-set-aside-1');
+    expect(notice).toHaveTextContent(/could not open/);
+    expect(notice).toHaveTextContent(/earlier conversation/);
+    expect(notice).toHaveTextContent(/kept, not written over/);
+    expect(notice).not.toHaveTextContent(/\/|Error|json|yaml|record|session/i);
+    expect(screen.getByTestId('row-body-1')).toHaveTextContent('hello');
+    expect(screen.queryByTestId('row-session-set-aside-2')).toBeNull();
+    expect(screen.queryByTestId('row-error-1')).toBeNull();
+  });
+
+  // What a clone saved from a turn, after the turn, is counted on that turn's row and on no
+  // other (#1404); the facts themselves are in Remembers.
+  // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: {message.knowledge_learned && message.knowledge_learned.length > 0 ? (
+  // Becomes: {false && message.knowledge_learned && message.knowledge_learned.length > 0 ? (
+  // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: {plural(t.row.knowledgeLearned, message.knowledge_learned.length, { label })}
+  // Becomes: {plural(t.row.knowledgeLearned, 1, { label })}
+  it('says, under a reply, how many things the clone will remember from it', () => {
+    renderRoom({
+      room: room({
+        transcript: [
+          message({ seq: 1, sender_id: 'scout', content: 'noted', knowledge_learned: ['mem_a', 'mem_b'] }),
+          message({ seq: 2, sender_id: 'scout', content: 'and this', knowledge_learned: ['mem_c'] }),
+          message({ seq: 3, sender_id: 'scout', content: 'nothing new', knowledge_learned: [] }),
+        ],
+      }),
+    });
+
+    expect(screen.getByTestId('row-knowledge-learned-1')).toHaveTextContent(
+      /will remember 2 things from this turn\.$/,
+    );
+    expect(screen.getByTestId('row-knowledge-learned-2')).toHaveTextContent(
+      /will remember 1 thing from this turn\.$/,
+    );
+    // Ids are for the Remembers panel, never the conversation.
+    expect(screen.getByTestId('row-knowledge-learned-1')).not.toHaveTextContent(/mem_/);
+    expect(screen.queryByTestId('row-knowledge-learned-3')).toBeNull();
+    expect(screen.getByTestId('row-body-1')).toHaveTextContent('noted');
+  });
+
+  // Learning from a turn failed: one plain line, never the Core's sentence or a cause (#1404).
+  // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: {message.knowledge_extract_error ? (
+  // Becomes: {false && message.knowledge_extract_error ? (
+  it('says, under a reply, that the clone could not learn from it, in plain words', () => {
     renderRoom({
       room: room({
         transcript: [
           message({
             seq: 1,
             sender_id: 'scout',
-            content: 'here it is',
-            knowledge_persist_error: 'OSError: disk full',
+            content: 'happy to help',
+            knowledge_extract_error: 'LLMProviderError: upstream 503 req_9f8e mem_0123',
           }),
-          message({ seq: 2, sender_id: 'scout', content: 'and this one saved' }),
+          message({ seq: 2, sender_id: 'scout', content: 'fine' }),
         ],
       }),
     });
 
-    const notice = screen.getByTestId('row-knowledge-unsaved-1');
-    // The cause is for the log and the field, not the reader: no class name, no path.
-    expect(notice).not.toHaveTextContent(/OSError|disk full|Error/);
-    expect(notice).toHaveTextContent(/learned/);
-    expect(notice).toHaveTextContent(/after a restart/);
-    expect(screen.getByTestId('row-body-1')).toHaveTextContent('here it is');
-    expect(screen.queryByTestId('row-unsaved-1')).toBeNull();
-    expect(screen.queryByTestId('row-knowledge-unsaved-2')).toBeNull();
+    const notice = screen.getByTestId('row-knowledge-extract-failed-1');
+    expect(notice).toHaveTextContent(/could not pick up what to remember from this turn\.$/);
+    expect(notice).not.toHaveTextContent(/Error|503|req_|mem_/);
+    expect(screen.getByTestId('row-body-1')).toHaveTextContent('happy to help');
     expect(screen.queryByTestId('row-error-1')).toBeNull();
-  });
-
-  // A knowledge record that could not be read was set aside: said on the row of the turn that
-  // set it aside, and on no other, in plain words (#1367, P6). It speaks of that record only,
-  // never of the clone's saved memory, which the set-aside does not touch (#1434).
-  // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: {message.knowledge_set_aside ? (
-  // Becomes: {false && message.knowledge_set_aside ? (
-  // Killed by: frontend/src/i18n/locales/en/conversation.json :: "knowledgeSetAside": "{label}'s knowledge record for this conversation could not be read, so it was set aside and kept.",
-  // Becomes: "knowledgeSetAside": "{label}'s saved memory could not be read, so it was set aside and kept.",
-  it('says, under a reply, that the knowledge record for this conversation was set aside', () => {
-    renderRoom({
-      room: room({
-        transcript: [
-          message({ seq: 1, sender_id: 'scout', content: 'hello', knowledge_set_aside: true }),
-          message({ seq: 2, sender_id: 'scout', content: 'hello again' }),
-        ],
-      }),
-    });
-
-    const notice = screen.getByTestId('row-knowledge-reset-1');
-    expect(notice).toHaveTextContent(/could not be read/);
-    expect(notice).toHaveTextContent(/kept/);
-    expect(notice).toHaveTextContent(/knowledge record for this conversation/);
-    expect(notice).not.toHaveTextContent(/saved memory|start(?:ing)? over/i);
-    expect(notice.textContent ?? '').not.toMatch(ABSENCE_CLAIM);
-    expect(notice).not.toHaveTextContent(/\/|Error|yaml/i);
-    expect(screen.getByTestId('row-body-1')).toHaveTextContent('hello');
-    expect(screen.queryByTestId('row-knowledge-reset-2')).toBeNull();
-    expect(screen.queryByTestId('row-error-1')).toBeNull();
+    expect(screen.queryByTestId('row-knowledge-extract-failed-2')).toBeNull();
   });
 
   // A reply that claims a save the Core saw fail carries the failure beside it (#1375).
@@ -3276,5 +3351,78 @@ describe('a clone`s picture in the conversation', () => {
     await waitFor(() => expect(calls).toContain('/api/personas/writer/avatar'));
     expect(calls).not.toContain('/api/personas/writer-2/avatar');
     vi.unstubAllGlobals();
+  });
+});
+
+describe('RoomConversation in a room a head keeps (#1885)', () => {
+  const failed = message({
+    seq: 2,
+    sender_id: 'scout',
+    content: '',
+    completed: false,
+  });
+
+  // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: const keptBy = room.head ?? null;
+  // Becomes: const keptBy = null;
+  it('shows the conversation read-only, with a note in place of the composer', () => {
+    renderRoom({
+      room: room({ head: 'run', transcript: [message({ seq: 1 }), failed] }),
+      onToggleAutonomous: () => {},
+      onClearHistory: () => {},
+    });
+
+    expect(screen.getByTestId('head-room-note')).toHaveTextContent(
+      'This conversation continues in ucx run, in the terminal. You can read it here, but not write in it.',
+    );
+    expectPlain(screen.getByTestId('head-room-note').textContent);
+    expect(screen.queryByTestId('composer-column')).toBeNull();
+    expect(screen.queryByTestId('room-composer')).toBeNull();
+    expect(screen.queryByTestId('retry-turn')).toBeNull();
+    expect(screen.queryByTestId('toggle-autonomous')).toBeNull();
+    expect(screen.queryByTestId('add-someone')).toBeNull();
+    expect(screen.queryByTestId('clear-history')).toBeNull();
+    expect(screen.getByTestId('row-1')).toHaveTextContent('hello');
+  });
+
+  // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: case 'acp':
+  // Becomes: case 'acp-renamed':
+  it('names the editor for a room an editor keeps, in Korean too', () => {
+    renderRoom({ room: room({ head: 'acp' }) }, { korean: true });
+
+    expect(screen.getByTestId('head-room-note')).toHaveTextContent(
+      '이 대화는 대화를 연 편집기에서 이어집니다. 여기서는 읽을 수만 있고 쓸 수는 없습니다.',
+    );
+  });
+
+  // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: if (!isAutonomous || keptBy !== null) return;
+  // Becomes: if (!isAutonomous) return;
+  it('reports no presence, which the server would refuse', () => {
+    const calls: string[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string) => {
+        calls.push(url);
+        return new Response('{}', { status: 200 });
+      }),
+    );
+    try {
+      renderRoom({
+        room: room({
+          head: 'loop',
+          policy: { ...room().policy, autonomous: true },
+        }),
+      });
+
+      expect(calls.filter((url) => url.endsWith('/presence'))).toEqual([]);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('keeps the composer in a room the app keeps', () => {
+    renderRoom({ room: room({ head: null }) });
+
+    expect(screen.getByTestId('composer-column')).toBeInTheDocument();
+    expect(screen.queryByTestId('head-room-note')).toBeNull();
   });
 });

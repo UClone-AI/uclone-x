@@ -50,7 +50,7 @@ except ImportError as exc:
 from uclone_x import __version__
 from uclone_x.acp import AcpConformanceReport, conformance_summary
 from uclone_x.agent.base import BaseAgent
-from uclone_x.agent.clone_builder import AppScope, build_clone, provider_tool_binder
+from uclone_x.agent.clone_builder import AppScope, ontology_map, provider_tool_binder
 from uclone_x.agent.models import (
     PersonaDefinition,
 )
@@ -99,6 +99,7 @@ from uclone_x.core.session_diagnostics import (
     DEFAULT_MAX_CONVERSATION_TURNS,
     count_active_turns,
 )
+from uclone_x.core.set_aside import expire_set_aside, set_aside_unreadable
 from uclone_x.engine.event_bus import (
     AgentEvent,
     EventBus,
@@ -111,7 +112,6 @@ from uclone_x.errors import (
     LLMTimeoutError,
     PathTraversalError,
     PlainRefusalError,
-    SessionHistoryRehydrationError,
 )
 from uclone_x.evaluation import (
     EvalBackendUnavailableError,
@@ -119,6 +119,7 @@ from uclone_x.evaluation import (
     default_reports_dir,
 )
 from uclone_x.i18n import DEFAULT_UI_LANGUAGE, UI_LANGUAGES, UiLanguage, is_ui_language
+from uclone_x.link.uclone2.supervisor import LinkSupervisor
 from uclone_x.llm import create_llm_connector
 from uclone_x.llm.budget import TokenBudgetManager
 from uclone_x.llm.catalog import (
@@ -158,7 +159,6 @@ from uclone_x.llm.models import (
     ChatMessage,
     LLMRequest,
     MessageRole,
-    ToolCallRequest,
 )
 from uclone_x.llm.protocols import LLMProviderProtocol
 from uclone_x.llm.providers import (
@@ -171,7 +171,7 @@ from uclone_x.llm.providers import (
 from uclone_x.llm.usage.gate import UsageGate
 from uclone_x.llm.usage.store import USAGE_FILE_NAME
 from uclone_x.memory.store import CrossSessionMemory, default_cross_session_memory
-from uclone_x.ontology.engine import OntologyEngine
+from uclone_x.ontology.protocols import OntologyEngineProtocol
 from uclone_x.room.service import (
     SESSION_ID_PREFIX as _ROOM_SESSION_PREFIX,
 )
@@ -180,11 +180,20 @@ from uclone_x.room.service import (
 )
 from uclone_x.sandbox.path_validator import PathValidator
 from uclone_x.shells.ui_process import UI_BIND_HOST_ENV_VAR
+from uclone_x.skills.approvals import SkillApprovalLedger
 from uclone_x.skills.auditor import (
     SkillRegistry,
     load_approved_skills,
     runtime_skill_store_dir,
 )
+from uclone_x.skills.models import skill_hidden_from
+from uclone_x.skills.proposals import (
+    SETTINGS_PERSON,
+    SkillProposalChangedError,
+    SkillProposalError,
+    SkillProposalStore,
+)
+from uclone_x.skills.shipped_pins import SHIPPED_SKILL_PINS
 from uclone_x.telemetry.tracer import TelemetryTracer
 from uclone_x.tools.base import replace_file
 from uclone_x.tools.builtin.comfy_client import (
@@ -752,6 +761,21 @@ def _validate_read_roots(
     return tuple(cleaned)
 
 
+def _absorbed_agent_errors(agents: Sequence[BaseAgent]) -> dict[str, list[str]]:
+    """Clone id -> the failures its live seats absorbed, for the health reads (#198).
+
+    Keyed by clone, as before rooms: one clone seated in two conversations is one entry
+    holding both seats' failures.
+    """
+    errors: dict[str, list[str]] = {}
+    for agent in agents:
+        if agent.processing_errors:
+            errors.setdefault(agent.agent_id, []).extend(
+                str(err) for err in agent.processing_errors
+            )
+    return errors
+
+
 def _persona_payload(registry: PersonaRegistry, persona: PersonaDefinition) -> dict[str, Any]:
     """One persona as the dashboard reads it, and as its editor sends it back.
 
@@ -817,77 +841,6 @@ def _next_sequence_number() -> int:
     global _sequence_counter
     _sequence_counter += 1
     return _sequence_counter
-
-
-TRANSCRIPT_FAILURE_ROLE = "failure"
-"""The transcript role of a turn that failed (#969).
-
-A failure is not something the agent said. The chat head saved one as `role: "assistant"`
-with `Error: ...` content, so the saved conversation claimed a reply and the only mark on it
-was that wording. A record with this role keeps the text the page showed in `content` and
-the turn's error in `error`; it is shown to the user and never rebuilt into model context.
-"""
-
-
-LEGACY_FAILURE_PREFIX = "Error: "
-"""How a failed turn's text began in a transcript saved before `TRANSCRIPT_FAILURE_ROLE`."""
-
-TRANSCRIPT_CANCELLED_ROLE = "cancelled"
-"""The transcript role of a turn Stop cancelled before it finished (#1031).
-
-A cancellation is not a failure and not a reply: nothing went wrong and nothing was said.
-Before this role existed a cancelled turn wrote **no row at all**, while the Core kept the
-prompt and whatever the turn had already done -- so the page showed no sign a tool had run,
-and the orphaned prompt stalled the truncation mapping, which then cut a turn the page was
-still showing (#1031, measured end to end in PR #1033's probe).
-
-The row carries the calls the Core records for the turn in `tool_calls`, so a stop after a
-tool step is visible as one. It never re-enters model context, exactly as a failure row does
-not: `reconstruct_history` drops both, through `_records_a_turn_not_spoken`.
-"""
-
-
-def _is_failure_entry(role: str, entry: dict[str, Any]) -> bool:
-    """Whether a persisted transcript entry records a failed turn rather than a message.
-
-    A record written since #969 says so in its role. One written before says so only by
-    the shape the chat head gave it: an assistant row whose text starts with
-    `LEGACY_FAILURE_PREFIX` under degraded provenance. That wording is read only here, for
-    transcripts that carry nothing better, and only to keep the row out of model context;
-    the page is still served the row as it was saved.
-    """
-    if role == TRANSCRIPT_FAILURE_ROLE:
-        return True
-    content = entry.get("content")
-    provenance = entry.get("provenance")
-    return (
-        role == MessageRole.ASSISTANT.value
-        and isinstance(content, str)
-        and content.startswith(LEGACY_FAILURE_PREFIX)
-        and isinstance(provenance, dict)
-        and cast(dict[str, Any], provenance).get("degraded") is True
-    )
-
-
-def _records_a_turn_not_spoken(role: str, entry: dict[str, Any]) -> bool:
-    """Whether this row records how a turn ended rather than something that was said (#1031).
-
-    `reconstruct_history` must keep both out of rebuilt model context: neither is anything
-    the agent said. Such rows exist only in transcripts the retired single-agent chat path
-    (`/api/turn`, removed in #1731) saved before every conversation became a room.
-    """
-    return role == TRANSCRIPT_CANCELLED_ROLE or _is_failure_entry(role, entry)
-
-
-def _is_presentable_role(role: str, compaction_ledger: bool) -> bool:
-    """Whether a message with this role belongs in the transcript the user reads.
-
-    Stated over the two fields it actually depends on, because `reconstruct_history` asks
-    it of a persisted transcript dict rather than of a typed `ChatMessage` (#872).
-
-    A system message is an anchor, not conversation, *unless* it is a compaction ledger.
-    """
-    return role != MessageRole.SYSTEM.value or compaction_ledger
 
 
 def _turns_taken(transcript: Sequence[dict[str, Any]]) -> int:
@@ -968,7 +921,12 @@ class KeyRemovalRefused(ValueError):
 
 
 class AgentSessionManager:
-    """Manages active BaseAgent instances per agent_id and session for the UI layer."""
+    """The app's clone scope, settings and session records, for the UI layer.
+
+    It holds no agent. Every conversation is a room (D1 Rev 23), and a room's seats are
+    built and cached by that room's `RoomAgentResolver` (`RoomStack`); this class hands
+    them the scope they are built from (`app_scope`).
+    """
 
     def __init__(
         self,
@@ -978,7 +936,6 @@ class AgentSessionManager:
         tracer: TelemetryTracer | None = None,
         fallback_to_mock: bool = False,
         storage_dir: Path | None = None,
-        ontology_engine: OntologyEngine | None = None,
         skill_registry: SkillRegistry | None = None,
         budget_tracker: TokenBudgetManager | None = None,
         eval_reports_dir: Path | None = None,
@@ -986,10 +943,10 @@ class AgentSessionManager:
     ) -> None:
         self._bus = bus if bus is not None else get_ui_event_bus()
         self._llm = llm
-        #: Told when Settings replaces the connector. The chat agents in `_agents` are
-        #: reloaded here, but a conversation's seats are built and cached by the room stack,
-        #: which this class cannot see; without this they kept the connector they were
-        #: built with -- `None`, for a room first used before a model was chosen (#1446).
+        #: Told when Settings replaces the connector. A conversation's seats are built and
+        #: cached by the room stack, which this class cannot see; without this they kept
+        #: the connector they were built with -- `None`, for a room first used before a
+        #: model was chosen (#1446).
         self._llm_listeners: list[Callable[[LLMProviderProtocol | None], None]] = []
         self._tools = tools if tools is not None else create_default_registry()
         self._tracer = tracer if tracer is not None else get_ui_tracer()
@@ -1028,7 +985,9 @@ class AgentSessionManager:
         self._transcript_dir = self._storage_dir / UI_TRANSCRIPT_SUBDIR
         self._transcript_dir.mkdir(parents=True, exist_ok=True)
         reap_orphaned_temp_files(self._transcript_dir)
-        self._ontology_engine = ontology_engine if ontology_engine is not None else OntologyEngine()
+        # A transcript kept aside when its conversation was cleared is kept 30 days once no
+        # transcript has been written under its name again, as a Core record's copy is (#1877).
+        expire_set_aside(self._transcript_dir, suffix=".json")
         # Over the runtime skill store by default, which `ucx skill approve` writes; the
         # approved skills in it are loaded at app startup (`create_ui_app`'s lifespan).
         # A registry built with no directory is inert: `reload_approved` loads nothing,
@@ -1044,26 +1003,25 @@ class AgentSessionManager:
         self._eval_reports_dir = (
             eval_reports_dir.resolve() if eval_reports_dir is not None else default_reports_dir()
         )
-        self._agents: dict[str, BaseAgent] = {}
         # One memory store instance per agent id, not per session. Two live sessions of the
         # same agent constructing their own stores over the same file would each hold the
         # whole fact set in memory and each `save()` the whole of it, so the second writer
         # drops whatever the first recorded after it loaded (#1097).
         self._agent_memories: dict[str, CrossSessionMemory] = {}
+        #: Clone id -> that clone's one rules engine, as `_agent_memories` is for memory
+        #: (clone-knowledge-graph step 6). Every head this manager serves builds its clones
+        #: from this map, so a clone reasons under one set of rules in chat and in rooms.
+        self._clone_ontologies = ontology_map()
         #: (provider, base URL) -> the host binder for it, or `None` where every tool is
         #: pinned. Shared by every clone, so a tool description is embedded once.
         self._tool_binders: dict[tuple[str, str], ToolBinder | None] = {}
         self._session_messages: dict[str, list[dict[str, Any]]] = {}
-        self._lock = asyncio.Lock()
         self._configured_provider: str | None = None
         self._configured_base_url: str | None = None
         #: The deep model: what a clone's turns run on unless its persona names its own.
         self._configured_model: str | None = None
         #: The fast model, for auxiliary calls (room routing); `None` means the deep one.
         self._configured_model_fast: str | None = None
-        #: Chat agent -> whether its (deep, fast) model follows Settings, i.e. its persona
-        #: named none. A Settings save moves only those; a persona's own model stays.
-        self._follows_settings: dict[str, tuple[bool, bool]] = {}
         self._configured_comfyui_url: str | None = os.getenv(
             "COMFYUI_BASE_URL", DEFAULT_COMFYUI_BASE_URL
         )
@@ -1073,11 +1031,16 @@ class AgentSessionManager:
         self._configured_ui_language: UiLanguage = DEFAULT_UI_LANGUAGE
         # The same file `ucx run` and `ucx install` read and seed (`saved_choice.py`).
         self._settings_file: Path = self._storage_dir / SETTINGS_FILE_NAME
+        #: Whether a Settings save of this dashboard found the file unreadable and moved it
+        #: aside (#1860). Settings says so from then on, for as long as this dashboard runs:
+        #: the keys the person saved are in that copy, not in the file Settings now shows.
+        self._settings_set_aside = False
         # This dashboard's paid calls are held to the limits in its own settings file and
         # booked in its own storage directory, which its Usage panel reads.
         self._usage_file: Path = self._storage_dir / USAGE_FILE_NAME
         self._usage_gate = UsageGate.for_storage(self._settings_file, self._usage_file)
         self._load_persisted_settings()
+        self._build_initial_llm()
         # Pictures follow this dashboard's settings file, the chat provider in effect and
         # the Gemini address the chat uses, all read again on every draw, so a change in
         # Settings applies to the next one.
@@ -1151,26 +1114,6 @@ class AgentSessionManager:
     def tools(self) -> ToolRegistryProtocol:
         return self._tools
 
-    def apply_persona(self, persona: PersonaDefinition) -> int:
-        """Put an edited persona in force on every chat agent seated as it; return how many.
-
-        Chat agents only: a room's agents are built by `room/resolver.py` and are not held
-        here, so they take the edit when the room is next seated.
-
-        Each agent resolves its prompt from the persona on every read, but its tool scope is
-        resolved once and stored, and `define_persona` is the call that recomputes it
-        (#1153). An agent is counted once however many keys it is cached under. What an
-        agent took at construction -- its model settings and the write and delegation
-        switches -- stays until that agent is created again.
-        """
-        seen: set[int] = set()
-        for agent in self._agents.values():
-            if agent.persona != persona.name or id(agent) in seen:
-                continue
-            seen.add(id(agent))
-            agent.define_persona(persona)
-        return len(seen)
-
     @property
     def llm(self) -> LLMProviderProtocol | None:
         return self._llm
@@ -1178,10 +1121,6 @@ class AgentSessionManager:
     @property
     def tracer(self) -> TelemetryTracer:
         return self._tracer
-
-    @property
-    def ontology_engine(self) -> OntologyEngine:
-        return self._ontology_engine
 
     @property
     def skill_registry(self) -> SkillRegistry:
@@ -1470,15 +1409,26 @@ class AgentSessionManager:
                 if isinstance(entry, str) and entry.strip()
             )
 
-        if self._llm is None and (self._configured_provider or self._configured_base_url):
-            try:
-                self._llm = self._build_llm_in_effect()
-            except Exception as exc:
-                logger.warning(
-                    "Failed to initialize active LLM connector from persisted settings %s: %s",
-                    self._settings_file,
-                    exc,
-                )
+    def _build_initial_llm(self) -> None:
+        """Build the connector a dashboard starts with, from whatever names a provider.
+
+        The saved file, or `LLM_PROVIDER` alone: the environment overrides the file and
+        does not need one (settings-single-source S4). Only the file was consulted before,
+        so a dashboard started with `LLM_PROVIDER` and no settings file reported that
+        provider in Settings while every conversation had no model (#1899).
+        """
+        if self._llm is not None:
+            return
+        if not (self.provider_in_effect or self._configured_base_url):
+            return
+        try:
+            self._llm = self._build_llm_in_effect()
+        except Exception as exc:
+            logger.warning(
+                "Failed to initialize the LLM connector (settings file %s): %s",
+                self._settings_file,
+                exc,
+            )
 
     def _adopt_saved_choice(self) -> None:
         """Pick up a model choice saved after this dashboard started, while it has none.
@@ -1512,28 +1462,62 @@ class AgentSessionManager:
             self._install_llm(adopted)
 
     def _install_llm(self, new_llm: LLMProviderProtocol) -> None:
-        """Make ``new_llm`` the connector, and hand it to every open agent and room (#1446).
+        """Make ``new_llm`` the connector, and hand it to every open room (#1446).
 
         A Settings save and a choice adopted after startup both go through here, so a room
-        opened before either picks the new connector up the same way. An agent takes the
+        opened before either picks the new connector up the same way. A seat takes the
         Settings models only in the slots its persona left empty; a persona's own model is
-        never replaced by a Settings save.
+        never replaced by a Settings save (`RoomAgentResolver.replace_llm`).
         """
         self._llm = new_llm
-        deep, fast = self.global_models()
-        seen: set[int] = set()
-        for key, agent in self._agents.items():
-            if id(agent) in seen:
-                continue
-            seen.add(id(agent))
-            deep_follows, fast_follows = self._follows_settings.get(key, (True, True))
-            agent.hot_reload_llm(
-                new_llm,
-                model_name=deep if deep_follows else None,
-                fast_model=fast if fast_follows else None,
-            )
         for listener in self._llm_listeners:
             listener(new_llm)
+
+    def _save_key(self, provider: str, key: str, *, held: dict[str, Any]) -> None:
+        """Save `key` for `provider`, first keeping an unreadable settings file aside (#1877).
+
+        `save_api_key` refuses to merge into a file it cannot read, and its refusal names
+        the file's path; that text used to reach Settings as the reason the save failed
+        (#1860). A Settings save states every value Settings holds, so the unreadable file
+        is kept aside and replaced with them, as `_save_persisted_settings` does for a
+        save without a key -- and Settings then says the earlier file was kept. The key is
+        saved into the new file.
+
+        `held` is what Settings held before this save: the new file gets those values, not
+        the ones this save is still trying, which a failed model check takes back.
+
+        Raises:
+            OSError: The unreadable file could not be kept aside, or the key could not be
+                written. Its text is not a `ValueError`'s, so it never becomes the reason
+                Settings shows; the route answers with a failure Settings words itself.
+        """
+        try:
+            save_api_key(provider, key, path=self._settings_file)
+            return
+        except ValueError as exc:
+            refusal = exc
+        aside = update_settings_file({}, path=self._settings_file, replace_unreadable_with=held)
+        if aside is None:
+            raise refusal  # the file was readable: the refusal is about the key, as before
+        logger.warning("Settings could not be read before a key was saved: %s", refusal)
+        self._settings_set_aside = True  # and Settings says so
+        try:
+            save_api_key(provider, key, path=self._settings_file)
+        except ValueError as exc:
+            # Unreadable again: another writer since the file was kept aside.
+            raise OSError("the settings file could not be read, so the key was not saved") from exc
+
+    def _persisted_settings(self) -> dict[str, Any]:
+        """Every setting this dashboard holds, as a settings file written whole holds them."""
+        return {
+            "llm_provider": self._configured_provider,
+            "llm_base_url": self._configured_base_url,
+            "llm_model": self._configured_model,
+            LLM_MODEL_FAST_KEY: self._configured_model_fast,
+            "comfyui_base_url": self._configured_comfyui_url,
+            "read_roots": list(self._configured_read_roots),
+            "ui_language": self._configured_ui_language,
+        }
 
     def _save_persisted_settings(self, changes: dict[str, Any]) -> None:
         """Merge the settings this save changed into the settings file.
@@ -1544,19 +1528,13 @@ class AgentSessionManager:
         everything this dashboard holds, as a Settings save always did. Keys are not held
         here, so they are written by `save_api_key` alone.
         """
-        everything: dict[str, Any] = {
-            "llm_provider": self._configured_provider,
-            "llm_base_url": self._configured_base_url,
-            "llm_model": self._configured_model,
-            LLM_MODEL_FAST_KEY: self._configured_model_fast,
-            "comfyui_base_url": self._configured_comfyui_url,
-            "read_roots": list(self._configured_read_roots),
-            "ui_language": self._configured_ui_language,
-        }
+        everything = self._persisted_settings()
         try:
-            update_settings_file(
+            aside = update_settings_file(
                 changes, path=self._settings_file, replace_unreadable_with=everything
             )
+            if aside is not None:
+                self._settings_set_aside = True  # a Settings save kept the file aside
         except Exception as exc:
             logger.warning("Failed to write settings file %s: %s", self._settings_file, exc)
 
@@ -1645,6 +1623,9 @@ class AgentSessionManager:
             "llm_base_url_source": base_url_source,
             "llm_base_url_env_var": base_url_var,
             "env_overrides": self._env_overrides(active_provider),
+            # The words are the page's, in the person's language: this says only that it
+            # happened, never where the copy is or why it could not be read (#1860).
+            "settings_set_aside": self._settings_set_aside,
             "llm_api_key_set": bool(key),
             "llm_api_key_masked": self._mask_key(key) if key else "",
             "llm_api_key_source": source or "",
@@ -1699,14 +1680,6 @@ class AgentSessionManager:
     def on_llm_replaced(self, listener: Callable[[LLMProviderProtocol | None], None]) -> None:
         """Call `listener` with the new connector whenever Settings replaces it."""
         self._llm_listeners.append(listener)
-
-    def set_agent_model(self, agent: BaseAgent, model_name: str) -> None:
-        """Give ``agent`` its own deep model; a later Settings save no longer moves it."""
-        agent.hot_reload_llm(self._llm or agent.llm, model_name=model_name)
-        for key, held in self._agents.items():
-            if held is agent:
-                _, fast_follows = self._follows_settings.get(key, (True, True))
-                self._follows_settings[key] = (False, fast_follows)
 
     def remove_api_key(self, provider: str) -> dict[str, Any]:
         """Remove the key saved for ``provider``; return the settings as they now are.
@@ -1808,12 +1781,13 @@ class AgentSessionManager:
             for v in (llm_provider, llm_base_url, llm_api_key, llm_model, llm_model_fast)
         )
         previous = {attr: getattr(self, attr) for attr in state_updates}
+        held = self._persisted_settings()  # before this save's values, which may be undone
         for k, v in state_updates.items():
             setattr(self, k, v)
         if new_key is not None:
             # The key is saved before the rebuild reads it, and stays saved if the rebuild
             # fails: it is the person's key for that provider whatever happens to the probe.
-            save_api_key(new_key[0], new_key[1], path=self._settings_file)
+            self._save_key(*new_key, held=held)
         new_llm = None
         if reload_llm:
             # The provider in effect after this save: `LLM_PROVIDER` still wins over the
@@ -1859,10 +1833,9 @@ class AgentSessionManager:
                 img_tool.update_base_url(clean_comfy)
 
         if clean_roots is not None:
+            # Every conversation seat reads the list again at its next turn
+            # (`RoomAgentResolver.resolve`), so nothing is pushed to a live agent here.
             self._configured_read_roots = clean_roots
-            effective_roots = self.read_roots
-            for agent in self._agents.values():
-                agent.set_read_roots(effective_roots)
 
         changes: dict[str, Any] = {
             key: getattr(self, attr)
@@ -1968,13 +1941,11 @@ class AgentSessionManager:
         The live agent is preferred over the store because it is the writer: an agent
         holding an unpersisted turn is ahead of the record, never behind it.
 
-        `agent` is for a caller that is already holding the writer and knows this manager
-        cannot find it. A conversation seat's agent is built and cached by
-        `RoomAgentResolver`, never registered here, so `get_agent` answers `None` for one and
-        this would silently fall back to the persisted copy — behind the live agent by
-        whatever it has not written yet, which is exactly the turn a reader is asking about.
+        `agent` is the writer, when the caller holds one. A conversation seat's agent is
+        built and cached by `RoomAgentResolver` and this manager holds none, so without it
+        this reads the persisted copy -- behind the live agent by whatever it has not
+        written yet, which is exactly the turn a reader is asking about.
         """
-        agent = agent if agent is not None else self.get_agent(agent_id, session_id)
         if agent is not None:
             live = agent.get_session(session_id)
             return list(live.messages), live.turn_counter
@@ -2023,11 +1994,10 @@ class AgentSessionManager:
         no-agent branch its Core record. Both are now refused, by the read below and by
         `SessionStore.delete` respectively.
 
-        **`agent` names the live writer when the caller is holding one this manager cannot
-        find.** A conversation seat's agent is built and cached by `RoomAgentResolver` and is
-        never registered in `_agents`, so `get_agent` answers `None` for one and the branch
-        below would delete the stored record while that live agent went on holding the
-        messages it had — and persisted them back over the deletion at its next turn, which
+        **`agent` names the live writer when the caller holds one.** A conversation seat's
+        agent is built and cached by `RoomAgentResolver`, and this manager holds no agent,
+        so without it the branch below would delete the stored record while that live agent
+        went on holding the messages it had — and persisted them back over the deletion at its next turn, which
         presents as a clear that silently did nothing. Passing the agent takes the reset
         branch, so the in-memory copy and the record are cut by the same call.
 
@@ -2041,7 +2011,7 @@ class AgentSessionManager:
         # Then ownership, before anything is reset or unlinked. `load_session_record`
         # raises on a transcript naming another session and returns `None` when there is
         # nothing there to own.
-        self.load_session_record(session_id)
+        transcript = self.load_session_record(session_id)
 
         # Core reset **before** the transcript unlink. The previous order deleted the
         # transcript first, so a Core reset that then failed left `transcript False /
@@ -2049,7 +2019,6 @@ class AgentSessionManager:
         # actually reasons over was intact, which is the least recoverable of the four
         # possible outcomes because the user sees an empty pane and the model does not.
         # Resetting Core first means a failure leaves *both* sides untouched.
-        agent = agent if agent is not None else self.get_agent(agent_id, session_id)
         if agent is not None:
             agent.reset_session(session_id)
         else:
@@ -2058,276 +2027,32 @@ class AgentSessionManager:
             # and with no agent constructed there is nothing authoritative to read it
             # from — calling `reset()` with the empty default would persist a session
             # with no system prompt at all, which is strictly worse than no record.
-            # Deleting makes the next `get_or_create_agent` seed correctly from config.
+            # Deleting makes the next clone built for it seed correctly from config.
             self._core_store.delete(session_id)
 
         # Only now the transcript, once Core has definitely been reset.
         self._session_messages.pop(session_id, None)
-        if path.exists():
-            path.unlink(missing_ok=True)
-
-    def get_agent(self, agent_id: str, session_id: str | None = None) -> BaseAgent | None:
-        """Retrieve an active agent if already initialized."""
-        if session_id:
-            key = f"{agent_id}:{session_id}"
-            if key in self._agents:
-                return self._agents[key]
-            if agent_id in self._agents and self._agents[agent_id].context.session_id == session_id:
-                return self._agents[agent_id]
-            return None
-        if agent_id in self._agents:
-            return self._agents[agent_id]
-        def_key = f"{agent_id}:sess_{agent_id}"
-        if def_key in self._agents:
-            return self._agents[def_key]
-        for ag in self._agents.values():
-            if ag.agent_id == agent_id:
-                return ag
-        return None
-
-    def list_agents(self, session_id: str | None = None) -> list[BaseAgent]:
-        """Return list of unique active agents, optionally filtered by session_id."""
-        if session_id:
-            matching = [
-                ag
-                for ag in self._agents.values()
-                if getattr(ag.context, "session_id", None) == session_id
-            ]
-            if matching:
-                seen: set[str] = set()
-                deduped: list[BaseAgent] = []
-                for ag in matching:
-                    if ag.agent_id not in seen:
-                        seen.add(ag.agent_id)
-                        deduped.append(ag)
-                return deduped
-
-        # Deduplicate by agent_id across all agents so multiple session instances don't duplicate
-        seen_all: set[str] = set()
-        deduped_all: list[BaseAgent] = []
-        for ag in self._agents.values():
-            if ag.agent_id not in seen_all:
-                seen_all.add(ag.agent_id)
-                deduped_all.append(ag)
-        return deduped_all
-
-    def reconstruct_history(
-        self,
-        raw_list: Sequence[object],
-        system_prompt: str | None = None,
-        session_id: str = "",
-    ) -> tuple[list[ChatMessage], list[dict[str, Any]]]:
-        """Reconstruct ChatMessage history and UI session transcript from a persisted message list.
-
-        Preserves tool identity (`name`, `tool_call_id`, `tool_calls`) and distinguishes
-        `content=None` from `content=""`.
-
-        If a `TOOL` message lacks a tool name, this method attempts to repair it using
-        positive evidence from preceding `tool_calls` or `tool_executions` matching `tool_call_id`.
-        If the tool identity cannot be determined, it raises `SessionHistoryRehydrationError`
-        rather than fabricating a name or handing an unmappable message to the model (P6).
-
-        Parameters:
-            raw_list: Raw list of message objects loaded from transcript JSON.
-            system_prompt: Optional agent system prompt to prepend if not already seeded.
-            session_id: Session identifier for diagnostic attribution on error.
-
-        Returns:
-            A tuple of (reconstructed ChatMessages for agent history, typed UI session message dicts).
-
-        Raises:
-            SessionHistoryRehydrationError: If a tool message cannot be given a valid name.
-        """
-        history_messages: list[ChatMessage] = []
-        typed_session_msgs: list[dict[str, Any]] = []
-        known_tool_calls: dict[str, str] = {}
-
-        if system_prompt:
-            history_messages.append(ChatMessage(role=MessageRole.SYSTEM, content=system_prompt))
-
-        for idx, item in enumerate(raw_list):
-            if not isinstance(item, dict):
-                continue
-            item_dict: dict[str, Any] = dict(cast(dict[str, Any], item))
-            typed_session_msgs.append(item_dict)
-
-            role_str = str(item_dict.get("role", "")).strip().lower()
-            if not role_str:
-                raw_sender = str(item_dict.get("sender", "")).strip().lower()
-                if raw_sender == "user":
-                    role_str = "user"
-                elif raw_sender in ("agent", "assistant"):
-                    role_str = "assistant"
-                elif raw_sender == "system":
-                    role_str = "system"
-                elif raw_sender == "tool":
-                    role_str = "tool"
-                elif not raw_sender:
-                    raise SessionHistoryRehydrationError(
-                        f"Cannot rehydrate session {session_id!r}: message at index {idx} "
-                        "lacks both 'role' and 'sender' fields. Refusing the damaged "
-                        "history rather than guessing who said it."
-                    )
-                else:
-                    raise SessionHistoryRehydrationError(
-                        f"Cannot rehydrate session {session_id!r}: message at index {idx} "
-                        f"has unrecognized sender {raw_sender!r}. Refusing the damaged "
-                        "history rather than guessing who said it."
-                    )
-
-            # A failed or cancelled turn is the page's record, not conversation: nothing
-            # the agent said, so never handed back to the model as though it were (#969,
-            # #1031). `cancelled` is no `MessageRole` either, so this is also what stops the
-            # rebuild choking on a row that names no conversational role.
-            if _records_a_turn_not_spoken(role_str, item_dict):
-                continue
-
-            # The same rule the outbound transcript is rendered with, reached through the
-            # one predicate rather than restated here (#872).
-            if not _is_presentable_role(role_str, bool(item_dict.get("compaction_ledger", False))):
-                continue
-
-            if role_str == "system":
-                raw_c = item_dict.get("content")
-                c_str = str(raw_c) if raw_c is not None else None
-                history_messages.append(
-                    ChatMessage(
-                        role=MessageRole.SYSTEM,
-                        content=c_str,
-                        compaction_ledger=True,
-                    )
-                )
-                continue
-
+        if transcript is None and path.is_file():
+            # There and unreadable -- damaged, or written by a build this one cannot
+            # parse: kept beside its name, not unlinked, like the Core record above
+            # (#1860). If it cannot be moved, it is left where it is.
             try:
-                role_enum = MessageRole(role_str)
-            except ValueError as exc:
-                raise SessionHistoryRehydrationError(
-                    f"Cannot rehydrate session {session_id!r}: message at index {idx} "
-                    f"has unrecognized role {role_str!r}. Refusing the damaged history "
-                    "rather than guessing who said it."
-                ) from exc
-
-            # Preserve content fidelity: distinguish absent field / None from empty string ""
-            if "content" not in item_dict or item_dict["content"] is None:
-                content_str = None
+                aside = set_aside_unreadable(path)
+            except OSError as exc:
+                logger.warning(
+                    "Transcript at %s cannot be read and could not be moved aside (%s); "
+                    "it was left where it is",
+                    path,
+                    exc,
+                )
             else:
-                content_str = str(item_dict["content"])
-
-            if role_enum == MessageRole.USER:
-                user_name = item_dict.get("name")
-                name_str = (
-                    str(user_name).strip()
-                    if user_name is not None and str(user_name).strip()
-                    else None
+                logger.warning(
+                    "Transcript at %s cannot be read; it was moved aside, unchanged, to %s",
+                    path,
+                    aside,
                 )
-                history_messages.append(
-                    ChatMessage(role=role_enum, content=content_str, name=name_str)
-                )
-
-            elif role_enum == MessageRole.ASSISTANT:
-                reconstructed_tool_calls: list[ToolCallRequest] = []
-                raw_tc_obj: object = item_dict.get("tool_calls")
-                has_tc_list = isinstance(raw_tc_obj, list)
-                if has_tc_list:
-                    raw_tc_list: list[object] = cast(list[object], raw_tc_obj)
-                    for tc_item in raw_tc_list:
-                        if isinstance(tc_item, dict):
-                            tc_dict: dict[str, Any] = cast(dict[str, Any], tc_item)
-                            if "id" in tc_dict and "name" in tc_dict:
-                                tc_id = str(tc_dict["id"])
-                                tc_name = str(tc_dict["name"]).strip()
-                                raw_args: object = tc_dict.get("arguments", {})
-                                tc_args: dict[str, Any] = (
-                                    cast(dict[str, Any], raw_args)
-                                    if isinstance(raw_args, dict)
-                                    else {}
-                                )
-                                reconstructed_tool_calls.append(
-                                    ToolCallRequest(id=tc_id, name=tc_name, arguments=tc_args)
-                                )
-                                known_tool_calls[tc_id] = tc_name
-
-                raw_te_obj: object = item_dict.get("tool_executions")
-                if isinstance(raw_te_obj, list):
-                    raw_te_list: list[object] = cast(list[object], raw_te_obj)
-                    for te_item in raw_te_list:
-                        if isinstance(te_item, dict):
-                            te_dict: dict[str, Any] = cast(dict[str, Any], te_item)
-                            te_id_val: object = te_dict.get("tool_call_id")
-                            te_name_val: object = te_dict.get("tool_name")
-                            if te_id_val is not None and te_name_val is not None:
-                                te_id = str(te_id_val).strip()
-                                te_name = str(te_name_val).strip()
-                                if te_id and te_name:
-                                    known_tool_calls[te_id] = te_name
-                                if not has_tc_list and te_id and te_name:
-                                    raw_te_args: object = te_dict.get("arguments", {})
-                                    te_args: dict[str, Any] = (
-                                        cast(dict[str, Any], raw_te_args)
-                                        if isinstance(raw_te_args, dict)
-                                        else {}
-                                    )
-                                    reconstructed_tool_calls.append(
-                                        ToolCallRequest(
-                                            id=te_id,
-                                            name=te_name,
-                                            arguments=te_args,
-                                        )
-                                    )
-
-                history_messages.append(
-                    ChatMessage(
-                        role=role_enum,
-                        content=content_str,
-                        tool_calls=tuple(reconstructed_tool_calls),
-                    )
-                )
-
-            elif role_enum == MessageRole.TOOL:
-                raw_name_obj: object = item_dict.get("name") or item_dict.get("tool_name")
-                tool_name: str | None = (
-                    str(raw_name_obj).strip()
-                    if raw_name_obj is not None and str(raw_name_obj).strip()
-                    else None
-                )
-
-                raw_call_id_obj: object = item_dict.get("tool_call_id") or item_dict.get("tool_id")
-                tool_call_id: str | None = (
-                    str(raw_call_id_obj).strip()
-                    if raw_call_id_obj is not None and str(raw_call_id_obj).strip()
-                    else None
-                )
-
-                # Attempt repair if tool_name is absent/blank but tool_call_id is known
-                is_inferred = False
-                if not tool_name and tool_call_id and tool_call_id in known_tool_calls:
-                    tool_name = known_tool_calls[tool_call_id]
-                    is_inferred = True
-
-                if not tool_name:
-                    raise SessionHistoryRehydrationError(
-                        f"Cannot rehydrate session {session_id!r}: message at index {idx} "
-                        "has role 'tool' but lacks tool identity ('name' is missing or blank) "
-                        "and cannot be repaired from preceding tool calls. Refusing damaged "
-                        "history rather than fabricating a tool name or passing an unmappable "
-                        "message to the model."
-                    )
-
-                item_dict["name"] = tool_name
-                if is_inferred or bool(item_dict.get("name_inferred")):
-                    item_dict["name_inferred"] = True
-
-                history_messages.append(
-                    ChatMessage(
-                        role=role_enum,
-                        content=content_str,
-                        name=tool_name,
-                        tool_call_id=tool_call_id,
-                    )
-                )
-
-        return history_messages, typed_session_msgs
+        elif path.exists():
+            path.unlink(missing_ok=True)
 
     def app_scope(self, llm: LLMProviderProtocol | None = None) -> AppScope:
         """The app scope every clone this manager serves is built from (§5.9.2).
@@ -2366,7 +2091,9 @@ class AgentSessionManager:
             store=self._core_store,
             budget=self._budget_tracker,
             skills=self._skill_registry,
-            ontology=self._ontology_engine,
+            # Each clone's own engine, never the manager's (step 6): one engine on the app
+            # scope was every clone's, and what one clone was taught reached them all.
+            ontology_for=self.ontology_for,
             tool_binder=self._tool_binders[binder_key],
             # The desktop app has no approval prompt in a conversation, so a call that
             # needs a person is refused at once and names where to decide instead (the
@@ -2378,6 +2105,14 @@ class AgentSessionManager:
         return dataclasses.replace(
             scope, live_host=lambda: dataclasses.replace(scope.host, llm=self._llm or llm)
         )
+
+    def ontology_for(self, agent_id: str) -> OntologyEngineProtocol:
+        """The one rules engine of clone `agent_id`, created on first use (step 6).
+
+        Public for the same reason as `memory_for`: `RoomStack` seats the same ids and its
+        knowledge read reports the rules this map holds, not a copy of its own.
+        """
+        return self._clone_ontologies(agent_id)
 
     def memory_for(self, agent_id: str) -> CrossSessionMemory:
         """The one cross-session memory store for `agent_id`, created on first use.
@@ -2391,8 +2126,7 @@ class AgentSessionManager:
         its chat agents and the seats a conversation puts them in.
 
         Get-or-create has no `await` between the read and the write, so two coroutines
-        cannot race a second store into being; `get_or_create_agent` additionally calls
-        this under `self._lock`.
+        cannot race a second store into being.
         """
         existing = self._agent_memories.get(agent_id)
         if existing is not None:
@@ -2400,141 +2134,6 @@ class AgentSessionManager:
         store = default_cross_session_memory(agent_id)
         self._agent_memories[agent_id] = store
         return store
-
-    async def get_or_create_agent(
-        self,
-        agent_id: str,
-        session_id: str | None = None,
-        system_prompt: str | None = None,
-        model_name: str | None = None,
-        fallback_to_mock: bool | None = None,
-    ) -> BaseAgent:
-        """Get existing agent or instantiate and start a new BaseAgent hydrated from session state."""
-        effective_session_id = session_id or f"sess_{agent_id}"
-        agent_key = f"{agent_id}:{effective_session_id}"
-
-        async with self._lock:
-            if agent_key in self._agents:
-                return self._agents[agent_key]
-            if session_id is None and agent_id in self._agents:
-                return self._agents[agent_id]
-            if (
-                agent_id in self._agents
-                and self._agents[agent_id].context.session_id == effective_session_id
-            ):
-                return self._agents[agent_id]
-
-            self._adopt_saved_choice()
-            use_fallback = (
-                fallback_to_mock if fallback_to_mock is not None else self._fallback_to_mock
-            )
-            if self._llm is not None:
-                llm = self._llm
-            else:
-                deep = self.deep_model
-                provider = self.provider_in_effect
-                llm = self.build_llm(
-                    provider=provider,
-                    api_key=self._api_key_for(provider),
-                    base_url=self.base_url_in_effect(provider),
-                    fallback_to_mock=use_fallback,
-                    **({"model": deep} if deep else {}),
-                )
-
-            # Built as a room seat of this clone is built (owner ruling 2026-09-27); a chat
-            # adds nothing a room adds. A model asked for with this request wins, else the
-            # persona's own, else Settings'; only the slots left empty follow Settings.
-            built = build_clone(
-                self.app_scope(llm),
-                clone_id=agent_id,
-                session_id=effective_session_id,
-                model_name=model_name,
-                fallback_prompt=system_prompt or None,
-            )
-            agent = built.agent
-            config = agent.config
-            follows = built.follows
-
-            # P8: the Core session record is the primary source of the conversation. Try
-            # it first; only fall back to reconstructing `ChatMessage`s from the UI's
-            # presentation transcript, which is what this method used to do
-            # unconditionally. That reconstruction is conversation-rehydration logic
-            # living in the UI, which P8 forbids, and it is kept solely so installs with
-            # an existing transcript and no Core record still resume. See #183 for the
-            # follow-up that retires it.
-            if agent.hydrate_session(effective_session_id) is not None:
-                record = self.load_session_record(effective_session_id)
-                if record is not None:
-                    raw_cached: object = record.get("messages", [])
-                    if isinstance(raw_cached, list):
-                        cached_list: list[object] = cast(list[object], raw_cached)
-                        self._session_messages[effective_session_id] = [
-                            cast(dict[str, Any], item)
-                            for item in cached_list
-                            if isinstance(item, dict)
-                        ]
-                await agent.start()
-                self._agents[agent_key] = agent
-                self._follows_settings[agent_key] = follows
-                if agent_id not in self._agents:
-                    self._agents[agent_id] = agent
-                    self._follows_settings[agent_id] = follows
-                return agent
-
-            # Legacy path: reconstruct history from the UI transcript.
-            record = self.load_session_record(effective_session_id)
-            if record is not None and "messages" in record:
-                raw_msgs: object = record.get("messages", [])
-                if isinstance(raw_msgs, list):
-                    raw_list: list[object] = cast(list[object], raw_msgs)
-                    history_messages, typed_session_msgs = self.reconstruct_history(
-                        raw_list=raw_list,
-                        system_prompt=config.system_prompt,
-                        session_id=effective_session_id,
-                    )
-                    turns = int(str(record.get("turns", 0)))
-                    agent.load_history(history_messages, turn_counter=turns)
-                    self._session_messages[effective_session_id] = list(typed_session_msgs)
-
-            if effective_session_id not in self._session_messages:
-                self._session_messages[effective_session_id] = []
-
-            await agent.start()
-            self._agents[agent_key] = agent
-            self._follows_settings[agent_key] = follows
-            if agent_id not in self._agents:
-                self._agents[agent_id] = agent
-                self._follows_settings[agent_id] = follows
-            return agent
-
-    async def stop_agent(self, agent_id: str, session_id: str | None = None) -> None:
-        """Stop and remove a specific agent."""
-        async with self._lock:
-            if session_id:
-                agent = self._agents.pop(f"{agent_id}:{session_id}", None)
-                if agent is not None:
-                    await agent.stop()
-                if (
-                    agent_id in self._agents
-                    and self._agents[agent_id].context.session_id == session_id
-                ):
-                    self._agents.pop(agent_id, None)
-            else:
-                agent = self._agents.pop(agent_id, None)
-                if agent is not None:
-                    await agent.stop()
-                for k in list(self._agents.keys()):
-                    if k.startswith(f"{agent_id}:"):
-                        ag = self._agents.pop(k)
-                        await ag.stop()
-
-    async def clear(self) -> None:
-        """Stop and clear all active agents and in-memory session caches."""
-        async with self._lock:
-            for agent in list(dict.fromkeys(self._agents.values())):
-                await agent.stop()
-            self._agents.clear()
-            self._session_messages.clear()
 
     def _eval_read_error(self, exc: Exception) -> str:
         """Name the reports directory and the exception, for a head to show in words."""
@@ -2756,18 +2355,14 @@ class AgentSessionManager:
         resolved, _ = self.get_artifact_file(path=path, session_id=session_id)
         return resolved.read_text(encoding="utf-8")
 
-    def get_knowledge_graph(
-        self, session_id: str | None = None, agent_id: str | None = None
-    ) -> dict[str, Any]:
-        """Return dynamic entity-relation triples (subject, predicate, object, provenance, tier) (RFC §6.1)."""
-        engine = self._ontology_engine
-        if agent_id and agent_id in self._agents:
-            agent_inst = self._agents[agent_id]
-            agent_onto = getattr(agent_inst, "ontology", None)
-            if agent_onto is not None:
-                engine = agent_onto  # pyright: ignore
+    def get_knowledge_graph(self, agent_id: str, session_id: str | None = None) -> dict[str, Any]:
+        """Return dynamic entity-relation triples (subject, predicate, object, provenance, tier) (RFC §6.1).
 
-        return knowledge_graph(engine, session_id=session_id, agent_id=agent_id)
+        From clone `agent_id`'s one rules engine (`ontology_for`), the one its seats and
+        chats reason with: the manager keeps no shared engine (clone-knowledge-graph §3.8,
+        #1869).
+        """
+        return knowledge_graph(self.ontology_for(agent_id), session_id=session_id)
 
 
 _PERSONA_DRAFT_TIMEOUT_S = 120.0
@@ -2870,15 +2465,18 @@ def create_ui_app(
     session_manager: AgentSessionManager | None = None,
     fallback_to_mock: bool = False,
     storage_dir: Path | None = None,
-    ontology_engine: OntologyEngine | None = None,
     skill_registry: SkillRegistry | None = None,
     budget_tracker: TokenBudgetManager | None = None,
     eval_reports_dir: Path | None = None,
     workspace_dir: Path | None = None,
     shutdown_event: asyncio.Event | None = None,
     bind_host: str | None = None,
+    link_supervisor: LinkSupervisor | None = None,
 ) -> FastAPI:
     """Create and configure the FastAPI developer dashboard application.
+
+    `link_supervisor` runs the uClone2 link sessions while the app is up; by default, one
+    over the links file (`UCLONE_LINKS_DIR`). With no link stored, nothing is dialled.
 
     `bind_host` is the address the server listens on. While it is a loopback address,
     every request must name this machine by a loopback name (`LoopbackHostGuard`). When
@@ -2898,7 +2496,6 @@ def create_ui_app(
             tracer=active_tracer,
             fallback_to_mock=fallback_to_mock,
             storage_dir=storage_dir,
-            ontology_engine=ontology_engine,
             skill_registry=skill_registry,
             budget_tracker=budget_tracker,
             eval_reports_dir=eval_reports_dir,
@@ -2916,6 +2513,7 @@ def create_ui_app(
         workspace_root=session_mgr.workspace_dir,
     )
     tunnel_manager = SSHTunnelManager()
+    links = link_supervisor if link_supervisor is not None else LinkSupervisor()
     # What a remote-GPU connect overwrote, kept on disk rather than in memory: the tunnel is
     # a child process that dies with this one (or on its own), and a restore held only in
     # memory left `127.0.0.1:11435` saved as the LLM address after a restart, pointing at
@@ -2982,7 +2580,14 @@ def create_ui_app(
             with contextlib.suppress(Exception):
                 restored = _restore_remote_settings()
                 logger.info("Restored settings a remote-GPU tunnel had replaced: %s", restored)
+        # The uClone2 links dial out in the background; a stored link that cannot reach
+        # uClone2 retries on its own and never holds the dashboard up.
+        await links.start()
         yield
+        # First, while the event loop is healthy: each session sends `bye{logout}` so
+        # uClone2 shows the clone offline at once (bounded at 2 s per session, in parallel).
+        with contextlib.suppress(Exception):
+            await links.shutdown()
         mcp_start.cancel()
         with contextlib.suppress(BaseException):
             await mcp_start
@@ -3013,6 +2618,7 @@ def create_ui_app(
     app.state.shutdown_event = active_shutdown_event
     app.state.mcp_manager = mcp_manager
     app.state.tunnel_manager = tunnel_manager
+    app.state.link_supervisor = links
 
     # Per app, not per module: two `create_ui_app` calls in one process — which is
     # every test session — must not share a model's in-flight pull (#1233). Also on
@@ -3072,12 +2678,8 @@ def create_ui_app(
     @app.get("/api/health")
     async def health() -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
         """Health check and absorbed failure accounting endpoint (#198)."""
-        live_agents = session_mgr.list_agents()
-        agent_errors: dict[str, list[str]] = {
-            ag.agent_id: [str(err) for err in ag.processing_errors]
-            for ag in live_agents
-            if ag.processing_errors
-        }
+        live_agents = room_stack.live_agents()
+        agent_errors = _absorbed_agent_errors(live_agents)
         total_agent_errors = sum(len(errs) for errs in agent_errors.values())
 
         return {
@@ -3108,12 +2710,8 @@ def create_ui_app(
     @app.get("/api/diagnostics")
     async def diagnostics() -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
         """Operator diagnostics endpoint exposing system telemetry and absorbed failure metrics (#198)."""
-        live_agents = session_mgr.list_agents()
-        agent_errors: dict[str, list[str]] = {
-            ag.agent_id: [str(err) for err in ag.processing_errors]
-            for ag in live_agents
-            if ag.processing_errors
-        }
+        live_agents = room_stack.live_agents()
+        agent_errors = _absorbed_agent_errors(live_agents)
         total_agent_errors = sum(len(errs) for errs in agent_errors.values())
 
         return {
@@ -3122,7 +2720,7 @@ def create_ui_app(
             "started_at": SERVER_START_TIME,
             "runtime": "uclone_x",
             "agents": {
-                "total": len(live_agents),
+                "total": len({ag.agent_id for ag in live_agents}),
                 "active_states": {ag.agent_id: ag.state.value for ag in live_agents},
             },
             "absorbed_failures": {
@@ -3851,7 +3449,8 @@ def create_ui_app(
             content={
                 "status": "ok",
                 "persona": _persona_payload(registry, persona),
-                "live_agents_updated": session_mgr.apply_persona(persona),
+                # How many open conversations take the edit at their next turn.
+                "live_agents_updated": room_stack.persona_edited(persona),
             },
         )
 
@@ -4220,10 +3819,36 @@ def create_ui_app(
             },
         }
 
+    def _developer_graph_clone(agent_id: str | None) -> str:
+        """The clone a developer-graph route reads, refused in plain words when unusable.
+
+        There is no shared engine to fall back on (clone-knowledge-graph §3.8, #1869): a
+        request names the clone, and a name that is not one of the clones listed here --
+        installed or running, as `GET /api/clones` lists them -- is refused before an engine
+        is made for it. Without that, every unknown name read would leave an empty engine in
+        the manager's map for the app's lifetime and answer 200 with an empty graph. A row
+        the listing marks unreadable is not a clone that can be read, so it is refused the
+        same way (#1879).
+        """
+        from uclone_x.ui.clones import CloneStatus, clone_listing
+
+        if not agent_id:
+            raise HTTPException(status_code=400, detail="Name the clone to read with agent_id.")
+        # The listing does show a folder whose name no clone can have (`Bad Name`), marked
+        # unreadable; skipping unreadable rows refuses that name as well as a damaged home.
+        readable = (
+            clone.name
+            for clone in clone_listing(session_mgr, room_stack).clones
+            if clone.status is not CloneStatus.UNREADABLE
+        )
+        if agent_id not in readable:
+            raise HTTPException(status_code=404, detail="There is no clone with that name here.")
+        return agent_id
+
     @app.get("/api/ontology")
-    async def get_ontology() -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
-        """Return LinkML concept hierarchy, relation graph, and tier metadata from live Core Engine."""
-        return session_mgr.ontology_engine.export_graph()
+    async def get_ontology(agent_id: str | None = None) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
+        """The concepts, relations, axioms and tier counts of clone `agent_id`'s rules engine."""
+        return session_mgr.ontology_for(_developer_graph_clone(agent_id)).export_graph()
 
     @app.get("/api/artifacts")
     async def get_artifacts(session_id: str | None = None) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
@@ -4268,13 +3893,149 @@ def create_ui_app(
         session_id: str | None = None,
         agent_id: str | None = None,
     ) -> dict[str, Any]:
-        """Return dynamic entity-relation triples (subject, predicate, object, provenance, tier) (RFC §6.1)."""
-        return session_mgr.get_knowledge_graph(session_id=session_id, agent_id=agent_id)
+        """Clone `agent_id`'s triples, nodes and edges, optionally one session's (RFC §6.1)."""
+        return session_mgr.get_knowledge_graph(
+            _developer_graph_clone(agent_id), session_id=session_id
+        )
 
     @app.get("/api/skills")
     async def get_skills() -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
-        """Return registered skills, P9 security audit reports, and quarantine statuses from live SkillRegistry."""
-        return session_mgr.skill_registry.get_summary()
+        """Return registered skills, P9 security audit reports, and quarantine statuses from live SkillRegistry.
+
+        Each skill also carries `hidden_from`: the clones whose tool scope lacks a tool the
+        skill requires, and which tools (#1826), so the panel can say why a clone is not
+        offered it rather than letting the skill vanish from that clone in silence.
+        """
+        from uclone_x.agent.persona_registry import get_default_persona_registry
+
+        summary = session_mgr.skill_registry.get_summary()
+        registry = get_default_persona_registry(
+            session_mgr.workspace_dir,
+            tool_names=[tool.name for tool in session_mgr.tools.list_tools()],
+        )
+        scopes = {p.name: p.granted_tools for p in registry.list_personas()}
+        for entry in summary["skills"]:
+            entry["hidden_from"] = skill_hidden_from(entry.get("requires_tools", []), scopes)
+            # Settings offers Revoke only for a skill that did not ship (#1827).
+            entry["shipped"] = entry.get("name") in SHIPPED_SKILL_PINS
+        summary["proposals"] = await _skill_proposals()
+        return summary
+
+    # --- Skill proposals (#1827) --------------------------------------------------------
+    #
+    # A clone proposes a skill with `propose_skill`; it waits, unloaded, in the store's
+    # `.pending/` area. Only a person may approve, reject or revoke, so each route refuses a
+    # cross-origin request and then requires a window this server confirmed (#1589) before
+    # the body is read: the model's shell cannot approve its own proposal. A refusal is the
+    # store's plain sentence, or one fixed sentence, never an exception's text.
+
+    _SKILLS_NO_STORE = "There is no skill folder for this project, so there is nothing to change."
+    _SKILLS_NOT_CHANGED = "The skill could not be changed. Try again."
+
+    def _proposal_store() -> SkillProposalStore:
+        root = session_mgr.skill_registry.store_root
+        if root is None or not root.is_dir():
+            raise HTTPException(status_code=404, detail=_SKILLS_NO_STORE)
+        return SkillProposalStore(root)
+
+    async def _skill_proposals() -> list[dict[str, Any]]:
+        root = session_mgr.skill_registry.store_root
+        if root is None or not root.is_dir():
+            return []
+        try:
+            proposals = await asyncio.to_thread(SkillProposalStore(root).list_proposals)
+        except OSError as exc:
+            logger.warning("Skill proposals could not be listed: %s", exc)
+            return []
+        return [proposal.to_dict() for proposal in proposals]
+
+    async def _skill_body_text(request: Request, key: str, missing: str) -> str:
+        try:
+            payload: object = await request.json()
+        except ValueError:
+            payload = None
+        value = payload.get(key) if isinstance(payload, dict) else None  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
+        if not isinstance(value, str) or not value:
+            raise HTTPException(status_code=400, detail=missing)
+        return value
+
+    async def _skill_version(request: Request) -> str:
+        return await _skill_body_text(request, "version", "Say which version of the skill.")
+
+    async def _after_skill_change() -> dict[str, Any]:
+        # The registry reloads from the store, so `load_skill` and new sessions see the
+        # change now; a session already running keeps the catalog it started with.
+        registry = session_mgr.skill_registry
+        await load_approved_skills(registry)
+        return {"ok": True}
+
+    def _a_person_decides(decision: Request) -> None:
+        # A skill decision is a person's (#1589): the model's shell reaches these routes
+        # too, so a window the server did not confirm is refused before anything changes.
+        _refuse_cross_origin(decision)
+        person_gate.require(decision)
+
+    @app.post("/api/skills/{name}/approve")
+    async def approve_skill_proposal(name: str, request: Request) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
+        """Approve a clone's proposal: audit, install as the active version, pin its digest."""
+        _a_person_decides(request)
+        version = await _skill_version(request)
+        # The digest of the proposal as Settings showed it: approval installs exactly that
+        # text or nothing, even if a clone's file tools rewrote it since (#1827).
+        seen_digest = await _skill_body_text(
+            request, "seen_digest", "Look at the proposal again, then approve it."
+        )
+        store = _proposal_store()
+        try:
+            await store.approve(
+                name,
+                version,
+                seen_digest=seen_digest,
+                approver=SETTINGS_PERSON,
+                ledger=SkillApprovalLedger(),
+            )
+        except SkillProposalChangedError as exc:
+            # 412, so Settings can say this in the person's language and show it again.
+            raise HTTPException(status_code=412, detail=str(exc)) from exc
+        except SkillProposalError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except Exception as exc:  # the person gets one plain sentence; the log gets the rest
+            logger.warning("Approving the skill proposal '%s' failed: %s", name, exc)
+            raise HTTPException(status_code=500, detail=_SKILLS_NOT_CHANGED) from exc
+        return await _after_skill_change()
+
+    @app.post("/api/skills/{name}/reject")
+    async def reject_skill_proposal(name: str, request: Request) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
+        """Turn down a clone's proposal; it is kept under `.rejected/`."""
+        _a_person_decides(request)
+        version = await _skill_version(request)
+        store = _proposal_store()
+        try:
+            await asyncio.to_thread(
+                store.reject, name, version, rejecter=SETTINGS_PERSON, reason=None
+            )
+        except SkillProposalError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.warning("Turning down the skill proposal '%s' failed: %s", name, exc)
+            raise HTTPException(status_code=500, detail=_SKILLS_NOT_CHANGED) from exc
+        return await _after_skill_change()
+
+    @app.post("/api/skills/{name}/revoke")
+    async def revoke_skill(name: str, request: Request) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
+        """Stop using an approved skill: remove its pin and mark it rejected."""
+        _a_person_decides(request)
+        store = _proposal_store()
+        try:
+            await asyncio.to_thread(
+                store.revoke, name, revoker=SETTINGS_PERSON, ledger=SkillApprovalLedger()
+            )
+        except SkillProposalError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.warning("Revoking the skill '%s' failed: %s", name, exc)
+            raise HTTPException(status_code=500, detail=_SKILLS_NOT_CHANGED) from exc
+        return await _after_skill_change()
 
     @app.get("/api/acp/status")
     async def get_acp_status() -> AcpConformanceReport:  # pyright: ignore[reportUnusedFunction]
@@ -4380,6 +4141,26 @@ def create_ui_app(
         app,
         settings_file=session_mgr.settings_file,
         usage_file=session_mgr.usage_file,
+        refuse_cross_origin=_refuse_cross_origin,
+    )
+
+    from uclone_x.ui.links import register_link_routes
+
+    def _local_clone_names() -> list[str]:
+        from uclone_x.agent.persona_registry import get_default_persona_registry
+
+        registry = get_default_persona_registry(
+            session_mgr.workspace_dir,
+            tool_names=[tool.name for tool in session_mgr.tools.list_tools()],
+        )
+        return [p.name for p in registry.list_personas()]
+
+    # Settings → 연결 → uClone2 (`uclone2-link.md` §3.6): the same supervisor the lifespan
+    # starts, so a link made here starts its session at once.
+    register_link_routes(
+        app,
+        supervisor=links,
+        local_clone_names=_local_clone_names,
         refuse_cross_origin=_refuse_cross_origin,
     )
 

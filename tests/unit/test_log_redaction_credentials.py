@@ -251,6 +251,27 @@ class TestSessionStateCredentialRedaction:
         assert "sk-proj-" not in str(redacted.tool_calls[0].arguments)
         assert "[REDACTED]" in str(redacted.tool_calls[0].arguments)
 
+    def test_a_shortened_result_keeps_its_form_when_a_credential_is_masked(self) -> None:
+        """An excerpt whose text holds a credential is rewritten to mask it; it is still
+        an excerpt, so the context state records the form it was shown in (#1866).
+
+        Killed by: src/uclone_x/core/session_state.py :: form=message.form,
+        Becomes: form=None,
+        """
+        from uclone_x.core.context_state import ContextForm, message_form
+
+        msg = ChatMessage(
+            role=MessageRole.TOOL,
+            content="[excerpt head]\nexport KEY=sk-ant-api03-123456789012345678901234567890\n...",
+            name="file_read",
+            tool_call_id="c1",
+            form="excerpt",
+        )
+        redacted = redact_message(msg)
+        assert "sk-ant-api03" not in str(redacted.content)
+        assert redacted.form == "excerpt"
+        assert message_form(redacted) is ContextForm.EXCERPT
+
     def test_session_state_creation_redacts_messages(self) -> None:
         """SessionState validator strips credentials on construction.
 

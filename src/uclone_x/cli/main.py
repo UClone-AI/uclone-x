@@ -31,6 +31,7 @@ from uclone_x.cli.commands.acp import acp_app, start_acp_server
 from uclone_x.cli.commands.dev import dev_app
 from uclone_x.cli.commands.eval import eval_app
 from uclone_x.cli.commands.key import key_app
+from uclone_x.cli.commands.link import link_app
 from uclone_x.cli.commands.llm import llm_app
 from uclone_x.cli.commands.loop import loop_app
 from uclone_x.cli.commands.media import media_app
@@ -418,6 +419,7 @@ app.add_typer(a2a_app, name="a2a")
 app.add_typer(acp_app, name="acp")
 app.add_typer(eval_app, name="eval")
 app.add_typer(key_app, name="key")
+app.add_typer(link_app, name="link")
 app.add_typer(llm_app, name="llm")
 app.add_typer(loop_app, name="loop")
 agent_app.add_typer(loop_app, name="loop")
@@ -525,8 +527,9 @@ def run(
     session_id: str | None = typer.Option(
         None,
         "--session-id",
-        help="Session to run in. Persisted under the Core session store, so a session "
-        "resumed by ID keeps the conversation it had (#183).",
+        help="Conversation to run in: the id of this clone's one-seat room, created when "
+        "new. Omitted, a new room is started and its id printed. Giving the id again "
+        "resumes the conversation it had (#183).",
     ),
     reset: bool = typer.Option(
         False,

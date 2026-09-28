@@ -6,7 +6,9 @@ import asyncio
 import logging
 import os
 import sys
+from dataclasses import replace
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import typer
 from rich.console import Console
@@ -30,11 +32,13 @@ from uclone_x.agent.prompts import compose_system_prompt
 from uclone_x.agent.session import SessionStore
 from uclone_x.core.agent_home import AgentHomeError
 from uclone_x.core.failure_journal import record_failure
+from uclone_x.core.set_aside import SESSION_SET_ASIDE_NOTICE
 from uclone_x.engine.event_bus import EventBus
 from uclone_x.errors import (
     LLMError,
     MissingDependencyError,
     PathTraversalError,
+    RoomError,
     SessionIdCollisionError,
 )
 from uclone_x.llm.connectors.factory import (
@@ -47,10 +51,15 @@ from uclone_x.llm.connectors.saved_choice import describe_saved_choice
 from uclone_x.llm.models import MessageRole
 from uclone_x.llm.protocols import LLMProviderProtocol
 from uclone_x.llm.providers import PROVIDERS, env_key
+from uclone_x.room.one_seat import HeadTurn, open_head_room, record_head_turn
+from uclone_x.room.store import RoomStore
 from uclone_x.sandbox.models import NoIsolation, WorkspaceIsolation
 from uclone_x.telemetry import TelemetryTracer, create_telemetry_exporter
 from uclone_x.tools.protocols import ToolRegistryProtocol
 from uclone_x.tools.registry import create_default_registry
+
+if TYPE_CHECKING:
+    from uclone_x.agent.base import BaseAgent
 
 logger = logging.getLogger(__name__)
 # Every value this module interpolates into a Rich string that the code did not write --
@@ -166,12 +175,86 @@ def _turn_failure(result: TurnResult) -> str | None:
     return result.error
 
 
+def report_set_aside(store: SessionStore, session_id: str, out: Console) -> bool:
+    """Say, once, that saving `session_id` kept an unreadable earlier record aside (#1860).
+
+    The store logs where the copy went; this is the person's line, and it holds nothing a
+    person cannot act on -- no path, no parser text. Returns whether it was said, so the
+    turn's row in the room can carry it too (#1877). `ucx loop` says it the same way.
+    """
+    if not store.take_set_aside(session_id):
+        return False
+    out.print(f"[yellow]{escape(SESSION_SET_ASIDE_NOTICE)}[/yellow]")
+    return True
+
+
 def _report_unsaved_session(save_error: str) -> None:
     """Report on stderr that the session was not written, after a turn that answered."""
     err_console.print(
         f"[bold red]✖ Session not saved:[/bold red] {escape(save_error)}\n"
         "[dim]The reply was not recorded; --session-id will not resume it.[/dim]"
     )
+
+
+#: What a head says when a turn ran but its room did not take it (#1837). Plain: the
+#: cause, which may name the store's path, is in the log.
+ROOM_NOT_RECORDED_NOTICE = (
+    "This turn was not added to the conversation's history, so the app will not show it. "
+    "The reply itself is not affected."
+)
+
+
+def record_in_room(
+    store: RoomStore,
+    *,
+    room_id: str,
+    clone_id: str,
+    turn: HeadTurn,
+    out: Console,
+    head: str = "run",
+) -> bool:
+    """Record `turn` in the head's one-seat room; on failure say so plainly and go on.
+
+    `head` is the command recording it, `run` or `loop`; a room it creates is that
+    command's, and the app will not post into it (#1885).
+
+    A turn the room could not take is not a failed turn -- the reply stands and the seat's
+    session holds it -- so this neither raises nor changes the exit status (author's
+    choice, #1837). Returns whether the room took it.
+    """
+    try:
+        record_head_turn(store, room_id=room_id, clone_id=clone_id, turn=turn, head=head)
+    except Exception as exc:
+        logger.warning("Could not record a turn in room %s", room_id, exc_info=exc)
+        out.print(f"[yellow]⚠ {escape(ROOM_NOT_RECORDED_NOTICE)}[/yellow]")
+        return False
+    return True
+
+
+def _persist_tick(agent: BaseAgent) -> None:
+    """Save the seat session after a REPL `/loop` tick; a failed save is logged, not raised."""
+    try:
+        agent.persist_session()
+    except Exception as persist_err:
+        logger.warning("Failed to persist session after a loop tick: %s", persist_err)
+
+
+def loop_tick_turn(
+    job: LoopJob, tick: LoopTickResult, *, session_set_aside: bool = False
+) -> HeadTurn:
+    """The turn a loop tick ran, as its room records it; not called for a skipped tick.
+
+    A tick with no `TurnResult` raised or hit the watchdog; a timed-out one was cut off,
+    so it is recorded as interrupted. `session_set_aside`: the save after the tick kept an
+    earlier record aside (`report_set_aside`).
+    """
+    if tick.turn is not None:
+        turn = HeadTurn.from_result(job.prompt, tick.turn)
+    else:
+        turn = HeadTurn.failed(
+            job.prompt, tick.error or "The turn failed.", completed=tick.stop_reason != "timeout"
+        )
+    return replace(turn, session_set_aside=session_set_aside)
 
 
 def _report_interrupted_save(label: str) -> None:
@@ -365,13 +448,17 @@ async def run_agent_repl_async(
     store: SessionStore | None = None,
     isolation: str = "workspace",
     workspace_dir: str | Path | None = None,
+    room_store: RoomStore | None = None,
 ) -> None:
     """Asynchronous interactive chat loop or single-turn runner with BaseAgent.
 
-    `session_id`, `reset` and `compact` implement #183 requirement 4's CLI surface. The
-    session is persisted through the Core `SessionStore` (P8), so `--session-id` resumes
-    the conversation that ID had rather than starting a fresh one that merely shares a
-    name.
+    `session_id`, `reset` and `compact` implement #183 requirement 4's CLI surface. A run
+    is a one-seat room (§5.9, owner ruling 2026-09-27): `session_id` is the room's id, or
+    a new room is started, and the room is persisted through the Core `RoomStore`. The
+    clone keeps the session a room seat keeps (`participant_session_id`), persisted
+    through the Core `SessionStore` (P8), so `--session-id` resumes the conversation that
+    room had rather than starting a fresh one that merely shares a name. A session kept
+    under the earlier `sess_<clone>` name is left on disk and not resumed.
     """
     bus = EventBus()
     # Read before the connector is built, from the same test the factory applies, and said
@@ -428,6 +515,17 @@ async def run_agent_repl_async(
     from uclone_x.agent.clone_builder import build_clone, local_app_scope, saved_models
     from uclone_x.skills.auditor import load_runtime_skill_registry
 
+    rooms = room_store if room_store is not None else RoomStore()
+    room = open_head_room(agent_name, session_id, head="run", store=rooms)
+    if room.created and session_id is None:
+        notices.print(
+            f"[dim]New conversation [bold]{escape(room.room_id)}[/bold]; "
+            f"--session-id {escape(room.room_id)} resumes it.[/dim]"
+        )
+
+    def _record(turn: HeadTurn, out: Console) -> None:
+        record_in_room(rooms, room_id=room.room_id, clone_id=agent_name, turn=turn, out=out)
+
     # Built as the desktop app builds the same clone (#1731): an agent name that is a
     # persona answers as that persona, with its memory, its tools and host binding.
     agent = build_clone(
@@ -444,7 +542,7 @@ async def run_agent_repl_async(
             skills=await load_runtime_skill_registry(),
         ),
         clone_id=agent_name,
-        session_id=f"sess_{agent_name}" if session_id is None else session_id,
+        session_id=room.session_id,
         # `--model` wins over a persona's own model, as a model asked for in the app does;
         # the saved choice only fills what the persona leaves empty (`saved_models`).
         model_name=model,
@@ -485,7 +583,8 @@ async def run_agent_repl_async(
 
     # Non-interactive single-shot execution mode
     if prompt:
-        # The session the turn is saved to, which `--session-id` may name: not `sess_<agent>`.
+        # The session the turn is saved to: the seat's session in the room `--session-id`
+        # names, not the room id and not `sess_<agent>`.
         turn_session = agent.session_id
         failure: str | None = None
         blocked = False
@@ -504,7 +603,8 @@ async def run_agent_repl_async(
                         "model": effective_model,
                     },
                 ):
-                    result = await agent.execute_turn(prompt)
+                    result = await agent.execute_turn(prompt, person_names=room.person_names)
+                head_turn = HeadTurn.from_result(prompt, result)
                 # `execute_turn` returns most failures rather than raising them: an
                 # unreachable provider arrives as `error` with empty `content`, which
                 # printed `(No response content)` as the reply and exited 0.
@@ -523,6 +623,7 @@ async def run_agent_repl_async(
                 record_failure(e, context={"surface": "cli.run", "single_shot": True})
                 logger.exception("Single-shot turn failed for agent %s", agent_name)
                 failure = f"{type(e).__name__}: {e}"
+                head_turn = HeadTurn.failed(prompt, failure)
             finally:
                 completed = tracer.get_completed_spans()
                 if completed:
@@ -560,6 +661,10 @@ async def run_agent_repl_async(
             logger.warning("Failed to persist session state: %s", persist_err)
             save_failure = f"{type(persist_err).__name__}: {persist_err}"
             _report_unsaved_session(save_failure)
+        set_aside = report_set_aside(session_store, turn_session, err_console)
+        # After the seat's save, as a room seat's turn lands: the room's transcript is
+        # what the app shows of this conversation (#1837).
+        _record(replace(head_turn, session_set_aside=set_aside), err_console)
         write_failure: str | None = None
         if failure is None:
             err_console.print(f"\n[bold green]{escape(agent_name)}[/bold green]:")
@@ -605,6 +710,11 @@ async def run_agent_repl_async(
                 f"\n[dim]⏱ [Loop {escape(job.job_id)}] Skipped tick: previous run still active.[/dim]"
             )
             return
+        # Saved to the seat first, as `ucx loop` saves a tick (#1837): a room that shows a
+        # tick the seat's session lacks would be resumed by `--session-id` without it.
+        _persist_tick(agent)
+        set_aside = report_set_aside(session_store, agent.session_id, console)  # the tick's save
+        _record(loop_tick_turn(job, result, session_set_aside=set_aside), console)
         status_color = "green" if result.success else "red"
         console.print(
             f"\n[bold yellow]⏱ [Loop {escape(job.job_id)} Tick #{result.tick_index}][/bold yellow] "
@@ -625,7 +735,9 @@ async def run_agent_repl_async(
                 f"[bold red]✖ Loop '{escape(job.job_id)}' terminated due to consecutive failures.[/bold red]"
             )
 
-    loop_scheduler = LoopScheduler(agent, on_tick_completed=_on_loop_tick)
+    loop_scheduler = LoopScheduler(
+        agent, on_tick_completed=_on_loop_tick, person_names=room.person_names
+    )
 
     turn_count = 0
     session_unsaved = False
@@ -829,7 +941,10 @@ async def run_agent_repl_async(
                             "model": effective_model,
                         },
                     ):
-                        result = await agent.execute_turn(clean_input)
+                        result = await agent.execute_turn(
+                            clean_input, person_names=room.person_names
+                        )
+                    repl_turn = HeadTurn.from_result(clean_input, result)
                     failure_in_turn = _turn_failure(result)
                     blocked = _blocked_by_hook(result)
                     if failure_in_turn is None:
@@ -840,6 +955,7 @@ async def run_agent_repl_async(
                     record_failure(e, context={"surface": "cli.run", "single_shot": False})
                     logger.exception("REPL turn failed for agent %s", agent_name)
                     failure_in_turn = f"{type(e).__name__}: {e}"
+                    repl_turn = HeadTurn.failed(clean_input, failure_in_turn)
                 finally:
                     completed = tracer.get_completed_spans()
                     if completed:
@@ -906,6 +1022,8 @@ async def run_agent_repl_async(
                     f"[yellow]⚠ Turn completed but the session was not saved: "
                     f"{escape(str(persist_err))}[/yellow]"
                 )
+            turn_set_aside = report_set_aside(session_store, agent.session_id, console)
+            _record(replace(repl_turn, session_set_aside=turn_set_aside), console)
 
             if agent.state == AgentState.ERROR:
                 agent.transition_to(AgentState.IDLE)
@@ -929,6 +1047,7 @@ async def run_agent_repl_async(
                 f"{escape(f'{type(persist_err).__name__}: {persist_err}')}"
             )
             session_unsaved = True
+        report_set_aside(session_store, agent.session_id, console)  # the save on the way out
         await agent.stop()
         console.print(
             f"\n[dim]Session finished. Completed [bold]{turn_count}[/bold] turns with "
@@ -954,6 +1073,7 @@ def run_agent_repl(
     store: SessionStore | None = None,
     isolation: str = "workspace",
     workspace_dir: str | Path | None = None,
+    room_store: RoomStore | None = None,
 ) -> None:
     """Synchronous entry point launching the agent REPL event loop."""
     try:
@@ -971,6 +1091,7 @@ def run_agent_repl(
                 store=store,
                 isolation=isolation,
                 workspace_dir=workspace_dir,
+                room_store=room_store,
             )
         )
     except AgentHomeError as exc:
@@ -984,6 +1105,11 @@ def run_agent_repl(
         # Was an unhandled traceback on `--session-id ../../etc/passwd`: the name rule
         # fired correctly in the Core and the CLI printed a stack trace at the user.
         # A refused argument is a usage error, not a crash.
+        console.print(f"[bold red]Invalid --session-id:[/bold red] {escape(str(exc))}")
+        raise typer.Exit(code=2) from exc
+    except RoomError as exc:
+        # The id names a room this clone is not seated in, or holds the `__` a seat's
+        # session id reserves: the same usage-error class, with the room's own words.
         console.print(f"[bold red]Invalid --session-id:[/bold red] {escape(str(exc))}")
         raise typer.Exit(code=2) from exc
     except SessionIdCollisionError as exc:

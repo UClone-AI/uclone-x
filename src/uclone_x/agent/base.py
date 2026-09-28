@@ -11,6 +11,15 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, Literal, cast
 
+from uclone_x.agent.artist_skill_router import (
+    CASE_SKILL_PERSONAS,
+    case_skill_section,
+    extract_request_facts,
+    grounded_facts,
+    is_follow_up,
+    route_first_turn,
+    route_follow_up,
+)
 from uclone_x.agent.compaction_driver import CompactionDriver, CompactionScope
 from uclone_x.agent.hooks import (
     BaseHook,
@@ -39,6 +48,7 @@ from uclone_x.agent.prompt_assembler import (
     PromptAssembler,
     PromptScope,
     compose_identity_prompt,
+    composed_seat_framing,
 )
 from uclone_x.agent.prompts import adapt_system_prompt
 from uclone_x.agent.protocols import BaseAgentProtocol, TurnLifecycleHookProtocol
@@ -130,6 +140,7 @@ from uclone_x.tools.base import (
 )
 from uclone_x.tools.builtin.media_registry import ImageModelSource, ModelProfile
 from uclone_x.tools.builtin.skill_loader import LoadSkillTool
+from uclone_x.tools.builtin.skill_proposer import ProposeSkillTool
 from uclone_x.tools.models import ToolContext
 from uclone_x.tools.protocols import ToolProtocol, ToolRegistryProtocol
 from uclone_x.tools.registry import ToolRegistry
@@ -274,8 +285,52 @@ class BaseAgent(BaseAgentProtocol):
         recomputation is the one the setters run, so the operator's list still wins, and
         registering a name that is not in force leaves the scope as it was.
         """
-        self._persona_store[persona.name] = persona
-        self._apply_persona_tool_scope()  # a registration can move the persona in force
+        self._persona_definition_commit(persona)()
+
+    def _persona_definition_commit(self, persona: PersonaDefinition) -> Callable[[], None]:
+        """Work out what registering `persona` changes, and return the step that applies it.
+
+        Everything that can raise -- resolving the persona in force, reading its tools,
+        copying the config -- runs here, against a candidate copy of the store, before any
+        of the agent's state moves. The returned step only assigns. So a registration that
+        fails leaves the agent wholly on the definition it had: not the new prompt (which
+        `effective_system_prompt` reads from the store) under the old tool scope (#1904).
+        """
+        store = {**self._persona_store, persona.name: persona}
+        config = self._persona_scoped_config(store)
+
+        def commit() -> None:
+            self._persona_store[persona.name] = persona
+            self._config = config  # the tool scope, recomputed for the registration
+
+        return commit
+
+    def stage_persona_edit(self, persona: PersonaDefinition) -> None:
+        """Hold a saved persona edit until this agent's next turn starts (#1899).
+
+        A live seat takes a saved edit at a turn boundary, never mid-turn: `define_persona`
+        changes the prompt and the tool scope, and a turn that is running -- or one that
+        compaction is resolving the seat beside -- must finish under the persona it began
+        with. The turn applies the edit under its turn lock and opens a new epoch for it,
+        so the session log shows where the identity changed. A later edit replaces an
+        earlier one that has not been taken yet.
+        """
+        self._staged_persona = persona
+
+    def _take_staged_persona(self) -> Callable[[], None] | None:
+        """Take the staged edit, if any; the step that applies it, or `None` if it changes nothing.
+
+        Called only at a turn's start, under the turn lock (`TurnExecutor.execute_turn`).
+        Nothing is applied here: the caller opens the edit's epoch first and then runs the
+        returned step, which only assigns, so a raise anywhere before it leaves the seat on
+        its old definition with no epoch opened (#1904). The edit is taken off the stage
+        either way; one that fails to apply is dropped with its failed turn rather than
+        failing every turn after it.
+        """
+        staged, self._staged_persona = self._staged_persona, None
+        if staged is None or self._persona_store.get(staged.name) == staged:
+            return None
+        return self._persona_definition_commit(staged)
 
     def get_persona(self, name: str) -> PersonaDefinition | None:
         """Resolve a persona: this agent's own registrations first, then the registry.
@@ -285,8 +340,14 @@ class BaseAgent(BaseAgentProtocol):
         rather than overriding or being refused; both now ship as YAML that the registry
         seeds, so the constants have no resolution role left.
         """
-        if name in self._persona_store:
-            return self._persona_store[name]
+        return self._persona_in(self._persona_store, name)
+
+    def _persona_in(
+        self, store: Mapping[str, PersonaDefinition], name: str
+    ) -> PersonaDefinition | None:
+        """`get_persona`, resolved against `store` in place of this agent's own registrations."""
+        if name in store:
+            return store[name]
         from uclone_x.agent.persona_registry import get_default_persona_registry
 
         return get_default_persona_registry(self._workspace_root_hint).get_persona(name)
@@ -351,6 +412,7 @@ class BaseAgent(BaseAgentProtocol):
         # them; the turn then re-resolves the prompt, and the record says something
         # other than what was sent.
         self._persona_store: dict[str, PersonaDefinition] = {p.name: p for p in personas}
+        self._staged_persona: PersonaDefinition | None = None
         self._bus = bus
         self._llm = llm
         self._tools = tools
@@ -387,10 +449,21 @@ class BaseAgent(BaseAgentProtocol):
                 self._skills,
                 on_load=self._record_loaded_skill,
                 profile_provider=profile_provider,
+                tool_scope=lambda: self._config.allowed_tools,
             )
             agent_local_tools[skill_tool.name] = skill_tool
             if self._tools.get(skill_tool.name) is None:
                 self._tools.register(skill_tool)
+            # `propose_skill` writes a pending proposal into the store's `.pending/` area,
+            # which a person approves in Settings (#1827). Only a file-system store has
+            # such a folder. Not a base tool: a clone with an `allowed_tools` list has it
+            # only by naming it.
+            store_root = getattr(self._skills, "store_root", None)
+            if isinstance(store_root, Path):
+                propose_tool = ProposeSkillTool(store_root)
+                agent_local_tools[propose_tool.name] = propose_tool
+                if self._tools.get(propose_tool.name) is None:
+                    self._tools.register(propose_tool)
         self._ontology = ontology
         self._memory = memory
         # Memory tools are bound to *this* agent's store, so unlike every other tool they
@@ -525,6 +598,7 @@ class BaseAgent(BaseAgentProtocol):
                 prepare_turn_messages=lambda: self._prepare_turn_messages,
                 nudged_retry=lambda: self._nudged_retry,
                 image_set_section=lambda: self._image_set_section,
+                case_skill_section=lambda: self._case_skill_section,
                 auto_compact_if_needed=lambda: self._auto_compact_if_needed,
                 ingest_tool_message=lambda: self._ingest_tool_message,
                 execute_single_tool=lambda: self._execute_single_tool,
@@ -532,6 +606,7 @@ class BaseAgent(BaseAgentProtocol):
                 invoke_model=lambda: self._invoke_model,
                 fit_step_to_window=lambda: self._fit_step_to_window,
                 execute_tools=lambda: self._execute_tools,
+                take_staged_persona=lambda: self._take_staged_persona,
             )
         )
         self._session_lifecycle = SessionLifecycle(
@@ -815,7 +890,49 @@ class BaseAgent(BaseAgentProtocol):
         """
         if isinstance(session.anchor_provenance, AnchorWriter):
             return False
-        return session.anchor_provenance != self._resolved_persona()
+        if session.anchor_provenance != self._resolved_persona():
+            return True
+        return self._anchor_framing_moved(session)
+
+    def _anchor_framing_moved(self, session: _LiveSession) -> bool:
+        """Whether `session`'s agent-composed anchor carries a seat framing no longer in force.
+
+        A one-seat room seeds its clone without the multi-agent framing, and a second clone
+        joining puts it back (§5.9.3); leaving takes it away again. The persona has not
+        moved, so the persona comparison above calls such an anchor fresh, and the turn
+        would go on sending the framing of a roster that is gone. The framing is read back
+        from the anchor's text (`composed_seat_framing`). An anchor that is not a
+        composition of this persona under any framing is left alone: this method cannot
+        say what it was, and replacing it is the mode #1081 rejects.
+
+        The anchor itself is not rewritten; the turn sends the recomposed identity, which
+        costs one prompt-cache miss when the roster crosses between one clone and two.
+        """
+        if not session.messages or session.messages[0].role is not MessageRole.SYSTEM:
+            return False
+
+        def canonical(text: str) -> str:
+            return adapt_system_prompt(text, None)
+
+        persona = self._resolved_persona()
+        if persona is not None:
+            persona = persona.model_copy(update={"system_prompt": canonical(persona.system_prompt)})
+        recorded = composed_seat_framing(
+            canonical(session.messages[0].content or ""),
+            config_prompt=canonical(self._config.system_prompt),
+            persona=persona,
+        )
+        return recorded is not None and recorded != canonical(self._config.seat_framing)
+
+    def set_seat_framing(self, framing: str) -> None:
+        """Place this agent in a room whose roster changed: frame its seat with `framing`.
+
+        The room decides the framing (`""` for a clone alone with its people, §5.9.3); the
+        agent composes it into its identity as at construction. A session anchored under
+        the other framing is caught by `_anchor_framing_moved` on its next turn.
+        """
+        if framing != self._config.seat_framing:
+            self._config = self._config.model_copy(update={"seat_framing": framing})
 
     def _apply_persona_tool_scope(self) -> None:
         """Resolve `config.allowed_tools` from the operator's list and the persona's.
@@ -839,12 +956,21 @@ class BaseAgent(BaseAgentProtocol):
         persona is given (`BASE_PERSONA_TOOLS`, #1402). An operator's list is taken as
         written: the operator is naming exactly what this agent may run.
         """
+        self._config = self._persona_scoped_config(self._persona_store)
+
+    def _persona_scoped_config(self, store: Mapping[str, PersonaDefinition]) -> AgentConfig:
+        """The config `_apply_persona_tool_scope` would set were `store` the registrations.
+
+        Reads the agent and changes nothing, so a registration can be worked out in full
+        before any of it is applied (`_persona_definition_commit`).
+        """
         resolved = self._operator_allowed_tools
-        persona = self._resolved_persona()
+        persona = self._persona_in(store, self._persona) if self._persona else None
         if not resolved and persona is not None and persona.granted_tools:
             resolved = persona.granted_tools
-        if resolved != self._config.allowed_tools:
-            self._config = self._config.model_copy(update={"allowed_tools": resolved})
+        if resolved == self._config.allowed_tools:
+            return self._config
+        return self._config.model_copy(update={"allowed_tools": resolved})
 
     @property
     def write_tools_enabled(self) -> bool:
@@ -937,6 +1063,30 @@ class BaseAgent(BaseAgentProtocol):
     def llm(self) -> LLMProviderProtocol | None:
         """Active LLM provider connector instance."""
         return self._llm
+
+    async def invoke_auxiliary_model(self, request: LLMRequest) -> ModelResponse:
+        """One model call outside a turn, on this clone's own connector and budget (#1404).
+
+        For work done on the clone's behalf after a turn, such as learning from it: the
+        call is budget-checked before and charged after, exactly as a turn's own calls are
+        (P5). A request that names no model is sent with the clone's configured model, and
+        with its configured context window when it names none.
+
+        Raises:
+            RuntimeError: The agent has no model connector.
+        """
+        llm = self._llm
+        if llm is None:
+            raise RuntimeError(f"Agent {self._config.agent_id} has no model connector")
+        update: dict[str, Any] = {}
+        if request.model is None and self._config.llm_config.model_name:
+            update["model"] = self._config.llm_config.model_name
+        limit = self._config.llm_config.context_limit
+        if request.context_window is None and (limit or 0) > 0:
+            update["context_window"] = limit
+        return await self._invoke_model(
+            llm, request.model_copy(update=update) if update else request
+        )
 
     def set_read_roots(self, read_roots: tuple[Path, ...]) -> None:
         """Replace the folders outside the workspace this agent's read-only tools may read.
@@ -1185,7 +1335,13 @@ class BaseAgent(BaseAgentProtocol):
 
     @_history.setter
     def _history(self, messages: list[ChatMessage] | tuple[ChatMessage, ...]) -> None:
+        # What is being replaced is logged first: it leaves the history, not the log. What
+        # replaces it is logged at once, so the count of what the history holds is current
+        # before anything else enters (#1443).
+        self._active_session.log_history()
         self._active_session.messages = list(messages)
+        self._active_session.log_history()  # and what replaced it
+        self._active_session.declare_new_epoch("history_replaced")
         self._active_session.updated_at = _now_iso()
 
     @property
@@ -1370,12 +1526,11 @@ class BaseAgent(BaseAgentProtocol):
         sid: str,
         reason: str,
         *,
-        hold_unseen_step: bool = False,
         reader_offered: bool | None = None,
     ) -> CompactionResult:
         """Compact one session unconditionally, without the in-flight-turn guard."""
         return await self._compaction_driver.compact_session_unguarded(
-            sid, reason, hold_unseen_step=hold_unseen_step, reader_offered=reader_offered
+            sid, reason, reader_offered=reader_offered
         )
 
     def _should_compact_session(
@@ -1394,11 +1549,10 @@ class BaseAgent(BaseAgentProtocol):
         extra_sections: Sequence[str] = (),
         *,
         reason: str = "auto_threshold",
-        hold_unseen_step: bool = False,
     ) -> CompactionResult | None:
         """Compact the active session when the request about to be sent reaches the threshold."""
         return await self._compaction_driver.auto_compact_if_needed(
-            tools, extra_sections, reason=reason, hold_unseen_step=hold_unseen_step
+            tools, extra_sections, reason=reason
         )
 
     def _nudged_retry(
@@ -1632,8 +1786,13 @@ class BaseAgent(BaseAgentProtocol):
         caller_turn_id: str | None = None,
         room_id: str | None = None,
         story_id: str | None = None,
+        person_names: tuple[str, ...] = (),
     ) -> TurnResult:
         """Execute a single reasoning turn with serialized execution lock (P4, Issue #60).
+
+        `person_names` are the names the room's person goes by; each tool call this turn
+        receives them on its `ToolContext`, so `record_memory_fact` files a fact under
+        one of them under `user` (#1857).
 
         `room_id` and `story_id` are the conversation (room) this turn runs in and the
         story it has open (#1555). A room passes its id and its `story_id` for every seat,
@@ -1661,6 +1820,7 @@ class BaseAgent(BaseAgentProtocol):
             caller_turn_id=caller_turn_id,
             room_id=room_id,
             story_id=story_id,
+            person_names=person_names,
         )
         # Read with no `await` between the turn's end and here, so no next turn has yet
         # reset it. Stamped once rather than at each of the executor's six returns.
@@ -1717,6 +1877,58 @@ class BaseAgent(BaseAgentProtocol):
             return None
         logger.info("Image-set plan for agent %s: %d prompts", self.agent_id, len(prompts))
         return image_set_note(prompts)
+
+    async def _case_skill_section(
+        self,
+        message: str,
+        tool_defs: Sequence[ToolDefinition],
+        *,
+        emit: Callable[[str, dict[str, Any]], Awaitable[None]] | None = None,
+    ) -> str | None:
+        """The case skills that fit `message`, as a turn section after the user's message.
+
+        `None` unless the persona is one `CASE_SKILL_PERSONAS` names and `generate_image`
+        is offered this turn. A follow-up (an image already drawn in this conversation) is
+        read from history; a first turn is routed by grounded extraction, one structured
+        call. An extraction failure of any kind is logged and answers `None`: routing
+        improves a turn and must never be what breaks one. No failure text reaches the
+        person.
+        """
+        llm = self._llm
+        if llm is None or self._persona not in CASE_SKILL_PERSONAS:
+            return None
+        if not any(tool.name == "generate_image" for tool in tool_defs):
+            return None
+        if is_follow_up(self._history):
+            names = route_follow_up(message)
+        else:
+
+            async def generate(request: LLMRequest) -> ModelResponse:
+                return await self._invoke_model(llm, request)
+
+            limit = self._config.llm_config.context_limit
+            try:
+                if emit is not None:
+                    await emit("status", {"status": "thinking", "detail": "Reading the request..."})
+                facts = await extract_request_facts(
+                    generate,
+                    message,
+                    model=self._config.llm_config.model_name or None,
+                    context_window=limit if (limit or 0) > 0 else None,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "Case-skill routing skipped for agent %s: %s: %s",
+                    self.agent_id,
+                    type(exc).__name__,
+                    exc,
+                )
+                return None  # an unread request is drawn unrouted
+            names = route_first_turn(grounded_facts(facts, message))
+        logger.info("Case skills for agent %s: %s", self.agent_id, ", ".join(names))
+        return case_skill_section(names)
 
     def _image_set_earlier(self, message: str, *, turns: int = 8, chars: int = 3000) -> str:
         """The recent conversation as plain lines, for the image-set planner.
@@ -1812,7 +2024,9 @@ class BaseAgent(BaseAgentProtocol):
         )
         if content == msg.content:
             return msg
-        return msg.model_copy(update={"content": content})
+        # The form is recorded here, where the result was cut, not read back from its text
+        # later (#1854).
+        return msg.model_copy(update={"content": content, "form": "excerpt"})
 
     def _window_model(self) -> str | None:
         """The model the next request is sent to, as the window is looked up for it."""

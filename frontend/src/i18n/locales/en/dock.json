@@ -24,6 +24,10 @@
     "noneListed": "No facts are listed for {name}.",
     "hereHeading": "Learned in this conversation",
     "elsewhereHeading": "From other conversations",
+    "workedOutHeading": "Worked out from these facts",
+    "workedOut": "worked out",
+    "workedOutFrom": "From: {facts}",
+    "workedOutJoin": "; ",
     "origin": {
       "told": "told",
       "found": "found",
@@ -128,5 +132,176 @@
     "aspect": "Aspect",
     "size": "Size",
     "time": "Time"
+  },
+  "modelCalls": {
+    "title": "Model calls",
+    "loadingTurn": "Reading the turn's model calls from the session log...",
+    "loadingStep": "Reading this call from the session log...",
+    "noTrace": "The Core returned no trace and no reason for it.",
+    "rolledBack": "This turn was rolled back: the conversation kept nothing of it. Its calls are shown as the log recorded them.",
+    "helpers": "Helpers ran ({names}). Their own model calls are not kept.",
+    "helpersUnreadable": "A tool result that names a helper could not be read, so a helper may be missing from this list.",
+    "noSteps": "The session log lists no model calls for this turn.",
+    "headline": {
+      "step": "step {step}",
+      "tokens": "{input} → {output} tokens"
+    },
+    "verified": "verified",
+    "notVerified": "not verified",
+    "callFailed": "call failed",
+    "rowRequest": "Request:",
+    "rowResponse": "Response:",
+    "rowRequestNoReason": "Request: unavailable, and the Core gave no reason.",
+    "rowResponseNoReason": "Response: unavailable, and the Core gave no reason.",
+    "unverified": "Rebuilt from the saved record. A credential-like string was redacted, so this may differ from what was sent.",
+    "tabs": {
+      "request": "Request",
+      "tools": "Tools offered",
+      "response": "Response",
+      "raw": "Raw"
+    },
+    "layers": {
+      "identity": "identity",
+      "slowContext": "slow context",
+      "turnContext": "turn context"
+    },
+    "noSlowContext": "This request carried no slow context in its system message.",
+    "noMessageText": "This message carried no text.",
+    "calls": "calls {name}",
+    "noTools": "This request offered the model no tools.",
+    "noRequest": "The Core gave no request and no reason for its absence.",
+    "noResponse": "The Core gave no response and no reason for its absence.",
+    "missingRequest": "The request is unavailable. The runtime's reason:",
+    "missingResponse": "The response is unavailable. The runtime's reason:",
+    "response": {
+      "content": "Content",
+      "thinking": "Thinking",
+      "toolCalls": "Tool calls",
+      "error": "Error",
+      "noText": "The response carried no text."
+    },
+    "copy": {
+      "idle": "Copy as JSON",
+      "done": "Copied",
+      "failed": "Copy refused"
+    },
+    "toolResults": "Tool results, in full",
+    "statusNotRecorded": "status not recorded",
+    "noOutput": "The log holds no output for this call.",
+    "failure": {
+      "unreachable": "The runtime did not answer:",
+      "notJson": "The runtime answered with something that is not JSON.",
+      "http": "The runtime answered HTTP {status} with no explanation.",
+      "refused": "The runtime refused this read (HTTP {status})."
+    },
+    "reasons": {
+      "not_an_agent_turn": "This turn was spoken by a person, not an agent.",
+      "turn_not_linked": "This turn was recorded before turns were linked to their session (#1489), so its model calls cannot be found.",
+      "turn_not_saved": "This turn's record was not saved, so its model calls cannot be shown.",
+      "session_not_found": "No saved session was found for this seat.",
+      "session_unreadable": "This seat's saved session could not be read, so the turn cannot be traced.",
+      "log_missing": "No session log was found for this seat.",
+      "log_unreadable": "This seat's session log could not be read, so the turn cannot be traced.",
+      "trace_failed": "This turn's record could not be read back, so its model calls cannot be shown.",
+      "turn_not_found": "Turn {seq} was not found in this conversation.",
+      "step_not_found": "Step {step} was not found for turn {seq}."
+    },
+    "fromLog": {
+      "matches": "The conversation this call sent matches the session log.",
+      "differs": "The conversation this call sent does not match what the session log rebuilds.",
+      "unchecked": "Not checked against the session log. The runtime's reason:",
+      "uncheckedNoReason": "Not checked against the session log, and the runtime gave no reason.",
+      "reasons": {
+        "no_context_state": "Not checked against the session log: no context state is recorded for this session.",
+        "no_epoch_for_request": "Not checked against the session log: no epoch of the context state was opened at or before this request.",
+        "epoch_unreadable": "Not checked against the session log: this call's epoch could not be rebuilt from it."
+      },
+      "details": {
+        "body_missing": "Part of its record is missing.",
+        "snapshot_missing": "A context snapshot it needs is missing.",
+        "log_entry_missing": "The session log lacks an entry it names.",
+        "chain_broken": "A request it builds on is missing from the session log.",
+        "before_capture": "It was recorded before requests were captured (#1421).",
+        "unreadable": "Part of its record could not be read.",
+        "epoch_mismatch": "Its entries do not match the session log."
+      }
+    },
+    "requestReasons": {
+      "not_recorded": "No request is recorded for this call.",
+      "before_capture": "This request was recorded before requests were captured (#1421), so it cannot be rebuilt.",
+      "body_missing": "Part of this request's record is missing, so it cannot be rebuilt.",
+      "snapshot_missing": "This request's context snapshot is missing, so it cannot be rebuilt.",
+      "log_entry_missing": "The session log lacks an entry this request needs, so it cannot be rebuilt.",
+      "chain_broken": "A request this one builds on is missing from the session log, so it cannot be rebuilt.",
+      "unreadable": "Part of this request's record could not be read, so it cannot be rebuilt.",
+      "epoch_mismatch": "The context state does not match its session log entries, so this request cannot be rebuilt."
+    },
+    "responseReasons": {
+      "not_recorded": "No response is recorded for this call. Responses are recorded from #1489 on."
+    },
+    "logFailures": {
+      "unknown_event_type": "It holds an event this version does not know.",
+      "malformed_log": "It is not in the session log's format.",
+      "not_text": "It is not readable text.",
+      "read_failed": "The file could not be read from disk.",
+      "unexpected": "The runtime did not expect this failure; the server log has the details."
+    }
+  },
+  "topology": {
+    "title": "How this conversation ran",
+    "subtitle": "Seats, their turns in order, the tools each turn called, and the helpers they started",
+    "summary": "{seats} seated · {turns} turns · {toolCalls} tool calls listed · {helpers} helpers",
+    "refresh": "Refresh",
+    "noRoom": "No conversation is open. Open one from the rail to see how it ran.",
+    "readFailed": "Couldn't read this conversation's graph:",
+    "loading": "Reading this conversation…",
+    "historyGaps": "Turns may be missing from this graph because:",
+    "historyComplete": "No turn is known to be missing from this graph.",
+    "toolCallGaps": "Tool calls may be missing from the turns shown because:",
+    "reasons": {
+      "no_seat": "No agent is seated in this conversation."
+    },
+    "historyGapReasons": {
+      "before_record": "this conversation began before its history was fully recorded",
+      "cleared": "its history was cleared",
+      "rewound": "its history was rewound",
+      "unsaved": {
+        "one": "{count} turn started but stopped before its result was saved, or is still running in another copy of the app",
+        "other": "{count} turns started but stopped before their results were saved, or are still running in another copy of the app"
+      },
+      "uncounted": "some turns were taken before this conversation counted turns as they started"
+    },
+    "toolCallGapReasons": {
+      "saved_without_tools": {
+        "one": "{count} turn was saved without a record of its tools",
+        "other": "{count} turns were saved without a record of their tools"
+      },
+      "unreported": {
+        "one": "{count} turn ended before reporting its tools",
+        "other": "{count} turns ended before reporting their tools"
+      }
+    },
+    "helperCallsNote": "The tool calls shown are the ones each turn reported; a helper's own calls are not shown.",
+    "left": "left",
+    "running": "running",
+    "noSeatTurns": "No turns listed.",
+    "seatTurns": {
+      "one": "{count} turn",
+      "other": "{count} turns"
+    },
+    "startedHelper": "Started helper {id}",
+    "noTurns": "No turns are listed for this conversation.",
+    "toolsNotRecorded": "This turn did not record which tools it used in full.",
+    "noToolCalls": "No tool calls listed.",
+    "turnStatus": {
+      "answered": "answered",
+      "failed": "failed",
+      "interrupted": "interrupted"
+    },
+    "toolStatus": {
+      "success": "success",
+      "running": "running",
+      "error": "error"
+    }
   }
 }

@@ -16,7 +16,6 @@ from uclone_x.errors import (
 )
 from uclone_x.ontology.engine import (
     OntologyEngine,
-    OntologyInducer,
     OntologyService,
 )
 from uclone_x.ontology.models import (
@@ -508,20 +507,32 @@ def test_linkml_export_and_yaml_roundtrip() -> None:
         assert len(engine2.list_axioms()) == 1
 
 
-@pytest.mark.asyncio
-async def test_ontology_inducer() -> None:
-    engine = OntologyEngine()
-    inducer = OntologyInducer(engine=engine)
+def test_an_induced_candidate_keeps_its_evidence_through_yaml(tmp_path: Path) -> None:
+    """A candidate-tier concept round-trips through YAML with its tier and evidence.
 
-    turn_text = "The AuthService authenticated JWTPayload and sent response to ClientApp."
-    candidates = await inducer.induce_from_turn(
-        turn_text=turn_text,
-        tool_results=(),
+    Moved from the removed session-induction tests (KG step 7), which staged the concept
+    through the regex extractor; the engine's own `induce_concept` stages it here.
+    """
+    engine = OntologyEngine(agent_id="persisted_agent")
+    engine.induce_concept(
+        name="OrderRecord",
+        description="Candidate concept",
+        confidence=0.85,
+        source_session="sess_202",
+        model_id="mock_model",
     )
-    assert len(candidates) >= 2
-    names = [c.name for c in candidates]
-    assert "AuthService" in names or "JWTPayload" in names
-    assert all(c.tier == OntologyTier.INDUCED_CANDIDATE for c in candidates)
+
+    yaml_file = tmp_path / "ontology.yaml"
+    engine.save_to_yaml(yaml_file)
+
+    new_engine = OntologyEngine()
+    new_engine.load_from_yaml(yaml_file)
+    concept = new_engine.get_concept("OrderRecord")
+    assert concept is not None
+    assert concept.tier == OntologyTier.INDUCED_CANDIDATE
+    assert concept.evidence is not None
+    assert concept.evidence.source_session == "sess_202"
+    assert concept.evidence.model_id == "mock_model"
 
 
 def test_ontology_tier_normalization_and_unrecognised_rejection() -> None:

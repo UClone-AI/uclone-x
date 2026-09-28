@@ -20,7 +20,7 @@ from typing import Any
 import pytest
 from playwright.async_api import APIRequestContext, async_playwright
 
-from tests.e2e.conftest import running_ui
+from tests.e2e.conftest import is_extraction_request, nothing_learned, running_ui
 from uclone_x.llm.connectors.mock import MockLLMConnector
 from uclone_x.llm.models import LLMRequest, MessageRole, ModelResponse, ToolCallRequest
 
@@ -30,13 +30,20 @@ _PROMPT = "You survey the site and report what you map."
 
 
 class _RecordingConnector(MockLLMConnector):
-    """Answers normally, and keeps every request it was sent."""
+    """Answers normally, and keeps every request a turn sent.
+
+    The clone's learning call after the turn (#1404) is answered with no facts and not kept:
+    `requests[-1]` is the turn's last call, which is what the assertions read.
+    """
 
     def __init__(self) -> None:
         super().__init__(default_model="mock-gpt-4o", default_response="Surveyed.")
         self.requests: list[LLMRequest] = []
+        self._learner = nothing_learned()
 
     async def generate(self, request: LLMRequest) -> ModelResponse:
+        if is_extraction_request(request):
+            return await self._learner.generate(request)
         self.requests.append(request)
         return await super().generate(request)
 
@@ -143,8 +150,11 @@ class _DelegatingConnector(MockLLMConnector):
             ),
         )
         self.requests: list[LLMRequest] = []
+        self._learner = nothing_learned()
 
     async def generate(self, request: LLMRequest) -> ModelResponse:
+        if is_extraction_request(request):  # the learning call, as `_RecordingConnector`
+            return await self._learner.generate(request)
         self.requests.append(request)
         return await super().generate(request)
 

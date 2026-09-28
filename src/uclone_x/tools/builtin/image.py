@@ -38,6 +38,7 @@ from uclone_x.tools.builtin.comfy_client import (
     default_comfy_checkpoint,
 )
 from uclone_x.tools.builtin.comfy_image_tool import build_txt2img_workflow
+from uclone_x.tools.builtin.danbooru_tags import prepare_prompt
 from uclone_x.tools.builtin.image_set_intent import asks_for_variety
 from uclone_x.tools.builtin.media_registry import (
     ModelProfile,
@@ -1927,7 +1928,8 @@ class ImagePipelineDispatcher:
             )
             return replace(drawn, prompt_changes=gemini_fill.changes)
         profile = self.get_active_profile()
-        fill = fill_prompt_defaults(prompt, negative_prompt, profile)
+        # Tag form first (`danbooru` only), then what the prompt left open; both reported.
+        fill = prepare_prompt(prompt, negative_prompt, profile)
         width, height = resolve_aspect_dimensions(aspect_ratio, profile=profile)
         steps, cfg = resolve_sampling(profile)
         attempts = self._local_engines()

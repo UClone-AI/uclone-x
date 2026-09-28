@@ -81,14 +81,13 @@ export const KnowledgeGraphViewer: React.FC<KnowledgeGraphViewerProps> = ({
   );
   const loading = read.loading;
   const error = read.error;
-  // Only `ok` carries a graph; the other statuses carry the Core's reason instead (P6).
-  const data: KnowledgeGraphResponse | null =
-    read.data?.status === 'ok' ? (read.data as KnowledgeGraphResponse) : null;
+  // The clone's rules engine is always there (step 6), so every answer carries a graph.
+  const data: KnowledgeGraphResponse | null = read.data;
   const notice = !roomId
     ? 'No conversation is open.'
     : !seatId
       ? 'No agent is seated in this conversation.'
-      : // A non-`ok` status, or an `ok` graph with nothing in it: the Core says why.
+      : // An empty graph: the Core says why, when it gives a reason.
         (read.data?.reason ?? null);
 
   // Filters & Controls

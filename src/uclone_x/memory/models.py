@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import unicodedata
 import uuid
+from collections.abc import Iterable
 from datetime import UTC, datetime
 from typing import Any, Literal
 
@@ -12,9 +14,44 @@ from uclone_x.core.provenance import Provenance
 from uclone_x.errors import MissingProvenanceError
 
 #: How a fact came to be known (clone-knowledge-graph design §3.2). `told`: extracted from
-#: what a person wrote. `found`: extracted from a tool result the clone received. `saved`:
-#: the model called `record_memory_fact`. `corrected`: a person edited it.
+#: what a person wrote. `found`: extracted from a tool result the clone received, or from
+#: what the clone itself said in the turn (then `metadata["grounded_in"]` is `"self"`, #1404).
+#: `saved`: the model called `record_memory_fact`. `corrected`: a person edited it.
 FactOrigin = Literal["told", "found", "saved", "corrected"]
+
+
+#: The one subject every fact about the person (the human owner) is filed under
+#: (clone-knowledge-graph design §3.3 step 5); recall always includes these (§3.5).
+PERSON_SUBJECT = "user"
+#: The subject for durable working preferences of this workspace, such as the reply
+#: language or a code style. Recall always includes a few of these, after the person's
+#: (clone-knowledge-graph design §3.5); the extractor and `record_memory_fact` name it.
+PROJECT_SUBJECT = "project"
+#: Words a model may use for the person. With the person's own names, all are filed under
+#: `PERSON_SUBJECT`, by the extractor and by `record_memory_fact` alike.
+PERSON_WORDS = frozenset({"user", "the user", "person", "the person", "human", "me", "i", "owner"})
+
+
+def fold_name(name: str) -> str:
+    """`name` as names are compared: in NFC, whitespace collapsed, casefolded (#1893).
+
+    NFC first, so a name stored decomposed ("José" as `e` and a combining accent) matches
+    the composed form a model writes, and the reverse.
+    """
+    return " ".join(unicodedata.normalize("NFC", name).split()).casefold()
+
+
+def person_subject(subject: str, person_names: Iterable[str] = ()) -> str:
+    """`subject` in NFC with its whitespace collapsed, or `PERSON_SUBJECT` when it names the person.
+
+    It names the person when, folded (`fold_name`), it is one of `PERSON_WORDS` or one of
+    `person_names` (the person's id, display name and aliases).
+    """
+    collapsed = " ".join(unicodedata.normalize("NFC", subject).split())
+    names = {fold_name(name) for name in person_names if name.strip()}
+    if fold_name(collapsed) in PERSON_WORDS | names:
+        return PERSON_SUBJECT
+    return collapsed
 
 
 def utc_now_iso() -> str:
@@ -122,16 +159,18 @@ class MemoryFact(BaseModel):
     def conflicts_with(self, other: MemoryFact) -> bool:
         """Determine if this fact conflicts with another active fact.
 
-        A conflict occurs when two active facts share the same subject and predicate
-        (normalized) but assert different object values.
+        A conflict occurs when two active facts share the same subject and predicate but
+        assert different object values. Subject and predicate are compared folded
+        (`fold_name`, NFC included), so a subject stored decomposed before #1895 still
+        meets the composed form a model writes now (#1893).
         """
         if self.retracted or other.retracted:
             return False
         if self.fact_id == other.fact_id:
             return False
 
-        same_subject = self.subject.strip().lower() == other.subject.strip().lower()
-        same_predicate = self.predicate.strip().lower() == other.predicate.strip().lower()
+        same_subject = fold_name(self.subject) == fold_name(other.subject)
+        same_predicate = fold_name(self.predicate) == fold_name(other.predicate)
         different_value = self.object_value.strip() != other.object_value.strip()
 
         return same_subject and same_predicate and different_value

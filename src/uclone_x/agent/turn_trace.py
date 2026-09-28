@@ -13,12 +13,16 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from uclone_x.agent.request_record import (
     RebuiltRequest,
+    RecordErrorCode,
     RequestRecordError,
+    epoch_renderer,
     rebuild_requests,
 )
 from uclone_x.agent.session import SessionState
+from uclone_x.core.context_state import ContextEpoch
 from uclone_x.core.session_store import SessionStoreProtocol
 from uclone_x.errors import UCloneXError
+from uclone_x.llm.models import ChatMessage
 
 __all__ = [
     "ModelResponseRecord",
@@ -79,6 +83,20 @@ class ModelResponseRecord(BaseModel):
     error: dict[str, Any] | None = None
 
 
+#: Why a step's conversation was not checked against the session log (#1903): the
+#: session predates the context state, the request predates every epoch, or the step's
+#: own epoch could not be rendered (`from_log_reason` then names what was missing). A
+#: code, so the UI says it in the reader's language instead of quoting the reason.
+FromLogCode = Literal["no_context_state", "no_epoch_for_request", "epoch_unreadable"]
+
+#: Why a step's request is unavailable, as a stable code the UI words (#1907): the kind of
+#: gap that stopped its rebuild (`RecordErrorCode`), or `not_recorded` for a step with no
+#: `REQUEST_CONTEXT` in the log. `request_reason` stays the English detail.
+RequestReasonCode = Literal[RecordErrorCode, "not_recorded"]
+#: Why a step's response is unavailable (#1907): only `not_recorded`, a log before #1489.
+ResponseReasonCode = Literal["not_recorded"]
+
+
 class TraceStep(BaseModel):
     """One step of an agent turn, pairing its request and response."""
 
@@ -87,13 +105,37 @@ class TraceStep(BaseModel):
     step: int
     request_status: Literal["ok", "unavailable"]
     request_reason: str | None = None
+    request_code: RequestReasonCode | None = Field(
+        default=None,
+        description="Why the request is unavailable, as a stable code the UI maps to its own "
+        "sentence (#1907); `request_reason` stays the English detail.",
+    )
     verified: bool | None = None
     message_count: int | None = None
     model: str | None = None
     temperature: float | None = None
     max_tokens: int | None = None
+    from_log: bool | None = Field(
+        default=None,
+        description="Whether the step's conversation is what the session log and the "
+        "context state render (#1848): a prefix of its own epoch's conversation, the "
+        "last epoch opened at or before the step, rendered from the log alone. `None` "
+        "when the request or that epoch could not be rebuilt.",
+    )
+    from_log_reason: str | None = None
+    from_log_code: FromLogCode | None = Field(
+        default=None,
+        description="Why `from_log` is `None`, as a stable code the UI maps to its own "
+        "sentence (#1903); `from_log_reason` stays the English detail.",
+    )
+    from_log_detail_code: RecordErrorCode | None = Field(
+        default=None,
+        description="For `epoch_unreadable`, what kind of gap stopped the epoch's rebuild, "
+        "as a stable code (#1911); `from_log_reason` stays the English detail.",
+    )
     response_status: Literal["ok", "error", "unavailable"]
     response_reason: str | None = None
+    response_code: ResponseReasonCode | None = None
     response: ModelResponseRecord | None = None
     tool_results: list[TraceToolResult] = Field(default_factory=list[TraceToolResult])
 
@@ -124,10 +166,20 @@ class StepDetail(BaseModel):
     step: int
     request: dict[str, Any] | None = None
     request_reason: str | None = None
+    request_code: RequestReasonCode | None = None
     verified: bool | None = None
     layers: dict[str, Any] | None = None
+    from_log: bool | None = Field(
+        default=None,
+        description="As `TraceStep.from_log`: whether the step's conversation is a prefix "
+        "of its own epoch's conversation rendered from the session log (#1848).",
+    )
+    from_log_reason: str | None = None
+    from_log_code: FromLogCode | None = None
+    from_log_detail_code: RecordErrorCode | None = None
     response: ModelResponseRecord | None = None
     response_reason: str | None = None
+    response_code: ResponseReasonCode | None = None
 
 
 #: The request reason when a step has no `REQUEST_CONTEXT` at all in the log. Distinct
@@ -253,6 +305,78 @@ def _rebuild_turn_requests(
     return {r.step: r for r in rebuilt}, errors
 
 
+#: `from_log_reason` for a session recorded before the context state (#1443).
+NO_CONTEXT_STATE = "no context state is recorded for this session"
+#: `from_log_reason` for a request older than every epoch the context state records.
+NO_EPOCH_FOR_REQUEST = "no epoch of the context state was opened at or before this request"
+
+
+def _unchecked(
+    code: FromLogCode, reason: str, detail_code: RecordErrorCode | None = None
+) -> dict[str, Any]:
+    """The `from_log` fields of a step that was not checked, with its code and reason.
+
+    `detail_code` is the kind of gap behind `epoch_unreadable` (#1911); `None` otherwise.
+    """
+    return {
+        "from_log": None,
+        "from_log_reason": reason,
+        "from_log_code": code,
+        "from_log_detail_code": detail_code,
+    }
+
+
+class _LogCheck:
+    """Checks a rebuilt request against its own epoch rendered from the session log.
+
+    An epoch records the turn and step of the request that opened it, and the epochs
+    are in the order they opened, so a request of turn `t`, step `s` belongs to the last
+    epoch opened at or before `(t, s)`. Within an epoch the context only appends (§5.8,
+    Rule 1), so each of its requests is a prefix of the conversation the epoch records.
+    Comparing with the request's own epoch, not any epoch, is what catches a request
+    that re-sent history an earlier epoch showed and a compaction replaced.
+
+    Each epoch is rendered once, when a step first needs it. A missing or unreadable
+    body is reported on the steps of that epoch, not raised, so the trace still shows
+    the turn and the steps of other epochs are still checked (P6).
+    """
+
+    def __init__(self, store: SessionStoreProtocol, state: SessionState) -> None:
+        self._epochs = state.context_epochs
+        self._render = epoch_renderer(store, state)
+        self._rendered: dict[int, list[ChatMessage] | RequestRecordError] = {}
+
+    def _own_epoch(self, turn: int, step: int) -> ContextEpoch | None:
+        own: ContextEpoch | None = None
+        for epoch in self._epochs:
+            if (epoch.turn, epoch.step) <= (turn, step):
+                own = epoch
+        return own
+
+    def _conversation(self, epoch: ContextEpoch) -> list[ChatMessage] | RequestRecordError:
+        if epoch.number not in self._rendered:
+            try:
+                self._rendered[epoch.number] = self._render(epoch)
+            except RequestRecordError as err:
+                self._rendered[epoch.number] = err
+        return self._rendered[epoch.number]
+
+    def fields(self, rebuilt: RebuiltRequest, turn: int) -> dict[str, Any]:
+        """The `from_log` fields of a step of turn `turn` whose request was rebuilt."""
+        if not self._epochs:
+            return _unchecked("no_context_state", NO_CONTEXT_STATE)
+        if rebuilt.layers is None:
+            return {"from_log": None, "from_log_reason": None}
+        epoch = self._own_epoch(turn, rebuilt.step)
+        if epoch is None:
+            return _unchecked("no_epoch_for_request", NO_EPOCH_FOR_REQUEST)
+        rendered = self._conversation(epoch)
+        if isinstance(rendered, RequestRecordError):
+            return _unchecked("epoch_unreadable", rendered.detail, rendered.code)
+        sent = list(rebuilt.layers.conversation)
+        return {"from_log": rendered[: len(sent)] == sent}
+
+
 def _step_number(ev: Mapping[str, Any]) -> int | None:
     raw = ev.get("step")
     if raw is None:
@@ -355,6 +479,7 @@ def trace_turn(
         [ev for ev in turn_events if ev.get("type") == "REQUEST_CONTEXT"],
     )
 
+    log_check = _LogCheck(store, state)
     steps: list[TraceStep] = []
     for s in sorted(step_numbers):
         rebuilt = rebuilt_by_step.get(s)
@@ -368,6 +493,7 @@ def trace_turn(
                 "model": rebuilt.request.model,
                 "temperature": rebuilt.request.temperature,
                 "max_tokens": rebuilt.request.max_tokens,
+                **log_check.fields(rebuilt, start_turn_index),
             }
         else:
             rebuild_err = step_errors.get(s)
@@ -376,6 +502,7 @@ def trace_turn(
                 "request_reason": (
                     rebuild_err.detail if rebuild_err is not None else NO_REQUEST_RECORDED
                 ),
+                "request_code": rebuild_err.code if rebuild_err is not None else "not_recorded",
             }
         steps.append(
             TraceStep(
@@ -385,6 +512,7 @@ def trace_turn(
                     "unavailable" if resp is None else "error" if resp.error is not None else "ok"
                 ),
                 response_reason=NO_RESPONSE_RECORDED if resp is None else None,
+                response_code="not_recorded" if resp is None else None,
                 response=resp,
                 tool_results=step_tool_results.get(s, []),
             )
@@ -420,7 +548,7 @@ def trace_step(
         StepNotFoundError: The turn has no event for `step`.
     """
     event_list = list(events)
-    _, _, turn_events, _ = _locate_turn(event_list, caller_turn_id)
+    _, turn_index, turn_events, _ = _locate_turn(event_list, caller_turn_id)
 
     if step not in {n for n in map(_step_number, turn_events) if n is not None}:
         raise StepNotFoundError(f"step {step} not found in turn {caller_turn_id}")
@@ -439,12 +567,15 @@ def trace_step(
 
     request_dump: dict[str, Any] | None = None
     request_reason: str | None = None
+    request_code: RequestReasonCode | None = None
     verified: bool | None = None
     layers_payload: dict[str, Any] | None = None
+    log_fields: dict[str, Any] = {}
     rebuilt = rebuilt_by_step.get(step)
     if rebuilt is not None:
         request_dump = rebuilt.request.model_dump(mode="json")
         verified = rebuilt.verified
+        log_fields = _LogCheck(store, state).fields(rebuilt, turn_index)
         if rebuilt.layers is not None:
             layers_payload = {
                 "identity": rebuilt.layers.identity,
@@ -455,8 +586,10 @@ def trace_step(
             }
     elif step in step_errors:
         request_reason = step_errors[step].detail
+        request_code = step_errors[step].code
     else:
         request_reason = NO_REQUEST_RECORDED
+        request_code = "not_recorded"
 
     resp_event = next(
         (
@@ -470,8 +603,11 @@ def trace_step(
         step=step,
         request=request_dump,
         request_reason=request_reason,
+        request_code=request_code,
         verified=verified,
         layers=layers_payload,
+        **log_fields,
         response=_response_record(resp_event, step) if resp_event is not None else None,
         response_reason=None if resp_event is not None else NO_RESPONSE_RECORDED,
+        response_code=None if resp_event is not None else "not_recorded",
     )

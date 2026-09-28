@@ -109,10 +109,54 @@ Use this skill when queries take > 100ms or when table scans are detected.
 > `requested_isolation`.
 
 `parse_skill_markdown` requires a leading `---`, a closing `---`, and a YAML **mapping**
-between them; each is a distinct `ValueError`. `manifest_from_dict` requires a non-empty
+between them; each is a distinct `ValueError`. The header ends only at a line that is exactly
+`---` (#1826). Until then the first `---` anywhere after the opening line closed it, so a
+value holding one, such as a `description` of `a---b`, cut the header in half. The synthesizer
+refused such descriptions to work around it; that refusal is gone. The approval digest finds
+the header's end by the same rule, so the two cannot disagree about where it is. `manifest_from_dict` requires a non-empty
 string `name`. `serialize_skill_markdown` writes the manifest back in a fixed key order
 and omits unset optional fields, so `save_skill` → `load_skill_from_dir` round-trips.
 *Verified in* `test_skill_markdown_parsing_and_serialization` and `test_save_and_load_skill`.
+
+### 2.2 `requires_tools` — which clones are offered a skill — *Implemented*
+
+Owner ruling 2026-09-27 (#1826; Decision B4 of the 2026-09-26 runtime skills review). A skill may list the tools its instructions call:
+
+```yaml
+requires_tools:
+  - generate_image
+  - set_avatar
+```
+
+Each entry is a tool name (letters, digits, `_` or `-`, at most 64 characters), and none may
+repeat. A string in place of a list, a non-text entry, a bad name or a repeat is a
+`ValueError` naming the entry.
+
+A clone is offered the skill only when **every** listed tool is in its declared tool scope,
+`AgentConfig.allowed_tools`. For a persona that scope is its `allowed_tools` plus the base
+tools every persona gets. The same rule already decides which tools a persona may use. An empty scope means an unrestricted agent, which is offered every skill. A
+skill that lists no tools is offered to every clone. The rule is applied in two places:
+
+* the `[Available Approved Skills]` catalog in the system turn leaves the skill out
+  (`missing_required_tools`, `src/uclone_x/skills/models.py`);
+* `load_skill` refuses it by name, saying which tools this agent cannot use. This covers a
+  model that names a skill it was never shown, and the per-turn image-skill override.
+
+A hidden skill is not silent. `/api/skills` reports, for each skill, the clones it is hidden
+from and which tools each lacks (`hidden_from`, from `skill_hidden_from`). The Settings Skills
+panel shows that list under the chosen skill, and a clone's page lists the skills that clone is
+not offered. Both are written in the reader's language.
+
+What this does not do:
+
+* The scope is the declared one. A tool the clone holds that is not registered in this
+  process, or that is switched off by a setting, still counts.
+* The B3 option of preloading a skill's body into the system turn is not implemented.
+* The shipped image skills declare `generate_image`, and `avatar` and `character-consistency`
+  also declare the tool they end with. `media-architecture` names no tool in its text but is
+  an image-prompt skill, so it declares `generate_image` too. `remote_gpu_recovery` declares
+  none. Adding the field changed each package's digest, so `shipped_pins.py` was updated in
+  the same change.
 
 ---
 
@@ -279,8 +323,8 @@ Markdown: line and paragraph breaks become spaces, control and Unicode format ch
 (which include bidirectional overrides) are dropped, Markdown punctuation is
 backslash-escaped, and a leading list or underline marker is escaped. A step therefore
 cannot open a heading, a code block, an HTML comment or another list item. A
-description holding `---` is refused, because the loader ends the frontmatter at the
-first `---`.
+description holding `---` is safe: the loader ends the frontmatter only at a line that is
+exactly `---` (#1826), and the description is one line.
 
 The skill becomes active only through `./ucx skill approve`, which pins its digest in the
 approvals ledger (§7.2). `synthesize` has no `--auto-approve`: an LLM-authored skill is
@@ -422,7 +466,8 @@ Reachable states: `PENDING` (the default on disk) → `ACTIVE` via `approve`, or
 → `REJECTED` via `reject`; `REJECTED` → `ACTIVE` via `approve` (which clears the
 rejection fields). `QUARANTINED` is a defined `SkillStatus` that **no shipped code
 path ever writes** to a `SKILL.md` — only `list` reads it there. `get_summary` reports a
-skill the store refused as `quarantined` (§7.2). There is no `./ucx skill revoke`.
+skill the store refused as `quarantined` (§7.2). There is no `./ucx skill revoke`;
+Settings revokes an active skill (§7.3).
 
 `--force` is worth naming plainly: it is a documented override that promotes a skill the
 auditor rejected. It records the human approver in `approved_by`, so the act is
@@ -471,9 +516,77 @@ so it is refused until it is approved again. Such a skill still names its approv
 file, so it is told apart (`approved_before_pins`), and the panel shows one line listing
 every such skill with the command to run.
 
+### 7.3 Agent proposals and approval in Settings (#1827)
+
+A clone may **propose** a skill; only a person can make it active. The rulings (owner,
+2026-09-27): a proposal is written only to the store's `.pending/` area, is never loaded,
+listed in the `[Available Approved Skills]` catalog or loadable through `load_skill` while
+pending, never auto-approves (no flag, no setting), and is a prompt-only `SKILL.md` built
+with `format_instructions` (§5.1) that keeps `requires_tools` (§2.2).
+
+**On disk.** Everything a proposal writes is under dot-named folders of the store, which
+the loader, `ucx skill list` and `SkillRegistry.scan` skip by name:
+
+```text
+ucx-agent-skills/
+├── <name>/SKILL.md                    # the active version, as today (+ .proposal.json)
+├── .pending/<name>/<version>/         # a proposal: SKILL.md + .proposal.json
+├── .versions/<name>/<version>/        # an approved version that a newer one replaced
+└── .rejected/<name>/<version>/        # a proposal the person turned down
+```
+
+`.proposal.json` records which clone (`agent_id`) and session proposed it, when, and the
+version it was written against. Its name starts with a dot, so it is outside the digest
+(§7.2). The runtime picks the version: `0.1.0` for a new name, otherwise one patch above
+the highest version of that name anywhere in the store, so a proposal never overwrites
+anything.
+
+**The tool.** `propose_skill(name, description, steps, requires_tools=[])`
+(`src/uclone_x/tools/builtin/skill_proposer.py`). It has no status, version, author or
+approval argument, and refuses unknown ones. It writes `origin: synthesized`,
+`status: pending` and `author: agent:<agent_id>` whatever the model says, and no script or
+entrypoint. The body is `format_instructions`, so every step and the description are one
+escaped line each. A clone is given the tool when its agent has a file-system skill store.
+It is not a base tool: a clone with an `allowed_tools` list gets it only by naming it, and
+it writes files, so `enable_write_tools: false` refuses it. It refuses a name that is not
+an identifier, a skill that ships with UClone-X, and a skill whose current package holds
+files other than `SKILL.md`, since replacing it would drop them. Its result tells the
+model the proposal waits for the person's approval in Settings.
+
+**The API.** `GET /api/skills` adds `proposals`: name, version, description,
+`requires_tools`, the proposing clone and session, the full instructions, the current
+version when one exists, a unified diff against it, and `digest`: the package digest of
+the copy that text was read from. Each skill in the list also carries
+`shipped`, so Settings offers Revoke only where the route would accept it. Three routes change the store:
+
+| Route | Effect |
+| :--- | :--- |
+| `POST /api/skills/{name}/approve` `{version, seen_digest}` | The `ucx skill approve` flow on a copy of the proposal: audit it (`SAFE_ONLY`), refuse it with `412` when the copy's digest is not `seen_digest`, refuse any verdict but a safe `APPROVE` (the only one `load_approved` loads; there is no `--force` here), write `status: active` with the approver and time, take the digest, check the proposal did not change meanwhile, move the current version to `.versions/`, install the copy as `<name>/`, and pin the digest in the approvals ledger. The pending folder is then removed. |
+| `POST /api/skills/{name}/reject` `{version}` | Moves the proposal to `.rejected/`, with `status: rejected`, who and when. No audit. |
+| `POST /api/skills/{name}/revoke` | Removes the pin for an active skill and writes `status: rejected` with a revoked reason. The files stay; `ucx skill approve` restores it. A skill that ships with UClone-X is refused. |
+
+Each route refuses a cross-origin request and then requires a confirmed window
+(`PersonGate`, #1589) before reading the body; a request from a window the server did not
+confirm is refused with `403` and changes nothing. After a change the web app reloads its registry, so `load_skill`
+and new sessions see it at once; a session already running keeps the catalog it started
+with. A refusal is one plain sentence, with no path, exception name or refusal code.
+
+**What the person sees.** Settings › Skills lists proposals above the skills, each with
+the clone that proposed it, its description, the tools it needs, and either its full
+instructions (a new skill) or the changes from the current version. Approve sends the
+proposal's `digest` as `seen_digest`, so the package it installs and pins is the one the
+shown text was read from, or none: when the
+pending files changed after the list was read, for instance through a clone's file tools,
+the route refuses with `412`, and the panel says so and shows the proposal again. Turn down
+names the version only. An active skill that did not ship has a Revoke button. When the
+window is not a confirmed one, the panel says so and offers to open one, as the story
+view does. Restoring an archived version from `.versions/` is not offered in Settings.
+
+*Verified in* `tests/unit/test_skill_proposals.py` and `tests/unit/test_ui_skill_proposals.py`.
+
 ---
 
-## 8. Auto-Approval Policy — an Open Decision
+## 8. Auto-Approval Policy
 
 ```python
 class AutoApprovalPolicy(StrEnum):
@@ -489,17 +602,17 @@ class AutoApprovalPolicy(StrEnum):
 | `never` | A clean package gets `REQUIRE_HUMAN_REVIEW`. Nothing is ever auto-approved. |
 
 > [!IMPORTANT]
-> **A skill `./ucx skill synthesize` writes is never auto-approved** (#1824, owner ruling
-> 2026-09-27): the command has no promotion path, and `./ucx skill approve` is the only way
-> such a skill becomes active (§5.1). The wider question — how the audit policy applies to
-> agent-authored skills — was registered as `2026-09-02-002` and weighed as
-> decision **D2** in [`security-threat-model.md`](security-threat-model.md), which
-> records four options and a recommendation — *not* a ruling. The recommendation there
-> (split synthesis from persistence: a synthesized skill activates for its own agent and
-> session only, at a runtime-clamped `workspace` ceiling, with persistence to `ucx-agent-skills/`
-> and cross-agent publication as separate explicit human acts) is **not implemented**.
+> **Decided (owner ruling 2026-09-27): a skill an agent or an LLM wrote is never
+> auto-approved.** A synthesized skill becomes active only through `./ucx skill approve`,
+> which also pins its digest (§7.2). `synthesize --auto-approve` was removed in #1824 (PR
+> #1832), so the command has no promotion path (§5.1). This settles decision **D2** in
+> [`security-threat-model.md`](security-threat-model.md), registered as `2026-09-02-002`.
+> The four options and the recommendation recorded there are kept as the pre-ruling
+> analysis. The recommendation (a synthesized skill active for its own agent and session
+> only, at a runtime-clamped `workspace` ceiling) was not adopted and is not implemented.
 >
-> `AutoApprovalPolicy` therefore designates no member as the policy, and
+> The ruling covers skills an agent or an LLM wrote. For other skills, `AutoApprovalPolicy`
+> still designates no member as the policy, and
 > `SkillAuditorProtocol.policy` is a bare read-only property — the protocol states that
 > an auditor *has* a policy and takes no position on which.
 >
@@ -551,8 +664,9 @@ findings.
    by anything that runs as them.
 4. **Synthesis is prompt-only and run by hand** (§5.1). `./ucx skill synthesize` writes a
    pending `SKILL.md` of instructions and no script (#1810, owner ruling 2026-09-27), and
-   its one caller in `src/` is that command, so no agent synthesizes a skill on its own
-   — P9's headline claim and PRD FR-5.2 are met only in part. The quarantine mechanism is
+   its one caller in `src/` is that command. A clone can propose a skill with
+   `propose_skill` (§7.3), but writes only a pending proposal that a person approves in
+   Settings — P9's headline claim and PRD FR-5.2 are met only in part. The quarantine mechanism is
    exercised by `tests/unit/test_skill_synthesizer.py` and the `synthesize` cases in
    `tests/unit/test_cli_skills.py`.
 5. **Loaded once, at startup; no hot-reload.** The web app (`create_ui_app`'s lifespan)
@@ -561,15 +675,18 @@ findings.
    `active` package and registers those that pass. An agent given that registry gets the
    `load_skill` tool and lists the approved skills in its system turn. PRD FR-5.3's
    runtime hot-reload does not exist: `SkillRegistry` is an in-process dict with no
-   watcher, so a skill approved while a head runs reaches it only after a restart.
+   watcher, so a skill approved with `ucx skill approve` while a head runs reaches it
+   only after a restart. The web app reloads its registry after an approve, reject or
+   revoke in Settings (§7.3); a session already running keeps its catalog.
    `registry.load_all()` and `agent.bind_skill(...)` — shown in earlier revisions of this
    document — are not defined anywhere in `src/`.
 6. **`./ucx skill add` and `./ucx skill teach` do not exist.** Earlier revisions of this
    document showed both. The implemented commands are exactly `list`, `audit`,
    `approve`, `reject` and `synthesize` (§7.1).
-7. **No revoke, no TTL or size bound** on `ucx-agent-skills/`, all of which
-   `2026-09-02-002` asked for, alongside version pinning. Pinning now exists (§7.2);
-   `reject` removes a pin, which is the nearest thing to a revoke.
+7. **No TTL or size bound** on `ucx-agent-skills/`, which `2026-09-02-002` asked for,
+   alongside version pinning and revoke. Pinning exists (§7.2), Settings revokes an active
+   skill and keeps replaced versions in `.versions/` (§7.3), and nothing ever deletes a
+   kept version or a rejected proposal.
 8. **`QUARANTINED` is never written to disk** (§7.1). `get_summary` reports a skill the store
    refused as `quarantined` (§7.2), but nothing records that status in a `SKILL.md`.
 9. **The auditor parses only Python.** Bash, SQL and every other script in a package is
@@ -642,7 +759,7 @@ enforced statically, by the bindings in `tests/unit/test_protocol_conformance.py
 ## 11. Related
 
 * [`sandbox-execution-architecture.md`](sandbox-execution-architecture.md) — `IsolationLevel`, the discriminated union, and `effective_isolation_level`
-* [`security-threat-model.md`](security-threat-model.md) — F5 (fail-open report defaults), T1/T2 (injection, self-granted privilege), D2 (the open auto-approval decision)
+* [`security-threat-model.md`](security-threat-model.md) — F5 (fail-open report defaults), T1/T2 (injection, self-granted privilege), D2 (auto-approval; decided 2026-09-27: never for agent- or LLM-authored skills)
 * `2026-09-02-002` — the finding this subsystem answers
 * `2026-09-02-001` — the isolation default and the clamping rule
 * [`cli-specification.md`](cli-specification.md) — the `./ucx skill` command surface

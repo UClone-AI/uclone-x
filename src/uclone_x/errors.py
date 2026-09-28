@@ -46,6 +46,7 @@ __all__ = [
     "ExtendedAgentCardNotConfiguredError",
     "ExtensionSupportRequiredError",
     "FrontendBuildFailedError",
+    "HeadRoomWriteError",
     "InvalidAgentResponseError",
     "InvalidStateTransitionError",
     "LLMConnectorNotConfiguredError",
@@ -95,12 +96,11 @@ __all__ = [
     "RoomIdError",
     "RoomNotFoundError",
     "SandboxViolationError",
-    "SeatKnowledgeUnreadableError",
     "SecondHumanInRoomError",
     "SessionEventLogNotConfiguredError",
-    "SessionHistoryRehydrationError",
     "SessionIdCollisionError",
     "SessionMutationDuringTurnError",
+    "SessionRecordUnreadableError",
     "SessionStoreNotConfiguredError",
     "SessionSwitchWhileRunningError",
     "SkillAuditError",
@@ -231,16 +231,6 @@ class SessionEventLogNotConfiguredError(AgentStateError):
     """
 
 
-class SessionHistoryRehydrationError(AgentStateError):
-    """A session history record cannot be safely rehydrated into ChatMessages.
-
-    Principle 6 forbids silently fabricating a missing tool identity or passing a
-    nameless tool result to an LLM connector. When a tool message lacks identity and
-    cannot be repaired from positive evidence in the session, rehydration fails fast
-    with this error rather than corrupting conversation history.
-    """
-
-
 class SessionMutationDuringTurnError(AgentStateError):
     """A session was reset or switched while a reasoning turn was still in flight.
 
@@ -340,6 +330,23 @@ class SessionIdCollisionError(AgentStateError):
         # The one path both ids resolve to. Named so a report can point at the file rather
         # than leave the user to work out which of their session records is involved.
         self.path = path
+
+
+class SessionRecordUnreadableError(AgentStateError):
+    """A session record this build cannot read could not be moved aside, so it was not replaced (#1844).
+
+    `SessionStore.save` and `SessionStore.delete` move a record that will not load to
+    `<name>.unreadable-<UTC time>` before writing or removing anything at its name: it is
+    most often a conversation a newer build wrote, and replacing it would lose it. When
+    that rename fails the write is refused instead, and the record stays where it was.
+    `path` is where it is; `cause` is why it could not be read. Neither belongs in text a
+    person is shown.
+    """
+
+    def __init__(self, message: str, *, path: Path, cause: str) -> None:
+        super().__init__(message)
+        self.path = path
+        self.cause = cause
 
 
 class StaleSessionWriteError(AgentStateError):
@@ -1384,25 +1391,6 @@ class ParticipantNotResolvableError(RoomError):
     """
 
 
-class SeatKnowledgeUnreadableError(ParticipantNotResolvableError):
-    """A room seat's saved knowledge is on disk and cannot be read (#1367).
-
-    Its message is written for the person in the conversation and says neither where the
-    record is nor what the parser said: `reader_facing_reason` passes a `RoomError`'s text
-    through to them. `path` and `cause` carry both for the log and for any diagnostics
-    surface that wants them.
-
-    Raised by the knowledge read, which changes nothing, and by the resolver only when the
-    record could not be set aside either -- then the seat is refused rather than built over
-    an empty engine that its next save would write over the record.
-    """
-
-    def __init__(self, message: str, *, path: Path | None = None, cause: str | None = None) -> None:
-        super().__init__(message)
-        self.path = path
-        self.cause = cause
-
-
 class RoomIdError(RoomError, PathTraversalError):
     """A room id cannot be used to address a record.
 
@@ -1466,6 +1454,16 @@ class NothingToRetryError(RoomError):
     which would make "retried and it worked" and "there was nothing to retry"
     indistinguishable to the caller, in the one command a user reaches for precisely
     because they cannot tell what the room did.
+    """
+
+
+class HeadRoomWriteError(RoomError):
+    """A post or retry was sent to a room a head keeps (#1885).
+
+    A head's room (`ucx run`, `ucx loop`, ACP, A2A) has one writer, the head: it runs the
+    clone on the seat's session and records each turn. A second surface driving a turn
+    there would be a second writer of that session. The message is plain, because it
+    reaches the person through the app and `ucx room say`.
     """
 
 

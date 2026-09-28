@@ -1,11 +1,9 @@
-"""Ontology subsystem: LinkML domain schemas, Tier-1 validation, and autonomous induction."""
+"""Ontology subsystem: LinkML domain schemas, Tier-1 validation, tiers and reasoning."""
 
 from uclone_x.ontology.engine import (
     ExpressionEvaluationError,
     OntologyEngine,
-    OntologyInducer,
     OntologyService,
-    SessionKnowledgeExtractor,
     safe_eval_rule_expression,
 )
 from uclone_x.ontology.justification import (
@@ -35,7 +33,6 @@ from uclone_x.ontology.models import (
 )
 from uclone_x.ontology.protocols import (
     OntologyEngineProtocol,
-    OntologyInducerProtocol,
     OntologyServiceProtocol,
     OntologyValidatorProtocol,
 )
@@ -53,8 +50,6 @@ __all__ = [
     "OntologyConcept",
     "OntologyEngine",
     "OntologyEngineProtocol",
-    "OntologyInducer",
-    "OntologyInducerProtocol",
     "OntologyInvariant",
     "OntologyReasoner",
     "OntologyRelation",
@@ -65,7 +60,6 @@ __all__ = [
     "OntologyValidatorProtocol",
     "ProofStep",
     "RelationSchema",
-    "SessionKnowledgeExtractor",
     "TYPE_PREDICATE",
     "UnsupportedAxiom",
     "ValidationResult",

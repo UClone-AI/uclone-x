@@ -1,5 +1,5 @@
 """Tool results at ingest: canonical JSON, a size cap with a stored body, and compaction
-that checks between steps and cuts only on turn boundaries (#1422).
+that runs only at a turn start and cuts only on turn boundaries (#1422, #1443).
 """
 
 from __future__ import annotations
@@ -17,9 +17,13 @@ from uclone_x.agent.base import BaseAgent
 from uclone_x.agent.models import AgentConfig, AgentLLMConfig
 from uclone_x.agent.session import SessionState, SessionStore, reap_orphaned_tool_artifacts
 from uclone_x.core.provenance import Provenance
+from uclone_x.core.session_log import SessionLogKind
 from uclone_x.core.tool_results import (
     STEP_EXCERPT_MIN_BYTES,
     STEP_NO_ROOM_MESSAGE,
+    STEP_NO_ROOM_NO_COMPACTION_MESSAGE,
+    STEP_NO_ROOM_SETUP_MESSAGE,
+    STEP_NO_ROOM_SETUP_REPLY_MESSAGE,
     STEP_OVER_WINDOW_MESSAGE,
     STEP_REPLY_RESERVE_TOKENS,
     STORED_RESULT_PREFIX,
@@ -392,7 +396,7 @@ async def test_a_sub_agent_result_goes_through_the_same_cap(tmp_path: Path) -> N
 
 
 # ======================================================================================
-# Compaction: the trigger, between steps, and where it cuts
+# Compaction: the trigger, at a turn start only, and where it cuts
 # ======================================================================================
 
 
@@ -421,29 +425,42 @@ def test_the_trigger_counts_tool_schemas_and_system_sections() -> None:
 
 
 @pytest.mark.asyncio
-async def test_a_mid_turn_overflow_compacts_before_the_next_step(tmp_path: Path) -> None:
-    """A step that crosses the threshold is compacted before the next request is built,
-    and that request carries the step's own result exactly as ingested.
+async def test_a_step_that_does_not_fit_is_refused_and_earlier_results_are_not_shrunk(
+    tmp_path: Path,
+) -> None:
+    """No compaction runs between two steps (§5.8, #1443): a step whose conversation
+    leaves no room is refused, and the result an earlier request showed stays as shown.
 
-    The pass prunes what the model has already read -- the earlier step's result -- and
-    leaves the step that just ran alone: the model has not seen it yet (#1422 review B1).
+    Before #1443 a pass between steps pruned the first result here and sent the step
+    (#1422); what the model had already read changed under it mid-turn. The window is set
+    a few tokens above what the second request and the reply reserve take, measured on an
+    agent with no window: the first step fits whole, the second cannot fit even as an
+    excerpt.
 
-    Killed by: src/uclone_x/agent/turn_executor.py :: if await self._auto_compact_if_needed(
-    Becomes: if False and await self._auto_compact_if_needed(
+    Killed by: src/uclone_x/agent/turn_executor.py :: if caps is None:
+    Becomes: if False:
     """
+    from uclone_x.llm.compactor import estimate_request_tokens
+
     older = "o" * 2_000
-    fresh = "y" * 6_000  # under the ingest cap, far over this agent's threshold
-    llm = _ScriptedLLM(
-        [
+    tools = [_returning("small", older), _returning("tiny", "x")]
+
+    def steps() -> list[list[ToolCallRequest]]:
+        return [
             [ToolCallRequest(id="c1", name="small", arguments={})],
-            [ToolCallRequest(id="c2", name="dump", arguments={})],
+            [ToolCallRequest(id="c2", name="tiny", arguments={})],
         ]
-    )
+
+    probe_llm = _ScriptedLLM(steps())
+    await _agent(tmp_path / "probe", probe_llm, tools).execute_turn("go")
+    window = estimate_request_tokens(probe_llm.requests[1]) + 64 + 6  # max_tokens is 64
+
+    llm = _ScriptedLLM(steps())
     agent = _agent(
-        tmp_path,
+        tmp_path / "real",
         llm,
-        [_returning("small", older), _returning("dump", fresh)],
-        llm_config=AgentLLMConfig(model_name="mock-model", compaction_threshold_tokens=1_200),
+        tools,
+        llm_config=AgentLLMConfig(model_name="mock-model", context_limit=window, max_tokens=64),
     )
     reasons: list[tuple[str, int]] = []
     original = agent._compact_session  # pyright: ignore[reportPrivateUsage]
@@ -453,34 +470,27 @@ async def test_a_mid_turn_overflow_compacts_before_the_next_step(tmp_path: Path)
         return await original(sid, reason, **kwargs)
 
     agent._compact_session = recording  # type: ignore[method-assign]
-    await agent.execute_turn("go")
+    result = await agent.execute_turn("go")
 
-    assert ("auto_threshold_mid_turn", 2) in reasons
-    assert len(llm.requests) == 3
-    third = llm.requests[2]
-    by_id = {m.tool_call_id: m for m in _tool_messages(third.messages)}
-    # The step the model has not read reaches it verbatim ...
-    assert by_id["c2"].content == fresh
-    # ... while the one it has read was pruned by the pass.
-    assert by_id["c1"].content is not None and len(by_id["c1"].content) < len(older)
-    # Both groups survive: each call and its result reach the next request.
-    calls = [m for m in third.messages if m.role is MessageRole.ASSISTANT and m.tool_calls]
-    assert [c.id for m in calls for c in m.tool_calls] == ["c1", "c2"]
+    assert len(llm.requests) == 2
+    assert result.stop_reason == "step_results_over_window"
+    assert result.error == STEP_OVER_WINDOW_MESSAGE
+    assert [r for r in reasons if r[1] > 0] == []  # only a turn start may compact
+    assert _tool_messages(llm.requests[1].messages)[0].content == older
+    assert _tool_messages(agent.history)[0].content == older
 
 
 @pytest.mark.asyncio
-async def test_a_freshly_read_file_survives_mid_turn_compaction_on_an_8k_window(
-    tmp_path: Path,
-) -> None:
-    """The review's reproduction: the full default tool set, an 8K window, one small file.
+async def test_a_file_read_again_on_an_8k_window_is_sent_once(tmp_path: Path) -> None:
+    """The #1422 review's reproduction: the full default tool set, an 8K window, one small
+    file read four times. Every read reaches the model, the first verbatim in every later
+    request and each repeat as a back-reference to it (§5.8, Rule 2), so nothing is
+    compacted and no step is refused.
 
-    The tool schemas alone are most of the trigger, so the first `file_read` crosses it.
-    Every later request must carry the read it follows exactly as ingested; before the
-    fix each carried a 410-character offload line and the model re-read forever.
-
-    Killed by: src/uclone_x/agent/turn_executor.py :: hold_unseen_step=True,
-    Becomes: hold_unseen_step=False,
+    Killed by: src/uclone_x/core/context_state.py :: earlier = first_with.get(content)
+    Becomes: earlier = None
     """
+    from uclone_x.core.context_state import back_reference_text
     from uclone_x.tools.registry import create_default_registry
 
     text = "\n".join(f"line {i:05d} " + "x" * 60 for i in range(3_000 // 72))
@@ -510,27 +520,31 @@ async def test_a_freshly_read_file_survives_mid_turn_compaction_on_an_8k_window(
         return await original(sid, reason, **kwargs)
 
     agent._compact_session = recording  # type: ignore[method-assign]
-    await agent.execute_turn("read a.py")
+    result = await agent.execute_turn("read a.py")
 
-    assert "auto_threshold_mid_turn" in reasons
+    assert result.is_completed and reasons == []
     assert len(llm.requests) == 5
-    ingested = {m.tool_call_id: m.content for m in _tool_messages(agent.history)}
+    first = {m.tool_call_id: m for m in _tool_messages(agent.history)}["c0"]
+    assert first.content is not None and text.splitlines()[-1] in first.content
     for n, request in enumerate(llm.requests[1:]):
-        latest = _tool_messages(request.messages)[-1]
-        assert latest.tool_call_id == f"c{n}"
-        assert latest.content is not None and text.splitlines()[-1] in latest.content
-        if n == 3:
-            # The last read is never compacted afterwards, so history holds it as ingested.
-            assert latest.content == ingested[f"c{n}"]
+        results = _tool_messages(request.messages)
+        assert [m.tool_call_id for m in results] == [f"c{i}" for i in range(n + 1)]
+        assert results[0].content == first.content
+        for repeat in results[1:]:
+            assert repeat.content == back_reference_text(first)
 
 
 @pytest.mark.asyncio
-async def test_a_mid_turn_compaction_is_rebuilt_from_the_request_record(tmp_path: Path) -> None:
-    """The request after a pass between steps is recorded as a divergence, not an extension.
+async def test_a_compaction_at_a_turn_start_is_rebuilt_from_the_request_record(
+    tmp_path: Path,
+) -> None:
+    """The first request after a compaction is recorded as a divergence, not an extension.
 
     #1421 records each request's conversation as a delta on the previous one, found by
-    comparing prefixes. A pass between steps rewrites an earlier result, so the delta must
-    start there, and the rebuilt request must equal the one sent.
+    comparing prefixes. A compaction at a turn start rewrites what the previous turn
+    showed, so the delta must start there, and every rebuilt request must equal the one
+    sent. Compaction runs only at a turn start (§5.8), so this is the one place a request
+    of an agent diverges from the one before it.
 
     Killed by: src/uclone_x/agent/prompt_assembler.py :: if before != now:
     Becomes: if False:
@@ -540,9 +554,7 @@ async def test_a_mid_turn_compaction_is_rebuilt_from_the_request_record(tmp_path
     from uclone_x.log.reader import read_session_log
 
     store = SessionStore(tmp_path / "store")
-    sid = "sess_1422"
-    older = "o" * 2_000
-    fresh = "y" * 6_000
+    sid = "sess_1443"
     llm = _ScriptedLLM(
         [
             [ToolCallRequest(id="c1", name="small", arguments={})],
@@ -550,8 +562,8 @@ async def test_a_mid_turn_compaction_is_rebuilt_from_the_request_record(tmp_path
         ]
     )
     registry = ToolRegistry()
-    registry.register(_returning("small", older))
-    registry.register(_returning("dump", fresh))
+    registry.register(_returning("small", "o" * 2_000))
+    registry.register(_returning("dump", "y" * 6_000))
     agent = BaseAgent(
         config=AgentConfig(
             agent_id="ingest",
@@ -564,28 +576,29 @@ async def test_a_mid_turn_compaction_is_rebuilt_from_the_request_record(tmp_path
         store=store,
         context=AgentContext(session_id=sid, agent_id="ingest", current_state=AgentState.IDLE),
     )
-    reasons: list[str] = []
+    reasons: list[tuple[str, int]] = []
     original = agent._compact_session  # pyright: ignore[reportPrivateUsage]
 
     async def recording(session_id: str, reason: str, **kwargs: Any) -> Any:
-        reasons.append(reason)
+        reasons.append((reason, len(llm.requests)))
         return await original(session_id, reason, **kwargs)
 
     agent._compact_session = recording  # type: ignore[method-assign]
     await agent.start()
     assert (await agent.execute_turn("go")).is_completed
+    assert (await agent.execute_turn("again")).is_completed
     agent.persist_session()
-    assert "auto_threshold_mid_turn" in reasons
+    assert reasons == [("auto_threshold", 3)]  # at turn 2's start, and only there
 
     state = store.load(sid)
     log = store.event_log_path(sid)
     assert state is not None and log is not None
     events = [dict(e) for e in read_session_log(log)]
     contexts = [e for e in events if e.get("type") == "REQUEST_CONTEXT"]
-    assert len(contexts) == len(llm.requests) == 3
-    # The third request diverges where the pass pruned the first result.
-    second_len = contexts[1]["kept_message_count"] + len(contexts[1]["appended_messages"])
-    assert contexts[2]["kept_message_count"] < second_len
+    assert len(contexts) == len(llm.requests) == 4
+    # The fourth request diverges where the compaction folded turn 1.
+    third_len = contexts[2]["kept_message_count"] + len(contexts[2]["appended_messages"])
+    assert contexts[3]["kept_message_count"] < third_len
 
     rebuilt = rebuild_requests(store, state, events)
     for number, (request, sent) in enumerate(zip(rebuilt, llm.requests, strict=True)):
@@ -851,7 +864,9 @@ def test_the_reaper_without_a_liveness_check_keeps_its_old_behaviour(tmp_path: P
 # ======================================================================================
 
 
-def _default_registry_agent(workspace: Path, llm: MockLLMConnector) -> BaseAgent:
+def _default_registry_agent(
+    workspace: Path, llm: MockLLMConnector, *, auto_compact: bool = True
+) -> BaseAgent:
     from uclone_x.tools.registry import create_default_registry
 
     return BaseAgent(
@@ -859,7 +874,9 @@ def _default_registry_agent(workspace: Path, llm: MockLLMConnector) -> BaseAgent
             agent_id="ingest",
             name="Ingest",
             workspace_dir=workspace,
-            llm_config=AgentLLMConfig(model_name="mock-model", context_limit=8_192),
+            llm_config=AgentLLMConfig(
+                model_name="mock-model", context_limit=8_192, auto_compact=auto_compact
+            ),
         ),
         llm=llm,
         tools=create_default_registry(workspace_root=workspace, enable_mcp=False),
@@ -977,6 +994,40 @@ async def test_a_step_that_cannot_fit_even_as_excerpts_is_refused_in_plain_words
     assert error == STEP_OVER_WINDOW_MESSAGE
     for internal in ("/", "\\", "tr_", "Error", "Traceback", "token", str(tmp_path), "{"):
         assert internal not in error
+
+
+@pytest.mark.asyncio
+async def test_a_refused_step_leaves_the_history_and_stays_in_the_session_log(
+    tmp_path: Path,
+) -> None:
+    """The refused step's forty results are withheld from the history, not from the log.
+
+    The step is logged as ingested before it is fitted (#1443); nothing after the refusal
+    sees those results again, so that is the only point they can be logged. Compaction
+    is off: its save would log them first and hide whether the step's own call does.
+
+    Killed by: src/uclone_x/agent/turn_executor.py :: self._active_session.log_history()  # the step as ingested, before any cut
+    Becomes: pass
+    """
+    names = [f"f{i:02d}.txt" for i in range(40)]
+    for name in names:
+        _near_cap_file(tmp_path, name)
+    llm = _ScriptedLLM(
+        [
+            [
+                ToolCallRequest(id=f"c{i}", name="file_read", arguments={"path": name})
+                for i, name in enumerate(names)
+            ]
+        ]
+    )
+    agent = _default_registry_agent(tmp_path, llm, auto_compact=False)
+    result = await agent.execute_turn("read them all")
+    assert result.stop_reason == "step_results_over_window"
+
+    session = agent.get_session()
+    assert not [m for m in session.messages if m.role == MessageRole.TOOL]
+    logged = [e for e in session.session_log if e.kind is SessionLogKind.TOOL_RESULT]
+    assert len(logged) == len(names)
 
 
 @pytest.mark.asyncio
@@ -1216,17 +1267,24 @@ async def test_a_step_still_over_the_window_after_cutting_is_refused_not_sent(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("auto_compact", "expected"),
+    [(False, STEP_NO_ROOM_NO_COMPACTION_MESSAGE), (True, STEP_NO_ROOM_MESSAGE)],
+)
 async def test_a_step_refused_for_a_full_conversation_does_not_blame_the_tools(
-    tmp_path: Path,
+    tmp_path: Path, auto_compact: bool, expected: str
 ) -> None:
     """When the conversation before the step already takes the window, a step of one
     one-byte result is refused -- and the refusal says the conversation is the cause, in
-    plain words, rather than that the tools returned too much.
+    plain words, rather than that the tools returned too much. It says the next message
+    can carry on only where compaction will make room for it (#1854).
 
     The window is set just above the first request, measured on an agent with no window.
 
     Killed by: src/uclone_x/agent/turn_executor.py :: if outside + reserve >= window:
     Becomes: if False:
+    Killed by: src/uclone_x/agent/turn_executor.py :: if self._config.llm_config.auto_compact:
+    Becomes: if True:
     """
     from uclone_x.llm.compactor import estimate_request_tokens
 
@@ -1247,16 +1305,339 @@ async def test_a_step_refused_for_a_full_conversation_does_not_blame_the_tools(
         llm,
         tools,
         llm_config=AgentLLMConfig(
-            model_name="mock-model", context_limit=window, max_tokens=64, auto_compact=False
+            model_name="mock-model",
+            context_limit=window,
+            max_tokens=64,
+            auto_compact=auto_compact,
         ),
     )
     result = await agent.execute_turn(prompt)
 
     assert len(llm.requests) == 1
     assert result.stop_reason == "step_results_over_window"
-    assert result.error == STEP_NO_ROOM_MESSAGE
-    for internal in ("/", "\\", "tr_", "Error", "Traceback", "token", str(tmp_path), "{"):
-        assert internal not in STEP_NO_ROOM_MESSAGE
+    assert result.error == expected
+
+
+@pytest.mark.parametrize("message", [STEP_NO_ROOM_MESSAGE, STEP_NO_ROOM_NO_COMPACTION_MESSAGE])
+def test_the_no_room_refusal_is_plain_and_does_not_send_the_user_elsewhere(message: str) -> None:
+    """The refusal a person reads names no internals, and does not tell them to start a
+    new conversation: the next message in this one can go on (#1854).
+
+    Killed by: src/uclone_x/core/tool_results.py :: older parts of the conversation are shortened first to make room.
+    Becomes: Start a new conversation to go on, or raise context_limit.
+    """
+    lowered = message.lower()
+    for internal in (
+        "/",
+        "\\",
+        "tr_",
+        "error",
+        "traceback",
+        "token",
+        "{",
+        "_",
+        "compact",
+        "context_limit",
+        "epoch",
+    ):
+        assert internal not in lowered, internal
+    assert "new conversation" not in lowered
+    assert "new chat" not in lowered
+    assert "new session" not in lowered
+
+
+@pytest.mark.asyncio
+async def test_a_step_holding_a_back_reference_that_fits_is_not_refused(
+    tmp_path: Path,
+) -> None:
+    """A step that reads again a file an earlier step read sends it as a one-line
+    back-reference (§5.8, Rule 2). The step budget counts it the way the request renders
+    it -- one line, not shared out -- so the step's new results are cut to fit and the
+    turn goes on, instead of the repeat being counted whole and the step refused (#1854).
+
+    Killed by: src/uclone_x/agent/turn_executor.py :: shared_out = [i for i in tail if refers[i] is None]
+    Becomes: shared_out = list(tail)
+    """
+    from uclone_x.core.context_state import back_reference_text
+    from uclone_x.llm.compactor import estimate_request_tokens
+
+    reads = _near_cap_reads(tmp_path)
+    again = ToolCallRequest(id="c0-again", name="file_read", arguments={"path": "a.txt"})
+    llm = _ScriptedLLM([[reads[0]], [again, *reads[1:]]])
+    agent = _budget_agent(tmp_path, llm)
+    result = await agent.execute_turn("read a, then all five")
+
+    assert result.is_completed, result.error
+    assert len(llm.requests) == 3
+    assert all(estimate_request_tokens(r) <= 8_192 for r in llm.requests)
+    last = llm.requests[-1]
+    (first,) = [m for m in last.messages if m.tool_call_id == "c0"]
+    (repeat,) = [m for m in last.messages if m.tool_call_id == "c0-again"]
+    assert repeat.content == back_reference_text(first)
+
+
+@pytest.mark.asyncio
+async def test_two_identical_reads_in_one_cut_step_send_the_second_as_a_back_reference(
+    tmp_path: Path,
+) -> None:
+    """A step that reads the same large file twice, and is cut to fit, sends the first
+    read as an excerpt and the second as a back-reference to it (§5.8, Rule 2; #1866).
+    The second still holds the whole text when the first is cut, so it is given the cut
+    text too; otherwise it no longer matches, is sent whole, and the step is refused.
+
+    Killed by: src/uclone_x/agent/turn_executor.py :: if earlier is not None and earlier in cut:
+    Becomes: if False:
+    """
+    from uclone_x.core.context_state import back_reference_text
+    from uclone_x.llm.compactor import estimate_request_tokens
+
+    reads = _near_cap_reads(tmp_path)
+    again = ToolCallRequest(id="c0-again", name="file_read", arguments={"path": "a.txt"})
+    llm = _ScriptedLLM([[reads[0], again, *reads[1:]]])
+    agent = _budget_agent(tmp_path, llm)
+    result = await agent.execute_turn("read all five, a twice")
+
+    assert result.is_completed, result.error
+    assert len(llm.requests) == 2
+    assert estimate_request_tokens(llm.requests[1]) <= 8_192
+    (first,) = [m for m in llm.requests[1].messages if m.tool_call_id == "c0"]
+    (repeat,) = [m for m in llm.requests[1].messages if m.tool_call_id == "c0-again"]
+    assert handle_in(first.content or "") is not None  # cut to an excerpt
+    assert repeat.content == back_reference_text(first)
+
+
+@pytest.mark.asyncio
+async def test_a_step_refused_because_the_setup_alone_fills_the_window_advises_a_larger_model(
+    tmp_path: Path,
+) -> None:
+    """When the system turn and the tool schemas alone leave no room for the reply, no
+    shortening of the conversation can help, so the refusal says so and advises a larger
+    model instead of promising the next message can carry on (#1866).
+
+    The window is set just above the setup part of a first request, measured on an agent
+    with no window: the conversation is one short message.
+
+    Killed by: src/uclone_x/agent/turn_executor.py :: if fixed + reserve >= window:
+    Becomes: if False:
+    """
+    from uclone_x.llm.compactor import estimate_request_tokens
+
+    tools = [_returning("tiny", "x")]
+
+    def step() -> list[list[ToolCallRequest]]:
+        return [[ToolCallRequest(id="t0", name="tiny", arguments={})]]
+
+    probe_llm = _ScriptedLLM(step())
+    await _agent(tmp_path / "probe", probe_llm, tools).execute_turn("go")
+    sent = probe_llm.requests[0]
+    setup = tuple(m for m in sent.messages if m.role is MessageRole.SYSTEM)
+    fixed = estimate_request_tokens(LLMRequest(messages=setup, tools=sent.tools))
+
+    window = fixed + 32
+    llm = _ScriptedLLM(step())
+    agent = _agent(
+        tmp_path / "real",
+        llm,
+        tools,
+        llm_config=AgentLLMConfig(model_name="mock-model", context_limit=window, max_tokens=64),
+    )
+    result = await agent.execute_turn("go")
+
+    assert len(llm.requests) == 1
+    assert result.stop_reason == "step_results_over_window"
+    assert result.error == STEP_NO_ROOM_SETUP_MESSAGE
+
+
+def test_the_setup_refusal_is_plain_and_advises_a_larger_model() -> None:
+    """The refusal names no internals, does not send the person to a new conversation, and
+    does not promise that shortening helps (#1866).
+
+    Killed by: src/uclone_x/core/tool_results.py :: this step were not sent to it. Use a model with a larger context window.
+    Becomes: this step were not sent to it. Your next message can carry on once it is compacted.
+    """
+    lowered = STEP_NO_ROOM_SETUP_MESSAGE.lower()
+    for internal in (
+        "/",
+        "\\",
+        "tr_",
+        "error",
+        "traceback",
+        "token",
+        "{",
+        "_",
+        "compact",
+        "context_limit",
+        "epoch",
+        "schema",
+        "system turn",
+        "prompt",
+    ):
+        assert internal not in lowered, internal
+    assert "new conversation" not in lowered
+    assert "next message" not in lowered
+    assert "shorten" not in lowered
+    assert "larger context window" in lowered
+
+
+def _large_schema_tool() -> LocalTool:
+    """A tool whose schema alone is a few thousand tokens: its description is long."""
+
+    async def handler(params: dict[str, Any], context: ToolContext) -> ToolResult:
+        return ToolResult(
+            success=True,
+            output="x",
+            provenance=Provenance.primary(provider="local.test", model="wide"),
+        )
+
+    description = "Returns a fixed result. " + "It documents itself at length. " * 600
+    return LocalTool("wide", description, handler=handler, writes_files=False)
+
+
+async def _setup_tokens(workspace: Path, tools: Sequence[Any]) -> int:
+    """The system turn and the tool schemas of a first request, on an agent with no window."""
+    from uclone_x.llm.compactor import estimate_request_tokens
+
+    probe_llm = _ScriptedLLM([[ToolCallRequest(id="t0", name=tools[0].name, arguments={})]])
+    await _agent(workspace, probe_llm, tools).execute_turn("go")
+    sent = probe_llm.requests[0]
+    setup = tuple(m for m in sent.messages if m.role is MessageRole.SYSTEM)
+    return estimate_request_tokens(LLMRequest(messages=setup, tools=sent.tools))
+
+
+@pytest.mark.asyncio
+async def test_the_setup_check_counts_the_tool_schemas(tmp_path: Path) -> None:
+    """A tool schema of a few thousand tokens is part of the setup every request sends, so
+    when it is what fills the window the refusal is the setup one: shortening the
+    conversation would not help (#1875, item 1).
+
+    Killed by: src/uclone_x/agent/turn_executor.py :: fixed = estimate_request_tokens(LLMRequest(messages=setup, tools=tuple(tools)))
+    Becomes: fixed = estimate_request_tokens(LLMRequest(messages=setup, tools=()))
+    """
+    tools = [_large_schema_tool()]
+    fixed = await _setup_tokens(tmp_path / "probe", tools)
+    assert fixed > 1_000  # the schema, not the system turn, is most of the setup
+
+    llm = _ScriptedLLM([[ToolCallRequest(id="t0", name="wide", arguments={})]])
+    agent = _agent(
+        tmp_path / "real",
+        llm,
+        tools,
+        llm_config=AgentLLMConfig(
+            model_name="mock-model", context_limit=fixed + 32, max_tokens=64, auto_compact=False
+        ),
+    )
+    result = await agent.execute_turn("go")
+
+    assert len(llm.requests) == 1
+    assert result.stop_reason == "step_results_over_window"
+    assert result.error == STEP_NO_ROOM_SETUP_MESSAGE
+
+
+@pytest.mark.asyncio
+async def test_the_setup_check_does_not_count_a_compaction_ledger(tmp_path: Path) -> None:
+    """A compaction ledger is a system message, but it is conversation: a later compaction
+    folds it again. When a large ledger is what fills the window, the refusal says the
+    conversation is the cause, not the setup (#1875, item 1).
+
+    Killed by: src/uclone_x/agent/turn_executor.py :: and not m.compaction_ledger
+    Becomes: and m is not None
+    """
+    from uclone_x.llm.compactor import estimate_request_tokens
+
+    ledger = ChatMessage(
+        role=MessageRole.SYSTEM,
+        content="[Session Progress Ledger]\n" + "- An earlier step read a long file.\n" * 400,
+        compaction_ledger=True,
+    )
+    history = [ChatMessage(role=MessageRole.SYSTEM, content="You are a test agent."), ledger]
+    tools = [_returning("tiny", "x")]
+
+    def step() -> list[list[ToolCallRequest]]:
+        return [[ToolCallRequest(id="t0", name="tiny", arguments={})]]
+
+    probe_llm = _ScriptedLLM(step())
+    probe = _agent(tmp_path / "probe", probe_llm, tools)
+    probe.load_history(history)
+    await probe.execute_turn("go")
+    first = estimate_request_tokens(probe_llm.requests[0])
+    assert any(m.compaction_ledger for m in probe_llm.requests[0].messages)
+
+    llm = _ScriptedLLM(step())
+    agent = _agent(
+        tmp_path / "real",
+        llm,
+        tools,
+        llm_config=AgentLLMConfig(
+            model_name="mock-model", context_limit=first + 32, max_tokens=64, auto_compact=False
+        ),
+    )
+    agent.load_history(history)
+    result = await agent.execute_turn("go")
+
+    assert len(llm.requests) == 1
+    assert result.stop_reason == "step_results_over_window"
+    assert result.error == STEP_NO_ROOM_NO_COMPACTION_MESSAGE
+
+
+@pytest.mark.asyncio
+async def test_a_reply_length_that_fills_the_window_is_named_as_a_fix(tmp_path: Path) -> None:
+    """When the setup leaves room for a reply of the default size but the agent asks for a
+    much longer one, the refusal also suggests shorter replies (#1875, item 3). With a
+    reply length no longer than the default, it does not (the setup test above).
+
+    Killed by: src/uclone_x/agent/turn_executor.py :: if fixed + STEP_REPLY_RESERVE_TOKENS < window:
+    Becomes: if False:
+    """
+    tools = [_returning("tiny", "x")]
+    fixed = await _setup_tokens(tmp_path / "probe", tools)
+
+    llm = _ScriptedLLM([[ToolCallRequest(id="t0", name="tiny", arguments={})]])
+    window = fixed + STEP_REPLY_RESERVE_TOKENS + 256
+    agent = _agent(
+        tmp_path / "real",
+        llm,
+        tools,
+        llm_config=AgentLLMConfig(
+            model_name="mock-model", context_limit=window, max_tokens=window, auto_compact=False
+        ),
+    )
+    result = await agent.execute_turn("go")
+
+    assert len(llm.requests) == 1
+    assert result.stop_reason == "step_results_over_window"
+    assert result.error == STEP_NO_ROOM_SETUP_REPLY_MESSAGE
+
+
+def test_the_reply_length_refusal_is_plain_and_names_both_fixes() -> None:
+    """The refusal names no internals and offers both fixes: shorter replies, or a larger
+    model (#1875, item 3).
+
+    Killed by: src/uclone_x/core/tool_results.py :: "shorter replies, or use a model with a larger context window."
+    Becomes: "fewer tools, or use a model with a larger context window."
+    """
+    lowered = STEP_NO_ROOM_SETUP_REPLY_MESSAGE.lower()
+    for internal in (
+        "/",
+        "\\",
+        "tr_",
+        "error",
+        "traceback",
+        "token",
+        "{",
+        "_",
+        "compact",
+        "max_tokens",
+        "context_limit",
+        "epoch",
+        "schema",
+        "system turn",
+        "prompt",
+    ):
+        assert internal not in lowered, internal
+    assert "new conversation" not in lowered
+    assert "shorten" not in lowered
+    assert "shorter replies" in lowered
+    assert "larger context window" in lowered
 
 
 # ======================================================================================
@@ -1370,6 +1751,32 @@ async def test_a_compactor_with_no_session_truncates_rather_than_storing(tmp_pat
     tool_msg = _tool_messages(outcome.messages)[0]
     assert (tool_msg.content or "").startswith("[Tool Output Truncated")
     assert not artifacts_dir_for(tmp_path).exists()
+
+
+@pytest.mark.asyncio
+async def test_a_result_truncated_for_want_of_a_session_is_recorded_as_an_excerpt(
+    tmp_path: Path,
+) -> None:
+    """The truncate path keeps a head and a tail, so it records the `excerpt` form where
+    it cuts, as the other paths do; the text is never read back to decide it (#1866).
+
+    Killed by: src/uclone_x/llm/compactor.py :: form="excerpt",
+    Becomes: form=None,
+    """
+    from uclone_x.core.context_state import ContextForm, message_form
+
+    messages = [
+        ChatMessage(role=MessageRole.USER, content="go"),
+        ChatMessage(role=MessageRole.ASSISTANT, tool_calls=(ToolCallRequest(id="c1", name="t"),)),
+        ChatMessage(role=MessageRole.TOOL, content="r" * 5_000, tool_call_id="c1", name="t"),
+    ]
+    compactor = ContextCompactor(max_tool_output_chars=300)
+
+    outcome = await compactor.compact(messages)
+
+    tool_msg = _tool_messages(outcome.messages)[0]
+    assert len(tool_msg.content or "") < 5_000
+    assert message_form(tool_msg) is ContextForm.EXCERPT
 
 
 @pytest.mark.asyncio

@@ -73,7 +73,7 @@
   "unreachable": "The server could not be reached ({reason}). Check it is running, then save again.",
   "saved": "Saved {name}.",
   "savedWithLive": {
-    "one": "Saved {name}. {count} open conversation will use it from the next message.",
-    "other": "Saved {name}. {count} open conversations will use it from the next message."
+    "one": "Saved {name}. {count} open conversation will use it from the next message. A model change applies in a new conversation, and in an open one after UClone-X restarts.",
+    "other": "Saved {name}. {count} open conversations will use it from the next message. A model change applies in a new conversation, and in an open one after UClone-X restarts."
   }
 }

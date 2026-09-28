@@ -20,6 +20,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from uclone_x.agent.session import SessionStore
+from uclone_x.core.agent_home import AgentHome
 from uclone_x.engine.event_bus import EventBus
 from uclone_x.ontology.engine import OntologyEngine
 from uclone_x.ontology.models import OntologyConcept, OntologyTier
@@ -137,7 +138,18 @@ async def test_user_creative_workflow_scenario(tmp_path: Path) -> None:
     # ----------------------------------------------------------------------------------
     # Stage 3: Dynamic Knowledge Graph Reasoning & Integration
     # ----------------------------------------------------------------------------------
-    ontology_engine = OntologyEngine(agent_id=agent_id)
+    # The clone's own rules engine, the one its seats and chats reason with: the manager
+    # keeps no shared engine (clone-knowledge-graph §3.8, #1869). The clone is installed,
+    # as the developer-graph routes read only a clone listed here.
+    assert AgentHome.for_username(agent_id).agent_id()
+    session_manager = AgentSessionManager(
+        bus=bus,
+        storage_dir=storage_dir,
+        workspace_dir=workspace_dir,
+        tools=tools,
+    )
+    ontology_engine = session_manager.ontology_for(agent_id)
+    assert isinstance(ontology_engine, OntologyEngine)
     ontology_engine.register_entity(
         OntologyConcept(
             name="CardGameDesign",
@@ -166,14 +178,6 @@ async def test_user_creative_workflow_scenario(tmp_path: Path) -> None:
     # ----------------------------------------------------------------------------------
     # Stage 4: Verify End-to-End API Projections (ArtifactsDock & Knowledge Graph endpoints)
     # ----------------------------------------------------------------------------------
-    session_manager = AgentSessionManager(
-        bus=bus,
-        storage_dir=storage_dir,
-        workspace_dir=workspace_dir,
-        ontology_engine=ontology_engine,
-        tools=tools,
-    )
-
     app = create_ui_app(
         static_dir=tmp_path / "ui_static",
         session_manager=session_manager,
@@ -223,7 +227,9 @@ async def test_user_creative_workflow_scenario(tmp_path: Path) -> None:
 
     # 4.4 Verify Dynamic Knowledge Graph projection & triples
     # A. Session-filtered query
-    kg_res = client.get(f"/api/knowledge-graph?session_id={session_id}")
+    kg_res = client.get(
+        "/api/knowledge-graph", params={"agent_id": agent_id, "session_id": session_id}
+    )
     assert kg_res.status_code == 200
     kg_data = cast(dict[str, Any], kg_res.json())
     assert "triples" in kg_data
@@ -241,7 +247,7 @@ async def test_user_creative_workflow_scenario(tmp_path: Path) -> None:
     assert rel_triple["provenance"]["origin"] == "derived"
 
     # B. Unfiltered query includes parent_type (is_a) and concept graph
-    kg_all = client.get("/api/knowledge-graph")
+    kg_all = client.get("/api/knowledge-graph", params={"agent_id": agent_id})
     assert kg_all.status_code == 200
     all_data = cast(dict[str, Any], kg_all.json())
     assert all_data["summary"]["total_triples"] >= 2

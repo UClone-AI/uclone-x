@@ -27,11 +27,13 @@ from uclone_x.agent.session import (
     SESSION_STORAGE_DIR_ENV_VAR,
 )
 from uclone_x.core.agent_home import AGENTS_DIR_ENV_VAR, DEFAULT_AGENTS_ROOT
+from uclone_x.link.uclone2.store import LINKS_DIR_ENV_VAR
 from uclone_x.llm.connectors.ollama import OLLAMA_ENDPOINT_ENV_VARS
 from uclone_x.llm.connectors.vllm import (
     VLLM_ENDPOINT_ENV_VARS,
     VLLM_MODEL_ENV_VAR,
 )
+from uclone_x.room.store import ROOM_STORAGE_DIR_ENV_VAR
 from uclone_x.shells.ui_process import DASHBOARD_STATE_DIR_ENV_VAR, UI_BIND_HOST_ENV_VAR
 from uclone_x.skills.approvals import APPROVALS_DIR_ENV_VAR
 from uclone_x.tools.builtin import mcp_loader
@@ -52,6 +54,13 @@ _COLLECTION_AGENTS_DIR = Path(tempfile.gettempdir()) / "uclone-test-agents-colle
 _COLLECTION_AGENTS_DIR.mkdir(parents=True, exist_ok=True)
 if AGENTS_DIR_ENV_VAR not in os.environ:
     os.environ[AGENTS_DIR_ENV_VAR] = str(_COLLECTION_AGENTS_DIR)
+
+# The same, for uClone2 links. A dashboard built during collection, or in a subprocess,
+# starts a session per stored link: pointed at the developer's `~/.uclone/links` it would
+# dial uClone2 with their real token and show their clone online from a test run.
+_COLLECTION_LINKS_DIR = Path(tempfile.mkdtemp(prefix="uclone-test-links-collection-"))
+if LINKS_DIR_ENV_VAR not in os.environ:
+    os.environ[LINKS_DIR_ENV_VAR] = str(_COLLECTION_LINKS_DIR)
 
 # ---------------------------------------------------------------------------
 # Inherited `GIT_*`: scrubbed for the whole session, at import, before collection.
@@ -136,7 +145,13 @@ else:
 # would write into the invoking developer's `~/.uclone/agents`.
 # The skill approvals ledger (#1720) is carried for the same reason: `ucx skill approve` in a
 # child writes a pin, and left at the default that pin lands in the developer's own ledger.
-_ISOLATED_CHILD_ENV_VARS = (SESSION_STORAGE_DIR_ENV_VAR, AGENTS_DIR_ENV_VAR, APPROVALS_DIR_ENV_VAR)
+_ISOLATED_CHILD_ENV_VARS = (
+    SESSION_STORAGE_DIR_ENV_VAR,
+    AGENTS_DIR_ENV_VAR,
+    APPROVALS_DIR_ENV_VAR,
+    ROOM_STORAGE_DIR_ENV_VAR,
+    LINKS_DIR_ENV_VAR,
+)
 
 
 def _carry_isolated_dirs_into_child_env(kwargs: dict[str, Any]) -> None:
@@ -360,6 +375,21 @@ def _isolate_session_storage(  # pyright: ignore[reportUnusedFunction]
 
 
 @pytest.fixture(autouse=True)
+def _isolate_room_storage(  # pyright: ignore[reportUnusedFunction]
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> Path:
+    """Point every test's room store at a temporary directory.
+
+    Autouse for the reason session storage is: `ucx run` and `ucx loop` open a one-seat
+    room in the default `RoomStore` (§5.9), so a CLI test that did not redirect it would
+    write a room into the invoking developer's `~/.uclone/rooms`.
+    """
+    root = tmp_path_factory.mktemp("room-storage")
+    monkeypatch.setenv(ROOM_STORAGE_DIR_ENV_VAR, str(root))
+    return root
+
+
+@pytest.fixture(autouse=True)
 def _isolate_agent_homes(  # pyright: ignore[reportUnusedFunction]
     tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
 ) -> Iterator[Path]:
@@ -382,6 +412,20 @@ def _isolate_agent_homes(  # pyright: ignore[reportUnusedFunction]
         yield root
 
     homes.assert_no_leaks()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_links(  # pyright: ignore[reportUnusedFunction]
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> Path:
+    """Point every test's uClone2 links file at an empty temporary folder.
+
+    Every dashboard a test builds starts a session per stored link; left at the default, a
+    test would dial uClone2 with the developer's own link token.
+    """
+    folder = tmp_path_factory.mktemp("links")
+    monkeypatch.setenv(LINKS_DIR_ENV_VAR, str(folder))
+    return folder
 
 
 @pytest.fixture(autouse=True)

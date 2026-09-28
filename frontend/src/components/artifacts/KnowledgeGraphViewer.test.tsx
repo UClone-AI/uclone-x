@@ -274,39 +274,36 @@ describe('KnowledgeGraphViewer', () => {
     expect(globalThis.fetch).not.toHaveBeenCalledWith(expect.stringContaining('session_id'));
   });
 
-  it.each(['not_recorded', 'unreadable', 'no_ontology'] as const)(
-    'shows the Core’s reason instead of an empty graph (%s)',
-    async (status) => {
-      vi.spyOn(globalThis, 'fetch').mockImplementation(
-        async () =>
-          new Response(
-            JSON.stringify({
-              room_id: 'room-a',
-              participant_id: 'scout',
-              session_id: 's',
-              status,
-              reason: `Scout cannot be read (${status}).`,
-              facts: [],
-              triples: null,
-              nodes: null,
-              edges: null,
-              summary: null,
-            }),
-            { status: 200 },
-          ),
-      );
-      render(<KnowledgeGraphViewer roomId="room-a" seatId="scout" />);
-      expect(await screen.findByTestId('kg-notice')).toHaveTextContent(
-        `Scout cannot be read (${status}).`,
-      );
-      expect(screen.queryByTestId('kg-node-count')).toBeNull();
-    },
-  );
+  // The per-seat record is retired (step 6): the graph is the clone's rules engine, which is
+  // always there. Facts that could not be read are Remembers' to say, not a reason to
+  // withhold the rules graph.
+  it('draws the clone’s rules graph even when its facts could not be read', async () => {
+    vi.spyOn(globalThis, 'fetch').mockImplementation(
+      async () =>
+        new Response(
+          JSON.stringify({
+            room_id: 'room-a',
+            participant_id: 'scout',
+            session_id: 's',
+            status: 'ok',
+            reason: null,
+            facts: null,
+            facts_reason: 'What Scout knows could not be read, so it cannot be shown.',
+            worked_out: null,
+            ...mockGraphData,
+          }),
+          { status: 200 },
+        ),
+    );
+    render(<KnowledgeGraphViewer roomId="room-a" seatId="scout" />);
+    expect(await screen.findByTestId('kg-node-count')).toBeDefined();
+    expect(screen.queryByTestId('kg-notice')).toBeNull();
+  });
 
   // An `ok` graph with nothing in it is "nothing listed", and the Core says why: the head
   // cannot tell an empty record from one it was not told about (#1366).
   // Killed by: frontend/src/components/artifacts/KnowledgeGraphViewer.tsx :: (read.data?.reason ?? null);
-  // Becomes: (read.data && read.data.status !== 'ok' ? read.data.reason : null);
+  // Becomes: (null);
   it('shows the Core’s reason for an empty graph it could read', async () => {
     const reason = 'Scout has no remembered facts on record in this conversation.';
     vi.spyOn(globalThis, 'fetch').mockImplementation(

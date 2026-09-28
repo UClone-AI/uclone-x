@@ -473,7 +473,7 @@ def test_resolve_model_context_limit() -> None:
     assert resolve_model_context_limit("models/gemini-2.0-flash") == 1_000_000
     assert resolve_model_context_limit("gemini-1.5-pro") == 2_000_000
 
-    # Claude family
+    # Claude family: retired IDs a saved config may still name
     assert resolve_model_context_limit("claude-3-5-sonnet") == 200_000
     assert resolve_model_context_limit("claude-3-7-sonnet") == 200_000
 
@@ -484,6 +484,54 @@ def test_resolve_model_context_limit() -> None:
     # Qwen family
     assert resolve_model_context_limit("qwen2.5-coder:32b") == 128_000
     assert resolve_model_context_limit("qwen2.5") == 128_000
+
+
+def test_a_current_claude_model_is_not_read_as_the_200k_family_fallback() -> None:
+    """Opus 5.5, Sonnet 5 and Fable 5.1 publish 1M windows; the bare `"claude"` key says 200K.
+
+    The lookup takes the first key contained in the name, so without their own entries
+    every current Claude model compacted at 70% of a fifth of its window.
+
+    The `-5-5` and `-5-1` declarations mutate the value, not the key: a renamed key now
+    falls through to `claude-opus-5` or `claude-fable-5` (#1917), whose window is the same.
+
+    Killed by: src/uclone_x/llm/compactor.py :: "claude-opus-5-5": 1_000_000,
+    Becomes: "claude-opus-5-5": 2_000_000,
+    Killed by: src/uclone_x/llm/compactor.py :: "claude-sonnet-5": 1_000_000,
+    Becomes: "claude-sonnet-x": 1_000_000,
+    Killed by: src/uclone_x/llm/compactor.py :: "claude-fable-5-1": 1_000_000,
+    Becomes: "claude-fable-5-1": 2_000_000,
+    """
+    assert resolve_model_context_limit("claude-opus-5-5") == 1_000_000
+    assert resolve_model_context_limit("claude-sonnet-5") == 1_000_000
+    assert resolve_model_context_limit("claude-fable-5-1") == 1_000_000
+
+
+def test_a_legacy_claude_model_still_served_has_its_published_window() -> None:
+    """Legacy models Anthropic still serves, from each model's own page on 2026-09-28 (#1917).
+
+    Without their own entries the 1M models compacted at 70% of the bare `"claude"` key's
+    200K. Opus 4.5 and Sonnet 4.5 are 200K, the same as that fallback, so their entries
+    are pinned by value rather than by key.
+
+    Killed by: src/uclone_x/llm/compactor.py :: "claude-opus-4-8": 1_000_000,
+    Becomes: "claude-opus-4-x": 1_000_000,
+    Killed by: src/uclone_x/llm/compactor.py :: "claude-fable-5": 1_000_000,
+    Becomes: "claude-fable-x": 1_000_000,
+    Killed by: src/uclone_x/llm/compactor.py :: "claude-sonnet-4-5": 200_000,
+    Becomes: "claude-sonnet-4-5": 100_000,
+    """
+    for model in (
+        "claude-fable-5",
+        "claude-opus-5",
+        "claude-opus-4-8",
+        "claude-opus-4-7",
+        "claude-opus-4-6",
+        "claude-sonnet-4-6",
+    ):
+        assert resolve_model_context_limit(model) == 1_000_000, model
+    assert resolve_model_context_limit("claude-opus-4-5-20251101") == 200_000
+    assert resolve_model_context_limit("claude-sonnet-4-5-20250929") == 200_000
 
 
 @pytest.mark.asyncio

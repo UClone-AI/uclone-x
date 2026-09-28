@@ -136,8 +136,8 @@ def test_an_agents_home_records_an_id_that_survives_a_second_lookup(
 def test_an_unreadable_store_is_quarantined_and_reported(tmp_path: Path) -> None:
     """An unreadable memory is not an empty memory, and must not be overwritten.
 
-    Killed by: src/uclone_x/memory/store.py :: os.replace(self._storage_path, quarantine)
-    Becomes: pass
+    Killed by: src/uclone_x/memory/store.py :: moved_to: str | None = str(set_aside_unreadable(self._storage_path))
+    Becomes: moved_to: str | None = None
     """
     path = tmp_path / "mem.json"
     path.write_text("{not json at all", encoding="utf-8")

@@ -36,11 +36,21 @@ from uclone_x.agent.models import AgentConfig, AgentContext
 from uclone_x.agent.session import CompactionResult
 from uclone_x.agent.session_lifecycle import _LiveSession  # pyright: ignore[reportPrivateUsage]
 from uclone_x.agent.tool_invoker import ToolInvoker
+from uclone_x.core.context_state import (
+    CompactedForms,
+    ContextEntry,
+    compacted_entries,
+    derive_compacted_forms,
+    recorded_forms,
+    recorded_renderings,
+    shown_entries,
+)
+from uclone_x.core.session_log import LoggedMessage
 from uclone_x.core.session_store import SessionStoreProtocol
 from uclone_x.core.tool_results import TOOL_RESULT_READ_TOOL
 from uclone_x.engine.event_bus import AgentEvent, EventPriority, EventType
 from uclone_x.engine.protocols import PublisherHandleProtocol
-from uclone_x.llm.compactor import ContextCompactor, unseen_step_start
+from uclone_x.llm.compactor import ContextCompactor
 from uclone_x.llm.models import ChatMessage, LLMRequest, ToolDefinition
 from uclone_x.llm.protocols import ContextCompactorProtocol, TokenBudgetManagerProtocol
 from uclone_x.telemetry.protocols import TracerProtocol
@@ -60,7 +70,6 @@ class _CompactSession(Protocol):
         sid: str,
         reason: str,
         *,
-        hold_unseen_step: bool = ...,
         reader_offered: bool | None = ...,
     ) -> Awaitable[CompactionResult]: ...
 
@@ -318,24 +327,18 @@ class CompactionDriver:
         sid: str,
         reason: str,
         *,
-        hold_unseen_step: bool = False,
         reader_offered: bool | None = None,
     ) -> CompactionResult:
         """Compact one session unconditionally, without the in-flight-turn guard.
 
         Split from `compact_session` because automatic compaction runs *inside*
         `execute_turn`, while `_turn_lock` is held — so the public method's guard would
-        refuse the one caller that is allowed to compact mid-turn. That caller is safe
-        for the reason the guard exists to protect: it compacts *before* a request is
-        built -- at turn start, or between two steps once every tool result of the last
-        step is in the history (#1422) -- so no in-flight assistant message can be
-        orphaned, and it is the turn itself rather than a concurrent caller racing it.
-
-        `hold_unseen_step` is set between two steps (#1422): the step that just ran --
-        its assistant message and its tool results -- is left out of the pass and kept
-        as ingested. The model has not seen those results yet; they are already held to
-        the result cap, and pruning them would send the next request without what the
-        model asked for, so it would ask again.
+        refuse the one caller that is allowed to compact inside a turn. That caller is
+        safe for the reason the guard exists to protect: it compacts at turn start,
+        *before* the turn's first request is built, so no in-flight assistant message can
+        be orphaned, and it is the turn itself rather than a concurrent caller racing it.
+        It never runs between two steps of a turn: an epoch starts only at a turn boundary
+        (§5.8, owner ruling 2026-09-27, reversing #1422's pass between steps).
 
         `reader_offered` says whether this turn offers `tool_result_read`; the short form
         of a stored result names it, so it is used only when the model can call it.
@@ -355,33 +358,68 @@ class CompactionDriver:
         before_messages = list(live.messages)
         tokens_before = compactor.estimate_tokens(before_messages)
 
-        held: list[ChatMessage] = []
-        to_compact = before_messages
-        if hold_unseen_step:
-            start = unseen_step_start(before_messages)
-            if start is not None:
-                to_compact, held = before_messages[:start], before_messages[start:]
-
-        outcome = await compactor.compact(to_compact)
-        compacted = (*outcome.messages, *held)
+        outcome = await compactor.compact(before_messages)
+        compacted = tuple(outcome.messages)
+        derived = _derive_forms(live, before_messages, compacted, outcome.origins)
+        if derived is not None and derived.rising:
+            # A pruned message whose form would rank above the one it replaces is not
+            # taken: the message it replaces stays, in the form it was shown in (Rule 3).
+            logger.warning(
+                "compaction kept %d message(s) whose pruned form would rank above the form "
+                "they were shown in",
+                len(derived.rising),
+            )
+            compacted = tuple(
+                before_messages[origin]
+                if position in derived.rising and origin is not None
+                else message
+                for position, (message, origin) in enumerate(
+                    zip(compacted, outcome.origins, strict=True)
+                )
+            )
         tokens_after = compactor.estimate_tokens(compacted)
 
-        # Persist *before* replacing what is in memory, so a failed write leaves the
-        # session untouched on both sides rather than compacted in memory and whole on
-        # disk. The previous order mutated `live.messages` first, so one failed `save`
-        # left the process believing a 25-message session was 6 messages long while the
-        # record still held 25 — and the exception carried no hint that the in-memory
-        # sequence had already been discarded. Compaction is destructive and
-        # unrecoverable, so it commits atomically or not at all.
-        new_state = live.to_state(sid, self._config.agent_id).with_messages(
-            compacted, turn_counter=live.turn_counter
-        )
-        if self._store is not None:
-            self._write_pending_bodies(sid)  # before the record that names them
-            new_state = self._store.save(new_state)
+        # A failed write leaves the session untouched on both sides, never compacted in
+        # memory and whole on disk. An earlier order mutated `live.messages` before the
+        # save, so one failed `save` left the process believing a 25-message session was
+        # 6 messages long while the record still held 25 — and the exception carried no
+        # hint that the in-memory sequence had already been discarded. Compaction is
+        # destructive and unrecoverable, so it commits atomically or not at all.
+        #
+        # The record it writes logs the compacted history and holds the entries derived
+        # for it (#1848), so a restart before the next request reads each pruned message
+        # as the entry it replaced, under the same ids, instead of logging it as an entry
+        # of its own. Those are computed on the working copy, which is put back if the
+        # write fails (`_Undo`).
+        live.log_history()
+        undo = _Undo.of(live)
+        try:
+            # `entry_ids` and `to_state` log the compacted history: the summary enters the
+            # log at the turn it was made in, and the log's count of what the history
+            # holds drops the folded turns, so a message identical to one of them that
+            # arrives later is logged when it enters (#1443).
+            live.messages = list(compacted)
+            # The new epoch's entries and forms, derived from the entries the history
+            # showed before the compaction: a pruned message is the entry it replaced, in
+            # a smaller form, and its logged body is that form's rendering. The next
+            # request shows them.
+            live.compacted_entries = (
+                {} if derived is None else compacted_entries(live.entry_ids(), derived)
+            )
+            # The one point a request may show the history in smaller forms: the next
+            # request opens a new epoch (§5.8, Rule 3). Declared before the record is
+            # built, so a restart before that request still names the compaction.
+            live.declare_new_epoch("compaction")
+            new_state = live.to_state(sid, self._config.agent_id)
+            if self._store is not None:
+                self._write_pending_bodies(sid)  # before the record that names them
+                new_state = self._store.save(new_state)
+        except BaseException:
+            undo.restore(live)
+            raise
         live.messages = list(new_state.messages)
         # The one point the tools layer may shrink (design §5.1): binding restarts from the
-        # base set and a pinned session retries. Mid-turn, the caller re-seeds instead.
+        # base set and a pinned session retries.
         live.bound_tools.clear()
         live.tools_pin_all = False
         # Adopt the revision the store wrote, for the reason spelled out in
@@ -528,7 +566,6 @@ class CompactionDriver:
         extra_sections: Sequence[str] = (),
         *,
         reason: str = "auto_threshold",
-        hold_unseen_step: bool = False,
     ) -> CompactionResult | None:
         """Compact the active session when the request about to be sent reaches the threshold.
 
@@ -548,17 +585,71 @@ class CompactionDriver:
             self._context.session_id, self._history, request=request
         ):
             return None
-        live = self._live_session(self._context.session_id)
-        pinned = live.tools_pin_all
         # The unguarded path: this *is* the turn, so the in-flight-turn guard on the
         # public `compact_session` would refuse its own caller.
-        result = await self._compact_session(
+        return await self._compact_session(
             self._context.session_id,
             reason,
-            hold_unseen_step=hold_unseen_step,
             reader_offered=any(d.name == TOOL_RESULT_READ_TOOL for d in tools),
         )
-        if hold_unseen_step and self._tools is not None:
-            # Between steps the rest of this turn still sends `tools`: keep that set.
-            self._tool_invoker.reseed_bound_tools(live, tools, pinned=pinned)
-        return result
+
+
+@dataclass(frozen=True, slots=True)
+class _Undo:
+    """What a compaction changes on the working copy before its write, to put back if the
+    write fails. The log only grows, so it is put back by length."""
+
+    messages: list[ChatMessage]
+    log_length: int
+    aligned: list[tuple[ChatMessage, LoggedMessage, str]] | None
+    pending_bodies: dict[str, str]
+    compacted_entries: dict[str, ContextEntry]
+    epoch_causes: list[str]
+
+    @classmethod
+    def of(cls, live: _LiveSession) -> _Undo:
+        return cls(
+            messages=list(live.messages),
+            log_length=len(live.session_log),
+            aligned=live.aligned,
+            pending_bodies=dict(live.pending_bodies),
+            compacted_entries=live.compacted_entries,
+            epoch_causes=list(live.epoch_causes),
+        )
+
+    def restore(self, live: _LiveSession) -> None:
+        live.messages = self.messages
+        del live.session_log[self.log_length :]
+        live.aligned = self.aligned
+        live.pending_bodies = self.pending_bodies
+        live.compacted_entries = self.compacted_entries
+        live.epoch_causes = self.epoch_causes
+
+
+def _derive_forms(
+    live: _LiveSession,
+    before: Sequence[ChatMessage],
+    after: Sequence[ChatMessage],
+    origins: Sequence[int | None],
+) -> CompactedForms | None:
+    """The entries and forms a compaction's result shows (`derive_compacted_forms`, #1848).
+
+    Derived from what the history before it showed -- each message's entry and form, read
+    from the log and the epochs as a request reads them (`shown_entries`) -- not from the
+    messages the compactor wrote. `None` when the compactor did not say where its messages
+    came from (an injected compactor may not), or said it inconsistently: the next request
+    then reads each message as its own entry, as it does for any history (`shown_form`).
+    """
+    if not origins:
+        return None
+    epochs = live.context_epochs
+    showing = shown_entries(
+        live.logged_history(),
+        recorded_forms(epochs),
+        {**recorded_renderings(epochs), **live.compacted_entries},
+    )
+    try:
+        return derive_compacted_forms(list(zip(showing, before, strict=True)), after, origins)
+    except ValueError as exc:
+        logger.warning("compaction forms not derived: %s", exc)
+        return None

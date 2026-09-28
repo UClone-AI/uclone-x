@@ -575,7 +575,9 @@ class TestTurnRecordEnrichment:
         )
 
         class _Seat:
-            async def resolve(self, participant: Participant) -> BaseAgent:
+            async def resolve(
+                self, participant: Participant, *, one_seat: bool = False
+            ) -> BaseAgent:
                 return agent
 
         class _ScoutSpeaks:
@@ -650,7 +652,7 @@ class TestTurnRecordEnrichment:
         )
 
         class _SimpleResolver:
-            async def resolve(self, participant: Any) -> Any:
+            async def resolve(self, participant: Any, *, one_seat: bool = False) -> Any:
                 return agent
 
         orchestrator = RoomOrchestrator(

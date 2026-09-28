@@ -21,7 +21,9 @@ the room, which is what makes the routing rules testable without a live agent.
 
 from __future__ import annotations
 
+import re
 import uuid
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import cast, get_args
@@ -50,7 +52,12 @@ __all__ = [
     "SpeakerDecision",
     "SpeakerRequest",
     "TurnState",
+    "head_keeper",
+    "head_room_write_refusal",
+    "room_head",
+    "server_head_of_id",
     "is_loop_command",
+    "is_one_seat",
     "turn_refusal",
     "with_legacy_loop_rows_as_notes",
 ]
@@ -75,11 +82,12 @@ class ParticipantKind(StrEnum):
 class Participant(BaseModel):
     """One member of a room, and the per-member resources the room must keep apart.
 
-    `session_id` and `ontology_namespace` are declared here rather than resolved later so
-    that "each agent keeps its own session and its own knowledge graph" is a property of
-    the room's *data*, checkable by reading a `RoomState`, instead of a convention each
-    resolver is trusted to follow. `RoomAgentResolverProtocol` states the matching
-    obligation on the runtime side.
+    `session_id` is declared here rather than resolved later so that "each agent keeps its
+    own session" is a property of the room's *data*, checkable by reading a `RoomState`,
+    instead of a convention each resolver is trusted to follow. `RoomAgentResolverProtocol`
+    states the matching obligation on the runtime side. What a clone knows is not the
+    seat's: its facts and its rules engine are its clone's, looked up by `id`
+    (clone-knowledge-graph step 6), so a seat names no knowledge graph of its own.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
@@ -109,17 +117,20 @@ class Participant(BaseModel):
         "who has no agent session.",
         default="",
     )
-    ontology_namespace: str = Field(
-        default="",
-        description="Namespace IRI for this participant's own ontology engine (P7). "
-        "Separate per agent: a shared namespace would merge one agent's induced concepts "
-        "into another's, which is not a room feature but a loss of the per-agent "
-        "grounding P7 requires. Empty for a human, and for an agent running without an "
-        "ontology.",
-    )
     persona: str = Field(
         default="",
         description="Name of registered persona blueprint to hydrate this participant with.",
+    )
+
+    ontology_namespace: str = Field(
+        default="",
+        exclude=True,
+        description="Retired with the per-seat rules engine (clone-knowledge-graph step 6); "
+        "read from a stored room so it still loads, never written and read by nothing. A "
+        "seat once named an engine of its own, `<root>/<room>/<participant>`; the engine is "
+        "now its clone's, named by the clone's id (`clone_builder.clone_namespace`). Kept "
+        "as an excluded field rather than dropped by a `before` validator: on this strict "
+        "model a `before` validator makes JSON arrays fail the tuple fields.",
     )
 
 
@@ -191,6 +202,67 @@ class RoomTurnRefusal(StrEnum):
     PROVIDER_AUTH = "provider_auth"
 
 
+def is_one_seat(participants: Sequence[Participant]) -> bool:
+    """Whether a roster seats exactly one clone -- a one-seat room, i.e. a 1:1 chat (§5.9).
+
+    People are not seats in this sense: a clone with one person, or with several, is still
+    alone as a speaker, and the multi-agent seat framing would describe participants who
+    are not there (§5.9.3).
+    """
+    return sum(1 for p in participants if p.kind is ParticipantKind.AGENT) == 1
+
+
+#: Who keeps a head's room, in the words the refusal of a post there uses (#1885).
+_HEAD_KEEPERS: Mapping[str, str] = {
+    "run": "ucx run",
+    "loop": "ucx loop",
+    "acp": "the editor that opened it",
+    "a2a": "the agent that called this clone",
+}
+
+
+def head_keeper(head: str) -> str:
+    """Who keeps a room `head` created, as a person reads it: `ucx run`, the editor, ..."""
+    return _HEAD_KEEPERS.get(head, "another program")
+
+
+def head_room_write_refusal(head: str) -> str:
+    """What a post or retry into a room `head` keeps is told (#1885). Plain: no ids, no paths."""
+    keeper = head_keeper(head)
+    return (
+        f"This conversation belongs to {keeper}, so only {keeper} can continue it. "
+        "You can read it here."
+    )
+
+
+#: The id a server head's room is kept under (`conversation_room_id` in
+#: `room/one_seat.py`): the head's name, then 24 hex digits of a digest. Nothing else mints
+#: one -- the app and `ucx room` mint `room_<hex>`, and `RoomService.create` refuses the
+#: shape to any other creator (#1885) -- so an unmarked room under such an id is that
+#: head's own, stored before rooms were marked (#1890).
+_SERVER_HEAD_ROOM_ID = re.compile(r"(acp|a2a)_[0-9a-f]{24}")
+
+
+def server_head_of_id(room_id: str) -> str | None:
+    """The server head (`acp` or `a2a`) whose id shape `room_id` has, or None."""
+    unmarked = _SERVER_HEAD_ROOM_ID.fullmatch(room_id)
+    return unmarked.group(1) if unmarked is not None else None
+
+
+def room_head(state: RoomState) -> str | None:
+    """The head that keeps `state`, or None for a room the app or `ucx room` keeps (#1885).
+
+    The room's mark (`RoomState.head`), or, for a room with none, the head its id names:
+    an ACP or A2A room saved before rooms were marked is still that head's, and a write
+    from anywhere else would make it a second writer (author's choice). A `run` or `loop`
+    room from before the mark cannot be told from the app's by its id, so it stays the
+    app's, as `_seat_in` in `room/one_seat.py` treats it.
+    """
+    if state.head is not None:
+        return state.head
+    return server_head_of_id(state.room_id)
+
+
 def turn_refusal(stop_reason: str | None) -> RoomTurnRefusal | None:
     """The refusal a failed turn's `TurnResult.stop_reason` states, if it states one (#969).
 
@@ -247,6 +319,7 @@ class RoomMessage(BaseModel):
     )
     code: NoticeCode | None = Field(
         default=None,
+        exclude_if=lambda code: code is None,
         description="Which notice a `NOTE` row is, for the head to word in the reader's "
         "language (`room/notices.py`). A stored sentence would keep the language it was "
         "written in; a code is worded again every time the row is drawn. `content` still "
@@ -255,6 +328,7 @@ class RoomMessage(BaseModel):
     )
     params: NoticeParams | None = Field(
         default=None,
+        exclude_if=lambda params: params is None,
         description="The values `code`'s sentence uses, by placeholder name: numbers raw "
         "(`interval_seconds`) so that each head formats them in its own language. `None` "
         "wherever `code` is.",
@@ -296,6 +370,7 @@ class RoomMessage(BaseModel):
     )
     provider_failure: ProviderFailure | None = Field(
         default=None,
+        exclude_if=lambda failure: failure is None,
         description="Set, beside `error`, when the turn failed on a hosted provider's "
         "failure the connector classified (#1630): the kind, and the plain sentence a head "
         "shows for it. `error` is for the log's reader and is never shown; this is what "
@@ -318,25 +393,37 @@ class RoomMessage(BaseModel):
     )
     knowledge_persist_error: str | None = Field(
         default=None,
-        description="Set when what the speaker has learned could not be saved after this "
-        "turn, naming the error (#1367). The same contract as `persist_error`, for the "
-        "seat's knowledge rather than its session: the reply stands, but what the seat "
-        "knows will not be there after a restart, and saying nothing would present it as "
-        "kept (P6). `None` when it was saved, when the seat has no knowledge store, on a "
-        "human's row, a membership row, and a row stored before it existed.",
+        exclude_if=lambda retired: retired is None,
+        description="Retired with the per-seat knowledge record (clone-knowledge-graph "
+        "step 6); nothing sets it and no head reads it. It said that what the seat had "
+        "learned could not be saved after the turn (#1367). Kept so a row stored before "
+        "step 6 still loads and keeps what it said on disk; left out of every row that "
+        "does not carry it.",
     )
     knowledge_set_aside: bool = Field(
         default=False,
-        description="Whether the speaker's knowledge record for this conversation could not "
-        "be read before this turn and was set aside -- renamed beside where it was, kept, "
-        "never deleted (#1367). It concerns that record only; the clone's saved memory "
-        "facts are a different file and are not touched. Said on the row so a record that "
-        "could not be read is not presented as one that never was (P6). A flag, "
-        "not text: where the file went and why it was unreadable are in the log.",
+        exclude_if=lambda retired: not retired,
+        description="Retired with the per-seat knowledge record (clone-knowledge-graph "
+        "step 6); nothing sets it and no head reads it. It said that the seat's knowledge "
+        "record could not be read and was set aside before the turn (#1367). Kept so a row "
+        "stored before step 6 still loads and keeps what it said on disk; left out of every "
+        "row that does not carry it.",
+    )
+    session_set_aside: bool = Field(
+        default=False,
+        exclude_if=lambda set_aside: not set_aside,
+        description="Whether the speaker's own saved record of this conversation could not "
+        "be read by this version and was set aside when this turn was saved -- renamed "
+        "beside where it was, kept, never written over (#1844). It is typically a record a "
+        "newer version wrote. The speaker carried on from what it could read, so the "
+        "earlier conversation is not in its context. A flag, not text: where the file went "
+        "and why it was unreadable are in the log. Left out of the saved row while `False`, "
+        "so a build older than this field can still read the room.",
     )
     memory_facts_tried: int = Field(
         default=0,
         ge=0,
+        exclude_if=lambda tried: tried == 0,
         description="How many distinct facts the turn asked to save to memory (#1375). "
         "Counted as `room/orchestrator.py::_memory_save_outcome` states. `0` when none was "
         "attempted, on a human's row, a membership row, and a row stored before it existed.",
@@ -344,6 +431,7 @@ class RoomMessage(BaseModel):
     memory_facts_unsaved: int = Field(
         default=0,
         ge=0,
+        exclude_if=lambda unsaved: unsaved == 0,
         description="How many of `memory_facts_tried` were never saved in the turn. The "
         "reply is the model's and is left as written -- including when it says the save "
         "worked, which is the case this exists for (#1375): the failures were visible only "
@@ -366,13 +454,33 @@ class RoomMessage(BaseModel):
 
     turn_id: str | None = Field(
         default=None,
+        exclude_if=lambda turn: turn is None,
         description="The id the orchestrator minted for the turn that produced this row, "
         "the same one its `AGENT_REPLY` and `TOOL_CALL` events carry. What joins a row to "
         "`RoomState.tool_uses`: a row number cannot, because a rewind reuses it (#1353). "
         "`None` on a human's row, a membership row, and a row stored before it existed.",
     )
+    knowledge_learned: tuple[str, ...] = Field(
+        default=(),
+        exclude_if=lambda learned: not learned,
+        description="The ids of the facts the speaker saved to its memory from this turn, "
+        "after it (#1404). Written by the room once the knowledge extractor has run, which "
+        "is after the reply landed, so the row first appears without it. Empty when "
+        "nothing was saved, while the extraction has not run, on a human's row, and on a "
+        "row stored before it existed. A fact already held and seen again is not counted. "
+        "Left out of the saved row while empty, as `knowledge_extract_error` is while "
+        "`None`, so a build older than #1404 can still read every room it never learned in.",
+    )
+    knowledge_extract_error: str | None = Field(
+        default=None,
+        exclude_if=lambda error: error is None,
+        description="A plain sentence for the person when the speaker could not learn from "
+        "this turn (#1404). Never the cause: the model's error, its raw reply and fact ids "
+        "stay in the log. The reply stands either way, and the extraction is not retried.",
+    )
     tools_recorded: bool = Field(
         default=False,
+        exclude_if=lambda recorded: not recorded,
         description="True when the tools this turn ran were written to "
         "`RoomState.tool_uses` -- including when it ran none. False on a turn that raised "
         "or was interrupted, which returns no `TurnResult` and so no account of its tools, "
@@ -597,6 +705,7 @@ class RoomPolicy(BaseModel):
     max_span_tokens: int = Field(
         default=DEFAULT_MAX_SPAN_TOKENS,
         ge=1,
+        exclude_if=lambda tokens: tokens == DEFAULT_MAX_SPAN_TOKENS,
         description="Ceiling, in estimated tokens, on the transcript span one turn hands "
         "its speaker (#1641). Distinct from `transcript_window`, which bounds what a "
         "*selector* reads: this bounds what an *agent* is given. An agent addressed for the "
@@ -649,6 +758,7 @@ class RoomPolicy(BaseModel):
     )
     autonomous: bool = Field(
         default=False,
+        exclude_if=lambda autonomous: not autonomous,
         description="Whether agents discuss and collaborate autonomously as long as the "
         "user is actively viewing the room, bounded by a 20-turn safety circuit breaker.",
     )
@@ -730,6 +840,7 @@ class RoomToolUse(BaseModel):
     )
     written_paths: tuple[str, ...] = Field(
         default_factory=tuple,
+        exclude_if=lambda paths: not paths,
         description="Every path the call wrote, by the same rule as `written_path`, from "
         "its output's `path` and `paths` (#1558). One call can name several: an `a2a_call` "
         "reports the files the persona it asked wrote, an image call each picture it made.",
@@ -840,6 +951,28 @@ class RoomState(BaseModel):
     `SessionState` — a room has one writer (the orchestrator) by design, and the
     precondition is what turns a second writer into a refused write rather than a lost
     utterance.
+
+    **Forward compatibility (#1885).** The fields added for a feature -- `tool_uses`,
+    `written_files`, `file_record`, `story_id`, `head` -- are left out of the saved record
+    while they hold their default (`exclude_if`), so a room that uses none of those
+    features is written in the shape an older build reads. A room that does use one still
+    carries it, and an older build refuses that record under `extra="forbid"`. That
+    refusal is kept on purpose: an older build that loaded the room while ignoring, say,
+    `head` would save it back without the mark, and the room would silently gain a second
+    writer. Refusing the load and the overwrite loses nothing. Pinned by
+    `tests/unit/test_room_service.py::test_a_default_room_is_saved_without_the_feature_fields`.
+    A field added later joins this list, or an older build stops reading every room.
+
+    The nested records follow the same rule (#1885 item 5): every field `RoomMessage`,
+    `RoomPolicy` and `RoomToolUse` gained after #1366 is left out while it holds its
+    default (the knowledge and session fields on a row already were), and so are the two
+    #1366 added to a row (`turn_id`, `tools_recorded`). `Participant`, `TurnState`,
+    `SpeakerDecision`, `Provenance` and `TokenUsage` gained none. A room the service
+    creates carries `file_record` from its first save, so the oldest build that reads one
+    is #1366's; a room written now in that build's shape is one it reads. Author's choice:
+    `AgentLLMConfig.fast_model`, written only inside a room's `selector_llm`, is left as
+    it is, since that model is shared with every persona file. Pinned by
+    `tests/unit/test_room_service.py::test_nested_records_are_saved_in_the_older_shape`.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
@@ -882,6 +1015,7 @@ class RoomState(BaseModel):
     )
     tool_uses: tuple[RoomToolUse, ...] = Field(
         default_factory=tuple,
+        exclude_if=lambda uses: not uses,
         description="Every tool call a seat made in a recorded turn, in order (#1353). "
         "Written in the same save as the turn's row, so the two cannot disagree. Rows "
         "whose `tools_recorded` is False have no entries here, and that is not the same "
@@ -889,20 +1023,33 @@ class RoomState(BaseModel):
     )
     written_files: tuple[RoomWrittenFile, ...] = Field(
         default_factory=tuple,
+        exclude_if=lambda written: not written,
         description="Every file a seat wrote through a tool in this room, in write order, "
         "one entry per write (#1354). Survives a rewind and a clear: see `RoomWrittenFile`.",
     )
     file_record: RoomFileRecord = Field(
         default_factory=RoomFileRecord,
+        exclude_if=lambda record: record == RoomFileRecord(),
         description="The known reasons `written_files` may be missing a write (#1366). "
         "Never a proof that it is complete: see `RoomFileRecord`.",
     )
     story_id: str | None = Field(
         default=None,
+        exclude_if=lambda story: story is None,
         description="The story this conversation has open (#1555), or None. A story is a "
         "workspace artifact under `stories/<story_id>/`, not part of the room: deleting the "
         "room leaves it. Every seat's tools receive this id, so the room's seats work on "
         "one story. Moved only by a successful call of a tool declaring `opens_story`.",
+    )
+    head: str | None = Field(
+        default=None,
+        exclude_if=lambda head: head is None,
+        description="The head that keeps this room -- `run`, `loop`, `acp` or `a2a` -- or "
+        "None for a room the app or `ucx room` keeps (#1885). A head's room has one writer, "
+        "the head, so `RoomOrchestrator` refuses a post or a retry there (`HeadRoomWriteError`). "
+        "Set when a head's first recorded turn creates the room. A room written before this "
+        "field has none and is the app's (author's choice): only an ACP or A2A head, whose "
+        "ids name it, still continues one of its own.",
     )
     created_at: str = Field(default_factory=_now_iso)
     updated_at: str = Field(default_factory=_now_iso)

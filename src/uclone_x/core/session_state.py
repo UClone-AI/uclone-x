@@ -19,11 +19,21 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any, cast
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SerializerFunctionWrapHandler,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
+from uclone_x.core.context_state import ContextEntry, ContextEpoch
 from uclone_x.core.immutable import unwrap_immutable
 from uclone_x.core.models import PersonaDefinition, PlanState
 from uclone_x.core.secrets import redact_credentials, redact_log_payload
+from uclone_x.core.session_log import SessionLogEntry
 from uclone_x.llm.models import ChatMessage, MessageRole, ToolCallRequest
 
 __all__ = [
@@ -115,6 +125,7 @@ def redact_message(message: ChatMessage) -> ChatMessage:
         tool_call_id=message.tool_call_id,
         tool_calls=tuple(new_tool_calls),
         compaction_ledger=message.compaction_ledger,
+        form=message.form,
     )
 
 
@@ -295,6 +306,81 @@ class SessionState(BaseModel):
         "first (#1421). A record written before this field reads back with none, and a "
         "reset clears them together with the event log that refers to them.",
     )
+    session_log: tuple[SessionLogEntry, ...] = Field(
+        default=(),
+        description="Every message that entered `messages`, oldest first, append-only "
+        "(#1443); see `core/session_log.py`. Each entry names its message's body in the "
+        "context body store. A record written before this field reads back with none, and "
+        "loading it backfills one `migrated` entry per message. A reset clears it with the "
+        "history it describes.",
+    )
+    context_epochs: tuple[ContextEpoch, ...] = Field(
+        default=(),
+        description="What each request showed of `session_log`, per epoch: an ordered "
+        "list of (entry id, form) that only grows within an epoch (#1443); see "
+        "`core/context_state.py`. A record written before this field reads back with "
+        "none, and the next request opens the first epoch. A reset clears it.",
+    )
+    compacted_entries: tuple[ContextEntry, ...] = Field(
+        default=(),
+        description="What a compaction derived for the request that opens the next epoch, "
+        "saved until that request records it (#1848): per logged message of the compacted "
+        "history, the entry it shows and its form, keyed by the log entry whose body it is "
+        "(`ContextEntry.body`). Left out of the record when empty, so a record with none "
+        "is written as before (#1844). A record that has it is not readable by a build "
+        "from before this field, which sets it aside (#1844).",
+    )
+    epoch_causes: tuple[str, ...] = Field(
+        default=(),
+        description="Why the next request opens a new epoch, as declared since the last "
+        "request and saved until that request records it (#1848): `compaction`, "
+        "`rollback`, and the other causes `ContextEpoch.opened_by` names. `restored` is "
+        "not saved, because loading the record declares it again. Left out of the record "
+        "when empty, so a record with none is written as before (#1844). A record that "
+        "has it is not readable by a build from before this field, which sets it aside "
+        "(#1844).",
+    )
+
+    @model_serializer(mode="wrap")
+    def _omit_empty_pending_fields(
+        self, handler: SerializerFunctionWrapHandler
+    ) -> dict[str, object]:
+        """Leave `compacted_entries` and `epoch_causes` out when empty, so a record without
+        them is written in the shape a build from before the fields reads (#1844)."""
+        data: dict[str, object] = handler(self)
+        if not data.get("compacted_entries"):
+            data.pop("compacted_entries", None)
+        if not data.get("epoch_causes"):
+            data.pop("epoch_causes", None)
+        return data
+
+    @field_validator("context_epochs", mode="after")
+    @classmethod
+    def _epoch_numbers_are_positions(
+        cls, epochs: tuple[ContextEpoch, ...]
+    ) -> tuple[ContextEpoch, ...]:
+        """Refuse epochs whose numbers are not `0..n-1`: one was dropped or reordered."""
+        for position, epoch in enumerate(epochs):
+            if epoch.number != position:
+                raise ValueError(
+                    f"context_epochs[{position}] is numbered {epoch.number}; epochs are "
+                    "only appended, so epoch n is numbered n."
+                )
+        return epochs
+
+    @field_validator("session_log", mode="after")
+    @classmethod
+    def _log_ids_are_positions(
+        cls, log: tuple[SessionLogEntry, ...]
+    ) -> tuple[SessionLogEntry, ...]:
+        """Refuse a log whose ids are not `e0..e(n-1)`: an entry was dropped or reordered."""
+        for position, entry in enumerate(log):
+            if entry.id != f"e{position}":
+                raise ValueError(
+                    f"session_log entry {position} has id {entry.id!r}; the log is "
+                    "append-only, so entry n is `e<n>`."
+                )
+        return log
 
     @classmethod
     def seed(cls, session_id: str, agent_id: str, system_prompt: str = "") -> SessionState:
@@ -411,6 +497,8 @@ class SessionState(BaseModel):
                 self.anchor_provenance if replacement[:1] == self.messages[:1] else None
             ),
             context_snapshots=self.context_snapshots,
+            session_log=self.session_log,
+            context_epochs=self.context_epochs,
         )
 
     def with_plan(self, plan: PlanState | None) -> SessionState:
@@ -426,6 +514,10 @@ class SessionState(BaseModel):
             revision=self.revision,
             anchor_provenance=self.anchor_provenance,
             context_snapshots=self.context_snapshots,
+            session_log=self.session_log,
+            context_epochs=self.context_epochs,
+            compacted_entries=self.compacted_entries,
+            epoch_causes=self.epoch_causes,
         )
 
     def append_message(
@@ -457,4 +549,8 @@ class SessionState(BaseModel):
             # is exactly the one this stamp already describes.
             anchor_provenance=self.anchor_provenance,
             context_snapshots=self.context_snapshots,
+            session_log=self.session_log,
+            context_epochs=self.context_epochs,
+            compacted_entries=self.compacted_entries,
+            epoch_causes=self.epoch_causes,
         )

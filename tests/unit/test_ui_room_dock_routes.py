@@ -21,7 +21,7 @@ import re
 import time
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, cast, get_args
 
 import pytest
 from fastapi.testclient import TestClient
@@ -32,6 +32,7 @@ from uclone_x.agent.models import AgentConfig, AgentContext, ToolExecutionRecord
 from uclone_x.agent.session import SessionState
 from uclone_x.llm import MockLLMConnector
 from uclone_x.llm.models import LLMRequest, ModelResponse, ToolCallRequest
+from uclone_x.ontology.engine import OntologyEngine
 from uclone_x.ontology.models import OntologyRelation
 from uclone_x.room.models import (
     Participant,
@@ -45,6 +46,12 @@ from uclone_x.tools.base import BaseTool
 from uclone_x.tools.models import ToolContext, ToolResultStatus
 from uclone_x.tools.registry import ToolRegistry
 from uclone_x.ui.app import create_ui_app
+from uclone_x.ui.room_dock import (
+    HistoryGapCode,
+    LogFailureKind,
+    ToolCallGapCode,
+    TopologyReasonCode,
+)
 
 
 @pytest.fixture
@@ -180,7 +187,7 @@ def _take_one_turn(client: TestClient, room_id: str, seat: _Seat) -> None:
             )
 
     class _Resolver:
-        async def resolve(self, participant: Any) -> Any:
+        async def resolve(self, participant: Any, *, one_seat: bool = False) -> Any:
             return seat
 
     orch = RoomOrchestrator(store=_stack(client).store, selectors=[_Once()], resolver=_Resolver())
@@ -866,8 +873,10 @@ class TestARoomsTopology:
         Every turn row is present, but one turn ended before reporting its tools and one
         was saved by a build that kept no tool record, so the tool-call total is low.
 
-        Killed by: src/uclone_x/ui/room_dock.py :: "tool_call_gaps": tool_call_gaps,
+        Killed by: src/uclone_x/ui/room_dock.py :: "tool_call_gaps": [text for _, _, text in tool_gaps],
         Becomes: "tool_call_gaps": [],
+        Killed by: src/uclone_x/ui/room_dock.py :: "tool_call_gap_codes": [{"code": code, "count": count} for code, count, _ in tool_gaps],
+        Becomes: "tool_call_gap_codes": [],
         """
         from uclone_x.room.models import RoomFileRecord
 
@@ -890,6 +899,11 @@ class TestARoomsTopology:
             "1 turn(s) were saved without a record of their tools",
             "1 turn(s) ended before reporting their tools",
         ]
+        # The same gaps as codes with their counts, in the same order (#1911).
+        assert body["tool_call_gap_codes"] == [
+            {"code": "saved_without_tools", "count": 1},
+            {"code": "unreported", "count": 1},
+        ]
 
     def test_a_room_with_no_known_tool_gap_names_none(self, client: TestClient) -> None:
         """Killed by: src/uclone_x/ui/room_dock.py :: if record.unrecorded_turns:
@@ -909,6 +923,76 @@ class TestARoomsTopology:
     def test_an_unknown_room_is_a_404(self, client: TestClient) -> None:
         assert client.get("/api/rooms/room_missing/topology").status_code == 404
 
+    def test_each_turn_gap_is_sent_as_a_code_beside_its_clause(self, client: TestClient) -> None:
+        """The head words a code in its reader's language; the clause stays English (#1911).
+
+        Codes and clauses are in the same order, one for one, and a count travels apart.
+
+        Killed by: src/uclone_x/ui/room_dock.py :: history_codes.append({"code": "before_record", "count": None})
+        Becomes: history_codes.append({"code": "cleared", "count": None})
+        Killed by: src/uclone_x/ui/room_dock.py :: history_codes.append({"code": "cleared", "count": None})
+        Becomes: history_codes.append({"code": "rewound", "count": None})
+        Killed by: src/uclone_x/ui/room_dock.py :: history_codes.append({"code": "rewound", "count": None})
+        Becomes: history_codes.append({"code": "cleared", "count": None})
+        Killed by: src/uclone_x/ui/room_dock.py :: return {"code": "uncounted", "count": None}
+        Becomes: return {"code": "unsaved", "count": None}
+        """
+        from uclone_x.room.models import RoomFileRecord
+
+        room_id = _create(client, ["scout"])
+        _seed(
+            client,
+            room_id,
+            file_record=RoomFileRecord(clears=1, rewinds=2, turns_started=0, turns_landed=1),
+        )
+
+        body = client.get(f"/api/rooms/{room_id}/topology").json()
+
+        assert body["history_gaps"] == [
+            "this conversation began before its history was fully recorded",
+            "its history was cleared",
+            "its history was rewound",
+            "some turns were taken before this conversation counted turns as they started",
+        ]
+        assert body["history_gap_codes"] == [
+            {"code": "before_record", "count": None},
+            {"code": "cleared", "count": None},
+            {"code": "rewound", "count": None},
+            {"code": "uncounted", "count": None},
+        ]
+        assert body["reason_code"] is None
+
+    def test_turns_lost_before_saving_are_coded_with_their_count(self, client: TestClient) -> None:
+        """Killed by: src/uclone_x/ui/room_dock.py :: return {"code": "unsaved", "count": unsaved}
+        Becomes: return {"code": "unsaved", "count": None}
+        """
+        from uclone_x.room.models import RoomFileRecord
+
+        room_id = _create(client, ["scout"])
+        _seed(
+            client,
+            room_id,
+            file_record=RoomFileRecord(kept_since_creation=True, turns_started=3, turns_landed=1),
+        )
+
+        body = client.get(f"/api/rooms/{room_id}/topology").json()
+
+        assert len(body["history_gaps"]) == 1
+        assert body["history_gaps"][0].startswith("2 turn(s) started but stopped")
+        assert body["history_gap_codes"] == [{"code": "unsaved", "count": 2}]
+
+    def test_a_room_with_no_seat_is_coded_no_seat(self, client: TestClient) -> None:
+        """Killed by: src/uclone_x/ui/room_dock.py :: reason_code: TopologyReasonCode | None = None if seated else "no_seat"
+        Becomes: reason_code: TopologyReasonCode | None = None
+        """
+        room_id = _create(client, ["scout"])
+        _seed(client, room_id, participants=())
+
+        body = client.get(f"/api/rooms/{room_id}/topology").json()
+
+        assert body["reason"] == "No agent is seated in this conversation."
+        assert body["reason_code"] == "no_seat"
+
 
 # --------------------------------------------------------------------------------------
 # GET /api/rooms/{room_id}/knowledge?agent_id=  (#1357)
@@ -916,11 +1000,13 @@ class TestARoomsTopology:
 
 
 class TestASeatsKnowledge:
-    def test_a_live_seat_answers_from_its_own_engine_not_the_shared_one(
+    def test_a_seat_answers_from_its_clones_engine_not_the_managers(
         self, client: TestClient
     ) -> None:
-        """Killed by: src/uclone_x/ui/room_dock.py :: engine = live.ontology
-        Becomes: engine = stack.session_manager().ontology_engine
+        """The engine a running seat reasons with is its clone's, and the route reads that one.
+
+        Killed by: src/uclone_x/ui/room_dock.py :: engine = stack.session_manager().ontology_for(seat.id)
+        Becomes: engine = stack.session_manager().ontology_for("default")
         """
         room_id = _create(client, ["scout"])
         client.post(f"/api/rooms/{room_id}/messages", json={"content": "hello"})
@@ -928,38 +1014,71 @@ class TestASeatsKnowledge:
         room = client.get(f"/api/rooms/{room_id}").json()
         session_id = next(p["session_id"] for p in room["participants"] if p["id"] == "scout")
         live = _stack(client).live_agent(room_id, session_id)
-        assert live is not None and live.ontology is not None
+        manager = _stack(client).session_manager()
+        assert live is not None and live.ontology is manager.ontology_for("scout")
         live.ontology.register_relation(
             OntologyRelation(source_entity="Postgres", predicate="is_a", target_entity="Database")
         )
-        shared = _stack(client).session_manager().ontology_engine
-        assert not any(r.source_entity == "Postgres" for r in shared.list_relations())
+        other_clone = manager.ontology_for("default")
+        assert isinstance(other_clone, OntologyEngine)
+        assert not any(r.source_entity == "Postgres" for r in other_clone.list_relations())
 
         body = client.get(f"/api/rooms/{room_id}/knowledge", params={"agent_id": "scout"}).json()
 
-        assert body["status"] == "ok"
+        assert body["status"] == "ok" and body["reason"] is None
         assert body["participant_id"] == "scout"
         assert ("Postgres", "is_a", "Database") in {
             (t["subject"], t["predicate"], t["object"]) for t in body["triples"]
         }
-        assert body["triples"], body
-        assert body["reason"] is None
 
-    def test_a_seat_with_nothing_saved_says_so_instead_of_an_empty_memory(
+    def test_two_clones_in_one_room_never_read_each_others_rules(self, client: TestClient) -> None:
+        """Per clone, and read without building the seat: nobody has spoken here yet."""
+        room_id = _create(client, ["scout", "critic"])
+        manager = _stack(client).session_manager()
+        manager.ontology_for("scout").register_relation(
+            OntologyRelation(source_entity="tide", predicate="part_of", target_entity="sea")
+        )
+
+        scout = _knowledge(client, room_id, "scout")
+        critic = _knowledge(client, room_id, "critic")
+
+        assert [(t["subject"], t["object"]) for t in scout["triples"]] == [("tide", "sea")]
+        assert critic["triples"] == []
+        assert scout["status"] == critic["status"] == "ok"
+
+    def test_what_the_rules_work_out_is_listed_with_the_facts_it_rests_on(
         self, client: TestClient
     ) -> None:
-        """Not running and nothing saved (#1367): said, not shown as remembering nothing.
+        """Computed on the read from the clone's facts and rules, never saved (§3.1).
 
-        Killed by: src/uclone_x/ui/room_dock.py :: if engine is None:
-        Becomes: if False:
+        A second clone holding the same facts under no rule works out nothing: the rule is
+        the first clone's alone.
+
+        Killed by: src/uclone_x/ui/room_dock.py :: axioms = engine.list_axioms() if isinstance(engine, OntologyEngine) else []
+        Becomes: axioms = []
         """
-        room_id = _create(client, ["scout"])
+        room_id = _create(client, ["scout", "critic"])
+        _stack(client).session_manager().ontology_for("scout").teach_axiom(
+            name="part_of_is_transitive",
+            subject_entity="part_of",
+            predicate="transitive",
+            object_value="true",
+        )
+        wheel = _record("scout", "wheel", "part_of", "car", "a-chat")
+        car = _record("scout", "car", "part_of", "fleet", "a-chat")
+        _record("critic", "wheel", "part_of", "car", "a-chat")
+        _record("critic", "car", "part_of", "fleet", "a-chat")
 
-        body = client.get(f"/api/rooms/{room_id}/knowledge", params={"agent_id": "scout"}).json()
+        scout = _knowledge(client, room_id, "scout")
+        critic = _knowledge(client, room_id, "critic")
 
-        assert body["status"] == "not_recorded"
-        assert body["triples"] is None
-        assert "no knowledge record in this conversation" in body["reason"]
+        assert scout["worked_out"] == [
+            {"statement": "wheel part of fleet", "because": sorted([wheel, car])}
+        ]
+        assert critic["worked_out"] == []
+        assert "wheel part of fleet" not in [f["statement"] for f in scout["facts"]], (
+            "worked out is not saved as a fact"
+        )
 
     def test_a_missing_agent_id_is_refused_naming_the_seats(self, client: TestClient) -> None:
         """Killed by: src/uclone_x/ui/room_dock.py :: if not agent_id:
@@ -1471,7 +1590,7 @@ class TestRemembersListsTheClonesFacts:
         where the tool saved it. `sage` names no shipped persona, so it has every tool, as a
         new clone does.
 
-        Killed by: src/uclone_x/ui/room_dock.py :: **_known_facts(state.room_id, seat),
+        Killed by: src/uclone_x/ui/room_dock.py :: **known,
         Becomes: **{"facts": [], "facts_reason": None},
         """
         room_id = _create(saving_client, ["sage"])
@@ -1538,12 +1657,12 @@ class TestRemembersListsTheClonesFacts:
             "Kenny drives a bike": False,
         }
 
-    def test_facts_are_listed_when_the_seat_has_no_knowledge_record(
+    def test_facts_are_listed_for_a_seat_nobody_has_spoken_to_here(
         self, client: TestClient
     ) -> None:
         """A seat nobody has spoken to here still knows what it learned elsewhere.
 
-        Killed by: src/uclone_x/ui/room_dock.py :: **_known_facts(state.room_id, seat),
+        Killed by: src/uclone_x/ui/room_dock.py :: **known,
         Becomes: **{},
         """
         room_id = _create(client, ["scout"])
@@ -1551,7 +1670,7 @@ class TestRemembersListsTheClonesFacts:
 
         body = _knowledge(client, room_id, "scout")
 
-        assert body["status"] == "not_recorded"
+        assert body["status"] == "ok"
         assert [f["statement"] for f in body["facts"]] == ["Kenny lives in Seoul"]
 
     def test_a_retracted_fact_is_not_listed(self, client: TestClient) -> None:
@@ -1597,9 +1716,10 @@ class TestRemembersListsTheClonesFacts:
             id="CON", kind=ParticipantKind.AGENT, display_name="Con", session_id="s-1"
         )
 
-        answer = _known_facts("room-1", seat)
+        answer, facts = _known_facts("room-1", seat)
 
         assert answer == {"facts": [], "facts_reason": "No facts are listed for Con."}
+        assert facts == []
 
     def test_an_unreadable_memory_is_said_plainly_and_left_where_it_is(
         self, client: TestClient
@@ -1611,6 +1731,8 @@ class TestRemembersListsTheClonesFacts:
 
         Killed by: src/uclone_x/ui/room_dock.py :: "facts": None,
         Becomes: "facts": [],
+        Killed by: src/uclone_x/ui/room_dock.py :: "worked_out": None if facts is None else worked_out_list(facts, axioms),
+        Becomes: "worked_out": worked_out_list(facts or [], axioms),
         """
         room_id = _create(client, ["scout"])
         path = _memory_file("scout")
@@ -1620,6 +1742,8 @@ class TestRemembersListsTheClonesFacts:
         body = _knowledge(client, room_id, "scout")
 
         assert body["facts"] is None
+        # Nothing to work out from, which is not "nothing follows" (P6).
+        assert body["worked_out"] is None
         reason = body["facts_reason"]
         assert reason == "What scout knows could not be read, so it cannot be shown."
         assert not _TECHNICAL.search(reason), reason
@@ -1844,7 +1968,7 @@ class TestCorrectAFact:
 
 
 class TestAnEmptyKnowledgeRecordIsNotPresentedAsNothingLearned:
-    """#1404: nothing in a room turn writes to a seat's own knowledge engine yet."""
+    """#1404: nothing in a room turn writes to a clone's rules engine."""
 
     def test_an_empty_record_gives_no_reason_of_its_own(self, client: TestClient) -> None:
         """The Core adds no sentence to an empty list; the head says only that none are listed.
@@ -1860,49 +1984,6 @@ class TestAnEmptyKnowledgeRecordIsNotPresentedAsNothingLearned:
 
         assert body["status"] == "ok" and body["triples"] == []
         assert body["reason"] is None
-
-    def test_no_record_yet_says_only_that_there_is_none(self, client: TestClient) -> None:
-        """Killed by: src/uclone_x/ui/room_dock.py :: f"{seat.display_name} has no knowledge record in this conversation."
-        Becomes: f"{seat.display_name} has no knowledge record in this conversation, and remembers nothing."
-        """
-        room_id = _create(client, ["scout"])
-
-        body = _knowledge(client, room_id, "scout")
-
-        assert body["status"] == "not_recorded"
-        assert body["reason"] == "scout has no knowledge record in this conversation."
-        assert not _absence_claim(body["reason"])
-
-    def test_an_unreadable_record_claims_no_absence_and_saved_facts_stay_listed(
-        self, client: TestClient
-    ) -> None:
-        """A damaged knowledge record is this conversation's only; memory.json is not it.
-
-        The record is genuinely unreadable -- not YAML -- and the seat has a saved fact. The
-        sentence speaks of the record alone: setting it aside never touches the saved
-        memory, which is read and listed in the same answer, so "nothing remembered" would
-        be contradicted on the same panel (#1429 review).
-
-        Killed by: src/uclone_x/ui/room_dock.py :: f"so it cannot be shown."
-        Becomes: f"so it cannot be shown, and {name} will start over with nothing remembered."
-        """
-        room_id = _create(client, ["scout"])
-        room = client.get(f"/api/rooms/{room_id}").json()
-        session_id = next(p["session_id"] for p in room["participants"] if p["id"] == "scout")
-        stack = cast(Any, client.app).state.room_stack
-        record: Path = stack.knowledge.path(session_id)
-        record.parent.mkdir(parents=True, exist_ok=True)
-        record.write_text("concepts: [unterminated", encoding="utf-8")
-        _record("scout", "Kenny", "lives_in", "Seoul", "a-chat")
-
-        body = _knowledge(client, room_id, "scout")
-
-        assert body["status"] == "unreadable", body
-        assert "knowledge record for this conversation could not be read" in body["reason"]
-        assert not _absence_claim(body["reason"]), body["reason"]
-        assert "saved memory" not in body["reason"], "the record is not the saved memory"
-        assert [f["statement"] for f in body["facts"]] == ["Kenny lives in Seoul"]
-        assert record.read_text(encoding="utf-8") == "concepts: [unterminated"
 
 
 class TestRoomDockTurnSummaryRoutes:
@@ -2221,6 +2302,7 @@ class TestRoomDockTurnTraceRoutes:
         (step,) = resp.json()["trace"]["steps"]
         assert step["request_status"] == "unavailable"
         assert step["request_reason"] == "request 2 extends 1, last seen None"
+        assert step["request_code"] == "chain_broken"
         assert step["response"]["content"] == "reply 2"
 
         detail = tolerant.get(f"/api/rooms/{room_id}/turns/2/trace/steps/1")
@@ -2228,6 +2310,7 @@ class TestRoomDockTurnTraceRoutes:
         assert detail.json()["reason"] is None
         assert detail.json()["request"] is None
         assert detail.json()["request_reason"] == "request 2 extends 1, last seen None"
+        assert detail.json()["request_code"] == "chain_broken"
 
     def test_a_gap_after_the_turn_is_not_read(self, client: TestClient) -> None:
         """Blocker 2: a gap after the traced turn, and the request built on it, cost it nothing.
@@ -2397,3 +2480,40 @@ class TestRoomDockTurnTraceRoutes:
             assert resp.status_code == 200, resp.text
             assert resp.json()["reason"]["code"] == "session_unreadable"
             assert "boom" not in resp.text
+
+
+_LOCALES = Path(__file__).resolve().parents[2] / "frontend" / "src" / "i18n" / "locales"
+
+
+@pytest.mark.parametrize("language", ["en", "ko"])
+def test_every_log_failure_kind_has_a_sentence_in_the_head(language: str) -> None:
+    """The `log_unreadable` detail is a closed set of codes the head words (#1907).
+
+    Equal, not contained: a kind the catalog lacks reads as a bare code on a Korean screen.
+
+    Killed by: src/uclone_x/ui/room_dock.py :: "not_text", "read_failed", "unexpected"
+    Becomes: "not_text", "read_failed", "renamed"
+    """
+    catalog = json.loads((_LOCALES / language / "dock.json").read_text(encoding="utf-8"))
+    assert set(get_args(LogFailureKind)) == set(catalog["modelCalls"]["logFailures"])
+
+
+@pytest.mark.parametrize("language", ["en", "ko"])
+def test_every_topology_code_has_a_sentence_in_the_head(language: str) -> None:
+    """The topology's reason and gap codes are closed sets the head words (#1911).
+
+    Equal, not contained, as for the model-call codes (#1907).
+
+    Killed by: src/uclone_x/ui/room_dock.py :: HistoryGapCode = Literal["before_record", "cleared", "rewound", "unsaved", "uncounted"]
+    Becomes: HistoryGapCode = Literal["before_record", "cleared", "rewound", "unsaved", "renamed"]
+    Killed by: src/uclone_x/ui/room_dock.py :: ToolCallGapCode = Literal["saved_without_tools", "unreported"]
+    Becomes: ToolCallGapCode = Literal["saved_without_tools", "renamed"]
+    Killed by: src/uclone_x/ui/room_dock.py :: TopologyReasonCode = Literal["no_seat"]
+    Becomes: TopologyReasonCode = Literal["renamed"]
+    """
+    topology = json.loads((_LOCALES / language / "dock.json").read_text(encoding="utf-8"))[
+        "topology"
+    ]
+    assert set(get_args(HistoryGapCode)) == set(topology["historyGapReasons"])
+    assert set(get_args(ToolCallGapCode)) == set(topology["toolCallGapReasons"])
+    assert set(get_args(TopologyReasonCode)) == set(topology["reasons"])

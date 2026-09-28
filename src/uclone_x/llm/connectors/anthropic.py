@@ -47,6 +47,34 @@ from uclone_x.llm.models import (
 #: Who the person using the app holds the key with, as a failure names it (#1630).
 _PROVIDER = "Anthropic"
 
+#: The prompt-cache marker placed at each layer boundary (#1371). Ephemeral is the only
+#: type Anthropic accepts; the default five-minute lifetime is kept, since the steps of
+#: one turn follow each other within seconds.
+_CACHE_BREAKPOINT: dict[str, str] = {"type": "ephemeral"}
+
+
+def _cache_counts(usage: dict[str, Any] | None) -> tuple[int | None, int | None]:
+    """Anthropic's cache write and cache read counts, each `None` when not reported (#1371)."""
+    return (
+        reported_count(usage, "cache_creation_input_tokens"),
+        reported_count(usage, "cache_read_input_tokens"),
+    )
+
+
+def _prompt_tokens(
+    uncached: int | None, cache_creation: int | None, cache_read: int | None
+) -> int | None:
+    """Every input token the request carried, or `None` when Anthropic reported no count.
+
+    Anthropic's `input_tokens` counts only the tokens after the last cache hit or write;
+    `TokenUsage.input_tokens` is the whole prompt, as OpenAI reports it, so budgets and
+    the context display do not shrink when caching starts to work.
+    """
+    if uncached is None:
+        return None
+    return uncached + sum(c for c in (cache_creation, cache_read) if c is not None)
+
+
 ANTHROPIC_REQUIRED_MAX_TOKENS_DEFAULT = 4096
 """The ceiling sent when a caller names none, because Anthropic requires the field.
 
@@ -193,6 +221,23 @@ class AnthropicConnector(BaseLLMConnector):
         a caller that asked for 0 be billed against 4096 — while `None` still takes the
         connector's declared 4096, because Anthropic requires the field.
 
+        **Prompt-cache breakpoints (#1371).** Anthropic caches the prefix up to each block
+        marked `cache_control`, in the order tools, system, messages, at most four marks.
+        Three are placed, one per stable layer of the request-layering design (§5.8, §5.9):
+
+        * the last tool definition -- the tool layer;
+        * the system block -- identity and slow context (`compose_system_message`);
+        * the last block of the last `ASSISTANT` or `TOOL` message -- the end of the
+          conversation this epoch has appended so far.
+
+        The trailing `USER` message is never marked. It carries the turn context
+        (`place_turn_context` joins it to the user's message or appends it as its own
+        `USER` message), which differs from step to step, so a mark there would pay the
+        cache-write premium on bytes no later request reads. Everything up to the
+        conversation mark is history the next step sends again byte for byte, so a step can
+        read the entry the previous one wrote. A blank system prompt or a blank assistant text
+        block cannot carry a mark and gets none.
+
         Raises:
             UnmappableChatMessageError: a message has no faithful Anthropic
                 representation. The offending value is named in the message.
@@ -295,7 +340,14 @@ class AnthropicConnector(BaseLLMConnector):
         }
 
         if system_prompts:
-            payload["system"] = "\n\n".join(system_prompts)
+            system_text = "\n\n".join(system_prompts)
+            # A breakpoint needs a text block, and Anthropic refuses a blank one, so a blank
+            # system prompt goes out as the plain string it always was, unmarked.
+            payload["system"] = (
+                [{"type": "text", "text": system_text, "cache_control": _CACHE_BREAKPOINT}]
+                if system_text.strip()
+                else system_text
+            )
 
         if request.tools:
             payload["tools"] = [
@@ -306,6 +358,18 @@ class AnthropicConnector(BaseLLMConnector):
                 }
                 for t in request.tools
             ]
+            payload["tools"][-1]["cache_control"] = _CACHE_BREAKPOINT
+
+        # Where the stable conversation prefix ends: the last message the model or a tool
+        # wrote. Those carry block lists; a `USER` message, where turn context goes, is a
+        # plain string, so everything after the mark is user text.
+        stable = [i for i, m in enumerate(messages_payload) if isinstance(m["content"], list)]
+        if stable:
+            # The last block of that message: tool_use or tool_result blocks are never
+            # empty, and an assistant text block is only last when it has no tool calls.
+            last_block = messages_payload[stable[-1]]["content"][-1]
+            if last_block.get("type") != "text" or last_block["text"].strip():
+                last_block["cache_control"] = _CACHE_BREAKPOINT
 
         return payload
 
@@ -354,7 +418,10 @@ class AnthropicConnector(BaseLLMConnector):
         content = "".join(text_parts) if text_parts else None
         # A count Anthropic left out is estimated and labelled, never read as 0 (#939).
         usage_data: dict[str, Any] | None = data.get("usage")
-        in_tokens = reported_count(usage_data, "input_tokens")
+        cache_creation, cache_read = _cache_counts(usage_data)
+        in_tokens = _prompt_tokens(
+            reported_count(usage_data, "input_tokens"), cache_creation, cache_read
+        )
         out_tokens = reported_count(usage_data, "output_tokens")
         in_tokens, out_tokens, count_source = resolve_token_counts(
             request, in_tokens, out_tokens, reply=content, tool_calls=tool_calls
@@ -368,6 +435,8 @@ class AnthropicConnector(BaseLLMConnector):
             output_tokens=out_tokens,
             total_tokens=in_tokens + out_tokens,
             count_source=count_source,
+            cache_creation_input_tokens=cache_creation,
+            cache_read_input_tokens=cache_read,
         )
 
         finish_reason = self._map_finish_reason(data.get("stop_reason"))
@@ -399,6 +468,8 @@ class AnthropicConnector(BaseLLMConnector):
         # `None` until the stream reports a count; a count it never reports is estimated
         # from the request and from what the stream said, and labelled (#939).
         input_tokens: int | None = None
+        cache_creation: int | None = None
+        cache_read: int | None = None
         streamed: list[str] = []
 
         try:
@@ -433,7 +504,10 @@ class AnthropicConnector(BaseLLMConnector):
                     if event_type == "message_start":
                         msg_data = event_data.get("message", {})
                         u = msg_data.get("usage")
-                        input_tokens = reported_count(u, "input_tokens")
+                        cache_creation, cache_read = _cache_counts(u)
+                        input_tokens = _prompt_tokens(
+                            reported_count(u, "input_tokens"), cache_creation, cache_read
+                        )
                     elif event_type == "content_block_delta":
                         delta = event_data.get("delta", {})
                         if delta.get("type") == "text_delta":
@@ -464,6 +538,8 @@ class AnthropicConnector(BaseLLMConnector):
                             output_tokens=out_tok,
                             total_tokens=in_tok + out_tok,
                             count_source=count_source,
+                            cache_creation_input_tokens=cache_creation,
+                            cache_read_input_tokens=cache_read,
                         )
 
                     if delta_content or tool_calls or usage or finish_reason:

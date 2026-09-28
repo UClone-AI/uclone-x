@@ -189,7 +189,7 @@ class _OneAgentResolver:
     def __init__(self, agent: _RecordingAgent) -> None:
         self.agent = agent
 
-    async def resolve(self, participant: Participant) -> Any:
+    async def resolve(self, participant: Participant, *, one_seat: bool = False) -> Any:
         return self.agent
 
 

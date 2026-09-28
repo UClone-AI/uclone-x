@@ -1,10 +1,12 @@
-import { useMemo, useState } from 'react';
+import { useMemo, useState, type ReactNode } from 'react';
 import { GitBranch, Network, RefreshCw, User, Wrench } from 'lucide-react';
 import { Badge, type Tone } from './ui/Badge';
+import { fmt, plural, useCopy, type Plural } from '../i18n';
 import {
   roomDockUrls,
   useRoomRead,
   type RoomTopology,
+  type RoomTopologyGapCode,
   type RoomTopologyNode,
 } from '../lib/roomDock';
 
@@ -26,6 +28,10 @@ const TURN_TONE: Record<TurnNode['status'], Tone> = {
   interrupted: 'neutral',
 };
 
+/** A status word from the catalog, or the Core's own word for a status this head does not know. */
+const statusWord = (table: Record<string, string>, status: string): string =>
+  Object.prototype.hasOwnProperty.call(table, status) ? table[status] : status;
+
 const toolTone = (status: string): Tone =>
   status === 'success' ? 'success' : status === 'running' ? 'warning' : 'danger';
 
@@ -37,7 +43,29 @@ const toolTone = (status: string): Tone =>
  * `spawned`), not from re-sorting the nodes here, so what is drawn is what the Core said.
  * A developer surface (the DAG tab); the everyday view of the same turns is Activity.
  */
+/**
+ * The Core's gap clauses in the reader's language (#1911): each clause's code worded by the
+ * catalog, with the count it names. A clause keeps the Core's English when its code is one this
+ * head does not know, and every clause does when the codes are missing (a Core older than
+ * them) or do not line up one to one with the clauses.
+ */
+const wordGaps = (
+  clauses: readonly string[],
+  codes: readonly RoomTopologyGapCode[] | undefined,
+  sentences: Readonly<Record<string, string | Plural>>,
+): string[] => {
+  if (!codes || codes.length !== clauses.length) return [...clauses];
+  return clauses.map((clause, i) => {
+    const { code, count } = codes[i];
+    const worded = Object.prototype.hasOwnProperty.call(sentences, code) ? sentences[code] : undefined;
+    if (typeof worded === 'string') return worded;
+    if (worded && typeof count === 'number') return plural(worded, count);
+    return clause;
+  });
+};
+
 export function TopologyTab({ roomId, refreshKey }: TopologyTabProps) {
+  const t = useCopy().dock.topology;
   const [reloads, setReloads] = useState(0);
   const { data, error, loading } = useRoomRead<RoomTopology>(
     roomId ? roomDockUrls.topology(roomId) : null,
@@ -80,13 +108,27 @@ export function TopologyTab({ roomId, refreshKey }: TopologyTabProps) {
     };
   }, [data]);
 
-  const reason = !roomId
-    ? 'No conversation is open. Open one from the rail to see how it ran.'
-    : error
-      ? `Couldn't read this conversation's graph: ${error}`
-      : !data
-        ? 'Reading this conversation…'
-        : data.reason;
+  // The Core's `reason` and gaps are worded from their codes (#1911); the Core's English is
+  // shown for a code this head does not know, or from a Core older than the codes.
+  const reasons: Readonly<Record<string, string>> = t.reasons;
+  const reason: ReactNode = !roomId ? (
+    t.noRoom
+  ) : error ? (
+    <>
+      {t.readFailed}{' '}
+      <code className="break-words font-mono text-[11px] text-slate-400">{error}</code>
+    </>
+  ) : !data ? (
+    t.loading
+  ) : data.reason_code && Object.prototype.hasOwnProperty.call(reasons, data.reason_code) ? (
+    reasons[data.reason_code]
+  ) : (
+    data.reason
+  );
+  const historyGaps = data ? wordGaps(data.history_gaps ?? [], data.history_gap_codes, t.historyGapReasons) : [];
+  const toolCallGaps = data
+    ? wordGaps(data.tool_call_gaps ?? [], data.tool_call_gap_codes, t.toolCallGapReasons)
+    : [];
 
   return (
     <div className="space-y-4">
@@ -96,11 +138,16 @@ export function TopologyTab({ roomId, refreshKey }: TopologyTabProps) {
             <Network className="w-4 h-4 text-cyan-300" />
           </div>
           <div className="min-w-0">
-            <h2 className="text-xs font-bold text-white">How this conversation ran</h2>
+            <h2 className="text-xs font-bold text-white">{t.title}</h2>
             <p className="text-[11px] text-slate-400">
               {data
-                ? `${data.summary.seats} seated · ${data.summary.turns} turns · ${data.summary.tool_calls} tool calls listed · ${data.summary.subagents} helpers`
-                : 'Seats, their turns in order, the tools each turn called, and the helpers they started'}
+                ? fmt(t.summary, {
+                    seats: data.summary.seats,
+                    turns: data.summary.turns,
+                    toolCalls: data.summary.tool_calls,
+                    helpers: data.summary.subagents,
+                  })
+                : t.subtitle}
             </p>
           </div>
         </div>
@@ -112,7 +159,7 @@ export function TopologyTab({ roomId, refreshKey }: TopologyTabProps) {
             className="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-semibold text-slate-200 transition-colors border border-slate-700 inline-flex items-center gap-1.5 disabled:opacity-50"
           >
             <RefreshCw className="w-3.5 h-3.5" />
-            Refresh
+            {t.refresh}
           </button>
         </div>
       </div>
@@ -125,33 +172,30 @@ export function TopologyTab({ roomId, refreshKey }: TopologyTabProps) {
           data-testid="topology-history"
           className="p-2.5 rounded-xl bg-slate-900/70 border border-slate-800 text-[11px] text-slate-400 space-y-1"
         >
-          {(data.history_gaps ?? []).length > 0 ? (
+          {historyGaps.length > 0 ? (
             <div data-testid="topology-history-gaps">
-              <span>Turns may be missing from this graph because:</span>
+              <span>{t.historyGaps}</span>
               <ul className="list-disc pl-4">
-                {data.history_gaps.map((gap) => (
+                {historyGaps.map((gap) => (
                   <li key={gap}>{gap}</li>
                 ))}
               </ul>
             </div>
           ) : data.history_complete ? (
-            <p data-testid="topology-history-complete">No turn is known to be missing from this graph.</p>
+            <p data-testid="topology-history-complete">{t.historyComplete}</p>
           ) : null}
           {/* Apart from the turns: a turn that is shown can still be missing calls (#1388 N3). */}
-          {(data.tool_call_gaps ?? []).length > 0 && (
+          {toolCallGaps.length > 0 && (
             <div data-testid="topology-tool-call-gaps">
-              <span>Tool calls may be missing from the turns shown because:</span>
+              <span>{t.toolCallGaps}</span>
               <ul className="list-disc pl-4">
-                {data.tool_call_gaps.map((gap) => (
+                {toolCallGaps.map((gap) => (
                   <li key={gap}>{gap}</li>
                 ))}
               </ul>
             </div>
           )}
-          <p>
-            The tool calls shown are the ones each turn reported; a helper&apos;s own calls are
-            not shown.
-          </p>
+          <p>{t.helperCallsNote}</p>
         </div>
       )}
 
@@ -174,18 +218,16 @@ export function TopologyTab({ roomId, refreshKey }: TopologyTabProps) {
                   <div className="flex items-center gap-1.5 flex-wrap">
                     <User className="w-3.5 h-3.5 text-slate-400" />
                     <span className="font-semibold text-slate-100">{seat.display_name}</span>
-                    {seat.status === 'left' && <Badge tone="neutral">left</Badge>}
-                    {seat.live && <Badge tone="info">running</Badge>}
+                    {seat.status === 'left' && <Badge tone="neutral">{t.left}</Badge>}
+                    {seat.live && <Badge tone="info">{t.running}</Badge>}
                   </div>
                   <p className="text-[11px] text-slate-400">
-                    {seat.turn_count === 0
-                      ? 'No turns listed.'
-                      : `${seat.turn_count} ${seat.turn_count === 1 ? 'turn' : 'turns'}`}
+                    {seat.turn_count === 0 ? t.noSeatTurns : plural(t.seatTurns, seat.turn_count)}
                   </p>
                   {helpers.map((h) => (
                     <p key={h.id} className="text-[11px] text-slate-400 flex items-center gap-1">
                       <GitBranch className="w-3 h-3" />
-                      Started helper {h.subagent_id}
+                      {fmt(t.startedHelper, { id: h.subagent_id })}
                     </p>
                   ))}
                 </div>
@@ -195,9 +237,7 @@ export function TopologyTab({ roomId, refreshKey }: TopologyTabProps) {
 
           {/* Turns, in the order they were taken */}
           {graph.turns.length === 0 ? (
-            <p className="text-xs text-slate-400 text-center py-6">
-              No turns are listed for this conversation.
-            </p>
+            <p className="text-xs text-slate-400 text-center py-6">{t.noTurns}</p>
           ) : (
             <ol className="space-y-2 border-l border-slate-800 ml-2 pl-3">
               {graph.turns.map((turn) => {
@@ -213,16 +253,14 @@ export function TopologyTab({ roomId, refreshKey }: TopologyTabProps) {
                       <span className="font-semibold text-slate-100">
                         {graph.seatName(turn.participant_id)}
                       </span>
-                      <Badge tone={TURN_TONE[turn.status]}>{turn.status}</Badge>
+                      <Badge tone={TURN_TONE[turn.status]}>{statusWord(t.turnStatus, turn.status)}</Badge>
                     </div>
                     {!turn.tools_recorded && (
-                      <p className="text-[11px] text-slate-400">
-                        This turn did not record which tools it used in full.
-                      </p>
+                      <p className="text-[11px] text-slate-400">{t.toolsNotRecorded}</p>
                     )}
                     {tools.length === 0 ? (
                       turn.tools_recorded && (
-                        <p className="text-[11px] text-slate-500">No tool calls listed.</p>
+                        <p className="text-[11px] text-slate-500">{t.noToolCalls}</p>
                       )
                     ) : (
                       <ul className="space-y-1">
@@ -230,7 +268,7 @@ export function TopologyTab({ roomId, refreshKey }: TopologyTabProps) {
                           <li key={tool.id} className="flex items-center gap-1.5 flex-wrap">
                             <Wrench className="w-3 h-3 text-slate-500" />
                             <span className="font-mono text-slate-200">{tool.tool_name}</span>
-                            <Badge tone={toolTone(tool.status)}>{tool.status}</Badge>
+                            <Badge tone={toolTone(tool.status)}>{statusWord(t.toolStatus, tool.status)}</Badge>
                           </li>
                         ))}
                       </ul>

@@ -25,7 +25,7 @@ import hashlib
 import logging
 import stat as stat_mode
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, TypedDict
 
 from fastapi import FastAPI, HTTPException
 
@@ -42,12 +42,12 @@ from uclone_x.errors import (
     LogHeaderError,
     MemoryStoreUnreadableError,
     PathTraversalError,
-    SeatKnowledgeUnreadableError,
     UnknownLogEventError,
 )
 from uclone_x.log import read_session_log
 from uclone_x.memory.models import MemoryFact
 from uclone_x.memory.store import CrossSessionMemory, read_saved_facts
+from uclone_x.ontology.engine import OntologyEngine
 from uclone_x.room.models import (
     Participant,
     ParticipantKind,
@@ -59,7 +59,7 @@ from uclone_x.room.models import (
 from uclone_x.room.service import participant_session_id
 from uclone_x.room.turn_summary import TurnNotFoundError, summarize_turn
 from uclone_x.sandbox.path_validator import PathValidator
-from uclone_x.ui.knowledge import knowledge_graph, known_facts
+from uclone_x.ui.knowledge import knowledge_graph, known_facts, worked_out_list
 from uclone_x.ui.rooms import _http_error, seated_agents  # pyright: ignore[reportPrivateUsage]
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle; the app imports this module
@@ -247,19 +247,59 @@ def _file_record_gaps(
     return gaps
 
 
-def _tool_call_gaps(record: RoomFileRecord, legacy_agent_turns: int) -> list[str]:
+#: Why turns may be missing from the topology graph, as stable codes the head words in its
+#: reader's language (#1911). A closed set naming the kind only; a count, where the kind has
+#: one, travels beside it. `history_gaps` stays the English clause, in the same order.
+HistoryGapCode = Literal["before_record", "cleared", "rewound", "unsaved", "uncounted"]
+#: Why a turn in the graph may show fewer tool calls than it made (#1911); as above.
+ToolCallGapCode = Literal["saved_without_tools", "unreported"]
+#: Why the graph has no turns to show at all (#1911): only `no_seat`.
+TopologyReasonCode = Literal["no_seat"]
+
+
+class HistoryGap(TypedDict):
+    """One entry of the topology's `history_gap_codes` (#1911)."""
+
+    code: HistoryGapCode
+    count: int | None
+
+
+def _unsaved_gap_code(unsaved: int) -> HistoryGap | None:
+    """`_unsaved_gap` as a code and a count, for the head to word (#1911)."""
+    if unsaved > 0:
+        return {"code": "unsaved", "count": unsaved}
+    return {"code": "uncounted", "count": None} if unsaved < 0 else None
+
+
+def _tool_call_gaps(
+    record: RoomFileRecord, legacy_agent_turns: int
+) -> list[tuple[ToolCallGapCode, int, str]]:
     """Each known reason a turn in the graph may show fewer tool calls than it made (#1388 N3).
 
     Apart from `history_gaps`, which names turn rows that may be missing: every row can be
     present while a turn's calls are not. A helper's own calls are never listed and are not
     a gap here: that is the graph's scope, not a lapse in its record, and the seat history's
     `tools_note` and the head's topology tab say so with every read.
+
+    Each gap is its code, its count and its English clause (#1911).
     """
-    gaps: list[str] = []
+    gaps: list[tuple[ToolCallGapCode, int, str]] = []
     if legacy_agent_turns:
-        gaps.append(f"{legacy_agent_turns} turn(s) were saved without a record of their tools")
+        gaps.append(
+            (
+                "saved_without_tools",
+                legacy_agent_turns,
+                f"{legacy_agent_turns} turn(s) were saved without a record of their tools",
+            )
+        )
     if record.unrecorded_turns:
-        gaps.append(f"{record.unrecorded_turns} turn(s) ended before reporting their tools")
+        gaps.append(
+            (
+                "unreported",
+                record.unrecorded_turns,
+                f"{record.unrecorded_turns} turn(s) ended before reporting their tools",
+            )
+        )
     return gaps
 
 
@@ -310,7 +350,7 @@ def _no_turns_reason(state: RoomState, name: str, unsaved: int, in_progress: boo
     return f"{name} has not taken a turn in this conversation yet."
 
 
-def _known_facts(room_id: str, seat: Participant) -> dict[str, Any]:
+def _known_facts(room_id: str, seat: Participant) -> tuple[dict[str, Any], list[MemoryFact] | None]:
     """The clone's facts, one clone-wide list, or why they cannot be listed (#1638 step 3).
 
     Read from the memory the seat's `record_memory_fact` writes: the store the room's
@@ -318,6 +358,9 @@ def _known_facts(room_id: str, seat: Participant) -> dict[str, Any]:
     id, shared with that clone in every other conversation. Each fact says whether it was
     learned in this conversation (`learned_here`); the head groups by it. Read-only -- a
     GET never moves a damaged document aside, and never creates the agent's home.
+
+    Also returns the facts read, `None` when they could not be read, for what the clone's
+    rules work out from them.
     """
     name = seat.display_name
     try:
@@ -337,10 +380,11 @@ def _known_facts(room_id: str, seat: Participant) -> dict[str, Any]:
         return {
             "facts": None,
             "facts_reason": f"What {name} knows could not be read, so it cannot be shown.",
-        }
-    listed = known_facts(facts or [], room_id, seat.session_id)
+        }, None
+    held = list(facts or [])
+    listed = known_facts(held, room_id, seat.session_id)
     reason = None if listed else f"No facts are listed for {name}."
-    return {"facts": listed, "facts_reason": reason}
+    return {"facts": listed, "facts_reason": reason}, held
 
 
 #: What a person is told when Correct or Forget cannot be done (#1638 step 3). Plain words
@@ -399,7 +443,14 @@ _TRACE_REASONS: dict[str, dict[str, str]] = {
 }
 
 
-def _log_failure_kind(exc: BaseException) -> str:
+#: The `detail` of a `log_unreadable` reason: what kind of failure it was, and nothing of
+#: the file or the exception's text (#1907). A closed set; the head words each one.
+LogFailureKind = Literal[
+    "unknown_event_type", "malformed_log", "not_text", "read_failed", "unexpected"
+]
+
+
+def _log_failure_kind(exc: BaseException) -> LogFailureKind:
     """A stable name for why `read_session_log` failed, safe to send to the client."""
     if isinstance(exc, UnknownLogEventError):
         return "unknown_event_type"
@@ -919,17 +970,26 @@ def register_room_dock_routes(app: FastAPI, stack: RoomStack) -> None:
         # `history_gaps` and `history_complete` speak for turn rows only; a turn that is
         # present can still be missing tool calls, named in `tool_call_gaps` (#1388 N3).
         record = state.file_record
+        # Each gap is also sent as a code (#1911), in the same order as its English clause.
         history_gaps: list[str] = []
+        history_codes: list[HistoryGap] = []
         if not record.kept_since_creation:
             history_gaps.append("this conversation began before its history was fully recorded")
+            history_codes.append({"code": "before_record", "count": None})
         if record.clears:
             history_gaps.append("its history was cleared")
+            history_codes.append({"code": "cleared", "count": None})
         if record.rewinds:
             history_gaps.append("its history was rewound")
-        unsaved_gap = _unsaved_gap(_unsaved_turns(record, stack.turn_unlanded(state.room_id)))
-        if unsaved_gap is not None:
+            history_codes.append({"code": "rewound", "count": None})
+        unsaved = _unsaved_turns(record, stack.turn_unlanded(state.room_id))
+        unsaved_gap = _unsaved_gap(unsaved)
+        unsaved_code = _unsaved_gap_code(unsaved)
+        if unsaved_gap is not None and unsaved_code is not None:  # both set, or neither
             history_gaps.append(unsaved_gap)
-        tool_call_gaps = _tool_call_gaps(record, _legacy_agent_turns(state))
+            history_codes.append(unsaved_code)
+        tool_gaps = _tool_call_gaps(record, _legacy_agent_turns(state))
+        reason_code: TopologyReasonCode | None = None if seated else "no_seat"
         return {
             "room_id": state.room_id,
             "nodes": nodes,
@@ -938,7 +998,10 @@ def register_room_dock_routes(app: FastAPI, stack: RoomStack) -> None:
             # `tool_call_gaps` names why a present turn may be missing calls (#1388 N3).
             "history_complete": not history_gaps,
             "history_gaps": history_gaps,
-            "tool_call_gaps": tool_call_gaps,
+            # The same gaps as closed codes, each with its count or `None` (#1911).
+            "history_gap_codes": history_codes,
+            "tool_call_gaps": [text for _, _, text in tool_gaps],
+            "tool_call_gap_codes": [{"code": code, "count": count} for code, count, _ in tool_gaps],
             "summary": {
                 "seats": len(seated),
                 "turns": len(turns),
@@ -946,32 +1009,31 @@ def register_room_dock_routes(app: FastAPI, stack: RoomStack) -> None:
                 "subagents": len(subagents),
             },
             "reason": None if seated else "No agent is seated in this conversation.",
+            "reason_code": reason_code,
         }
 
     @app.get("/api/rooms/{room_id}/knowledge")
     async def read_seat_knowledge(room_id: str, agent_id: str | None = None) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
-        """What one seat has learned, from that seat's own engine (#1357, G4).
+        """What one seat's clone knows, and what its rules work out from it (step 6).
 
-        Never the manager's shared engine: a seat is composed with an engine of its own
-        (P7), and the shared one describes nothing it learned.
+        A clone has one rules engine and one memory, whichever conversation it is in
+        (clone-knowledge-graph §3.1); no seat has a graph of its own any more. The route
+        reads both without building the seat.
 
-        A running seat is read from its agent. A seat that is not running is read from its
-        saved knowledge record (#1367), loaded into a detached
-        engine -- the route does not build the seat to find out, because building it is
-        what a turn does. Each answer that is not a memory says which it is:
+        `facts` is what the clone knows, one clone-wide list (#1638 step 3): the facts in
+        its own memory -- never another clone's -- each with `learned_here` for the
+        conversation on screen. `null` with `facts_reason` when they could not be read; an
+        empty list with a reason saying none are listed.
 
-        * `not_recorded`: not running and nothing saved -- not an empty memory;
-        * `unreadable`: a saved record is there and could not be read;
-        * `no_ontology`: running without a knowledge store.
+        `worked_out` is what the clone's rules work out from those facts, computed on this
+        read and never saved: each a `statement` and `because`, the `fact_id`s it rests on.
+        `null` when the facts could not be read.
 
-        `status`, `reason` and the graph fields describe that per-seat record, for the
-        developer graph; step 6 of the clone-knowledge-graph design retires it.
-
-        `facts` is what the clone knows, one clone-wide list on every answer whatever the
-        record's status (#1638 step 3): the facts in its own memory -- never another
-        clone's -- each with `learned_here` for the conversation on screen. `null` with
-        `facts_reason` when they could not be read; an empty list with a reason saying none
-        are listed.
+        `triples`, `nodes`, `edges` and `summary` describe the clone's rules engine, for the
+        developer graph. The engine is always there (it is created with the clone's first
+        use), so `status` is always `ok` and `reason` `null`: the per-seat record's
+        `not_recorded`, `unreadable` and `no_ontology` went with the record. Whether the
+        facts could be read is `facts` / `facts_reason`, as before.
         """
         state = _room(room_id)
         if not agent_id:
@@ -981,60 +1043,16 @@ def register_room_dock_routes(app: FastAPI, stack: RoomStack) -> None:
                 detail=f"Name the seat to read with agent_id (seated: {seats}).",
             )
         seat = _seat(state, agent_id)
-        base: dict[str, Any] = {
+        known, facts = _known_facts(state.room_id, seat)
+        engine = stack.session_manager().ontology_for(seat.id)
+        axioms = engine.list_axioms() if isinstance(engine, OntologyEngine) else []
+        return {
             "room_id": state.room_id,
             "participant_id": seat.id,
             "session_id": seat.session_id,
-            # Read whatever the knowledge record says: a clone's facts are in its memory,
-            # not in its per-seat knowledge engine (#1401, #1638).
-            **_known_facts(state.room_id, seat),
-        }
-        empty: dict[str, Any] = {
-            "triples": None,
-            "nodes": None,
-            "edges": None,
-            "summary": None,
-        }
-        live = stack.live_agent(state.room_id, seat.session_id)
-        if live is not None and live.ontology is None:
-            return {
-                **base,
-                **empty,
-                "status": "no_ontology",
-                "reason": f"{seat.display_name} is running without a knowledge store.",
-            }
-        if live is not None:
-            engine = live.ontology
-        else:
-            try:
-                engine = stack.knowledge.read(seat.session_id, seat.ontology_namespace)
-            except SeatKnowledgeUnreadableError:
-                # Plain words only: the store logged where the record is and why it could
-                # not be read, and a reader of the dock can act on neither. The read itself
-                # changes nothing.
-                name = seat.display_name
-                return {
-                    **base,
-                    **empty,
-                    "status": "unreadable",
-                    "reason": (
-                        f"{name}'s knowledge record for this conversation could not be read, "
-                        f"so it cannot be shown."
-                    ),
-                }
-            if engine is None:
-                return {
-                    **base,
-                    **empty,
-                    "status": "not_recorded",
-                    "reason": (
-                        f"{seat.display_name} has no knowledge record in this conversation."
-                    ),
-                }
-        graph = knowledge_graph(engine)
-        return {
-            **base,
-            **graph,
+            **known,
+            "worked_out": None if facts is None else worked_out_list(facts, axioms),
+            **knowledge_graph(engine),
             "status": "ok",
             "reason": None,
         }

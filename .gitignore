@@ -111,3 +111,9 @@ evals/reports/*.json
 /stories/
 /.archive/
 .sandbox/
+
+# A clone's skill proposals and what approving, turning down or revoking them keeps
+# (#1827). These are one installation's review state, not shipped skill packages.
+ucx-agent-skills/.pending/
+ucx-agent-skills/.versions/
+ucx-agent-skills/.rejected/

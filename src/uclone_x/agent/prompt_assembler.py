@@ -39,11 +39,21 @@ from uclone_x.agent.session import (
     ContextSnapshot,
     content_digest,
 )
+from uclone_x.core.context_state import (
+    ContextEntry,
+    ContextEpoch,
+    ContextForm,
+    recorded_forms,
+    recorded_renderings,
+    render_entries,
+    shown_entries,
+)
 from uclone_x.core.immutable import unwrap_immutable
 from uclone_x.core.secrets import redact_credentials
 from uclone_x.llm.models import ChatMessage, LLMRequest, MessageRole, ToolCallRequest
+from uclone_x.memory.recall import recall_prompt_section
 from uclone_x.ontology.protocols import OntologyEngineProtocol
-from uclone_x.skills.models import SkillStatus
+from uclone_x.skills.models import SkillStatus, missing_required_tools
 from uclone_x.skills.protocols import SkillRegistryProtocol
 from uclone_x.tools.protocols import ToolRegistryProtocol
 
@@ -144,6 +154,36 @@ def compose_identity_prompt(
     if persona is not None and persona.system_prompt:
         return f"{seat_framing}\n\n[Persona Instructions: {persona.role}]\n{persona.system_prompt}"
     return f"{seat_framing}\n\n{config_prompt}"
+
+
+def composed_seat_framing(
+    identity: str, *, config_prompt: str, persona: PersonaDefinition | None
+) -> str | None:
+    """The seat framing `identity` was composed with, or `None` if it is not this identity.
+
+    The inverse of `compose_identity_prompt` for one persona and configured prompt: `""`
+    when `identity` is the unframed composition, the framing text when it is the framed
+    one, and `None` when it is neither -- a prompt a caller wrote, or one composed from
+    something else. `None` claims nothing, so a reader treats it as "cannot tell".
+
+    Exists because a seat's framing can change under an anchor that was already written:
+    a one-seat room seeds its clone without the multi-agent framing (§5.9.3), and a second
+    clone joining puts it back. The anchor records the persona that composed it, not the
+    framing, so the framing is read back from the text. Compare canonical forms
+    (`adapt_system_prompt(..., None)`) on both sides, so a model-family re-framing is not
+    mistaken for a framing change.
+    """
+    bare = compose_identity_prompt(config_prompt=config_prompt, persona=persona)
+    if identity == bare:
+        return ""
+    # What follows the framing in a framed composition: compose under a one-character
+    # framing and drop that character, so this cannot drift from the composer's layout.
+    tail = compose_identity_prompt(config_prompt=config_prompt, persona=persona, seat_framing="\0")[
+        1:
+    ]
+    if len(identity) > len(tail) and identity.endswith(tail):
+        return identity[: -len(tail)]
+    return None
 
 
 #: Opens the block of state that changes during a conversation. It travels at the tail of
@@ -324,6 +364,24 @@ class SnapshotSession(Protocol):
     context_snapshots: list[ContextSnapshot]
     last_conversation: list[dict[str, Any]]
     last_request: int | None
+    recalled_memory: str | None
+    #: Per log entry of the history a compaction left, the entry it shows and its form
+    #: (`compacted_entries`, #1848), until the next request records them.
+    compacted_entries: dict[str, ContextEntry]
+
+    @property
+    def context_epochs(self) -> Sequence[ContextEpoch]:
+        """What each earlier request showed, per epoch (#1443)."""
+        ...
+
+    def logged_history(self) -> list[tuple[str, ChatMessage]]:
+        """Each history message's log entry and the message its logged body decodes to,
+        logging any not yet logged (#1848)."""
+        ...
+
+    def record_shown(self, shown: list[ContextEntry], *, step: int) -> ContextEpoch:
+        """Record what a request's conversation showed in the context state (#1443)."""
+        ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -356,6 +414,31 @@ class PromptAssembler:
 
     def __init__(self, scope: PromptScope) -> None:
         self._scope = scope
+        #: `recorded_forms` and `recorded_renderings` of the epochs they were computed
+        #: from, which are held so a reused `id()` never matches (#1875, item 5). Several
+        #: prepares of one request read the same epochs; a request that records a new one
+        #: replaces the sequence.
+        self._forms_of: tuple[Sequence[ContextEpoch], ContextEpoch | None] | None = None
+        self._forms: dict[str, ContextForm] = {}
+        self._renderings: dict[str, ContextEntry] = {}
+
+    def _recorded(
+        self, epochs: Sequence[ContextEpoch]
+    ) -> tuple[dict[str, ContextForm], dict[str, ContextEntry]]:
+        """`recorded_forms(epochs)` and `recorded_renderings(epochs)`, reused while
+        `epochs` is the sequence they were read from.
+
+        The sequence and its last epoch must both be the same objects: `advance` only ever
+        appends an epoch or replaces the last, so an epoch added or extended in place is
+        read afresh.
+        """
+        last = epochs[-1] if epochs else None
+        cached = self._forms_of
+        if cached is None or cached[0] is not epochs or cached[1] is not last:
+            self._forms = recorded_forms(epochs)
+            self._renderings = recorded_renderings(epochs)
+            self._forms_of = (epochs, last)
+        return self._forms, self._renderings
 
     @property
     def _ontology(self) -> OntologyEngineProtocol | None:
@@ -406,6 +489,16 @@ class PromptAssembler:
     def _anchor_is_stale(self) -> bool:
         return self._scope.anchor_is_stale()
 
+    async def recall_memory(self, message: str) -> str | None:
+        """The memory section recalled for `message`, or `None` with no memory store.
+
+        Ranked against the message (clone-knowledge-graph §3.5), so it changes per turn and
+        is sent only in the turn-context tail; `prepare_turn_layers` reads it back from the
+        live session, where the turn executor holds it for the turn.
+        """
+        memory = self._memory
+        return None if memory is None else await recall_prompt_section(memory, message)
+
     def get_active_invariants_prompt_section(
         self,
         domain: str | None = None,
@@ -436,8 +529,15 @@ class PromptAssembler:
         """Return progressive disclosure prompt section listing approved skills (P9)."""
         if self._skills is None:
             return ""
+        # A skill whose `requires_tools` the agent's tool scope does not grant is left out
+        # (#1826): offering it would teach the model a procedure it cannot carry out. The
+        # scope is the declared one, so the listing is stable across a session's turns.
+        scope = self._config.allowed_tools
         active_skills = [
-            s for s in self._skills.list_skills() if s.manifest.status == SkillStatus.ACTIVE
+            s
+            for s in self._skills.list_skills()
+            if s.manifest.status == SkillStatus.ACTIVE
+            and not missing_required_tools(s.manifest, scope)
         ]
         if not active_skills:
             return ""
@@ -554,9 +654,14 @@ class PromptAssembler:
         `request` numbers the requests of this working copy and `base_request` names the
         one this extends, so a reader can tell a gap in the log from a real extension.
         `digest` is over the whole request as sent, before redaction.
+
+        What the conversation showed -- each message's log entry and form -- goes to the
+        session's context state (`record_shown`, #1443), which extends the current epoch
+        or opens a new one.
         """
         session = self._active_session
         snapshot_id = self.record_context_snapshot(req, layers)
+        session.record_shown(list(layers.shown), step=step)
         conversation = [m.model_dump() for m in layers.conversation]
         kept, appended = request_context_delta(session.last_conversation, conversation)
         base_request = session.last_request
@@ -650,7 +755,11 @@ class PromptAssembler:
             turn_sections.append(plan_section)
 
         if self._memory is not None:
-            memory_section = self._memory.format_prompt_section()
+            # The running turn's recall when a turn set one; the message-free section
+            # otherwise (a request built outside a turn has no message to rank against).
+            memory_section = self._active_session.recalled_memory
+            if memory_section is None:
+                memory_section = self._memory.format_prompt_section()
             if memory_section:
                 turn_sections.append(memory_section)
 
@@ -692,10 +801,27 @@ class PromptAssembler:
         # One composition for both branches, so a synthesised turn carries the sections in
         # exactly the order and spacing an anchored one does.
         resolved = compose_system_message(base_sys, combined_section)
+        history = messages[1:] if anchored_turn else messages
+        # The context state (#1443): which log entry each message shows, in which form,
+        # and the entry an already-shown result refers back to (§5.8, Rule 2). The history
+        # names the log bodies and their order; each entry is rendered in its form from
+        # the log (#1848) -- its own body, or the rendering a compaction dropped it to --
+        # so a rebuild that reads only the log renders the same request.
+        # A body an epoch recorded as a rendering shows the entry it renders; any other
+        # keeps the form the epochs before recorded for it, where its message carries none
+        # (`shown_form`, #1866). After a compaction, the entries it derived from the
+        # history before it are the new epoch's (`compacted_entries`, #1848).
+        session = self._active_session
+        logged = session.logged_history()[len(messages) - len(history) :]
+        prior, renderings = self._recorded(session.context_epochs)
+        shown = shown_entries(logged, prior, {**renderings, **session.compacted_entries})
+        by_entry = dict(logged)
+        conversation = render_entries(shown, by_entry.__getitem__)
         return RequestLayers(
             identity=base_sys,
             slow_context=combined_section,
             system_message=anchored_turn or bool(resolved),
-            conversation=tuple(messages[1:] if anchored_turn else messages),
+            conversation=tuple(conversation),
             turn_context=turn_context,
+            shown=shown,
         )

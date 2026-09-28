@@ -69,7 +69,11 @@ def test_missing_dependency_error_attributes_and_message() -> None:
 def test_kernel_core_packages_importable_without_optional_frameworks() -> None:
     """Kernel packages (core, engine, agent, errors, sandbox) import without shell frameworks.
 
-    Killed by: pyproject.toml :: "pydantic>=2.7.0",
+    The declaration named the pydantic line in `pyproject.toml`, which this test never
+    reads, so it could not be replayed; it now names a kernel import (#1917).
+
+    Killed by: src/uclone_x/errors.py :: from enum import StrEnum
+    Becomes: from enum import StrEnum; import typer
     """
     script = (
         "import sys\n"

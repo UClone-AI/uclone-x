@@ -55,6 +55,19 @@ _NOT_CHAT_FRAGMENTS = (
 )
 
 
+def cached_prompt_tokens(usage: dict[str, Any] | None) -> int | None:
+    """`usage.prompt_tokens_details.cached_tokens`, or `None` when not reported (#1371).
+
+    OpenAI counts them inside `prompt_tokens`, as `TokenUsage.cache_read_input_tokens`
+    expects. An OpenAI-compatible server that leaves the field out (a vLLM server may,
+    depending on how it was started) records no count rather than a zero.
+    """
+    details: object = usage.get("prompt_tokens_details") if usage else None
+    if not isinstance(details, dict):
+        return None
+    return reported_count(cast("dict[str, Any]", details), "cached_tokens")
+
+
 def named_model(request: LLMRequest) -> str | None:
     """The model the caller named, or `None` when they left the choice to the connector.
 
@@ -403,6 +416,7 @@ class OpenAIConnector(BaseLLMConnector):
             output_tokens=out_tokens,
             total_tokens=in_tokens + out_tokens,
             count_source=count_source,
+            cache_read_input_tokens=cached_prompt_tokens(usage_data),
         )
 
         finish_reason = self._map_finish_reason(choice.get("finish_reason"))
@@ -530,6 +544,7 @@ class OpenAIConnector(BaseLLMConnector):
                             output_tokens=out_tok,
                             total_tokens=in_tok + out_tok,
                             count_source=count_source,
+                            cache_read_input_tokens=cached_prompt_tokens(stream_usage),
                         )
 
                     if delta_content or tool_calls or usage or finish_reason:

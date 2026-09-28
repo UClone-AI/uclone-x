@@ -49,7 +49,7 @@ async def test_execute_loop_tick_success(mock_agent: MagicMock) -> None:
     assert job.runs_count == 1
     assert job.consecutive_failures == 0
     assert job.status == LoopStatus.ACTIVE
-    mock_agent.execute_turn.assert_awaited_once_with("Test prompt")
+    mock_agent.execute_turn.assert_awaited_once_with("Test prompt", person_names=())
 
 
 @pytest.mark.asyncio
@@ -77,7 +77,7 @@ async def test_execute_loop_tick_concurrency_lock_skips(mock_agent: MagicMock) -
 async def test_execute_loop_tick_watchdog_timeout(mock_agent: MagicMock) -> None:
     """Watchdog timeout test: Long-running turn is cancelled and flagged."""
 
-    async def _hang(_prompt: str) -> TurnResult:
+    async def _hang(_prompt: str, **_kwargs: Any) -> TurnResult:
         await asyncio.sleep(5.0)
         return TurnResult(
             turn_index=1, content="never", stop_reason="model_stopped", provenance=None
@@ -192,3 +192,25 @@ async def test_loop_scheduler_lifecycle(mock_agent: MagicMock) -> None:
     assert len(completed_ticks) == 2
 
     scheduler.cancel_all()
+
+
+@pytest.mark.asyncio
+async def test_every_tick_is_given_the_person_s_names(mock_agent: MagicMock) -> None:
+    """A loop is a one-seat room, so each tick's turn knows who the person is (#1893).
+
+    Killed by: src/uclone_x/agent/loop/runner.py :: agent.execute_turn(job.prompt, person_names=person_names),
+    Becomes: agent.execute_turn(job.prompt),
+    Killed by: src/uclone_x/agent/loop/scheduler.py :: self.agent, job, tick_index, person_names=self.person_names
+    Becomes: self.agent, job, tick_index
+    """
+    scheduler = LoopScheduler(agent=mock_agent, person_names=("user", "Kenny"))
+    job = scheduler.add_job(
+        interval_seconds=0.05, prompt="Tick prompt", max_runs=2, run_immediately=True
+    )
+
+    await scheduler.wait_job(job.job_id)
+    scheduler.cancel_all()
+
+    assert [c.kwargs for c in mock_agent.execute_turn.await_args_list] == [
+        {"person_names": ("user", "Kenny")}
+    ] * 2

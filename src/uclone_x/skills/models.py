@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import re
+from collections.abc import Iterable, Mapping
 from enum import StrEnum
 from typing import Any, Self
 
@@ -17,7 +18,12 @@ __all__ = [
     "SkillManifest",
     "SkillOrigin",
     "SkillStatus",
+    "missing_required_tools",
+    "skill_hidden_from",
 ]
+
+
+_TOOL_NAME = re.compile(r"[A-Za-z0-9_-]{1,64}")
 
 
 class AutoApprovalPolicy(StrEnum):
@@ -73,6 +79,11 @@ class SkillManifest(BaseModel):
     author: str | None = None
     scripts: tuple[str, ...] = Field(default_factory=tuple)
     tags: tuple[str, ...] = Field(default_factory=tuple)
+    requires_tools: tuple[str, ...] = Field(
+        default_factory=tuple,
+        description="Tools the skill's instructions call (#1826). A clone is offered the skill "
+        "only when every one is in its tool scope; an empty tuple means every clone may use it.",
+    )
     entrypoint: str | None = None
     family_sections: bool = Field(
         default=False,
@@ -120,6 +131,18 @@ class SkillManifest(BaseModel):
         description="Explanation if the skill was rejected.",
     )
 
+    @model_validator(mode="after")
+    def _check_requires_tools(self) -> Self:
+        for tool in self.requires_tools:
+            if not _TOOL_NAME.fullmatch(tool):
+                raise ValueError(
+                    f"requires_tools entry {tool!r} is not a tool name "
+                    "(letters, digits, '_' or '-', at most 64)"
+                )
+        if len(set(self.requires_tools)) != len(self.requires_tools):
+            raise ValueError("requires_tools names a tool more than once")
+        return self
+
     def model_copy(self, *, update: Mapping[str, Any] | None = None, deep: bool = False) -> Self:
         """Override model_copy so updates are strictly validated through model_validate (Issue #42)."""
         if update:
@@ -127,6 +150,40 @@ class SkillManifest(BaseModel):
             dumped.update(update)
             return type(self).model_validate(dumped)
         return super().model_copy(deep=deep)
+
+
+def missing_required_tools(manifest: SkillManifest, tool_scope: Iterable[str]) -> tuple[str, ...]:
+    """The tools `manifest` requires that `tool_scope` does not grant, in declared order (#1826).
+
+    `tool_scope` is a clone's declared scope (its `allowed_tools` plus the base tools), the
+    same list `ToolInvoker.in_tool_range` enforces, so an empty scope means unrestricted and
+    nothing is missing.
+    """
+    return _missing_tools(manifest.requires_tools, tool_scope)
+
+
+def skill_hidden_from(
+    requires_tools: Iterable[str], scopes: Mapping[str, Iterable[str]]
+) -> list[dict[str, Any]]:
+    """Which clones a skill is not offered to, and the tools each lacks, by clone name (#1826).
+
+    `scopes` maps a clone's name to its declared tool scope. What `/api/skills` reports as
+    `hidden_from`, so the head and the runtime decide from the same rule.
+    """
+    required = tuple(requires_tools)
+    hidden: list[dict[str, Any]] = []
+    for name in sorted(scopes):
+        missing = _missing_tools(required, scopes[name])
+        if missing:
+            hidden.append({"persona": name, "missing_tools": list(missing)})
+    return hidden
+
+
+def _missing_tools(required: tuple[str, ...], tool_scope: Iterable[str]) -> tuple[str, ...]:
+    scope = frozenset(tool_scope)
+    if not scope:
+        return ()
+    return tuple(tool for tool in required if tool not in scope)
 
 
 class SkillAuditReport(BaseModel):

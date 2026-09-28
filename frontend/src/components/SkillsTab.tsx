@@ -14,6 +14,7 @@ import {
 import { SkillsData, SkillManifest } from '../types';
 import { fmt, useCopy, type Messages } from '../i18n';
 import { placeholders } from '../i18n/format';
+import { Button } from './ui/Button';
 
 type NotLoadedCopy = Messages['skills']['notLoaded'];
 
@@ -49,13 +50,55 @@ export const notLoadedText = (skill: SkillManifest, t: NotLoadedCopy): string | 
  */
 const labelOf = (table: Record<string, string>, value: string): string => table[value] ?? value;
 
+/**
+ * Which clones are not offered this skill, and the tools each lacks (#1826).
+ *
+ * The runtime leaves such a skill out of that clone's skill list and refuses to load it
+ * there, so without this the skill would vanish from that clone with no word of why.
+ * Renders nothing when every clone can use the skill.
+ */
+export function SkillHiddenFromNotice({ skill }: { skill: SkillManifest }) {
+  const t = useCopy().skills.requiresTools;
+  const hidden = skill.hidden_from ?? [];
+  if (hidden.length === 0) return null;
+  return (
+    <div
+      data-testid="skill-hidden-from"
+      className="p-3 rounded-lg bg-slate-900/60 border border-slate-700 text-slate-300 text-xs space-y-1.5"
+    >
+      <strong className="text-slate-200">{t.heading}</strong>
+      <ul className="space-y-0.5">
+        {hidden.map((h) => (
+          <li key={h.persona}>
+            {fmt(t.row, { clone: h.persona, tools: h.missing_tools.join(', ') })}
+          </li>
+        ))}
+      </ul>
+      <p className="text-slate-400">{t.remedy}</p>
+    </div>
+  );
+}
+
 interface SkillsTabProps {
   skillsData: SkillsData | null;
   onRefresh: () => void;
   isLoading: boolean;
+  /**
+   * Revoke an approved skill (#1827). Offered for an active skill that did not ship with
+   * UClone-X; without it the tab offers no revoke at all.
+   */
+  onRevoke?: (name: string) => void;
+  /** A decision is in flight, so the revoke button waits. */
+  deciding?: boolean;
 }
 
-export function SkillsTab({ skillsData, onRefresh, isLoading }: SkillsTabProps) {
+export function SkillsTab({
+  skillsData,
+  onRefresh,
+  isLoading,
+  onRevoke,
+  deciding = false,
+}: SkillsTabProps) {
   const [searchTerm, setSearchTerm] = useState<string>('');
   const [statusFilter, setStatusFilter] = useState<string>('ALL');
   const [originFilter, setOriginFilter] = useState<string>('ALL');
@@ -120,7 +163,10 @@ export function SkillsTab({ skillsData, onRefresh, isLoading }: SkillsTabProps) 
             <span>{copy.cards.pending.label}</span>
             <ShieldAlert className="w-4 h-4 text-amber-400" />
           </div>
-          <p className="mt-2 text-2xl font-bold text-amber-400">{summary.pending_count}</p>
+          {/* A clone's proposals wait for review too, though the catalogue does not list them (#1827). */}
+          <p data-testid="skills-waiting-count" className="mt-2 text-2xl font-bold text-amber-400">
+            {summary.pending_count + (skillsData?.proposals?.length ?? 0)}
+          </p>
           <p className="text-[11px] text-slate-400 mt-0.5">{copy.cards.pending.hint}</p>
         </div>
 
@@ -348,12 +394,28 @@ export function SkillsTab({ skillsData, onRefresh, isLoading }: SkillsTabProps) 
                   )}
                 </div>
 
+                <SkillHiddenFromNotice skill={activeSkill} />
+
                 {notLoaded && (
                   <div
                     data-testid="skill-not-loaded-reason"
                     className="p-3 rounded-lg bg-rose-950/40 border border-rose-800/60 text-rose-200 text-xs"
                   >
                     <strong>{notLoadedCopy.label}</strong> {notLoaded}
+                  </div>
+                )}
+
+                {onRevoke && activeSkill.status === 'active' && !activeSkill.shipped && (
+                  <div className="pt-2 border-t border-slate-800/80 flex flex-wrap items-center justify-between gap-2">
+                    <span className="text-[11px] text-slate-400">{skillsCopy.revoke.hint}</span>
+                    <Button
+                      variant="bordered"
+                      disabled={deciding}
+                      onClick={() => onRevoke(activeSkill.name)}
+                      data-testid="skill-revoke"
+                    >
+                      {skillsCopy.revoke.button}
+                    </Button>
                   </div>
                 )}
 

@@ -409,9 +409,10 @@ class AgentHomeListing:
 def list_agent_homes(root: Path | None = None) -> AgentHomeListing:
     """Enumerate the agent homes under `root`, defaulting to the resolved agents root.
 
-    Nothing else enumerates them. `list_agents` on the head's session manager returns
-    *live instances*, which is empty on an install where nothing has been spawned -- so a
-    surface built on it shows nothing on exactly the first screen a new user sees.
+    Nothing else enumerates them. The seated clones a head reports (`seated_agent_ids`
+    on its room stack) are *live instances*, which is empty on an install where no
+    conversation has started -- so a surface built on them shows nothing on exactly the
+    first screen a new user sees.
 
     This function never raises for a fault it can describe. A root that cannot be read
     and a root holding nothing both produce an empty `homes`, and a damaged single home

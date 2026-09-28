@@ -59,7 +59,13 @@ async def _run_loop_agent(
     tools = create_default_registry()
     # Imported here, as `room` does: `ucx --help` imports this module, and `run` is kept
     # out of that path on purpose, by a fitness check on what `--help` reaches.
-    from uclone_x.cli.commands.run import apply_saved_model, own_model_notice
+    from uclone_x.cli.commands.run import (
+        apply_saved_model,
+        loop_tick_turn,
+        own_model_notice,
+        record_in_room,
+        report_set_aside,
+    )
 
     saved_model, saved_notice = apply_saved_model(provider, model)
     if saved_notice is not None:
@@ -70,13 +76,34 @@ async def _run_loop_agent(
     effective_model = saved_model
 
     store = SessionStore()
-    effective_session_id = session_id or f"loop_{agent_name}"
     tracer = TelemetryTracer()
 
     default_system = compose_system_prompt(model_name=effective_model)
     # Deferred for the reason `run` is: `ucx --help` imports this module.
     from uclone_x.agent.clone_builder import build_clone, local_app_scope, saved_models
+    from uclone_x.core.agent_home import AgentHomeError
+    from uclone_x.errors import PathTraversalError, RoomError
+    from uclone_x.room.one_seat import open_head_room
+    from uclone_x.room.store import RoomStore
     from uclone_x.skills.auditor import load_runtime_skill_registry
+
+    # A loop is a one-seat room (§5.9, owner ruling 2026-09-27): `--session-id` names the
+    # room, or a new one is started; the clone keeps a room seat's session in it. A
+    # session kept under the earlier `loop_<clone>` name is left on disk and not resumed.
+    rooms = RoomStore()
+    try:
+        room = open_head_room(agent_name, session_id, head="loop", store=rooms)
+    except AgentHomeError as exc:
+        err_console.print(f"[bold red]✖ Invalid --agent:[/bold red] {escape(str(exc))}")
+        return 2
+    except (PathTraversalError, RoomError) as exc:
+        err_console.print(f"[bold red]✖ Invalid --session-id:[/bold red] {escape(str(exc))}")
+        return 2
+    if room.created and session_id is None:
+        err_console.print(
+            f"[dim]New conversation [bold]{escape(room.room_id)}[/bold]; "
+            f"--session-id {escape(room.room_id)} resumes it.[/dim]"
+        )
 
     # Built as the desktop app builds the same clone (#1731).
     agent = build_clone(
@@ -92,7 +119,7 @@ async def _run_loop_agent(
             skills=await load_runtime_skill_registry(),
         ),
         clone_id=agent_name,
-        session_id=effective_session_id,
+        session_id=room.session_id,
         # `--model` wins over a persona's own model, as a model asked for in the app does;
         # the saved choice only fills what the persona leaves empty (`saved_models`).
         model_name=model,
@@ -148,8 +175,26 @@ async def _run_loop_agent(
             err_console.print(
                 f"[{status_style}]✖ Error: {escape(result.error or 'unknown error')}[/{status_style}]"
             )
+        # Each tick is a turn in the loop's room (#1837), saved to the seat first as a room
+        # seat's turn is, so the room never shows a tick the seat's session lacks.
+        try:
+            agent.persist_session()
+        except Exception as persist_err:
+            logger.warning("Failed to persist loop session after a tick: %s", persist_err)
+        # Said as `ucx run` says it (#1877): the save kept an earlier record aside.
+        set_aside = report_set_aside(store, room.session_id, err_console)
+        record_in_room(
+            rooms,
+            room_id=room.room_id,
+            clone_id=agent_name,
+            turn=loop_tick_turn(job, result, session_set_aside=set_aside),
+            out=err_console,
+            head="loop",
+        )
 
-    scheduler = LoopScheduler(agent=agent, on_tick_completed=_on_tick)
+    scheduler = LoopScheduler(
+        agent=agent, on_tick_completed=_on_tick, person_names=room.person_names
+    )
     job = scheduler.add_job(
         interval_seconds=interval_seconds,
         prompt=prompt,
@@ -172,6 +217,7 @@ async def _run_loop_agent(
             agent.persist_session()
         except Exception as persist_err:
             logger.warning("Failed to persist loop session: %s", persist_err)
+        report_set_aside(store, room.session_id, err_console)  # the save on the way out
         await agent.stop()
 
     # Summary
@@ -236,7 +282,11 @@ def run_loop_cmd(
         Path | None,
         typer.Option("--cwd", "-w", help="Workspace root directory"),
     ] = None,
-    session_id: str | None = typer.Option(None, "--session-id", help="Session identifier"),
+    session_id: str | None = typer.Option(
+        None,
+        "--session-id",
+        help="Conversation (one-seat room) to resume; a new one is started if omitted",
+    ),
 ) -> None:
     """Run recurring agent automation loop with watchdog and concurrency protections."""
     effective_interval: float

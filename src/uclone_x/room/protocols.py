@@ -24,6 +24,7 @@ __all__ = [
     "RoomAgentResolverProtocol",
     "RoomOrchestratorProtocol",
     "RoomStoreProtocol",
+    "SeatSessionSetAsideProtocol",
     "SpeakerSelectorProtocol",
     "StoryLeaseProtocol",
 ]
@@ -93,8 +94,14 @@ class RoomAgentResolverProtocol(Protocol):
     registries and skill sets may be shared; the session and the ontology may not.
     """
 
-    async def resolve(self, participant: Participant) -> BaseAgentProtocol:
+    async def resolve(
+        self, participant: Participant, *, one_seat: bool = False
+    ) -> BaseAgentProtocol:
         """Return the live agent for `participant`, constructing it if needed.
+
+        `one_seat`: the room seats no other clone (`is_one_seat`), so the agent is framed
+        as a 1:1 chat and not as one participant among several (§5.9.3). Asked on every
+        call, not only the first, because the roster can change under a built agent.
 
         Raises:
             ParticipantNotResolvableError: No agent can be produced for this participant —
@@ -222,4 +229,20 @@ class StoryLeaseProtocol(Protocol):
 
     def release(self, story_id: str, conversation_id: str) -> bool:
         """Give up the lease if `conversation_id` holds it; return whether it did."""
+        ...
+
+
+class SeatSessionSetAsideProtocol(Protocol):
+    """Says when a seat's own session record could not be read and was set aside (#1844).
+
+    The session store a room's seats are saved to has this shape (`SessionStore`). A record
+    written by a newer build can fail this build's validation; the store moves it aside
+    before saving over it, and the room says so on the seat's next row.
+    """
+
+    def take_set_aside(self, session_id: str) -> bool:
+        """Whether `session_id`'s record was set aside since this was last asked.
+
+        Answers `True` once per set-aside, so the notice lands on one row.
+        """
         ...

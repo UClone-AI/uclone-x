@@ -107,6 +107,18 @@ class ToolContext(BaseModel):
         "model; `None` means no story is open, and they refuse with that reason.",
     )
 
+    person_names: tuple[str, ...] = Field(
+        default=(),
+        description="The names this turn's person goes by (id, display name, aliases), "
+        "filled per turn from the room that started it (`person_names` on "
+        "`execute_turn`). `record_memory_fact` files a fact under any of them as a fact "
+        "about `user` (#1857). The room leaves out any of them, the id included, that "
+        "another participant goes by, whole or as one word of theirs (#1868, #1893); "
+        "names are compared in NFC. Per call, never "
+        "held by the store: one clone's store "
+        "serves every room it sits in. Empty for a turn no room started.",
+    )
+
     approved_by_person: bool = Field(
         default=False,
         description="True only when a person approved this very call through the runtime's "

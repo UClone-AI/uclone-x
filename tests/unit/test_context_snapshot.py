@@ -31,6 +31,7 @@ from typing import Any
 import pytest
 from pydantic import BaseModel, Field
 
+from tests.support.app_clone import app_clone
 from uclone_x.agent.base import BaseAgent
 from uclone_x.agent.composition import HostDependencies
 from uclone_x.agent.models import AgentConfig, AgentLLMConfig, PersonaDefinition
@@ -288,7 +289,7 @@ def test_a_one_to_one_clones_stored_anchor_is_the_identity_its_request_sends(
     session_id = "sess_clone"
 
     async def turn() -> None:
-        agent = await manager.get_or_create_agent("agent-clone", session_id=session_id)
+        agent = app_clone(manager, "agent-clone", session_id)
         assert (await agent.execute_turn("hello")).error is None
         agent.persist_session(session_id=session_id)
 
@@ -572,8 +573,9 @@ async def test_a_turn_context_redacted_on_disk_is_not_called_verified(tmp_path: 
     assert (await agent.execute_turn("count")).is_completed
     memory = agent.memory
     assert isinstance(memory, CrossSessionMemory)
+    # About counting, so recall selects it for "count again" (clone-knowledge-graph §3.5).
     memory.record_fact(
-        subject="service",
+        subject="count_service",
         predicate="key",
         object_value=_FAKE_KEY,
         provenance=_PROV,
@@ -611,7 +613,7 @@ def _missing_bodies(store: SessionStore, session_id: str = "sess_snap") -> list[
             s.slow_context_digest,
             s.turn_context_digest,
         )
-    }
+    } | {entry.digest for entry in state.session_log}  # and the session log's (#1443)
     return sorted(d for d in named if store.load_context_body(session_id, d) is None)
 
 
@@ -619,14 +621,20 @@ def _missing_bodies(store: SessionStore, session_id: str = "sess_snap") -> list[
 async def test_a_history_loaded_before_a_save_keeps_the_bodies_to_write(tmp_path: Path) -> None:
     """A rewind replaces the working copy and then saves it; the record's bodies are there.
 
-    Killed by: src/uclone_x/agent/session_lifecycle.py :: replaced.pending_bodies = live.pending_bodies
-    Becomes: pass
+    Both halves carry over: the snapshot bodies the old copy had not written, and the log
+    body of a message the rewind brings in that was never in the history (#1443).
+
+    Killed by: src/uclone_x/agent/session_lifecycle.py :: replaced.pending_bodies = {**live.pending_bodies, **replaced.pending_bodies}
+    Becomes: replaced.pending_bodies = live.pending_bodies
     """
     store = SessionStore(tmp_path)
     agent = _agent(store, RecordingLLM())
     await agent.start()
     assert (await agent.execute_turn("count")).is_completed
-    kept = list(agent.get_session().messages)
+    kept = [
+        *agent.get_session().messages,
+        ChatMessage(role=MessageRole.USER, content="brought in by the rewind"),
+    ]
     agent.load_history(kept, turn_counter=1)
     agent.persist_session()
 

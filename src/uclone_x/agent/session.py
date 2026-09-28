@@ -166,10 +166,12 @@ from uclone_x.core.session_state import (
     content_digest,
     redact_message,
 )
+from uclone_x.core.set_aside import expire_set_aside, kept_copies, set_aside_unreadable
 from uclone_x.errors import (
     PathTraversalError,
     SessionEventLogNotConfiguredError,
     SessionIdCollisionError,
+    SessionRecordUnreadableError,
     StaleSessionWriteError,
 )
 from uclone_x.llm.models import LedgerSource
@@ -510,9 +512,9 @@ class CompactionResult(BaseModel):
     session_id: str
     reason: str = Field(
         description="Why the pass ran — `auto_threshold` when `execute_turn` tripped "
-        "the configured token threshold before a turn, `auto_threshold_mid_turn` when it "
-        "tripped between two steps of one, or a caller-supplied reason for an explicit "
-        "`compact_session`.",
+        "the configured token threshold before a turn, or a caller-supplied reason for an "
+        "explicit `compact_session`. A record written before #1443 may also say "
+        "`auto_threshold_mid_turn`, a pass between two steps, which no longer runs.",
     )
     ledger_source: LedgerSource = Field(
         description="Which producer wrote the ledger, forwarded from the outcome.",
@@ -610,7 +612,13 @@ class SessionStore:
         )
         if log_writer is None and log_allocator is None:
             self._event_log_dir = self._storage_dir / EVENT_LOG_SUBDIR
+        #: Session ids whose unreadable record `save` moved aside, until `take_set_aside`
+        #: reports each one once (#1844).
+        self._set_aside: set[str] = set()
         reap_orphaned_temp_files(self._storage_dir)
+        # Before the artifact reaper: a session whose last copy expires here is no longer
+        # live to it, so its tool results go in the same start.
+        self._expire_kept_copies()
         if self._artifacts_dir is not None:
             reap_orphaned_tool_artifacts(self._artifacts_dir, is_live=self._has_record)
 
@@ -620,10 +628,16 @@ class SessionStore:
         return self._storage_dir
 
     def _has_record(self, session_id: str) -> bool:
-        """Whether a record exists for `session_id`; `False` for a name no record can have."""
+        """Whether a record exists for `session_id`, or a copy of one was set aside.
+
+        `False` for a name no record can have. A set-aside copy counts (#1844): its tool
+        results are named by handle in its history, and a build that can read it again
+        needs them there. An empty one does not (#1877): it holds no history.
+        """
         try:
-            return self.session_path(session_id).is_file()
-        except (PathTraversalError, ValueError):
+            path = self.session_path(session_id)
+            return path.is_file() or bool(kept_copies(path))
+        except (PathTraversalError, ValueError, OSError):
             return False
 
     def session_path(self, session_id: str) -> Path:
@@ -744,6 +758,13 @@ class SessionStore:
         "no session here" — not a fabricated empty session presented as a real one, which
         is what P6 forbids. The corruption is logged.
 
+        **Absent to a reader, never to a writer (#1844).** The commonest unreadable record
+        is not a damaged one: it is a conversation a newer build wrote, with a field this
+        build refuses under `extra="forbid"`. `load` leaves it where it is, so a newer
+        build started again still finds it; `save` and `delete` move it to
+        `<name>.unreadable-<UTC time>` before they would replace or remove it
+        (`uclone_x.core.set_aside`).
+
         The `is_file()` probe is inside the `try` for the same reason. An ID long enough
         to exceed the filesystem's name limit makes `is_file()` itself raise
         `OSError(ENAMETOOLONG)`, which used to escape past this documented `None` — the
@@ -775,24 +796,129 @@ class SessionStore:
                 identifies a different session.
         """
         path = self.session_path(session_id)
+        state, cause = self._read(session_id, path)
+        if cause is not None:
+            # Left where it is: a read changes nothing on disk. `save` and `delete` move it
+            # aside before they would replace or remove it (#1844).
+            logger.warning(
+                "Session record at %s cannot be read (%s); treating as absent", path, cause
+            )
+        return state
+
+    @staticmethod
+    def _read(session_id: str, path: Path) -> tuple[SessionState | None, str | None]:
+        """The record at `path`, and why it could not be read, for the log, when it could not.
+
+        `(None, None)` when there is no record, including a path too long to exist.
+        `(None, cause)` when a file is there and does not load: undecodable, unopenable, or
+        a shape this build refuses -- most often a field a newer build added.
+
+        Raises:
+            SessionIdCollisionError: The record loads and identifies a different session.
+        """
         try:
             if not path.is_file():
-                return None
+                return None, None
+        except OSError:
+            return None, None
+        try:
             text = path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError):
-            logger.warning("Unreadable session record at %s; treating as absent", path)
-            return None
+        except (OSError, UnicodeDecodeError) as exc:
+            return None, f"{type(exc).__name__}: {exc}"
         try:
             state = SessionState.model_validate_json(text)
-        except ValueError:
-            logger.warning(
-                "Session record at %s does not match SessionState; treating as absent", path
-            )
-            return None
+        except ValueError as exc:
+            return None, f"it does not match SessionState: {exc}"
         # After parsing, not before: an unparseable file has no id to compare, and it is
-        # already reported absent above for a reason that has nothing to do with #256.
+        # reported unreadable above for a reason that has nothing to do with #256.
         verify_record_identity(session_id, state.session_id, path)
-        return state
+        return state, None
+
+    def _set_aside_unreadable(self, path: Path, cause: str) -> None:
+        """Move the unreadable record at `path` aside, or refuse whatever was about to replace it.
+
+        Raises:
+            SessionRecordUnreadableError: The rename failed; the record is still at `path`.
+        """
+        try:
+            aside = set_aside_unreadable(path)
+        except OSError as exc:
+            logger.warning(
+                "Session record at %s cannot be read (%s) and could not be moved aside (%s); "
+                "nothing is written over it.",
+                path,
+                cause,
+                exc,
+            )
+            refusal = SessionRecordUnreadableError(
+                "This conversation's saved record could not be opened by this version and "
+                "could not be kept aside, so nothing was saved over it.",
+                path=path,
+                cause=cause,
+            )
+            raise refusal from exc
+        logger.warning(
+            "Session record at %s cannot be read (%s); it was moved aside, unchanged, to %s",
+            path,
+            cause,
+            aside,
+        )
+
+    def _expire_kept_copies(self) -> None:
+        """Delete expired copies of deleted records, then what the last of them referred to.
+
+        A delete keeps a record's event log, context bodies and tool results while a copy of
+        it is kept (#1860), and a deleted record is never set aside again, so nothing else
+        would ever remove them. `expire_set_aside` deletes a copy 30 days after it was set
+        aside once its record is gone (#1877); when no copy of that id is left and no record
+        has been saved under it since, this removes what `delete` would have.
+
+        The record and the copies are looked at again just before the history goes. A
+        session saved under the same id between that look and the removal loses its event
+        log and context bodies -- the window `delete` itself has. Never raises: this runs
+        when a store opens, and a store that cannot tidy up still opens.
+        """
+        for record in expire_set_aside(self._storage_dir, suffix=".json"):
+            session_id = record.name.removesuffix(".json")
+            try:
+                if self.session_path(session_id) != record:
+                    continue
+                if record.is_file() or kept_copies(record):
+                    continue
+                self.clear_event_log(session_id)  # the last copy is gone
+                if self._artifacts_dir is not None:
+                    cleanup_session_artifacts(self._artifacts_dir, session_id)
+            except Exception as exc:
+                logger.warning(
+                    "Could not remove the history of %r after its last kept copy expired (%s)",
+                    session_id,
+                    exc,
+                )
+                continue
+            logger.info(
+                "Removed the event log and tool results of %r: its record is gone and its "
+                "last kept copy expired",
+                session_id,
+            )
+
+    @staticmethod
+    def _has_kept_copy(path: Path) -> bool:
+        """Whether a copy of the record at `path` is set aside; `True` when that cannot be told.
+
+        Answering `True` when the directory cannot be listed keeps what a copy might need;
+        answering `False` would delete it on a guess. An empty copy is not one (#1877).
+        """
+        try:
+            return bool(kept_copies(path))
+        except OSError:
+            return True  # cannot tell, so keep what a copy may need
+
+    def take_set_aside(self, session_id: str) -> bool:
+        """Whether `save` moved this session's unreadable record aside since last asked; once each."""
+        if session_id not in self._set_aside:
+            return False
+        self._set_aside.discard(session_id)
+        return True
 
     def save(
         self, state: SessionState, pending_events: Sequence[Any] | None = None
@@ -1000,9 +1126,11 @@ class SessionStore:
           two-process failure does not.)
         * **An absent record accepts any revision.** There is no update to lose when the
           file is gone, and refusing would make a session unsavable after a legitimate
-          `delete`. A record that exists but does not parse is the same case for the same
-          reason — `load` reports it absent, and an unreadable record holds no update to
-          preserve.
+          `delete`. A record that exists but does not load holds no revision to compare
+          either, and is **moved aside, not written over** (#1844): it is most often a
+          conversation a newer build wrote, and this write would otherwise destroy it. The
+          move happens once the new record has validated, so a write refused for any
+          other reason leaves it where it was. `take_set_aside` then reports it once.
         * **This is a precondition, not a lock.** It closes the read-modify-write window
           that spans a turn, which is the one this defect actually arrives through, and
           leaves a sub-millisecond window in which two writers both pass the check and
@@ -1038,6 +1166,8 @@ class SessionStore:
             SessionEventLogNotConfiguredError: If `pending_events` is non-empty and the
                 store was built with only one of `log_writer` and `log_allocator`, so it
                 has nowhere to write them (#1442).
+            SessionRecordUnreadableError: If the record at this id's path cannot be read
+                and could not be moved aside. Nothing is written over it (#1844).
         """
         path = self.session_path(state.session_id)
         # Before anything is read or written, for the same reason as the revision check
@@ -1055,10 +1185,11 @@ class SessionStore:
                 f"default per-session event log."
             )
         # Read-then-check *before* serializing: a refused write must leave no trace, and
-        # the cheapest way to guarantee that is to decide before anything is built. Routed
-        # through `load` rather than a second reader here so a corrupt record is treated
-        # as absent by the same rule, once.
-        on_disk = self.load(state.session_id)
+        # the cheapest way to guarantee that is to decide before anything is built. A
+        # record that is there and will not load holds no revision to compare, so this
+        # write replaces nothing of it: it is moved aside below, once the write is known to
+        # be valid, and never written over (#1844).
+        on_disk, unreadable = self._read(state.session_id, path)
         if on_disk is not None and on_disk.revision != state.revision:
             raise StaleSessionWriteError(
                 f"Refusing to persist session {state.session_id!r}: it was read at "
@@ -1092,6 +1223,9 @@ class SessionStore:
             ) from exc
         clean_payload = json.dumps(validated.model_dump(mode="json"), indent=2)
         self._storage_dir.mkdir(parents=True, exist_ok=True)
+        if unreadable is not None:
+            self._set_aside_unreadable(path, unreadable)
+            self._set_aside.add(state.session_id)
         offsets: list[LogOffset] = []
         event_log = self._event_log_for(state.session_id) if pending_events else None
         if pending_events and event_log is not None:
@@ -1184,27 +1318,54 @@ class SessionStore:
         on `e8b3e2f`, `delete("SESSA")` returned `True` having unlinked `SessA.json`, so a
         caller could annihilate a conversation it had never named and be told it succeeded.
         `#256`'s table does not list this door — it was found by enumerating the store's
-        surface rather than the card's cases. Routed through `load` so the ownership rule
-        has one implementation and so an unparseable record stays deletable: `load` reports
-        it absent, it holds no id to compare, and refusing would make it impossible to
-        clear.
+        surface rather than the card's cases. Routed through the same reader as `load` so
+        the ownership rule has one implementation.
+
+        **An unreadable record is moved aside, not unlinked (#1844).** It holds no id to
+        compare, and refusing would make the session impossible to clear; but the person
+        clearing it is clearing a conversation this build showed as empty, and the record
+        is most often one a newer build wrote. So its name is freed and its bytes are kept.
+
+        **What a kept copy refers to is kept with it (#1860).** A record's event log,
+        context bodies and tool artifacts are found by session id, not by file name, so a
+        copy set aside -- by this delete or by an earlier save -- names the same ones. Removing
+        them would leave a copy that, restored by hand, has lost its tool results: the
+        reason `_has_record` spares them from the reaper. So while any copy of this id is
+        kept, the delete removes the record and nothing it refers to. Kept copies are
+        bounded (`uclone_x.core.set_aside.KEEP_SET_ASIDE`), so this is too.
 
         Raises:
             PathTraversalError: See `resolve_session_path`.
             SessionIdCollisionError: If the record at this id's path identifies a different
                 session. Nothing is unlinked.
+            SessionRecordUnreadableError: If the record cannot be read and could not be
+                moved aside. Nothing is removed.
         """
         path = self.session_path(session_id)
-        # Ownership before destruction. `load` raises on a foreign record and returns
-        # `None` for an absent or unparseable one, so this is the whole check.
-        self.load(session_id)
+        # Ownership before destruction. `_read` raises on a foreign record and returns no
+        # state for an absent or unreadable one, so this is the whole check.
+        _, unreadable = self._read(session_id, path)
         try:
             if not path.is_file():
                 return False
         except OSError:
             logger.warning("Cannot probe session record for %r; treating as absent", session_id)
             return False
-        path.unlink(missing_ok=True)
+        if unreadable is not None:
+            # Most likely a conversation a newer build wrote: kept, not unlinked (#1844).
+            self._set_aside_unreadable(path, cause=unreadable)
+        else:
+            path.unlink(missing_ok=True)
+        if self._has_kept_copy(path):
+            # A kept copy names this id's event log, context bodies and tool artifacts;
+            # they stay while it does (#1860).
+            logger.info(
+                "Session %r deleted; its event log and tool results are kept for the copy "
+                "set aside beside %s",
+                session_id,
+                path,
+            )
+            return True
         # The event log is this session's history too; deleting the record and keeping
         # every tool output it produced would make "delete" a claim the disk contradicts.
         self.clear_event_log(session_id)

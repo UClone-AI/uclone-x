@@ -5,14 +5,19 @@
  * The Core half is `src/uclone_x/agent/turn_trace.py` and the two routes in
  * `src/uclone_x/ui/room_dock.py` (#1490). The shapes below mirror their answers.
  *
- * **Reasons are rendered, never interpreted.** A trace the Core cannot give comes back as
- * `trace: null` with a `reason: {code, message}`, and the head prints `message`. The `code` is
- * for tests; no branch here reads it, so a code the Core adds later needs no change on this
- * side. The same holds for a step read that fails: whatever message the Core gave is shown.
+ * **A reason's code picks the sentence; its message is the fallback.** A trace the Core cannot
+ * give comes back as `trace: null` with a `reason: {code, message}`. The head says a code it
+ * knows in the reader's language (`dock.modelCalls.reasons`, #1903) and prints the Core's
+ * English `message` only for a code it does not know yet, so a code the Core adds later still
+ * reads, in English, until the catalogs learn it. Nothing else is decided by a code. A step
+ * read that fails is handled the same way, and a session-log check carries its own code
+ * (`from_log_code`).
  *
  * Read only in developer mode, and only on an explicit expand: the trace reads the whole
  * session log on every request (§6).
  */
+
+import { fmt } from '../i18n/format';
 
 const enc = encodeURIComponent;
 
@@ -35,12 +40,21 @@ export interface TraceReason {
 }
 
 /**
- * A reason as the head prints it: the Core's message, and its `detail` after it when there is
- * one. Neither `code` nor `detail` decides anything here; `detail` is only shown.
+ * Why a read gave no body, for the head to put in words: the Core's `{code, message}` (a trace
+ * reason, or a refusal's `detail`), the Core's bare message, or a failure of the answer itself.
+ * No sentence is built here; the panel words each kind from its catalog.
  */
-export const reasonLine = (reason: TraceReason | null | undefined): string | null => {
+export type TraceProblem =
+  | { kind: 'reason'; code: string; message: string; detail?: string | null }
+  | { kind: 'message'; status: number; message: string }
+  | { kind: 'unreachable'; detail: string }
+  | { kind: 'notJson' }
+  | { kind: 'http'; status: number };
+
+/** A reason the Core gave, or `null` when it gave none the head can print. */
+export const reasonProblem = (reason: TraceReason | null | undefined): TraceProblem | null => {
   if (!reason || typeof reason.message !== 'string' || reason.message.trim() === '') return null;
-  return reason.detail ? `${reason.message} (${reason.detail})` : reason.message;
+  return { kind: 'reason', code: String(reason.code ?? ''), message: reason.message, detail: reason.detail };
 };
 
 /** One tool call's result in full, as the session log holds it (not the room's preview). */
@@ -76,6 +90,11 @@ export interface TraceStep {
   step: number;
   request_status: 'ok' | 'unavailable';
   request_reason: string | null;
+  /**
+   * Why the request is unavailable, as a code (`turn_trace.py`'s `RequestReasonCode`, #1907);
+   * the head words it from its catalog. Absent from a Core older than the field.
+   */
+  request_code?: string | null;
   /** Whether the rebuilt request matched the recorded digest; `null` when unavailable. */
   verified: boolean | null;
   message_count: number | null;
@@ -84,6 +103,8 @@ export interface TraceStep {
   max_tokens: number | null;
   response_status: 'ok' | 'error' | 'unavailable';
   response_reason: string | null;
+  /** Why the response is unavailable, as a code (`ResponseReasonCode`, #1907). */
+  response_code?: string | null;
   response: ModelResponseRecord | null;
   tool_results: TraceToolResult[];
 }
@@ -154,37 +175,94 @@ export interface StepDetail {
   step: number;
   request: TraceRequest | null;
   request_reason: string | null;
+  /** As on `TraceStep`. */
+  request_code?: string | null;
   verified: boolean | null;
   layers: RequestLayers | null;
+  /**
+   * Whether the conversation this step sent is what the session log rebuilds for the step's
+   * own epoch (llm-request-layering.md §5.8, #1848): true when it is, false when it is not,
+   * `null` when it could not be checked -- `from_log_reason` then says why, where the Core
+   * gives a reason. Absent from a Core older than the field.
+   */
+  from_log?: boolean | null;
+  from_log_reason?: string | null;
+  /**
+   * Why the check was not made, as a code (`turn_trace.py`'s `FromLogCode`, #1903); the head
+   * words it from its catalog, and `from_log_reason` is the detail shown beside it.
+   */
+  from_log_code?: string | null;
+  /**
+   * For `epoch_unreadable`, what kind of gap stopped the epoch's rebuild, as a code
+   * (`request_record.py`'s `RecordErrorCode`, #1911). Absent from a Core older than the field.
+   */
+  from_log_detail_code?: string | null;
   response: ModelResponseRecord | null;
   response_reason: string | null;
+  /** As on `TraceStep`. */
+  response_code?: string | null;
   /** Present when the Core answers with a reason instead of a step. */
   reason?: TraceReason | null;
 }
 
-/** A read's outcome: the body, or the Core's own message for why there is none. */
+/**
+ * How a step's session-log check reads: it matched, it did not, or it was not made -- with the
+ * Core's code for why (`null` from a Core older than the code) and its English detail.
+ */
+export type FromLog =
+  | { status: 'matches' }
+  | { status: 'differs' }
+  | { status: 'unchecked'; code: string | null; detailCode: string | null; reason: string | null };
+
+/**
+ * A step's `from_log` as the head shows it, or `null` when the Core says nothing about it: a
+ * request that was not rebuilt (its own reason is shown already), or a Core older than the
+ * field.
+ */
+export const fromLog = (
+  detail: Pick<StepDetail, 'from_log' | 'from_log_reason' | 'from_log_code' | 'from_log_detail_code'>,
+): FromLog | null => {
+  if (detail.from_log === true) return { status: 'matches' };
+  if (detail.from_log === false) return { status: 'differs' };
+  const reason = typeof detail.from_log_reason === 'string' && detail.from_log_reason.trim() !== ''
+    ? detail.from_log_reason
+    : null;
+  const code = typeof detail.from_log_code === 'string' && detail.from_log_code !== ''
+    ? detail.from_log_code
+    : null;
+  const detailCode =
+    typeof detail.from_log_detail_code === 'string' && detail.from_log_detail_code !== ''
+      ? detail.from_log_detail_code
+      : null;
+  if (code !== null || reason !== null) return { status: 'unchecked', code, detailCode, reason };
+  return null;
+};
+
+/** A read's outcome: the body, or why there is none. */
 export type TraceRead<T> =
   | { status: 'loading' }
   | { status: 'ok'; data: T }
-  | { status: 'failed'; message: string };
+  | { status: 'failed'; problem: TraceProblem };
 
 /**
- * The message a failed answer carries: `detail` as a string, or `detail.message`, which is the
- * shape the trace routes refuse with (`{code, message}`). Anything else is the status line.
+ * Why a failed answer failed: `detail` as a string, or `detail` as the `{code, message}` the
+ * trace routes refuse with. Anything else is the status alone.
  */
-export const failureMessage = (status: number, body: unknown): string => {
+export const failureProblem = (status: number, body: unknown): TraceProblem => {
   if (typeof body === 'object' && body !== null && 'detail' in body) {
     const detail = (body as { detail: unknown }).detail;
-    if (typeof detail === 'string' && detail.trim() !== '') return detail;
+    if (typeof detail === 'string' && detail.trim() !== '') return { kind: 'message', status, message: detail };
     if (typeof detail === 'object' && detail !== null && 'message' in detail) {
-      const message = (detail as { message: unknown }).message;
-      if (typeof message === 'string' && message.trim() !== '') return message;
+      const { code, message } = detail as { code?: unknown; message: unknown };
+      if (typeof message === 'string' && message.trim() !== '') {
+        return { kind: 'reason', code: typeof code === 'string' ? code : '', message };
+      }
     }
   }
-  return `The runtime answered HTTP ${status} with no explanation.`;
+  return { kind: 'http', status };
 };
 
-/** One `GET` of a trace route. Never throws: a failure is a message to print. */
+/** One `GET` of a trace route. Never throws: a failure is a problem to word. */
 export async function readTrace<T>(url: string): Promise<TraceRead<T>> {
   let res: Response;
   try {
@@ -192,18 +270,16 @@ export async function readTrace<T>(url: string): Promise<TraceRead<T>> {
   } catch (err) {
     return {
       status: 'failed',
-      message: `The runtime did not answer: ${err instanceof Error ? err.message : String(err)}`,
+      problem: { kind: 'unreachable', detail: err instanceof Error ? err.message : String(err) },
     };
   }
   let body: unknown = null;
   try {
     body = await res.json();
   } catch {
-    if (res.ok) {
-      return { status: 'failed', message: 'The runtime answered with something that is not JSON.' };
-    }
+    if (res.ok) return { status: 'failed', problem: { kind: 'notJson' } };
   }
-  if (!res.ok) return { status: 'failed', message: failureMessage(res.status, body) };
+  if (!res.ok) return { status: 'failed', problem: failureProblem(res.status, body) };
   return { status: 'ok', data: body as T };
 }
 
@@ -222,20 +298,29 @@ const count = (usage: Record<string, unknown> | null, key: string): number | nul
   return typeof value === 'number' ? value : null;
 };
 
+/** The two worded parts of a step's headline, from the catalog (`dock.modelCalls.headline`). */
+export interface HeadlineWords {
+  /** `{step}`. */
+  step: string;
+  /** `{input}` and `{output}`, already formatted. */
+  tokens: string;
+}
+
 /**
- * A step's headline: `step n · model · 1,234 → 210 tokens · 3.7s · finish_reason`.
+ * A step's headline: `step n · model · 1,234 → 210 tokens · 3.7s · finish_reason`, with the
+ * step and token parts worded by `words`.
  *
  * A part nothing recorded is left out rather than drawn as a zero.
  */
-export const stepHeadline = (step: TraceStep): string => {
+export const stepHeadline = (step: TraceStep, words: HeadlineWords): string => {
   const response = step.response;
-  const parts = [`step ${step.step}`];
+  const parts = [fmt(words.step, { step: step.step })];
   const model = response?.model_name ?? step.model;
   if (model) parts.push(model);
   const input = count(response?.usage ?? null, 'input_tokens');
   const output = count(response?.usage ?? null, 'output_tokens');
   if (input !== null && output !== null) {
-    parts.push(`${input.toLocaleString()} → ${output.toLocaleString()} tokens`);
+    parts.push(fmt(words.tokens, { input: input.toLocaleString(), output: output.toLocaleString() }));
   }
   const ms = response ? durationMs(response.started_at, response.ended_at) : null;
   if (ms !== null) parts.push(formatDuration(ms));

@@ -24,6 +24,10 @@
     "noneListed": "{name}의 사실이 목록에 없습니다.",
     "hereHeading": "이 대화에서 알게 된 내용",
     "elsewhereHeading": "다른 대화에서 알게 된 내용",
+    "workedOutHeading": "이 사실들로 알아낸 내용",
+    "workedOut": "알아냄",
+    "workedOutFrom": "근거: {facts}",
+    "workedOutJoin": "; ",
     "origin": {
       "told": "들음",
       "found": "찾음",
@@ -128,5 +132,176 @@
     "aspect": "비율",
     "size": "크기",
     "time": "시간"
+  },
+  "modelCalls": {
+    "title": "모델 호출",
+    "loadingTurn": "세션 로그에서 이 턴의 모델 호출을 읽는 중입니다...",
+    "loadingStep": "세션 로그에서 이 호출을 읽는 중입니다...",
+    "noTrace": "런타임이 추적 결과도, 결과가 없는 이유도 알려 주지 않았습니다.",
+    "rolledBack": "이 턴은 롤백되어 대화에 아무것도 남지 않았습니다. 호출은 로그에 기록된 그대로 보여 줍니다.",
+    "helpers": "도우미 에이전트가 실행되었습니다 ({names}). 도우미 자신의 모델 호출은 보관하지 않습니다.",
+    "helpersUnreadable": "도우미 에이전트를 가리키는 도구 결과를 읽지 못했습니다. 이 목록에서 도우미가 빠졌을 수 있습니다.",
+    "noSteps": "세션 로그에 이 턴의 모델 호출이 없습니다.",
+    "headline": {
+      "step": "{step}단계",
+      "tokens": "{input} → {output}토큰"
+    },
+    "verified": "검증됨",
+    "notVerified": "검증되지 않음",
+    "callFailed": "호출 실패",
+    "rowRequest": "요청:",
+    "rowResponse": "응답:",
+    "rowRequestNoReason": "요청을 읽을 수 없고, 런타임이 이유를 알려 주지 않았습니다.",
+    "rowResponseNoReason": "응답을 읽을 수 없고, 런타임이 이유를 알려 주지 않았습니다.",
+    "unverified": "저장된 기록으로 다시 만든 요청입니다. 자격 증명처럼 보이는 문자열을 가렸으므로 실제로 보낸 요청과 다를 수 있습니다.",
+    "tabs": {
+      "request": "요청",
+      "tools": "제공한 도구",
+      "response": "응답",
+      "raw": "원본"
+    },
+    "layers": {
+      "identity": "정체성",
+      "slowContext": "느린 컨텍스트",
+      "turnContext": "턴 컨텍스트"
+    },
+    "noSlowContext": "이 요청의 시스템 메시지에는 느린 컨텍스트가 없었습니다.",
+    "noMessageText": "이 메시지에는 텍스트가 없었습니다.",
+    "calls": "{name} 호출",
+    "noTools": "이 요청은 모델에 도구를 제공하지 않았습니다.",
+    "noRequest": "런타임이 요청도, 요청이 없는 이유도 알려 주지 않았습니다.",
+    "noResponse": "런타임이 응답도, 응답이 없는 이유도 알려 주지 않았습니다.",
+    "missingRequest": "요청을 읽을 수 없습니다. 런타임이 알려 준 이유:",
+    "missingResponse": "응답을 읽을 수 없습니다. 런타임이 알려 준 이유:",
+    "response": {
+      "content": "내용",
+      "thinking": "생각",
+      "toolCalls": "도구 호출",
+      "error": "오류",
+      "noText": "응답에 텍스트가 없었습니다."
+    },
+    "copy": {
+      "idle": "JSON으로 복사",
+      "done": "복사했습니다",
+      "failed": "복사하지 못했습니다"
+    },
+    "toolResults": "도구 결과 전체",
+    "statusNotRecorded": "상태가 기록되지 않음",
+    "noOutput": "로그에 이 호출의 출력이 없습니다.",
+    "failure": {
+      "unreachable": "런타임이 응답하지 않았습니다:",
+      "notJson": "런타임이 JSON이 아닌 응답을 보냈습니다.",
+      "http": "런타임이 설명 없이 HTTP {status} 응답을 보냈습니다.",
+      "refused": "런타임이 이 읽기 요청을 거부했습니다(HTTP {status})."
+    },
+    "reasons": {
+      "not_an_agent_turn": "이 턴은 에이전트가 아니라 사람이 말한 것입니다.",
+      "turn_not_linked": "턴을 세션에 연결하기 전(#1489)에 기록된 턴이라 모델 호출을 찾을 수 없습니다.",
+      "turn_not_saved": "이 턴의 기록이 저장되지 않아 모델 호출을 보여 줄 수 없습니다.",
+      "session_not_found": "이 참여자의 저장된 세션을 찾지 못했습니다.",
+      "session_unreadable": "이 참여자의 저장된 세션을 읽지 못해 턴을 추적할 수 없습니다.",
+      "log_missing": "이 참여자의 세션 로그를 찾지 못했습니다.",
+      "log_unreadable": "이 참여자의 세션 로그를 읽지 못해 턴을 추적할 수 없습니다.",
+      "trace_failed": "이 턴의 기록을 다시 읽지 못해 모델 호출을 보여 줄 수 없습니다.",
+      "turn_not_found": "이 대화에서 {seq}번 턴을 찾지 못했습니다.",
+      "step_not_found": "{seq}번 턴에서 {step}단계를 찾지 못했습니다."
+    },
+    "fromLog": {
+      "matches": "이 호출이 보낸 대화는 세션 로그로 다시 만든 대화와 일치합니다.",
+      "differs": "이 호출이 보낸 대화는 세션 로그로 다시 만든 대화와 다릅니다.",
+      "unchecked": "세션 로그와 대조하지 못했습니다. 런타임이 알려 준 이유:",
+      "uncheckedNoReason": "세션 로그와 대조하지 못했고, 런타임이 이유를 알려 주지 않았습니다.",
+      "reasons": {
+        "no_context_state": "세션 로그와 대조하지 못했습니다. 이 세션에는 컨텍스트 상태가 기록되어 있지 않습니다.",
+        "no_epoch_for_request": "세션 로그와 대조하지 못했습니다. 이 요청 이전에 열린 컨텍스트 에포크가 없습니다.",
+        "epoch_unreadable": "세션 로그와 대조하지 못했습니다. 이 호출의 에포크를 세션 로그로 다시 만들지 못했습니다."
+      },
+      "details": {
+        "body_missing": "기록 일부가 없습니다.",
+        "snapshot_missing": "필요한 컨텍스트 스냅샷이 없습니다.",
+        "log_entry_missing": "에포크가 가리키는 항목이 세션 로그에 없습니다.",
+        "chain_broken": "바탕이 되는 이전 요청이 세션 로그에 없습니다.",
+        "before_capture": "요청 캡처가 도입되기 전(#1421)에 기록되었습니다.",
+        "unreadable": "기록 일부를 읽지 못했습니다.",
+        "epoch_mismatch": "에포크의 항목이 세션 로그와 맞지 않습니다."
+      }
+    },
+    "requestReasons": {
+      "not_recorded": "이 호출의 요청이 기록되어 있지 않습니다.",
+      "before_capture": "요청 캡처가 도입되기 전(#1421)에 기록된 요청이라 다시 만들 수 없습니다.",
+      "body_missing": "이 요청의 기록 일부가 없어 다시 만들 수 없습니다.",
+      "snapshot_missing": "이 요청의 컨텍스트 스냅샷이 없어 다시 만들 수 없습니다.",
+      "log_entry_missing": "이 요청에 필요한 항목이 세션 로그에 없어 다시 만들 수 없습니다.",
+      "chain_broken": "이 요청의 바탕이 되는 이전 요청이 세션 로그에 없어 다시 만들 수 없습니다.",
+      "unreadable": "이 요청의 기록 일부를 읽지 못해 다시 만들 수 없습니다.",
+      "epoch_mismatch": "컨텍스트 상태가 세션 로그 항목과 맞지 않아 이 요청을 다시 만들 수 없습니다."
+    },
+    "responseReasons": {
+      "not_recorded": "이 호출의 응답이 기록되어 있지 않습니다. 응답은 #1489부터 기록합니다."
+    },
+    "logFailures": {
+      "unknown_event_type": "이 버전이 모르는 이벤트가 들어 있습니다.",
+      "malformed_log": "세션 로그 형식이 아닙니다.",
+      "not_text": "읽을 수 있는 텍스트가 아닙니다.",
+      "read_failed": "디스크에서 파일을 읽지 못했습니다.",
+      "unexpected": "런타임이 예상하지 못한 오류입니다. 자세한 내용은 서버 로그에 있습니다."
+    }
+  },
+  "topology": {
+    "title": "이 대화의 진행 방식",
+    "subtitle": "참여자, 순서대로 진행된 턴, 각 턴이 호출한 도구, 참여자가 시작한 도우미 에이전트입니다",
+    "summary": "참여자 {seats}명 · 턴 {turns}개 · 목록의 도구 호출 {toolCalls}개 · 도우미 에이전트 {helpers}개",
+    "refresh": "새로 고침",
+    "noRoom": "열린 대화가 없습니다. 사이드바에서 대화를 열면 대화가 어떻게 진행되었는지 볼 수 있습니다.",
+    "readFailed": "이 대화의 그래프를 읽지 못했습니다:",
+    "loading": "이 대화를 읽는 중입니다…",
+    "historyGaps": "다음 이유로 이 그래프에서 턴이 빠졌을 수 있습니다:",
+    "historyComplete": "이 그래프에서 빠진 것으로 알려진 턴은 없습니다.",
+    "toolCallGaps": "다음 이유로 표시된 턴에서 도구 호출이 빠졌을 수 있습니다:",
+    "reasons": {
+      "no_seat": "이 대화에 참여 중인 에이전트가 없습니다."
+    },
+    "historyGapReasons": {
+      "before_record": "이 대화는 기록이 모두 남기 전에 시작되었습니다.",
+      "cleared": "대화 기록이 지워졌습니다.",
+      "rewound": "대화 기록이 되감겼습니다.",
+      "unsaved": {
+        "one": "턴 {count}개가 시작되었지만 결과를 저장하기 전에 멈췄거나, 다른 앱 인스턴스에서 아직 실행 중입니다.",
+        "other": "턴 {count}개가 시작되었지만 결과를 저장하기 전에 멈췄거나, 다른 앱 인스턴스에서 아직 실행 중입니다."
+      },
+      "uncounted": "이 대화가 턴 시작을 세기 전에 진행된 턴이 있습니다."
+    },
+    "toolCallGapReasons": {
+      "saved_without_tools": {
+        "one": "턴 {count}개가 사용한 도구를 기록하지 않은 채 저장되었습니다.",
+        "other": "턴 {count}개가 사용한 도구를 기록하지 않은 채 저장되었습니다."
+      },
+      "unreported": {
+        "one": "턴 {count}개가 사용한 도구를 보고하기 전에 끝났습니다.",
+        "other": "턴 {count}개가 사용한 도구를 보고하기 전에 끝났습니다."
+      }
+    },
+    "helperCallsNote": "표시된 도구 호출은 각 턴이 보고한 것입니다. 도우미 에이전트 자신의 호출은 표시하지 않습니다.",
+    "left": "나감",
+    "running": "실행 중",
+    "noSeatTurns": "목록에 있는 턴이 없습니다.",
+    "seatTurns": {
+      "one": "턴 {count}개",
+      "other": "턴 {count}개"
+    },
+    "startedHelper": "도우미 에이전트를 시작했습니다 ({id})",
+    "noTurns": "이 대화에서 목록에 있는 턴이 없습니다.",
+    "toolsNotRecorded": "이 턴은 사용한 도구를 모두 기록하지 않았습니다.",
+    "noToolCalls": "목록에 있는 도구 호출이 없습니다.",
+    "turnStatus": {
+      "answered": "답변함",
+      "failed": "실패",
+      "interrupted": "중단됨"
+    },
+    "toolStatus": {
+      "success": "성공",
+      "running": "실행 중",
+      "error": "오류"
+    }
   }
 }

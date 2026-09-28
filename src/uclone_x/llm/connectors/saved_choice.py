@@ -40,6 +40,7 @@ acts on a saved choice reports that it came from here, via :func:`describe_saved
 from __future__ import annotations
 
 import json
+import logging
 import os
 import tempfile
 from collections.abc import Generator, Mapping
@@ -48,7 +49,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, cast
 
+from uclone_x.core.set_aside import set_aside_unreadable
 from uclone_x.llm.providers import PROVIDERS, canonical_provider
+
+logger = logging.getLogger(__name__)
+
+#: The set-aside's log line: the two paths, never the contents -- the file holds API keys.
+_SET_ASIDE_LOG = (
+    "Settings file %s could not be read; it was moved aside, unchanged, to %s before this save"
+)
 
 try:
     import fcntl
@@ -285,18 +294,26 @@ def _locked(target: Path) -> Generator[None]:
         os.close(fd)  # closing the descriptor releases the lock
 
 
-def _current(
-    target: Path, replace_unreadable_with: Mapping[str, Any] | None = None
-) -> dict[str, Any]:
+def _current(target: Path) -> dict[str, Any]:
     """The file's contents for a merge; ``ValueError`` when it exists but cannot be read."""
     if not target.exists():
         return {}
     current = _read_settings(target)
     if current is not None:
         return current
-    if replace_unreadable_with is not None:
-        return dict(replace_unreadable_with)
     raise ValueError(f"{target} could not be read, so it was left as it is")
+
+
+def _set_aside_settings(target: Path) -> Path:
+    """Move the unreadable settings file aside, never writing over it (#1844); log where.
+
+    It may be a newer build's settings, API keys included, that this build cannot parse. If
+    the rename fails, the ``OSError`` stops the write and the file stays where it was. The
+    log names the two paths and nothing the file holds: it holds keys (#1860).
+    """
+    aside = set_aside_unreadable(target)
+    logger.warning(_SET_ASIDE_LOG, target, aside)
+    return aside
 
 
 def _fold_legacy_key(data: dict[str, Any], *, replace: bool) -> None:
@@ -356,7 +373,7 @@ def update_settings_file(
     *,
     path: Path | None = None,
     replace_unreadable_with: Mapping[str, Any] | None = None,
-) -> None:
+) -> Path | None:
     """Merge ``updates`` into the settings file, keeping every key they do not name.
 
     The one writer of the file, for setup and for the dashboard alike. It re-reads the
@@ -368,11 +385,23 @@ def update_settings_file(
     A file that exists but cannot be read raises ``ValueError`` and is left as it is,
     unless the caller passes ``replace_unreadable_with`` -- the whole state it holds, which
     the dashboard does because a Settings save is the person stating every value there.
-    Raises ``OSError`` when the file cannot be written.
+    Even then the unreadable file is first renamed to ``settings.json.unreadable-<UTC
+    time>`` beside it, so its contents are kept rather than written over; that new path is
+    returned, so the caller can tell the person (#1860). ``None`` when nothing was set aside.
+    Raises ``OSError`` when the file cannot be written or set aside.
     """
     target = path if path is not None else settings_file()
     with _locked(target):
-        _merge(target, _current(target, replace_unreadable_with), updates)
+        aside: Path | None = None
+        try:
+            current = _current(target)
+        except ValueError:
+            if replace_unreadable_with is None:
+                raise
+            aside = _set_aside_settings(target)
+            current = dict(replace_unreadable_with)
+        _merge(target, current, updates)
+        return aside
 
 
 def remember_choice_if_unset(

@@ -4,9 +4,14 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from enum import StrEnum
-from typing import Self
+from typing import Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    model_validator,
+)
 
 from uclone_x.core.immutable import ImmutableIntMapping, ImmutableJsonMapping
 from uclone_x.core.provenance import Provenance
@@ -103,12 +108,31 @@ class ChatMessage(BaseModel):
         "issue #183's. Only meaningful on a `SYSTEM` message.",
     )
 
+    form: Literal["excerpt", "stub"] | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+        description="For a `TOOL` message that holds less than the result it answers with: "
+        "`excerpt` for a head and tail within a cap, `stub` for the one-line form a "
+        "compaction leaves (design `llm-request-layering.md` §5.8, *Forms*). Set where the "
+        "shortening is decided -- ingest, the step budget, the compactor -- so the context "
+        "state records it rather than reading it back from the text, which a tool's own "
+        "output can imitate (#1854). `None` is the whole result, and is left out of a dump, "
+        "so a message without a form serialises as it did before the field existed. Like "
+        "`compaction_ledger`, it is not sent to a provider. Only meaningful on a `TOOL` "
+        "message.",
+    )
+
     @model_validator(mode="after")
     def _validate_compaction_ledger_role(self) -> Self:
         if self.compaction_ledger and self.role != MessageRole.SYSTEM:
             raise ValueError(
                 "compaction_ledger=True is only meaningful and permitted on MessageRole.SYSTEM "
                 f"messages (got role={self.role.value!r}) (#204)"
+            )
+        if self.form is not None and self.role != MessageRole.TOOL:
+            raise ValueError(
+                f"form={self.form!r} is only meaningful and permitted on MessageRole.TOOL "
+                f"messages (got role={self.role.value!r}) (#1854)"
             )
         return self
 
@@ -151,6 +175,27 @@ class TokenUsage(BaseModel):
         "Defaulted to `PROVIDER` because a connector building usage from a provider "
         "response is the normal producer; a producer that substitutes figures must say so.",
     )
+    cache_creation_input_tokens: int | None = Field(
+        default=None,
+        ge=0,
+        exclude_if=lambda created: created is None,
+        description="Of `input_tokens`, how many the provider wrote to its prompt cache "
+        "(Anthropic's `cache_creation_input_tokens`, #1371). A subset of `input_tokens`, "
+        "never added to it again. `None` means the provider reported no figure, which is "
+        "not 0 (P6); a record without one serializes exactly as it did before the field "
+        "existed (#1844).",
+    )
+    cache_read_input_tokens: int | None = Field(
+        default=None,
+        ge=0,
+        exclude_if=lambda read: read is None,
+        description="Of `input_tokens`, how many the provider served from its prompt cache "
+        "(Anthropic's `cache_read_input_tokens`; OpenAI-compatible "
+        "`prompt_tokens_details.cached_tokens`; Gemini's `cachedContentTokenCount`, #1371). "
+        "A subset of `input_tokens`. `None` "
+        "means the provider reported no figure, which is not 0 (P6); a record without one "
+        "serializes exactly as it did before the field existed (#1844).",
+    )
 
     @model_validator(mode="after")
     def _validate_or_derive_total(self) -> Self:
@@ -170,6 +215,8 @@ def aggregate_token_usages(usages: Sequence[TokenUsage]) -> TokenUsage | None:
     Returns None if no usage records are provided (i.e. no model calls completed).
     `count_source` is `TokenCountSource.PROVIDER` only if every step's source was `PROVIDER`.
     Otherwise, the least certain source across steps is used (ESTIMATE < PROVIDER).
+    A cache count is summed only when every step reported it; one step without a figure
+    makes the sum unknown (`None`), never an undercount (#1371).
     """
     if not usages:
         return None
@@ -192,7 +239,17 @@ def aggregate_token_usages(usages: Sequence[TokenUsage]) -> TokenUsage | None:
         output_tokens=output_tokens,
         total_tokens=total_tokens,
         count_source=count_source,
+        cache_creation_input_tokens=_sum_if_all_reported(
+            [u.cache_creation_input_tokens for u in usages]
+        ),
+        cache_read_input_tokens=_sum_if_all_reported([u.cache_read_input_tokens for u in usages]),
     )
+
+
+def _sum_if_all_reported(counts: Sequence[int | None]) -> int | None:
+    """The sum when every count is known, else `None`: a partial sum would understate."""
+    known = [c for c in counts if c is not None]
+    return sum(known) if len(known) == len(counts) else None
 
 
 class ModelResponse(BaseModel):
@@ -327,6 +384,13 @@ class CompactionOutcome(BaseModel):
         default_factory=tuple,
         description="The compacted context, in order: anchors, retained ledgers, the "
         "new ledger if any, then the recent window.",
+    )
+    origins: tuple[int | None, ...] = Field(
+        default=(),
+        description="Per message of `messages`, the index of the input message it renders "
+        "-- kept as it was or pruned -- or `None` for a ledger this pass wrote (#1848). The "
+        "caller derives the new epoch's forms from it. Empty when the compactor does not "
+        "say; the caller then takes each message's form as recorded on it.",
     )
     ledger_source: LedgerSource = Field(
         description="Required. A defaulted source would let an unattributed ledger pass "

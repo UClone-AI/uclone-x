@@ -4,6 +4,8 @@ import { PersonaInfo } from '../../types';
 import { personaPicture } from '../../lib/avatarChoice';
 import { AvatarMenu } from '../avatar/AvatarMenu';
 import { PersonaDetail } from '../layout/PersonaDetail';
+import { CloneLinkLine } from './CloneLinkLine';
+import { CloneSkillNotice } from './CloneSkillNotice';
 import { PersonaEditor } from '../personas/PersonaEditor';
 import {
   draftFromPersona,
@@ -274,6 +276,7 @@ export const CloneProfile: React.FC<CloneProfileProps> = ({
         >
           {persona?.role || t.noRole}
         </p>
+        <CloneLinkLine cloneId={cloneId} />
       </div>
 
       <div className="flex items-center gap-2">
@@ -304,7 +307,10 @@ export const CloneProfile: React.FC<CloneProfileProps> = ({
       </div>
 
       {persona ? (
-        <PersonaDetail persona={persona} />
+        <>
+          <PersonaDetail persona={persona} />
+          <CloneSkillNotice cloneId={cloneId} />
+        </>
       ) : (
         // A clone can be running with no file installed under its name -- the rail builds a
         // row from the live instance in that case. Saying so is the point: "this clone has no

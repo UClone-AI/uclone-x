@@ -29,6 +29,7 @@ from typing import Any, cast
 import pytest
 from pydantic import BaseModel, Field
 
+from tests.support.app_clone import app_clone
 from uclone_x.agent.base import BaseAgent
 from uclone_x.agent.composition import HostDependencies
 from uclone_x.agent.models import AgentConfig, AgentLLMConfig
@@ -206,7 +207,7 @@ class TestTheStoresTheHeadsBuildWriteEvents:
         session_id = "sess_ui_events"
 
         async def turn() -> None:
-            agent = await manager.get_or_create_agent("agent-general", session_id=session_id)
+            agent = app_clone(manager, "agent-general", session_id)
             result = await agent.execute_turn("read a")
             assert result.error is None, result.error
             agent.persist_session(session_id=session_id)  # a turn's events land with its save
@@ -504,15 +505,14 @@ class TestTheDefaultEventLog:
         log_path = tmp_path / CORE_RECORD_SUBDIR / EVENT_LOG_SUBDIR / f"{session_id}.jsonl"
 
         async def conversation() -> None:
-            agent = await manager.get_or_create_agent("agent-general", session_id=session_id)
+            agent = app_clone(manager, "agent-general", session_id)
             assert (await agent.execute_turn("read a")).error is None
             agent.persist_session(session_id=session_id)
             assert "first conversation body" in log_path.read_text()
-            assert manager.get_agent("agent-general", session_id) is not None, (
-                "no live agent, so this would test the delete branch instead"
-            )
 
-            manager.clear_session_history("agent-general", session_id)
+            # Named, as a room names its seat's agent: without it this would test the
+            # delete branch instead.
+            manager.clear_session_history("agent-general", session_id, agent=agent)
             assert not log_path.exists(), "the cleared conversation's events are still on disk"
             assert not log_path.with_suffix(".cursor").exists()
 

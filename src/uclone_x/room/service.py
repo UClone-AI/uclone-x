@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from datetime import UTC, datetime
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -31,6 +31,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from uclone_x.core.agent_home import AgentHomeError, refuse_an_unusable_username
 from uclone_x.core.session import validate_session_id
 from uclone_x.errors import (
+    HeadRoomWriteError,
     PathTraversalError,
     RoomAlreadyExistsError,
     RoomError,
@@ -48,26 +49,24 @@ from uclone_x.room.models import (
     RoomMessageKind,
     RoomPolicy,
     RoomState,
+    head_room_write_refusal,
+    room_head,
+    server_head_of_id,
 )
 from uclone_x.room.protocols import RoomStoreProtocol, StoryLeaseProtocol
 
 __all__ = [
-    "ONTOLOGY_NAMESPACE_ROOT",
     "SESSION_ID_PREFIX",
     "SESSION_ID_SEPARATOR",
     "RoomListing",
     "RoomService",
     "RoomSummary",
     "participant_session_id",
+    "refuse_an_underivable_id",
+    "refuse_another_heads_id",
 ]
 
 logger = logging.getLogger(__name__)
-
-#: Root IRI under which each room participant's own ontology namespace is minted. One
-#: namespace per `(room, agent)` pair, never shared: merging two agents' induced concepts
-#: destroys the per-agent grounding P7 requires.
-ONTOLOGY_NAMESPACE_ROOT = "https://uclone-x.ai/ontology"
-
 
 #: Prefix for derived room-scoped session ids. Follows the UClone-X `sess_*` convention
 #: to prevent namespace confusion with room identifiers (`room_*`).
@@ -124,6 +123,42 @@ def _refuse_an_id_the_derivation_cannot_carry(label: str, value: str) -> None:
             f"one session, which is two writers on one record and the isolation the room "
             f"derives these ids to guarantee."
         )
+
+
+#: Whose conversations a server head's id shape is kept for, as the refusal words it.
+_SERVER_HEAD_ID_OWNERS = {
+    "acp": "conversations an editor opens",
+    "a2a": "conversations another agent starts with a clone",
+}
+
+
+def refuse_another_heads_id(room_id: str, head: str | None, *, label: str = "Room id") -> None:
+    """Refuse `room_id` when it has a server head's id shape and `head` is not that head.
+
+    `room_head` reads an unmarked `acp_`/`a2a_` + 24-hex room as that head's (#1890), so
+    only that head may mint one (#1885). Worded for any creator -- `ucx room create --id`,
+    another head's `--session-id` -- with no flag in it. `label` names the id as the
+    person typed it: `run` and `loop` take it as a session id (#1900). A head checks a new
+    id with it before its first turn runs, since the room is written only after that turn.
+
+    Raises:
+        RoomError: The id is reserved for another head's conversations.
+    """
+    owner = server_head_of_id(room_id)
+    if owner is not None and owner != head:
+        raise RoomError(
+            f"{label} {room_id!r} is reserved: ids of this form belong to "
+            f"{_SERVER_HEAD_ID_OWNERS[owner]}. Choose another id, or leave it out to get "
+            f"a new one."
+        )
+
+
+def refuse_an_underivable_id(label: str, value: str) -> None:
+    """`_refuse_an_id_the_derivation_cannot_carry`, for a caller that checks an id before
+    anything is written under it -- a head resolving a room it will write only with its
+    first turn (`room/one_seat.py`).
+    """
+    _refuse_an_id_the_derivation_cannot_carry(label, value)
 
 
 def _floor_after(
@@ -201,11 +236,6 @@ def _clean_title(title: str) -> str:
             "A room title must not contain ANSI escape sequences: it is stored and rendered to terminals."
         )
     return cleaned
-
-
-def participant_namespace(room_id: str, participant_id: str) -> str:
-    """The ontology namespace an agent keeps for its part in one room (P7, G4)."""
-    return f"{ONTOLOGY_NAMESPACE_ROOT}/{room_id}/{participant_id}"
 
 
 class RoomSummary(BaseModel):
@@ -296,12 +326,21 @@ class RoomService:
         *,
         room_id: str | None = None,
         policy: RoomPolicy | None = None,
+        head: str | None = None,
+        seats: Sequence[tuple[str, ParticipantKind]] = (),
     ) -> RoomState:
-        """Create and persist an empty, titled room.
+        """Create and persist a titled room, with `seats` seated in order.
 
-        Empty on purpose: a participant arrives through `add_participant`, so the joins
-        that formed the room are in its transcript like any other roster change, and there
-        is one code path that seats somebody rather than two that must agree.
+        `head` names the head that keeps the room (`RoomState.head`); only a head's
+        one-seat room passes it.
+
+        **One save** (#1885 item 3). Each seat is taken by the same step `add_participant`
+        takes (`_seated`), so the joins that formed the room are in its transcript like any
+        other roster change and there is one code path that seats somebody. They are
+        applied in memory and the room is written once: before this, a room was written
+        empty and then once per seat, and a crash between those writes left a room that
+        seated nobody -- listed, and never answerable. A seat that is refused leaves
+        nothing written.
 
         Raises:
             RoomError: `title` is blank. A room whose title is whitespace is the opaque
@@ -309,6 +348,10 @@ class RoomService:
                 it while looking like a feature. Or `room_id` is one the session-id
                 derivation cannot carry unambiguously.
             RoomAlreadyExistsError: `room_id` already names a stored room.
+            RoomError: `room_id` has the shape an ACP or A2A head's room id has
+                (`server_head_of_id`) and `head` is not that head (#1885). An unmarked
+                room under such an id is read as that head's, so a room another creator
+                made there would be refused everywhere, its maker included.
         """
         cleaned = _clean_title(title)
 
@@ -322,8 +365,11 @@ class RoomService:
             "policy": policy or RoomPolicy(),
             "file_record": RoomFileRecord(kept_since_creation=True),
         }
+        if head is not None:
+            seed["head"] = head
         if room_id is not None:
             _refuse_an_id_the_derivation_cannot_carry("Room id", room_id)
+            refuse_another_heads_id(room_id, head)
             seed["room_id"] = room_id
         state = RoomState.model_validate(seed)
         if self._store.load(state.room_id) is not None:
@@ -331,6 +377,8 @@ class RoomService:
                 f"Room {state.room_id!r} already exists; refusing to overwrite its "
                 f"conversation. Pick another id, or open the one that is there."
             )
+        for participant_id, kind in seats:
+            state = self._seated(state, participant_id, kind=kind)
         return self._store.save(state)
 
     def get(self, room_id: str) -> RoomState:
@@ -347,6 +395,27 @@ class RoomService:
                 f"No room {room_id!r} in the store: it has been deleted, or was never "
                 f"created. List the rooms to see the ones that exist."
             )
+        return state
+
+    def _writable(self, room_id: str) -> RoomState:
+        """The room under `room_id`, for a change made from outside it; refused in a head's.
+
+        A room has a single owner (owner ruling). A room a head keeps (`room_head`) is
+        written by that head alone, so every change a person asks for here -- rename,
+        roster, responder, rewind, clear, opening a story -- is refused before anything is
+        saved (#1885). Here rather than only in the app's route guard, so `ucx room add`,
+        `remove` and `responder` and a route that names the room in its body are refused
+        by the same check. The head itself writes through `create` and the store, never
+        through these.
+
+        Raises:
+            RoomNotFoundError: No such room.
+            HeadRoomWriteError: A head keeps the room.
+        """
+        state = self.get(room_id)
+        head = room_head(state)
+        if head is not None:
+            raise HeadRoomWriteError(head_room_write_refusal(head))
         return state
 
     def rename(self, room_id: str, title: str) -> RoomState:
@@ -369,7 +438,7 @@ class RoomService:
             StaleRoomWriteError: Another writer moved the room first.
         """
         cleaned = _clean_title(title)
-        state = self.get(room_id)
+        state = self._writable(room_id)
         return self._store.save(state.model_copy(update={"title": cleaned}))
 
     def set_story(self, room_id: str, story_id: str | None) -> RoomState:
@@ -382,9 +451,13 @@ class RoomService:
 
         Raises:
             RoomNotFoundError: No room under that id.
+            HeadRoomWriteError: `story_id` is a story, and a head keeps the room.
             StaleRoomWriteError: Another writer moved the room first.
         """
-        state = self.get(room_id)
+        # Opening a story is refused in a head's room; clearing one is not (author's
+        # choice): a story that left the library, or whose writer was stopped, is let go
+        # of by every room that named it, and the head never reads the field back.
+        state = self.get(room_id) if story_id is None else self._writable(room_id)
         return self._store.save(state.model_copy(update={"story_id": story_id}))
 
     def forget_story(self, story_id: str) -> tuple[str, ...]:
@@ -571,7 +644,36 @@ class RoomService:
                 is not one the session store will name.
         """
         _refuse_an_id_the_derivation_cannot_carry("Participant id", participant_id)
-        state = self.get(room_id)
+        return self._store.save(
+            self._seated(
+                self._writable(room_id),
+                participant_id,
+                kind=kind,
+                display_name=display_name,
+                persona_summary=persona_summary,
+                aliases=aliases,
+                persona=persona,
+            )
+        )
+
+    def _seated(
+        self,
+        state: RoomState,
+        participant_id: str,
+        *,
+        kind: ParticipantKind = ParticipantKind.AGENT,
+        display_name: str = "",
+        persona_summary: str = "",
+        aliases: tuple[str, ...] = (),
+        persona: str = "",
+    ) -> RoomState:
+        """`state` with `participant_id` seated and its join row appended; nothing saved.
+
+        The whole of seating, shared by `add_participant` and `create` so the two cannot
+        disagree about who may sit where. Refusals as `add_participant`.
+        """
+        _refuse_an_id_the_derivation_cannot_carry("Participant id", participant_id)
+        room_id = state.room_id
         # Case-insensitively, because two ids that differ only by case derive two session
         # ids that differ only by case, and on macOS and Windows those are one file.
         # `BaseAgent.hydrate_session` then refuses a record identifying a different session
@@ -652,10 +754,9 @@ class RoomService:
             display_name=display_name.strip() or participant_id,
             persona_summary=effective_summary,
             aliases=aliases,
-            # A human has no agent session and no ontology of its own; stamping one would
-            # claim a record that nothing writes.
+            # A human has no agent session; stamping one would claim a record that nothing
+            # writes. An agent's knowledge is its clone's, not the seat's (step 6).
             session_id=participant_session_id(room_id, participant_id) if is_agent else "",
-            ontology_namespace=participant_namespace(room_id, participant_id) if is_agent else "",
             persona=persona if is_agent else "",
         )
         note = self._membership_row(
@@ -665,13 +766,11 @@ class RoomService:
             f"{participant.display_name} ({participant_id}) joined the room "
             f"as {'an' if kind is ParticipantKind.AGENT else 'a'} {kind.value}",
         )
-        return self._store.save(
-            state.model_copy(
-                update={
-                    "participants": (*state.participants, participant),
-                    "transcript": (*state.transcript, note),
-                }
-            )
+        return state.model_copy(
+            update={
+                "participants": (*state.participants, participant),
+                "transcript": (*state.transcript, note),
+            }
         )
 
     def remove_participant(self, room_id: str, participant_id: str) -> RoomState:
@@ -693,7 +792,7 @@ class RoomService:
             RoomNotFoundError: No such room.
             UnknownRoomParticipantError: Nobody with that id is seated.
         """
-        state = self.get(room_id)
+        state = self._writable(room_id)
         leaving = next((p for p in state.participants if p.id == participant_id), None)
         if leaving is None:
             roster = ", ".join(p.id for p in state.participants)
@@ -730,7 +829,7 @@ class RoomService:
             RoomNotFoundError: No such room.
             RoomError: `agent_id` is not a seated agent of the room.
         """
-        state = self.get(room_id)
+        state = self._writable(room_id)
         if agent_id:
             seated = {p.id for p in state.participants if p.kind is ParticipantKind.AGENT}
             if agent_id not in seated:
@@ -787,7 +886,7 @@ class RoomService:
                 will not do is empty the room — that is `clear_transcript`, which is a
                 different act on the record and says so.
         """
-        state = self.get(room_id)
+        state = self._writable(room_id)
         if not any(m.seq == seq for m in state.transcript):
             present = [m.seq for m in state.transcript]
             span = f"{present[0]}-{present[-1]}" if present else "none; the room is empty"
@@ -841,7 +940,7 @@ class RoomService:
         Raises:
             RoomNotFoundError: No such room.
         """
-        state = self.get(room_id)
+        state = self._writable(room_id)
         record = state.file_record
         if state.transcript or state.tool_uses:
             # Counted, never reset: see the same step in `truncate_transcript` (#1366).

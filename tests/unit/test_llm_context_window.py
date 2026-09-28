@@ -31,6 +31,56 @@ class TestThePublishedTable:
         assert published_context_window("openai", "gpt-4o-mini-2024-07-18") == 128_000
         assert published_context_window("openai", "gpt-3.5-turbo-0125") == 16_385
 
+    def test_current_claude_models_have_their_published_windows(self) -> None:
+        """The four models Anthropic's models overview lists as current on 2026-09-28.
+
+        The table named only retired `claude-3-*` IDs, so every current Claude seat had no
+        window. A dated snapshot resolves through its alias; a retired ID a saved seat may
+        still name keeps resolving.
+
+        Killed by: src/uclone_x/llm/context_window.py :: "claude-opus-5-5": 1_000_000,
+        Becomes: "claude-opus-5-5": 2_000_000,
+        Killed by: src/uclone_x/llm/context_window.py :: "claude-haiku-4-5": 200_000,
+        Becomes: "claude-haiku-4-x": 200_000,
+        Killed by: src/uclone_x/llm/context_window.py :: "claude-3-5-sonnet": 200_000,
+        Becomes: "claude-3-5-sonnex": 200_000,
+        """
+        assert published_context_window("anthropic", "claude-fable-5-1") == 1_000_000
+        assert published_context_window("anthropic", "claude-opus-5-5") == 1_000_000
+        assert published_context_window("anthropic", "claude-sonnet-5") == 1_000_000
+        assert published_context_window("anthropic", "claude-haiku-4-5-20251001") == 200_000
+        assert published_context_window("anthropic", "claude-3-5-sonnet-20241022") == 200_000
+
+    def test_legacy_claude_models_still_served_have_their_published_windows(self) -> None:
+        """Legacy models Anthropic still serves, from each model's own page on 2026-09-28 (#1917).
+
+        They had no entry, so a seat on any of them showed no window. Opus 4.5 and Sonnet
+        4.5 are 200K and are named by dated IDs that resolve through their aliases; the
+        others are dateless and 1M. `claude-opus-5` and `claude-fable-5` are prefixes of
+        the current `claude-opus-5-5` and `claude-fable-5-1`, and each still resolves.
+
+        Killed by: src/uclone_x/llm/context_window.py :: "claude-opus-5": 1_000_000,
+        Becomes: "claude-opus-x": 1_000_000,
+        Killed by: src/uclone_x/llm/context_window.py :: "claude-opus-4-5": 200_000,
+        Becomes: "claude-opus-4-x": 200_000,
+        Killed by: src/uclone_x/llm/context_window.py :: "claude-sonnet-4-6": 1_000_000,
+        Becomes: "claude-sonnet-4-x": 1_000_000,
+        """
+        one_million = {
+            "claude-fable-5",
+            "claude-opus-5",
+            "claude-opus-4-8",
+            "claude-opus-4-7",
+            "claude-opus-4-6",
+            "claude-sonnet-4-6",
+        }
+        for model in one_million:
+            assert published_context_window("anthropic", model) == 1_000_000, model
+        assert published_context_window("anthropic", "claude-opus-4-5-20251101") == 200_000
+        assert published_context_window("anthropic", "claude-sonnet-4-5-20250929") == 200_000
+        assert published_context_window("anthropic", "claude-fable-5-1") == 1_000_000
+        assert published_context_window("anthropic", "claude-opus-5-5") == 1_000_000
+
     def test_a_prefix_that_is_not_delimited_is_not_a_match(self) -> None:
         """`gpt-4omni` is not a `gpt-4o`, and a naive `startswith` says it is.
 

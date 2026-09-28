@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
@@ -28,6 +29,7 @@ from uclone_x.core.immutable import unwrap_immutable
 from uclone_x.engine.event_bus import AgentEvent, EventSource, EventType
 from uclone_x.engine.protocols import EventBusProtocol, PublisherHandleProtocol
 from uclone_x.errors import (
+    HeadRoomWriteError,
     NothingToRetryError,
     RoomError,
     RoomNotFoundError,
@@ -37,7 +39,16 @@ from uclone_x.errors import (
     UnknownRoomParticipantError,
 )
 from uclone_x.llm.compactor import estimate_text_tokens
-from uclone_x.room.knowledge import SeatKnowledgeProtocol
+from uclone_x.memory.extractor import (
+    EXCLUDED_TOOL_PREFIXES,
+    EXTRACTION_FAILED,
+    ExtractionOutcome,
+    KnowledgeExtractor,
+    LearningSeatProtocol,
+    Lesson,
+    SpanLine,
+)
+from uclone_x.memory.models import fold_name
 from uclone_x.room.models import (
     SPAN_WINDOW_SHARE,
     Participant,
@@ -51,16 +62,20 @@ from uclone_x.room.models import (
     SelectionVerdict,
     SpeakerDecision,
     SpeakerRequest,
+    head_room_write_refusal,
+    is_one_seat,
+    room_head,
     turn_refusal,
 )
 from uclone_x.room.protocols import (
     RoomAgentResolverProtocol,
     RoomStoreProtocol,
+    SeatSessionSetAsideProtocol,
     SpeakerSelectorProtocol,
 )
 from uclone_x.tools.models import ToolResultStatus
 
-__all__ = ["RoomOrchestrator"]
+__all__ = ["RoomOrchestrator", "memory_save_outcome", "record_turn_tools"]
 
 logger = logging.getLogger(__name__)
 
@@ -224,6 +239,12 @@ def _record_tools(
     return tuple(uses), tuple(written)
 
 
+#: The two readings above, for a head that lands a turn without this orchestrator: a CLI,
+#: ACP or A2A head's one-seat room records its turns the way a room seat's are (#1837).
+record_turn_tools = _record_tools
+memory_save_outcome = _memory_save_outcome
+
+
 class RoomOrchestrator:
     """Drives one room: appends an utterance, then runs turns until the floor is quiet."""
 
@@ -233,16 +254,22 @@ class RoomOrchestrator:
         selectors: Sequence[SpeakerSelectorProtocol],
         resolver: RoomAgentResolverProtocol,
         bus: EventBusProtocol | None = None,
-        knowledge: SeatKnowledgeProtocol | None = None,
+        extractor: KnowledgeExtractor | None = None,
+        sessions: SeatSessionSetAsideProtocol | None = None,
     ) -> None:
         self._store = store
         self._selectors = tuple(selectors)
         self._resolver = resolver
-        #: Where each seat's knowledge is written after its turn (#1367). Optional for the
-        #: same reason `bus` is: a caller whose seats run without an ontology -- `ucx room
-        #: say` composes none -- has nothing to keep. A head that gives its seats engines
-        #: passes the store its resolver loads them from.
-        self._knowledge = knowledge
+        #: What learns durable facts from each committed turn, after the room's cascade has
+        #: ended (#1404). Optional like `bus`: `ucx room say` learns nothing.
+        self._extractor = extractor
+        #: The store the seats' own sessions are saved to, asked after each save whether it
+        #: had to set an unreadable record aside (#1844). Optional: without it the record
+        #: is still kept -- the store does that -- but no row says so.
+        self._sessions = sessions
+        #: room id -> the task working through that room's queued lessons. One per room,
+        #: so a room's lessons are learned one at a time and in order.
+        self._learning: dict[str, asyncio.Task[None]] = {}
         # Optional, and deliberately so. `post()` returns only once every turn has landed,
         # so without a bus a caller waits through the whole exchange with nothing to show —
         # which is what a head needs this for. A CLI that wants no streaming should not
@@ -397,7 +424,7 @@ class RoomOrchestrator:
 
     def _require_human_sender(self, room_id: str, sender_id: str) -> RoomState:
         """The room, when `sender_id` is its human; refused otherwise."""
-        state = self._require_room(room_id)
+        state = self._refuse_a_head_room(self._require_room(room_id))
         sender = self._participant(state, sender_id)
         if sender is None:
             roster = ", ".join(p.id for p in state.participants)
@@ -424,7 +451,26 @@ class RoomOrchestrator:
         see `_interjected`. A caller that passes a stale baseline is telling the loop to
         treat the message it is answering as an interjection, which stops it immediately.
         """
-        return await self._run_turns(room_id, baseline_seq, self._generation.get(room_id, 0))
+        self._refuse_a_head_room(self._require_room(room_id))
+        try:
+            return await self._run_turns(room_id, baseline_seq, self._generation.get(room_id, 0))
+        finally:
+            self._start_learning(room_id)  # after the cascade, never inside it (#1404)
+
+    async def wait_for_learning(self, room_id: str) -> None:
+        """Return once the room has no lesson queued and none being learned.
+
+        For a caller that must see what a finished exchange taught its clones -- a test, a
+        command that exits. The room itself never waits for learning.
+        """
+        while True:
+            task = self._learning.get(room_id)
+            if task is None or task.done():
+                if self._extractor is None or not self._extractor.has_pending(room_id):
+                    return
+                self._start_learning(room_id)
+                continue
+            await asyncio.shield(task)
 
     async def note_human_activity(self, room_id: str, sender_id: str = "human") -> None:
         """Record that a human is composing — a timestamp, never keystroke content.
@@ -493,7 +539,7 @@ class RoomOrchestrator:
                 succeeded, or somebody has spoken since.
             UnknownRoomParticipantError: The agent that failed has left the room.
         """
-        state = self._require_room(room_id)
+        state = self._refuse_a_head_room(self._require_room(room_id))
         # The last *utterance*, not the last row — see `RoomState.last_utterance`, which
         # the rendering half asks the same question of.
         failed = state.last_utterance
@@ -530,8 +576,11 @@ class RoomOrchestrator:
         # Under the floor, like every other turn. `retry` is the second door into
         # `_take_turn`, and a retry running beside a live cascade put two agents on the
         # floor by the one route the loop's own guard cannot see.
-        async with self._floor.setdefault(room_id, asyncio.Lock()):
-            return await self._take_turn(room_id, speaker, failed.decision or retried)
+        try:
+            async with self._floor.setdefault(room_id, asyncio.Lock()):
+                return await self._take_turn(room_id, speaker, failed.decision or retried)
+        finally:
+            self._start_learning(room_id)
 
     def append_human(self, state: RoomState, sender_id: str, content: str) -> RoomState:
         """Return `state` with a human utterance appended and the turn budget reset.
@@ -736,7 +785,9 @@ class RoomOrchestrator:
         turn: an agent turn is the long window in which another writer can move the
         record, and a carried handle would be stale by exactly that much.
         """
-        agent = await self._resolver.resolve(speaker)
+        agent = await self._resolver.resolve(
+            speaker, one_seat=is_one_seat(self._require_room(room_id).participants)
+        )
         state = self._require_room(room_id)
         prompt = self._render_span(state, speaker, span_token_budget(state, agent))
         # The span this turn actually showed. The high-water mark advances to *this*, not to
@@ -857,6 +908,7 @@ class RoomOrchestrator:
                 # room resolve the same story and hold its lease as one writer (#1555).
                 room_id=room_id,
                 story_id=state.story_id,
+                person_names=_person_names(state),  # per turn, never stored (#1857)
             )
         )
         self._active_turns[room_id] = (turn_id, turn_task)
@@ -929,10 +981,6 @@ class RoomOrchestrator:
         # failed turn, and the log still holds the turn's events and the rollback's.
         # A rollback that could not be made is not written over, and the row says so.
         persist_error = rollback_error or self._persist_seat(agent, speaker)
-        # What the seat has learned is written beside its session, for the same reason and
-        # after every turn in the same way: nothing else writes it, and the resolver loads it
-        # back into the seat's engine after a restart (#1367).
-        knowledge_persist_error = self._persist_knowledge(agent, speaker)
 
         # Re-read, with no `await` from here to the save: a change this server's event loop
         # made while the turn ran -- a rename, a story released from the Files screen -- is
@@ -962,8 +1010,7 @@ class RoomOrchestrator:
             completed=completed,
             rendered_through=rendered_through,
             persist_error=persist_error,
-            knowledge_persist_error=knowledge_persist_error,
-            knowledge_set_aside=self._knowledge_set_aside(speaker),
+            session_set_aside=self._session_set_aside(speaker),
             memory_facts_tried=memory_facts_tried,
             memory_facts_unsaved=memory_facts_unsaved,
             turn_id=turn_id,
@@ -1040,10 +1087,160 @@ class RoomOrchestrator:
                 f"{speaker.display_name}'s reply could not be saved to this conversation, "
                 "so it was not kept. The reason is in the server log."
             ) from exc
+        if committed:  # a failed turn teaches nothing
+            # Queued, not run: learning waits for the cascade to end (#1404).
+            self._queue_lesson(
+                state, speaker, agent, turn_id, rendered_through, content, executions
+            )
         # Before the landed reply, so a head sees the calls ahead of the answer they fed.
         await self._publish_tools(saved, speaker, message.seq, uses)
         await self._publish(saved, message, turn_id)
         return saved
+
+    # -- learning from a turn (#1404) ----------------------------------------------------
+
+    def _queue_lesson(
+        self,
+        state: RoomState,
+        speaker: Participant,
+        agent: BaseAgentProtocol,
+        turn_id: str,
+        rendered_through: int,
+        content: str,
+        executions: Sequence[ToolExecutionRecord],
+    ) -> None:
+        """Queue what `speaker` saw and did in a committed turn, for learning later.
+
+        `state` is the room as the landing read it, before the landing: its
+        `last_seen_seq` for the speaker still marks where this turn's span began.
+        """
+        if self._extractor is None or not isinstance(agent, LearningSeatProtocol):
+            return
+        memory = agent.memory
+        if memory is None:
+            return
+        try:
+            since = int(state.last_seen_seq.get(speaker.id, "0"))
+        except ValueError:
+            since = 0
+        lines = _lesson_lines(state, speaker, since, rendered_through, content, executions)
+        self._extractor.submit(
+            Lesson(
+                clone_id=speaker.id,
+                clone_name=speaker.display_name,
+                room_id=state.room_id,
+                session_id=speaker.session_id or state.room_id,
+                turn_id=turn_id,
+                lines=lines,
+                memory=memory,
+                generate=agent.invoke_auxiliary_model,
+                person_names=_person_names(state),
+            )
+        )
+
+    def _start_learning(self, room_id: str) -> None:
+        """Start working through the room's queued lessons, unless that is under way."""
+        if self._extractor is None or not self._extractor.has_pending(room_id):
+            return
+        running = self._learning.get(room_id)
+        if running is not None and not running.done():
+            return  # it takes the new lesson when it gets to it
+        self._learning[room_id] = asyncio.create_task(self._learn(room_id))
+
+    async def _learn(self, room_id: str) -> None:
+        """Learn each queued lesson in turn, each once no turn holds the floor.
+
+        The floor is waited for and let go, not held: learning takes a model call, and a
+        reply the person is waiting for must not queue behind it.
+        """
+        extractor = self._extractor
+        if extractor is None:
+            return
+        while True:
+            waited = self._floor.setdefault(room_id, asyncio.Lock())
+            async with waited:  # wait for the floor, then let it go
+                pass
+            lesson = extractor.take(room_id)
+            if lesson is None:
+                return
+            try:
+                outcome = await extractor.extract(lesson)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # extract returns its failures; this is a defect in it
+                logger.exception("Learning from turn %s in room %s failed", lesson.turn_id, room_id)
+                outcome = ExtractionOutcome(
+                    clone_id=lesson.clone_id,
+                    room_id=lesson.room_id,
+                    turn_id=lesson.turn_id,
+                    error=EXTRACTION_FAILED,
+                )
+            if outcome.added or outcome.error is not None:
+                self._record_learning(outcome)
+            await self._publish_learning(outcome)
+
+    def _record_learning(self, outcome: ExtractionOutcome) -> None:
+        """Write what the turn taught onto its row: the saved fact ids, or the failure.
+
+        Re-read with no `await` before the save, as the landing is. A row that is gone -- the
+        history was cleared or rewound meanwhile -- has nothing to carry it, and the facts
+        stay saved either way.
+        """
+        try:
+            state = self._require_room(outcome.room_id)
+            rows = list(state.transcript)
+            for index, row in enumerate(rows):
+                if row.turn_id == outcome.turn_id and row.sender_id == outcome.clone_id:
+                    rows[index] = row.model_copy(
+                        update={
+                            "knowledge_learned": (*row.knowledge_learned, *outcome.added),
+                            "knowledge_extract_error": outcome.error,
+                        }
+                    )
+                    break
+            else:
+                return
+            self._store.save(state.model_copy(update={"transcript": tuple(rows)}))
+        except Exception:
+            logger.warning(
+                "Room %s could not note on turn %s what %s learned from it",
+                outcome.room_id,
+                outcome.turn_id,
+                outcome.clone_id,
+                exc_info=True,
+            )
+
+    async def _publish_learning(self, outcome: ExtractionOutcome) -> None:
+        """Say on the room's knowledge topic that a clone's memory may have changed.
+
+        A sub-topic, like tool calls, so a head's reducer for the room's own events never
+        sees it; the head refreshes the room and its memory views.
+        """
+        if self._bus is None:
+            return
+        try:
+            await self._publisher(outcome.clone_id).publish(
+                AgentEvent(
+                    type=EventType.KNOWLEDGE_UPDATED,
+                    topic=f"room.{outcome.room_id}.knowledge",
+                    payload={
+                        "room_id": outcome.room_id,
+                        "agent_id": outcome.clone_id,
+                        "turn_id": outcome.turn_id,
+                        "added": len(outcome.added),
+                        "reinforced": len(outcome.reinforced),
+                        "superseded": len(outcome.superseded),
+                        "failed": outcome.error is not None,
+                    },
+                )
+            )
+        except Exception:
+            logger.warning(
+                "Room %s could not announce what %s learned on the bus",
+                outcome.room_id,
+                outcome.clone_id,
+                exc_info=True,
+            )
 
     async def _publish_tools(
         self, state: RoomState, speaker: Participant, seq: int, uses: Sequence[RoomToolUse]
@@ -1385,6 +1582,20 @@ class RoomOrchestrator:
         return state
 
     @staticmethod
+    def _refuse_a_head_room(state: RoomState) -> RoomState:
+        """`state`, unless a head keeps it (#1885): then no turn is driven here.
+
+        A head's room has one writer, the head, which runs the clone on the seat's session.
+        A post, a retry or a resumed cascade from here would run that session a second time
+        beside it. Checked on the record as loaded, so a head room another surface has
+        open is refused as soon as it asks.
+        """
+        head = room_head(state)
+        if head is not None:
+            raise HeadRoomWriteError(head_room_write_refusal(head))
+        return state
+
+    @staticmethod
     def _persist_seat(agent: BaseAgentProtocol, speaker: Participant) -> str | None:
         """Write `speaker`'s own session, returning why it could not be written, or `None`.
 
@@ -1452,43 +1663,15 @@ class RoomOrchestrator:
         # without. A failure here is logged by `_persist_seat` itself.
         cls._persist_seat(agent, speaker)
 
-    def _persist_knowledge(self, agent: BaseAgentProtocol, speaker: Participant) -> str | None:
-        """Write what `speaker` has learned, returning why it could not be written, or `None`.
-
-        The same contract as `_persist_seat`, and kept apart from it so a row can say which
-        of the two was lost. `None` without writing when this orchestrator keeps no
-        knowledge or the seat runs without an engine: there is nothing to keep, and the
-        knowledge read says so for that seat in its own words.
-        """
-        if self._knowledge is None:
-            return None
-        engine = agent.ontology
-        if engine is None:
-            return None
-        try:
-            self._knowledge.save(speaker.session_id, engine)
-        except Exception as exc:
-            stated = f"{type(exc).__name__}: {exc}"
-            logger.warning(
-                "Could not write what room seat %r has learned (session %s) after its turn; "
-                "the reply landed but that knowledge will not be there after a restart: %s",
-                speaker.id,
-                speaker.session_id,
-                stated,
-                exc_info=True,
-            )
-            return stated
-        return None
-
-    def _knowledge_set_aside(self, speaker: Participant) -> bool:
-        """Whether `speaker`'s unreadable record was set aside for this turn (#1367).
+    def _session_set_aside(self, speaker: Participant) -> bool:
+        """Whether `speaker`'s unreadable session record was set aside when saved (#1844).
 
         Taken, not peeked: the store answers `True` once, so the notice is on this row and
         on no later one.
         """
-        if self._knowledge is None:
+        if self._sessions is None:
             return False
-        return self._knowledge.take_set_aside(speaker.session_id)
+        return self._sessions.take_set_aside(speaker.session_id)
 
     @staticmethod
     def _participant(state: RoomState, participant_id: str) -> Participant | None:
@@ -1702,6 +1885,76 @@ class RoomOrchestrator:
         if withheld > 0:
             shown = [_withheld_notice(withheld), *shown]
         return "\n".join(shown)
+
+
+def _person_names(state: RoomState) -> tuple[str, ...]:
+    """The names that mean one of the room's people: each one's id, display name and aliases.
+
+    A name is left out when it could mean someone else in the room (#1868): another
+    participant goes by the same name, or it is one word and another participant's name
+    holds that word, as "Kim" does in "Kim Jiho". The person's id is held to the same rule
+    (#1893): an id `kim` beside a clone shown as "Kim" is left out, so a fact about that
+    clone keeps its subject. An id no one else in the room goes by always counts. Names are
+    compared folded (`fold_name`, NFC included), and each is given once: a seat whose
+    display name is its id, as a head's `user` is, gives `("user",)` (#1885).
+    """
+    names: list[str] = []
+    given: set[str] = set()
+    for person in state.participants:
+        if person.kind is not ParticipantKind.HUMAN:
+            continue
+        others = [p for p in state.participants if p.id != person.id]
+        other_names = {fold_name(n) for p in others for n in (p.id, p.display_name, *p.aliases)}
+        other_words = {w for n in other_names for w in re.findall(r"\w+", n)}
+        for name in (person.id, person.display_name, *person.aliases):
+            folded = fold_name(name)
+            if folded in given:
+                continue
+            # A name of two words or more is never one of `other_words`.
+            if not (folded in other_names or folded in other_words):
+                given.add(folded)
+                names.append(name)
+    return tuple(names)
+
+
+def _lesson_lines(
+    state: RoomState,
+    speaker: Participant,
+    since: int,
+    rendered_through: int,
+    content: str,
+    executions: Sequence[ToolExecutionRecord],
+) -> tuple[SpanLine, ...]:
+    """What `speaker` was shown and did in one turn, each line labelled by its source.
+
+    The span is the rows the turn rendered that the speaker had not seen (`since` to
+    `rendered_through`): a person's are `person`, another clone's are `other`. Then the
+    turn's successful tool results, except a story's contents and the memory tools' own
+    echoes, and last what the speaker said. Only `person` and `tool` lines can ground a
+    fact; the speaker's own words and another clone's are context for reading them.
+    """
+    kinds = {p.id: p.kind for p in state.participants}
+    names = {p.id: p.display_name for p in state.participants}
+    lines: list[SpanLine] = []
+    for row in state.transcript:
+        if not (since < row.seq <= rendered_through) or not row.is_utterance:
+            continue
+        if row.sender_id == speaker.id or not row.content.strip():
+            continue
+        kind = "person" if kinds.get(row.sender_id) is ParticipantKind.HUMAN else "other"
+        lines.append(SpanLine(kind, names.get(row.sender_id, row.sender_id), row.content))
+    for record in executions:
+        if record.status is not ToolResultStatus.SUCCESS:
+            continue
+        if record.tool_name.startswith(EXCLUDED_TOOL_PREFIXES):
+            continue
+        output = record.output
+        text = output if isinstance(output, str) else json.dumps(output, default=str)
+        if text.strip() and output is not None:
+            lines.append(SpanLine("tool", record.tool_name, text))
+    if content.strip():
+        lines.append(SpanLine("self", speaker.display_name, content))
+    return tuple(lines)
 
 
 def _withheld_notice(withheld: int) -> str:

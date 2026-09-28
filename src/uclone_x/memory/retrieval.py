@@ -29,7 +29,13 @@ RANKING_METHOD_NO_CANDIDATES = "nothing ranked (no candidate facts)"
 RANKING_METHOD_NO_ROOM = "nothing ranked (top_k asked for no results)"
 RANKING_METHOD_LEXICAL = "lexical overlap (no embedder configured — paraphrases will not match)"
 
-_WORD_RE = re.compile(r"\w+", re.UNICODE)
+# Word characters without the underscore: fact keys are snake_case (`gate_command`), and a
+# person asks in words ("the gate command"). `\w+` kept each key one token, so recall's
+# lexical ranking matched nothing in a key (clone-knowledge-graph §3.5).
+_WORD_RE = re.compile(r"[^\W_]+", re.UNICODE)
+# A whole snake_case key is kept as a token too: a key made only of one-letter parts
+# (`a_b`) would otherwise yield no token at all and never match (#1857).
+_KEY_RE = re.compile(r"\w*_\w*", re.UNICODE)
 _MIN_LEXICAL_TOKEN = 2
 _CJK_NGRAM = 2
 
@@ -82,6 +88,7 @@ def _tokens(text: str) -> set[str]:
     """
     lowered = text.lower()
     tokens = {word for word in _WORD_RE.findall(lowered) if len(word) >= _MIN_LEXICAL_TOKEN}
+    tokens.update(key for key in _KEY_RE.findall(lowered) if key.strip("_"))
     for word in list(tokens):
         if _is_cjk(word):
             tokens.update(

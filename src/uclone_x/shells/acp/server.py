@@ -10,13 +10,16 @@ import time
 import uuid
 from collections import OrderedDict
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any, Final, cast
 
 import uclone_x
 from uclone_x.agent.base import BaseAgent
+from uclone_x.agent.models import TurnResult
 from uclone_x.agent.session import SessionStore
 from uclone_x.core.session import validate_session_id
 from uclone_x.core.session_store import SessionStoreProtocol
+from uclone_x.core.set_aside import SESSION_SET_ASIDE_NOTICE
 from uclone_x.engine.event_bus import AgentEvent, EventBus, EventSubscription, EventType
 from uclone_x.errors import ProviderFailureKind
 from uclone_x.shells.acp.models import (
@@ -42,6 +45,37 @@ logger = logging.getLogger(__name__)
 #: `SessionStore` the server reads -- so what a turn persists is what `load_session`
 #: finds. The CLI builds it from a persona (`uclone_x.cli.commands.acp`).
 SessionAgentFactory = Callable[[str], BaseAgent]
+
+#: Names the stored session behind an ACP session id. The CLI serves each ACP session as
+#: a one-seat room keyed by clone and ACP session id (§5.9, owner ruling 2026-09-27), so
+#: the record a turn saves is the room seat's (`participant_session_id`), not the ACP id.
+#: The server reads, saves, restores and routes bus events under the name this returns,
+#: and still speaks the ACP id to the client. Unset, the two are the same id.
+SeatSessionName = Callable[[str], str]
+
+
+@dataclass(frozen=True, slots=True)
+class ACPTurnFailure:
+    """A turn that returned no result: it raised (`cause` is the raw text), or was cancelled."""
+
+    cause: str
+    completed: bool = True
+
+
+#: Records a turn a session ran, beyond the session's own save (#1837): the CLI records it
+#: in the session's one-seat room transcript, which the app shows. Called with the ACP
+#: session id, the prompt, the turn's result or an `ACPTurnFailure`, and whether the save
+#: kept an unreadable earlier record aside (#1877, so the room's row says so as the app's
+#: own rows do), after the save and before anything awaits. Synchronous for the cancelled
+#: path, as `_save_turn` is. A recorder that raises is logged; the turn and what the client
+#: is told stand.
+TurnRecorder = Callable[[str, str, "TurnResult | ACPTurnFailure", bool], None]
+
+#: The names the person on the other end of an ACP session goes by, read before each
+#: turn (#1893 item 1). The CLI reads them from the session's one-seat room, as the room
+#: orchestrator gives a seat's turn its room's; the turn's tools then file a fact about
+#: the person under `user`. Unset, a turn is given none.
+PersonNames = Callable[[str], tuple[str, ...]]
 
 #: How many per-session agents a server holds at once (#1454). See `ACPServer`.
 DEFAULT_MAX_LIVE_AGENTS: Final[int] = 8
@@ -178,10 +212,16 @@ class ACPServer:
         reader: asyncio.StreamReader | None = None,
         writer: asyncio.StreamWriter | None = None,
         max_live_agents: int = DEFAULT_MAX_LIVE_AGENTS,
+        seat_session: SeatSessionName | None = None,
+        turn_recorder: TurnRecorder | None = None,
+        person_names: PersonNames | None = None,
     ) -> None:
         if max_live_agents < 1:
             raise ValueError(f"max_live_agents must be at least 1, got {max_live_agents}")
         self._agent_factory = agent_factory
+        self._seat_session = seat_session
+        self._turn_recorder = turn_recorder
+        self._person_names = person_names
         self._bus = bus
         self._store = store or SessionStore()
         self._reader = reader
@@ -198,6 +238,10 @@ class ACPServer:
         self._client_req_counter: int = 0
         self._running: bool = False
         self._write_lock = asyncio.Lock()
+
+    def stored_session_id(self, session_id: str) -> str:
+        """The stored session ACP session `session_id` is kept under (`SeatSessionName`)."""
+        return session_id if self._seat_session is None else self._seat_session(session_id)
 
     def session_agent(self, session_id: str) -> BaseAgent | None:
         """The agent currently serving `session_id`, or `None` if none is held."""
@@ -482,7 +526,7 @@ class ACPServer:
         # A record that cannot be read is not an absent one: reporting it as "not found"
         # would tell the person their conversation does not exist (P6).
         try:
-            data = self._store.load(session_id)
+            data = self._store.load(self.stored_session_id(session_id))
         except Exception:
             logger.exception("Could not read the saved ACP session %s", session_id)
             return make_jsonrpc_error(req_id, INTERNAL_ERROR, CANNOT_OPEN_MESSAGE)
@@ -638,13 +682,13 @@ class ACPServer:
         except Exception as exc:
             logger.exception("Could not build the agent for ACP session %s", session_id)
             raise _AgentBuildError() from exc
-        if agent.session_id != session_id:
+        if agent.session_id != self.stored_session_id(session_id):
             # A turn runs against the agent's active session, so an agent built for
             # another id would answer -- and save -- in the wrong conversation.
             logger.error(
                 "The ACP agent factory built an agent for session %r when asked for %r",
                 agent.session_id,
-                session_id,
+                self.stored_session_id(session_id),
             )
             raise _AgentBuildError()
         return agent
@@ -691,7 +735,7 @@ class ACPServer:
         if session_id in self._sessions:
             return make_jsonrpc_error(req_id, INVALID_PARAMS, SESSION_EXISTS_MESSAGE)
         try:
-            existing = self._store.load(session_id)
+            existing = self._store.load(self.stored_session_id(session_id))
         except Exception:
             logger.exception("Could not check for a saved ACP session %s", session_id)
             return make_jsonrpc_error(req_id, INTERNAL_ERROR, CANNOT_START_MESSAGE)
@@ -704,7 +748,7 @@ class ACPServer:
         except _AgentBuildError:
             return make_jsonrpc_error(req_id, INTERNAL_ERROR, CANNOT_START_MESSAGE)
         try:
-            agent.persist_session(session_id)
+            agent.persist_session(self.stored_session_id(session_id))
         except Exception:
             logger.exception("Could not save the new ACP session %s", session_id)
             return make_jsonrpc_error(req_id, INTERNAL_ERROR, CANNOT_START_MESSAGE)
@@ -724,7 +768,7 @@ class ACPServer:
         except _AgentBuildError as exc:
             raise _SessionUnopenableError() from exc
         try:
-            restored = agent.hydrate_session(session_id)
+            restored = agent.hydrate_session(self.stored_session_id(session_id))
         except Exception as exc:
             logger.exception("Could not restore the saved ACP session %s", session_id)
             raise _SessionUnopenableError() from exc
@@ -746,6 +790,35 @@ class ACPServer:
             return agent
         return self._revive_session_agent(session_id)
 
+    def _turn_person_names(self, session_id: str) -> tuple[str, ...]:
+        """The person's names for `session_id`'s next turn (`PersonNames`); none if unset.
+
+        A reader that raises is logged and the turn is given none: the names sharpen where
+        a fact is filed, and are not worth refusing the turn over.
+        """
+        if self._person_names is None:
+            return ()
+        try:
+            return self._person_names(session_id)
+        except Exception:
+            logger.exception("Could not read the person's names for ACP session %s", session_id)
+            return ()
+
+    def _record_turn(
+        self,
+        session_id: str,
+        prompt_text: str,
+        outcome: TurnResult | ACPTurnFailure,
+        session_set_aside: bool = False,
+    ) -> None:
+        """Hand the turn to `turn_recorder`, if there is one; never raises."""
+        if self._turn_recorder is None:
+            return
+        try:
+            self._turn_recorder(session_id, prompt_text, outcome, session_set_aside)
+        except Exception:
+            logger.exception("Could not record the turn of ACP session %s", session_id)
+
     def _save_turn(self, session_id: str, agent: BaseAgent) -> bool:
         """Persist `session_id` after a turn; whether it was saved.
 
@@ -753,13 +826,43 @@ class ACPServer:
         would otherwise raise the cancellation again and abandon the save.
         """
         try:
-            agent.persist_session(session_id=session_id)
+            agent.persist_session(session_id=self.stored_session_id(session_id))
         except Exception:
             logger.exception("Could not save ACP session %s after its turn", session_id)
             self._unsaved.add(session_id)
             return False
         self._unsaved.discard(session_id)
         return True
+
+    def _took_set_aside(self, session_id: str) -> bool:
+        """Whether the last save kept an unreadable earlier record aside (#1877); once each.
+
+        Only a store that sets records aside can say so; any other says it did not. Never
+        raises: the turn stands whatever the answer.
+        """
+        take = getattr(self._store, "take_set_aside", None)
+        if take is None:
+            return False
+        try:
+            return bool(take(self.stored_session_id(session_id)))
+        except Exception:
+            logger.exception("Could not ask whether ACP session %s was set aside", session_id)
+            return False
+
+    async def _send_set_aside_notice(self, session_id: str) -> None:
+        """Tell the client, in the words every head uses, that a record was kept aside.
+
+        A `notice` update: plain text for the person, no path and no cause (#1860).
+        """
+        await self.send_response(
+            make_jsonrpc_notification(
+                "session_update",
+                {
+                    "sessionId": session_id,
+                    "update": {"type": "notice", "content": SESSION_SET_ASIDE_NOTICE},
+                },
+            )
+        )
 
     async def _execute_turn(
         self,
@@ -771,11 +874,15 @@ class ACPServer:
         """Execute turn asynchronously, stream updates, and send final prompt response."""
         sub: EventSubscription | None = None
         listener_task: asyncio.Task[None] | None = None
+        # Once the turn is recorded, a later failure -- a reply the client could not be
+        # sent -- must not record it a second time as a failed turn.
+        recorded = False
 
         try:
             # Subscribe to bus events for session-scoped updates
             if self._bus is not None:
-                sub = self._bus.subscribe({f"session.{session_id}"})
+                # The agent publishes under the session it runs in, the seat's.
+                sub = self._bus.subscribe({f"session.{self.stored_session_id(session_id)}"})
                 listener_task = asyncio.create_task(self._forward_session_events(session_id, sub))
 
             # Emit initial semantic update: turn started
@@ -789,9 +896,16 @@ class ACPServer:
                 )
             )
 
-            turn_result = await agent.execute_turn(prompt_text)
+            turn_result = await agent.execute_turn(
+                prompt_text, person_names=self._turn_person_names(session_id)
+            )
             turn_content = turn_result.content or ""
             saved = self._save_turn(session_id, agent)
+            set_aside = self._took_set_aside(session_id)  # this turn's save
+            self._record_turn(session_id, prompt_text, turn_result, set_aside)
+            recorded = True
+            if set_aside:
+                await self._send_set_aside_notice(session_id)
 
             # Emit completion semantic update. A failed turn with nothing to show sends
             # no empty text; its reason goes in the error below.
@@ -844,7 +958,17 @@ class ACPServer:
             # Turn was cancelled (§3.1). Saved first, before anything awaits: what the
             # turn already added to the session is kept, as the chat head keeps it (#1031).
             self._save_turn(session_id, agent)
+            set_aside = self._took_set_aside(session_id)  # the cancelled turn's save
+            if not recorded:
+                self._record_turn(
+                    session_id,
+                    prompt_text,
+                    ACPTurnFailure(cause="Turn was interrupted", completed=False),
+                    set_aside,
+                )
             logger.info("Turn for session %s was cancelled", session_id)
+            if set_aside:
+                await self._send_set_aside_notice(session_id)
             await self.send_response(
                 make_jsonrpc_notification(
                     "session_update",
@@ -869,6 +993,16 @@ class ACPServer:
         except Exception as exc:
             logger.exception("Error executing turn for session %s: %s", session_id, exc)
             self._save_turn(session_id, agent)
+            set_aside = self._took_set_aside(session_id)
+            if not recorded:
+                self._record_turn(
+                    session_id,
+                    prompt_text,
+                    ACPTurnFailure(cause=f"{type(exc).__name__}: {exc}"),
+                    set_aside,
+                )
+            if set_aside:
+                await self._send_set_aside_notice(session_id)
             if req_id is not None:
                 await self.send_response(
                     make_jsonrpc_error(req_id, INTERNAL_ERROR, TURN_FAILED_MESSAGE)
@@ -988,7 +1122,7 @@ class ACPServer:
         if self._bus is not None:
             approval_resp = AgentEvent(
                 type=EventType.TOOL_APPROVAL_RESPONSE,
-                topic=f"session.{session_id}",
+                topic=f"session.{self.stored_session_id(session_id)}",
                 sender_id="acp_server",
                 payload={
                     "request_id": request_id,

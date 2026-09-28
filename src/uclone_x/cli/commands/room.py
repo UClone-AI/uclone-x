@@ -94,6 +94,9 @@ def build_orchestrator(
     # The scope `ucx run` builds its clone from, so a seat here is that clone (#1731). Its
     # memory is one store per participant id: `record_memory_fact` reaches the seated
     # agent's own file, never one store read back by every seat as its own recollection.
+    # One store for the seats' saves and for the room's question after each: whether a save
+    # had to keep an unreadable earlier record aside (#1860).
+    sessions = SessionStore()
     app = local_app_scope(
         workspace_root=Path(os.getenv("UCLONE_WORKSPACE_DIR", os.getcwd())).resolve(),
         llm=llm,
@@ -101,7 +104,7 @@ def build_orchestrator(
         llm_override=None if model is None else AgentLLMConfig(model_name=model),
         bus=EventBus(),
         tracer=TelemetryTracer(),
-        store=SessionStore(),
+        store=sessions,
         # P9: the approved skills in the runtime store, shared by every seat as the web
         # app's rooms share theirs; without them no seat has `load_skill`.
         skills=asyncio.run(load_runtime_skill_registry()),
@@ -111,6 +114,7 @@ def build_orchestrator(
         store=store,
         selectors=build_selector_chain(policy, provider=llm),
         resolver=resolver,
+        sessions=sessions,
     )
 
 
@@ -418,6 +422,40 @@ def room_show(
     _offer_retry(state)
 
 
+#: Why a refused turn was refused, in the app's words (`refusalReason` in
+#: `frontend/src/i18n/locales/en/conversation.json`), so a room reads the same in the
+#: terminal as in the app (#1885).
+_REFUSAL_REASONS: dict[RoomTurnRefusal, str] = {
+    RoomTurnRefusal.BUDGET_EXCEEDED: "it has used all the tokens this conversation allows",
+    RoomTurnRefusal.MODEL_WITHOUT_TOOLS: "its model can't use tools, which clones need",
+    RoomTurnRefusal.MODEL_UNAVAILABLE: (
+        "no model is chosen for it, or the one chosen is not available from the provider"
+    ),
+    RoomTurnRefusal.PROVIDER_AUTH: "the provider did not accept the API key",
+    RoomTurnRefusal.USAGE_LIMIT: "you've reached your usage limit for paid models",
+}
+
+
+def turn_failure_sentence(message: RoomMessage) -> str:
+    """What a failed row says, as the app says it (`turnFailureSentence`, #1885).
+
+    Built from the row's structured fields and never from `error`: that is the raw cause
+    -- an exception's text, with the paths and class names in it -- kept for the log's
+    reader, and it was printed here as it was. The provider's own message is the Core's
+    plain sentence for the person, which the app shows too. English, as the app's source
+    copy is (author's choice): the terminal has no language setting yet.
+    """
+    label = message.sender_id
+    if message.provider_failure is not None:
+        return f"{label} couldn't finish this turn. {message.provider_failure.message}"
+    if message.refusal is not None:
+        reason = _REFUSAL_REASONS.get(message.refusal, "the app refused to run it")
+        return f"{label} couldn't finish this turn: {reason}."
+    if not message.completed:
+        return f"{label} was stopped before finishing this turn."
+    return f"{label} couldn't finish this turn because something went wrong while it was answering."
+
+
 def _render_row(message: RoomMessage) -> str:
     """One transcript row, with a membership row visibly not somebody talking."""
     if not message.is_utterance:
@@ -425,7 +463,7 @@ def _render_row(message: RoomMessage) -> str:
     if message.error is not None:
         return (
             f"[bold red]{message.seq:>3} ✖ {escape(message.sender_id)}[/bold red] "
-            f"[red]turn failed: {escape(message.error)}[/red]"
+            f"[red]{escape(turn_failure_sentence(message))}[/red]"
         )
     return (
         f"[bold cyan]{message.seq:>3} {escape(message.sender_id)}[/bold cyan]  "
@@ -648,6 +686,16 @@ def _render_new_rows(before: RoomState, after: RoomState) -> None:
         attribution = _render_attribution(row)
         if attribution:
             console.print(attribution)
+        if row.session_set_aside:
+            console.print(f"[yellow]{escape(_session_set_aside_line(row.sender_id))}[/yellow]")
+
+
+def _session_set_aside_line(label: str) -> str:
+    """The row's plain line when the speaker's earlier conversation was kept aside (#1860)."""
+    return (
+        f"This version could not open {label}'s earlier conversation here. It was kept, "
+        f"not written over, and {label} carried on without it."
+    )
 
 
 def _offer_retry(state: RoomState) -> None:
@@ -676,7 +724,8 @@ def _offer_retry(state: RoomState) -> None:
         console.print(f"[dim]— {provider_key_remedy(provider)}[/dim]")
     elif last.refusal == RoomTurnRefusal.MODEL_WITHOUT_TOOLS:
         console.print(
-            "[dim]— retry that turn on a model that supports tools with:[/dim] "
+            "[dim]— retry that turn on a model that supports tools (for example qwen3:8b)"
+            " with:[/dim] "
             f"ucx room retry {room_id} --model <model>"
         )
     elif last.refusal == RoomTurnRefusal.MODEL_UNAVAILABLE:

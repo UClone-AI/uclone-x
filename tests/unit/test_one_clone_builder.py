@@ -17,6 +17,7 @@ from typing import Any, cast
 
 import pytest
 
+from tests.support.app_clone import app_clone
 from uclone_x.agent.base import BaseAgent
 from uclone_x.llm import MockLLMConnector
 from uclone_x.room.models import ParticipantKind
@@ -39,7 +40,7 @@ def _chat_and_seat(tmp_path: Path, clone_id: str) -> tuple[BaseAgent, BaseAgent]
             llm=MockLLMConnector(),
             workspace_dir=tmp_path / "workspace",
         )
-        chat = asyncio.run(mgr.get_or_create_agent(clone_id))
+        chat = app_clone(mgr, clone_id)
         stack = RoomStack(mgr)
         state = stack.service.create(title="Parity")
         stack.service.add_participant(

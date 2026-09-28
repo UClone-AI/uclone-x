@@ -27,6 +27,7 @@ import {
   FolderOpen,
   ExternalLink,
   Globe,
+  Link2,
 } from 'lucide-react';
 import {
   getProviderMeta,
@@ -50,6 +51,7 @@ import { SkillsSection } from './settings/SkillsSection';
 import { McpServersSection } from './settings/McpServersSection';
 import { DiagnosticsSection } from './settings/DiagnosticsSection';
 import { UsageSection } from './settings/UsageSection';
+import { LinksSection } from './settings/LinksSection';
 import { ImagesSection } from './settings/ImagesSection';
 import { UsageOffer } from './settings/UsageOffer';
 import type { UsageReport } from '../lib/usage';
@@ -63,7 +65,16 @@ const PERSONA_ICONS = { add: Plus, edit: Pencil, save: Save, cancel: X, spinner:
 import { Badge } from './ui/Badge';
 import { Button } from './ui/Button';
 
-export type SettingsTabId = 'all' | 'llm' | 'usage' | 'tools' | 'folders' | 'clones' | 'skills' | 'diagnostics';
+export type SettingsTabId =
+  | 'all'
+  | 'llm'
+  | 'usage'
+  | 'tools'
+  | 'folders'
+  | 'clones'
+  | 'skills'
+  | 'links'
+  | 'diagnostics';
 
 interface SettingsTabItem {
   id: SettingsTabId;
@@ -79,6 +90,7 @@ const SETTINGS_TABS: SettingsTabItem[] = [
   { id: 'folders', icon: FolderOpen },
   { id: 'clones', icon: Users },
   { id: 'skills', icon: Wrench },
+  { id: 'links', icon: Link2 },
   { id: 'diagnostics', icon: CheckCircle2 },
 ];
 
@@ -1071,6 +1083,20 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             </div>
           )}
 
+          {/* A Settings save kept an unreadable settings file aside (#1860). On every tab: the
+              person otherwise finds their API keys gone and nothing saying why (P6). No path
+              and no cause -- the page's own words, in the person's language. */}
+          {currentSettings?.settings_set_aside && (
+            <div
+              data-testid="settings-set-aside"
+              role="status"
+              className="p-3.5 rounded-xl border flex items-start gap-2.5 text-xs bg-amber-950/40 border-amber-800/70 text-amber-200"
+            >
+              <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+              <div className="flex-1">{t.setAside.notice}</div>
+            </div>
+          )}
+
           {/* The language control, first so it can be found by someone who cannot read the rest. */}
           {activeTab === 'all' && (
             <div className="space-y-2" data-testid="settings-language">
@@ -1946,6 +1972,11 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               <McpServersSection />
             </div>
           )}
+
+          {activeTab === 'all' && <hr className="border-slate-800/80" />}
+
+          {/* Section 5b: Connections -- uClone2 links (uclone2-link.md §3.5) */}
+          {(activeTab === 'all' || activeTab === 'links') && <LinksSection />}
 
           {activeTab === 'all' && <hr className="border-slate-800/80" />}
 

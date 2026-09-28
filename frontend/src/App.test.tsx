@@ -1128,6 +1128,26 @@ describe('App developer mode (owner ruling 2026-09-22)', () => {
   });
 });
 
+describe('App reads the Ontology tab for the dock clone (#1869)', () => {
+  it('reads no rules engine with developer mode off, and the seated clone engine once it is on', async () => {
+    // Killed by: frontend/src/App.tsx :: if (!developerMode || !dockSeat) {
+    // Becomes: if (!dockSeat) {
+    //
+    // Killed by: frontend/src/App.tsx :: fetch(`/api/ontology?agent_id=${encodeURIComponent(dockSeat)}`)
+    // Becomes: fetch('/api/ontology')
+    render(<App />);
+    await openedConversation();
+    await waitFor(() => expect(sent('GET', '/api/budget').length).toBeGreaterThan(0));
+    expect(sent('GET', '/api/ontology')).toHaveLength(0);
+
+    await turnOnDeveloperMode();
+    await waitFor(() => expect(sent('GET', '/api/ontology').length).toBeGreaterThan(0));
+    for (const read of sent('GET', '/api/ontology')) {
+      expect(new URL(read.url, 'http://x').searchParams.get('agent_id')).toBe('champion');
+    }
+  });
+});
+
 describe('App start-up reads (#1358)', () => {
   it('reads Skills, ACP and Evals only when Settings shows them, not at start-up', async () => {
     // Killed by: frontend/src/App.tsx :: fetch('/api/budget'),

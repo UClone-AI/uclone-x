@@ -3104,7 +3104,7 @@ wheels = [
 
 [[package]]
 name = "uclone-x"
-version = "0.3.0"
+version = "0.3.1"
 source = { editable = "." }
 dependencies = [
     { name = "httpx" },
@@ -3120,6 +3120,7 @@ all = [
     { name = "diffusers" },
     { name = "fastapi" },
     { name = "google-genai" },
+    { name = "jsonschema" },
     { name = "linkml-runtime" },
     { name = "networkx" },
     { name = "openai" },
@@ -3143,6 +3144,7 @@ all = [
     { name = "typer" },
     { name = "uv" },
     { name = "uvicorn" },
+    { name = "websockets" },
 ]
 cli = [
     { name = "rich" },
@@ -3153,6 +3155,7 @@ code-intel = [
     { name = "tree-sitter-language-pack" },
 ]
 dev = [
+    { name = "jsonschema" },
     { name = "playwright" },
     { name = "pyright" },
     { name = "pytest" },
@@ -3165,6 +3168,7 @@ dev = [
 http = [
     { name = "fastapi" },
     { name = "uvicorn" },
+    { name = "websockets" },
 ]
 llm = [
     { name = "anthropic" },
@@ -3197,6 +3201,7 @@ requires-dist = [
     { name = "fastapi", marker = "extra == 'http'", specifier = ">=0.110.0" },
     { name = "google-genai", marker = "extra == 'llm'", specifier = ">=0.1.0" },
     { name = "httpx", specifier = ">=0.27.0" },
+    { name = "jsonschema", marker = "extra == 'dev'", specifier = ">=4.18.0" },
     { name = "linkml-runtime", marker = "extra == 'ontology'", specifier = ">=1.6.0" },
     { name = "networkx", marker = "extra == 'ontology'", specifier = ">=3.3" },
     { name = "openai", marker = "extra == 'llm'", specifier = ">=1.25.0" },
@@ -3205,7 +3210,7 @@ requires-dist = [
     { name = "opentelemetry-sdk", marker = "extra == 'telemetry'", specifier = ">=1.24.0" },
     { name = "pillow", marker = "extra == 'media'", specifier = ">=10.0.0" },
     { name = "playwright", marker = "extra == 'dev'", specifier = ">=1.44.0" },
-    { name = "pydantic", specifier = ">=2.7.0" },
+    { name = "pydantic", specifier = ">=2.12" },
     { name = "pydantic-settings", specifier = ">=2.2.0" },
     { name = "pyright", marker = "extra == 'dev'", specifier = ">=1.1.360" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.1.0" },
@@ -3224,6 +3229,7 @@ requires-dist = [
     { name = "uclone-x", extras = ["cli", "http", "code-intel", "telemetry", "llm", "ontology", "media", "dev"], marker = "extra == 'all'" },
     { name = "uv", marker = "extra == 'dev'", specifier = ">=0.1.30" },
     { name = "uvicorn", marker = "extra == 'http'", specifier = ">=0.29.0" },
+    { name = "websockets", marker = "extra == 'http'", specifier = ">=15.0" },
 ]
 provides-extras = ["cli", "http", "code-intel", "telemetry", "llm", "ontology", "media", "dev", "all"]
 

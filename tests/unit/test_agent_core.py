@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
@@ -53,6 +53,7 @@ from uclone_x.llm.models import (
     ToolCallRequest,
 )
 from uclone_x.llm.protocols import LLMProviderProtocol
+from uclone_x.room.models import ParticipantKind
 from uclone_x.sandbox.models import IsolationLevel
 from uclone_x.telemetry import SpanStatus, TelemetryTracer
 from uclone_x.tools.models import ToolResult
@@ -999,7 +1000,13 @@ def test_base_agent_should_compact_session_uses_llm_predicate() -> None:
 
 @pytest.mark.asyncio
 async def test_compact_session_records_absorbed_publish_failure(tmp_path: Path) -> None:
-    """A committed compaction whose CONTEXT_COMPACTED publish fails absorbs the error into processing_errors (P6, #227)."""
+    """A committed compaction whose CONTEXT_COMPACTED publish fails absorbs the error into processing_errors (P6, #227).
+
+    The health reads report it from the room seats, where every live clone is (#1899).
+
+    Killed by: src/uclone_x/ui/rooms.py :: agent for runtime in self._rooms.values() for agent in runtime.resolver.live_agents()
+    Becomes: agent for runtime in () for agent in runtime.resolver.live_agents()
+    """
     bus = EventBus()
     await bus.start()
     config = _sample_config("agent-compaction-fail")
@@ -1033,9 +1040,15 @@ async def test_compact_session_records_absorbed_publish_failure(tmp_path: Path) 
     assert "bus is full" in str(err)
 
     # 3. Assert that /api/diagnostics and /api/health report the agent_processing_errors
+    # of a clone seated in a conversation -- the only place a live clone is (#1899).
     mgr = AgentSessionManager(bus=bus)
-    mgr._agents[result.session_id] = agent  # pyright: ignore[reportPrivateUsage]
     app = create_ui_app(static_dir=tmp_path, bus=bus, session_manager=mgr)
+    stack: Any = cast(Any, app).state.room_stack
+    room = stack.service.create("health", seats=[(agent.agent_id, ParticipantKind.AGENT)])
+    stack.orchestrator(room)
+    resolver = stack._rooms[room.room_id].resolver  # pyright: ignore[reportPrivateUsage]
+    resolver._agents[result.session_id] = agent  # pyright: ignore[reportPrivateUsage]
+    resolver._sessions[result.session_id] = agent.agent_id  # pyright: ignore[reportPrivateUsage]
 
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"

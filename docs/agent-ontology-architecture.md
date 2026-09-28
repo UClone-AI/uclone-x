@@ -5,8 +5,9 @@
 > implements the three tiers (asserted / induced_enforcing / induced_candidate), a Datalog
 > reasoner (`reasoner.py`, `rules.py`), justification, YAML persistence, and the CLI
 > `ucx ontology list | teach | review | forget | validate`. What is **not** implemented is the
-> learning loop: nothing extracts concepts or relations from conversations (the regex
-> `OntologyInducer` / `SessionKnowledgeExtractor` have no caller), and the repository-root
+> learning loop: nothing extracts concepts or relations from conversations into this engine
+> (the regex `OntologyInducer` / `SessionKnowledgeExtractor`, which had no caller, were removed
+> in KG step 7), and the repository-root
 > `ontology/` directory does not exist. §3.3 (4)'s scope is per clone since P7 was amended on
 > 2026-09-25 (#1654), for the design in
 > `design/clone-knowledge-graph.md` (issue #1638). That design

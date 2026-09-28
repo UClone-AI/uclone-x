@@ -141,6 +141,27 @@ PUBLISHED_CONTEXT_WINDOWS: dict[str, dict[str, int]] = {
         "gpt-3.5-turbo": 16_385,
     },
     "anthropic": {
+        # Current models, as Anthropic's models overview lists them on 2026-09-28. A
+        # dated snapshot (`claude-haiku-4-5-20251001`) matches its alias by prefix.
+        "claude-fable-5-1": 1_000_000,
+        "claude-opus-5-5": 1_000_000,
+        "claude-sonnet-5": 1_000_000,
+        "claude-haiku-4-5": 200_000,
+        # Legacy but still served, each from its own page under Anthropic's models overview
+        # on 2026-09-28. `claude-opus-4-5` and `claude-sonnet-4-5` are aliases of dated
+        # IDs (`-20251101`, `-20250929`), which match them by prefix; the rest are dateless.
+        # `claude-opus-5` and `claude-fable-5` are prefixes of the current `-5-5` and `-5-1`
+        # keys, and the longest delimited prefix wins, so each resolves to its own entry.
+        "claude-fable-5": 1_000_000,
+        "claude-opus-5": 1_000_000,
+        "claude-opus-4-8": 1_000_000,
+        "claude-opus-4-7": 1_000_000,
+        "claude-opus-4-6": 1_000_000,
+        "claude-opus-4-5": 200_000,
+        "claude-sonnet-4-6": 1_000_000,
+        "claude-sonnet-4-5": 200_000,
+        # Retired. Kept because a saved room seat or config may still name one, and its
+        # window has not changed by the model being withdrawn.
         "claude-3-5-sonnet": 200_000,
         "claude-3-opus": 200_000,
         "claude-3-haiku": 200_000,

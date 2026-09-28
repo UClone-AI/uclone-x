@@ -96,8 +96,6 @@ from uclone_x.log.file_allocator import FileLogOffsetAllocator
 from uclone_x.ontology import (
     OntologyEngine,
     OntologyEngineProtocol,
-    OntologyInducer,
-    OntologyInducerProtocol,
     OntologyValidatorProtocol,
 )
 from uclone_x.sandbox import (
@@ -314,7 +312,6 @@ _runner: SandboxRunnerProtocol = WorkspaceSandboxRunner()
 
 _real_ontology_engine = OntologyEngine()
 _ontology_validator: OntologyValidatorProtocol = _real_ontology_engine
-_inducer: OntologyInducerProtocol = OntologyInducer(engine=_real_ontology_engine)
 _ontology: OntologyEngineProtocol = _real_ontology_engine
 
 
@@ -444,14 +441,12 @@ def test_the_real_skill_registry_satisfies_protocol_at_runtime() -> None:
     assert isinstance(registry, SkillRegistryProtocol)
 
 
-def test_the_real_ontology_engine_and_inducer_satisfy_protocols() -> None:
-    """Ontology protocols are @runtime_checkable; assert concrete implementations satisfy them."""
+def test_the_real_ontology_engine_satisfies_protocols() -> None:
+    """Ontology protocols are @runtime_checkable; assert the concrete engine satisfies them."""
     engine = OntologyEngine()
-    inducer = OntologyInducer(engine=engine)
 
     assert isinstance(engine, OntologyValidatorProtocol)
     assert isinstance(engine, OntologyEngineProtocol)
-    assert isinstance(inducer, OntologyInducerProtocol)
 
 
 def test_the_real_tool_registry_and_mcp_client_satisfy_protocols() -> None:

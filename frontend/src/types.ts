@@ -344,6 +344,12 @@ export interface SkillAuditReport {
   content_sha256: string;
 }
 
+/** One clone a skill is not offered to, and the required tools that clone does not have. */
+export interface SkillHiddenFrom {
+  persona: string;
+  missing_tools: string[];
+}
+
 export interface SkillManifest {
   name: string;
   description: string;
@@ -355,6 +361,12 @@ export interface SkillManifest {
   content_sha256: string;
   scripts: string[];
   tags: string[];
+  /** The tools the skill's steps call (#1826). A clone is offered it only when it has them all. */
+  requires_tools?: string[];
+  /** The clones that are not offered the skill, and the tools each lacks (#1826). */
+  hidden_from?: SkillHiddenFrom[];
+  /** The skill comes with UClone-X, so Settings cannot revoke it (#1827). */
+  shipped?: boolean;
   approved_by: string | null;
   approved_at: string | null;
   rejected_by?: string | null;
@@ -376,8 +388,33 @@ export interface SkillManifest {
   audit_report: SkillAuditReport;
 }
 
+/**
+ * A skill a clone proposed with `propose_skill`, waiting for a person to approve or turn it
+ * down in Settings (#1827). It is not used until then.
+ */
+export interface SkillProposal {
+  name: string;
+  version: string;
+  description: string;
+  requires_tools: string[];
+  /** The clone that proposed it, and the conversation it was proposed in. */
+  agent_id: string;
+  session_id: string;
+  proposed_at: string;
+  /** The skill's full instructions, as they would be installed. */
+  instructions: string;
+  /** The version in use now, when this proposal would replace one. */
+  current_version: string | null;
+  /** The changes from the version in use now, as a unified diff; empty for a new skill. */
+  diff: string;
+  /** The digest of the text above; Approve sends it back so only this text is installed. */
+  digest: string;
+}
+
 export interface SkillsData {
   skills: SkillManifest[];
+  /** Proposals waiting for a person's decision (#1827). */
+  proposals?: SkillProposal[];
   /** The skill folder this runtime reads does not exist, so nothing could be loaded (#1721). */
   store_missing?: boolean;
   summary: {
@@ -545,6 +582,11 @@ export interface RuntimeSettings {
   llm_base_url_env_var?: string;
   /** Each setting an environment variable decides instead of the saved choice. */
   env_overrides?: EnvOverride[];
+  /**
+   * A Settings save found the settings file unreadable and kept it aside, unchanged, before
+   * writing a new one (#1860). The keys saved in it are not the ones shown here.
+   */
+  settings_set_aside?: boolean;
   comfyui_base_url: string;
   /** What draws pictures: `auto`, `local` or `gemini`, as saved. */
   image_engine?: string;
@@ -770,7 +812,6 @@ export interface RoomParticipant {
   display_name?: string;
   role?: string;
   session_id?: string;
-  ontology_namespace?: string;
   /**
    * Other names this participant answers to.
    *
@@ -903,19 +944,12 @@ export interface RoomTranscriptMessage {
    */
   persist_error?: string | null;
   /**
-   * Set when what the speaker learned in this turn could not be saved (#1367). The reply
-   * stands; the clone will not know it after a restart. Apart from `persist_error` because
-   * the two records are written, and lost, independently. Its text is the cause, for
-   * diagnostics; the conversation says only that it was not saved.
+   * Set when the speaker's own saved record of this conversation could not be read by this
+   * version -- typically one a newer version wrote -- and was set aside when this turn was
+   * saved: kept under another name, never written over (#1844). The speaker carried on
+   * without it. A flag: where the file went and why are in the log.
    */
-  knowledge_persist_error?: string | null;
-  /**
-   * Set when the speaker's knowledge record for this conversation could not be read before
-   * this turn and was set aside -- kept under another name, never deleted (#1367). Saved
-   * memory facts are another file and are not touched. A flag: where the file went and why
-   * are in the log.
-   */
-  knowledge_set_aside?: boolean;
+  session_set_aside?: boolean;
   /**
    * How many distinct facts the turn asked to save to memory, and how many of them were never
    * saved (#1375). The reply may still claim it saved; these say what happened. Counts, not
@@ -923,6 +957,17 @@ export interface RoomTranscriptMessage {
    */
   memory_facts_tried?: number;
   memory_facts_unsaved?: number;
+  /**
+   * The ids of the facts the speaker saved to its memory from this turn (#1404). Written after
+   * the reply landed, when the clone has learned from the turn, so a row first arrives without
+   * it. Empty, or absent on a row stored before the field existed, when nothing was saved.
+   */
+  knowledge_learned?: string[];
+  /**
+   * Set when the speaker could not learn from this turn (#1404): a plain sentence, never the
+   * cause. The reply stands. The conversation shows its own translated line, not this text.
+   */
+  knowledge_extract_error?: string | null;
   /**
    * The turn that produced this row, per `RoomMessage.turn_id` -- the id every streamed
    * delta of that turn carried. What lets the head retire a turn's live bubble the moment
@@ -935,10 +980,12 @@ export interface RoomTranscriptMessage {
 export interface RoomPolicy {
   /** Resets on every human message. Not a conversation-lifetime budget. */
   max_agent_turns_per_human_message: number;
-  max_span_tokens: number;
+  /** Absent while it holds the Core's default (#1898): the room API leaves such keys out. */
+  max_span_tokens?: number;
   transcript_window: number;
   hesitation_seconds: number;
   default_responder_id: string;
+  /** Absent while false (#1898). */
   autonomous?: boolean;
 }
 
@@ -1011,6 +1058,12 @@ export interface RoomState {
   tool_uses?: RoomToolUse[];
   written_files?: RoomWrittenFile[];
   file_record?: RoomFileRecord;
+  /**
+   * The terminal or protocol head that keeps this room (`run`, `loop`, `acp`, `a2a`), absent
+   * for a room the app keeps. A head's room has that head as its one writer (#1885): the
+   * server refuses every change from here, so the conversation shows it read-only.
+   */
+  head?: string | null;
   active_turn?: RoomActiveTurn | null;
 }
 

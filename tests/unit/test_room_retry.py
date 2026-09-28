@@ -68,7 +68,7 @@ class FakeResolver:
     def __init__(self, agents: dict[str, FakeAgent]) -> None:
         self._agents = agents
 
-    async def resolve(self, participant: Participant) -> Any:
+    async def resolve(self, participant: Participant, *, one_seat: bool = False) -> Any:
         return self._agents[participant.id]
 
 
@@ -97,7 +97,6 @@ SCOUT = Participant(
     kind=ParticipantKind.AGENT,
     display_name="Scout",
     session_id="sess_room__r1__scout",
-    ontology_namespace="https://uclone-x.ai/ontology/r1/scout",
 )
 
 

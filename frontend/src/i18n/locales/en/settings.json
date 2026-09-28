@@ -7,6 +7,7 @@
     "folders": "Folder Access",
     "clones": "Personas & Clones",
     "skills": "Skills & MCP",
+    "links": "Connections",
     "diagnostics": "Diagnostics"
   },
   "header": {
@@ -21,6 +22,9 @@
     "hint": "The language of the screens. Clones still reply in the language you write to them in.",
     "system": "System default ({resolved})",
     "saveFailed": "Something went wrong saving the language."
+  },
+  "setAside": {
+    "notice": "This version could not open your saved settings. When you saved here, it kept that file unchanged beside the new one, so settings saved before, such as API keys, are not shown here."
   },
   "feedback": {
     "saved": "Settings successfully applied! Live agents and tools hot-reloaded.",

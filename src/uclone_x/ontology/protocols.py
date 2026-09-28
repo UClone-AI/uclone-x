@@ -1,4 +1,4 @@
-"""Protocols for LinkML domain ontology management and induction."""
+"""Protocols for LinkML domain ontology management and validation."""
 
 from __future__ import annotations
 
@@ -11,7 +11,6 @@ from uclone_x.ontology.models import (
     OntologyValidationResult,
     RelationSchema,
 )
-from uclone_x.tools.models import ToolResult
 
 
 @runtime_checkable
@@ -29,19 +28,6 @@ class OntologyValidatorProtocol(Protocol):
         `docs/nfr-performance-budgets.md`, where each is marked unmeasured, so that
         figures stop being frozen into normative text. A docstring is normative text.
         """
-        ...
-
-
-@runtime_checkable
-class OntologyInducerProtocol(Protocol):
-    """Protocol for autonomous entity and relation extraction from turns."""
-
-    async def induce_from_turn(
-        self,
-        turn_text: str,
-        tool_results: tuple[ToolResult, ...],
-    ) -> tuple[EntitySchema, ...]:
-        """Extract candidate entities and constraints from successful turns."""
         ...
 
 

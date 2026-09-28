@@ -19,7 +19,7 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
-from uclone_x.core.session import resolve_session_path
+from uclone_x.core.session import default_session_root, resolve_session_path
 from uclone_x.errors import (
     PathTraversalError,
     RoomIdError,
@@ -28,7 +28,13 @@ from uclone_x.errors import (
 )
 from uclone_x.room.models import RoomState, with_legacy_loop_rows_as_notes
 
-__all__ = ["ROOM_STORAGE_DIR_ENV_VAR", "RoomStore", "default_room_storage_dir"]
+__all__ = [
+    "ROOMS_SUBDIR",
+    "ROOM_STORAGE_DIR_ENV_VAR",
+    "RoomStore",
+    "default_room_storage_dir",
+    "room_storage_dir_under",
+]
 
 #: Redirects the room store, as `UCLONE_SESSION_DIR` redirects the session store. Separate
 #: variables for separate records: a headless run that wants its rooms elsewhere is not
@@ -36,20 +42,41 @@ __all__ = ["ROOM_STORAGE_DIR_ENV_VAR", "RoomStore", "default_room_storage_dir"]
 #: cannot express the difference.
 ROOM_STORAGE_DIR_ENV_VAR = "UCLONE_ROOM_DIR"
 
-DEFAULT_ROOM_STORAGE_DIR = Path.home() / ".uclone" / "rooms"
+#: The folder, under the session family root, that the desktop app keeps its rooms in
+#: (`ui.rooms.RoomStack`). The default store is that folder, so a room a head opens is one
+#: the app lists (#1837). It was `~/.uclone/rooms` until then, which the app never read;
+#: rooms written there are left in place.
+ROOMS_SUBDIR = "rooms"
 
 
 def default_room_storage_dir() -> Path:
     """Resolve the room store's root, honouring `UCLONE_ROOM_DIR`.
 
-    A sibling of the session root rather than a subdirectory of it: the session store
-    treats every `*.json` under its root as a session, and a room document placed there
-    would read back as a session that will not validate.
+    Otherwise `<session family root>/rooms`, where the desktop app reads them, so the app
+    and every CLI head share one store (#1837). A sibling of the Core session store
+    (`<family root>/core`), not inside it: the session store treats every `*.json` under
+    its root as a session, and a room document placed there would read back as a session
+    that will not validate.
     """
     override = os.environ.get(ROOM_STORAGE_DIR_ENV_VAR)
     if override:
         return Path(override).expanduser()
-    return DEFAULT_ROOM_STORAGE_DIR
+    return default_session_root() / ROOMS_SUBDIR
+
+
+def room_storage_dir_under(session_root: Path) -> Path:
+    """Where an app whose sessions are under `session_root` keeps its rooms (#1885).
+
+    Over the default session root -- the one every CLI head resolves -- this is the CLI's
+    own store, `UCLONE_ROOM_DIR` included, so the app lists the rooms `ucx run` and the
+    other heads write. It ignored the variable before, and the two could use different
+    folders. An app given a storage folder of its own keeps its rooms inside it, beside
+    the sessions it was pointed at (author's choice): that folder is the app's whole
+    record, and a variable set for the CLI does not move part of it elsewhere.
+    """
+    if session_root.resolve() == default_session_root().resolve():
+        return default_room_storage_dir()
+    return session_root / ROOMS_SUBDIR
 
 
 def _now_iso() -> str:

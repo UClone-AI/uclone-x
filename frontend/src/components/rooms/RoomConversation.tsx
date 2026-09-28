@@ -326,9 +326,11 @@ const TranscriptRow = React.memo<{
                     {providerFailureRemedy(message.provider_failure.kind, t.outcome)}
                   </p>
                 ) : null}
-                <Button data-testid="retry-turn" onClick={onRetry} className="mt-1">
-                  {t.row.retry}
-                </Button>
+                {room.head ? null : (
+                  <Button data-testid="retry-turn" onClick={onRetry} className="mt-1">
+                    {t.row.retry}
+                  </Button>
+                )}
               </>
             )}
           </div>
@@ -346,9 +348,11 @@ const TranscriptRow = React.memo<{
                 ? fmt(t.row.silentFinished, { label })
                 : fmt(t.row.silentStopped, { label })}
             </p>
-            <Button data-testid="retry-turn" onClick={onRetry} className="mt-1">
-              {t.row.retry}
-            </Button>
+            {room.head ? null : (
+              <Button data-testid="retry-turn" onClick={onRetry} className="mt-1">
+                {t.row.retry}
+              </Button>
+            )}
           </div>
         ) : (
           // The clone that wrote it, for a picture's "Use as avatar" (#1300); nobody's for
@@ -368,28 +372,37 @@ const TranscriptRow = React.memo<{
           </p>
         ) : null}
 
-        {/* Its knowledge is a second record, saved beside the session and lost on its own
-            (#1367). The same quiet line, naming what is lost: what it learned, not the turn.
-            The field's text is the cause, for the log's reader; it is not shown here. */}
-        {message.knowledge_persist_error ? (
+        {/* What the speaker saved to its memory from this turn, after the turn (#1404). A
+            count, in the same quiet line: the facts themselves are in the Remembers panel,
+            where they can be corrected or forgotten. A failure says only that it failed; the
+            cause is in the server log. */}
+        {message.knowledge_learned && message.knowledge_learned.length > 0 ? (
           <p
-            data-testid={`row-knowledge-unsaved-${message.seq}`}
+            data-testid={`row-knowledge-learned-${message.seq}`}
             className="mt-1 text-[11px] text-slate-500"
           >
-            {fmt(t.row.knowledgeUnsaved, { label })}
+            {plural(t.row.knowledgeLearned, message.knowledge_learned.length, { label })}
+          </p>
+        ) : null}
+        {message.knowledge_extract_error ? (
+          <p
+            data-testid={`row-knowledge-extract-failed-${message.seq}`}
+            className="mt-1 text-[11px] text-slate-500"
+          >
+            {fmt(t.row.knowledgeExtractFailed, { label })}
           </p>
         ) : null}
 
-        {/* Its knowledge record for this conversation could not be read, so it was set
-            aside in this turn -- kept under another name, not deleted (#1367). Only that
-            record: the clone's saved memory facts are another file, untouched (#1434). Said
-            once, on this row: a record that could not be read is not one that never was (P6). */}
-        {message.knowledge_set_aside ? (
+        {/* Its own saved record of this conversation could not be opened by this version --
+            typically one a newer version wrote -- so it was set aside when this turn was
+            saved, kept rather than written over (#1844). Said once, on this row: the speaker
+            went on without that conversation, and saying nothing would hide it (P6). */}
+        {message.session_set_aside ? (
           <p
-            data-testid={`row-knowledge-reset-${message.seq}`}
+            data-testid={`row-session-set-aside-${message.seq}`}
             className="mt-1 text-[11px] text-slate-500"
           >
-            {fmt(t.row.knowledgeSetAside, { label })}
+            {fmt(t.row.sessionSetAside, { label })}
           </p>
         ) : null}
 
@@ -465,10 +478,20 @@ const MembershipRow = React.memo<{ room: RoomState; message: RoomTranscriptMessa
   message,
 }) {
   const t = useCopy().conversation;
-  const name = senderLabel(room, message.sender_id, t.you);
+  const joined = message.kind === 'join';
+  // The reader's own row has a sentence of its own: their name for themselves does not take
+  // the particle or the capital a third person's name does (#1900).
+  const ownRow = senderKind(room, message.sender_id) === 'human';
+  const line = ownRow
+    ? joined
+      ? t.membership.joinedSelf
+      : t.membership.leftSelf
+    : fmt(joined ? t.membership.joined : t.membership.left, {
+        name: senderLabel(room, message.sender_id, t.you),
+      });
   return (
     <p data-testid={`membership-${message.seq}`} className="py-1.5 text-[11px] text-slate-500">
-      {fmt(message.kind === 'join' ? t.membership.joined : t.membership.left, { name })}
+      {line}
     </p>
   );
 });
@@ -550,13 +573,17 @@ export const RoomConversation: React.FC<RoomConversationProps> = ({
   insertDraft = null,
 }) => {
   const isAutonomous = Boolean(room.policy?.autonomous);
+  // A room a terminal or protocol head keeps has that head as its one writer (#1885). The
+  // server refuses every change from here, so nothing on this screen offers one: no
+  // composer, no retry, no roster or history controls, and no presence reports.
+  const keptBy = room.head ?? null;
   const copy = useCopy();
   const t = copy.conversation;
   const c = copy.composer;
   const { language } = useLocale();
 
   useEffect(() => {
-    if (!isAutonomous) return;
+    if (!isAutonomous || keptBy !== null) return;
 
     const report = (active: boolean) => {
       void roomsApi.reportPresence(room.room_id, active).catch(() => {});
@@ -593,7 +620,7 @@ export const RoomConversation: React.FC<RoomConversationProps> = ({
       clearInterval(interval);
       report(false);
     };
-  }, [room.room_id, isAutonomous]);
+  }, [room.room_id, isAutonomous, keptBy]);
 
   // What is in the box. Local, so a keystroke re-renders this component and not its owner;
   // re-seeded from the owner's copy when a different conversation is put on screen.
@@ -1143,7 +1170,7 @@ export const RoomConversation: React.FC<RoomConversationProps> = ({
           </label>
         ) : null}
 
-        {onToggleAutonomous ? (
+        {onToggleAutonomous && keptBy === null ? (
           <Button
             data-testid="toggle-autonomous"
             onClick={() => onToggleAutonomous(!isAutonomous)}
@@ -1164,6 +1191,7 @@ export const RoomConversation: React.FC<RoomConversationProps> = ({
           </Button>
         ) : null}
 
+        {keptBy === null ? (
         <Button
           data-testid="add-someone"
           onClick={() => setInviting((open) => !open)}
@@ -1173,8 +1201,9 @@ export const RoomConversation: React.FC<RoomConversationProps> = ({
           <Plus className="w-3 h-3" />
           <span className="column-icon-only">{t.header.addSomeone}</span>
         </Button>
+        ) : null}
 
-        {onClearHistory ? (
+        {onClearHistory && keptBy === null ? (
           <Button
             data-testid="clear-history"
             onClick={() => setPending({ kind: 'clear' })}
@@ -1483,6 +1512,16 @@ export const RoomConversation: React.FC<RoomConversationProps> = ({
         </div>
       ) : null}
 
+      {keptBy !== null ? (
+        /* In place of the composer, not beside a disabled one: a box that takes typing and
+           then refuses it tells the reader nothing until they have written something. The
+           sentence names where the conversation goes on, which is the remedy. */
+        <div data-testid="head-room-note" className="mx-auto w-full max-w-3xl px-4 pt-2 pb-3">
+          <p className="rounded-md border border-slate-800 px-3 py-2 text-xs text-slate-400">
+            {headRoomNote(keptBy, t.headRoom)}
+          </p>
+        </div>
+      ) : (
       <div data-testid="composer-column" className="px-4 pt-2 pb-3 mx-auto w-full max-w-3xl">
         <UsageBanner refreshKey={room.transcript.length} onOpenSettings={onOpenSettings} />
         {mention && candidates.length > 0 ? (
@@ -1784,6 +1823,26 @@ export const RoomConversation: React.FC<RoomConversationProps> = ({
           </p>
         ) : null}
       </div>
+      )}
     </section>
   );
 };
+
+/** The note shown in place of the composer in a room `head` keeps. */
+function headRoomNote(
+  head: string,
+  copy: { run: string; loop: string; acp: string; a2a: string; other: string },
+): string {
+  switch (head) {
+    case 'run':
+      return copy.run;
+    case 'loop':
+      return copy.loop;
+    case 'acp':
+      return copy.acp;
+    case 'a2a':
+      return copy.a2a;
+    default:
+      return copy.other;
+  }
+}

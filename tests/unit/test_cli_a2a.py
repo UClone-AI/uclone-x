@@ -15,11 +15,18 @@ from typer.testing import CliRunner
 from uclone_x.a2a.models import AgentCard, TaskMessage, TaskResult, TaskStatus
 from uclone_x.agent.base import BaseAgent
 from uclone_x.agent.models import AgentConfig, TurnResult
+from uclone_x.agent.session import SessionState, SessionStore
 from uclone_x.cli import main
 from uclone_x.core.provenance import Provenance
 from uclone_x.engine.event_bus import AgentEvent, EventBus
 from uclone_x.llm.connectors.mock import MockLLMConnector
-from uclone_x.shells.a2a_server import A2AServer, ManagedTaskRecord
+from uclone_x.room.store import RoomStore
+from uclone_x.shells.a2a_server import (
+    TURN_FAILED_MESSAGE,
+    TURN_UNATTRIBUTED_MESSAGE,
+    A2AServer,
+    ManagedTaskRecord,
+)
 
 runner = CliRunner()
 
@@ -297,7 +304,7 @@ async def test_a2a_server_custom_handler_failure(
             assert get_resp.status_code == 200
             data = get_resp.json()
             assert data["status"] == "failed"
-            assert data["error"] == "InternalError: ValueError: Simulated handler crash"
+            assert data["error"] == TURN_FAILED_MESSAGE  # the cause is logged (#1885)
             assert data["provenance"] is None
             assert len(server.processing_errors) == 1
             err = server.processing_errors[0]
@@ -367,7 +374,7 @@ async def test_a2a_server_unattributed_turn_failure_preserves_null_provenance(
                 await asyncio.sleep(0.05)
 
             assert poll_data.get("status") == "failed"
-            assert "Turn execution failed without attribution" in str(poll_data.get("error"))
+            assert poll_data.get("error") == TURN_UNATTRIBUTED_MESSAGE
             assert poll_data.get("provenance") is None
     finally:
         await server.stop()
@@ -487,7 +494,7 @@ class _UnattributedAgent:
         self._is_completed = is_completed
 
     async def execute_turn(  # noqa: D102
-        self, input_data: object, *, continuation: bool = False
+        self, input_data: object, *, continuation: bool = False, **kwargs: Any
     ) -> TurnResult:
         return TurnResult(
             turn_index=1,
@@ -523,22 +530,26 @@ async def test_gateway_refuses_to_attribute_an_unattributed_turn(
     await server._execute_managed_task(record)  # pyright: ignore[reportPrivateUsage]
 
     wire = record.to_dict()
-    # The peer sees an explicit absence and a stated reason — not a clean primary.
+    # The peer sees an explicit absence and a plain reason — not a clean primary. Which
+    # agent and turn it was goes to the server's log (#1885), not over the wire.
     assert wire["provenance"] is None
     assert wire["status"] == TaskStatus.FAILED.value
-    assert "no provenance" in str(wire["error"])
-    assert "agent-alpha" in str(wire["error"])
+    assert wire["error"] == TURN_UNATTRIBUTED_MESSAGE
     # And the unattributed content is not published as a completed result.
     assert wire["output_data"] == {}
     assert wire["artifacts"] == []
 
 
 async def test_gateway_refusal_preserves_the_turns_own_error(
-    sample_agent_card: AgentCard,
+    sample_agent_card: AgentCard, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A turn that both failed and stated no provenance reports both facts (#157).
+    """A turn that both failed and stated no provenance keeps both facts (#157).
 
-    The refusal must not overwrite the diagnosis the caller actually needs.
+    The refusal must not overwrite the diagnosis: the turn's own error is in the server's
+    log beside the refusal, and the peer is told plainly (#1885).
+
+    Killed by: src/uclone_x/shells/a2a_server.py :: turn_result.error or "no error",
+    Becomes: "no error",
     """
     server = A2AServer(
         agent_card=sample_agent_card,
@@ -554,8 +565,10 @@ async def test_gateway_refusal_preserves_the_turns_own_error(
 
     assert record.provenance is None
     assert record.status is TaskStatus.FAILED
-    assert "no provenance" in str(record.error)
-    assert "provider down" in str(record.error)
+    assert record.error == TURN_UNATTRIBUTED_MESSAGE
+    logged = caplog.text
+    assert "no provenance" in logged
+    assert "provider down" in logged
 
 
 async def test_gateway_forwards_a_stated_provenance_unchanged(
@@ -570,7 +583,7 @@ async def test_gateway_forwards_a_stated_provenance_unchanged(
 
     class _AttributedAgent(_UnattributedAgent):
         async def execute_turn(  # noqa: D102
-            self, input_data: object, *, continuation: bool = False
+            self, input_data: object, *, continuation: bool = False, **kwargs: Any
         ) -> TurnResult:
             return TurnResult(
                 turn_index=1,
@@ -622,7 +635,7 @@ async def test_gateway_refuses_an_unattributed_handler_result(
 
     assert record.provenance is None
     assert record.status is TaskStatus.FAILED
-    assert "no provenance" in str(record.error)
+    assert record.error == TURN_UNATTRIBUTED_MESSAGE
     assert record.to_dict()["provenance"] is None
 
 
@@ -690,8 +703,7 @@ async def test_unattributed_turn_reaches_a_peer_as_a_failure_over_real_http(
             # all -- rather than a fabricated clean primary it could not have detected.
             assert poll.get("status") == "failed"
             assert poll.get("provenance") is None
-            assert "no provenance" in str(poll.get("error"))
-            assert "unattributed_agent" in str(poll.get("error"))
+            assert poll.get("error") == TURN_UNATTRIBUTED_MESSAGE
             # The unattributed content is not published as a result.
             assert poll.get("output_data") == {}
     finally:
@@ -752,7 +764,7 @@ async def test_a2a_server_unexpected_exception_logging_and_resilience(
 
                 # Verify failure status, error formatting, and provenance absence (P6)
                 assert fail_data["status"] == "failed"
-                assert fail_data["error"] == "InternalError: RuntimeError: database crash"
+                assert fail_data["error"] == TURN_FAILED_MESSAGE
                 assert fail_data["provenance"] is None
 
                 # 1) & 4) logger.exception invoked
@@ -827,7 +839,7 @@ async def test_a2a_server_agent_turn_exception_records_processing_error(
     await server._execute_managed_task(record)  # pyright: ignore[reportPrivateUsage]
 
     assert record.status is TaskStatus.FAILED
-    assert record.error == "InternalError: KeyError: 'unexpected internal dictionary key missing'"
+    assert record.error == TURN_FAILED_MESSAGE
     assert record.provenance is None
     assert len(server.processing_errors) == 1
     err = server.processing_errors[0]
@@ -905,3 +917,459 @@ async def test_a2a_managed_task_returns_nested_output_data(
             assert artifacts and artifacts[0]["content"] == nested_output
     finally:
         await server.stop()
+
+
+# ======================================================================================
+# Each A2A contextId is a one-seat room (#1836)
+# ======================================================================================
+
+
+def _a2a_room_server(
+    tmp_path: Path, sample_agent_card: AgentCard, clone_id: str = "ada"
+) -> tuple[A2AServer, SessionStore, RoomStore]:
+    """An A2A server serving `clone_id`, built per context the way `ucx a2a serve` builds it."""
+    from uclone_x.agent.clone_builder import AppScope
+    from uclone_x.agent.composition import HostDependencies
+    from uclone_x.agent.models import AgentLLMConfig
+    from uclone_x.agent.persona_registry import PersonaRegistry
+    from uclone_x.cli.commands.a2a import a2a_turn_recorder, context_agent_factory
+    from uclone_x.telemetry.tracer import TelemetryTracer
+    from uclone_x.tools.registry import ToolRegistry
+
+    store = SessionStore(tmp_path / "sessions")
+    rooms = RoomStore(tmp_path / "rooms")
+    app = AppScope(
+        host=HostDependencies(
+            bus=EventBus(),
+            llm=MockLLMConnector(),
+            tools=ToolRegistry(),
+            tracer=TelemetryTracer(),
+            store=store,
+        ),
+        workspace_root=tmp_path,
+        persona_registry=PersonaRegistry(include_defaults=False),
+    )
+    server = A2AServer(
+        agent_card=sample_agent_card,
+        port=0,
+        context_agent_factory=context_agent_factory(
+            app,
+            clone_id=clone_id,
+            room_store=rooms,
+            fallback_llm=AgentLLMConfig(model_name="mock"),
+            config_update={"name": clone_id, "max_steps": 3},
+        ),
+        turn_recorder=a2a_turn_recorder(clone_id, rooms),
+    )
+    return server, store, rooms
+
+
+async def _ask(server: A2AServer, context_id: str, prompt: str) -> ManagedTaskRecord:
+    record = ManagedTaskRecord(
+        task_id=f"task-{context_id}-{prompt}",
+        session_id="sess-caller",
+        input_data={"prompt": prompt},
+        context_id=context_id,
+    )
+    await server._execute_managed_task(record)  # pyright: ignore[reportPrivateUsage]
+    return record
+
+
+def _asked(store: SessionStore, clone_id: str, context_id: str) -> list[str]:
+    from uclone_x.cli.commands.a2a import a2a_room_id
+    from uclone_x.llm.models import MessageRole
+    from uclone_x.room.service import participant_session_id
+
+    state = store.load(participant_session_id(a2a_room_id(clone_id, context_id), clone_id))
+    assert state is not None, f"no seat session for {context_id!r}"
+    return [m.content or "" for m in state.messages if m.role == MessageRole.USER]
+
+
+async def test_a2a_context_continues_its_room_and_a_new_context_starts_one(
+    tmp_path: Path, sample_agent_card: AgentCard
+) -> None:
+    """A known `contextId` continues its room's seat session; a new one starts a room.
+
+    The `sess_<clone>` session the gateway used before is neither written nor resumed.
+
+    Killed by: src/uclone_x/shells/a2a_server.py :: answering_id, turn_result = await self._run_turn(record.context_id, prompt)
+    Becomes: answering_id, turn_result = await self._run_turn(record.session_id, prompt)
+    Killed by: src/uclone_x/cli/commands/a2a.py :: agent.hydrate_session()
+    Becomes: pass
+    """
+    from uclone_x.cli.commands.a2a import a2a_room_id
+
+    old = SessionState(session_id="sess_ada", agent_id="ada")
+    server, store, rooms = _a2a_room_server(tmp_path, sample_agent_card)
+    store.save(old)
+    before = store.session_path("sess_ada").read_bytes()
+
+    first = await _ask(server, "ctx-1", "one")
+    # A fresh server: continuing must come from the stored seat, not a held agent.
+    server, _, _ = _a2a_room_server(tmp_path, sample_agent_card)
+    second = await _ask(server, "ctx-1", "two")
+    other = await _ask(server, "ctx-2", "three")
+
+    assert [r.status for r in (first, second, other)] == [TaskStatus.COMPLETED] * 3
+    assert _asked(store, "ada", "ctx-1") == ["one", "two"]
+    assert _asked(store, "ada", "ctx-2") == ["three"]
+    assert set(rooms.list_room_ids()) == {a2a_room_id("ada", "ctx-1"), a2a_room_id("ada", "ctx-2")}
+    state = rooms.load(a2a_room_id("ada", "ctx-1"))
+    assert state is not None
+    assert state.head == "a2a"  # the app will not post into it (#1885)
+    humans = [
+        m.content for m in state.transcript if m.kind == "utterance" and m.sender_id == "user"
+    ]
+    assert humans == ["one", "two"]
+    assert store.session_path("sess_ada").read_bytes() == before
+
+
+async def test_a2a_two_clones_under_one_context_never_share_a_room(
+    tmp_path: Path, sample_agent_card: AgentCard
+) -> None:
+    """Two clones called with one `contextId` each keep a room of their own (#1836).
+
+    Killed by: src/uclone_x/cli/commands/a2a.py :: return conversation_room_id("a2a", clone_id, context_id)
+    Becomes: return conversation_room_id("a2a", "shared", context_id)
+    """
+    ada, store, rooms = _a2a_room_server(tmp_path, sample_agent_card, "ada")
+    bo, _, _ = _a2a_room_server(tmp_path, sample_agent_card, "bo")
+
+    asked_ada = await _ask(ada, "ctx", "for ada")
+    asked_bo = await _ask(bo, "ctx", "for bo")
+
+    assert asked_ada.status is TaskStatus.COMPLETED, asked_ada.error
+    assert asked_bo.status is TaskStatus.COMPLETED, asked_bo.error
+    assert len(rooms.list_room_ids()) == 2
+    assert _asked(store, "ada", "ctx") == ["for ada"]
+    assert _asked(store, "bo", "ctx") == ["for bo"]
+
+
+def test_a2a_task_request_reads_context_id_and_reports_it() -> None:
+    """`contextId` on the wire names the conversation; the task reports which one it joined.
+
+    Killed by: src/uclone_x/shells/a2a_server.py :: "context_id": self.context_id,
+    Becomes: "context_id": self.session_id,
+    """
+    from uclone_x.shells.a2a_server import TaskCreateRequest
+
+    payload = TaskCreateRequest.model_validate({"contextId": "ctx-9", "session_id": "sess-9"})
+    record = ManagedTaskRecord(
+        task_id="t", session_id="sess-9", input_data={}, context_id=payload.context_id
+    )
+    unkeyed = ManagedTaskRecord(task_id="u", session_id="sess-8", input_data={})
+
+    assert payload.context_id == "ctx-9"
+    assert record.to_dict()["context_id"] == "ctx-9"
+    assert unkeyed.to_dict()["context_id"] == "sess-8"
+
+
+class _PooledAgent:
+    """A context's agent that can be held mid-turn, counting the turns it runs at once."""
+
+    def __init__(self, context_id: str, pool: _Pool) -> None:
+        self.agent_id = f"agent-{context_id}"
+        self._pool = pool
+        self._context_id = context_id
+
+    async def execute_turn(  # noqa: D102
+        self, input_data: object, *, continuation: bool = False, **kwargs: Any
+    ) -> TurnResult:
+        pool = self._pool
+        pool.running += 1
+        pool.most_at_once = max(pool.most_at_once, pool.running)
+        pool.started.set()
+        if self._context_id in pool.held_mid_turn:
+            await pool.release.wait()
+        pool.running -= 1
+        return TurnResult(
+            turn_index=1,
+            content=f"answered {input_data}",
+            is_completed=True,
+            provenance=Provenance.primary(self.agent_id),
+        )
+
+    def persist_session(self) -> None:  # noqa: D102
+        return None
+
+
+class _Pool:
+    def __init__(self, *held_mid_turn: str) -> None:
+        self.held_mid_turn = set(held_mid_turn)
+        self.running = 0
+        self.most_at_once = 0
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    def factory(self, context_id: str) -> BaseAgent:
+        return cast(BaseAgent, _PooledAgent(context_id, self))
+
+
+def _pooled_server(sample_agent_card: AgentCard, pool: _Pool, cap: int) -> A2AServer:
+    return A2AServer(
+        agent_card=sample_agent_card,
+        port=0,
+        context_agent_factory=pool.factory,
+        max_context_agents=cap,
+    )
+
+
+async def test_a2a_past_the_cap_the_idle_saved_context_is_released(
+    sample_agent_card: AgentCard,
+) -> None:
+    """At the cap, a new context releases the least recently used idle one (#1836).
+
+    Killed by: src/uclone_x/shells/a2a_server.py :: if len(self._context_agents) >= self._max_context_agents:
+    Becomes: if False:
+    """
+    server = _pooled_server(sample_agent_card, _Pool(), cap=1)
+
+    first = await _ask(server, "c1", "hello")
+    second = await _ask(server, "c2", "hello")
+
+    assert (first.status, second.status) == (TaskStatus.COMPLETED, TaskStatus.COMPLETED)
+    assert server.context_agent("c1") is None
+    assert server.context_agent("c2") is not None
+
+
+async def test_a2a_a_context_mid_turn_is_not_released_and_the_newcomer_is_told_plainly(
+    sample_agent_card: AgentCard,
+) -> None:
+    """A context whose turn is running is never released; the new one is refused (#1836).
+
+    Killed by: src/uclone_x/shells/a2a_server.py :: if held not in self._unsaved_contexts and not self._context_locks[held].locked()
+    Becomes: if held not in self._unsaved_contexts
+    """
+    from uclone_x.shells.a2a_server import CONTEXTS_BUSY_MESSAGE
+
+    pool = _Pool("c1")
+    server = _pooled_server(sample_agent_card, pool, cap=1)
+    running = asyncio.create_task(_ask(server, "c1", "slow"))
+    await pool.started.wait()
+
+    refused = await _ask(server, "c2", "hello")
+    held = server.context_agent("c1")
+    pool.release.set()
+    finished = await running
+
+    assert (refused.status, refused.error) == (TaskStatus.FAILED, CONTEXTS_BUSY_MESSAGE)
+    assert held is not None
+    assert finished.status == TaskStatus.COMPLETED
+
+
+async def test_a2a_one_context_runs_one_turn_at_a_time(sample_agent_card: AgentCard) -> None:
+    """Two tasks in one context take turns rather than running on its agent at once (#1836).
+
+    Killed by: src/uclone_x/shells/a2a_server.py :: async with lock:
+    Becomes: if True:
+    """
+    pool = _Pool("c1")
+    server = _pooled_server(sample_agent_card, pool, cap=2)
+    first = asyncio.create_task(_ask(server, "c1", "one"))
+    second = asyncio.create_task(_ask(server, "c1", "two"))
+    await pool.started.wait()
+    for _ in range(5):
+        await asyncio.sleep(0)
+    pool.release.set()
+    done = await asyncio.gather(first, second)
+
+    assert [task.status for task in done] == [TaskStatus.COMPLETED, TaskStatus.COMPLETED]
+    assert pool.most_at_once == 1
+
+
+async def test_a2a_a_released_context_leaves_no_lock_behind(sample_agent_card: AgentCard) -> None:
+    """The lock map holds the held contexts and no more, however many callers came (#1885).
+
+    It kept a lock for every context the server had ever answered, so a long-lived server
+    grew by one per caller conversation. A refused context leaves none either.
+
+    Killed by: src/uclone_x/shells/a2a_server.py :: del self._context_locks[victim]
+    Becomes: pass
+    Killed by: src/uclone_x/shells/a2a_server.py :: del self._context_locks[context_id]
+    Becomes: pass
+    """
+    from uclone_x.shells.a2a_server import CONTEXTS_BUSY_MESSAGE
+
+    pool = _Pool("busy")
+    server = _pooled_server(sample_agent_card, pool, cap=1)
+    for context_id in ("c1", "c2", "c3", "c4"):
+        answered = await _ask(server, context_id, "hello")
+        assert answered.status == TaskStatus.COMPLETED
+
+    locks = server._context_locks  # pyright: ignore[reportPrivateUsage]
+    users = server._context_users  # pyright: ignore[reportPrivateUsage]
+    assert set(locks) == {"c4"} and users == {}
+
+    pool.started.clear()  # the four turns above set it
+    running = asyncio.create_task(_ask(server, "busy", "slow"))
+    await pool.started.wait()
+    refused = await _ask(server, "late", "hello")
+    pool.release.set()
+    await running
+
+    assert refused.error == CONTEXTS_BUSY_MESSAGE
+    assert set(locks) == {"busy"} and users == {}
+
+
+# ======================================================================================
+# #1893 item 1 -- a context's turn knows who the person is; #1885 -- failures read plainly
+# ======================================================================================
+
+
+class _NamedAgent:
+    """A context's agent that keeps the names each turn was given."""
+
+    def __init__(self, context_id: str, seen: dict[str, list[tuple[str, ...]]]) -> None:
+        self.agent_id = f"agent-{context_id}"
+        self._seen = seen.setdefault(context_id, [])
+
+    async def execute_turn(  # noqa: D102
+        self, input_data: object, *, person_names: tuple[str, ...] = (), **kwargs: Any
+    ) -> TurnResult:
+        self._seen.append(person_names)
+        return TurnResult(
+            turn_index=1,
+            content="noted",
+            is_completed=True,
+            provenance=Provenance.primary(self.agent_id),
+        )
+
+    def persist_session(self) -> None:  # noqa: D102
+        return None
+
+
+async def test_a2a_context_turn_is_given_the_person_s_names(sample_agent_card: AgentCard) -> None:
+    """Read per turn with the context id; a reader that fails gives none, not a failed task.
+
+    Killed by: src/uclone_x/shells/a2a_server.py :: prompt, person_names=self._turn_person_names(context_id)
+    Becomes: prompt
+    Killed by: src/uclone_x/shells/a2a_server.py :: return self._person_names(context_id)
+    Becomes: return (context_id,)
+    """
+    seen: dict[str, list[tuple[str, ...]]] = {}
+
+    def names(context_id: str) -> tuple[str, ...]:
+        if context_id == "broken":
+            raise OSError("room record unreadable")
+        return ("user", f"Kenny of {context_id}")
+
+    server = A2AServer(
+        agent_card=sample_agent_card,
+        port=0,
+        context_agent_factory=lambda c: cast(BaseAgent, _NamedAgent(c, seen)),
+        person_names=names,
+    )
+
+    done = [await _ask(server, c, "remember me") for c in ("c1", "broken")]
+
+    assert [r.status for r in done] == [TaskStatus.COMPLETED] * 2
+    assert seen == {"c1": [("user", "Kenny of c1")], "broken": [()]}
+
+
+#: What a caller must never be shown: a class name, a traceback, a path, the raw cause.
+_A2A_INTERNALS = ("Error", "Traceback", "/", "\\", "KeyError", "secret-db", "InternalError")
+
+
+def _plain(text: object) -> None:
+    assert isinstance(text, str) and text, text
+    assert not [w for w in _A2A_INTERNALS if w in text], text
+
+
+class _FailingAgent:
+    def __init__(self, how: str) -> None:
+        self.agent_id = "agent-failing"
+        self._how = how
+
+    async def execute_turn(  # noqa: D102
+        self, input_data: object, **kwargs: Any
+    ) -> TurnResult:
+        if self._how == "raises":
+            raise KeyError("/Users/someone/secret-db/index.json")
+        return TurnResult(
+            turn_index=1,
+            content="",
+            is_completed=False,
+            error="LLMProviderError: 401 at /Users/someone/secret-db",
+            provenance=None if self._how == "unattributed" else Provenance.primary("x"),
+        )
+
+    def persist_session(self) -> None:  # noqa: D102
+        return None
+
+
+@pytest.mark.parametrize(
+    ("how", "copy"),
+    [
+        ("raises", TURN_FAILED_MESSAGE),
+        ("fails", TURN_FAILED_MESSAGE),
+        ("unattributed", TURN_UNATTRIBUTED_MESSAGE),
+    ],
+)
+async def test_a2a_failed_task_tells_the_caller_plainly_and_logs_the_cause(
+    sample_agent_card: AgentCard, caplog: pytest.LogCaptureFixture, how: str, copy: str
+) -> None:
+    """The caller's owner reads the task's error; the cause is for the server's log (#1885).
+
+    Killed by: src/uclone_x/shells/a2a_server.py :: record.error = TURN_FAILED_MESSAGE
+    Becomes: record.error = turn_result.error or TURN_FAILED_MESSAGE
+    Killed by: src/uclone_x/shells/a2a_server.py :: record.error = TURN_UNATTRIBUTED_MESSAGE
+    Becomes: record.error = f"{TURN_UNATTRIBUTED_MESSAGE} {turn_result.error}"
+    Killed by: src/uclone_x/shells/a2a_server.py :: record.error, record.provenance = TURN_FAILED_MESSAGE, None
+    Becomes: record.error, record.provenance = str(exc), None
+    """
+    server = A2AServer(
+        agent_card=sample_agent_card,
+        port=0,
+        context_agent_factory=lambda c: cast(BaseAgent, _FailingAgent(how)),
+    )
+
+    record = await _ask(server, "c1", "go")
+
+    assert record.status is TaskStatus.FAILED
+    assert record.error == copy
+    _plain(record.to_dict()["error"])
+    assert "secret-db" in caplog.text
+
+
+def test_a2a_failure_copy_is_plain() -> None:
+    """Both sentences, whatever the failure: no class names, paths or tracebacks."""
+    _plain(TURN_FAILED_MESSAGE)
+    _plain(TURN_UNATTRIBUTED_MESSAGE)
+
+
+async def test_a2a_handler_crash_over_send_and_stream_reads_plainly(
+    sample_agent_card: AgentCard, caplog: pytest.LogCaptureFixture
+) -> None:
+    r"""`/send` and `/stream` answer a crashed handler with the plain sentence, not `str(exc)`.
+
+    Killed by: src/uclone_x/shells/a2a_server.py :: detail={"error": "InvalidAgentResponseError", "message": TURN_FAILED_MESSAGE},
+    Becomes: detail={"error": "InvalidAgentResponseError", "message": str(e)},
+    Killed by: src/uclone_x/shells/a2a_server.py :: yield f"data: {json.dumps({'error': TURN_FAILED_MESSAGE})}\n\n"
+    Becomes: yield f"data: {json.dumps({'error': traceback.format_exc()})}\n\n"
+    """
+
+    async def crashing(msg: TaskMessage) -> TaskResult:
+        raise ValueError("/Users/someone/secret-db is locked")
+
+    server = A2AServer(agent_card=sample_agent_card, handler=crashing, port=0)
+    await server.start()
+    try:
+        async with httpx.AsyncClient() as client:
+            body: dict[str, object] = {
+                "task_id": "t-crash",
+                "session_id": "s-crash",
+                "input_data": {},
+                "sender_agent_id": "caller",
+                "target_agent_id": "target",
+            }
+            headers = {"A2A-Version": "1.0"}
+            sent = await client.post(f"{server.url}/tasks/send", headers=headers, json=body)
+            streamed = await client.post(f"{server.url}/tasks/stream", headers=headers, json=body)
+    finally:
+        await server.stop()
+
+    assert sent.status_code == 500
+    assert sent.json()["detail"]["message"] == TURN_FAILED_MESSAGE
+    event = json.loads(streamed.text.strip().removeprefix("data: "))
+    assert event == {"error": TURN_FAILED_MESSAGE}
+    assert "secret-db" in caplog.text

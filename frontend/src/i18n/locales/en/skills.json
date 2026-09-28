@@ -85,5 +85,42 @@
     "noFindings": "Nothing unsafe was found in this skill's code.",
     "turnedDown": "Why it was turned down:",
     "choose": "Choose a skill to see its safety check."
+  },
+  "requiresTools": {
+    "heading": "Clones this skill is not offered to",
+    "row": "{clone}: needs {tools}",
+    "remedy": "A clone is offered a skill only when it has every tool the skill needs. To offer this one, add the missing tools to that clone's tools.",
+    "cloneHeading": "Skills this clone is not offered",
+    "cloneRow": "{skill}: needs {tools}",
+    "cloneRemedy": "A clone is offered a skill only when it has every tool the skill needs. To offer one of these, add the tools it needs to this clone's tools."
+  },
+  "proposals": {
+    "heading": "Skills your clones proposed",
+    "intro": "A proposed skill is not used until you approve it. Read its instructions, then approve it or turn it down.",
+    "by": "Proposed by {clone}",
+    "version": "Version {version}",
+    "replaces": "Replaces version {version}, which is in use now. What changes:",
+    "newSkill": "A new skill. Its instructions:",
+    "tools": "Tools it needs: {tools}",
+    "noTools": "It needs no tools.",
+    "approve": "Approve",
+    "turnDown": "Turn down",
+    "approved": "{name} is approved and ready to use.",
+    "turnedDown": "{name} was turned down and will not be used.",
+    "approveFailed": "The skill could not be approved.",
+    "changed": "This proposal changed after it was shown to you, so it was not approved. It is shown again below: look at it again, then approve it.",
+    "turnDownFailed": "The proposal could not be turned down."
+  },
+  "revoke": {
+    "button": "Revoke",
+    "hint": "Stop using this skill. Its files are kept, so it can be approved again later.",
+    "done": "{name} is revoked and no longer used.",
+    "failed": "The skill could not be revoked."
+  },
+  "confirmWindow": {
+    "unconfirmed": "Only you can decide this, and this window was not opened by UClone-X, so it cannot tell that it is you. Open a window UClone-X confirms, then decide there.",
+    "open": "Open a confirmed window",
+    "opened": "A confirmed window was opened in your browser. Decide there.",
+    "failed": "A confirmed window could not be opened."
   }
 }

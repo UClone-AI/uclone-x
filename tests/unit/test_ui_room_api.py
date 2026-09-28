@@ -34,6 +34,7 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
+from tests.support.app_clone import app_clone
 from uclone_x.agent.base import BaseAgent
 from uclone_x.llm import MockLLMConnector
 from uclone_x.llm.context_window import OllamaContextWindows
@@ -176,14 +177,15 @@ class TestCreateAndList:
         assert listed[0]["human_ids"] == ["user"]
 
     def test_a_room_that_cannot_be_seated_is_not_left_behind(self, client: TestClient) -> None:
-        """Create-then-seat is two writes, and the head must not show the first alone.
+        """A room is written once, seated, so a refused seat leaves nothing (#1885 item 3).
 
-        Killed by: src/uclone_x/ui/rooms.py :: _roll_back(service, state.room_id, exc)
-        Becomes: pass
+        Killed by: src/uclone_x/room/service.py ::
+            state = self._seated(state, participant_id, kind=kind)
+        Becomes: state = self._store.save(self._seated(state, participant_id, kind=kind))
         """
 
         # The second agent's id is one the session derivation cannot carry, so the roster
-        # refuses it -- after the room itself has already been written.
+        # refuses it -- after the human and the first agent were seated.
         refused = _create(client, agent_ids=["scout", "bad__id"])
 
         assert refused.status_code == 400, refused.text
@@ -809,7 +811,7 @@ class TestTheDesktopSaysNobodyAnswersApprovals:
         with pytest.MonkeyPatch.context() as mp:
             mp.setenv(AGENTS_DIR_ENV_VAR, str(tmp_path / "agents"))
             mgr = AgentSessionManager(storage_dir=tmp_path / "sessions", llm=MockLLMConnector())
-            chat = asyncio.run(mgr.get_or_create_agent("writer"))
+            chat = app_clone(mgr, "writer")
             stack = RoomStack(mgr)
             state = stack.service.create(title="Chapter one")
             stack.service.add_participant(
@@ -1313,25 +1315,34 @@ class TestWhichSeatsAHistoryControlActsOn:
         assert seated_agents(state) == ()
 
     def test_a_seat_that_has_spoken_is_counted_from_the_live_agent(
-        self, client: TestClient
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """The hazard this slice was written around, on the read side.
 
-        A seat's agent is built and cached by `RoomAgentResolver` and never registered in
-        `AgentSessionManager._agents`, so `get_agent` answers `None` for one. The readout
-        therefore has to be handed the agent the resolver holds; the fallback it would
-        otherwise take reads a stored copy, and reports a conversation as empty while the
-        agent driving it is one turn from its ceiling.
+        A seat's agent is built and cached by `RoomAgentResolver`, and nothing else holds it
+        (the session manager's own agent registry, `_agents` and `get_agent`, was removed
+        in #1899). The readout therefore has to be handed the agent the resolver holds; the
+        fallback it would otherwise take reads a stored copy, and reports a conversation as
+        empty while the agent driving it is one turn from its ceiling.
 
         `live` still reads `True` without it — the resolver holds the agent either way —
-        while `active_turns` is answered from the record rather than from the writer.
+        while `active_turns` is answered from the record rather than from the writer. The
+        record is made unreadable here, as for a seat that has not been persisted yet, so
+        the only source of the turn is the live agent.
 
         Killed by: src/uclone_x/ui/rooms.py :: session_id=participant.session_id, agent=live
         Becomes: session_id=participant.session_id
         """
+        from uclone_x.agent.session import SessionStore
+
         room_id = _create(client, agent_ids=["scout"]).json()["room_id"]
         client.post(f"/api/rooms/{room_id}/messages", json={"content": "hello"})
         _wait_for_transcript(client, room_id, rows=4)
+
+        def _unpersisted(self: SessionStore, session_id: str) -> None:
+            return None
+
+        monkeypatch.setattr(SessionStore, "load", _unpersisted)
 
         seat = client.get(f"/api/rooms/{room_id}/context").json()["seats"][0]
 
@@ -1769,7 +1780,7 @@ class TestHistoryIsRefusedWhileSomebodyIsAnswering:
             "user",
             "/loop help",
         )
-        assert command["code"] is None
+        assert "code" not in command  # left out while unset (#1885)
         # Stored as a note, and not only read as one: loading converts a command saved as
         # speech by an older build, which would hide this route saving it as speech.
         stored = json.loads((tmp_path / "sessions" / "rooms" / f"{room_id}.json").read_text())
@@ -1779,7 +1790,7 @@ class TestHistoryIsRefusedWhileSomebodyIsAnswering:
         assert notes == [help_note]
         assert notes[0]["sender_id"] == "system"
         assert notes[0]["code"] == "loop.help"
-        assert notes[0]["params"] is None
+        assert "params" not in notes[0]  # left out while unset (#1885)
         # The stored fallback is English, for exports and heads that predate the code.
         assert "`/loop list`" in notes[0]["content"]
         assert not _HANGUL.search(notes[0]["content"])
@@ -1873,7 +1884,7 @@ class TestHistoryIsRefusedWhileSomebodyIsAnswering:
         assert res.status_code == 202
         notes = _notes(client, room_id)
         assert [n["code"] for n in notes] == [code]
-        assert notes[0]["params"] == params
+        assert notes[0].get("params") == params  # left out while unset (#1885)
         assert "spin loop" not in notes[0]["content"]
         assert "Supported units" not in notes[0]["content"]
 
@@ -1899,7 +1910,7 @@ class TestHistoryIsRefusedWhileSomebodyIsAnswering:
         client.post(f"/api/rooms/{room_id}/messages", json={"content": "/loop list"})
         notes = _notes(client, room_id)
         assert notes[-1]["code"] == "loop.none_active"
-        assert notes[-1]["params"] is None
+        assert "params" not in notes[-1]  # left out while unset (#1885)
 
     def test_room_toggle_autonomous_and_presence(self, client: TestClient) -> None:
         """POST /api/rooms/{id}/autonomous toggles policy, /presence updates presence."""
@@ -1907,7 +1918,7 @@ class TestHistoryIsRefusedWhileSomebodyIsAnswering:
 
         # Initially autonomous is False
         room = client.get(f"/api/rooms/{room_id}").json()
-        assert room["policy"]["autonomous"] is False
+        assert "autonomous" not in room["policy"]  # left out while off (#1885)
 
         # Enable autonomous
         res = client.post(f"/api/rooms/{room_id}/autonomous", json={"enabled": True})
@@ -1922,7 +1933,7 @@ class TestHistoryIsRefusedWhileSomebodyIsAnswering:
         # Disable autonomous
         res_off = client.post(f"/api/rooms/{room_id}/autonomous", json={"enabled": False})
         assert res_off.status_code == 200
-        assert res_off.json()["policy"]["autonomous"] is False
+        assert "autonomous" not in res_off.json()["policy"]
 
         # Re-enabling autonomous resets turn count if circuit breaker was reached
         from uclone_x.room.orchestrator import AUTONOMOUS_CIRCUIT_BREAKER_TURNS
@@ -2075,3 +2086,219 @@ class TestHistoryIsRefusedWhileSomebodyIsAnswering:
                 await asyncio.sleep(0.01)
 
         assert client.get(f"/api/rooms/{room_id}").json()["active_turn"] is None
+
+
+class TestAHeadRoomInTheApp:
+    """The app reads a head's room and cannot post into it (#1885)."""
+
+    @staticmethod
+    def _head_room(client: TestClient) -> str:
+        from uclone_x.room.one_seat import HeadTurn, record_head_turn
+
+        stack = cast(Any, client.app).state.room_stack
+        state = record_head_turn(
+            stack.store,
+            room_id="room_from_the_terminal",
+            clone_id="scout",
+            turn=HeadTurn(prompt="what is in the index?", content="three tables"),
+            head="run",
+        )
+        assert state.head == "run"
+        return state.room_id
+
+    @pytest.mark.parametrize(
+        ("route", "body"),
+        [("messages", {"content": "hello from the app"}), ("retry", None)],
+    )
+    def test_a_post_is_refused_with_the_plain_reason_and_nothing_is_written(
+        self, answering_client: TestClient, route: str, body: dict[str, Any] | None
+    ) -> None:
+        """Unmapped, the refusal reaches the head as a bare 500 with no reason to show.
+
+        Killed by: src/uclone_x/ui/rooms.py :: (NothingToRetryError, HeadRoomWriteError)
+        Becomes: (NothingToRetryError,)
+        """
+        room_id = self._head_room(answering_client)
+        before = answering_client.get(f"/api/rooms/{room_id}").json()
+
+        refused = answering_client.post(f"/api/rooms/{room_id}/{route}", json=body)
+
+        assert refused.status_code == 409, refused.text
+        assert refused.json()["detail"] == (
+            "This conversation belongs to ucx run, so only ucx run can continue it. "
+            "You can read it here."
+        )
+        assert answering_client.get(f"/api/rooms/{room_id}").json() == before
+
+    def test_every_route_that_changes_a_room_refuses_a_head_room(self, client: TestClient) -> None:
+        """One guard, every writing route: the enumeration is of the app, not of a list here.
+
+        Each non-read route under `/api/rooms/{room_id}` is sent to a fresh head room, and
+        each must answer 409 with the plain refusal and leave the stored room as it was --
+        compact, rewind, clear, roster, rename, autonomy and presence included, which write
+        without the orchestrator. The one exception is deleting the room itself (author's
+        choice, `_HEAD_ROOM_OWNER_ACTIONS`). The named paths below only guard against the
+        enumeration going quietly empty.
+
+        Killed by: src/uclone_x/ui/rooms.py :: if head is not None:
+        Becomes: if False:
+        Killed by: src/uclone_x/ui/rooms.py :: if request.method in _READ_METHODS:
+        Becomes: if True:
+        Killed by: src/uclone_x/ui/rooms.py :: return self._app.patch(path, dependencies=self._dependencies, **kwargs)
+        Becomes: return self._app.patch(path, **kwargs)
+        """
+        from uclone_x.room.one_seat import HeadTurn, record_head_turn
+
+        stack = cast(Any, client.app).state.room_stack
+        writes = sorted(
+            (method, route.path)
+            for route in cast(list[Any], cast(Any, client.app).routes)
+            if str(getattr(route, "path", "")).startswith("/api/rooms/{room_id}")
+            for method in (getattr(route, "methods", None) or ())
+            if method not in ("GET", "HEAD", "OPTIONS")
+        )
+        assert {
+            ("PATCH", "/api/rooms/{room_id}"),
+            ("POST", "/api/rooms/{room_id}/participants"),
+            ("DELETE", "/api/rooms/{room_id}/participants/{participant_id}"),
+            ("POST", "/api/rooms/{room_id}/compact"),
+            ("POST", "/api/rooms/{room_id}/history/truncate"),
+            ("DELETE", "/api/rooms/{room_id}/history"),
+            ("POST", "/api/rooms/{room_id}/autonomous"),
+            ("POST", "/api/rooms/{room_id}/presence"),
+        } <= set(writes)
+
+        for n, (method, path) in enumerate(writes):
+            room_id = record_head_turn(
+                stack.store,
+                room_id=f"room_head_{n}",
+                clone_id="scout",
+                turn=HeadTurn(prompt="what is in the index?", content="three tables"),
+                head="run",
+            ).room_id
+            before = stack.service.get(room_id)
+            url = path.format(room_id=room_id, participant_id="scout", seq=1)
+
+            answer = client.request(method, url, json={})
+
+            if (method, path) == ("DELETE", "/api/rooms/{room_id}"):
+                assert answer.status_code == 204, (method, path, answer.text)
+                continue
+            assert answer.status_code == 409, (method, path, answer.text)
+            assert answer.json()["detail"] == (
+                "This conversation belongs to ucx run, so only ucx run can continue it. "
+                "You can read it here."
+            )
+            assert stack.service.get(room_id) == before, (method, path)
+
+    @pytest.mark.parametrize(
+        ("head", "keeper"),
+        [("acp", "the editor that opened it"), ("a2a", "the agent that called this clone")],
+    )
+    def test_an_editor_or_agent_room_from_before_the_mark_is_the_head_s(
+        self, answering_client: TestClient, head: str, keeper: str
+    ) -> None:
+        """An ACP or A2A room's id says whose it is, so it is refused though it has no mark.
+
+        Unlike `run`/`loop`, whose ids are the app's own `room_` shape, these ids are made
+        only by their head (`conversation_room_id`). Author's choice (#1885): they are
+        read as the head's, and `GET` reports the head so the app shows them read-only.
+
+        Killed by: src/uclone_x/ui/rooms.py :: return {**state.model_dump(mode="json"), "head": room_head(state), "active_turn": active}
+        Becomes: return {**state.model_dump(mode="json"), "active_turn": active}
+        Killed by: src/uclone_x/room/models.py :: return unmarked.group(1) if unmarked is not None else None
+        Becomes: return None
+        """
+        from uclone_x.room.one_seat import HeadTurn, conversation_room_id, record_head_turn
+
+        stack = cast(Any, answering_client.app).state.room_stack
+        state = record_head_turn(
+            stack.store,
+            room_id=conversation_room_id(head, "scout", "c1"),
+            clone_id="scout",
+            turn=HeadTurn(prompt="what is in the index?", content="three tables"),
+            head=head,
+        )
+        state = stack.store.save(state.model_copy(update={"head": None}))
+        before = answering_client.get(f"/api/rooms/{state.room_id}").json()
+        assert before["head"] == head
+
+        refused = answering_client.post(
+            f"/api/rooms/{state.room_id}/messages", json={"content": "hello from the app"}
+        )
+
+        assert refused.status_code == 409, refused.text
+        assert refused.json()["detail"] == (
+            f"This conversation belongs to {keeper}, so only {keeper} can continue it. "
+            "You can read it here."
+        )
+        assert answering_client.get(f"/api/rooms/{state.room_id}").json() == before
+        assert stack.store.load(state.room_id).head is None, "the record is read, not rewritten"
+
+    def test_a_head_room_from_before_the_mark_is_served_as_before(self, client: TestClient) -> None:
+        """An unmarked run room stays the app's: it takes a post, and `ucx run` is refused.
+
+        An unmarked room written by `ucx run` before rooms were marked cannot be told from
+        one the app made -- both seat `user` and one clone -- so it has a single owner only
+        if one side gives it up. Author's choice (#1885): the app keeps it, because marking
+        it later would change, under the person, what the app lets them do in a room it
+        already shows, and a refused `--session-id` says plainly where to continue.
+
+        Killed by: src/uclone_x/room/one_seat.py :: if state.head != head and not _unmarked_server_room(state, room_id, head):
+        Becomes: if False:
+        """
+        from uclone_x.errors import RoomError
+        from uclone_x.room.one_seat import ONE_SEAT_HUMAN_ID, HeadTurn, record_head_turn
+
+        stack = cast(Any, client.app).state.room_stack
+        room_id = stack.service.create("scout", room_id="room_before_the_mark").room_id
+        stack.service.add_participant(room_id, ONE_SEAT_HUMAN_ID, kind=ParticipantKind.HUMAN)
+        stack.service.add_participant(room_id, "scout", kind=ParticipantKind.AGENT)
+
+        with pytest.raises(RoomError, match="belongs to the app"):
+            record_head_turn(
+                stack.store,
+                room_id=room_id,
+                clone_id="scout",
+                turn=HeadTurn(prompt="and now?", content="still here"),
+                head="run",
+            )
+        sent = client.post(f"/api/rooms/{room_id}/messages", json={"content": "from the app"})
+
+        assert stack.service.get(room_id).head is None
+        assert sent.status_code == 202, sent.text
+
+
+class TestTheAppAndTheCliShareOneRoomStore:
+    """`RoomStack` resolves the room folder as the CLI does (#1885)."""
+
+    def test_over_the_default_session_root_it_honours_the_room_variable(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Otherwise the app lists a folder no head writes to while `UCLONE_ROOM_DIR` is set.
+
+        Killed by: src/uclone_x/room/store.py :: return default_room_storage_dir()
+        Becomes: return session_root / ROOMS_SUBDIR
+        """
+        from uclone_x.room.store import ROOM_STORAGE_DIR_ENV_VAR, RoomStore
+
+        elsewhere = tmp_path / "rooms-elsewhere"
+        monkeypatch.setenv(ROOM_STORAGE_DIR_ENV_VAR, str(elsewhere))
+        app = create_ui_app(static_dir=tmp_path, llm=MockLLMConnector())
+        stack = cast(Any, app).state.room_stack
+
+        assert stack.store.storage_dir == elsewhere
+        assert stack.store.storage_dir == RoomStore().storage_dir
+
+    def test_a_storage_folder_of_its_own_keeps_its_rooms_inside_it(self, tmp_path: Path) -> None:
+        """An app pointed at a folder keeps that folder whole (author's choice).
+
+        Killed by: src/uclone_x/room/store.py :: if session_root.resolve() == default_session_root().resolve():
+        Becomes: if True:
+        """
+        app = create_ui_app(
+            static_dir=tmp_path, storage_dir=tmp_path / "sessions", llm=MockLLMConnector()
+        )
+        stack = cast(Any, app).state.room_stack
+
+        assert stack.store.storage_dir == (tmp_path / "sessions").resolve() / "rooms"

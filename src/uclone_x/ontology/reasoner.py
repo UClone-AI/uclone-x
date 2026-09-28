@@ -48,7 +48,8 @@ answers "does this follow?", not "is the graph it follows from coherent?".
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 from itertools import chain
 from typing import Any, Final
 
@@ -70,7 +71,14 @@ from uclone_x.ontology.rules import (
     interpret_axioms,
 )
 
-__all__ = ["MAX_ROUNDS", "OntologyReasoner", "check_consistency", "materialize"]
+__all__ = [
+    "MAX_ROUNDS",
+    "OntologyReasoner",
+    "WorkedOut",
+    "check_consistency",
+    "materialize",
+    "worked_out",
+]
 
 MAX_ROUNDS: Final = 1000
 """Round ceiling. Termination is argued structurally; this only turns a hypothetical
@@ -122,6 +130,67 @@ def materialize(facts: Iterable[Fact], axioms: Iterable[OntologyAxiom]) -> Closu
         justifications={fact_id: _order_steps(steps) for fact_id, steps in justifications.items()},
         unsupported_axioms=unsupported,
     )
+
+
+@dataclass(frozen=True)
+class WorkedOut:
+    """One statement that follows from a clone's facts under its rules, and from which facts.
+
+    `because` names the caller's own ids for the facts it rests on (a memory fact's
+    `fact_id`), sorted, never the reasoner's triple hashes: those name nothing a reader of
+    the facts can find.
+    """
+
+    subject: str
+    predicate: str
+    object: str
+    because: tuple[str, ...]
+
+
+def worked_out(
+    statements: Mapping[str, tuple[str, str, str]], axioms: Iterable[OntologyAxiom]
+) -> tuple[WorkedOut, ...]:
+    """What follows from `statements` under `axioms` and is not itself one of them.
+
+    `statements` maps the caller's id for a fact to its `(subject, predicate, object)`.
+    Computed on every call and never kept (clone-knowledge-graph §3.1): a fact corrected or
+    forgotten since is not in the next call's input, so nothing that followed from it can
+    outlive it. What rests on no input fact -- the schema facts the rules seed, and what
+    follows from those alone -- is not listed: it is the rules, not something worked out.
+
+    `because` is every input fact some well-founded proof of the statement rests on
+    (`Closure.explain`), the union over all of its proofs, so forgetting any one of them may
+    or may not retract it -- the list says which facts are involved, not which is decisive.
+    Ordered by statement, so two calls over one input answer alike.
+    """
+    ids_by_triple: dict[str, list[str]] = {}
+    facts: list[Fact] = []
+    for caller_id, (subject, predicate, object_value) in statements.items():
+        fact = Fact(subject=subject, predicate=predicate, object=object_value)
+        ids_by_triple.setdefault(fact.id, []).append(caller_id)
+        facts.append(fact)
+    closure = materialize(facts, axioms)
+    found: list[WorkedOut] = []
+    for fact_id, fact in closure.facts.items():
+        if not fact.derived or fact_id in ids_by_triple:
+            continue
+        leaves = {
+            premise
+            for step in closure.explain(fact_id)
+            for premise in step.premises
+            if premise in ids_by_triple
+        }
+        if not leaves:  # follows from the rules alone: a rule, not something learned
+            continue
+        found.append(
+            WorkedOut(
+                subject=fact.subject,
+                predicate=fact.predicate,
+                object=fact.object,
+                because=tuple(sorted(cid for leaf in leaves for cid in ids_by_triple[leaf])),
+            )
+        )
+    return tuple(sorted(found, key=lambda w: (w.subject, w.predicate, w.object)))
 
 
 def check_consistency(closure: Closure) -> tuple[Inconsistency, ...]:

@@ -1,20 +1,21 @@
 """The knowledge-graph payload, built from one ontology engine.
 
 Shared by `GET /api/knowledge-graph` and the room route `GET /api/rooms/{id}/knowledge`
-(#1357). The first picks an engine by looking an agent up among the chat surface's agents;
-the second is handed the seat's own. Choosing the engine is the caller's decision, and it
-is the one thing the two routes must not share -- the chat lookup cannot see a room seat,
-and falling back to the shared engine described nothing the seat learned.
+(#1357). Both are handed the named clone's one rules engine (`ontology_for`); there is no
+shared engine to fall back on any more (#1869), since a fallback described nothing the
+clone learned.
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from typing import Any
 
 from uclone_x.memory.models import MemoryFact
+from uclone_x.ontology.models import OntologyAxiom
+from uclone_x.ontology.reasoner import worked_out
 
-__all__ = ["knowledge_graph", "known_facts"]
+__all__ = ["knowledge_graph", "known_facts", "worked_out_list"]
 
 
 def knowledge_graph(
@@ -233,3 +234,22 @@ def known_facts(
             }
         )
     return listed
+
+
+def worked_out_list(
+    facts: Sequence[MemoryFact], axioms: Iterable[OntologyAxiom]
+) -> list[dict[str, Any]]:
+    """What a clone's rules work out from its facts, each with the facts it rests on (step 6).
+
+    Computed on every read and never saved (clone-knowledge-graph §3.1), so a fact
+    corrected or forgotten takes what followed from it with it. `because` holds the
+    `fact_id`s of the facts in `facts` the statement rests on.
+    """
+    statements = {f.fact_id: (f.subject, f.predicate, f.object_value) for f in facts}
+    return [
+        {
+            "statement": _statement(w.subject, w.predicate, w.object),
+            "because": list(w.because),
+        }
+        for w in worked_out(statements, axioms)
+    ]

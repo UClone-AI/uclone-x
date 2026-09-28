@@ -168,8 +168,8 @@ async def test_structured_filters_still_narrow_the_candidate_set() -> None:
     `considered == 1` alone is satisfied by a filter that keeps the *wrong* fact, so the
     identity of the survivor is asserted too, against the same store unfiltered.
 
-    Killed by: src/uclone_x/memory/store.py :: if target_subj and fact.subject.strip().lower() != target_subj:
-    Becomes: if target_subj and fact.subject.strip().lower() == target_subj:
+    Killed by: src/uclone_x/memory/store.py :: if target_subj and fold_name(fact.subject) != target_subj:
+    Becomes: if target_subj and fold_name(fact.subject) == target_subj:
     """
     memory = _memory()
 

@@ -27,6 +27,7 @@ import uvicorn
 from playwright.async_api import Locator, Page
 
 from uclone_x.engine.event_bus import EventBus
+from uclone_x.link.uclone2.supervisor import LinkSupervisor
 from uclone_x.llm.budget import TokenBudgetManager
 from uclone_x.llm.connectors.mock import MockLLMConnector
 from uclone_x.skills.auditor import SkillRegistry
@@ -284,6 +285,7 @@ def running_ui(
     workspace_dir: Path | None = None,
     eval_reports_dir: Path | None = None,
     skills_dir: Path | None = None,
+    link_supervisor: LinkSupervisor | None = None,
     configure: Callable[[Any], None] | None = None,
 ) -> Generator[str]:
     """Run the UI app on an ephemeral port for the duration of the context.
@@ -313,6 +315,10 @@ def running_ui(
     (`ucx-agent-skills/`) at startup, as a real head does, and every Skills assertion would
     then depend on what that directory ships -- a directory the published tree does not
     carry. A test that needs a registered skill passes a store it wrote.
+
+    `link_supervisor` is the uClone2 link supervisor. Left to default, the server reads the
+    links file under the machine's own data folder and dials whatever it finds there; a test
+    about links passes one over its own store and a fake uClone2.
     """
     app = create_ui_app(
         static_dir=STATIC_DIR,
@@ -323,6 +329,7 @@ def running_ui(
         workspace_dir=workspace_dir,
         eval_reports_dir=eval_reports_dir,
         skill_registry=SkillRegistry(skills_dir=skills_dir),
+        link_supervisor=link_supervisor,
     )
     # A hook rather than another keyword per setting: what a test needs to arrange is
     # sometimes a field on a Core object rather than an argument `create_ui_app` takes,
@@ -341,12 +348,43 @@ def running_ui(
         thread.join(timeout=_SHUTDOWN_TIMEOUT_SECONDS)
 
 
+def is_extraction_request(request: Any) -> bool:
+    """Whether `request` is a clone learning from its turn (#1404), not a turn's own call."""
+    from uclone_x.llm.models import MessageRole
+    from uclone_x.memory.extractor import INSTRUCTIONS_OPENING
+
+    return any(
+        (getattr(m, "content", "") or "").startswith(INSTRUCTIONS_OPENING)
+        for m in getattr(request, "messages", None) or ()
+        if getattr(m, "role", None) is MessageRole.SYSTEM
+    )
+
+
+def nothing_learned() -> MockLLMConnector:
+    """Answers an extraction call with no facts, so a scripted turn's queue is not spent on it.
+
+    Learning runs after every room turn. A mock that answered it from its own queue would hand
+    a later turn's scripted reply to the extractor, and its default prose is not a fact list,
+    which puts a failure line under every reply the page shows.
+    """
+    return MockLLMConnector(default_model="mock-gpt-4o", default_response="[]")
+
+
 class _E2EMockLLMConnector(MockLLMConnector):
-    """Mock connector that returns a valid silence decision for unscripted selector requests."""
+    """Mock connector that returns a valid silence decision for unscripted selector requests.
+
+    An extraction call is answered with no facts (`nothing_learned`).
+    """
+
+    _learner: MockLLMConnector | None = None
 
     async def generate(self, request: Any) -> Any:
         from uclone_x.llm.models import MessageRole
 
+        if is_extraction_request(request):
+            if self._learner is None:
+                self._learner = nothing_learned()
+            return await self._learner.generate(request)
         if (
             not self._responses
             and getattr(request, "messages", None)

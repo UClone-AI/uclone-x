@@ -56,13 +56,14 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from uclone_x.errors import (
+    HeadRoomWriteError,
     PathTraversalError,
     PlainRefusalError,
     RoomNotFoundError,
     StaleRoomWriteError,
     UnreadableRoomRecordError,
 )
-from uclone_x.room.models import RoomState
+from uclone_x.room.models import RoomState, head_room_write_refusal, room_head
 from uclone_x.room.service import RoomService
 from uclone_x.sandbox.path_validator import PathValidator
 from uclone_x.story.library import (
@@ -894,11 +895,16 @@ class ArtifactLibrary:
         `note` says which conversation is writing it.
         """
         try:
-            self._rooms.get(room_id)
+            room = self._rooms.get(room_id)
         except RoomNotFoundError as exc:
             raise ArtifactNotFoundError(
                 "That conversation no longer exists, so the story was not opened."
             ) from exc
+        # Before the lease is touched: a room a head keeps is written by that head alone
+        # (#1885), so the story is neither leased to it nor named in it.
+        head = room_head(room)
+        if head is not None:
+            raise HeadRoomWriteError(head_room_write_refusal(head))
         library = StoryLibrary(self._workspace)
         try:
             opening = library.open(story_id, room_id)

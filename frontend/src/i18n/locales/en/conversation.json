@@ -1,18 +1,31 @@
 {
   "you": "you",
+  "headRoom": {
+    "run": "This conversation continues in ucx run, in the terminal. You can read it here, but not write in it.",
+    "loop": "This conversation continues in ucx loop, in the terminal. You can read it here, but not write in it.",
+    "acp": "This conversation continues in the editor that opened it. You can read it here, but not write in it.",
+    "a2a": "This conversation continues with the agent that called this clone. You can read it here, but not write in it.",
+    "other": "This conversation continues in another program. You can read it here, but not write in it."
+  },
   "row": {
     "retry": "Retry",
     "silentFinished": "{label} finished this turn without sending any text.",
     "silentStopped": "{label} stopped partway through this turn and sent no text.",
     "unsaved": "{label} will not remember this turn after a restart; it could not be saved.",
-    "knowledgeUnsaved": "{label} will not know what it learned in this turn after a restart; it could not be saved.",
-    "knowledgeSetAside": "{label}'s knowledge record for this conversation could not be read, so it was set aside and kept.",
+    "sessionSetAside": "This version could not open {label}'s earlier conversation here. It was kept, not written over, and {label} carried on without it.",
+    "knowledgeLearned": {
+      "one": "{label} will remember 1 thing from this turn.",
+      "other": "{label} will remember {count} things from this turn."
+    },
+    "knowledgeExtractFailed": "{label} could not pick up what to remember from this turn.",
     "why": "why ›",
     "servedInstead": "{served} (asked for {requested})"
   },
   "membership": {
     "joined": "{name} joined this conversation",
-    "left": "{name} left this conversation"
+    "left": "{name} left this conversation",
+    "joinedSelf": "You joined this conversation",
+    "leftSelf": "You left this conversation"
   },
   "header": {
     "writing": "Writing…",

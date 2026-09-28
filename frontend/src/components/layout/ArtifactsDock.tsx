@@ -16,7 +16,7 @@ import { KnowledgeGraphViewer } from '../artifacts/KnowledgeGraphViewer';
 import { ActivityTimeline } from '../artifacts/ActivityTimeline';
 import { ResourceSummary } from '../artifacts/ResourceSummary';
 import { RemembersPanel } from '../artifacts/RemembersPanel';
-import { agentSeats } from '../../lib/roomDock';
+import { agentSeats, transcriptRefreshKey } from '../../lib/roomDock';
 import { useCopy } from '../../i18n';
 // The dock is one of the workspace's top-level regions and its parent spans the window, so the
 // quantity that decides whether it fits on screen is the window's own width. The panels
@@ -238,7 +238,9 @@ export const ArtifactsDock: React.FC<ArtifactsDockProps> = ({
   // one of its surfaces: then Docs & Artifacts, never a blank panel.
   const surface = shownSurface(activeSurface, developerMode);
   // The dock re-reads when the conversation moves on: a new message is a new record to show.
-  const refreshKey = room?.room_id === roomId ? (room?.transcript.length ?? 0) : 0;
+  // So is a clone learning from a turn after it (#1404): the row gains what was saved while
+  // the transcript keeps its length, so each saved fact and each failure moves the key too.
+  const refreshKey = room && room.room_id === roomId ? transcriptRefreshKey(room.transcript) : 0;
   // Only the agents in *this* conversation, and only while `room` is the one on screen.
   const seats = room && room.room_id === roomId ? agentSeats(room) : [];
   const seatName = (() => {

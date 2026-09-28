@@ -15,9 +15,9 @@ cost to get wrong:
   all three, and only two of them are something a reader can act on.
 * **One damaged home does not empty the list.** The damage belongs to that row.
 * **Running means running, on the path a user actually takes.** D1 makes every new
-  conversation a room, so a clone is normally seated by a `RoomAgentResolver` and never
-  appears in the session manager's chat map. A join that reads only that map calls the
-  ordinary running clone "Installed and not running".
+  conversation a room, so a running clone is one seated by a `RoomAgentResolver`; the
+  session manager holds no agent (#1899). A listing that does not read the seats calls
+  the ordinary running clone "Installed and not running".
 * **One predicate, not two.** The sentence above the list counts the rows the list holds.
   Counting the *disk* listing instead prints "No clone is installed yet." above a clone.
 * **The wire speaks the product's vocabulary.** A reason is rendered verbatim, so a
@@ -40,35 +40,51 @@ from uclone_x.agent.base import BaseAgent
 from uclone_x.agent.models import AgentConfig, AgentContext, AgentState
 from uclone_x.core.agent_home import AGENT_ID_PREFIX, AGENTS_DIR_ENV_VAR
 from uclone_x.llm import MockLLMConnector
-from uclone_x.ui.app import AgentSessionManager, create_ui_app
+from uclone_x.room.models import ParticipantKind
+from uclone_x.ui.app import create_ui_app
+from uclone_x.ui.rooms import RoomStack
 
 
-def _client(tmp_path: Path, session_mgr: AgentSessionManager | None = None) -> TestClient:
+def _client(tmp_path: Path) -> TestClient:
     storage_dir = tmp_path / "sessions"
     app = create_ui_app(
         static_dir=tmp_path / "static",
         storage_dir=storage_dir,
         llm=MockLLMConnector(),
-        session_manager=session_mgr,
     )
     return TestClient(app)
 
 
-def _seat_a_live_clone(session_mgr: AgentSessionManager, username: str) -> None:
-    """Register a running instance under `username`, as a chat turn would."""
+def _seated_client(tmp_path: Path, username: str) -> TestClient:
+    """A client whose app has `username` seated live in a conversation, as a turn leaves it.
+
+    The seat is the resolver's cache, which is where every live clone is: every head is a
+    one-seat room and the manager holds no agent (#1899). Filled directly rather than by
+    a turn, so that nothing mints the clone's home on disk -- several tests here need a
+    running clone whose home is absent.
+    """
+    client = _client(tmp_path)
+    stack: RoomStack = cast(Any, client.app).state.room_stack
+    state = stack.service.create(f"with {username}", seats=[(username, ParticipantKind.AGENT)])
+    stack.orchestrator(state)
+    participant = next(p for p in state.participants if p.id == username)
+    session_mgr = stack.session_manager()
     agent = BaseAgent(
         config=AgentConfig(agent_id=username, name=username),
         bus=session_mgr.bus,
         llm=MockLLMConnector(),
         tools=session_mgr.tools,
         context=AgentContext(
-            session_id=f"sess_{username}",
+            session_id=participant.session_id,
             agent_id=username,
             current_state=AgentState.IDLE,
         ),
         store=session_mgr.core_store,
     )
-    session_mgr._agents[f"{username}:sess_{username}"] = agent  # pyright: ignore[reportPrivateUsage]
+    resolver = stack._rooms[state.room_id].resolver  # pyright: ignore[reportPrivateUsage]
+    resolver._agents[participant.session_id] = agent  # pyright: ignore[reportPrivateUsage]
+    resolver._sessions[participant.session_id] = username  # pyright: ignore[reportPrivateUsage]
+    return client
 
 
 def _body(client: TestClient) -> dict[str, Any]:
@@ -182,10 +198,7 @@ def test_a_running_clone_is_reported_live_rather_than_left_to_be_inferred(
     (agents_root / "archivist").mkdir(parents=True)
     monkeypatch.setenv(AGENTS_DIR_ENV_VAR, str(agents_root))
 
-    session_mgr = AgentSessionManager(storage_dir=tmp_path / "sessions")
-    _seat_a_live_clone(session_mgr, "scout")
-
-    body = _body(_client(tmp_path, session_mgr))
+    body = _body(_seated_client(tmp_path, "scout"))
 
     by_name = {clone["name"]: clone for clone in body["clones"]}
     assert by_name["scout"]["status"] == "live"
@@ -295,10 +308,7 @@ def test_a_running_clone_whose_home_is_gone_is_still_listed(
     agents_root.mkdir(parents=True)
     monkeypatch.setenv(AGENTS_DIR_ENV_VAR, str(agents_root))
 
-    session_mgr = AgentSessionManager(storage_dir=tmp_path / "sessions")
-    _seat_a_live_clone(session_mgr, "scout")
-
-    body = _body(_client(tmp_path, session_mgr))
+    body = _body(_seated_client(tmp_path, "scout"))
 
     assert [clone["name"] for clone in body["clones"]] == ["scout"]
     assert body["clones"][0]["status"] == "live"
@@ -312,17 +322,16 @@ def test_a_running_clone_whose_home_is_gone_is_still_listed(
 def test_a_clone_answering_in_a_conversation_is_reported_live(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The default way to be running is to be seated in a conversation, not in the chat map.
+    """The default way to be running is to be seated in a conversation.
 
-    `AgentSessionManager.list_agents()` returns only `_agents`, the legacy chat map. A
-    clone seated in a conversation is built and cached by that room's `RoomAgentResolver`
-    (`uclone_x.room.resolver`), and nothing writes it back into the session manager. Under
-    D1 (design §1.3) *every* new conversation is a room, single-clone ones included, so a
-    join that reads only the chat map calls the ordinary running clone "Installed and not
-    running" while the user is reading the reply it just wrote.
+    A clone seated in a conversation is built and cached by that room's
+    `RoomAgentResolver` (`uclone_x.room.resolver`). Under D1 (design §1.3) *every* new
+    conversation is a room, single-clone ones included, so a listing that does not read
+    the room seats calls the ordinary running clone "Installed and not running" while the
+    user is reading the reply it just wrote. Driven by a real turn, not a filled cache.
 
-    Killed by: src/uclone_x/ui/clones.py :: return chatting | room_stack.seated_agent_ids()
-    Becomes: return chatting
+    Killed by: src/uclone_x/ui/clones.py :: return room_stack.seated_agent_ids()
+    Becomes: return frozenset()
     """
     agents_root = tmp_path / "agents"
     (agents_root / "scout").mkdir(parents=True)
@@ -526,10 +535,7 @@ def test_the_sentence_above_the_list_counts_the_rows_the_list_holds(
     agents_root.mkdir(parents=True)
     monkeypatch.setenv(AGENTS_DIR_ENV_VAR, str(agents_root))
 
-    session_mgr = AgentSessionManager(storage_dir=tmp_path / "sessions")
-    _seat_a_live_clone(session_mgr, "scout")
-
-    body = _body(_client(tmp_path, session_mgr))
+    body = _body(_seated_client(tmp_path, "scout"))
 
     assert [clone["name"] for clone in body["clones"]] == ["scout"]
     assert body["root_state"] == "readable"
@@ -553,10 +559,7 @@ def test_a_missing_or_unreadable_root_counts_the_rows_it_holds_too(
     """
     absent = tmp_path / "nowhere"
     monkeypatch.setenv(AGENTS_DIR_ENV_VAR, str(absent))
-    session_mgr = AgentSessionManager(storage_dir=tmp_path / "sessions")
-    _seat_a_live_clone(session_mgr, "scout")
-
-    missing = _body(_client(tmp_path, session_mgr))
+    missing = _body(_seated_client(tmp_path, "scout"))
 
     assert [clone["name"] for clone in missing["clones"]] == ["scout"]
     assert missing["root_state"] == "missing"
@@ -570,7 +573,7 @@ def test_a_missing_or_unreadable_root_counts_the_rows_it_holds_too(
         if os.access(locked_root, os.R_OK):  # pragma: no cover - only for a privileged user
             pytest.skip("this user can read a mode-000 directory, so there is no fault")
         monkeypatch.setenv(AGENTS_DIR_ENV_VAR, str(locked_root))
-        unreadable = _body(_client(tmp_path, session_mgr))
+        unreadable = _body(_seated_client(tmp_path, "scout"))
     finally:
         os.chmod(locked_root, 0o700)
 
@@ -603,10 +606,7 @@ def test_each_row_says_its_own_state_rather_than_repeating_one_sentence(
     (agents_root / "wrecked" / "id").write_text("  \n", encoding="utf-8")
     monkeypatch.setenv(AGENTS_DIR_ENV_VAR, str(agents_root))
 
-    session_mgr = AgentSessionManager(storage_dir=tmp_path / "sessions")
-    _seat_a_live_clone(session_mgr, "scout")
-
-    body = _body(_client(tmp_path, session_mgr))
+    body = _body(_seated_client(tmp_path, "scout"))
 
     live = _reason_of(body, "scout")
     dormant = _reason_of(body, "archivist")
@@ -674,10 +674,7 @@ def test_no_reason_carries_the_cores_vocabulary_onto_the_wire(
         "the fixture no longer mirrors the product default, which is the point of it"
     )
 
-    session_mgr = AgentSessionManager(storage_dir=tmp_path / "sessions")
-    _seat_a_live_clone(session_mgr, "scout")
-
-    body = _body(_client(tmp_path, session_mgr))
+    body = _body(_seated_client(tmp_path, "scout"))
 
     installed = {clone["name"] for clone in body["clones"]}
     assert installed == {"scout", "archivist", "wrecked", "my clone"}

@@ -26,16 +26,20 @@ Underneath is an event-driven agent runtime you can also use on its own: see
 Ask a clone a question. Here the default **clone** answers with a structured
 summary on a local model (`ollama:qwen3:8b`):
 
-![A clone answering "Find latest AI technology in september" with a structured list of AI trends](docs/assets/screenshots/research-conversation.webp)
+![A clone answering "Find latest AI technology in september" with a structured list of AI trends](https://raw.githubusercontent.com/UClone-AI/uclone-x/main/docs/assets/screenshots/research-conversation.webp)
 
 Or ask the **artist** clone for a picture. The image appears in the conversation,
 with links to open it in the browser or in Docs:
 
-![The artist clone showing a generated image for "beautiful girl with beautiful background"](docs/assets/screenshots/image-generation.webp)
+![The artist clone showing a generated image for "beautiful girl with beautiful background"](https://raw.githubusercontent.com/UClone-AI/uclone-x/main/docs/assets/screenshots/image-generation.webp)
 
 ---
 
 ## Install
+
+> On PyPI? The `pip install uclone-x` line PyPI prints at the top of the page
+> installs the library only, without the `ucx` command. Use one of the installs
+> below; with pip, that is `pip install "uclone-x[cli,http]"`.
 
 On macOS or Linux, paste this into a terminal:
 

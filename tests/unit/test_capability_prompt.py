@@ -21,6 +21,7 @@ from typing import cast
 
 import pytest
 
+from tests.support.app_clone import app_clone
 from uclone_x.agent.base import BaseAgent
 from uclone_x.agent.composition import HostDependencies
 from uclone_x.agent.models import AgentConfig, PersonaDefinition
@@ -334,7 +335,7 @@ async def test_a_one_to_one_session_gets_its_persona_s_derived_prompt(tmp_path: 
         storage_dir=tmp_path / "sessions", llm=MockLLMConnector(), workspace_dir=tmp_path
     )
 
-    agent = await manager.get_or_create_agent("scout")
+    agent = app_clone(manager, "scout")
 
     prompt = agent.effective_system_prompt
     assert prompt.endswith(default_prompt_for(_builtin("scout")))

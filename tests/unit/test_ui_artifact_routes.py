@@ -502,8 +502,8 @@ def test_a_decision_on_a_changed_proposal_is_a_400_with_the_plain_sentence(
 def test_a_decision_while_the_writer_answers_is_a_409(
     client: TestClient, workspace: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Killed by: src/uclone_x/ui/artifacts.py :: if isinstance(exc, (StoryInUseError, WriterBusyError)):
-    Becomes: if isinstance(exc, StoryInUseError):
+    """Killed by: src/uclone_x/ui/artifacts.py :: if isinstance(exc, (StoryInUseError, WriterBusyError, HeadRoomWriteError)):
+    Becomes: if isinstance(exc, (StoryInUseError, HeadRoomWriteError)):
     """
     story_id, room_id = _story_with_proposal(client, workspace)
     seen = client.get(f"/api/artifacts/library/stories/{story_id}").json()["pending"][0]["digest"]
@@ -567,3 +567,91 @@ def test_a_story_view_failure_that_is_not_a_refusal_is_a_plain_500(
 
     assert failed.status_code == 500
     assert failed.json()["detail"] == FILES_FAILURE_DETAIL
+
+
+def _head_room(client: TestClient, *, marked: bool) -> str:
+    """A room a head keeps: marked `run`, or an ACP room from before rooms were marked."""
+    from uclone_x.room.one_seat import HeadTurn, conversation_room_id, record_head_turn
+
+    stack = cast(Any, client.app).state.room_stack
+    head = "run" if marked else "acp"
+    state = record_head_turn(
+        stack.store,
+        room_id="room_from_the_terminal" if marked else conversation_room_id("acp", "scout", "s1"),
+        clone_id="scout",
+        turn=HeadTurn(prompt="what is in the index?", content="three tables"),
+        head=head,
+    )
+    if not marked:
+        state = stack.store.save(state.model_copy(update={"head": None}))
+        assert state.head is None
+    return str(state.room_id)
+
+
+@pytest.mark.parametrize(
+    ("marked", "keeper"), [(True, "ucx run"), (False, "the editor that opened it")]
+)
+def test_a_story_is_not_opened_into_a_head_room(
+    client: TestClient, workspace: Path, marked: bool, keeper: str
+) -> None:
+    """The room is named in the body, so the route guard on `/api/rooms/{room_id}` misses it.
+
+    Left alone, the story is leased to the head's room and named in it, and the head's next
+    turn writes into a story the person opened from the app (#1885).
+
+    Killed by: src/uclone_x/artifacts/library.py :: if head is not None:
+    Becomes: if False:
+    Killed by: src/uclone_x/ui/artifacts.py :: (StoryInUseError, WriterBusyError, HeadRoomWriteError)
+    Becomes: (StoryInUseError, WriterBusyError)
+    """
+    writer = _room(client, "Writing room")
+    stories = StoryLibrary(workspace)
+    story_id = stories.create("Night Train", writer).story_id
+    client.delete(f"/api/rooms/{writer}")  # gives the lease back
+    room_id = _head_room(client, marked=marked)
+    stack = cast(Any, client.app).state.room_stack
+    before = stack.service.get(room_id)
+    lease = stories.load(story_id).lease
+
+    refused = client.post(
+        f"/api/artifacts/library/stories/{story_id}/open", json={"room_id": room_id}
+    )
+
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["detail"] == (
+        f"This conversation belongs to {keeper}, so only {keeper} can continue it. "
+        "You can read it here."
+    )
+    assert stack.service.get(room_id) == before
+    assert stories.load(story_id).lease == lease
+    assert lease is None or lease.holder != room_id
+
+
+def test_every_route_naming_a_room_outside_its_path_is_known(client: TestClient) -> None:
+    """The route guard reads the room from the path; a room named in a body or query is not.
+
+    Every such route is listed here with how it refuses a head room, so a new one fails
+    this test until it is guarded and added. Found by introspecting each route's body model
+    and query parameters for a `room_id` field. A route taking an untyped dict body is not
+    seen by this; none outside `/api/rooms/{room_id}` reads a room id from one today.
+    """
+    from pydantic import BaseModel
+
+    naming: set[tuple[str, str]] = set()
+    for route in cast(list[Any], cast(Any, client.app).routes):
+        dependant = getattr(route, "dependant", None)
+        path = str(getattr(route, "path", ""))
+        if dependant is None or path.startswith("/api/rooms/{room_id}"):
+            continue
+        names = {p.name for p in dependant.query_params}
+        for body in dependant.body_params:
+            names.add(body.name)
+            annotation = body.field_info.annotation
+            if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+                names |= set(annotation.model_fields)
+        if "room_id" in names:
+            naming |= {(m, path) for m in route.methods if m not in ("GET", "HEAD")}
+
+    # Each is refused for a head room: story-open in `ArtifactLibrary`, the rest create or
+    # read rather than write an existing room.
+    assert naming == {("POST", "/api/artifacts/library/stories/{story_id}/open")}, naming

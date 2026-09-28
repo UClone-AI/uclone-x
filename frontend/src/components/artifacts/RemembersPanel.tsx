@@ -1,11 +1,12 @@
 import React, { useMemo, useState } from 'react';
-import { BookOpen, MoreHorizontal } from 'lucide-react';
+import { BookOpen, Lightbulb, MoreHorizontal } from 'lucide-react';
 import {
   editMemoryFact,
   roomDockUrls,
   useRoomRead,
   type KnownFact,
   type SeatKnowledge,
+  type WorkedOut,
 } from '../../lib/roomDock';
 import { en, type Messages } from '../../i18n/en';
 import { fmt, useCopy } from '../../i18n';
@@ -40,6 +41,21 @@ export const editRefusedSentence = (
   if (status === 404) return fmt(copy.factGone, { name });
   if (status === 409) return fmt(copy.memoryUnreadable, { name });
   return copy.editFailed;
+};
+
+/**
+ * What a worked-out statement rests on, as the facts' own sentences (§3.6). An id the list
+ * does not hold is left out rather than shown: an id is not a sentence.
+ */
+export const workedOutFromSentence = (
+  because: readonly string[],
+  facts: readonly KnownFact[],
+  copy: Copy = en.dock.remembers,
+): string | null => {
+  const said = because
+    .map((id) => facts.find((f) => f.fact_id === id)?.statement)
+    .filter((statement): statement is string => Boolean(statement));
+  return said.length > 0 ? fmt(copy.workedOutFrom, { facts: said.join(copy.workedOutJoin) }) : null;
 };
 
 type Editing = { kind: 'menu' } | { kind: 'correct'; value: string } | { kind: 'forget' };
@@ -206,8 +222,15 @@ const FactRow: React.FC<FactRowProps> = ({ fact, seatId, name, t, onChanged }) =
  *
  * With no facts the panel shows the Core's sentence or its own "none listed" (P6): an empty
  * list is "none listed", never "nothing learned". A failed read shows the Core's own plain
- * `detail` or a fixed sentence, never transport text. The per-seat record's `status` and
- * graph fields are for the developer graph and are not shown here.
+ * `detail` or a fixed sentence, never transport text. The graph fields describe the
+ * clone's rules engine, for the developer graph, and are not shown here.
+ *
+ * What the clone's rules work out from those facts (`worked_out`, step 6) is a third group:
+ * each statement with the facts it rests on, and no `⋯` -- a worked-out line is corrected or
+ * forgotten through the facts it names (§3.6). It is computed on every read, so forgetting a
+ * fact takes what followed from it away on the next read. With none, or when it could not be
+ * worked out (`null`), the group is not drawn and nothing is said beyond `facts_reason`: an
+ * empty list is not "nothing follows" (#1870).
  */
 export const RemembersPanel: React.FC<RemembersPanelProps> = ({
   roomId,
@@ -277,6 +300,7 @@ export const RemembersPanel: React.FC<RemembersPanelProps> = ({
   const here = (facts ?? []).filter((f) => f.learned_here);
   const elsewhere = (facts ?? []).filter((f) => !f.learned_here);
   const onChanged = () => setEdits((n) => n + 1);
+  const workedOut: WorkedOut[] = (facts && data.worked_out) ?? [];
 
   const group = (testid: string, heading: string, list: KnownFact[]) =>
     list.length > 0 && (
@@ -303,6 +327,37 @@ export const RemembersPanel: React.FC<RemembersPanelProps> = ({
       <div className="flex-1 overflow-y-auto min-h-0 space-y-4 pr-1">
         {group('remembers-here', t.hereHeading, here)}
         {group('remembers-elsewhere', t.elsewhereHeading, elsewhere)}
+        {workedOut.length > 0 && (
+          <section data-testid="remembers-worked-out" className="space-y-1.5">
+            <h3 className="text-[11px] font-semibold text-slate-300">{t.workedOutHeading}</h3>
+            <ul className="space-y-1.5">
+              {workedOut.map((w) => {
+                const from = workedOutFromSentence(w.because, facts ?? [], t);
+                return (
+                  <li
+                    key={w.statement}
+                    data-testid="worked-out-line"
+                    className="px-3 py-2 rounded-xl bg-slate-900/40 border border-dashed border-slate-700 text-xs text-slate-200 space-y-1"
+                  >
+                    <div className="flex items-start gap-2">
+                      <Lightbulb
+                        aria-hidden="true"
+                        className="w-3.5 h-3.5 shrink-0 text-amber-300"
+                      />
+                      <span className="flex-1 min-w-0 break-words">{w.statement}</span>
+                      <span className="shrink-0 text-[10px] text-slate-400">{t.workedOut}</span>
+                    </div>
+                    {from && (
+                      <p data-testid="worked-out-from" className="pl-5 text-[11px] text-slate-400">
+                        {from}
+                      </p>
+                    )}
+                  </li>
+                );
+              })}
+            </ul>
+          </section>
+        )}
         {note && (
           <p data-testid="remembers-reason" className="text-[11px] text-slate-400">
             {note}

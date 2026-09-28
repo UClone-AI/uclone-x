@@ -23,7 +23,7 @@ from uclone_x.ontology.justification import (
     compute_fact_id,
 )
 from uclone_x.ontology.models import OntologyAxiom, OntologyTier
-from uclone_x.ontology.reasoner import check_consistency, materialize
+from uclone_x.ontology.reasoner import WorkedOut, check_consistency, materialize, worked_out
 from uclone_x.ontology.rules import (
     KIND_CARDINALITY,
     KIND_DISJOINT,
@@ -1295,3 +1295,50 @@ def test_an_empty_closure_is_consistent_and_entails_nothing() -> None:
     assert closure.is_entailed("a", "p", "b") is False
     assert closure.get("a", "p", "b") is None
     assert closure.depth("0" * 64) == 0
+
+
+# -- worked_out: what a clone's facts entail under its rules, on read (step 6) --------------
+
+
+def test_worked_out_lists_what_follows_and_the_facts_it_rests_on() -> None:
+    statements = {
+        "f_wheel": ("wheel", "partOf", "car"),
+        "f_car": ("car", "partOf", "fleet"),
+        "f_other": ("Busan", "isIn", "Korea"),
+    }
+    found = worked_out(statements, [axiom("a1", "partOf", "transitiveProperty")])
+    assert found == (
+        WorkedOut(
+            subject="wheel", predicate="partOf", object="fleet", because=("f_car", "f_wheel")
+        ),
+    )
+
+
+def test_worked_out_never_lists_an_input_fact_and_nothing_without_a_rule() -> None:
+    statements = {"f1": ("wheel", "partOf", "car")}
+    assert worked_out(statements, [axiom("a1", "partOf", "transitiveProperty")]) == ()
+    two = {"f1": ("wheel", "partOf", "car"), "f2": ("car", "partOf", "fleet")}
+    assert worked_out(two, []) == ()
+
+
+def test_worked_out_forgets_what_rested_on_a_fact_no_longer_given() -> None:
+    rules = [axiom("a1", "partOf", "transitiveProperty")]
+    both = {"f1": ("wheel", "partOf", "car"), "f2": ("car", "partOf", "fleet")}
+    assert len(worked_out(both, rules)) == 1
+    del both["f2"]
+    assert worked_out(both, rules) == ()
+
+
+def test_worked_out_leaves_out_what_follows_from_the_rules_alone() -> None:
+    """`Reviewer subClassOf Actor` rests on no fact of the clone: it is the rules, not learned.
+
+    Killed by: src/uclone_x/ontology/reasoner.py :: if not leaves:  # follows from the rules alone
+    Becomes: if False:  # follows from the rules alone
+    """
+    rules = [
+        axiom("a1", "Reviewer", SUBCLASS_OF, "Agent"),
+        axiom("a2", "Agent", SUBCLASS_OF, "Actor"),
+    ]
+    found = worked_out({"f1": ("r", TYPE_PREDICATE, "Reviewer")}, rules)
+    assert {(w.subject, w.object) for w in found} == {("r", "Agent"), ("r", "Actor")}
+    assert all(w.because == ("f1",) for w in found)

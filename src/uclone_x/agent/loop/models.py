@@ -6,6 +6,10 @@ import asyncio
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from uclone_x.agent.models import TurnResult
 
 
 class LoopStatus(StrEnum):
@@ -31,6 +35,9 @@ class LoopTickResult:
     error: str | None = None
     skipped: bool = False
     stop_reason: str | None = None
+    #: The turn the tick ran, when it returned one; `None` for a skipped tick and for one
+    #: that timed out or raised. A head's room records the turn from it (#1837).
+    turn: TurnResult | None = None
 
 
 @dataclass

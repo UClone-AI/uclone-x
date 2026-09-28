@@ -46,14 +46,20 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "ARTIFACT_SUBDIR",
+    "EXCERPT_NOTE",
     "STEP_EXCERPT_MIN_BYTES",
     "STEP_NO_ROOM_MESSAGE",
+    "STEP_NO_ROOM_NO_COMPACTION_MESSAGE",
+    "STEP_NO_ROOM_SETUP_MESSAGE",
+    "STEP_NO_ROOM_SETUP_REPLY_MESSAGE",
     "STEP_OVER_WINDOW_MESSAGE",
     "STEP_REPLY_RESERVE_TOKENS",
     "STORED_RESULT_PREFIX",
+    "STUB_NOTE",
     "TOOL_RESULT_CAP_BYTES",
     "TOOL_RESULT_CAP_TOKENS",
     "TOOL_RESULT_READ_TOOL",
+    "UNSTORED_EXCERPT_PREFIX",
     "StoredResultNotFoundError",
     "artifacts_dir_for",
     "canonical_tool_text",
@@ -97,6 +103,15 @@ only when the handle it names resolves to a stored blob, so text a tool happened
 begin with these words is never mistaken for something that can be read back.
 """
 
+UNSTORED_EXCERPT_PREFIX: Final = "[Tool result shortened: "
+"""How an excerpt of a result that could not be stored begins."""
+
+EXCERPT_NOTE: Final = "too long to show in full"
+"""What every excerpt's header says, so the model can tell it is not the whole result."""
+
+STUB_NOTE: Final = "not shown here since the conversation was compacted"
+"""What a stub's header says, so the model can tell to read the rest by its handle."""
+
 # Room reserved for the header line and the omitted-part marker. Both are a few hundred
 # bytes at most -- two numbers, a handle and fixed words -- so this bounds every excerpt
 # and page at the cap without computing the header before the body it describes.
@@ -123,14 +138,59 @@ small results can fail to fit as surely as one of a few large ones (#1509).
 
 STEP_NO_ROOM_MESSAGE: Final = (
     "This conversation already takes up all the room the model has to read and reply, so "
-    "the results of the tools called in this step were not sent to it. Start a new "
-    "conversation, or use a model with a larger context window."
+    "the results of the tools called in this step were not sent to it. Your next message "
+    "can carry on: older parts of the conversation are shortened first to make room."
 )
 """What a turn says when the request leaves no room for a step's results at all (#1509).
 
 The conversation before the step, with the system turn, the tool schemas, the turn context
 and the room kept for the reply, already reaches the window, so any result would be over
 it. Asking for fewer things would not help, and the step message would blame the tools.
+
+It does not send the person to a new conversation (#1854). No compaction runs between the
+steps of a turn (design §5.8), so this is usually the turn's own growth, and the next
+turn's start-of-turn compaction shortens the conversation before that turn's first request.
+When the agent does not compact on its own, `STEP_NO_ROOM_NO_COMPACTION_MESSAGE` is said
+instead, since nothing would shorten it.
+"""
+
+STEP_NO_ROOM_NO_COMPACTION_MESSAGE: Final = (
+    "This conversation already takes up all the room the model has to read and reply, so "
+    "the results of the tools called in this step were not sent to it. Shorten this "
+    "conversation, or use a model with a larger context window."
+)
+"""`STEP_NO_ROOM_MESSAGE` for an agent with automatic shortening turned off (#1854).
+
+Nothing shortens the conversation before the next turn, so the person has to: the room
+head offers "Shorten this conversation", and the CLI heads `/compact`.
+"""
+
+STEP_NO_ROOM_SETUP_MESSAGE: Final = (
+    "The instructions and tools this assistant starts every request with already take up "
+    "all the room the model has to read and reply, so the results of the tools called in "
+    "this step were not sent to it. Use a model with a larger context window."
+)
+"""What a turn says when the system turn and the tool schemas alone fill the window (#1866).
+
+Shortening the conversation cannot help here: without any of it, the request still leaves
+no room for the reply. So it neither promises that the next message can carry on, as
+`STEP_NO_ROOM_MESSAGE` does, nor asks the person to shorten the conversation, as
+`STEP_NO_ROOM_NO_COMPACTION_MESSAGE` does. English only: the refusals in core have no
+translation hook yet (#1862).
+"""
+
+STEP_NO_ROOM_SETUP_REPLY_MESSAGE: Final = (
+    "The instructions and tools this assistant starts every request with, together with "
+    "the room it keeps for its reply, already take up all the room the model has, so the "
+    "results of the tools called in this step were not sent to it. Allow this assistant "
+    "shorter replies, or use a model with a larger context window."
+)
+"""`STEP_NO_ROOM_SETUP_MESSAGE` when a shorter reply length would make room (#1875).
+
+The agent sets a reply length (`max_tokens`) above the default reserve, and the system
+turn and the tool schemas leave room for a reply of the default size. So lowering the
+reply length is a second fix besides a larger model, and the refusal names both. Plain
+words and English only, like the other refusals in core (#1862).
 """
 
 STEP_REPLY_RESERVE_TOKENS: Final = 1_024
@@ -365,19 +425,19 @@ def excerpt_tool_result(
     total = len(body)
     if handle is not None and readable:
         header = (
-            f"{STORED_RESULT_PREFIX}{handle}: {total:,} characters, too long to show in "
-            f"full. Its start and end are below. Read the rest with {TOOL_RESULT_READ_TOOL}"
+            f"{STORED_RESULT_PREFIX}{handle}: {total:,} characters, {EXCERPT_NOTE}. "
+            f"Its start and end are below. Read the rest with {TOOL_RESULT_READ_TOOL}"
             f'(handle="{handle}", offset={omitted_from}).]'
         )
     elif handle is not None:
         header = (
-            f"{STORED_RESULT_PREFIX}{handle}: {total:,} characters, too long to show in "
-            "full. Its start and end are below. The rest was kept, but this agent has no "
+            f"{STORED_RESULT_PREFIX}{handle}: {total:,} characters, {EXCERPT_NOTE}. "
+            "Its start and end are below. The rest was kept, but this agent has no "
             "tool to read it.]"
         )
     else:
         header = (
-            f"[Tool result shortened: {total:,} characters, too long to show in full. Its "
+            f"{UNSTORED_EXCERPT_PREFIX}{total:,} characters, {EXCERPT_NOTE}. Its "
             "start and end are below. The rest could not be kept, so it cannot be read "
             "back.]"
         )
@@ -480,10 +540,7 @@ def stored_result_stub(handle: str, body: str, *, keep_chars: int, readable: boo
         where = f'Read it with {TOOL_RESULT_READ_TOOL}(handle="{handle}", offset=0).]'
     else:
         where = "It was kept, but this agent has no tool to read it.]"
-    header = (
-        f"{STORED_RESULT_PREFIX}{handle}: {len(body):,} characters, not shown here since "
-        f"the conversation was compacted. {where}"
-    )
+    header = f"{STORED_RESULT_PREFIX}{handle}: {len(body):,} characters, {STUB_NOTE}. {where}"
     return f"{header}\n{body[: max(keep_chars, 0)]}"
 
 

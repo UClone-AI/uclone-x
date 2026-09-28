@@ -240,21 +240,15 @@ def _dormant_reason(entry: AgentHomeEntry) -> str:
 
 
 def _running_clone_names(session_mgr: AgentSessionManager, room_stack: RoomStack) -> frozenset[str]:
-    """Every clone with a live instance behind it, wherever it is seated.
+    """Every clone with a live instance behind it: the room seats.
 
-    Two seats, not one. `AgentSessionManager.list_agents()` returns `_agents`, the chat
-    map; a clone taking part in a conversation is built and cached by that room's
-    `RoomAgentResolver` and never written back into it. Under D1 (design §1.3) every new
-    conversation is a room, single-clone ones included, so the conversation seat is the
-    *default* path -- reading only the chat map reports the ordinary running clone as
-    "Installed and not running" while the user is reading its reply.
-
-    The same shape as `AgentSessionManager.memory_for`, whose docstring already records
-    the rule this restores: the ids collide by design, because an install's clones are
-    both its chat clones and the seats a conversation puts them in.
+    Every head is a one-seat room (design §1.3, D1), so a clone taking part in a
+    conversation is built and cached by that room's `RoomAgentResolver`, and that cache is
+    the only place a live clone exists. The manager's separate chat map was never written
+    once rooms took over and was removed (#1899); reading it reported nothing.
     """
-    chatting = frozenset(agent.agent_id for agent in session_mgr.list_agents())
-    return chatting | room_stack.seated_agent_ids()
+    del session_mgr  # kept in the signature; the manager holds no agent
+    return room_stack.seated_agent_ids()
 
 
 def clone_listing(session_mgr: AgentSessionManager, room_stack: RoomStack) -> CloneListing:

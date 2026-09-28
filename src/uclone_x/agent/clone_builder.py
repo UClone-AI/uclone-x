@@ -6,7 +6,8 @@ eight `HostDependencies(` sites, and the copies had drifted: only the room bound
 the 1:1 chat named the agent differently and set no workspace, and each CLI command
 opened its own memory store. Now a head says what the app has (`AppScope`) and asks for
 a clone (`build_clone`). A room seat passes only what a room adds: its framing, its
-display name, its own knowledge engine and the room's A2A transport (§5.9.3).
+display name and the room's A2A transport (§5.9.3). A clone's rules engine is its own,
+one per clone id like its memory (clone-knowledge-graph §3.1, step 6); no seat has one.
 
 A shell module, as `room/resolver.py` is: it composes agents, so it may import adapters.
 Nothing in the kernel imports it.
@@ -32,6 +33,7 @@ from uclone_x.agent.models import (
 )
 from uclone_x.agent.persona_registry import PersonaRegistry, get_default_persona_registry
 from uclone_x.memory.store import CrossSessionMemory, default_cross_session_memory
+from uclone_x.ontology.engine import OntologyEngine
 from uclone_x.ontology.protocols import OntologyEngineProtocol
 from uclone_x.story import StoryLifecycleHook
 from uclone_x.tools.tool_binder import ToolBinder, tool_binder_for
@@ -45,14 +47,18 @@ __all__ = [
     "APP_ONTOLOGY",
     "AppScope",
     "BuiltClone",
+    "CLONE_ONTOLOGY_ROOT",
     "GlobalModels",
     "OntologyChoice",
     "build_clone",
+    "clone_namespace",
+    "clone_ontology",
     "connector_tool_binder",
     "follow_global_models",
     "local_app_scope",
     "memory_map",
     "named_clone_prompt",
+    "ontology_map",
     "provider_tool_binder",
     "saved_models",
     "with_app_lifecycle_hooks",
@@ -123,12 +129,52 @@ def memory_map(
     return memory_for
 
 
+#: Where every clone's rules engine is named: `<root>/<clone id>` (§3.1, Q6 #1654).
+CLONE_ONTOLOGY_ROOT: Final = "https://uclone-x.ai/ontology/clones"
+
+
+def clone_namespace(clone_id: str) -> str:
+    """The namespace of clone `clone_id`'s rules engine: one per clone, in every conversation."""
+    return f"{CLONE_ONTOLOGY_ROOT}/{clone_id}"
+
+
+def clone_ontology(clone_id: str) -> OntologyEngineProtocol:
+    """A new, empty rules engine for clone `clone_id`, in the clone's own namespace.
+
+    It holds the rules a person gives the clone and nothing learned in a conversation: what
+    the clone learned is its facts, in its memory, and what follows from them under these
+    rules is worked out on read and never kept (clone-knowledge-graph §3.1).
+    """
+    return OntologyEngine(agent_id=clone_id, namespace_iri=clone_namespace(clone_id))
+
+
+def ontology_map(
+    opener: Callable[[str], OntologyEngineProtocol] = clone_ontology,
+) -> Callable[[str], OntologyEngineProtocol]:
+    """A get-or-create map from clone id to that clone's one rules engine, as `memory_map`.
+
+    One engine per clone and not per seat: a clone seated in two conversations reasons
+    under one set of rules, and two clones never share an engine (§3.1, step 6).
+    """
+    engines: dict[str, OntologyEngineProtocol] = {}
+
+    def ontology_for(clone_id: str) -> OntologyEngineProtocol:
+        existing = engines.get(clone_id)
+        if existing is None:
+            existing = opener(clone_id)
+            engines[clone_id] = existing
+        return existing
+
+    return ontology_for
+
+
 def local_app_scope(
     *,
     workspace_root: Path,
     llm: LLMProviderProtocol,
     tools: ToolRegistryProtocol,
     memory_for: Callable[[str], CrossSessionMemory] | None = None,
+    ontology_for: Callable[[str], OntologyEngineProtocol] | None = None,
     persona_registry: PersonaRegistry | None = None,
     llm_override: AgentLLMConfig | None = None,
     global_models: GlobalModels | None = None,
@@ -136,8 +182,9 @@ def local_app_scope(
 ) -> AppScope:
     """The app scope of a one-process head (a CLI command): the same clone the app builds.
 
-    Its personas are the installation's; its memory is one store
-    per clone id for the process (`memory_for`, else a fresh `memory_map`); it binds tools
+    Its personas are the installation's; its memory is one store and its rules one engine
+    per clone id for the process (`memory_for` / `ontology_for`, else a fresh
+    `memory_map` / `ontology_map`); it binds tools
     where its connector is local (§5.1). `global_models` is the command's saved model
     choice, which fills only the slots a persona leaves empty, as Settings does in the app.
     """
@@ -152,6 +199,7 @@ def local_app_scope(
             else get_default_persona_registry(workspace_root)
         ),
         memory_for=memory_for if memory_for is not None else memory_map(),
+        ontology_for=ontology_for if ontology_for is not None else ontology_map(),
         llm_override=llm_override,
         global_models=global_models,
         llm=llm,
@@ -175,7 +223,7 @@ def _no_read_roots() -> tuple[Path, ...]:
 @dataclass(frozen=True)
 class AppScope:
     """What every clone an app serves shares (§5.9.2, App scope), plus where clone-scope
-    data is looked up (the persona registry and the memory map).
+    data is looked up (the persona registry, the memory map and the rules-engine map).
 
     Built once by a head and handed to every `build_clone`. `host` holds app-scope parts
     only -- no persona, no memory, no transport -- and is what a peer-call agent starts
@@ -187,6 +235,8 @@ class AppScope:
     persona_registry: PersonaRegistry
     #: Clone id -> that clone's one memory store; `None` builds clones with no memory.
     memory_for: Callable[[str], CrossSessionMemory] | None = None
+    #: Clone id -> that clone's one rules engine; `None` builds clones with no engine.
+    ontology_for: Callable[[str], OntologyEngineProtocol] | None = None
     global_models: GlobalModels | None = None
     #: Asked on every build, so a folder added in Settings reaches the next clone.
     read_roots: Callable[[], tuple[Path, ...]] = field(default=_no_read_roots)
@@ -203,6 +253,7 @@ class AppScope:
         workspace_root: Path,
         persona_registry: PersonaRegistry,
         memory_for: Callable[[str], CrossSessionMemory] | None = None,
+        ontology_for: Callable[[str], OntologyEngineProtocol] | None = None,
         global_models: GlobalModels | None = None,
         read_roots: Callable[[], tuple[Path, ...]] | None = None,
         llm_override: AgentLLMConfig | None = None,
@@ -223,6 +274,7 @@ class AppScope:
             workspace_root=workspace_root,
             persona_registry=persona_registry,
             memory_for=memory_for,
+            ontology_for=ontology_for,
             global_models=global_models,
             read_roots=read_roots or _no_read_roots,
             llm_override=llm_override,
@@ -239,18 +291,20 @@ class AppScope:
 
 
 #: Set per clone by `build_clone`; an app scope carrying one would hand it to every clone.
+#: The rules engine is one of them (step 6): one engine on the app scope was the manager's
+#: shared engine, which every clone the app built reasoned in.
 _CLONE_SCOPE_HOST_FIELDS: Final = frozenset(
-    {"memory", "persona", "persona_name", "persona_definitions", "a2a_transport"}
+    {"memory", "ontology", "persona", "persona_name", "persona_definitions", "a2a_transport"}
 )
 
 
 class _AppOntology:
-    """Sentinel: the clone takes the app scope's engine."""
+    """Sentinel: the clone takes its own engine from the app scope (`ontology_for`)."""
 
 
 APP_ONTOLOGY: Final = _AppOntology()
 
-#: What a build is told to give the clone: an engine, none, or the app scope's.
+#: What a build is told to give the clone: an engine, none, or its own from the app scope.
 OntologyChoice: TypeAlias = OntologyEngineProtocol | None | _AppOntology
 
 
@@ -309,8 +363,9 @@ def build_clone(
     Settings; its memory is the app's one store for `clone_id`; host binding applies
     whenever the app has a binder; and a persona with `a2a_peers` reaches them.
 
-    Room-only, passed by the room: `seat_framing`, `display_name`, `ontology` (the seat's
-    own engine) and `a2a_transport` (the room's). A clone without a persona speaks as
+    Its rules engine is the app's one engine for `clone_id` (`ontology_for`), unless
+    `ontology` names one (a test's, or `None` for none). Room-only, passed by the room:
+    `seat_framing`, `display_name` and `a2a_transport` (the room's). A clone without a persona speaks as
     `fallback_prompt` (default: one naming the clone, `named_clone_prompt`) on
     `fallback_llm`. `config_update` carries what a CLI command sets
     and no persona holds (isolation, a step budget).
@@ -319,6 +374,8 @@ def build_clone(
     host = with_app_lifecycle_hooks(app.host)
     if not isinstance(ontology, _AppOntology):
         host = dataclasses.replace(host, ontology=ontology)
+    elif app.ontology_for is not None:
+        host = dataclasses.replace(host, ontology=app.ontology_for(clone_id))
     if app.memory_for is not None:
         host = dataclasses.replace(host, memory=app.memory_for(clone_id))
     if persona_def is not None:

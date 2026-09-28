@@ -1,8 +1,8 @@
 """Durable cross-session memory store for typed facts with P6 provenance.
 
 Provides structured persistence, conflict resolution, retraction management,
-bounded progressive disclosure for prompt injection, and synthesis / ontology
-promotion adapters according to Principles P6, P7, P8, and P9.
+bounded progressive disclosure for prompt injection, and a synthesis adapter
+according to Principles P6, P7, P8, and P9.
 """
 
 from __future__ import annotations
@@ -12,23 +12,18 @@ import json
 import logging
 import os
 import tempfile
-import time
 from collections.abc import Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any, cast
 
 from uclone_x.core.agent_home import AgentHome
 from uclone_x.core.provenance import Provenance, require_provenance
+from uclone_x.core.set_aside import set_aside_unreadable
 from uclone_x.errors import MemoryStoreUnreadableError
 from uclone_x.llm.protocols import EmbedderProtocol
-from uclone_x.memory.models import FactOrigin, MemoryFact, utc_now_iso
+from uclone_x.memory.models import FactOrigin, MemoryFact, fold_name, utc_now_iso
 from uclone_x.memory.retrieval import FactRanking, rank_facts
 from uclone_x.memory.vector_store import BruteForceVectorStore
-from uclone_x.ontology.models import EvidenceRecord
-
-if TYPE_CHECKING:
-    from uclone_x.ontology.engine import OntologyEngine
-    from uclone_x.ontology.models import OntologyConcept
 
 logger = logging.getLogger(__name__)
 
@@ -126,7 +121,7 @@ class CrossSessionMemory:
     2. Automatic conflict detection and supersession (conflicts_with).
     3. Explicit retraction tracking (retract_fact) preserving audit history.
     4. Bounded progressive disclosure prompt formatting to prevent unbounded context growth.
-    5. Integration as synthesis input for SkillSynthesizer (P9) and promotion input for OntologyEngine (P7).
+    5. Integration as synthesis input for SkillSynthesizer (P9).
     """
 
     def __init__(
@@ -188,11 +183,16 @@ class CrossSessionMemory:
         origin: FactOrigin = "saved",
         source_room_id: str | None = None,
         source_turn_id: str | None = None,
+        fact_id: str | None = None,
     ) -> MemoryFact:
         """Record a new verified cross-session fact carrying P6 provenance.
 
         `origin`, `source_room_id` and `source_turn_id` say how, and in which conversation
         and turn, the fact was learned (clone-knowledge-graph design §3.2).
+
+        `fact_id` is for a writer that must be idempotent across processes: two writers
+        that name the same id for the same fact leave one fact, because `save` folds
+        concurrent writes together by id. Every other caller leaves it to the default.
         """
         verified_prov = require_provenance(provenance, "MemoryFact")
 
@@ -223,6 +223,8 @@ class CrossSessionMemory:
             source_room_id=source_room_id,
             source_turn_id=source_turn_id,
         )
+        if fact_id is not None:
+            new_fact = new_fact.model_copy(update={"fact_id": fact_id})
 
         contradicted_id: str | None = None
         if auto_retract_conflicts:
@@ -370,6 +372,48 @@ class CrossSessionMemory:
         logger.info("Fact %s corrected as %s", current.fact_id, corrected.fact_id)
         return corrected
 
+    def refresh(self) -> None:
+        """Fold in what another writer saved since this object last read the document.
+
+        A reader that decides from the facts it holds -- the knowledge extractor asking
+        whether a person corrected a fact, or already knows it -- calls this first, so a
+        Forget or Correct made through another process is seen (#1404).
+        """
+        self._absorb_concurrent_writes()
+
+    def reinforce_fact(self, fact_id: str, turn_id: str) -> MemoryFact:
+        """Record that the fact was observed again in `turn_id` (design §3.3 step 5).
+
+        The fact itself is unchanged: its value, confidence and origin stay as saved. The
+        turn is appended to `metadata["observations"]` (once), and `updated_at` moves.
+
+        Raises:
+            KeyError: No fact has that id.
+            ValueError: The fact is retracted.
+        """
+        self._absorb_concurrent_writes()  # as retract_fact: the fact may be newer here
+        current = self._facts.get(fact_id)
+        if current is None:
+            raise KeyError(f"Memory fact '{fact_id}' not found")
+        if current.retracted:
+            raise ValueError(f"Memory fact '{fact_id}' is retracted and cannot be reinforced")
+        seen = current.metadata.get("observations")
+        observations = (
+            [str(turn) for turn in cast("list[object]", seen)] if isinstance(seen, list) else []
+        )
+        if turn_id in observations:
+            return current
+        reinforced = current.model_copy(
+            update={
+                "metadata": {**current.metadata, "observations": [*observations, turn_id]},
+                "updated_at": utc_now_iso(),
+            }
+        )
+        held = dict(self._facts)
+        self._facts[fact_id] = reinforced
+        self._save_or_restore(held)
+        return reinforced
+
     def _save_or_restore(self, held: dict[str, MemoryFact]) -> None:
         """Save, or put back the facts held before this edit if the save raised.
 
@@ -397,20 +441,24 @@ class CrossSessionMemory:
         tags: Sequence[str] | None = None,
         min_confidence: float = 0.0,
     ) -> list[MemoryFact]:
-        """List memory facts matching filter criteria."""
+        """List memory facts matching filter criteria.
+
+        `subject` and `predicate` match folded (`fold_name`, NFC included), so a subject
+        stored decomposed before #1895 matches the composed form asked for now (#1893).
+        """
         results: list[MemoryFact] = []
         target_tags = set(tags) if tags else None
-        target_subj = subject.strip().lower() if subject else None
-        target_pred = predicate.strip().lower() if predicate else None
+        target_subj = fold_name(subject) if subject else None
+        target_pred = fold_name(predicate) if predicate else None
 
         for fact in self._facts.values():
             if not include_retracted and fact.retracted:
                 continue
             if fact.confidence < min_confidence:
                 continue
-            if target_subj and fact.subject.strip().lower() != target_subj:
+            if target_subj and fold_name(fact.subject) != target_subj:
                 continue
-            if target_pred and fact.predicate.strip().lower() != target_pred:
+            if target_pred and fold_name(fact.predicate) != target_pred:
                 continue
             if target_tags and not target_tags.issubset(set(fact.tags)):
                 continue
@@ -542,97 +590,6 @@ class CrossSessionMemory:
         return steps
 
     # ----------------------------------------------------------------------
-    # P7 Evolving Ontology Grounding & Promotion Adapter
-    # ----------------------------------------------------------------------
-    def export_ontology_evidence(
-        self,
-        subject: str,
-        predicate: str,
-    ) -> EvidenceRecord | None:
-        """Aggregate cross-session memory facts into an EvidenceRecord for ontology induction (P7)."""
-        norm_subj = subject.strip().lower()
-        norm_pred = predicate.strip().lower()
-
-        matching_facts = [
-            f
-            for f in self._facts.values()
-            if f.subject.strip().lower() == norm_subj and f.predicate.strip().lower() == norm_pred
-        ]
-        if not matching_facts:
-            return None
-
-        active_facts = [f for f in matching_facts if not f.retracted]
-        retracted_facts = [f for f in matching_facts if f.retracted]
-
-        if not active_facts:
-            return None
-
-        sessions = tuple(sorted({f.source_session_id for f in active_facts}))
-        contradictions = tuple(
-            sorted(
-                {
-                    f"{f.fact_id}: {f.object_value} (retracted: {f.retraction_reason or 'retracted'})"
-                    for f in retracted_facts
-                }
-            )
-        )
-        avg_conf = sum(f.confidence for f in active_facts) / len(active_facts)
-
-        return EvidenceRecord(
-            observation_count=len(active_facts),
-            first_seen=min(f.created_at for f in active_facts),
-            last_seen=max(f.created_at for f in active_facts),
-            source_session=sessions[0] if sessions else None,
-            originating_sessions=sessions,
-            contradicting_observations=contradictions,
-            confidence=avg_conf,
-        )
-
-    def promote_fact_to_ontology_concept(
-        self,
-        ontology: OntologyEngine,
-        fact_id: str,
-        approver: str = "human:developer",
-        force: bool = False,
-        min_observations: int = 2,
-        min_distinct_sessions: int = 2,
-    ) -> OntologyConcept:
-        """Promote a memory fact into an induced or enforcing concept in OntologyEngine (P7)."""
-        fact = self.get_fact(fact_id)
-        if fact is None:
-            raise KeyError(f"Memory fact '{fact_id}' not found")
-        if fact.retracted:
-            raise ValueError(f"Cannot promote retracted fact '{fact_id}' to ontology")
-
-        evidence = self.export_ontology_evidence(fact.subject, fact.predicate)
-        if evidence is None:
-            raise ValueError(f"No valid observational evidence for fact '{fact_id}'")
-
-        from uclone_x.ontology.models import OntologyConcept
-
-        existing = ontology.get_concept(fact.subject)
-        if existing is None:
-            concept = ontology.induce_concept(
-                name=fact.subject,
-                attributes={fact.predicate: fact.object_value},
-                source_session=fact.source_session_id,
-                confidence=fact.confidence,
-            )
-            updated_concept = concept.model_copy(update={"evidence": evidence})
-            ontology._concepts[fact.subject] = updated_concept  # pyright: ignore[reportPrivateUsage]
-
-        promoted = ontology.promote(
-            name=fact.subject,
-            approver=approver,
-            force=force,
-            min_observations=min_observations,
-            min_distinct_sessions=min_distinct_sessions,
-        )
-        if not isinstance(promoted, OntologyConcept):
-            raise TypeError(f"Expected promoted concept, got {type(promoted)}")
-        return promoted
-
-    # ----------------------------------------------------------------------
     # Persistence
     # ----------------------------------------------------------------------
     def save(self) -> None:
@@ -744,12 +701,11 @@ class CrossSessionMemory:
         if self._storage_path is None:
             return
 
-        quarantine = self._storage_path.with_suffix(
-            self._storage_path.suffix + f".unreadable-{int(time.time())}"
-        )
+        # The shared helper, not `os.replace` onto a whole-second name: that replaced an
+        # earlier quarantined copy when a second one was set aside in the same second
+        # (#1844).
         try:
-            os.replace(self._storage_path, quarantine)
-            moved_to: str | None = str(quarantine)
+            moved_to: str | None = str(set_aside_unreadable(self._storage_path))
         except OSError as move_exc:
             moved_to = None
             logger.error(

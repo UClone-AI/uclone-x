@@ -8,6 +8,7 @@ from typing import ClassVar, cast
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from uclone_x.core.provenance import Provenance
+from uclone_x.memory.models import PROJECT_SUBJECT, person_subject
 from uclone_x.memory.retrieval import FactRanking
 from uclone_x.memory.store import CrossSessionMemory
 from uclone_x.tools.base import BaseTool
@@ -53,7 +54,10 @@ class RecordMemoryFactTool(BaseTool[RecordMemoryFactParams]):
     not_run_note: ClassVar[str] = "Nothing was saved to memory."
     description: str = (
         "Record a verified cross-session fact (subject, predicate, object_value) into durable memory. "
-        "Carries in-band P6 provenance and automatically supersedes conflicting prior assertions."
+        "Carries in-band P6 provenance and automatically supersedes conflicting prior assertions. "
+        'Use the subject "user" for facts about the person you work for, and the subject '
+        f'"{PROJECT_SUBJECT}" for durable working preferences of this workspace, such as the '
+        "reply language or a code style."
     )
 
     def __init__(self, memory: CrossSessionMemory) -> None:
@@ -69,7 +73,9 @@ class RecordMemoryFactTool(BaseTool[RecordMemoryFactParams]):
         )
         try:
             fact = self._memory.record_fact(
-                subject=params.subject,
+                # A fact about the person is filed under `user` whatever the model called
+                # them, as the extractor files it, so recall always includes it (#1857).
+                subject=person_subject(params.subject, context.person_names),
                 predicate=params.predicate,
                 object_value=params.object_value,
                 provenance=provenance,

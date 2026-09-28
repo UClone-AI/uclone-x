@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 
 from uclone_x.agent.base import BaseAgent
 from uclone_x.agent.loop.models import LoopJob, LoopStatus, LoopTickResult
+from uclone_x.agent.models import TurnResult
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +18,8 @@ async def execute_loop_tick(
     agent: BaseAgent,
     job: LoopJob,
     tick_index: int,
+    *,
+    person_names: tuple[str, ...] = (),
 ) -> LoopTickResult:
     """Execute a single tick of a recurring loop job.
 
@@ -27,6 +30,9 @@ async def execute_loop_tick(
            `asyncio.wait_for`.
         3. Budget & Exit Conditions: Automatically updates run counts, consecutive
            failures, and checks `until_pattern` or `max_runs` for completion.
+
+    `person_names` are the names the head's person goes by; the turn's tools file a fact
+    under one of them under `user` (#1893 item 1).
     """
     now = datetime.now(UTC)
 
@@ -54,6 +60,7 @@ async def execute_loop_tick(
         content = ""
         success = False
         stop_reason: str | None = None
+        turn: TurnResult | None = None
 
         try:
             # Clean context if requested (uclone2 headless poller mode)
@@ -62,9 +69,10 @@ async def execute_loop_tick(
 
             # Execute with watchdog timeout
             turn_result = await asyncio.wait_for(
-                agent.execute_turn(job.prompt),
+                agent.execute_turn(job.prompt, person_names=person_names),
                 timeout=job.timeout_seconds,
             )
+            turn = turn_result
 
             if turn_result.error is not None:
                 error_msg = turn_result.error
@@ -123,6 +131,7 @@ async def execute_loop_tick(
             error=error_msg,
             skipped=False,
             stop_reason=stop_reason,
+            turn=turn,
         )
 
         job.last_result = tick_result

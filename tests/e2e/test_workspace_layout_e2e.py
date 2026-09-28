@@ -1332,6 +1332,84 @@ async def test_a_failed_skills_read_names_its_cause_and_can_be_tried_again(
             await browser.close()
 
 
+#: A catalogue with one clone's proposal waiting, the shape `GET /api/skills` answers (#1827).
+_PROPOSAL_CATALOGUE = {
+    "skills": [],
+    "summary": {"total_skills": 0, "active_count": 0, "pending_count": 0, "quarantined_count": 0},
+    "proposals": [
+        {
+            "name": "tidy-notes",
+            "version": "0.1.0",
+            "description": "When the notes are a mess.",
+            "requires_tools": ["file_read"],
+            "agent_id": "clone-1",
+            "session_id": "s-1",
+            "proposed_at": "2026-09-28T10:00:00Z",
+            "instructions": "# Tidy Notes\n\n## Steps\n\n1. Read the notes.\n",
+            "current_version": None,
+            "diff": "",
+            "digest": "0" * 64,
+        }
+    ],
+}
+
+
+@pytest.mark.asyncio
+async def test_a_proposal_waits_in_settings_and_an_unconfirmed_window_is_offered_one(
+    ui_test_server: str,
+) -> None:
+    """#1827: a clone's proposal shows in Settings; this window may not approve it.
+
+    The catalogue read is answered with one proposal, since the test server's store holds
+    none. Approve is sent to the real server, whose person gate refuses it: this browser was
+    not opened by the server (#1589). The panel must say so in plain words, offer to open a
+    confirmed window, and leave the proposal where it was.
+
+    Mutation-checked by the component case in
+    `frontend/src/components/settings/SkillProposals.test.tsx`; this case shows the committed
+    bundle carries it against the real refusal.
+    """
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        try:
+            page: Page = await browser.new_page(viewport={"width": 1280, "height": 900})
+            errors: list[str] = []
+            page.on("pageerror", lambda err: errors.append(str(err)))
+
+            async def catalogue(route: Route) -> None:
+                if route.request.method == "GET":
+                    await route.fulfill(json=_PROPOSAL_CATALOGUE)
+                else:
+                    await route.continue_()
+
+            await page.route("**/api/skills", catalogue)
+            await page.goto(ui_test_server, wait_until="commit")
+            await page.wait_for_selector("[data-testid='room-composer']", timeout=20000)
+            await page.locator("[data-testid='open-settings']").click()
+
+            card = page.locator("[data-testid='skill-proposal']")
+            await card.wait_for(timeout=10000)
+            text = await card.inner_text()
+            assert "tidy-notes" in text and "Proposed by clone-1" in text
+            assert "1. Read the notes." in text
+
+            async with page.expect_response("**/api/skills/tidy-notes/approve") as answer:
+                await card.locator("[data-testid='skill-proposal-approve']").click()
+            assert (await answer.value).status == 403
+
+            notice = page.locator("[data-testid='skill-decision-notice']")
+            await notice.wait_for(timeout=10000)
+            said = await notice.inner_text()
+            assert "this window was not opened by UClone-X" in said
+            for internal in ("403", "Forbidden", "Error", "/api/"):
+                assert internal not in said, internal
+            assert await notice.locator("[data-testid='skill-open-confirmed-window']").count() == 1
+            assert await page.locator("[data-testid='skill-proposal']").count() == 1
+            assert errors == [], f"page errors {errors}"
+        finally:
+            await browser.close()
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("width", [375, 1280])
 async def test_the_settings_sections_hold_their_content_inside_their_edges(

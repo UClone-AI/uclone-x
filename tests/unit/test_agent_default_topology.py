@@ -6,6 +6,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).parent.parent.parent / "src"))
 
 import pytest
 
+from tests.support.app_clone import app_clone
 from uclone_x.agent.models import PersonaDefinition
 from uclone_x.agent.persona_registry import PersonaRegistry
 
@@ -72,23 +73,21 @@ async def test_topology_integration(
     Killed by: src/uclone_x/agent/clone_builder.py :: context=AgentContext(
     Becomes: context=AgentContext(parent_agent_id="champion" if clone_id != "champion" else None,
     """
-    # This test builds an agent but is not about provider resolution, so it says which
-    # connector it wants. `conftest` clears LLM configuration rather than pinning a
-    # provider, so an unconfigured build is now refused (#533) instead of silently
-    # producing one.
-    monkeypatch.setenv("LLM_PROVIDER", "mock")
-    from uclone_x.ui.app import get_ui_session_manager
+    # This test builds an agent but is not about provider resolution, so it names the
+    # connector it wants.
+    from uclone_x.llm import MockLLMConnector
+    from uclone_x.ui.app import AgentSessionManager
 
-    session_mgr = get_ui_session_manager(storage_dir=tmp_path / "storage")
+    session_mgr = AgentSessionManager(storage_dir=tmp_path / "storage", llm=MockLLMConnector())
 
-    # Two agents the UI can build. Neither is anybody's parent: `get_or_create_agent`
+    # Two agents the UI can build. Neither is anybody's parent: the retired chat helper
     # used to set `parent_agent_id="champion" if agent_id != "champion"`, so every agent
     # but one was recorded as having been spawned by `champion` -- an edge the dashboard's
     # agent graph then drew between two agents that had never spoken to each other.
-    clone_agent = await session_mgr.get_or_create_agent("clone")
+    clone_agent = app_clone(session_mgr, "clone")
     assert clone_agent.agent_id == "clone"
     assert clone_agent.context.parent_agent_id is None
 
-    guardian_agent = await session_mgr.get_or_create_agent("guardian")
+    guardian_agent = app_clone(session_mgr, "guardian")
     assert guardian_agent.agent_id == "guardian"
     assert guardian_agent.context.parent_agent_id is None

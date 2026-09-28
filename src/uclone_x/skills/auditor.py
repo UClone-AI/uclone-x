@@ -188,15 +188,27 @@ class Skill:
         return self._directory
 
 
+#: A `SKILL.md` frontmatter: a first line that is exactly `---`, then everything up to the next
+#: line that is exactly `---` (#1826). Splitting at the first `---` anywhere, as the parser did
+#: before, cut a value such as the name `a---b` in half. Both the parser and the digest rule
+#: read the boundary from here, so they cannot disagree about where the frontmatter ends.
+_FRONTMATTER: Final[re.Pattern[str]] = re.compile(
+    r"\A---\r?\n(?P<yaml>.*?)^---\r?(?:\n|\Z)", re.DOTALL | re.MULTILINE
+)
+_FRONTMATTER_BYTES: Final[re.Pattern[bytes]] = re.compile(
+    _FRONTMATTER.pattern.encode(), re.DOTALL | re.MULTILINE
+)
+
+
 def parse_skill_markdown(text: str) -> tuple[dict[str, Any], str]:
     """Parse a SKILL.md file into frontmatter dictionary and markdown body."""
-    if not text.startswith("---"):
+    if not re.match(r"---\r?\n", text):
         raise ValueError("Document has no leading YAML frontmatter block starting with '---'")
-    parts = text.split("---", 2)
-    if len(parts) < 3:
+    match = _FRONTMATTER.match(text)
+    if match is None:
         raise ValueError("Document frontmatter block is not closed with '---'")
-    yaml_content = parts[1]
-    instructions = parts[2].lstrip()
+    yaml_content = match.group("yaml")
+    instructions = text[match.end() :].lstrip()
     raw_data: object = yaml.safe_load(yaml_content)
     if not isinstance(raw_data, dict):
         raise ValueError("YAML frontmatter must be a mapping/dictionary")
@@ -260,6 +272,21 @@ def manifest_from_dict(data: dict[str, Any]) -> SkillManifest:
         for item in cast(tuple[object, ...], tags_val):
             tags_list.append(str(item))
 
+    requires_val: object = data.get("requires_tools")
+    requires_list: list[str] = []
+    if requires_val is not None:
+        if not isinstance(requires_val, list | tuple):
+            raise ValueError(
+                "SKILL.md frontmatter 'requires_tools' must be a list of tool names, "
+                f"not {requires_val!r}"
+            )
+        for item in cast(list[object] | tuple[object, ...], requires_val):
+            if not isinstance(item, str):
+                raise ValueError(
+                    f"SKILL.md frontmatter 'requires_tools' entry {item!r} is not a tool name"
+                )
+            requires_list.append(item)
+
     family_sections_val: object = data.get("family_sections", False)
     if not isinstance(family_sections_val, bool):
         raise ValueError(
@@ -277,6 +304,7 @@ def manifest_from_dict(data: dict[str, Any]) -> SkillManifest:
         requested_isolation=requested_isolation,
         scripts=tuple(scripts_list),
         tags=tuple(tags_list),
+        requires_tools=tuple(requires_list),
         entrypoint=str(data["entrypoint"]) if data.get("entrypoint") else None,
         family_sections=family_sections_val,
         content_sha256=str(data["content_sha256"]) if data.get("content_sha256") else None,
@@ -302,15 +330,14 @@ _OWN_DIGEST_LINE: Final[re.Pattern[bytes]] = re.compile(
 def _skill_md_digest_bytes(data: bytes) -> bytes:
     """The bytes of a `SKILL.md` that its digest covers: all of them but its own digest line.
 
-    The frontmatter is what `parse_skill_markdown` reads as one: from the leading `---` to
-    the next `---`. Only a line inside it can be left out, so the same line in the body is
-    hashed.
+    The frontmatter is what `parse_skill_markdown` reads as one (`_FRONTMATTER`): from the
+    leading `---` line to the next line that is exactly `---`. Only a line inside it can be
+    left out, so the same line in the body is hashed.
     """
-    if not data.startswith(b"---"):
+    match = _FRONTMATTER_BYTES.match(data)
+    if match is None:
         return data
-    end = data.find(b"---", 3)
-    if end == -1:
-        return data
+    end = match.end("yaml")
     kept = (
         line
         for line in data[:end].splitlines(keepends=True)
@@ -475,6 +502,8 @@ def serialize_skill_markdown(manifest: SkillManifest, instructions: str) -> str:
         data["scripts"] = list(manifest.scripts)
     if manifest.tags:
         data["tags"] = list(manifest.tags)
+    if manifest.requires_tools:
+        data["requires_tools"] = list(manifest.requires_tools)
     if manifest.family_sections:
         data["family_sections"] = True
     if manifest.content_sha256:
@@ -807,6 +836,7 @@ def _summary_entry(
         "content_sha256": manifest.content_sha256 or "",
         "scripts": list(manifest.scripts),
         "tags": list(manifest.tags),
+        "requires_tools": list(manifest.requires_tools),
         "approved_by": manifest.approved_by,
         "approved_at": manifest.approved_at,
         "rejected_by": manifest.rejected_by,
@@ -868,6 +898,14 @@ class SkillRegistry:
             f"Skill '{skill.manifest.name}' is not approved for registration: "
             f"verdict={report.recommendation.value}, is_safe={report.is_safe}"
         )
+
+    @property
+    def store_root(self) -> Path | None:
+        """The folder of this registry's file-system store, or None for any other store.
+
+        Where a clone's `propose_skill` writes its proposal (#1827), under `.pending/`.
+        """
+        return self._store.root if isinstance(self._store, FileSystemSkillStore) else None
 
     def get(self, name: str) -> SkillProtocol | None:
         """Retrieve an *active* skill by name. Quarantined packages are not returned."""
@@ -940,7 +978,9 @@ class SkillRegistry:
 
         manifests: list[SkillManifest] = []
         for child in sorted(skills_dir.iterdir()):
-            if not child.is_dir():
+            # A dot-named folder is the store's own (`.pending/`, `.versions/`, ...), never
+            # a package: a clone's proposal waits there, unloaded (#1827).
+            if not child.is_dir() or child.name.startswith("."):
                 continue
             try:
                 # `_is_file`, not `Path.is_file()`: a folder that can be listed but not
@@ -982,7 +1022,10 @@ class SkillRegistry:
             # A skill refused now is taken out even if an earlier reload admitted it: an
             # edit after approval must stop it at the next reload, not at the next restart.
             self._refused = {refusal.manifest.name: refusal for refusal in store.refused}
-            for name in self._refused:
+            # The store is the whole truth: a skill no longer approved -- refused, or
+            # revoked in Settings and so no longer active (#1827) -- leaves the registry.
+            loaded = {skill.manifest.name for skill in reloaded}
+            for name in [name for name in self._skills if name not in loaded]:
                 self._skills.pop(name, None)
                 self._audit_reports.pop(name, None)
         return tuple(reloaded)
@@ -1075,7 +1118,9 @@ class FileSystemSkillStore:
         approved: list[tuple[SkillProtocol, SkillAuditReport]] = []
         refused: list[SkillRefusal] = []
         for child in sorted(target_dir.iterdir()):
-            if not child.is_dir():
+            # `.pending/` holds clones' proposals, which load only once a person approves
+            # them into `<name>/` (#1827); no dot-named folder is a package.
+            if not child.is_dir() or child.name.startswith("."):
                 continue
             try:
                 is_package = _is_file(child / "SKILL.md")

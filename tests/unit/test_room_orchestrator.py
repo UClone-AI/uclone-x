@@ -169,13 +169,11 @@ class FakeResolver:
         self._agents = agents
         self.resolved: list[tuple[str, str, str]] = []
 
-    async def resolve(self, participant: Participant) -> Any:
+    async def resolve(self, participant: Participant, *, one_seat: bool = False) -> Any:
         agent = self._agents.get(participant.id)
         if agent is None:
             raise ParticipantNotResolvableError(f"no agent for {participant.id!r}")
-        self.resolved.append(
-            (participant.id, participant.session_id, participant.ontology_namespace)
-        )
+        self.resolved.append((participant.id, participant.session_id, participant.id))
         return agent
 
 
@@ -224,7 +222,6 @@ def agent_participant(agent_id: str, room_id: str = "r1") -> Participant:
         display_name=agent_id.title(),
         persona_summary=f"{agent_id} does {agent_id} things",
         session_id=f"sess_room__{room_id}__{agent_id}",
-        ontology_namespace=f"https://uclone-x.ai/ontology/{room_id}/{agent_id}",
     )
 
 
@@ -519,16 +516,17 @@ class TestOrchestratorBoundsTurns:
 
 class TestOrchestratorKeepsAgentsApart:
     @pytest.mark.asyncio
-    async def test_each_speaker_is_resolved_with_its_own_session_and_ontology(
+    async def test_each_speaker_is_resolved_with_its_own_session_and_clone(
         self, built: Any
     ) -> None:
         """G3 and G4, the orchestrator's half of them.
 
         What this proves is bounded, and the bound is worth stating: the orchestrator
         resolves each speaker by *its own* participant record, so it can never hand one
-        agent another's session or namespace. Whether the resolver then honours those ids
-        is the resolver's own obligation (`RoomAgentResolverProtocol`), and it has no
-        implementation yet — §7.3.
+        agent another's session, or another clone's id -- which is what its memory and,
+        since clone-knowledge-graph step 6, its rules engine are keyed by. Whether the
+        resolver then honours those ids is the resolver's own obligation
+        (`RoomAgentResolverProtocol`).
         """
         _, resolver, _ = built
         orch = _orchestrator(built, [ScriptedSelector("s", [speak("scout"), speak("critic")])])
@@ -536,9 +534,9 @@ class TestOrchestratorKeepsAgentsApart:
         await orch.post("r1", "alice", "discuss")
 
         sessions = {sid for _, sid, _ in resolver.resolved}
-        namespaces = {ns for _, _, ns in resolver.resolved}
+        clones = {clone for _, _, clone in resolver.resolved}
         assert sessions == {"sess_room__r1__scout", "sess_room__r1__critic"}
-        assert len(namespaces) == 2
+        assert clones == {"scout", "critic"}
 
     @pytest.mark.asyncio
     async def test_a_speaker_sees_only_the_span_it_has_not_seen(self, built: Any) -> None:
@@ -878,6 +876,96 @@ class TestPostRejectsNonHumans:
 
         with pytest.raises(UnknownRoomParticipantError, match="human"):
             await orch.post("r1", "scout", "and another thing")
+
+
+class TestAHeadRoomIsTheHeadsToDrive:
+    """A room a head keeps refuses every other writer, in the Core (#1885).
+
+    `ucx run` and the other heads record their turns into a one-seat room the app lists. A
+    post from the app into that room ran a turn the head never saw, and the head's next
+    turn then answered a conversation it did not have. The refusal is here rather than in
+    a route, so `ucx room say` and `ucx room retry` are refused by the same line.
+    """
+
+    @staticmethod
+    def _mark(built: Any, head: str | None) -> None:
+        store, _, _ = built
+        state = store.load("r1")
+        assert state is not None
+        store.save(state.model_copy(update={"head": head}))
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("entry", ["accept", "accept_command", "post", "retry", "resume"])
+    async def test_every_way_in_is_refused_and_nothing_is_written(
+        self, built: Any, entry: str
+    ) -> None:
+        """Each entry, left alone, records the post or reaches a refusal of its own.
+
+        Killed by: src/uclone_x/room/orchestrator.py :: if head is not None:
+        Becomes: if False:
+        """
+        from uclone_x.errors import HeadRoomWriteError
+
+        store, _, agents = built
+        self._mark(built, "run")
+        before = store.load("r1")
+        orch = _orchestrator(built, [ScriptedSelector("s", [speak("scout")] * 3)])
+        calls: dict[str, Any] = {
+            "accept": lambda: orch.accept("r1", "alice", "hello from the app"),
+            "accept_command": lambda: orch.accept_command("r1", "alice", "/loop 30s go"),
+            "post": lambda: orch.post("r1", "alice", "hello from the app"),
+            "retry": lambda: orch.retry("r1"),
+            "resume": lambda: orch.resume("r1", 0),
+        }
+
+        with pytest.raises(HeadRoomWriteError) as refused:
+            await calls[entry]()
+
+        assert store.load("r1") == before
+        assert all(not agent.prompts for agent in agents.values())
+        message = str(refused.value)
+        assert message == (
+            "This conversation belongs to ucx run, so only ucx run can continue it. "
+            "You can read it here."
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_unmarked_room_takes_a_post_as_before(self, built: Any) -> None:
+        """Old head rooms carry no mark and are served as they were (author's choice).
+
+        Killed by: src/uclone_x/room/orchestrator.py :: if head is not None:
+        Becomes: if True:
+        """
+        store, _, _ = built
+        orch = _orchestrator(built, [ScriptedSelector("s", [speak("scout")])])
+
+        await orch.post("r1", "alice", "go")
+
+        state = store.load("r1")
+        assert state is not None and state.head is None
+        assert [m.content for m in state.transcript][:2] == ["go", "scout says TTL"]
+
+    @pytest.mark.parametrize(
+        ("head", "keeper"),
+        [
+            ("run", "ucx run"),
+            ("loop", "ucx loop"),
+            ("acp", "the editor that opened it"),
+            ("a2a", "the agent that called this clone"),
+            ("something-new", "another program"),
+        ],
+    )
+    def test_the_refusal_names_the_keeper_plainly(self, head: str, keeper: str) -> None:
+        """What the app shows: the owner in words a person uses, no code, path or class name."""
+        from uclone_x.room.models import head_room_write_refusal
+
+        message = head_room_write_refusal(head)
+
+        assert message == (
+            f"This conversation belongs to {keeper}, so only {keeper} can continue it. "
+            "You can read it here."
+        )
+        assert "/" not in message and "`" not in message and "Error" not in message
 
 
 class TestStoreContainment:
@@ -4569,10 +4657,465 @@ class TestAFailedSaveIsOnTheRow:
         stored = store.load("r1")
         assert stored is not None
         old = stored.transcript[-1].model_dump(mode="json")
-        del old["memory_facts_tried"]
-        del old["memory_facts_unsaved"]
+        # Left out while 0 (#1885), as a row from before the counts has them.
+        assert "memory_facts_tried" not in old
+        assert "memory_facts_unsaved" not in old
         legacy = RoomMessage.model_validate_json(json.dumps(old))
         assert (legacy.memory_facts_tried, legacy.memory_facts_unsaved) == (0, 0)
+
+    @pytest.mark.asyncio
+    async def test_a_fact_saved_under_the_persons_display_name_is_filed_under_user(
+        self, built: Any, tmp_path: Any
+    ) -> None:
+        """The room tells the seat's memory who the person is before the turn (#1857).
+
+        So a fact the model saves under "Alice" lands in recall's always-included user slots,
+        as the extractor would have filed it.
+
+        Killed by: src/uclone_x/room/orchestrator.py :: person_names=_person_names(state),  # per turn
+        Becomes: person_names=(),  # per turn
+        """
+        _, _, agents = built
+        _cap(built, 1)
+        agents["scout"] = _remembering_agent(
+            SCOUT,
+            tmp_path,
+            [_save_call("c1", {"subject": "Alice", "predicate": "colour", "object_value": "teal"})],
+        )
+
+        await _orchestrator(built, [ScriptedSelector("s", [speak("scout")])]).post(
+            "r1", "alice", "remember my favourite colour is teal"
+        )
+
+        saved = agents["scout"].memory.list_facts()
+        assert [(f.subject, f.predicate, f.object_value) for f in saved] == [
+            ("user", "colour", "teal")
+        ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("head", ["run", "loop", "acp", "a2a"])
+    async def test_a_head_gives_its_turn_the_person_s_names_as_a_room_does(
+        self, tmp_path: Any, head: str
+    ) -> None:
+        """A head is a one-seat room, so a fact saved under the person's name is `user` (#1893).
+
+        The person is seated in the head's stored room as "Kenny" (`ucx room add --name`
+        is how today). Each head reads the names from its room as the room path does:
+        `run` and `loop` from the room they opened, ACP and A2A per turn from the room
+        their session or context keys. Given none, the fact keeps "Kenny" as its subject
+        and recall's always-included user slots never see it.
+
+        Killed by: src/uclone_x/room/one_seat.py :: return head_person_names(service.get(room_id))
+        Becomes: return head_person_names(None)
+        Killed by: src/uclone_x/room/one_seat.py :: return head_person_names(self.state)
+        Becomes: return head_person_names(None)
+        """
+        from uclone_x.cli.commands.a2a import a2a_person_names
+        from uclone_x.cli.commands.acp import acp_person_names
+        from uclone_x.room.one_seat import (
+            ONE_SEAT_HUMAN_ID,
+            HeadTurn,
+            conversation_room_id,
+            open_head_room,
+            record_head_turn,
+        )
+        from uclone_x.room.store import RoomStore
+
+        store = RoomStore(tmp_path / "rooms")
+        room_id = (
+            conversation_room_id(head, "scout", "c1") if head in ("acp", "a2a") else "room_kenny"
+        )
+        state = record_head_turn(
+            store,
+            room_id=room_id,
+            clone_id="scout",
+            turn=HeadTurn(prompt="hello", content="hi"),
+            head=head,
+        )
+        seats = tuple(
+            p.model_copy(update={"display_name": "Kenny"}) if p.id == ONE_SEAT_HUMAN_ID else p
+            for p in state.participants
+        )
+        store.save(state.model_copy(update={"participants": seats}))
+
+        if head == "acp":
+            names = acp_person_names("scout", store)("c1")
+        elif head == "a2a":
+            names = a2a_person_names("scout", store)("c1")
+        else:
+            names = open_head_room("scout", room_id, head=head, store=store).person_names
+        agent = _remembering_agent(
+            SCOUT,
+            tmp_path,
+            [
+                _save_call(
+                    "c1", {"subject": "Kenny", "predicate": "lives_in", "object_value": "Busan"}
+                )
+            ],
+        )
+
+        await agent.execute_turn("remember that I live in Busan", person_names=names)
+
+        saved = agent.memory.list_facts()
+        assert [(f.subject, f.predicate) for f in saved] == [("user", "lives_in")]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("person_id", "display_name"),
+        [("kenny", "kenny"), ("u_1", "김철수"), ("u_2", "José")],
+    )
+    async def test_a_one_word_name_nobody_else_in_the_room_shares_means_the_person(
+        self, built: Any, tmp_path: Any, person_id: str, display_name: str
+    ) -> None:
+        """A person seated as "kenny", "김철수" or "José" is `user` under that name (#1868).
+
+        One word is not enough to leave a name out; only another participant sharing it is.
+
+        Killed by: src/uclone_x/room/orchestrator.py :: others = [p for p in state.participants if p.id != person.id]
+        Becomes: others = list(state.participants)
+        """
+        store, _, agents = built
+        _cap(built, 1)
+        state = store.load("r1")
+        assert state is not None
+        person = ALICE.model_copy(update={"id": person_id, "display_name": display_name})
+        store.save(state.model_copy(update={"participants": (person, *state.participants[1:])}))
+        agents["scout"] = _remembering_agent(
+            SCOUT,
+            tmp_path,
+            [
+                _save_call(
+                    "c1",
+                    {"subject": display_name, "predicate": "lives_in", "object_value": "Busan"},
+                )
+            ],
+        )
+
+        await _orchestrator(built, [ScriptedSelector("s", [speak("scout")])]).post(
+            "r1", person_id, "remember that I live in Busan"
+        )
+
+        saved = agents["scout"].memory.list_facts()
+        assert [(f.subject, f.predicate) for f in saved] == [("user", "lives_in")]
+
+    @pytest.mark.asyncio
+    async def test_a_name_another_participant_shares_keeps_its_subject(
+        self, built: Any, tmp_path: Any
+    ) -> None:
+        """The person goes by "Kim"; a seat called "Kim Jiho" makes "Kim" mean either (#1868).
+
+        So a fact saved under "Kim" keeps that subject and stays out of recall's user slots,
+        while her id and her full name still file under `user`.
+
+        Killed by: src/uclone_x/room/orchestrator.py :: if not (folded in other_names or folded in other_words):
+        Becomes: if True:
+        Killed by: src/uclone_x/room/orchestrator.py :: for name in (person.id, person.display_name, *person.aliases):
+        Becomes: for name in (person.display_name, *person.aliases):
+        """
+        store, _, agents = built
+        _cap(built, 1)
+        state = store.load("r1")
+        assert state is not None
+        kim = ALICE.model_copy(
+            update={"id": "u_kim", "display_name": "Kim", "aliases": ("Kim Minji",)}
+        )
+        jiho = CRITIC.model_copy(update={"display_name": "Kim Jiho"})
+        store.save(state.model_copy(update={"participants": (kim, SCOUT, jiho)}))
+        agents["scout"] = _remembering_agent(
+            SCOUT,
+            tmp_path,
+            [
+                _save_call("c1", {"subject": "Kim", "predicate": "role", "object_value": "vendor"}),
+                _save_call(
+                    "c2", {"subject": "Kim Minji", "predicate": "colour", "object_value": "teal"}
+                ),
+                _save_call(
+                    "c3", {"subject": "u_kim", "predicate": "lives_in", "object_value": "Busan"}
+                ),
+            ],
+        )
+
+        await _orchestrator(built, [ScriptedSelector("s", [speak("scout")])]).post(
+            "r1", "u_kim", "Kim is the vendor; I like teal and live in Busan"
+        )
+
+        saved = agents["scout"].memory.list_facts()
+        assert sorted((f.subject, f.predicate) for f in saved) == [
+            ("Kim", "role"),
+            ("user", "colour"),
+            ("user", "lives_in"),
+        ]
+
+    @pytest.mark.parametrize(
+        ("name", "kept"),
+        [
+            ("Kim", False),  # one word of the seat "Kim Jiho"
+            ("kim  jiho", False),  # the seat's whole name
+            ("Lee", False),  # one word of the seat's id "jiho.lee"
+            ("Kim Minji", True),  # two words, shared whole by nobody
+            ("Minji", True),
+            ("Scout Lee", True),  # holds "scout", but is not one word
+        ],
+    )
+    def test_the_room_leaves_out_a_name_another_participant_shares(
+        self, name: str, kept: bool
+    ) -> None:
+        r"""Which of the person's names the room passes on; her id is always passed (#1868).
+
+        Killed by: src/uclone_x/room/orchestrator.py :: other_words = {w for n in other_names for w in re.findall(r"\w+", n)}
+        Becomes: other_words = {w for n in other_names for w in n.split()}
+        Killed by: src/uclone_x/room/orchestrator.py :: if not (folded in other_names or folded in other_words):
+        Becomes: if not folded in other_words:
+        Killed by: src/uclone_x/room/orchestrator.py :: if not (folded in other_names or folded in other_words):
+        Becomes: if not folded in other_names:
+        """
+        from uclone_x.room.orchestrator import (
+            _person_names,  # pyright: ignore[reportPrivateUsage]
+        )
+
+        person = ALICE.model_copy(update={"id": "u_kim", "display_name": "Kim", "aliases": (name,)})
+        seat = CRITIC.model_copy(update={"id": "jiho.lee", "display_name": "Kim Jiho"})
+        state = RoomState(room_id="r1", participants=(person, SCOUT, seat), policy=RoomPolicy())
+
+        names = _person_names(state)
+
+        assert names[0] == "u_kim"
+        assert (name in names) is kept
+
+    @pytest.mark.parametrize(
+        ("person_id", "clone_name", "kept"),
+        [
+            ("kim", "Kim", False),  # the clone's whole name
+            ("KIM", "kim", False),  # casefolded
+            ("kim", "Kim Jiho", False),  # one word of the clone's name
+            ("kim", "Kimberly", True),  # not a word of it
+            ("u_kim", "Kim", True),  # nobody else goes by it
+        ],
+    )
+    def test_the_persons_id_is_left_out_when_a_clone_goes_by_it(
+        self, person_id: str, clone_name: str, kept: bool
+    ) -> None:
+        """An id `kim` beside a clone shown as "Kim" could mean either (#1893).
+
+        The id is held to the rule a display name is (#1868); an id nobody else in the room
+        goes by still counts.
+
+        Killed by: src/uclone_x/room/orchestrator.py :: if not (folded in other_names or folded in other_words):
+        Becomes: if not (folded in other_names or folded in other_words) or name == person.id:
+        """
+        from uclone_x.room.orchestrator import (
+            _person_names,  # pyright: ignore[reportPrivateUsage]
+        )
+
+        person = ALICE.model_copy(update={"id": person_id, "display_name": "Minji"})
+        clone = CRITIC.model_copy(update={"display_name": clone_name})
+        state = RoomState(room_id="r1", participants=(person, SCOUT, clone), policy=RoomPolicy())
+
+        names = _person_names(state)
+
+        assert (person_id in names) is kept
+        assert "Minji" in names
+
+    @pytest.mark.parametrize(
+        ("mine", "theirs"),
+        [("Jose\u0301", "Jos\u00e9 Silva"), ("Jos\u00e9", "Jose\u0301 Silva")],
+        ids=["mine-decomposed", "theirs-decomposed"],
+    )
+    def test_names_are_compared_in_nfc(self, mine: str, theirs: str) -> None:
+        """ "José" stored decomposed is the same word as the composed "José" (#1893).
+
+        So a seat called "José Silva" leaves the person's "José" out, however either is
+        encoded.
+
+        Killed by: src/uclone_x/memory/models.py :: return " ".join(unicodedata.normalize("NFC", name).split()).casefold()
+        Becomes: return " ".join(name.split()).casefold()
+        """
+        from uclone_x.room.orchestrator import (
+            _person_names,  # pyright: ignore[reportPrivateUsage]
+        )
+
+        person = ALICE.model_copy(update={"id": "u_1", "display_name": mine})
+        seat = CRITIC.model_copy(update={"display_name": theirs})
+        state = RoomState(room_id="r1", participants=(person, SCOUT, seat), policy=RoomPolicy())
+
+        assert _person_names(state) == ("u_1",)
+
+    def test_each_name_is_given_once(self, tmp_path: Any) -> None:
+        """A head's person is seated as `user` shown as "user": the names are `("user",)`.
+
+        A name given twice, or twice spelled differently ("kenny", "Kenny"), is the same
+        name to the rule that reads it (#1885); the first spelling is kept.
+
+        Killed by: src/uclone_x/room/orchestrator.py :: if folded in given:
+        Becomes: if False:
+        """
+        from uclone_x.room.one_seat import HeadTurn, head_person_names, record_head_turn
+        from uclone_x.room.orchestrator import (
+            _person_names,  # pyright: ignore[reportPrivateUsage]
+        )
+        from uclone_x.room.store import RoomStore
+
+        head_room = record_head_turn(
+            RoomStore(tmp_path / "rooms"),
+            room_id="room_from_the_terminal",
+            clone_id="scout",
+            turn=HeadTurn(prompt="hello", content="hi"),
+            head="run",
+        )
+        person = ALICE.model_copy(
+            update={"id": "kenny", "display_name": "Kenny", "aliases": ("KENNY", "Kim")}
+        )
+        state = RoomState(room_id="r1", participants=(person, SCOUT), policy=RoomPolicy())
+
+        assert head_person_names(head_room) == ("user",)
+        assert _person_names(state) == ("kenny", "Kim")
+
+    @pytest.mark.asyncio
+    async def test_a_fact_about_a_clone_the_persons_id_names_keeps_its_subject(
+        self, built: Any, tmp_path: Any
+    ) -> None:
+        """The person's id is `kim` and a clone is shown as "Kim" (#1893).
+
+        A fact about that clone keeps the subject "Kim" instead of landing in recall's user
+        slots; the person's display name still files under `user`.
+
+        Killed by: src/uclone_x/room/orchestrator.py :: if not (folded in other_names or folded in other_words):
+        Becomes: if not (folded in other_names or folded in other_words) or name == person.id:
+        """
+        store, _, agents = built
+        _cap(built, 1)
+        state = store.load("r1")
+        assert state is not None
+        person = ALICE.model_copy(update={"id": "kim", "display_name": "Minji Park"})
+        clone = CRITIC.model_copy(update={"display_name": "Kim"})
+        store.save(state.model_copy(update={"participants": (person, SCOUT, clone)}))
+        agents["scout"] = _remembering_agent(
+            SCOUT,
+            tmp_path,
+            [
+                _save_call("c1", {"subject": "Kim", "predicate": "role", "object_value": "critic"}),
+                _save_call(
+                    "c2", {"subject": "Minji Park", "predicate": "colour", "object_value": "teal"}
+                ),
+            ],
+        )
+
+        await _orchestrator(built, [ScriptedSelector("s", [speak("scout")])]).post(
+            "r1", "kim", "Kim reviews drafts; I like teal"
+        )
+
+        saved = agents["scout"].memory.list_facts()
+        assert sorted((f.subject, f.predicate) for f in saved) == [
+            ("Kim", "role"),
+            ("user", "colour"),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_two_rooms_seating_one_clone_each_file_under_their_own_person(
+        self, tmp_path: Any
+    ) -> None:
+        """One clone's store serves every room; each turn's saves use that turn's person.
+
+        Room r1 (Alice) is mid-turn when room r2 (Kim) runs a whole turn of the same
+        clone. r1's model then saves a fact about "Kim", a colleague, a fact about
+        "Alice", and one about "Scout", r1's other seat. Only "Alice" is r1's person;
+        another room's person and an agent seat are never the person (#1857).
+
+        Killed by: src/uclone_x/agent/turn_executor.py :: person_names=self._turn_person_names,
+        Becomes: person_names=(),
+        Killed by: src/uclone_x/room/orchestrator.py :: if person.kind is not ParticipantKind.HUMAN:
+        Becomes: if person.kind is None:
+        """
+        from uclone_x.agent import BaseAgent
+        from uclone_x.agent.models import AgentConfig, AgentContext, AgentLLMConfig
+        from uclone_x.llm import MockLLMConnector
+        from uclone_x.llm.models import LLMRequest, ModelResponse
+        from uclone_x.memory.store import CrossSessionMemory
+        from uclone_x.room.orchestrator import RoomOrchestrator
+        from uclone_x.room.store import RoomStore
+
+        class _HeldFirstCall(MockLLMConnector):
+            """Its first call waits for `release`, so another room's turn runs meanwhile."""
+
+            def __init__(self, **kwargs: Any) -> None:
+                super().__init__(**kwargs)
+                self.entered = asyncio.Event()
+                self.release = asyncio.Event()
+                self._held = False
+
+            async def generate(self, request: LLMRequest) -> ModelResponse:
+                if not self._held:
+                    self._held = True
+                    self.entered.set()
+                    await self.release.wait()
+                return await super().generate(request)
+
+        kim = Participant(id="kim", kind=ParticipantKind.HUMAN, display_name="Kim")
+        scout_r2 = agent_participant("scout", "r2")
+        store = RoomStore(tmp_path)
+        store.save(
+            RoomState(
+                room_id="r1",
+                participants=(ALICE, SCOUT),
+                policy=RoomPolicy(max_agent_turns_per_human_message=1),
+            )
+        )
+        store.save(
+            RoomState(
+                room_id="r2",
+                participants=(kim, scout_r2),
+                policy=RoomPolicy(max_agent_turns_per_human_message=1),
+            )
+        )
+        memory = CrossSessionMemory(storage_path=tmp_path / "scout-memory.json")
+        held = _HeldFirstCall(
+            responses=["", "Saved."],
+            tool_calls=[
+                _save_call(
+                    "c1", {"subject": "Kim", "predicate": "role", "object_value": "colleague"}
+                ),
+                _save_call(
+                    "c2", {"subject": "Alice", "predicate": "colour", "object_value": "teal"}
+                ),
+                _save_call("c3", {"subject": "Scout", "predicate": "role", "object_value": "seat"}),
+            ],
+        )
+
+        def _seat(participant: Participant, llm: Any) -> Any:
+            return BaseAgent(
+                config=AgentConfig(
+                    agent_id="scout",
+                    name="scout",
+                    llm_config=AgentLLMConfig(model_name="mock-model"),
+                ),
+                llm=llm,
+                context=AgentContext(session_id=participant.session_id, agent_id="scout"),
+                memory=memory,
+            )
+
+        seats = {
+            SCOUT.session_id: _seat(SCOUT, held),
+            scout_r2.session_id: _seat(scout_r2, MockLLMConnector(responses=["Hello Kim."])),
+        }
+
+        class _PerRoom:
+            async def resolve(self, participant: Participant, *, one_seat: bool = False) -> Any:
+                return seats[participant.session_id]
+
+        orch = RoomOrchestrator(
+            store=store,
+            selectors=[ScriptedSelector("s", [speak("scout"), speak("scout")])],
+            resolver=_PerRoom(),
+        )
+
+        first = asyncio.create_task(orch.post("r1", "alice", "remember my colour and Kim's role"))
+        await asyncio.wait_for(held.entered.wait(), timeout=5)
+        await orch.post("r2", "kim", "hi")
+        held.release.set()
+        await first
+
+        saved = {(f.subject, f.predicate) for f in memory.list_facts()}
+        assert saved == {("Kim", "role"), ("user", "colour"), ("Scout", "role")}
 
 
 def _save_record(arguments: dict[str, Any], *, ok: bool) -> Any:

@@ -18,6 +18,7 @@ from typing import Any, cast
 import httpx
 import pytest
 
+from tests.support.app_clone import app_clone
 from uclone_x.agent.base import BaseAgent
 from uclone_x.agent.composition import HostDependencies
 from uclone_x.agent.models import AgentConfig, AgentLLMConfig
@@ -442,20 +443,19 @@ def test_the_environment_list_is_merged_before_the_settings_list(
 
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("no_env_roots")
-async def test_new_and_live_agents_both_receive_the_list(tmp_path: Path, papers: Path) -> None:
+async def test_a_clone_built_after_a_save_receives_the_list(tmp_path: Path, papers: Path) -> None:
     """Killed by: src/uclone_x/ui/app.py :: read_roots=lambda: self.read_roots,
     Becomes: read_roots=lambda: (),
-    Killed by: src/uclone_x/ui/app.py :: agent.set_read_roots(effective_roots)
-    Becomes: pass
+
+    A seat already speaking takes the list from its resolver (pinned below). The chat-agent
+    cache this also covered went with `get_or_create_agent` (#1893).
     """
-    mgr = AgentSessionManager(storage_dir=tmp_path / "store", fallback_to_mock=True)
-    live = await mgr.get_or_create_agent(agent_id="live", session_id="sess_live")
-    assert live.config.read_roots == ()
+    mgr = AgentSessionManager(storage_dir=tmp_path / "store", llm=MockLLMConnector())
+    assert app_clone(mgr, "before", "sess_before").config.read_roots == ()
 
     mgr.update_settings(read_roots=[str(papers)])
-    assert live.config.read_roots == (papers.resolve(),)
 
-    fresh = await mgr.get_or_create_agent(agent_id="fresh", session_id="sess_fresh")
+    fresh = app_clone(mgr, "fresh", "sess_fresh")
     assert fresh.config.read_roots == (papers.resolve(),)
 
 

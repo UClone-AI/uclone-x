@@ -13,7 +13,6 @@ from uclone_x.errors import MissingProvenanceError
 from uclone_x.llm.models import MessageRole
 from uclone_x.memory.models import MemoryFact
 from uclone_x.memory.store import CrossSessionMemory
-from uclone_x.ontology.engine import OntologyEngine
 from uclone_x.skills.synthesizer import SkillSynthesizer
 from uclone_x.tools.models import ToolContext
 
@@ -148,6 +147,49 @@ def test_cross_session_memory_auto_retract_conflicts() -> None:
 
     all_facts = memory.list_facts(include_retracted=True)
     assert len(all_facts) == 2
+
+
+#: "José" as a build before #1895 could store it (`e` and a combining accent), and as a
+#: model writes it now (one composed code point). Unequal as strings, one name in NFC.
+_JOSE_DECOMPOSED = "Jose\u0301"
+_JOSE_COMPOSED = "Jos\u00e9"
+
+
+def test_a_decomposed_stored_subject_is_superseded_by_the_composed_form() -> None:
+    """A fact stored decomposed conflicts with the composed form of the same subject (#1893).
+
+    Killed by: src/uclone_x/memory/models.py :: same_subject = fold_name(self.subject) == fold_name(other.subject)
+    Becomes: same_subject = self.subject.strip().lower() == other.subject.strip().lower()
+    """
+    assert _JOSE_DECOMPOSED != _JOSE_COMPOSED
+    memory = CrossSessionMemory()
+    prov = _test_provenance()
+    old = memory.record_fact(_JOSE_DECOMPOSED, "lives_in", "Busan", prov, "s0")
+
+    new = memory.record_fact(_JOSE_COMPOSED, "lives_in", "Seoul", prov, "s1")
+
+    assert new.contradicts_fact_id == old.fact_id
+    assert [f.fact_id for f in memory.list_facts()] == [new.fact_id]
+
+
+@pytest.mark.parametrize(
+    ("stored", "asked"),
+    [(_JOSE_DECOMPOSED, _JOSE_COMPOSED), (_JOSE_COMPOSED, _JOSE_DECOMPOSED)],
+    ids=["stored-decomposed", "stored-composed"],
+)
+def test_list_facts_matches_a_subject_in_either_unicode_form(stored: str, asked: str) -> None:
+    """`list_facts(subject=)` finds a subject whichever form was stored and asked (#1893).
+
+    Killed by: src/uclone_x/memory/store.py :: target_subj = fold_name(subject) if subject else None
+    Becomes: target_subj = subject.strip().lower() if subject else None
+    """
+    memory = CrossSessionMemory()
+    fact = memory.record_fact(
+        stored, "lives_in", "Busan", _test_provenance(), "s0", auto_retract_conflicts=False
+    )
+    memory.record_fact("Maria", "lives_in", "Daegu", _test_provenance(), "s0")
+
+    assert [f.fact_id for f in memory.list_facts(subject=asked)] == [fact.fact_id]
 
 
 def test_cross_session_memory_explicit_retraction() -> None:
@@ -324,48 +366,6 @@ def test_cross_session_memory_p9_skill_synthesizer_input() -> None:
     instructions = synthesizer.format_instructions("pr_routine", steps)
     assert instructions.startswith("# Pr Routine\n")
     assert "run quality gate before commit" in instructions
-
-
-def test_cross_session_memory_p7_ontology_evidence_and_promotion() -> None:
-    """Aggregates multi-session facts into EvidenceRecord and promotes into OntologyEngine.
-
-    Killed by: src/uclone_x/memory/store.py :: observation_count=len(active_facts),
-    Becomes: observation_count=0,
-    """
-    memory = CrossSessionMemory()
-    prov = _test_provenance()
-
-    # Two distinct sessions observe the same fact
-    f1 = memory.record_fact(
-        subject="UserEntity",
-        predicate="role",
-        object_value="admin",
-        provenance=prov,
-        source_session_id="session_101",
-    )
-    memory.record_fact(
-        subject="UserEntity",
-        predicate="role",
-        object_value="admin",
-        provenance=prov,
-        source_session_id="session_102",
-    )
-
-    evidence = memory.export_ontology_evidence("UserEntity", "role")
-    assert evidence is not None
-    assert evidence.observation_count == 2
-    assert evidence.session_count == 2
-    assert "session_101" in evidence.distinct_sessions
-    assert "session_102" in evidence.distinct_sessions
-
-    ontology = OntologyEngine()
-    promoted = memory.promote_fact_to_ontology_concept(
-        ontology=ontology,
-        fact_id=f1.fact_id,
-        force=True,
-    )
-    assert promoted.name == "UserEntity"
-    assert promoted.attributes.get("role") == "admin"
 
 
 @pytest.mark.asyncio

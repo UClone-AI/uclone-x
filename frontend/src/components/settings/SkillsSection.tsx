@@ -5,6 +5,7 @@ import { plural, useCopy } from '../../i18n';
 import { useApiRead } from '../../lib/useApiRead';
 import type { SkillsData } from '../../types';
 import { ReadFailure, ReadLoading } from './ReadState';
+import { SkillDecisionNotice, SkillProposalList, useSkillDecisions } from './SkillProposals';
 
 /**
  * The skill catalogue, as a section of Settings (#1358; owner ruling 2026-09-22).
@@ -19,7 +20,9 @@ import { ReadFailure, ReadLoading } from './ReadState';
  * and a way to try again), no skill is registered (or, when the runtime found no skill folder
  * at all, that none could be loaded and where to look, #1721), or the catalogue. The cause is the
  * runtime's own `detail` when it gave one, otherwise a fixed sentence from `skills.plainCause`.
- * Above the catalogue, one line names the skills that must be approved again (#1777).
+ * Above the catalogue, one line names the skills that must be approved again (#1777), and
+ * the skills clones proposed wait for a person's decision (#1827). An approved skill that did
+ * not ship with UClone-X can be revoked from its safety check.
  *
  * Carries `.dock-scope` so `SkillsTab`'s grids answer to the modal's width rather than the
  * window's, as they did in the dock (ui-authoring §3).
@@ -28,6 +31,8 @@ export const SkillsSection: React.FC = () => {
   const { data, fault, loading, reload } = useApiRead<SkillsData>('/api/skills');
   const skills = data?.skills ?? [];
   const copy = useCopy().skills;
+  const proposals = data?.proposals ?? [];
+  const decisions = useSkillDecisions(reload);
   // Skills approved before approvals were pinned (#1776) are not used until they are approved
   // again; one line says so and what to run (#1777).
   const reapprove = skills
@@ -66,9 +71,17 @@ export const SkillsSection: React.FC = () => {
           {plural(copy.reapprove, reapprove.length, { names: reapprove.join(', ') })}
         </p>
       )}
+      <SkillDecisionNotice decisions={decisions} />
+      {fault === null && <SkillProposalList proposals={proposals} decisions={decisions} />}
       {fault === null && skills.length > 0 && (
         <div className="dock-scope">
-          <SkillsTab skillsData={data} onRefresh={reload} isLoading={loading} />
+          <SkillsTab
+            skillsData={data}
+            onRefresh={reload}
+            isLoading={loading}
+            onRevoke={(name) => void decisions.revoke(name)}
+            deciding={decisions.busy}
+          />
         </div>
       )}
     </div>

@@ -1,6 +1,7 @@
 # pyright: reportUnknownMemberType=false, reportUnknownVariableType=false, reportUnknownArgumentType=false
 """Unit tests for interactive and non-interactive agent REPL execution and provider resolution (Issues #54, #141)."""
 
+import json
 import logging
 import os
 import pty
@@ -43,6 +44,9 @@ from uclone_x.llm.models import (
     TokenUsage,
     ToolCallRequest,
 )
+from uclone_x.room.models import ParticipantKind
+from uclone_x.room.service import RoomService, participant_session_id
+from uclone_x.room.store import RoomStore
 from uclone_x.telemetry import TelemetryTracer
 from uclone_x.tools import LocalTool, ToolRegistry
 
@@ -219,7 +223,7 @@ def test_run_command_without_explicit_system_sends_the_composed_default(
     )
     assert result.exit_code == 0, result.output
 
-    state = store.load("sess_prompt-agent")
+    state = store.load(_only_seat(store, "prompt-agent"))
     assert state is not None, "the run persisted no session; the harness is not reaching it"
     system_messages = [m.content or "" for m in state.messages if m.role == MessageRole.SYSTEM]
     assert system_messages, "no system message was persisted"
@@ -259,7 +263,7 @@ def test_run_command_explicit_system_still_takes_precedence(
     )
     assert result.exit_code == 0, result.output
 
-    state = store.load("sess_operator-agent")
+    state = store.load(_only_seat(store, "operator-agent"))
     assert state is not None, "the run persisted no session; the harness is not reaching it"
     system_messages = [m.content or "" for m in state.messages if m.role == MessageRole.SYSTEM]
     assert system_messages == ["Answer only in haiku."]
@@ -469,10 +473,40 @@ def _isolated_run_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Sessio
     return SessionStore(storage_dir=default_session_storage_dir())
 
 
+def _pin_the_new_room_id(monkeypatch: pytest.MonkeyPatch) -> str:
+    """Give a run started without `--session-id` a room id with no digits in it (#1885).
+
+    The run prints the id of the room it opens. A random hex id holds `404` or `400` often
+    enough that a test asserting those codes stay off the terminal failed on its own
+    notice, one run in a few hundred. A fixed id keeps that assertion whole.
+    """
+    import uclone_x.room.one_seat as one_seat
+
+    room_id = "room_pinned_for_the_test"
+    monkeypatch.setattr(one_seat, "new_one_seat_room_id", lambda: room_id)
+    return room_id
+
+
 def _assistant_texts(store: SessionStore, session_id: str) -> list[str]:
     state = store.load(session_id)
     assert state is not None, "the run persisted no session; the harness is not reaching it"
     return [m.content or "" for m in state.messages if m.role == MessageRole.ASSISTANT]
+
+
+def _seat(room_id: str, agent: str) -> str:
+    """The session `agent` keeps in room `room_id` -- where a `--session-id` run saves."""
+    return participant_session_id(room_id, agent)
+
+
+def _only_seat(store: SessionStore, agent: str) -> str:
+    """The one seat session `agent` holds, for a run that started a room of its own."""
+    ids = [
+        s
+        for s in store.list_session_ids()
+        if s.startswith("sess_room__") and s.endswith(f"__{agent}")
+    ]
+    assert len(ids) == 1, ids
+    return ids[0]
 
 
 def _use_connector(monkeypatch: pytest.MonkeyPatch, llm: MagicMock) -> None:
@@ -506,7 +540,7 @@ def _break_the_turn(monkeypatch: pytest.MonkeyPatch, shape: str) -> None:
         _use_connector(monkeypatch, _raising_llm())
         return
 
-    async def _explode(self: Any, content: str) -> Any:
+    async def _explode(self: Any, content: str, **_kwargs: Any) -> Any:
         raise RuntimeError(_TURN_FAILURE)
 
     _use_connector(monkeypatch, _mock_llm())
@@ -540,7 +574,10 @@ def test_a_failed_single_shot_turn_exits_non_zero_with_the_error_on_stderr(
     assert _TURN_FAILURE not in result.stdout
     # The session is still written -- the user's message was said -- but no assistant
     # message carries the failure as if the agent had replied with it.
-    assert not any(_TURN_FAILURE in text for text in _assistant_texts(store, "sess_failing-agent"))
+    assert not any(
+        _TURN_FAILURE in text
+        for text in _assistant_texts(store, _only_seat(store, "failing-agent"))
+    )
 
 
 _NO_TOOLS_SENTENCE = (
@@ -612,6 +649,7 @@ def test_a_retired_model_is_reported_with_the_flag_that_changes_it(
             raise ModelNotAvailableError(provider="Google", model="gemini-1.5-pro")
 
     _isolated_run_env(monkeypatch, tmp_path)
+    room_id = _pin_the_new_room_id(monkeypatch)
     _use_connector(monkeypatch, Retired(responses=[]))  # type: ignore[arg-type]
 
     result = runner.invoke(
@@ -625,6 +663,7 @@ def test_a_retired_model_is_reported_with_the_flag_that_changes_it(
     assert "The model gemini-1.5-pro is not available from Google." in stderr
     assert "Choose a model with --model." in stderr
     assert "Settings" not in stderr  # the command line has a flag, not a Settings page
+    assert room_id in result.output, "the pin did not reach the run; the id is random again"
     for internal in ("Traceback", "404", "{", "LLMProviderError", "ModelNotAvailableError"):
         assert internal not in result.output, internal
     loud = [r for r in caplog.records if r.levelno >= logging.WARNING or r.exc_info]
@@ -651,6 +690,7 @@ def test_a_revoked_gemini_key_reaches_the_terminal_as_one_plain_line(
         transport=httpx.MockTransport(lambda request: httpx.Response(400, text=body))
     )
     _isolated_run_env(monkeypatch, tmp_path)
+    room_id = _pin_the_new_room_id(monkeypatch)
     for var in ("GEMINI_API_KEY", "GOOGLE_API_KEY"):
         monkeypatch.delenv(var, raising=False)
     connector = GeminiConnector(api_key="bad", model="gemini-2.5-flash", http_client=client)
@@ -664,6 +704,7 @@ def test_a_revoked_gemini_key_reaches_the_terminal_as_one_plain_line(
     stderr = " ".join(result.stderr.split())
     assert "Google did not accept the API key." in stderr
     assert "Save a new key with `ucx key set gemini`." in stderr
+    assert room_id in result.output, "the pin did not reach the run; the id is random again"
     for internal in ("{", "400", "INVALID_ARGUMENT", "Traceback", "ProviderAuthError"):
         assert internal not in result.output, internal
     loud = [r for r in caplog.records if r.levelno >= logging.WARNING or r.exc_info]
@@ -820,10 +861,13 @@ def test_a_failed_turn_is_not_recorded_in_the_session_as_the_agents_reply(
     )
 
     assert result.exit_code != 0
-    state = store.load("sess_failing-agent")
+    state = store.load(_only_seat(store, "failing-agent"))
     assert state is not None
     assert [m.content for m in state.messages if m.role == MessageRole.USER] == ["hello"]
-    assert not any(_TURN_FAILURE in text for text in _assistant_texts(store, "sess_failing-agent"))
+    assert not any(
+        _TURN_FAILURE in text
+        for text in _assistant_texts(store, _only_seat(store, "failing-agent"))
+    )
 
 
 def test_a_successful_single_shot_turn_exits_zero_with_the_reply_on_stdout(
@@ -861,7 +905,7 @@ def test_a_missing_extra_during_the_turn_propagates_to_the_launcher(
     _isolated_run_env(monkeypatch, tmp_path)
     _use_connector(monkeypatch, _mock_llm())
 
-    async def _needs_extra(self: Any, content: str) -> Any:
+    async def _needs_extra(self: Any, content: str, **_kwargs: Any) -> Any:
         raise MissingDependencyError(extra="code", package="tree_sitter")
 
     monkeypatch.setattr("uclone_x.agent.base.BaseAgent.execute_turn", _needs_extra)
@@ -888,7 +932,7 @@ def test_a_missing_extra_during_a_repl_turn_also_propagates_to_the_launcher(
     _isolated_run_env(monkeypatch, tmp_path)
     _use_connector(monkeypatch, _mock_llm())
 
-    async def _needs_extra(self: Any, content: str) -> Any:
+    async def _needs_extra(self: Any, content: str, **_kwargs: Any) -> Any:
         raise MissingDependencyError(extra="code", package="tree_sitter")
 
     monkeypatch.setattr("uclone_x.agent.base.BaseAgent.execute_turn", _needs_extra)
@@ -911,7 +955,7 @@ def test_an_interrupted_single_shot_run_exits_130_not_0(
     _isolated_run_env(monkeypatch, tmp_path)
     _use_connector(monkeypatch, _mock_llm())
 
-    async def _interrupted(self: Any, content: str) -> Any:
+    async def _interrupted(self: Any, content: str, **_kwargs: Any) -> Any:
         raise KeyboardInterrupt
 
     monkeypatch.setattr("uclone_x.agent.base.BaseAgent.execute_turn", _interrupted)
@@ -953,7 +997,9 @@ def test_a_failed_repl_turn_keeps_the_repl_alive_and_is_not_shown_as_a_reply(
     # Still alive: the second turn ran and its reply reached stdout.
     assert llm.generate.await_count == 2
     assert "ok" in result.stdout.split("repl-agent", 1)[-1]
-    assert not any(_TURN_FAILURE in text for text in _assistant_texts(store, "sess_repl-agent"))
+    assert not any(
+        _TURN_FAILURE in text for text in _assistant_texts(store, _only_seat(store, "repl-agent"))
+    )
 
 
 # ======================================================================================
@@ -1056,7 +1102,7 @@ def test_a_single_shot_reply_with_an_unbalanced_closing_tag_exits_zero_and_is_sa
 
     assert result.exit_code == 0, result.output
     assert result.stdout == "closing [/bold] tag\n"
-    assert _assistant_texts(store, "sess_tag-agent") == ["closing [/bold] tag"]
+    assert _assistant_texts(store, _only_seat(store, "tag-agent")) == ["closing [/bold] tag"]
 
 
 def test_an_empty_single_shot_reply_leaves_stdout_empty(
@@ -1093,7 +1139,7 @@ def test_single_shot_notices_name_the_agent_and_session_verbatim_on_stderr(
     """
     _isolated_run_env(monkeypatch, tmp_path)
     _use_connector(monkeypatch, _mock_llm())
-    _seed_session("s[i]")
+    _seed_session(_seat("s[i]", "markup-agent"))
 
     result = runner.invoke(
         main.app,
@@ -1112,8 +1158,8 @@ def test_single_shot_notices_name_the_agent_and_session_verbatim_on_stderr(
 
     assert result.exit_code == 0, result.output
     assert result.stdout == "ok\n"
-    assert "Resumed session s[i] —" in result.stderr
-    assert "Session 's[i]' reset before start" in result.stderr
+    assert f"Resumed session {_seat('s[i]', 'markup-agent')} —" in result.stderr
+    assert f"Session '{_seat('s[i]', 'markup-agent')}' reset before start" in result.stderr
     assert "markup-agent:" in result.stderr
 
 
@@ -1149,7 +1195,7 @@ def test_the_compact_flag_names_the_session_verbatim(
     """
     _isolated_run_env(monkeypatch, tmp_path)
     _use_connector(monkeypatch, _mock_llm())
-    _seed_session("c[i]")
+    _seed_session(_seat("c[i]", "compactor"))
 
     result = runner.invoke(
         main.app,
@@ -1158,7 +1204,7 @@ def test_the_compact_flag_names_the_session_verbatim(
     )
 
     assert result.exit_code == 0, result.output
-    assert "Compacted 'c[i]' via" in result.stderr
+    assert f"Compacted '{_seat('c[i]', 'compactor')}' via" in result.stderr
     assert result.stdout == "ok\n"
 
 
@@ -1192,9 +1238,9 @@ def test_the_repl_prints_replies_history_and_identifiers_verbatim(
     assert "[user #1] q[i] asks [/bold]" in out
     assert f"[assistant #2] {reply}" in out
     assert "Agent ID:          markup-agent" in out
-    assert "Session ID:        s[i]" in out
+    assert f"Session ID:        {_seat('s[i]', 'markup-agent')}" in out
     assert "Agent Domain: markup-agent" in out
-    assert "Session 's[i]' reset" in out
+    assert f"Session '{_seat('s[i]', 'markup-agent')}' reset" in out
     assert "turns with markup-agent." in out
 
 
@@ -1208,7 +1254,7 @@ def test_the_repl_compact_command_names_the_session_verbatim(
     """
     _isolated_run_env(monkeypatch, tmp_path)
     _use_connector(monkeypatch, _mock_llm())
-    _seed_session("c[i]")
+    _seed_session(_seat("c[i]", "compactor"))
     _feed_prompts(monkeypatch, "/compact", "/exit")
 
     result = runner.invoke(
@@ -1216,7 +1262,7 @@ def test_the_repl_compact_command_names_the_session_verbatim(
     )
 
     assert result.exit_code == 0, result.output
-    assert "Compacted 'c[i]' via" in result.stdout
+    assert f"Compacted '{_seat('c[i]', 'compactor')}' via" in result.stdout
 
 
 def test_the_repl_tools_table_prints_tool_names_and_descriptions_verbatim(
@@ -1257,7 +1303,12 @@ def _collide_session_id(asked: str, stored: str) -> None:
     ("case", "extra_args", "exit_code", "shown"),
     [
         ("traversal", ["--session-id", "../x[i]"], 2, "Invalid --session-id: Invalid session ID"),
-        ("collision", ["--session-id", "k[i]"], 2, "Unusable --session-id 'k[i]': a session"),
+        (
+            "collision",
+            ["--session-id", "k[i]"],
+            2,
+            "Unusable --session-id 'sess_room__k[i]__refused': a session",
+        ),
         ("provider", ["--provider", "bad[i]"], 1, "LLM Error: Unsupported LLM provider: bad[i]"),
     ],
 )
@@ -1281,7 +1332,7 @@ def test_startup_refusals_print_the_users_text_verbatim(
     if case != "provider":
         _use_connector(monkeypatch, _mock_llm())
     if case == "collision":
-        _collide_session_id("k[i]", "K[i]")
+        _collide_session_id(_seat("k[i]", "refused"), _seat("K[i]", "refused"))
 
     result = runner.invoke(
         main.app, ["run", "refused", "--prompt", "hi", *extra_args, "--cwd", str(tmp_path)]
@@ -1294,10 +1345,10 @@ def test_startup_refusals_print_the_users_text_verbatim(
     if case == "collision":
         # Rich wraps at 80 columns: at a space for the prose, mid-word for a long path.
         words = " ".join(result.output.split())
-        assert "named 'K[i]' already occupies" in words
-        assert "identifies session 'K[i]'" in words
+        assert "named 'sess_room__K[i]__refused' already occupies" in words
+        assert "identifies session 'sess_room__K[i]__refused'" in words
         # Twice: in the headline and in the exception text under it.
-        assert result.output.replace("\n", "").count("k[i].json") == 2
+        assert result.output.replace("\n", "").count("sess_room__k[i]__refused.json") == 2
 
 
 # ======================================================================================
@@ -1340,12 +1391,12 @@ def test_a_single_shot_turn_that_was_not_saved_exits_3_with_the_reply_on_stdout(
     assert lost.stdout == "ok\n"
     assert "Session not saved" in lost.stderr
     assert f"OSError: {_SAVE_FAILURE}" in lost.stderr
-    assert store.load("kept") is None
+    assert store.load(_seat("kept", "saver")) is None
 
     resumed = runner.invoke(main.app, [*args[:3], "second", *args[4:]])
 
     assert resumed.exit_code == 0, resumed.output
-    state = store.load("kept")
+    state = store.load(_seat("kept", "saver"))
     assert state is not None
     assert [m.content for m in state.messages if m.role == MessageRole.USER] == ["second"]
 
@@ -1438,7 +1489,7 @@ def test_a_hook_blocked_single_shot_turn_exits_1_naming_the_hook_with_nothing_on
     assert f"✖ Turn blocked by hook: {_HOOK_REASON}" in result.stderr
     assert "Execution failed" not in result.stderr
     assert llm.generate.await_count == 0
-    state = store.load("sess_guarded")
+    state = store.load(_only_seat(store, "guarded"))
     assert state is not None
     assert [m.role for m in state.messages] == [MessageRole.SYSTEM]
 
@@ -1465,7 +1516,7 @@ def test_a_step_budget_refusal_with_partial_content_exits_1_with_nothing_on_stdo
     assert "✖ Execution failed: Agent step budget exceeded" in result.stderr
     assert "blocked by hook" not in result.stderr
     # The prompt and the partial work are persisted; no final reply is.
-    state = store.load("sess_budgeted")
+    state = store.load(_only_seat(store, "budgeted"))
     assert state is not None
     assert [m.content for m in state.messages if m.role == MessageRole.USER] == ["hello"]
 
@@ -1519,7 +1570,7 @@ def test_a_failure_message_with_markup_in_it_is_printed_verbatim(
 def _return_turn(monkeypatch: pytest.MonkeyPatch, turn: TurnResult) -> None:
     """Make `execute_turn` return `turn` as given, without running the engine."""
 
-    async def _returned(self: Any, content: str) -> TurnResult:
+    async def _returned(self: Any, content: str, **_kwargs: Any) -> TurnResult:
         return turn
 
     _use_connector(monkeypatch, _mock_llm())
@@ -1658,7 +1709,7 @@ def test_a_reply_written_into_a_closed_pipe_is_reported_and_the_turn_is_still_sa
     assert "✖ Reply not written to stdout: BrokenPipeError" in stderr
     assert "Traceback" not in stderr
     assert "Exception ignored" not in stderr
-    replies = _assistant_texts(store, "sess_piped")
+    replies = _assistant_texts(store, _only_seat(store, "piped"))
     assert len(replies) == 1 and "hello" in replies[0], replies
 
 
@@ -1942,7 +1993,7 @@ def test_a_reply_written_to_a_read_only_stdout_exits_1_without_failing_again_at_
     assert "The turn was saved; --session-id resumes it." in stderr
     assert "Exception ignored" not in stderr
     assert "Traceback" not in stderr
-    replies = _assistant_texts(store, "sess_readonly")
+    replies = _assistant_texts(store, _only_seat(store, "readonly"))
     assert len(replies) == 1 and "hello" in replies[0], replies
 
 
@@ -1970,7 +2021,7 @@ def test_a_reply_the_stdout_encoding_cannot_represent_is_reported_and_the_turn_i
     assert result.stdout_bytes == b""
     assert "Reply not written to stdout: UnicodeEncodeError" in result.stderr
     assert "--session-id resumes it" in result.stderr
-    assert _assistant_texts(store, "kept") == ["한글 reply 970"]
+    assert _assistant_texts(store, _seat("kept", "hangul")) == ["한글 reply 970"]
 
 
 def test_a_reply_neither_saved_nor_written_exits_1_and_does_not_claim_the_turn_was_saved(
@@ -2041,7 +2092,7 @@ def test_an_interrupt_while_the_reply_is_written_leaves_the_turn_saved(
     )
 
     assert result.exit_code == 130, result.output
-    assert _assistant_texts(store, "sess_irq-write") == ["ok"]
+    assert _assistant_texts(store, _only_seat(store, "irq-write")) == ["ok"]
 
 
 def _interrupt_saves_after(monkeypatch: pytest.MonkeyPatch, completed: int) -> None:
@@ -2083,7 +2134,7 @@ def test_an_interrupt_during_the_repls_exit_save_says_the_save_did_not_complete(
     assert "✖ Session not saved on exit: interrupted before the save completed" in result.stderr
     assert "Interrupted by user." in result.stderr
     # The per-turn save had finished, and saves are atomic, so that copy stands.
-    assert _assistant_texts(store, "sess_repl-irq") == ["ok"]
+    assert _assistant_texts(store, _only_seat(store, "repl-irq")) == ["ok"]
 
 
 def test_an_interrupt_during_the_single_shot_save_says_the_save_did_not_complete(
@@ -2105,7 +2156,7 @@ def test_an_interrupt_during_the_single_shot_save_says_the_save_did_not_complete
     assert result.exit_code == 130, result.output
     assert result.stdout == ""
     assert "✖ Session not saved: interrupted before the save completed" in result.stderr
-    assert store.load("sess_irq-save") is None
+    assert not [s for s in store.list_session_ids() if s.endswith("__irq-save")]
 
 
 def test_an_interrupt_during_the_save_of_a_failed_single_shot_turn_still_reports_the_failure(
@@ -2204,7 +2255,7 @@ def test_a_reply_that_overfills_a_non_blocking_pipe_leaves_its_start_on_stdout_a
     assert child.returncode == run.UNWRITTEN_REPLY_EXIT_CODE, stderr
     assert "✖ Reply not written to stdout: BlockingIOError" in stderr
     assert "Exception ignored" not in stderr
-    replies = _assistant_texts(store, "sess_overflow")
+    replies = _assistant_texts(store, _only_seat(store, "overflow"))
     assert len(replies) == 1 and prompt in replies[0], [len(r) for r in replies]
     reply = f"{replies[0]}\n".encode()
     assert 0 < len(written) < len(reply), (len(written), len(reply))
@@ -2359,9 +2410,9 @@ def test_a_run_s_turn_span_carries_the_session_it_ran_in(
     )
 
     assert result.exit_code == 0, result.output
-    assert _assistant_texts(store, "notes") == ["done"]
+    assert _assistant_texts(store, _seat("notes", "spanned")) == ["done"]
     turn_sessions = [attrs.get("session_id") for _, attrs in exporter.spans if "mode" in attrs]
-    assert turn_sessions == ["notes"]
+    assert turn_sessions == [_seat("notes", "spanned")]
 
 
 def test_an_interactive_turn_s_span_carries_the_session_it_ran_in(
@@ -2387,6 +2438,464 @@ def test_an_interactive_turn_s_span_carries_the_session_it_ran_in(
     )
 
     assert result.exit_code == 0, result.output
-    assert _assistant_texts(store, "notes") == ["done"]
+    assert _assistant_texts(store, _seat("notes", "spanned")) == ["done"]
     turn_spans = [attrs for _, attrs in exporter.spans if attrs.get("mode") == "interactive"]
-    assert [attrs.get("session_id") for attrs in turn_spans] == ["notes"]
+    assert [attrs.get("session_id") for attrs in turn_spans] == [_seat("notes", "spanned")]
+
+
+def test_a_run_is_a_one_seat_room_and_leaves_the_old_session_unresumed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A run without `--session-id` starts a room: a person and the clone, stored (§5.9).
+
+    The clone's session is the seat's (`participant_session_id`), as it would be in the
+    app, and the session the CLI kept before under `sess_<clone>` is neither resumed nor
+    touched (owner ruling 2026-09-27: no migration, no deletion).
+
+    Killed by: src/uclone_x/cli/commands/run.py :: session_id=room.session_id,
+    Becomes: session_id=f"sess_{agent_name}",
+    """
+    from uclone_x.room.models import ParticipantKind
+    from uclone_x.room.one_seat import ONE_SEAT_HUMAN_ID
+    from uclone_x.room.store import RoomStore
+
+    store = _isolated_run_env(monkeypatch, tmp_path)
+    _use_connector(monkeypatch, _answering_llm("fresh"))
+    _seed_session("sess_seated", agent_id="seated")
+    before = store.session_path("sess_seated").read_bytes()
+
+    result = runner.invoke(main.app, ["run", "seated", "--prompt", "hi", "--cwd", str(tmp_path)])
+
+    assert result.exit_code == 0, result.output
+    rooms = RoomStore().list_room_ids()
+    assert len(rooms) == 1, rooms
+    room = RoomStore().load(rooms[0])
+    assert room is not None
+    assert [(p.id, p.kind) for p in room.participants] == [
+        (ONE_SEAT_HUMAN_ID, ParticipantKind.HUMAN),
+        ("seated", ParticipantKind.AGENT),
+    ]
+    assert room.head == "run"  # the app will not post into it (#1885)
+    assert _only_seat(store, "seated") == _seat(rooms[0], "seated")
+    assert _assistant_texts(store, _seat(rooms[0], "seated")) == ["fresh"]
+    assert f"--session-id {rooms[0]} resumes it" in result.stderr
+    assert store.session_path("sess_seated").read_bytes() == before
+
+
+def test_session_id_resumes_the_room_it_names(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`--session-id` is the room's id: a second run with it continues the same seat session.
+
+    Killed by: src/uclone_x/room/one_seat.py :: room_id=room_id if room_id is not None else new_one_seat_room_id(),
+    Becomes: room_id=new_one_seat_room_id(),
+    """
+    from uclone_x.room.store import RoomStore
+
+    store = _isolated_run_env(monkeypatch, tmp_path)
+    _use_connector(monkeypatch, _mock_llm())
+    args = ["run", "resumer", "--session-id", "thread", "--cwd", str(tmp_path)]
+
+    first = runner.invoke(main.app, [*args, "--prompt", "one"])
+    second = runner.invoke(main.app, [*args, "--prompt", "two"])
+
+    assert first.exit_code == 0, first.output
+    assert second.exit_code == 0, second.output
+    assert RoomStore().list_room_ids() == ("thread",)
+    state = store.load(_seat("thread", "resumer"))
+    assert state is not None
+    assert [m.content for m in state.messages if m.role == MessageRole.USER] == ["one", "two"]
+    assert "New conversation" not in first.stderr + second.stderr
+
+
+def test_a_room_that_seats_another_clone_is_refused(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Naming another clone's room exits 2 instead of opening a second seat in it.
+
+    Killed by: src/uclone_x/room/one_seat.py :: if seat is None:
+    Becomes: if False:
+    """
+    store = _isolated_run_env(monkeypatch, tmp_path)
+    _use_connector(monkeypatch, _mock_llm())
+    ran = runner.invoke(
+        main.app,
+        ["run", "owner", "--prompt", "hi", "--session-id", "mine", "--cwd", str(tmp_path)],
+    )
+
+    result = runner.invoke(
+        main.app,
+        ["run", "visitor", "--prompt", "hi", "--session-id", "mine", "--cwd", str(tmp_path)],
+    )
+
+    assert ran.exit_code == 0, ran.output
+    assert result.exit_code == 2, result.output
+    assert "Invalid --session-id:" in result.output
+    assert "does not seat 'visitor'" in " ".join(result.output.split())
+    assert store.load(_seat("mine", "visitor")) is None
+
+
+def test_the_app_opens_a_run_s_room_with_its_turn_in_the_transcript(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The app's GET `/api/rooms/{id}` shows a `ucx run` turn, not a bare roster (#1837).
+
+    Opened the way the app opens it: `create_ui_app` on its default storage, with no
+    `UCLONE_ROOM_DIR`, so the test fails if the CLI writes its rooms anywhere the app
+    does not read them -- which it did, into `~/.uclone/rooms`, until #1837.
+
+    Killed by: src/uclone_x/cli/commands/run.py :: record_in_room(rooms, room_id=room.room_id, clone_id=agent_name, turn=turn, out=out)
+    Becomes: None
+    Killed by: src/uclone_x/room/store.py :: return default_session_root() / ROOMS_SUBDIR
+    Becomes: return Path.home() / ".uclone" / "rooms"
+    """
+    from fastapi.testclient import TestClient
+
+    from uclone_x.room.store import ROOM_STORAGE_DIR_ENV_VAR
+    from uclone_x.ui.app import create_ui_app
+
+    _isolated_run_env(monkeypatch, tmp_path)
+    monkeypatch.delenv(ROOM_STORAGE_DIR_ENV_VAR, raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    _use_connector(monkeypatch, _answering_llm("hello back"))
+
+    result = runner.invoke(
+        main.app, ["run", "shown", "--prompt", "hi", "--session-id", "seen", "--cwd", str(tmp_path)]
+    )
+    assert result.exit_code == 0, result.output
+
+    app = create_ui_app(static_dir=tmp_path, llm=MockLLMConnector())
+    with TestClient(app) as client:
+        listed = client.get("/api/rooms")
+        opened = client.get("/api/rooms/seen")
+
+    assert listed.status_code == 200, listed.text
+    assert "seen" in listed.text
+    assert opened.status_code == 200, opened.text
+    rows = [r for r in opened.json()["transcript"] if r["kind"] == "utterance"]
+    spoken = [(r["sender_id"], r["content"]) for r in rows if r.get("content")]
+    assert spoken[-2:] == [("user", "hi"), ("shown", "hello back")]
+    asked, answered = rows[-2], rows[-1]
+    assert answered["rendered_through"] == asked["seq"]
+    assert opened.json()["last_seen_seq"] == {"shown": str(asked["seq"])}
+
+
+def test_a_run_that_says_nothing_leaves_no_room(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A REPL closed before its first turn stores no room, so it does not list one (#1846).
+
+    Author's choice: a head room is written with its first recorded turn.
+
+    Killed by: src/uclone_x/room/one_seat.py :: return resolve_one_seat_room(
+    Becomes: return open_one_seat_room(
+    """
+    _isolated_run_env(monkeypatch, tmp_path)
+    _use_connector(monkeypatch, _mock_llm())
+    _feed_prompts(monkeypatch, "/exit")
+
+    result = runner.invoke(main.app, ["run", "quiet", "--cwd", str(tmp_path)])
+
+    assert result.exit_code == 0, result.output
+    assert RoomStore().list_room_ids() == ()
+
+
+def test_a_failed_run_turn_is_in_the_room_and_left_unseen(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A failed turn lands in the transcript with its error, and does not advance the seat.
+
+    As a seat's failed turn does in the app: `last_seen_seq` stays, so the next turn's
+    span renders the failure again.
+
+    Killed by: src/uclone_x/room/one_seat.py :: if turn.error is None:
+    Becomes: if True:
+    """
+    _isolated_run_env(monkeypatch, tmp_path)
+    _use_connector(monkeypatch, _raising_llm())
+
+    result = runner.invoke(
+        main.app,
+        ["run", "broken", "--prompt", "hi", "--session-id", "oops", "--cwd", str(tmp_path)],
+    )
+
+    assert result.exit_code != 0
+    state = RoomStore().load("oops")
+    assert state is not None, "a failed turn left no room"
+    reply = state.transcript[-1]
+    assert reply.sender_id == "broken"
+    assert reply.error is not None
+    assert state.transcript[-2].content == "hi"
+    assert "broken" not in state.last_seen_seq
+
+
+def test_a_repl_loop_tick_is_saved_to_the_seat_before_the_room_shows_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A REPL `/loop` tick reaches the seat's session before the room records it (#1837).
+
+    Otherwise a process killed after the room took the tick leaves a room showing a turn
+    that `--session-id` resumes without. The scheduler is replaced so the tick is fired
+    by hand, through the REPL's own callback, while the REPL is still open.
+
+    Killed by: src/uclone_x/cli/commands/run.py :: _persist_tick(agent)
+    Becomes: pass
+    """
+    from datetime import UTC, datetime
+
+    from uclone_x.agent.loop import LoopJob, LoopTickResult
+
+    _isolated_run_env(monkeypatch, tmp_path)
+    _use_connector(monkeypatch, _answering_llm("ticked"))
+    held: dict[str, Any] = {}
+    order: list[str] = []
+
+    class _HandDrivenScheduler:
+        def __init__(self, agent: Any, on_tick_completed: Any, **_kwargs: Any) -> None:
+            held["tick"] = on_tick_completed
+            real_persist = agent.persist_session
+
+            def _persist(*args: Any, **kwargs: Any) -> Any:
+                order.append("persist")
+                return real_persist(*args, **kwargs)
+
+            agent.persist_session = _persist
+
+        def __getattr__(self, name: str) -> Any:
+            return MagicMock()
+
+    real_record = run.record_in_room
+
+    def _spy(*args: Any, **kwargs: Any) -> bool:
+        order.append("record")
+        return real_record(*args, **kwargs)
+
+    now = datetime.now(UTC)
+    job = LoopJob(job_id="j1", interval_seconds=60.0, prompt="tick prompt")
+    tick = LoopTickResult(
+        tick_index=1,
+        started_at=now,
+        finished_at=now,
+        duration_seconds=0.0,
+        success=False,
+        error="The turn failed.",
+    )
+    asks = iter(["/exit"])
+
+    def _ask(*args: Any, **kwargs: Any) -> str:
+        if not order:
+            held["tick"](job, tick)
+        return next(asks)
+
+    monkeypatch.setattr(run, "LoopScheduler", _HandDrivenScheduler)
+    monkeypatch.setattr(run, "record_in_room", _spy)
+    monkeypatch.setattr("rich.prompt.Prompt.ask", _ask)
+    result = runner.invoke(
+        main.app, ["run", "looper", "--session-id", "ticks", "--cwd", str(tmp_path)]
+    )
+    assert result.exit_code == 0, result.output
+
+    assert order[:2] == ["persist", "record"]
+    room = RoomStore().load("ticks")
+    assert room is not None
+    assert [m.content for m in room.transcript if m.kind == "utterance"][:1] == ["tick prompt"]
+
+
+def test_a_room_that_seats_other_clones_too_is_refused(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A room `ucx room` made for two clones is not a head's: `run` exits 2 there.
+
+    Answering in it would write a seat session with no seat framing that the room's
+    transcript never sees.
+
+    Killed by: src/uclone_x/room/one_seat.py :: if not is_one_seat(state.participants):
+    Becomes: if False:
+    """
+    store = _isolated_run_env(monkeypatch, tmp_path)
+    _use_connector(monkeypatch, _mock_llm())
+    rooms = RoomService(RoomStore())
+    rooms.create(title="both", room_id="room_multi")
+    rooms.add_participant("room_multi", "user", kind=ParticipantKind.HUMAN)
+    rooms.add_participant("room_multi", "writer", kind=ParticipantKind.AGENT)
+    rooms.add_participant("room_multi", "champion", kind=ParticipantKind.AGENT)
+
+    result = runner.invoke(
+        main.app,
+        ["run", "writer", "--prompt", "x", "--session-id", "room_multi", "--cwd", str(tmp_path)],
+    )
+
+    assert result.exit_code == 2, result.output
+    assert "Invalid --session-id:" in result.output
+    assert "seats other clones besides 'writer'" in " ".join(result.output.split())
+    assert "Traceback" not in result.output
+    assert store.load(_seat("room_multi", "writer")) is None
+
+
+@pytest.mark.parametrize(
+    ("head", "keeper"), [(None, "belongs to the app"), ("loop", "belongs to ucx loop")]
+)
+def test_a_room_another_writer_keeps_is_refused_plainly(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, head: str | None, keeper: str
+) -> None:
+    """A room has one owner: `run` does not continue the app's room or another head's (#1885).
+
+    Continuing it would make `run` a second writer beside the app or `ucx loop`, each
+    reading rows and a seat session the other wrote. The refusal says where to go instead.
+
+    Killed by: src/uclone_x/room/one_seat.py :: keeper = "the app" if state.head is None else head_keeper(state.head)
+    Becomes: keeper = head_keeper(state.head or "")
+    Killed by: src/uclone_x/room/one_seat.py :: if state.head != head and not _unmarked_server_room(state, room_id, head):
+    Becomes: if state.head is not None and state.head != head:
+    """
+    store = _isolated_run_env(monkeypatch, tmp_path)
+    _use_connector(monkeypatch, _mock_llm())
+    rooms = RoomService(RoomStore())
+    before = rooms.create(
+        title="elsewhere",
+        room_id="room_elsewhere",
+        head=head,
+        seats=[("user", ParticipantKind.HUMAN), ("writer", ParticipantKind.AGENT)],
+    )
+
+    result = runner.invoke(
+        main.app,
+        [
+            "run",
+            "writer",
+            "--prompt",
+            "x",
+            "--session-id",
+            "room_elsewhere",
+            "--cwd",
+            str(tmp_path),
+        ],
+    )
+
+    said = " ".join(result.output.split())
+    assert result.exit_code == 2, result.output
+    assert "Invalid --session-id:" in said
+    assert keeper in said
+    assert "leave the id out to start a new one" in said
+    assert "Traceback" not in result.output
+    assert store.load(_seat("room_elsewhere", "writer")) is None
+    assert rooms.get("room_elsewhere") == before
+
+
+def test_a_run_says_on_stderr_that_it_kept_a_record_it_could_not_open(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A `--session-id` run over a newer build's record says it kept that record (#1860).
+
+    Before #1860 only a room's row said so; `ucx run` set the record aside in silence.
+    The line goes to stderr, so stdout still carries the reply alone.
+
+    Killed by: src/uclone_x/cli/commands/run.py :: set_aside = report_set_aside(session_store, turn_session, err_console)
+    Becomes: set_aside = False
+    """
+    store = _isolated_run_env(monkeypatch, tmp_path)
+    _use_connector(monkeypatch, _answering_llm("the reply"))
+    seat = _seat("kept", "keeper")
+    document = json.loads(SessionState.seed(seat, "keeper").model_dump_json())
+    document["a_field_from_a_newer_build"] = True
+    path = store.session_path(seat)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+    result = runner.invoke(
+        main.app,
+        ["run", "keeper", "--prompt", "hello", "--session-id", "kept", "--cwd", str(tmp_path)],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert run.SESSION_SET_ASIDE_NOTICE in " ".join(result.stderr.split())
+    assert run.SESSION_SET_ASIDE_NOTICE not in " ".join(result.stdout.split())
+    assert "the reply" in result.stdout
+    assert [p.name for p in path.parent.iterdir() if ".unreadable-" in p.name], "nothing set aside"
+
+
+def test_a_runs_room_row_says_it_kept_a_record_so_the_app_says_so_too(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The clone's row in the run's room carries the flag the app shows a notice for (#1877).
+
+    Killed by: src/uclone_x/cli/commands/run.py :: _record(replace(head_turn, session_set_aside=set_aside), err_console)
+    Becomes: _record(head_turn, err_console)
+    Killed by: src/uclone_x/room/one_seat.py :: session_set_aside=turn.session_set_aside,
+    Becomes: session_set_aside=False,
+    """
+    store = _isolated_run_env(monkeypatch, tmp_path)
+    _use_connector(monkeypatch, _answering_llm("the reply"))
+    _a_newer_builds_seat_record(store, _seat("kept", "keeper"), "keeper")
+
+    for _ in range(2):
+        result = runner.invoke(
+            main.app,
+            ["run", "keeper", "--prompt", "hello", "--session-id", "kept", "--cwd", str(tmp_path)],
+        )
+        assert result.exit_code == 0, result.output
+
+    room = RoomStore().load("kept")
+    assert room is not None
+    said = [
+        row.session_set_aside
+        for row in room.transcript
+        if row.sender_id == "keeper" and row.kind == "utterance"
+    ]
+    assert said == [True, False]  # once, on the turn whose save kept it
+
+
+def _a_newer_builds_seat_record(store: SessionStore, seat: str, agent: str) -> Path:
+    document = json.loads(SessionState.seed(seat, agent).model_dump_json())
+    document["a_field_from_a_newer_build"] = True
+    path = store.session_path(seat)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(document), encoding="utf-8")
+    return path
+
+
+def test_the_repl_says_it_kept_a_record_right_after_the_turn_that_saved(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The line follows the first turn's save, before the next turn, not only on the way out.
+
+    Killed by: src/uclone_x/cli/commands/run.py :: turn_set_aside = report_set_aside(session_store, agent.session_id, console)
+    Becomes: turn_set_aside = False
+    """
+    store = _isolated_run_env(monkeypatch, tmp_path)
+    _use_connector(monkeypatch, _answering_llm("the reply"))
+    _a_newer_builds_seat_record(store, _seat("kept", "keeper"), "keeper")
+    _feed_prompts(monkeypatch, "hello", "again", "/exit")
+
+    result = runner.invoke(
+        main.app, ["run", "keeper", "--session-id", "kept", "--cwd", str(tmp_path)]
+    )
+
+    assert result.exit_code == 0, result.output
+    out = " ".join(result.stdout.split())
+    notice = out.find(run.SESSION_SET_ASIDE_NOTICE)
+    first = out.find("keeper: the reply")
+    second = out.find("keeper: the reply", first + 1)
+    assert 0 <= first < notice < second, out
+
+
+def test_the_repl_says_it_kept_a_record_when_it_exits_before_any_turn(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """No turn ran, but the save on the way out set the record aside: that is said too.
+
+    Killed by: src/uclone_x/cli/commands/run.py :: report_set_aside(session_store, agent.session_id, console)  # the save on the way out
+    Becomes: pass
+    """
+    store = _isolated_run_env(monkeypatch, tmp_path)
+    _use_connector(monkeypatch, _answering_llm("the reply"))
+    path = _a_newer_builds_seat_record(store, _seat("kept", "keeper"), "keeper")
+    _feed_prompts(monkeypatch, "/exit")
+
+    result = runner.invoke(
+        main.app, ["run", "keeper", "--session-id", "kept", "--cwd", str(tmp_path)]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert [p for p in path.parent.iterdir() if ".unreadable-" in p.name], "nothing set aside"
+    assert run.SESSION_SET_ASIDE_NOTICE in " ".join(result.stdout.split())

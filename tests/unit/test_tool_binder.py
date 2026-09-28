@@ -375,7 +375,7 @@ async def test_a_range_with_no_base_tool_pins_only_the_search() -> None:
 def _compact_on_check(agent: BaseAgent, monkeypatch: pytest.MonkeyPatch, which: int) -> list[str]:
     """Make the `which`-th compaction check of the session say yes, and only that one.
 
-    A turn checks at its start, and again after each step that ran tools.
+    A turn checks at its start only (§5.8, #1443).
     """
     checks: list[str] = []
 
@@ -388,52 +388,32 @@ def _compact_on_check(agent: BaseAgent, monkeypatch: pytest.MonkeyPatch, which: 
 
 
 @pytest.mark.asyncio
-async def test_a_compaction_between_steps_keeps_what_the_turn_bound(
+async def test_a_turn_that_ran_tools_is_checked_for_compaction_only_at_its_start(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The rest of the turn still sends `alpha_image`, so the next turn keeps it too.
+    """No compaction runs between two steps (§5.8, #1443), so a bound set is never
+    re-seeded mid-turn: the only check a turn makes is at its start.
 
-    Killed by: src/uclone_x/agent/compaction_driver.py :: self._tool_invoker.reseed_bound_tools(live, tools, pinned=pinned)
-    Becomes: pass
+    Before #1443 the step after `alpha_image` ran was checked too, and a compaction there
+    had to carry the turn's bound set over (#1422).
+
+    Killed by: src/uclone_x/agent/turn_executor.py :: compaction = await self._auto_compact_if_needed(tool_defs, turn_extra_sections)
+    Becomes: compaction = None
     """
     embedder = _FakeEmbedder(
         {"draw it": _toward({"alpha_image": 0.9}), "now mail it": _toward({"beta_mail": 0.9})}
     )
     wire = _Scripted([_call("alpha_image"), "one", "two"])
     agent = _agent(wire, ToolBinder(embedder), [])
-    checks = _compact_on_check(agent, monkeypatch, 2)
+    checks = _compact_on_check(agent, monkeypatch, 0)
 
     await agent.execute_turn("draw it")
     await agent.execute_turn("now mail it")
 
-    assert len(checks) == 3, "expected a check at each turn start and one between steps"
-    first, _, last = (_names(r) for r in wire.requests if r.tools)
-    assert first == ["file_read", "search_tools", "alpha_image"]
+    assert len(checks) == 2, "expected one check at each turn start and none between steps"
+    first, second, last = (_names(r) for r in wire.requests if r.tools)
+    assert first == second == ["file_read", "search_tools", "alpha_image"]
     assert last == [*first, "beta_mail"]
-
-
-@pytest.mark.asyncio
-async def test_a_compaction_between_steps_keeps_a_pinned_session_pinned(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Killed by: src/uclone_x/agent/tool_invoker.py :: live.tools_pin_all = pinned
-    Becomes: live.tools_pin_all = False
-    """
-    embedder = _FakeEmbedder({"now mail it": _toward({"beta_mail": 0.9})})
-    embedder.fail = True
-    wire = _Scripted([_call("alpha_image"), "one", "two"])
-    agent = _agent(wire, ToolBinder(embedder), [])
-    _compact_on_check(agent, monkeypatch, 2)
-
-    await agent.execute_turn("draw it")
-    embedder.fail = False
-    await agent.execute_turn("now mail it")
-
-    everything = sorted(["file_read", *_AXES])
-    assert [sorted(_names(r)) for r in wire.requests if r.tools] == [everything] * 3
-    # Still pinned, not re-bound. The re-seeded set alone would hide this: it holds the
-    # whole catalog.
-    assert embedder.query_calls == 0
 
 
 @pytest.mark.asyncio

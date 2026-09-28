@@ -27,11 +27,11 @@ __all__ = ["SHIPPED_SKILL_PINS"]
 #: Skill name -> the digest `compute_skill_sha256` gives its approved package.
 SHIPPED_SKILL_PINS: Final[Mapping[str, str]] = MappingProxyType(
     {
-        "avatar": "ae8503461fd0d2eec70b605723369395ba2551bf48079dfe21a672a668a69b70",
-        "character-consistency": "8e25a4c8b94cb003e199e486e3e4e5a09d3e3e12f944794e8bda2f1a43666a4b",
-        "media-architecture": "18b43d798492e1e2dfe957e6ea450c5cc2b04fb724197d543245d8f1c3df0cb6",
-        "media-character": "1e9c5abac180f0a2af498c79e1d7026c2b85b57f48b9feef52ce61ec1f8310ea",
-        "media-engineering": "054e8ac12a1fc610c49696e4fcf7468b7c2d03cee370486c33595c51a7caa836",
+        "avatar": "32610294684963ee70a259549aeba6ac37e5f3046104aae8f388e943d4555fb2",
+        "character-consistency": "40921a01394d5c69b7fa72a8a6a44928971f22a48bcaa06aabbfae904c43b595",
+        "media-architecture": "f256d0a10ea619fbe4bce794d5f084c89168b64feb327521cfc5aeeb642bba3a",
+        "media-character": "8bd8c0f04009569343c4c0e22b88ea2b6f51b05365c1da77625e0aed3f012087",
+        "media-engineering": "91225f24df306133e22824d52c5f726c25a253d5744317be54c1a623d12893eb",
         "remote_gpu_recovery": "c1f598b77d47981aee14d7961973135f5e5e6069bfd34bc3f599c8d5ef3b5044",
     }
 )

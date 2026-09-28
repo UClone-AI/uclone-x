@@ -107,7 +107,7 @@ answer.
 | :--- | :--- | :--- | :--- | :--- |
 | `initialize` | capability negotiation; `AgentCard` is the A2A analogue, not a substitute | Yes | **Yes** | Reports real capabilities (§3.3) |
 | `new_session` | A per-session agent (`agent_config_for_persona` + `compose_agent`) + `BaseAgent.persist_session` | Yes | **Yes** | Rejects `AcpMcpServer` per §5. Each session gets its own agent, so no session's history reaches another's request (#1454) |
-| `load_session` | `SessionStore.load` + `BaseAgent.hydrate_session` | Yes | **Yes** | The saved history is restored into the session's own agent (#1454) |
+| `load_session` | `SessionStore.load` + `BaseAgent.hydrate_session` | Yes | **Yes** | The saved history is restored into the session's own agent (#1454). Since #1830 an ACP session is a one-seat room: it is saved as that room's seat session, not under the ACP id, so a session saved under the raw ACP id before #1830 answers "Session not found". A room another clone has joined is not opened |
 | `list_sessions` | `SessionStore.list_session_ids` | Yes | **No** | Ours returns ids only; ACP's response and its `cursor` pagination need more. §3.4 |
 | `fork_session` | *(none)* | Yes | **No** | Needs a copy-with-new-id; `SessionStore` has no fork |
 | `resume_session` | `SessionStore.load` | Yes | **No** | Distinct from `load_session` in ACP; the difference must be honoured, not collapsed |

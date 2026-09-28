@@ -4,10 +4,11 @@ The protocol states the obligation — for two distinct participants, return age
 no session and no ontology — and an obligation stated on an interface is discharged by
 whoever implements it. This is the implementation the room ships with, and it discharges
 it *structurally*: an agent is built against the ids already stamped on its `Participant`
-by `RoomService`, and a session id — or an ontology namespace — that two participants
-somehow share is refused here rather than colliding later inside `SessionStore.save`, where
-the error names a revision precondition and not the roster edit that caused it, or inside a
-knowledge graph, where nothing names it at all.
+by `RoomService`, and a session id that two participants somehow share is refused here
+rather than colliding later inside `SessionStore.save`, where the error names a revision
+precondition and not the roster edit that caused it. The ontology half is the clone's: a
+seat's rules engine is its clone's one engine (`AppScope.ontology_for`, keyed by clone id),
+so two clones never share one and no seat has one of its own (clone-knowledge-graph step 6).
 
 Lives in the Core, not in the CLI. Composing an agent from a participant is the room's
 business logic; `ucx room say` is the shell over it (P8).
@@ -22,22 +23,19 @@ from typing import TYPE_CHECKING
 
 from uclone_x.agent.base import BaseAgent
 from uclone_x.agent.clone_builder import (
-    APP_ONTOLOGY,
     AppScope,
     GlobalModels,
-    OntologyChoice,
     build_clone,
     follow_global_models,
 )
 from uclone_x.agent.composition import HostDependencies
-from uclone_x.agent.models import AgentLLMConfig
+from uclone_x.agent.models import AgentLLMConfig, PersonaDefinition
 from uclone_x.agent.persona_registry import PersonaRegistry, get_default_persona_registry
 from uclone_x.agent.protocols import BaseAgentProtocol
-from uclone_x.errors import ParticipantNotResolvableError, SeatKnowledgeUnreadableError
+from uclone_x.errors import ParticipantNotResolvableError
 from uclone_x.llm.protocols import LLMProviderProtocol
 from uclone_x.memory.store import CrossSessionMemory
 from uclone_x.ontology.protocols import OntologyEngineProtocol
-from uclone_x.room.knowledge import KnowledgeLoad, SeatKnowledgeProtocol
 from uclone_x.room.models import Participant, ParticipantKind
 
 if TYPE_CHECKING:
@@ -85,24 +83,21 @@ class RoomAgentResolver:
 
     _app: AppScope
     _a2a_transport: A2ATransportProtocol | None
-    _ontology_factory: Callable[[str], OntologyEngineProtocol] | None
-    _knowledge: SeatKnowledgeProtocol | None
     _agents: dict[str, BaseAgentProtocol]
     _follows: dict[str, tuple[bool, bool]]
     _sessions: dict[str, str]
-    _namespaces: dict[str, str]
+    _edited_personas: dict[str, tuple[PersonaDefinition, PersonaDefinition | None]]
 
     def __init__(
         self,
         host: AppScope | HostDependencies,
         *,
         llm_config: AgentLLMConfig | None = None,
-        ontology_factory: Callable[[str], OntologyEngineProtocol] | None = None,
+        ontology_for: Callable[[str], OntologyEngineProtocol] | None = None,
         memory_factory: Callable[[str], CrossSessionMemory] | None = None,
         persona_registry: PersonaRegistry | None = None,
         workspace_root: Path | None = None,
         read_roots: Callable[[], tuple[Path, ...]] | None = None,
-        knowledge: SeatKnowledgeProtocol | None = None,
         global_models: GlobalModels | None = None,
         a2a_transport: A2ATransportProtocol | None = None,
     ) -> None:
@@ -118,6 +113,7 @@ class RoomAgentResolver:
                 for name, value in (
                     ("llm_config", llm_config),
                     ("memory_factory", memory_factory),
+                    ("ontology_for", ontology_for),
                     ("persona_registry", persona_registry),
                     ("workspace_root", workspace_root),
                     ("read_roots", read_roots),
@@ -129,6 +125,13 @@ class RoomAgentResolver:
                 raise TypeError(f"{given} belong to the AppScope, not to the resolver")
             self._app = host
         else:
+            if host.ontology is not None:
+                # Every seat would be handed that one engine: the shared engine step 6
+                # retired. A clone's engine is its own, looked up by its id.
+                raise TypeError(
+                    "A host carrying an ontology would give every seat one shared engine; "
+                    "pass `ontology_for`, which gives each clone its own"
+                )
             root = (
                 workspace_root.resolve()
                 if workspace_root is not None
@@ -147,11 +150,13 @@ class RoomAgentResolver:
                     else get_default_persona_registry(root)
                 ),
                 #: participant id -> that participant's own cross-session memory store.
-                #: Per participant and not per room, the same shape as `ontology_factory`:
+                #: Per participant and not per room, the same shape as `ontology_for`:
                 #: one store behind two seats makes one agent's recollection readable as
                 #: another's. Given none, room agents are composed with no memory at all --
                 #: which since #1098 means the tools are neither resolved nor advertised.
                 memory_for=memory_factory,
+                #: clone id -> that clone's one rules engine, the same shape as memory.
+                ontology_for=ontology_for,
                 global_models=global_models,
                 read_roots=read_roots or (lambda: ()),
                 llm_override=llm_config,
@@ -159,12 +164,6 @@ class RoomAgentResolver:
         #: The room's transport, handed to every seat so a seat reaches the personas the
         #: room answers (#1558). Room scope, not app scope: a chat clone has none of it.
         self._a2a_transport = a2a_transport
-        #: Where each seat's knowledge was saved after its turns (#1367). Loaded into the
-        #: engine `ontology_factory` builds, before the seat's first turn, so a seat resumed
-        #: after a restart continues from what it knew rather than from an empty graph --
-        #: the knowledge half of what `hydrate_session` does for the session.
-        self._knowledge = knowledge
-        self._ontology_factory = ontology_factory
         #: session id -> the live agent built against it. Keyed by the *session* and not
         #: by the participant id, because an id is unique within one room and this cache
         #: is not: `scout` in two rooms is two participants with two derived sessions, and
@@ -179,11 +178,10 @@ class RoomAgentResolver:
         #: session id -> the participant id it was issued to. The check that turns the
         #: protocol's isolation obligation into a refusal.
         self._sessions: dict[str, str] = {}
-        #: ontology namespace -> the participant id it was issued to. The same check for
-        #: the other half of the obligation: G4 is a property of the *namespace*, not of
-        #: the engine object, so two engines built over one IRI still merge the concepts
-        #: P7 keeps apart and `is not` proves nothing about them.
-        self._namespaces: dict[str, str] = {}
+        #: persona name -> (its definition as last saved while this resolver was open,
+        #: what this resolver's registry gave for it then). A seat built later takes the
+        #: saved one only while the registry still gives what it gave at the save (#1904).
+        self._edited_personas: dict[str, tuple[PersonaDefinition, PersonaDefinition | None]] = {}
 
     @property
     def host(self) -> HostDependencies:
@@ -213,17 +211,19 @@ class RoomAgentResolver:
     def read_roots(self) -> Callable[[], tuple[Path, ...]]:
         return self._app.read_roots
 
-    async def resolve(self, participant: Participant) -> BaseAgentProtocol:
+    async def resolve(
+        self, participant: Participant, *, one_seat: bool = False
+    ) -> BaseAgentProtocol:
         """Return the live agent for `participant`, constructing it on first use.
+
+        `one_seat` drops the multi-agent seat framing (§5.9.3): a clone alone with its
+        people is framed as a 1:1 chat is. A built agent whose roster crossed between one
+        clone and two is re-framed here, before its next turn.
 
         Raises:
             ParticipantNotResolvableError: The participant is a human (which has no agent
-                behind it), carries no session id, carries a session id or an ontology
-                namespace already issued to a different participant, or carries a namespace
-                this resolver cannot honour because it has no ontology factory and the host
-                would hand every agent its one shared engine.
-            SeatKnowledgeUnreadableError: The seat's saved knowledge is there and cannot be
-                read (a `ParticipantNotResolvableError`).
+                behind it), carries no session id, or carries a session id already issued
+                to a different participant.
         """
         if participant.kind is not ParticipantKind.AGENT:
             raise ParticipantNotResolvableError(
@@ -248,58 +248,18 @@ class RoomAgentResolver:
         # the cache is keyed *by* is a single decision rather than two lines that have to
         # keep agreeing.
         cache_key = participant.session_id
+        framing = "" if one_seat else room_participant_system_prompt(participant)
         cached = self._agents.get(cache_key)
         if cached is not None:
             if isinstance(cached, BaseAgent):
                 cached.set_read_roots(self._app.read_roots())
+                cached.set_seat_framing(framing)
             return cached
 
-        ontology: OntologyChoice = APP_ONTOLOGY
-        if participant.ontology_namespace:
-            namespace_owner = self._namespaces.get(participant.ontology_namespace)
-            if namespace_owner is not None and namespace_owner != participant.id:
-                raise ParticipantNotResolvableError(
-                    f"Participants {namespace_owner!r} and {participant.id!r} both claim "
-                    f"ontology namespace {participant.ontology_namespace!r}. One namespace "
-                    f"for two agents merges what each induced from its own experience, "
-                    f"which is the per-agent grounding P7 requires and not a room feature."
-                )
-            if self._ontology_factory is None and self._app.host.ontology is not None:
-                raise ParticipantNotResolvableError(
-                    f"Participant {participant.id!r} carries ontology namespace "
-                    f"{participant.ontology_namespace!r}, but this resolver was built with "
-                    f"no ontology factory and the host already carries an engine. Every "
-                    f"participant would be handed that one engine and induce into one "
-                    f"graph — the merge the per-participant namespace exists to prevent. "
-                    f"Give the resolver an `ontology_factory`, or a host without an "
-                    f"ontology if the room's agents are to run without one."
-                )
-            if self._ontology_factory is not None:
-                engine = self._ontology_factory(participant.ontology_namespace)
-                if self._knowledge is not None:
-                    try:
-                        loaded = self._knowledge.load_into(participant.session_id, engine)
-                    except SeatKnowledgeUnreadableError as exc:
-                        # Unreadable and not set aside: refused rather than built over an
-                        # empty engine, which would be saved over the record after the turn.
-                        # The message is shown in the conversation, so it names the clone
-                        # and nothing else; the path and cause stay on the exception.
-                        raise SeatKnowledgeUnreadableError(
-                            f"{participant.display_name}'s knowledge record for this "
-                            f"conversation could not be read, and could not be set aside.",
-                            path=exc.path,
-                            cause=exc.cause,
-                        ) from exc
-                    if loaded is KnowledgeLoad.SET_ASIDE:
-                        # The record is kept under another name; the engine it failed in may
-                        # hold part of it, and the seat starts over from nothing instead.
-                        fresh = self._ontology_factory
-                        engine = fresh(participant.ontology_namespace)
-                ontology = engine
-
         # Everything else is built as a 1:1 chat builds it (owner ruling 2026-09-27): the
-        # room adds only what a room has -- the seat's framing, its display name, its own
-        # knowledge engine and the room's transport. The framing goes to the agent as its
+        # room adds only what a room has -- the seat's framing (none in a one-seat room,
+        # §5.9.3), its display name and the room's transport. Its rules engine, like its
+        # memory, is its clone's own. The framing goes to the agent as its
         # own field and the agent composes the prompt (`compose_identity_prompt`).
         built = build_clone(
             self._app,
@@ -307,12 +267,13 @@ class RoomAgentResolver:
             session_id=participant.session_id,
             persona=participant.persona,
             display_name=participant.display_name or participant.id,
-            seat_framing=room_participant_system_prompt(participant),
-            ontology=ontology,
+            seat_framing=framing,
             a2a_transport=self._a2a_transport,
         )
         agent = built.agent
         follows = built.follows
+        # A seat built from a registry read before the edit still takes it.
+        self._take_persona_edit(agent)
         # Resume before the first turn: the room outlives the process that drives it, so an
         # agent that did not hydrate would answer a continuing conversation from a blank
         # history and then persist that over the record.
@@ -321,8 +282,6 @@ class RoomAgentResolver:
         self._agents[cache_key] = agent
         self._follows[cache_key] = follows
         self._sessions[participant.session_id] = participant.id
-        if participant.ontology_namespace:
-            self._namespaces[participant.ontology_namespace] = participant.id
         return agent
 
     def replace_llm(self, llm: LLMProviderProtocol | None) -> None:
@@ -348,6 +307,57 @@ class RoomAgentResolver:
                     model_name=deep if deep_follows else None,
                     fast_model=(fast or deep) if fast_follows else None,
                 )
+
+    def persona_edited(self, persona: PersonaDefinition) -> int:
+        """Hold `persona` as saved; return how many built seats speak as it.
+
+        Nothing is changed on a live agent here, nor at `resolve`: a seat may be in the
+        middle of a turn, and compaction resolves a seat while another seat's turn runs
+        (#1899 review). Each built seat speaking as `persona` is handed the edit to hold
+        (`BaseAgent.stage_persona_edit`), and takes it at its own next turn start, under
+        its turn lock, where the turn opens a `persona_edited` epoch for it.
+        """
+        self._edited_personas[persona.name] = (
+            persona,
+            self._app.persona_registry.get_persona(persona.name),
+        )
+        seats = [
+            agent
+            for agent in self._agents.values()
+            if isinstance(agent, BaseAgent) and agent.persona == persona.name
+        ]
+        for agent in seats:
+            agent.stage_persona_edit(persona)
+        return len(seats)
+
+    def _take_persona_edit(self, agent: BaseAgent) -> None:
+        """Put the last saved definition of a *newly built* seat's persona in force.
+
+        The seat was built from a registry read before the edit, and has run no turn, so
+        there is no turn to interrupt and no epoch to mark. `define_persona` recomputes the
+        tool scope; the prompt is composed from the definition on every turn. What is fixed
+        at construction -- the persona's model -- follows the definition the build read.
+
+        The held copy is used only while this resolver's registry still gives what it gave
+        when the edit was saved, i.e. while the registry lags the save. Once the registry
+        gives something else, it changed after the save by some other path, and the build
+        already read that newer definition: the held copy is dropped rather than put over
+        it (#1904).
+        """
+        name = agent.persona
+        held = self._edited_personas.get(name) if name else None
+        if held is None:
+            return
+        edited, registry_at_save = held
+        if self._app.persona_registry.get_persona(edited.name) != registry_at_save:
+            del self._edited_personas[edited.name]
+            return
+        if agent.persona_definition != edited:
+            agent.define_persona(edited)
+
+    def live_agents(self) -> tuple[BaseAgent, ...]:
+        """Every seat agent this resolver has built and still holds, for the health reads."""
+        return tuple(agent for agent in self._agents.values() if isinstance(agent, BaseAgent))
 
     def seated_agent_ids(self) -> frozenset[str]:
         """The ids of the agents this resolver has built and still holds.

@@ -749,6 +749,17 @@ cheaper than C.
 
 ### D2 — May autonomously synthesized skills ever auto-approve?
 
+> [!IMPORTANT]
+> **Decided 2026-09-27 by the project owner: a skill an agent or an LLM wrote never
+> auto-approves.** A synthesized skill becomes active only when a person runs
+> `./ucx skill approve`, which also pins its digest outside the package
+> ([`skill-system-architecture.md`](skill-system-architecture.md) §7.2).
+> `ucx skill synthesize --auto-approve` was removed in #1824 (PR #1832). This is option C for
+> synthesized skills. Recommendation D (a session-scoped skill that activates at once) was
+> not adopted. The text of P9 and PRD FR-5.4 was not changed by this ruling.
+>
+> The options and the recommendation below are kept as the record of what was weighed.
+
 The status quo is P9 and FR-5.4: three policies, `safe_only` as the default. Narrowing
 this is also **Tier A** (it removes a configurable behaviour the principle grants).
 

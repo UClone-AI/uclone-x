@@ -145,11 +145,13 @@ class BaseAgentProtocol(Protocol):
         caller_turn_id: str | None = None,
         room_id: str | None = None,
         story_id: str | None = None,
+        person_names: tuple[str, ...] = (),
     ) -> TurnResult:
         """Execute a single reasoning turn.
 
         `room_id` and `story_id` name the conversation (room) the turn runs in and the
-        story it has open, for the turn's tool calls (#1555).
+        story it has open, for the turn's tool calls (#1555). `person_names` are the
+        names the room's person goes by, for the same calls (#1857).
 
         The `dict[str, Any]` arm is gone: the turn entry point accepted an arbitrary
         untyped payload, which is the contract shape P8 forbids (issue 2026-09-02-036).

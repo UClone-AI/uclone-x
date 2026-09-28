@@ -1882,7 +1882,7 @@ async def test_an_unanswered_prompt_from_another_sender_is_not_a_repeat_of_it() 
     A failed turn leaves its prompt at the end of history, and an identical re-send is not
     appended again -- that is what stops a retry showing the model the same question twice.
     The rule is the *sender's* prompt, not the words: `name` is what tells two senders apart
-    in a transcript that names them, and `reconstruct_history` sets it from a stored prompt.
+    in a transcript that names them.
     Without the clause, a head that names its users would silently lose one user's message
     whenever it repeated another's unanswered words.
 
@@ -2162,8 +2162,8 @@ async def test_a_persona_set_after_construction_changes_the_system_message_actua
     written back.
 
     Killed by: src/uclone_x/agent/base.py ::
-        return session.anchor_provenance != self._resolved_persona()
-    Becomes: return False
+        if session.anchor_provenance != self._resolved_persona():
+    Becomes: if False:
     """
     wire = _RecordingConnector(["Before", "After"])
     agent = BaseAgent(
@@ -2774,7 +2774,7 @@ async def test_a_definition_for_the_persona_in_force_restricts_tools_as_well_as_
     refused when it calls that tool directly. Asserting the prompt alone could not see
     this, because the prompt was already right.
 
-    Killed by: src/uclone_x/agent/base.py :: self._apply_persona_tool_scope()  # a registration can move the persona in force
+    Killed by: src/uclone_x/agent/base.py :: self._config = config  # the tool scope, recomputed for the registration
     Becomes:
     """
     registry = ToolRegistry()
@@ -2819,7 +2819,7 @@ async def test_a_definition_recomputes_the_tool_scope_by_the_setters_rule() -> N
       keeping the old definition's, or adding the two together;
     * registering a name that is not in force leaves the scope as it was.
 
-    Killed by: src/uclone_x/agent/base.py :: self._apply_persona_tool_scope()  # a registration can move the persona in force
+    Killed by: src/uclone_x/agent/base.py :: self._config = config  # the tool scope, recomputed for the registration
     Becomes:
     """
     operator_scoped = _agent_with_both_tools(

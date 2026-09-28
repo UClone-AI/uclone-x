@@ -11,7 +11,7 @@ import json
 import time
 from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, get_args
 
 import pytest
 from pydantic import BaseModel, Field
@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field
 from uclone_x.agent.base import BaseAgent
 from uclone_x.agent.models import AgentConfig, AgentContext, AgentLLMConfig
 from uclone_x.agent.request_record import (
+    RecordErrorCode,
     RequestRecordError,
     rebuild_requests,
 )
@@ -29,13 +30,20 @@ from uclone_x.agent.session import (
     content_digest,
 )
 from uclone_x.agent.turn_trace import (
+    NO_CONTEXT_STATE,
+    NO_EPOCH_FOR_REQUEST,
     NO_REQUEST_RECORDED,
+    NO_RESPONSE_RECORDED,
     SUBAGENT_UNREADABLE,
+    FromLogCode,
+    RequestReasonCode,
+    ResponseReasonCode,
     StepNotFoundError,
     TurnNotLinkedError,
     trace_step,
     trace_turn,
 )
+from uclone_x.core.context_state import ContextEpoch
 from uclone_x.core.provenance import ExecutionPath, Provenance, ServiceRef
 from uclone_x.llm.connectors.base import BaseLLMConnector
 from uclone_x.llm.models import (
@@ -728,6 +736,101 @@ async def test_a_gap_makes_only_the_requests_built_on_it_unavailable(tmp_path: P
     assert [s.verified for s in trace.steps] == [True]
 
 
+@pytest.mark.asyncio
+async def test_an_unavailable_request_or_response_carries_a_code_for_its_kind(
+    tmp_path: Path,
+) -> None:
+    """#1907: each unavailable half says what kind of gap it is, as a code the UI words.
+
+    The English reason is still sent beside it, as the detail and the fallback.
+
+    Killed by: src/uclone_x/agent/turn_trace.py :: "request_code": rebuild_err.code if rebuild_err is not None else "not_recorded",
+    Becomes: "request_code": None,
+    Killed by: src/uclone_x/agent/turn_trace.py :: response_code="not_recorded" if resp is None else None,
+    Becomes: response_code=None,
+    Killed by: src/uclone_x/agent/turn_trace.py :: request_code = step_errors[step].code
+    Becomes: request_code = None
+    Killed by: src/uclone_x/agent/turn_trace.py :: response_code=None if resp_event is not None else "not_recorded",
+    Becomes: response_code=None,
+    Killed by: src/uclone_x/agent/request_record.py :: code="before_capture",
+    Becomes: code="unreadable",
+    """
+    store, _ = await _restarted_log(tmp_path)
+    state = store.load(_SID)
+    assert state is not None
+    events = _events(store)
+
+    old = trace_turn(store, state, events, caller_turn_id="t1").steps[0]
+    assert (old.request_code, old.request_reason) == (
+        "before_capture",
+        "request recorded before request capture (#1421)",
+    )
+    assert old.response_code is None
+    step = trace_step(store, state, events, caller_turn_id="t1", step=1)
+    assert step.request_code == "before_capture"
+
+    kept = trace_turn(store, state, events, caller_turn_id="t2").steps[0]
+    assert (kept.request_code, kept.response_code) == (None, None)
+
+    unrecorded = _without(events, {"type": "REQUEST_CONTEXT", "request": 2})
+    unrecorded = _without(unrecorded, {"type": "MODEL_RESPONSE", "content": "two"})
+    missing = trace_turn(store, state, unrecorded, caller_turn_id="t2").steps[1]
+    assert (missing.request_code, missing.request_reason) == ("not_recorded", NO_REQUEST_RECORDED)
+    assert (missing.response_code, missing.response_reason) == (
+        "not_recorded",
+        NO_RESPONSE_RECORDED,
+    )
+    detail = trace_step(store, state, unrecorded, caller_turn_id="t2", step=2)
+    assert (detail.request_code, detail.response_code) == ("not_recorded", "not_recorded")
+
+
+@pytest.mark.asyncio
+async def test_a_gap_in_the_chain_is_coded_as_a_broken_chain(tmp_path: Path) -> None:
+    """#1907: the code names the kind of gap; the detail keeps the request numbers.
+
+    Killed by: src/uclone_x/agent/request_record.py :: code="chain_broken",
+    Becomes: code="body_missing",
+    """
+    store = SessionStore(storage_dir=tmp_path / "sessions")
+    await _turns(store, _Script(["one", "two"]), "first", "second")
+    state = store.load(_SID)
+    assert state is not None
+    gap = _without(_events(store), {"type": "REQUEST_CONTEXT", "request": 1})
+    step = trace_turn(store, state, gap, caller_turn_id="t2").steps[0]
+    assert (step.request_code, step.request_reason) == (
+        "chain_broken",
+        "request 2 extends 1, last seen None",
+    )
+
+
+_LOCALES = Path(__file__).resolve().parents[2] / "frontend" / "src" / "i18n" / "locales"
+
+
+def _model_calls(language: str) -> dict[str, Any]:
+    catalog = json.loads((_LOCALES / language / "dock.json").read_text(encoding="utf-8"))
+    words: dict[str, Any] = catalog["modelCalls"]
+    return words
+
+
+@pytest.mark.parametrize("language", ["en", "ko"])
+def test_every_reason_code_the_core_sends_has_a_sentence_in_the_head(language: str) -> None:
+    """A code the Core sends and the catalog lacks reads as English on a Korean screen (#1907).
+
+    Equal, not contained: a catalog sentence no code names is one nobody can see.
+
+    Killed by: src/uclone_x/agent/request_record.py :: RecordErrorCode = Literal[
+    Becomes: RecordErrorCode = Literal["renamed",
+    Killed by: src/uclone_x/agent/turn_trace.py :: ResponseReasonCode = Literal["not_recorded"]
+    Becomes: ResponseReasonCode = Literal["not_recorded", "renamed"]
+    """
+    words = _model_calls(language)
+    assert set(get_args(RequestReasonCode)) == set(words["requestReasons"])
+    assert set(get_args(ResponseReasonCode)) == set(words["responseReasons"])
+    assert set(get_args(FromLogCode)) == set(words["fromLog"]["reasons"])
+    # The kind of gap behind `epoch_unreadable` (#1911).
+    assert set(get_args(RecordErrorCode)) == set(words["fromLog"]["details"])
+
+
 class _Watched(dict[str, Any]):
     """An event that records which of its fields were read."""
 
@@ -895,6 +998,242 @@ async def test_tool_results_pair_by_call_id_and_by_position_before_1489(
     assert paired(events) == [["c0"], ["c1", "c2"], []]
     before_1489 = [e for e in events if e["type"] != "MODEL_RESPONSE"]
     assert paired(before_1489) == [["c0"], ["c1", "c2"], []]
+
+
+@pytest.mark.asyncio
+async def test_each_traced_request_is_checked_against_the_log(tmp_path: Path) -> None:
+    """Every request of a real turn with a tool call is the conversation the log and the
+    context state render (#1848): `from_log` is true on each step.
+
+    Killed by: src/uclone_x/agent/turn_trace.py :: return {"from_log": rendered[: len(sent)] == sent}
+    Becomes: return {"from_log": rendered == []}
+    """
+    store = SessionStore(tmp_path / "store")
+    await _turns(store, _Script([_call("c1"), "one", "two"]), "first", "second")
+    state = store.load(_SID)
+    assert state is not None and state.context_epochs
+
+    for turn in ("t1", "t2"):
+        trace = trace_turn(store, state, _events(store), caller_turn_id=turn)
+        assert [s.from_log for s in trace.steps] == [True] * len(trace.steps)
+        assert all(s.from_log_reason is None for s in trace.steps)
+
+
+@pytest.mark.asyncio
+async def test_a_request_the_log_does_not_render_is_reported_as_not_from_the_log(
+    tmp_path: Path,
+) -> None:
+    """An epoch naming a different entry renders a conversation no request sent.
+
+    Killed by: src/uclone_x/agent/turn_trace.py :: return {"from_log": rendered[: len(sent)] == sent}
+    Becomes: return {"from_log": True}
+    """
+    store = SessionStore(tmp_path / "store")
+    await _turns(store, _Script(["one", "two"]), "first", "second")
+    state = store.load(_SID)
+    assert state is not None
+    epochs: list[ContextEpoch] = []
+    for epoch in state.context_epochs:
+        entries = list(epoch.entries)
+        if len(entries) > 1:
+            entries[-1], entries[-2] = entries[-2], entries[-1]
+        epochs.append(epoch.model_copy(update={"entries": tuple(entries)}))
+    swapped = state.model_copy(update={"context_epochs": tuple(epochs)})
+
+    trace = trace_turn(store, swapped, _events(store), caller_turn_id="t2")
+
+    assert [s.request_status for s in trace.steps] == ["ok"]
+    assert [s.from_log for s in trace.steps] == [False]
+
+
+@pytest.mark.asyncio
+async def test_a_missing_log_body_leaves_the_check_unknown_and_the_trace_intact(
+    tmp_path: Path,
+) -> None:
+    """A body the step's epoch needs is missing: rendering that epoch raises, the trace
+    says why on the step and still returns the requests it rebuilt.
+
+    Killed by: src/uclone_x/agent/turn_trace.py :: except RequestRecordError as err:
+    Becomes: except KeyError as err:
+    Killed by: src/uclone_x/agent/turn_trace.py :: return _unchecked("epoch_unreadable", rendered.detail, rendered.code)
+    Becomes: return _unchecked("epoch_unreadable", rendered.detail)
+    """
+    store = SessionStore(tmp_path / "store")
+    await _turns(store, _Script(["one", "two"]), "first", "second")
+    state = store.load(_SID)
+    assert state is not None
+    later = [
+        entry.digest
+        for entry in state.session_log
+        if '"second"' in (store.load_context_body(_SID, entry.digest) or "")
+    ]
+    assert len(later) == 1
+    (store.context_body_dir(_SID) / later[0]).unlink()
+
+    trace = trace_turn(store, state, _events(store), caller_turn_id="t1")
+
+    assert [s.request_status for s in trace.steps] == ["ok"]
+    assert [s.from_log for s in trace.steps] == [None]
+    assert trace.steps[0].from_log_reason == f"no context body {later[0]}"
+    # The code is what the UI reads (#1903); the reason stays the detail it shows beside it.
+    assert trace.steps[0].from_log_code == "epoch_unreadable"
+    # What kind of gap it was, as a code the UI words, beside that English detail (#1911).
+    assert trace.steps[0].from_log_detail_code == "body_missing"
+    detail = trace_step(store, state, _events(store), caller_turn_id="t1", step=1)
+    assert (detail.from_log_code, detail.from_log_detail_code) == (
+        "epoch_unreadable",
+        "body_missing",
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_session_with_no_context_state_is_not_checked(tmp_path: Path) -> None:
+    """Killed by: src/uclone_x/agent/turn_trace.py :: if not self._epochs:
+    Becomes: if False:
+
+    Killed by: src/uclone_x/agent/turn_trace.py ::     from_log_code: FromLogCode | None = None
+    Becomes:     from_log_codes: FromLogCode | None = None
+    """
+    store = SessionStore(tmp_path / "store")
+    await _turns(store, _Script(["one"]), "first")
+    state = store.load(_SID)
+    assert state is not None
+    bare = state.model_copy(update={"context_epochs": ()})
+
+    trace = trace_turn(store, bare, _events(store), caller_turn_id="t1")
+
+    assert [(s.from_log, s.from_log_reason, s.from_log_code) for s in trace.steps] == [
+        (None, NO_CONTEXT_STATE, "no_context_state")
+    ]
+    # The step read carries the code too: `StepDetail` ignores a field it does not declare.
+    detail = trace_step(store, bare, _events(store), caller_turn_id="t1", step=1)
+    assert (detail.from_log, detail.from_log_code) == (None, "no_context_state")
+
+
+def _turn_of(events: list[dict[str, Any]], caller_turn_id: str) -> int:
+    return next(
+        int(e["turn_index"])
+        for e in events
+        if e["type"] == "TURN_START" and e.get("caller_turn_id") == caller_turn_id
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_step_is_checked_against_its_own_epoch_not_any_epoch(tmp_path: Path) -> None:
+    """A request that re-sent history an earlier epoch showed is not from the log.
+
+    Both turns' requests extend one epoch. A later epoch, as a compaction would open,
+    is recorded as opened at turn 2's first step with only turn 2's prompt in it. Turn
+    2's request still carries turn 1's history, which the first epoch renders, so
+    accepting a prefix of any epoch reads it as from the log; its own epoch does not
+    render it. Turn 1's request belongs to the first epoch and still matches.
+
+    Killed by: src/uclone_x/agent/turn_trace.py :: own = epoch
+    Becomes: own = own or epoch
+    """
+    store = SessionStore(tmp_path / "store")
+    await _turns(store, _Script(["one", "two"]), "first", "second")
+    state = store.load(_SID)
+    assert state is not None
+    events = _events(store)
+    (first,) = state.context_epochs
+    later = ContextEpoch(
+        number=1,
+        turn=_turn_of(events, "t2"),
+        step=1,
+        opened_by=("compaction",),
+        entries=first.entries[-1:],
+    )
+    compacted = state.model_copy(update={"context_epochs": (first, later)})
+
+    t1 = trace_turn(store, compacted, events, caller_turn_id="t1")
+    t2 = trace_turn(store, compacted, events, caller_turn_id="t2")
+
+    assert [s.from_log for s in t1.steps] == [True]
+    assert [s.from_log for s in t2.steps] == [False]
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_epoch_leaves_the_other_epochs_steps_checked(
+    tmp_path: Path,
+) -> None:
+    """A later epoch names an entry the log does not have. Only its steps are unknown.
+
+    Killed by: src/uclone_x/agent/turn_trace.py :: if (epoch.turn, epoch.step) <= (turn, step):
+    Becomes: if True:
+    """
+    store = SessionStore(tmp_path / "store")
+    await _turns(store, _Script(["one", "two"]), "first", "second")
+    state = store.load(_SID)
+    assert state is not None
+    events = _events(store)
+    (first,) = state.context_epochs
+    broken = ContextEpoch(
+        number=1,
+        turn=_turn_of(events, "t2"),
+        step=1,
+        opened_by=("compaction",),
+        entries=(first.entries[0].model_copy(update={"entry": "e999"}),),
+    )
+    two = state.model_copy(update={"context_epochs": (first, broken)})
+
+    t1 = trace_turn(store, two, events, caller_turn_id="t1")
+    t2 = trace_turn(store, two, events, caller_turn_id="t2")
+
+    assert [(s.from_log, s.from_log_reason, s.from_log_code) for s in t1.steps] == [
+        (True, None, None)
+    ]
+    assert [(s.from_log, s.from_log_reason, s.from_log_code) for s in t2.steps] == [
+        (None, "no log entry e999", "epoch_unreadable")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_request_older_than_every_epoch_is_not_checked(tmp_path: Path) -> None:
+    """A session whose context state begins after a request: that request has no epoch.
+
+    Killed by: src/uclone_x/agent/turn_trace.py :: return _unchecked("no_epoch_for_request", NO_EPOCH_FOR_REQUEST)
+    Becomes: return _unchecked("no_context_state", NO_EPOCH_FOR_REQUEST)
+    """
+    store = SessionStore(tmp_path / "store")
+    await _turns(store, _Script(["one", "two"]), "first", "second")
+    state = store.load(_SID)
+    assert state is not None
+    events = _events(store)
+    (first,) = state.context_epochs
+    late = state.model_copy(
+        update={"context_epochs": (first.model_copy(update={"turn": _turn_of(events, "t2")}),)}
+    )
+
+    t1 = trace_turn(store, late, events, caller_turn_id="t1")
+
+    assert [(s.from_log, s.from_log_reason, s.from_log_code) for s in t1.steps] == [
+        (None, NO_EPOCH_FOR_REQUEST, "no_epoch_for_request")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_step_detail_says_whether_its_request_is_from_the_log(tmp_path: Path) -> None:
+    """Killed by: src/uclone_x/agent/turn_trace.py :: log_fields = _LogCheck(store, state).fields(rebuilt, turn_index)
+    Becomes: log_fields = _LogCheck(store, state).fields(rebuilt, 0)
+    """
+    store = SessionStore(tmp_path / "store")
+    await _turns(store, _Script(["one", "two"]), "first", "second")
+    state = store.load(_SID)
+    assert state is not None
+    events = _events(store)
+    (epoch,) = state.context_epochs
+    entries = list(epoch.entries)
+    entries[-1], entries[-2] = entries[-2], entries[-1]
+    swapped = state.model_copy(
+        update={"context_epochs": (epoch.model_copy(update={"entries": tuple(entries)}),)}
+    )
+
+    detail = trace_step(store, state, events, caller_turn_id="t2", step=1)
+    wrong = trace_step(store, swapped, events, caller_turn_id="t2", step=1)
+
+    assert (detail.from_log, detail.from_log_reason) == (True, None)
+    assert wrong.from_log is False
 
 
 def test_trace_turn_not_linked(tmp_path: Path) -> None:

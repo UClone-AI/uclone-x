@@ -77,33 +77,3 @@ def test_sessions_listing_reports_saturation_flag(tmp_path: Path) -> None:
     assert compacted_sess["turn_counter"] == 25
     assert compacted_sess["active_turns"] == 2
     assert compacted_sess["is_saturated"] is False
-
-
-def test_reconstruct_history_reaches_the_shared_presentable_rule(tmp_path: Path) -> None:
-    """Rehydration keeps a ledger and drops a plain system anchor (#872, P6).
-
-    `reconstruct_history` makes this decision on persisted transcript *dicts*, and once
-    carried its own copy of the rule the message-side predicate applied. It reaches the
-    one rule through `_is_presentable_role`.
-
-    Killed by: src/uclone_x/ui/app.py :: if not _is_presentable_role(role_str, bool(item_dict.get("compaction_ledger", False))):
-    Becomes: if False:
-    """
-    from uclone_x.ui.app import AgentSessionManager
-
-    mgr = AgentSessionManager(storage_dir=tmp_path)
-    raw: list[object] = [
-        {"role": "system", "content": "You are Champion.", "sender": "system"},
-        {"role": "system", "content": "[Compacted] earlier turns", "compaction_ledger": True},
-        {"role": "user", "content": "hello"},
-    ]
-    history, transcript = mgr.reconstruct_history(raw, session_id="sess_872_rehydrate")
-
-    # The anchor is not conversation and does not come back as one; the ledger does.
-    assert [(m.role.value, m.compaction_ledger) for m in history] == [
-        ("system", True),
-        ("user", False),
-    ]
-    assert history[0].content == "[Compacted] earlier turns"
-    # The presentation view is untouched -- it keeps every persisted entry verbatim.
-    assert len(transcript) == 3

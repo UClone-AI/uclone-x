@@ -2,7 +2,6 @@
 """Unit tests for the FR-13 head surface: dispatch, health, sessions, personas, attribution."""
 
 import asyncio
-import json
 from pathlib import Path
 from typing import Any, cast
 
@@ -10,10 +9,11 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
+from tests.support.app_clone import app_clone
 from uclone_x.core.provenance import (
     ExecutionPath,
 )
-from uclone_x.errors import LLMProviderError, SessionHistoryRehydrationError
+from uclone_x.errors import LLMProviderError
 from uclone_x.llm import MockLLMConnector
 from uclone_x.llm.connectors.ollama import OllamaConnector
 from uclone_x.llm.models import (
@@ -22,7 +22,6 @@ from uclone_x.llm.models import (
     ModelResponse,
 )
 from uclone_x.ui.app import (
-    TRANSCRIPT_CANCELLED_ROLE,
     AgentSessionManager,
     create_ui_app,
 )
@@ -255,8 +254,9 @@ def test_only_a_token_or_cost_ceiling_is_a_refusal_a_retry_meets_again(
 
 # --------------------------------------------------------------------------------------
 # Ported from the retired `POST /api/turn` (#1731). The chat route is gone; what it pinned
-# about the agent it built, and about rebuilding an old transcript, is driven here through
-# `AgentSessionManager.get_or_create_agent` and `BaseAgent.execute_turn` directly.
+# about the agent it built is driven here through `build_clone` over the app scope -- the
+# path every conversation takes -- and `BaseAgent.execute_turn` directly. What it pinned
+# about rebuilding an old UI transcript went with that rebuild (#1893).
 # --------------------------------------------------------------------------------------
 
 
@@ -268,7 +268,7 @@ async def _turns(
     model_name: str | None = None,
 ) -> list[Any]:
     """Send `messages` in order to one agent; a turn that raised yields its exception."""
-    agent = await mgr.get_or_create_agent(agent_id, session_id=session_id, model_name=model_name)
+    agent = app_clone(mgr, agent_id, session_id, model_name=model_name)
     results: list[Any] = []
     for message in messages:
         try:
@@ -276,27 +276,6 @@ async def _turns(
         except Exception as exc:  # noqa: BLE001 -- the failed turn is the observation
             results.append(exc)
     return results
-
-
-def _write_legacy_transcript(
-    storage_dir: Path, session_id: str, messages: list[dict[str, Any]], turns: int
-) -> None:
-    """A UI transcript as the retired chat path saved it, with no Core record beside it."""
-    path = AgentSessionManager(storage_dir=storage_dir).get_session_path(session_id)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(
-            {
-                "session_id": session_id,
-                "agent_id": "agent-general",
-                "created_at": "2026-09-01T00:00:00Z",
-                "updated_at": "2026-09-01T00:00:00Z",
-                "turns": turns,
-                "messages": messages,
-            }
-        ),
-        encoding="utf-8",
-    )
 
 
 def test_fr13_attribution_is_independent_of_message_content(tmp_path: Path) -> None:
@@ -322,9 +301,7 @@ def test_hermes_model_adapts_system_prompt_for_steerability(tmp_path: Path) -> N
     from uclone_x.agent.prompts import HERMES_STEERABILITY_POLICY, IDENTITY_GROUNDING
 
     mgr = AgentSessionManager(storage_dir=tmp_path / "sessions", llm=MockLLMConnector())
-    agent = asyncio.run(
-        mgr.get_or_create_agent("pioneer", session_id="sess_hermes", model_name="hermes3:8b")
-    )
+    agent = app_clone(mgr, "pioneer", "sess_hermes", model_name="hermes3:8b")
     assert "You are Pioneer" in agent.effective_system_prompt
     assert IDENTITY_GROUNDING in agent.effective_system_prompt
     assert HERMES_STEERABILITY_POLICY in agent.effective_system_prompt
@@ -333,7 +310,7 @@ def test_hermes_model_adapts_system_prompt_for_steerability(tmp_path: Path) -> N
 def test_an_agent_is_built_from_its_declarative_persona(tmp_path: Path) -> None:
     """`agent_id='writer'` instantiates the agent from PersonaRegistry (#897)."""
     mgr = AgentSessionManager(storage_dir=tmp_path / "sessions", llm=MockLLMConnector())
-    agent = asyncio.run(mgr.get_or_create_agent("writer", session_id="sess_writer"))
+    agent = app_clone(mgr, "writer", "sess_writer")
     prompt = agent.effective_system_prompt
     assert "Writer" in prompt or "storyteller" in prompt.lower()
     assert "file_write" in agent.config.allowed_tools
@@ -364,92 +341,3 @@ def test_retrying_a_failed_turn_shows_the_model_the_prompt_once(tmp_path: Path) 
         ("assistant", "Answered"),
         ("user", "Same prompt"),
     ]
-
-
-def test_an_old_transcripts_failed_turn_is_kept_out_of_the_model(tmp_path: Path) -> None:
-    """A transcript saved before failure records existed is rebuilt without its failures (#969).
-
-    Its failed turns are `role: "assistant"` rows reading `Error: ...` with degraded
-    provenance. A conversation with no Core record is rebuilt from that transcript, and the
-    rebuild handed those rows to the model as replies the agent had given.
-
-    Killed by: src/uclone_x/ui/app.py :: and content.startswith(LEGACY_FAILURE_PREFIX)
-    Becomes: and False
-    """
-    storage_dir = tmp_path / "sessions"
-    _write_legacy_transcript(
-        storage_dir,
-        "sess_old",
-        [
-            {"id": "user-1", "sender": "user", "role": "user", "content": "Question one"},
-            {
-                "id": "agent-1",
-                "sender": "agent",
-                "role": "assistant",
-                "content": "Error: provider unavailable",
-                "provenance": {"degraded": True, "path": "FAILOVER", "served_by": "agent.core"},
-            },
-            {"id": "user-2", "sender": "user", "role": "user", "content": "Question two"},
-            {
-                "id": "agent-2",
-                "sender": "agent",
-                "role": "assistant",
-                "content": "Answer two",
-                "provenance": {"degraded": False, "path": "PRIMARY", "served_by": "mock:mock"},
-            },
-        ],
-        turns=2,
-    )
-    connector = _ScriptedChatConnector(set(), ["Answer three"])
-    mgr = AgentSessionManager(storage_dir=storage_dir, llm=connector)
-    (result,) = asyncio.run(_turns(mgr, "agent-general", "sess_old", ["Question three"]))
-    assert result.content == "Answer three"
-    assert _said(connector.requests[-1]) == [
-        ("user", "Question one"),
-        ("user", "Question two"),
-        ("assistant", "Answer two"),
-        ("user", "Question three"),
-    ]
-
-
-def test_an_old_transcripts_cancelled_turn_is_never_rebuilt_into_model_context(
-    tmp_path: Path,
-) -> None:
-    """A reopened transcript's cancellation row is not re-sent as a reply (#1031, #969).
-
-    `reconstruct_history` drops a cancellation row through the same predicate that drops a
-    failure row: neither is anything the agent said. The prompt of the cancelled turn *is*
-    conversation and comes back.
-
-    Killed by: src/uclone_x/ui/app.py :: return role == TRANSCRIPT_CANCELLED_ROLE or _is_failure_entry(role, entry)
-    Becomes: return _is_failure_entry(role, entry)
-    """
-    storage_dir = tmp_path / "sessions"
-    stopped = "Stopped before an answer."
-    _write_legacy_transcript(
-        storage_dir,
-        "sess_cancel",
-        [
-            {"id": "user-1", "sender": "user", "role": "user", "content": "msg 0"},
-            {"id": "agent-1", "sender": "agent", "role": "assistant", "content": "reply 0"},
-            {"id": "user-2", "sender": "user", "role": "user", "content": "cancel me"},
-            {
-                "id": "agent-2",
-                "sender": "agent",
-                "role": TRANSCRIPT_CANCELLED_ROLE,
-                "content": stopped,
-            },
-        ],
-        turns=2,
-    )
-    connector = _ScriptedChatConnector(set(), ["reply 3"])
-    mgr = AgentSessionManager(storage_dir=storage_dir, llm=connector)
-    try:
-        (result,) = asyncio.run(_turns(mgr, "agent-general", "sess_cancel", ["msg 3"]))
-    except SessionHistoryRehydrationError as exc:
-        # Kept as a row, `cancelled` is no `MessageRole`: the rebuild refuses the history.
-        raise AssertionError(f"the cancellation row reached the rebuild: {exc}") from exc
-    assert not isinstance(result, Exception), result
-    said = _said(connector.requests[-1])
-    assert ("user", "cancel me") in said
-    assert all(stopped not in (content or "") for _, content in said)

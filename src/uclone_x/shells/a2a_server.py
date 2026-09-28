@@ -9,9 +9,11 @@ import socket
 import time
 import traceback
 import uuid
+from collections import OrderedDict
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
-from typing import Any, cast
+from dataclasses import dataclass
+from typing import Any, Final, cast
 
 try:
     import uvicorn
@@ -31,6 +33,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from uclone_x.a2a.models import AgentCard, TaskMessage, TaskResult, TaskStatus
 from uclone_x.a2a.wire import task_result_to_wire, task_result_to_wire_json
 from uclone_x.agent.base import BaseAgent
+from uclone_x.agent.models import TurnResult
 from uclone_x.core.immutable import unwrap_immutable
 from uclone_x.core.provenance import Provenance
 from uclone_x.engine.event_bus import EventBus
@@ -45,14 +48,80 @@ logger = logging.getLogger(__name__)
 TaskHandler = Callable[[TaskMessage], Awaitable[TaskResult]]
 StreamHandler = Callable[[TaskMessage], AsyncIterator[str]]
 
+#: Builds the agent that answers one A2A conversation (`contextId`), with its saved
+#: history restored (#1836). The CLI builds it on the clone's seat session in the
+#: conversation's one-seat room (§5.9); the server keeps one agent per context.
+ContextAgentFactory = Callable[[str], BaseAgent]
+
+
+@dataclass(frozen=True, slots=True)
+class A2ATurnFailure:
+    """A turn that returned no result: it raised (`cause` is the raw text), or was cancelled."""
+
+    cause: str
+    completed: bool = True
+
+
+#: Records a turn a context ran, beyond the agent's own save (#1837): the CLI records it
+#: in the context's one-seat room transcript. Called with the context id, the prompt and
+#: the turn's result or an `A2ATurnFailure`. A recorder that raises is logged; the task's
+#: outcome stands.
+A2ATurnRecorder = Callable[[str, str, "TurnResult | A2ATurnFailure"], None]
+
+#: The names the person on the other end of an A2A conversation goes by, read before each
+#: turn with the context id (#1893 item 1). The CLI reads them from the context's one-seat
+#: room, as the room orchestrator gives a seat's turn its room's. Unset, a turn is given none.
+A2APersonNames = Callable[[str], tuple[str, ...]]
+
+#: How many per-context agents a server holds at once. See `A2AServer`.
+DEFAULT_MAX_CONTEXT_AGENTS: Final[int] = 8
+
+#: A task's error when every held agent is busy or unsaved. Read by the calling agent's
+#: owner, so it says what to do and nothing about the server.
+CONTEXTS_BUSY_MESSAGE: Final[str] = (
+    "Too many conversations are in progress with this agent. Please try again shortly."
+)
+
+#: A task's error when the conversation's agent could not be built or its history read.
+CONTEXT_UNOPENABLE_MESSAGE: Final[str] = "This conversation could not be opened. Please try again."
+
+#: A task's error when the agent's turn failed (#1885 item 8). The calling agent's owner
+#: reads it, so it is plain: the cause -- an exception's text, a provider's answer, a
+#: path -- goes to this server's log, never over the wire.
+TURN_FAILED_MESSAGE: Final[str] = (
+    "The agent could not finish this task. The reason is in the log of the agent's server."
+)
+
+#: A task's error when the turn came back with nobody named as its producer (P6). The
+#: answer is refused rather than attributed by whoever holds it; plain for the same reader.
+TURN_UNATTRIBUTED_MESSAGE: Final[str] = (
+    "The agent's answer could not be checked, so it was not sent. "
+    "The reason is in the log of the agent's server."
+)
+
+
+class _ContextRefusedError(Exception):
+    """A context's turn was not run; `message` is what the task says, in plain words."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.message = message
+
 
 class TaskCreateRequest(BaseModel):
     """Payload model for POST /a2a/v1/tasks."""
 
-    model_config = ConfigDict(extra="allow", strict=False)
+    model_config = ConfigDict(extra="allow", strict=False, populate_by_name=True)
 
     task_id: str | None = None
     session_id: str | None = None
+    context_id: str | None = Field(
+        default=None,
+        alias="contextId",
+        description="The A2A conversation this task belongs to. A server serving one-seat "
+        "rooms continues the room of a known context and starts one for a new context "
+        "(#1836). Absent, `session_id` stands in for it, and a new id when neither is sent.",
+    )
     input_data: dict[str, Any] = Field(default_factory=dict)
     sender_agent_id: str | None = None
     target_agent_id: str | None = None
@@ -66,6 +135,7 @@ class ManagedTaskRecord:
 
     task_id: str
     session_id: str
+    context_id: str
     input_data: dict[str, Any]
     sender_agent_id: str
     target_agent_id: str
@@ -90,9 +160,11 @@ class ManagedTaskRecord:
         sender_agent_id: str = "client",
         target_agent_id: str = "default",
         metadata: dict[str, str] | None = None,
+        context_id: str | None = None,
     ) -> None:
         self.task_id = task_id
         self.session_id = session_id
+        self.context_id = context_id if context_id is not None else session_id
         self.input_data = input_data
         self.sender_agent_id = sender_agent_id
         self.target_agent_id = target_agent_id
@@ -144,6 +216,7 @@ class ManagedTaskRecord:
         return {
             "task_id": self.task_id,
             "session_id": self.session_id,
+            "context_id": self.context_id,
             "status": self.status.value,
             "input_data": self.input_data,
             "output_data": self.output_data,
@@ -156,7 +229,19 @@ class ManagedTaskRecord:
 
 
 class A2AServer:
-    """HTTP/SSE wire server for A2A v1.0.1 protocol discovery and task dispatch."""
+    """HTTP/SSE wire server for A2A v1.0.1 protocol discovery and task dispatch.
+
+    **One agent per conversation, when given `context_agent_factory` (#1836).** Each
+    `contextId` is answered by an agent of its own, built by the factory on first use --
+    the CLI builds it on the clone's seat session in the context's one-seat room -- so a
+    known context continues its conversation and a new one starts fresh. One turn runs at
+    a time per context. After each turn the agent's session is saved and the turn handed
+    to `turn_recorder`. At most `max_context_agents` agents are held; past that the least
+    recently used one that is idle and saved is released (its session is on disk, and its
+    next task rebuilds it). An unsaved agent is never released, and if none can be the
+    task fails with `CONTEXTS_BUSY_MESSAGE`. Without a factory, `agent` answers every task
+    in its one session, as before.
+    """
 
     def __init__(
         self,
@@ -167,11 +252,30 @@ class A2AServer:
         bus: EventBus | None = None,
         host: str = "127.0.0.1",
         port: int = 0,
+        context_agent_factory: ContextAgentFactory | None = None,
+        turn_recorder: A2ATurnRecorder | None = None,
+        max_context_agents: int = DEFAULT_MAX_CONTEXT_AGENTS,
+        person_names: A2APersonNames | None = None,
     ) -> None:
+        if max_context_agents < 1:
+            raise ValueError(f"max_context_agents must be at least 1, got {max_context_agents}")
         self._agent_card = agent_card
         self._handler = handler
         self._stream_handler = stream_handler
         self._agent = agent
+        self._context_agent_factory = context_agent_factory
+        self._turn_recorder = turn_recorder
+        self._person_names = person_names
+        self._max_context_agents = max_context_agents
+        # Least recently used first.
+        self._context_agents: OrderedDict[str, BaseAgent] = OrderedDict()
+        # A context's lock lives while a turn holds or awaits it, or while its agent is
+        # held; `_context_users` counts the turns. Kept for every context ever seen, the
+        # map grew by one lock per caller conversation for the server's life (#1885).
+        self._context_locks: dict[str, asyncio.Lock] = {}
+        self._context_users: dict[str, int] = {}
+        # Contexts whose last save failed: their agent holds what the store does not.
+        self._unsaved_contexts: set[str] = set()
         self._bus = bus
         self._host = host
         self._requested_port = port
@@ -209,6 +313,10 @@ class A2AServer:
     def app(self) -> FastAPI:
         """Underlying FastAPI ASGI application."""
         return self._app
+
+    def context_agent(self, context_id: str) -> BaseAgent | None:
+        """The agent currently held for `context_id`, or `None`."""
+        return self._context_agents.get(context_id)
 
     @property
     def tasks(self) -> dict[str, ManagedTaskRecord]:
@@ -286,9 +394,10 @@ class A2AServer:
                 detail={"error": type(e).__name__, "message": str(e)},
             ) from e
         except Exception as e:
+            logger.exception("A2A task %s: the task handler failed", message.task_id)
             raise HTTPException(
                 status_code=500,
-                detail={"error": "InvalidAgentResponseError", "message": str(e)},
+                detail={"error": "InvalidAgentResponseError", "message": TURN_FAILED_MESSAGE},
             ) from e
 
     async def stream_task_endpoint(
@@ -320,8 +429,9 @@ class A2AServer:
             try:
                 async for chunk in stream_iter:
                     yield f"data: {chunk}\n\n"
-            except Exception as exc:
-                yield f'data: {{"error": "{str(exc)}"}}\n\n'
+            except Exception:
+                logger.exception("A2A task %s: the task stream failed", message.task_id)
+                yield f"data: {json.dumps({'error': TURN_FAILED_MESSAGE})}\n\n"
 
         return StreamingResponse(event_generator(), media_type="text/event-stream")
 
@@ -334,6 +444,9 @@ class A2AServer:
         self._verify_version(a2a_version)
         task_id = payload.task_id or f"task_{uuid.uuid4().hex[:12]}"
         session_id = payload.session_id or f"sess_{uuid.uuid4().hex[:8]}"
+        # The conversation: the caller's `contextId`, else its session id, else the new
+        # session id -- so a task sent with neither starts a conversation of its own.
+        context_id = payload.context_id or session_id
         input_data = dict(payload.input_data)
         if payload.prompt is not None and "prompt" not in input_data:
             input_data["prompt"] = payload.prompt
@@ -350,6 +463,7 @@ class A2AServer:
             sender_agent_id=sender_agent_id,
             target_agent_id=target_agent_id,
             metadata=metadata,
+            context_id=context_id,
         )
         self._tasks[task_id] = record
 
@@ -443,14 +557,20 @@ class A2AServer:
         """Execute managed task in background and broadcast status events."""
         try:
             await record.emit_event({"event": "status_changed", "status": "WORKING"})
-            if self._agent is not None:
+            if self._agent is not None or self._context_agent_factory is not None:
                 prompt = str(
                     record.input_data.get("prompt")
                     or record.input_data.get("message")
                     or json.dumps(record.input_data)
                 )
                 await record.emit_event({"event": "state", "state": "REASONING"})
-                turn_result = await self._agent.execute_turn(prompt)
+                try:
+                    answering_id, turn_result = await self._run_turn(record.context_id, prompt)
+                except _ContextRefusedError as refused:
+                    record.status = TaskStatus.FAILED
+                    record.error = refused.message
+                    await record.emit_event({"event": "failed", "error": record.error})
+                    return
                 await record.emit_event({"event": "token", "content": turn_result.content})
                 if turn_result.provenance is None:
                     # P6, and the policy this file already applies twice: an unattributed
@@ -463,15 +583,15 @@ class A2AServer:
                     # has no way to know the attribution was invented (#157).
                     record.status = TaskStatus.FAILED
                     record.provenance = None
-                    turn_failure = (
-                        f" The turn also reported: {turn_result.error}" if turn_result.error else ""
+                    logger.warning(
+                        "A2A task %s: agent %r produced turn %s with no provenance; refused "
+                        "(P6). The turn reported: %s",
+                        record.task_id,
+                        answering_id,
+                        turn_result.turn_index,
+                        turn_result.error or "no error",
                     )
-                    record.error = (
-                        f"Agent '{self._agent.agent_id}' produced turn "
-                        f"{turn_result.turn_index} with no provenance; refusing to "
-                        "attribute it and forward it over the wire (P6: absence is a "
-                        f"violation, not a default).{turn_failure}"
-                    )
+                    record.error = TURN_UNATTRIBUTED_MESSAGE
                     await record.emit_event({"event": "failed", "error": record.error})
                 elif turn_result.is_completed:
                     record.status = TaskStatus.COMPLETED
@@ -492,7 +612,14 @@ class A2AServer:
                     )
                 else:
                     record.status = TaskStatus.FAILED
-                    record.error = turn_result.error or "Agent turn failed"
+                    logger.warning(
+                        "A2A task %s: agent %r's turn failed (%s): %s",
+                        record.task_id,
+                        answering_id,
+                        turn_result.stop_reason,
+                        turn_result.error,
+                    )
+                    record.error = TURN_FAILED_MESSAGE
                     record.provenance = turn_result.provenance
                     await record.emit_event({"event": "failed", "error": record.error})
             elif self._handler is not None:
@@ -511,12 +638,12 @@ class A2AServer:
                     # substituted `Provenance.primary("handler")` named a provider that
                     # does not exist — there is no service called "handler".
                     record.status = TaskStatus.FAILED
-                    record.provenance = None
-                    record.error = (
-                        "Task handler returned a TaskResult with no provenance; refusing "
-                        "to attribute it and forward it over the wire (P6: absence is a "
-                        "violation, not a default)."
+                    logger.warning(
+                        "A2A task %s: the task handler returned a result with no "
+                        "provenance; refused (P6)",
+                        record.task_id,
                     )
+                    record.error, record.provenance = TURN_UNATTRIBUTED_MESSAGE, None
                     await record.emit_event({"event": "failed", "error": record.error})
                     return
                 record.status = result.status
@@ -574,11 +701,136 @@ class A2AServer:
                 }
             )
             record.status = TaskStatus.FAILED
-            record.error = f"InternalError: {type(exc).__name__}: {exc}"
-            record.provenance = None
+            # The cause is logged above and kept in `processing_errors`; the caller is told
+            # plainly (#1885 item 8).
+            record.error, record.provenance = TURN_FAILED_MESSAGE, None
             await record.emit_event({"event": "error", "error": record.error})
         finally:
             await record.close_listeners()
+
+    async def _run_turn(self, context_id: str, prompt: str) -> tuple[str, TurnResult]:
+        """Run `prompt` as `context_id`'s turn; the answering agent's id and the result.
+
+        With a context factory: one turn at a time per context, then the agent's session
+        is saved and the turn recorded -- a turn that raised or was cancelled is saved and
+        recorded as failed before it propagates.
+
+        Raises:
+            _ContextRefusedError: The context has no agent and none can be released, or
+                its agent could not be built. Nothing was run.
+        """
+        factory = self._context_agent_factory
+        if factory is None:
+            if self._agent is None:
+                raise A2AError("No agent is configured to answer this task.")
+            return self._agent.agent_id, await self._agent.execute_turn(prompt)
+        lock = self._context_locks.setdefault(context_id, asyncio.Lock())
+        self._context_users[context_id] = self._context_users.get(context_id, 0) + 1
+        try:
+            async with lock:
+                return await self._run_context_turn(context_id, prompt, factory)
+        finally:
+            self._release_context_lock(context_id)
+
+    def _release_context_lock(self, context_id: str) -> None:
+        """One turn is done with `context_id`'s lock; drop it once nothing needs it."""
+        users = self._context_users[context_id] - 1
+        if users:
+            self._context_users[context_id] = users
+            return
+        del self._context_users[context_id]
+        if context_id not in self._context_agents:
+            del self._context_locks[context_id]
+
+    async def _run_context_turn(
+        self, context_id: str, prompt: str, factory: ContextAgentFactory
+    ) -> tuple[str, TurnResult]:
+        """`_run_turn`'s body, under `context_id`'s lock."""
+        agent = self._agent_for_context(context_id, factory)
+        try:
+            result = await agent.execute_turn(
+                prompt, person_names=self._turn_person_names(context_id)
+            )
+        except asyncio.CancelledError:
+            self._save_context(context_id, agent)
+            self._record_turn(
+                context_id,
+                prompt,
+                A2ATurnFailure(cause="Turn was interrupted", completed=False),
+            )
+            raise
+        except Exception as exc:
+            self._save_context(context_id, agent)
+            self._record_turn(
+                context_id, prompt, A2ATurnFailure(cause=f"{type(exc).__name__}: {exc}")
+            )
+            raise
+        self._save_context(context_id, agent)
+        self._record_turn(context_id, prompt, result)
+        return agent.agent_id, result
+
+    def _turn_person_names(self, context_id: str) -> tuple[str, ...]:
+        """The person's names for `context_id`'s next turn (`A2APersonNames`); none if unset.
+
+        A reader that raises is logged and the turn is given none: the names sharpen where
+        a fact is filed, and are not worth refusing the task over.
+        """
+        if self._person_names is None:
+            return ()
+        try:
+            return self._person_names(context_id)
+        except Exception:
+            logger.exception("Could not read the person's names for A2A context %s", context_id)
+            return ()
+
+    def _agent_for_context(self, context_id: str, factory: ContextAgentFactory) -> BaseAgent:
+        """`context_id`'s held agent, or a new one from the factory once there is room."""
+        agent = self._context_agents.get(context_id)
+        if agent is not None:
+            self._context_agents.move_to_end(context_id)
+            return agent
+        if len(self._context_agents) >= self._max_context_agents:
+            victim = next(
+                (
+                    held
+                    for held in self._context_agents
+                    if held not in self._unsaved_contexts and not self._context_locks[held].locked()
+                ),
+                None,
+            )
+            if victim is None:
+                raise _ContextRefusedError(CONTEXTS_BUSY_MESSAGE)
+            del self._context_agents[victim]
+            if victim not in self._context_users:
+                del self._context_locks[victim]
+        try:
+            agent = factory(context_id)
+        except Exception as exc:
+            logger.exception("Could not open A2A context %s", context_id)
+            raise _ContextRefusedError(CONTEXT_UNOPENABLE_MESSAGE) from exc
+        self._context_agents[context_id] = agent
+        return agent
+
+    def _save_context(self, context_id: str, agent: BaseAgent) -> None:
+        """Persist `context_id`'s session after a turn; an unsaved agent is kept held."""
+        try:
+            agent.persist_session()
+        except Exception:
+            logger.exception("Could not save A2A context %s after its turn", context_id)
+            self._unsaved_contexts.add(context_id)
+            return
+        self._unsaved_contexts.discard(context_id)
+
+    def _record_turn(
+        self, context_id: str, prompt: str, outcome: TurnResult | A2ATurnFailure
+    ) -> None:
+        """Hand the turn to `turn_recorder`, if there is one; never raises."""
+        if self._turn_recorder is None:
+            return
+        try:
+            self._turn_recorder(context_id, prompt, outcome)
+        except Exception:
+            logger.exception("Could not record the turn of A2A context %s", context_id)
 
     def _build_app(self) -> FastAPI:
         @asynccontextmanager

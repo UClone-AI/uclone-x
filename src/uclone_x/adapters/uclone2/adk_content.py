@@ -93,7 +93,8 @@ drops, or coerces — that is the defect class #364 recorded against PR #358, wh
   `function_response`, or putting `function_call` under `"user"` / `function_response`
   under `"model"` — none has a single-`ChatMessage` representation.
 * Any `ChatMessage` field with no ADK slot in the chosen role: `name` or `tool_call_id`
-  on a non-`TOOL` message, `tool_calls` on a non-`ASSISTANT` message.
+  on a non-`TOOL` message, `tool_calls` on a non-`ASSISTANT` message, and `form` (the
+  excerpt or stub a tool result was shortened to, #1854) on any message.
 * An ADK part carrying anything other than exactly one of `text`, `function_call`,
   `function_response`. `extra="forbid"` on the mirror models makes an unmodelled ADK
   part field (`inline_data`, `code_execution_result`, ...) a loud `ValidationError` at
@@ -392,6 +393,12 @@ class ADKContentAdapter:
                 f"authored by the model and belongs to role={ADK_ROLE_MODEL!r}."
             )
 
+        if message.form is not None:
+            raise ADKUnrepresentableMessageError(
+                f"ChatMessage(role={message.role.value!r}) is a tool result shortened to "
+                f"form={message.form!r}; ADK FunctionResponse has no slot for the form, and "
+                "it is not dropped."
+            )
         if message.role == MessageRole.TOOL:
             if message.name is None:
                 raise ADKUnrepresentableMessageError(

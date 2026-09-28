@@ -57,7 +57,7 @@ describe('the conversation list in the chosen language', () => {
     fireEvent.click(screen.getByRole('button', { name: '“구조 검토” 삭제' }));
 
     const dialog = screen.getByRole('alertdialog');
-    expect(dialog).toHaveAccessibleName('“구조 검토”을(를) 삭제하시겠습니까?');
+    expect(dialog).toHaveAccessibleName('“구조 검토”를 삭제하시겠습니까?');
     expect(dialog).toHaveTextContent('항목 4개');
     expect(dialog).toHaveTextContent('scout, critic');
     expect(screen.getByRole('button', { name: ko.conversationList.deleteDialog.confirm })).toBeInTheDocument();

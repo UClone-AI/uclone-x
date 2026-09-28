@@ -83,6 +83,8 @@ export function App() {
   const [personasDir, setPersonasDir] = useState<string | null>(null);
   const [events, setEvents] = useState<EventEnvelope[]>([]);
   const [ontology, setOntology] = useState<OntologyData | null>(null);
+  /** Counts finished metadata reads, so the Ontology tab's own read follows each one. */
+  const [metadataReads, setMetadataReads] = useState<number>(0);
   const [budgetData, setBudgetData] = useState<BudgetData | null>(null);
 
   const [isConnected, setIsConnected] = useState<boolean>(false);
@@ -862,11 +864,11 @@ export function App() {
     try {
       // Skills, ACP status and evaluations are not read here any more: their sections in
       // Settings read their own routes when shown (#1358).
-      const [healthRes, personasRes, ontologyRes, budgetRes, modelsRes] =
+      // The Ontology tab's read is its own effect below: it names the dock's clone (#1869).
+      const [healthRes, personasRes, budgetRes, modelsRes] =
         await Promise.all([
           fetch('/api/health'),
           fetch('/api/personas'),
-          fetch('/api/ontology'),
           fetch('/api/budget'),
           fetch('/api/models'),
         ]);
@@ -892,10 +894,6 @@ export function App() {
         const named = firstNamed;
         setSelectedAgent((current) => current || named);
       }
-      if (ontologyRes.ok) {
-        const oData = await ontologyRes.json();
-        setOntology(oData);
-      }
       if (budgetRes.ok) {
         const bData = await budgetRes.json();
         setBudgetData(bData);
@@ -917,6 +915,7 @@ export function App() {
     } finally {
       setIsRefreshing(false);
       setMetadataListed(true);
+      setMetadataReads((n) => n + 1);
     }
   }, []);
 
@@ -952,6 +951,31 @@ export function App() {
     const interval = setInterval(fetchAllMetadata, 15000);
     return () => clearInterval(interval);
   }, [fetchAllMetadata]);
+
+  /**
+   * The Ontology tab (developer mode only) shows the rules engine of the clone the dock
+   * describes: there is no shared engine to read any more (clone-knowledge-graph §3.8,
+   * #1869). Read again with every metadata read, so the tab's refresh and the poll reach it.
+   * With developer mode off, or no clone in the dock, nothing is read.
+   */
+  useEffect(() => {
+    if (!developerMode || !dockSeat) {
+      setOntology(null);
+      return;
+    }
+    let current = true;
+    fetch(`/api/ontology?agent_id=${encodeURIComponent(dockSeat)}`)
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data: OntologyData | null) => {
+        if (current) setOntology(data);
+      })
+      .catch(() => {
+        if (current) setOntology(null);
+      });
+    return () => {
+      current = false;
+    };
+  }, [developerMode, dockSeat, metadataReads]);
 
   /**
    * Each clone's picture address, as the listing last gave it. Keyed by its contents, so a
@@ -1099,6 +1123,11 @@ export function App() {
               // from that object rather than by loading a session off disk.
               void readRoomContextRef.current(openRoomId);
             }
+          }
+          if (openRoomId && topic === `room.${openRoomId}.knowledge`) {
+            // A clone learned from a turn, after it (#1404): its row now says so, and what the
+            // dock shows of its memory may have changed. Both are re-read with the record.
+            void refreshRoom(openRoomId);
           }
 
           if (raw.type === 'HEARTBEAT') {

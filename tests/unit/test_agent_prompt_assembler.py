@@ -34,6 +34,7 @@ from uclone_x.agent.prompt_assembler import (
     turn_context_block,
 )
 from uclone_x.agent.session import ContextSnapshot
+from uclone_x.core.context_state import ContextEntry, ContextEpoch, ContextForm, advance
 from uclone_x.llm.models import ChatMessage, LLMRequest, MessageRole
 from uclone_x.tools.builtin.filesystem import FileReadTool
 from uclone_x.tools.protocols import ToolRegistryProtocol
@@ -47,6 +48,22 @@ class _Session:
     context_snapshots: list[ContextSnapshot] = field(default_factory=list[ContextSnapshot])
     last_conversation: list[dict[str, Any]] = field(default_factory=list[dict[str, Any]])
     last_request: int | None = None
+    history: list[ChatMessage] = field(default_factory=list[ChatMessage])
+    context_epochs: tuple[ContextEpoch, ...] = ()
+    recalled_memory: str | None = None
+    compacted_entries: dict[str, ContextEntry] = field(default_factory=dict[str, ContextEntry])
+
+    def reading(self, history: list[ChatMessage]) -> _Session:
+        """This session, answering for `history` (the scope reads both live)."""
+        self.history = history
+        return self
+
+    def logged_history(self) -> list[tuple[str, ChatMessage]]:
+        return [(f"e{position}", message) for position, message in enumerate(self.history)]
+
+    def record_shown(self, shown: list[ContextEntry], *, step: int) -> ContextEpoch:
+        self.context_epochs = advance(self.context_epochs, shown, turn=1, step=step)
+        return self.context_epochs[-1]
 
 
 class _FileToolRegistry:
@@ -80,7 +97,7 @@ def _assembler(state: _State) -> PromptAssembler:
             workspace_root=lambda: state.workspace,
             current_plan=lambda: state.plan,
             history=lambda: state.history,
-            active_session=lambda: state.session,
+            active_session=lambda: state.session.reading(state.history),
             turn_counter=lambda: 1,
             anchor_is_stale=lambda: False,
             system_prompt_base=lambda: "BASE",
@@ -170,6 +187,50 @@ def test_with_no_anchor_the_turn_sends_the_effective_prompt_and_the_plan_rides_a
     assert layers.turn_context.startswith(TURN_CONTEXT_HEADER)
     assert "[Extra] x" in layers.turn_context
     assert "### Active Execution Plan: Ship it" in layers.turn_context
+
+
+def test_the_forms_earlier_epochs_recorded_are_reread_once_an_epoch_is_added() -> None:
+    """The recorded forms are reused only while the epochs are the ones they were read
+    from (#1875, item 5): an entry a later epoch records as a `stub` is shown as one on the
+    next request, not as the `full` a cached read of no epochs would give.
+
+    Killed by: src/uclone_x/agent/prompt_assembler.py :: or cached[1] is not last:
+    Becomes: or False:
+    """
+    stub = ChatMessage(role=MessageRole.TOOL, content="stub text", name="t", tool_call_id="c1")
+    state = _State(config=_config(), history=[stub])
+    state.session.context_epochs = ()
+    assembler = _assembler(state)
+
+    assert [s.form for s in assembler.prepare_turn_layers().shown] == [ContextForm.FULL]
+    epochs: list[ContextEpoch] = []
+    state.session.context_epochs = epochs  # type: ignore[assignment]
+    assert [s.form for s in assembler.prepare_turn_layers().shown] == [ContextForm.FULL]
+    epochs.append(
+        ContextEpoch(
+            number=0,
+            turn=1,
+            step=1,
+            opened_by=("start",),
+            entries=(ContextEntry(entry="e0", form=ContextForm.STUB),),
+        )
+    )
+
+    assert [s.form for s in assembler.prepare_turn_layers().shown] == [ContextForm.STUB]
+
+
+def test_the_forms_a_compaction_derived_are_the_forms_the_next_request_shows() -> None:
+    """A compaction sets the new epoch's forms (#1848); the next request records them,
+    not the form read off the message.
+
+    Killed by: src/uclone_x/agent/prompt_assembler.py :: shown = shown_entries(logged, prior, {**renderings, **session.compacted_entries})
+    Becomes: shown = shown_entries(logged, prior, {**renderings})
+    """
+    stub = ChatMessage(role=MessageRole.TOOL, content="stub text", name="t", tool_call_id="c1")
+    state = _State(config=_config(), history=[stub])
+    state.session.compacted_entries = {"e0": ContextEntry(entry="e0", form=ContextForm.STUB)}
+
+    assert [s.form for s in _assembler(state).prepare_turn_layers().shown] == [ContextForm.STUB]
 
 
 def test_request_context_fields_chain_each_request_to_the_one_before() -> None:

@@ -96,15 +96,23 @@ async def test_topology_tab_renders_without_crash(ui_test_server: str) -> None:
         # The graph is the conversation on screen (#1355): either its seats, or the sentence
         # saying why there is nothing to draw (P6). Never a blank panel. The panel says
         # "Reading this conversation…" until its fetch lands, so wait for either settled
-        # state before reading; a single read raced that fetch under gate load.
-        settled = dock.locator("[data-testid='topology-reason']").or_(
-            dock.get_by_text(re.compile(r" seated · "))
+        # state before reading; a single read raced that fetch under gate load. That loading
+        # sentence sits in `topology-reason` too, so it is excluded: counting it as settled let
+        # the fetch land between the read and the count below (#1900 gate, author's choice).
+        # "No conversation is open" is excluded too: it is what the panel says before the
+        # room on screen reaches it, not a settled state of this room's graph (#1907).
+        settled = (
+            dock.locator("[data-testid='topology-reason']")
+            .filter(has_not_text=re.compile("Reading this conversation|No conversation is open"))
+            .or_(dock.get_by_text(re.compile(r" seated · ")))
         )
         await settled.first.wait_for(state="visible", timeout=15000)
+        # The fixture opens a conversation with a seat, so the settled state is its graph. The
+        # error sentence is also a `topology-reason`, and accepting any reason let a failing
+        # graph route pass as "nothing to draw" (#1903). So: no error, and the seats drawn.
         dock_text = await dock.inner_text()
-        assert " seated · " in dock_text or (
-            await dock.locator("[data-testid='topology-reason']").count() == 1
-        ), dock_text[:400]
+        assert "Couldn't read this conversation's graph" not in dock_text, dock_text[:400]
+        assert " seated · " in dock_text, dock_text[:400]
 
         await browser.close()
 

@@ -28,6 +28,7 @@ import pytest
 from fastapi.testclient import TestClient
 from pydantic import BaseModel, Field
 
+from tests.support.app_clone import app_clone
 from uclone_x.agent.base import BaseAgent
 from uclone_x.agent.models import AgentConfig, PersonaDefinition
 from uclone_x.core.provenance import Provenance
@@ -498,16 +499,15 @@ def test_the_shipped_guardian_neither_writes_nor_delegates_until_its_settings_al
             if m.role is MessageRole.SYSTEM
         )
 
-    async def take_turn(session_id: str, message: str) -> None:
-        agent = await manager.get_or_create_agent("guardian", session_id=session_id)
+    async def take_turn(session_id: str, message: str) -> BaseAgent:
+        agent = app_clone(manager, "guardian", session_id)
         await agent.execute_turn(message)
+        return agent
 
     with TestClient(app) as client:
         portal = client.portal
         assert portal is not None
-        portal.call(take_turn, "s1", "review this")
-        guardian = manager.get_agent("guardian", "s1")
-        assert guardian is not None
+        guardian = portal.call(take_turn, "s1", "review this")
         assert (guardian.write_tools_enabled, guardian.subagent_tools_enabled) == (False, False)
 
         assert not target.exists()

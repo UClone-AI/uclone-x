@@ -20,7 +20,7 @@ from collections.abc import Callable, Coroutine, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
@@ -29,6 +29,7 @@ from uclone_x.agent.composition import MissingCapabilityError
 from uclone_x.core.session_diagnostics import DEFAULT_MAX_CONVERSATION_TURNS
 from uclone_x.errors import (
     BudgetExceededError,
+    HeadRoomWriteError,
     NothingToRetryError,
     ParticipantNotResolvableError,
     RoomAlreadyExistsError,
@@ -45,10 +46,8 @@ from uclone_x.errors import (
     UnreadableRoomRecordError,
 )
 from uclone_x.llm.context_window import OLLAMA_CONTEXT_WINDOWS, published_context_window
-from uclone_x.ontology.engine import OntologyEngine
+from uclone_x.memory.extractor import KnowledgeExtractor
 from uclone_x.room.a2a_handlers import register_persona_handlers
-from uclone_x.room.knowledge import SEAT_KNOWLEDGE_SUBDIR
-from uclone_x.room.knowledge_store import SeatKnowledgeStore
 from uclone_x.room.models import (
     Participant,
     ParticipantKind,
@@ -58,7 +57,10 @@ from uclone_x.room.models import (
     RoomState,
     SelectionVerdict,
     SpeakerDecision,
+    head_room_write_refusal,
     is_loop_command,
+    is_one_seat,
+    room_head,
 )
 from uclone_x.room.notices import NoticeCode, NoticeParams, notice_content
 from uclone_x.room.orchestrator import (
@@ -66,13 +68,15 @@ from uclone_x.room.orchestrator import (
     RoomOrchestrator,
 )
 from uclone_x.room.resolver import RoomAgentResolver
+from uclone_x.room.seat_knowledge_import import SEAT_KNOWLEDGE_SUBDIR, import_seat_knowledge
 from uclone_x.room.selectors import build_selector_chain
 from uclone_x.room.service import RoomService
-from uclone_x.room.store import RoomStore
+from uclone_x.room.store import RoomStore, room_storage_dir_under
 from uclone_x.story.library import StoryLibrary
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle; the app imports this module
     from uclone_x.agent.base import BaseAgent
+    from uclone_x.agent.models import PersonaDefinition
     from uclone_x.llm.protocols import LLMProviderProtocol
     from uclone_x.ui.app import AgentSessionManager
 
@@ -187,16 +191,16 @@ class RoomStack:
 
     def __init__(self, session_mgr: AgentSessionManager) -> None:
         self._session_mgr = session_mgr
-        self.store = RoomStore(session_mgr.storage_dir / "rooms")
+        self.store = RoomStore(room_storage_dir_under(session_mgr.storage_dir))
         self.service = RoomService(self.store, stories=StoryLibrary(session_mgr.workspace_dir))
-        #: Every seat's knowledge, written by each room's orchestrator after a turn and
-        #: loaded by its resolver before the seat's first one (#1367). One store for all
-        #: rooms: a file is named by the seat's session id, which is already unique per
-        #: room and seat. Public because the knowledge read answers from it when the seat
-        #: is not running, without building an agent.
-        self.knowledge = SeatKnowledgeStore(
+        # A seat kept its own knowledge record until clone-knowledge-graph step 6; what a
+        # clone learned is its facts now. Any relation a retired record holds is moved into
+        # its clone's facts once, through the same memory map the seats write through, and
+        # the record is renamed and kept (§3.7). Nothing reads the records after this.
+        # Looked up per clone, only when a record is there to import.
+        import_seat_knowledge(
             session_mgr.storage_dir / SEAT_KNOWLEDGE_SUBDIR,
-            engine_factory=lambda namespace: OntologyEngine(namespace_iri=namespace),
+            lambda clone_id: session_mgr.memory_for(clone_id),
         )
         self._rooms: dict[str, _RoomRuntime] = {}
         #: Live cascades. A *set* per room, not one task: a second send used to overwrite
@@ -243,12 +247,9 @@ class RoomStack:
             # class's own: a store is per agent id, and a second map would hand
             # `champion` in a room a different object than `champion` in chat, each
             # `save()` dropping what the other recorded.
+            # Its rules engine map too: a seat's engine is its clone's one engine, the
+            # one its 1:1 chat reasons in (clone-knowledge-graph step 6).
             self._session_mgr.app_scope(),
-            # Each participant induces into its own graph (P7, G4). Without this the
-            # resolver refuses every seated agent, because the host carries one shared
-            # engine and handing it to all of them merges what each learned separately.
-            ontology_factory=lambda namespace: OntologyEngine(namespace_iri=namespace),
-            knowledge=self.knowledge,  # read before a seat's first turn (#1367)
             a2a_transport=transport,
         )
         register_persona_handlers(
@@ -271,7 +272,10 @@ class RoomStack:
             ),
             resolver=resolver,
             bus=self._session_mgr.bus,
-            knowledge=self.knowledge,  # written after each turn (#1367)
+            extractor=KnowledgeExtractor(),  # learns from each turn, after it (#1404)
+            # The store `app_scope()` saves the seats' sessions to; a record it had to set
+            # aside is said on the seat's next row (#1844).
+            sessions=self._session_mgr.core_store,
         )
         self._rooms[state.room_id] = _RoomRuntime(orchestrator=built, resolver=resolver)
         return built
@@ -375,20 +379,37 @@ class RoomStack:
         """
         self.orchestrator(state)
         runtime = self._rooms[state.room_id]
-        return cast("BaseAgent", await runtime.resolver.resolve(participant))
+        return cast(
+            "BaseAgent",
+            await runtime.resolver.resolve(participant, one_seat=is_one_seat(state.participants)),
+        )
 
     def session_manager(self) -> AgentSessionManager:
         """The manager that owns session records, for the routes that cut them back."""
         return self._session_mgr
 
+    def live_agents(self) -> tuple[BaseAgent, ...]:
+        """Every seat agent built in a live room, for the health reads (#198, #1899)."""
+        return tuple(
+            agent for runtime in self._rooms.values() for agent in runtime.resolver.live_agents()
+        )
+
+    def persona_edited(self, persona: PersonaDefinition) -> int:
+        """Hand a saved persona to every open room; return how many rooms seat it.
+
+        Each seat takes it at its next turn (`RoomAgentResolver.persona_edited`). The count
+        is of conversations, which is what the persona editor tells the person.
+        """
+        return sum(
+            1 for runtime in self._rooms.values() if runtime.resolver.persona_edited(persona) > 0
+        )
+
     def seated_agent_ids(self) -> frozenset[str]:
         """Every agent id with a live instance seated in some room right now.
 
-        The half of "which clones are running" that `AgentSessionManager.list_agents()`
-        cannot see: a clone taking part in a conversation is built and cached by that
-        room's resolver, and never written back into the manager's chat map. Under D1
-        (design §1.3) every new conversation is a room, so this is the ordinary case and
-        not an edge one.
+        "Which clones are running": a clone taking part in a conversation is built and
+        cached by that room's resolver. Under D1 (design §1.3) every conversation is a
+        room, so this is every running clone; the session manager holds none.
 
         Union, not a per-room answer, because a clone is running if it is running
         anywhere; and unioned over the live rooms only, so a deleted room's agents stop
@@ -629,7 +650,9 @@ def _http_error(exc: Exception) -> HTTPException:
         return HTTPException(status_code=503, detail=str(exc))
     if isinstance(exc, (RoomAlreadyExistsError, SecondHumanInRoomError, StaleRoomWriteError)):
         return HTTPException(status_code=409, detail=str(exc))
-    if isinstance(exc, NothingToRetryError):
+    if isinstance(exc, (NothingToRetryError, HeadRoomWriteError)):
+        # A head room is not refused for anything in the request: the room has another
+        # writer (#1885). The sentence is plain and says where to continue.
         return HTTPException(status_code=409, detail=str(exc))
     if isinstance(exc, (UnknownRoomParticipantError, ParticipantNotResolvableError)):
         return HTTPException(status_code=400, detail=str(exc))
@@ -699,6 +722,82 @@ def _summary_payload(summary: Any) -> dict[str, Any]:
     }
 
 
+#: Methods that change nothing, which the head-room guard lets through.
+_READ_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+
+#: The one change the app may still make to a room a head keeps: deleting it (author's
+#: choice, #1885). Deleting is the person's act on their own conversation, not a second
+#: voice in it -- nothing is written into the room, so the head never reads a row or a
+#: seat session it did not write. A head still running recreates the room with its next
+#: turn (`record_head_turn`), and until then the app is the only place the person can
+#: remove it.
+_HEAD_ROOM_OWNER_ACTIONS = frozenset({("DELETE", "/api/rooms/{room_id}")})
+
+
+def _head_room_guard(service: RoomService) -> Callable[[Request], Coroutine[Any, Any, None]]:
+    """The one refusal of every app write to a room a head keeps (#1885).
+
+    A room has a single owner (owner ruling). A head's room (`RoomState.head`) is written
+    by that head alone, so any route here that would change it -- post, retry, compact,
+    rewind, clear, roster, rename, autonomy, presence, stop, typing -- is refused with a
+    409 *before* the route runs, and nothing is saved. The orchestrator's own refusal
+    (`HeadRoomWriteError`) stays under it for `ucx room say` and `retry`; this guard covers
+    the routes that write without the orchestrator (the service, the seat sessions, the
+    stack's autonomy and presence).
+
+    Attached by `_GuardedRoutes` to every route `register_room_routes` mounts rather than
+    called per route, so a route added later is guarded without anyone remembering to. `tests/unit/test_ui_room_api.py`
+    enumerates the mounted routes and asserts each non-read one is refused.
+
+    A room that is missing or will not load passes through: the route answers that in its
+    own words.
+    """
+
+    async def guard(request: Request) -> None:
+        if request.method in _READ_METHODS:
+            return
+        room_id = request.path_params.get("room_id")
+        if not isinstance(room_id, str):
+            return
+        route = request.scope.get("route")
+        if (request.method, getattr(route, "path", "")) in _HEAD_ROOM_OWNER_ACTIONS:
+            return
+        try:
+            state = service.get(room_id)
+        except (RoomError, UnreadableRoomRecordError):
+            return
+        head = room_head(state)
+        if head is not None:
+            raise _http_error(HeadRoomWriteError(head_room_write_refusal(head)))
+
+    return guard
+
+
+class _GuardedRoutes:
+    """`app`'s route decorators, each one carrying the head-room guard (#1885).
+
+    Not an `APIRouter` passed to `include_router`: FastAPI 0.141 mounts an included router
+    as a single lazy entry, so `app.routes` would stop listing the room routes one by one,
+    and the tests that enumerate or await a route by its path read that list.
+    """
+
+    def __init__(self, app: FastAPI, guard: Any) -> None:
+        self._app = app
+        self._dependencies = [guard]
+
+    def get(self, path: str, **kwargs: Any) -> Any:
+        return self._app.get(path, dependencies=self._dependencies, **kwargs)
+
+    def post(self, path: str, **kwargs: Any) -> Any:
+        return self._app.post(path, dependencies=self._dependencies, **kwargs)
+
+    def patch(self, path: str, **kwargs: Any) -> Any:
+        return self._app.patch(path, dependencies=self._dependencies, **kwargs)
+
+    def delete(self, path: str, **kwargs: Any) -> Any:
+        return self._app.delete(path, dependencies=self._dependencies, **kwargs)
+
+
 def register_room_routes(app: FastAPI, stack: RoomStack) -> None:
     """Mount `/api/rooms` on `app`.
 
@@ -709,6 +808,9 @@ def register_room_routes(app: FastAPI, stack: RoomStack) -> None:
     per open room.
     """
     service = stack.service
+    # Every route below is mounted through `router`, so every one of them passes the
+    # head-room guard: a route added later cannot skip it (#1885).
+    router = _GuardedRoutes(app, Depends(_head_room_guard(service)))
 
     def _room(room_id: str) -> RoomState:
         try:
@@ -716,7 +818,7 @@ def register_room_routes(app: FastAPI, stack: RoomStack) -> None:
         except Exception as exc:
             raise _http_error(exc) from exc
 
-    @app.get("/api/rooms")
+    @router.get("/api/rooms")
     async def list_rooms() -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
         """Every stored conversation, by title rather than by id.
 
@@ -729,14 +831,13 @@ def register_room_routes(app: FastAPI, stack: RoomStack) -> None:
             "unreadable": list(listing.unreadable),
         }
 
-    @app.post("/api/rooms", status_code=201)
+    @router.post("/api/rooms", status_code=201)
     async def create_room(req: dict[str, Any]) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
-        """Create a conversation and seat its roster.
+        """Create a conversation and seat its roster, in one write (#1885 item 3).
 
-        Two writes: `RoomService.create` takes a title and nothing else, and participants
-        arrive through `add_participant`. If the second fails the first is undone -- a
-        titled, empty room left in the list is indistinguishable from one somebody meant
-        to make, and the user is given no way to tell.
+        `RoomService.create` seats the roster before it saves, so a seat that is refused
+        leaves nothing behind: a titled, empty room left in the list is indistinguishable
+        from one somebody meant to make, and the user is given no way to tell.
         """
         try:
             policy = RoomPolicy.model_validate(req.get("policy") or {})
@@ -750,33 +851,30 @@ def register_room_routes(app: FastAPI, stack: RoomStack) -> None:
         # Checked before anything is written, so a bad id is a refusal rather than a
         # rollback.
         _refuse_an_unaddressable_id(human_id)
-        try:
-            state = service.create(title, policy=policy)
-        except Exception as exc:
-            raise _http_error(exc) from exc
         raw_agents: object = req.get("agent_ids") or []
         agent_ids: list[str] = (
             [str(item) for item in cast(list[object], raw_agents)]
             if isinstance(raw_agents, list)
             else []
         )
+        seats = [(human_id, ParticipantKind.HUMAN)]
+        seats += [(agent_id, ParticipantKind.AGENT) for agent_id in agent_ids]
         try:
-            state = service.add_participant(state.room_id, human_id, kind=ParticipantKind.HUMAN)
-            for agent_id in agent_ids:
-                state = service.add_participant(state.room_id, agent_id)
+            state = service.create(title, policy=policy, seats=seats)
         except Exception as exc:
-            _roll_back(service, state.room_id, exc)
             raise _http_error(exc) from exc
         return state.model_dump(mode="json")
 
-    @app.get("/api/rooms/{room_id}")
+    @router.get("/api/rooms/{room_id}")
     async def get_room(room_id: str) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
         """One conversation, roster and transcript included."""
         state = _room(room_id)
         active = stack.get_active_turn(room_id)
-        return {**state.model_dump(mode="json"), "active_turn": active}
+        # `head` as the guard reads it: an ACP or A2A room from before the mark is shown
+        # read-only too, not offered a composer every send of which is refused (#1885).
+        return {**state.model_dump(mode="json"), "head": room_head(state), "active_turn": active}
 
-    @app.patch("/api/rooms/{room_id}")
+    @router.patch("/api/rooms/{room_id}")
     async def rename_room(room_id: str, req: dict[str, Any]) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
         """Give a conversation a new title, carrying creation's refusals."""
         try:
@@ -786,7 +884,7 @@ def register_room_routes(app: FastAPI, stack: RoomStack) -> None:
         except Exception as exc:
             raise _http_error(exc) from exc
 
-    @app.delete("/api/rooms/{room_id}", status_code=204)
+    @router.delete("/api/rooms/{room_id}", status_code=204)
     async def delete_room(room_id: str) -> None:  # pyright: ignore[reportUnusedFunction]
         """Remove a conversation, and stop anything still running in it.
 
@@ -808,7 +906,7 @@ def register_room_routes(app: FastAPI, stack: RoomStack) -> None:
         except Exception as exc:
             raise _http_error(exc) from exc
 
-    @app.post("/api/rooms/{room_id}/participants")
+    @router.post("/api/rooms/{room_id}/participants")
     async def add_participant(room_id: str, req: dict[str, Any]) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
         """Seat somebody in a conversation that is already running."""
         _room(room_id)
@@ -828,7 +926,7 @@ def register_room_routes(app: FastAPI, stack: RoomStack) -> None:
         # The roster decides the chain, so the cached one is out of date.
         return state.model_dump(mode="json")
 
-    @app.delete("/api/rooms/{room_id}/participants/{participant_id}")
+    @router.delete("/api/rooms/{room_id}/participants/{participant_id}")
     async def remove_participant(room_id: str, participant_id: str) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
         """Remove somebody from a conversation."""
         _room(room_id)
@@ -838,7 +936,7 @@ def register_room_routes(app: FastAPI, stack: RoomStack) -> None:
             raise _http_error(exc) from exc
         return state.model_dump(mode="json")
 
-    @app.post("/api/rooms/{room_id}/messages", status_code=202)
+    @router.post("/api/rooms/{room_id}/messages", status_code=202)
     async def send_message(room_id: str, req: dict[str, Any]) -> JSONResponse:  # pyright: ignore[reportUnusedFunction]
         """Record a message and answer; the turns it causes run behind the response.
 
@@ -948,7 +1046,7 @@ def register_room_routes(app: FastAPI, stack: RoomStack) -> None:
         stack.drive(room_id, lambda: orch.resume(room_id, seq))
         return JSONResponse(status_code=202, content={"room_id": room_id, "seq": seq})
 
-    @app.post("/api/rooms/{room_id}/stop")
+    @router.post("/api/rooms/{room_id}/stop")
     async def stop_room(room_id: str) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
         """Take the floor back. The invariant without this control is a claim."""
         stack.cancel_room_loop(room_id)
@@ -959,7 +1057,7 @@ def register_room_routes(app: FastAPI, stack: RoomStack) -> None:
             raise _http_error(exc) from exc
         return _room(room_id).model_dump(mode="json")
 
-    @app.post("/api/rooms/{room_id}/typing", status_code=204)
+    @router.post("/api/rooms/{room_id}/typing", status_code=204)
     async def report_typing(room_id: str) -> None:  # pyright: ignore[reportUnusedFunction]
         """Report that the operator is composing -- a timestamp, never keystrokes."""
         state = _room(room_id)
@@ -968,7 +1066,7 @@ def register_room_routes(app: FastAPI, stack: RoomStack) -> None:
         except Exception as exc:
             raise _http_error(exc) from exc
 
-    @app.post("/api/rooms/{room_id}/autonomous")
+    @router.post("/api/rooms/{room_id}/autonomous")
     async def toggle_autonomous(room_id: str, req: dict[str, Any]) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
         """Toggle autonomous discussion mode for this room."""
         state = _room(room_id)
@@ -979,7 +1077,7 @@ def register_room_routes(app: FastAPI, stack: RoomStack) -> None:
             raise _http_error(exc) from exc
         return updated.model_dump(mode="json")
 
-    @app.post("/api/rooms/{room_id}/presence")
+    @router.post("/api/rooms/{room_id}/presence")
     async def report_presence(room_id: str, req: dict[str, Any]) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
         """Report whether the user is actively viewing this room."""
         state = _room(room_id)
@@ -1001,7 +1099,7 @@ def register_room_routes(app: FastAPI, stack: RoomStack) -> None:
             stack.drive(room_id, lambda: orch.resume(room_id, last_seq))
         return {"room_id": room_id, "active": active}
 
-    @app.post("/api/rooms/{room_id}/retry")
+    @router.post("/api/rooms/{room_id}/retry")
     async def retry_turn(room_id: str) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
         """Run a failed turn again without spending a fresh one."""
         state = _room(room_id)
@@ -1010,7 +1108,7 @@ def register_room_routes(app: FastAPI, stack: RoomStack) -> None:
         except Exception as exc:
             raise _http_error(exc) from exc
 
-    @app.get("/api/rooms/{room_id}/context")
+    @router.get("/api/rooms/{room_id}/context")
     async def read_context(room_id: str) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
         """How full each seat's context is, and whether the conversation can still continue.
 
@@ -1148,7 +1246,7 @@ def register_room_routes(app: FastAPI, stack: RoomStack) -> None:
             "saturation_threshold": SATURATION_TURNS_THRESHOLD,
         }
 
-    @app.post("/api/rooms/{room_id}/compact")
+    @router.post("/api/rooms/{room_id}/compact")
     async def compact_room(room_id: str, req: dict[str, Any] | None = None) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
         """Shorten the context of every seat, or of the one named in `participant_id`.
 
@@ -1217,7 +1315,7 @@ def register_room_routes(app: FastAPI, stack: RoomStack) -> None:
             )
         return {"room_id": room_id, "results": results}
 
-    @app.post("/api/rooms/{room_id}/history/truncate")
+    @router.post("/api/rooms/{room_id}/history/truncate")
     async def truncate_history(room_id: str, req: dict[str, Any]) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
         """Rewind the conversation to a message, and cut every seat back to match.
 
@@ -1242,7 +1340,7 @@ def register_room_routes(app: FastAPI, stack: RoomStack) -> None:
             raise _http_error(exc) from exc
         return _history_answer(state, _reseat_after_history_change(stack, state))
 
-    @app.delete("/api/rooms/{room_id}/history")
+    @router.delete("/api/rooms/{room_id}/history")
     async def clear_history(room_id: str) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
         """Empty this conversation, keeping its id, its title and who is in it.
 
@@ -1383,25 +1481,6 @@ def _reseat_after_history_change(stack: RoomStack, state: RoomState) -> tuple[st
                 exc_info=True,
             )
     return tuple(kept_stale)
-
-
-def _roll_back(service: RoomService, room_id: str, cause: Exception) -> None:
-    """Undo a room that could not be seated, without losing why it could not.
-
-    The delete had no failure path: when it raised, its own exception replaced the
-    refusal the caller needed to read, and the half-seated room stayed in the list --
-    both outcomes this route's docstring promised could not happen.
-    """
-    try:
-        service.delete(room_id)
-    except Exception:
-        logger.error(
-            "Room %s could not be seated (%s) and could not be removed either; it is "
-            "left in the store and will appear in the listing",
-            room_id,
-            cause,
-            exc_info=True,
-        )
 
 
 def _sole_human(state: RoomState) -> str:

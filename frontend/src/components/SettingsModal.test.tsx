@@ -2903,3 +2903,55 @@ describe('SettingsModal provider and model follow-ups (#1657, #1672)', () => {
     expect(screen.queryByText('vLLM HTTP 401')).toBeNull();
   });
 });
+
+describe('SettingsModal unreadable settings file (#1860)', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    window.localStorage.clear();
+  });
+
+  it('says in plain English that the unreadable settings file was kept beside the new one', async () => {
+    // Killed by: frontend/src/components/SettingsModal.tsx :: {currentSettings?.settings_set_aside && (
+    // Becomes: {false && (
+    mockFetch({ '/api/settings': () => jsonResponse({ ...baseSettings, settings_set_aside: true }) });
+    render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
+
+    const notice = await screen.findByTestId('settings-set-aside');
+    expect(notice.textContent).toBe(en.settings.setAside.notice);
+    expect(notice.textContent).toMatch(/kept that file unchanged beside the new one/);
+    expectPlain(notice.textContent);
+  });
+
+  it('says it in Korean, in 합니다체, when the screens are in Korean', async () => {
+    // Killed by: frontend/src/i18n/locales/ko/settings.json :: 표시되지 않습니다.
+    // Becomes: 표시되지 않음.
+    mockFetch({
+      '/api/settings': () =>
+        jsonResponse({ ...baseSettings, ui_language: 'ko', settings_set_aside: true }),
+    });
+    render(
+      <LocaleProvider hints={['ko-KR']}>
+        <SettingsModal {...devModeOff} isOpen onClose={() => {}} />
+      </LocaleProvider>,
+    );
+
+    const notice = await screen.findByTestId('settings-set-aside');
+    await waitFor(() => expect(notice.textContent).toBe(ko.settings.setAside.notice));
+    const copy = notice.textContent ?? '';
+    expectPlain(copy);
+    const sentences = copy.split(/(?<=\.)\s+/).filter(Boolean);
+    expect(sentences.length).toBeGreaterThan(0);
+    for (const sentence of sentences) expect(sentence).toMatch(/니다\.$/);
+    // Only "API" is allowed through untranslated; everything else is Korean.
+    expect(copy.replace(/API/g, '')).not.toMatch(/[A-Za-z]/);
+  });
+
+  it('shows no notice when the settings file was read', async () => {
+    mockFetch({ '/api/settings': () => jsonResponse({ ...baseSettings, settings_set_aside: false }) });
+    render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
+
+    // The language control sits right below the notice's place, so the section has rendered.
+    await screen.findByText(en.settings.language.title);
+    expect(screen.queryByTestId('settings-set-aside')).toBeNull();
+  });
+});

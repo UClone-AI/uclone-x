@@ -338,7 +338,7 @@ def test_a_registered_persona_named_scout_overrides_the_shipped_one() -> None:
     Returning the constant from the fallback branch is not what this pins -- the store hit
     short-circuits before any fallback runs, which is the point.
 
-    Killed by: src/uclone_x/agent/base.py :: if name in self._persona_store:
+    Killed by: src/uclone_x/agent/base.py :: if name in store:
     Becomes: if False:
     """
     agent = BaseAgent(config=AgentConfig(agent_id="host", name="Host"))

@@ -257,7 +257,12 @@ class TestShowMakesTheRecordedOutcomesVisible:
         result = _run("show", "room_fail")
 
         assert result.exit_code == 0, result.output
-        assert "RuntimeError: boom" in result.output
+        output = " ".join(result.output.split())
+        assert (
+            "scout couldn't finish this turn because something went wrong while it was answering."
+            in output
+        )
+        assert "RuntimeError" not in output and "boom" not in output
         assert "room retry" in result.output
         assert "room_fail" in result.output
 
@@ -292,7 +297,9 @@ class TestShowMakesTheRecordedOutcomesVisible:
 
         assert result.exit_code == 0, result.output
         output = " ".join(result.output.split())
-        assert "The model deepseek-r1:14b can't use tools" in output
+        assert "scout couldn't finish this turn: its model can't use tools, which clones need." in (
+            output
+        )
         assert "qwen3:8b" in output
         assert "ucx room retry room_nt --model <model>" in output
         assert "retry that turn with: ucx room retry room_nt" not in output
@@ -326,7 +333,10 @@ class TestShowMakesTheRecordedOutcomesVisible:
 
         assert result.exit_code == 0, result.output
         output = " ".join(result.output.split())
-        assert "The model gemini-1.5-pro is not available from Google" in output
+        assert (
+            "scout couldn't finish this turn: no model is chosen for it, or the one chosen is "
+            "not available from the provider." in output
+        )
         assert "ucx room retry room_mu --model <model>" in output
         assert "retry that turn with: ucx room retry room_mu" not in output
 
@@ -443,6 +453,139 @@ class TestShowMakesTheRecordedOutcomesVisible:
         assert "room retry" not in result.output
 
 
+_REPO = Path(__file__).resolve().parents[2]
+_FAILED_ROWS = _REPO / "frontend" / "src" / "test" / "room-failed-rows.json"
+_EN_CONVERSATION = _REPO / "frontend" / "src" / "i18n" / "locales" / "en" / "conversation.json"
+
+
+class TestAFailedRowIsShownInPlainWords:
+    """`ucx room show` says what the app says of a failed turn, not the raw cause (#1885).
+
+    `error` holds an exception's text for the log's reader -- a class name, an errno, a
+    path in the person's home -- and `room show` printed it after "turn failed:". The rows
+    here are the ones real failures land (`room-failed-rows.json`, which
+    `test_room_failed_row_copy.py` regenerates from real runs), the same rows the app's
+    own test reads.
+    """
+
+    @staticmethod
+    def _row(name: str) -> Any:
+        import json
+
+        from uclone_x.room.models import RoomMessage
+
+        rows = json.loads(_FAILED_ROWS.read_text(encoding="utf-8"))["rows"]
+        return RoomMessage.model_validate_json(json.dumps(rows[name]))
+
+    @pytest.mark.parametrize(
+        ("name", "sentence"),
+        [
+            (
+                "raised",
+                "scout couldn't finish this turn because something went wrong while it was "
+                "answering.",
+            ),
+            (
+                "provider",
+                "scout couldn't finish this turn because something went wrong while it was "
+                "answering.",
+            ),
+            (
+                "refused",
+                "scout couldn't finish this turn: it has used all the tokens this conversation "
+                "allows.",
+            ),
+        ],
+    )
+    def test_a_real_failure_reads_as_the_app_reads_it_and_leaks_nothing(
+        self, rooms: RoomStore, name: str, sentence: str
+    ) -> None:
+        """The raw cause is replaced by the app's sentence, and nothing of it is left.
+
+        Killed by: src/uclone_x/cli/commands/room.py :: f"[red]{escape(turn_failure_sentence(message))}[/red]"
+        Becomes: f"[red]turn failed: {escape(message.error)}[/red]"
+        """
+        from uclone_x.room.models import RoomMessage
+
+        row = self._row(name)
+        assert row.error, "the fixture row carries no raw cause; nothing here would be tested"
+        _seed(rooms, "room_failed", RoomMessage(seq=1, sender_id="alice", content="hi"), row)
+
+        result = _run("show", "room_failed")
+
+        assert result.exit_code == 0, result.output
+        output = " ".join(result.output.split())
+        assert sentence in output
+        assert row.error not in output
+        for internal in ("/home/reader", ".uclone", "Errno", "Error", "turn failed", "0/0"):
+            assert internal not in output, internal
+
+    def test_a_stopped_turn_says_it_was_stopped(self) -> None:
+        """A stopped turn does not read as one that went wrong.
+
+        Killed by: src/uclone_x/cli/commands/room.py :: if not message.completed:
+        Becomes: if False:
+        """
+        from uclone_x.room.models import RoomMessage
+
+        row = RoomMessage(seq=2, sender_id="scout", content="", error="cancelled", completed=False)
+
+        assert room_cmd.turn_failure_sentence(row) == (
+            "scout was stopped before finishing this turn."
+        )
+
+    def test_the_copy_is_the_apps_english_copy(self) -> None:
+        """The terminal's sentences are the app's, word for word, so the two cannot drift.
+
+        Read from the app's locale file rather than restated: a copy edit there fails here
+        until the terminal says the same.
+        """
+        import json
+
+        from uclone_x.agent.models import ProviderFailure
+        from uclone_x.errors import ProviderAuthError
+        from uclone_x.room.models import RoomMessage, RoomTurnRefusal
+
+        copy = json.loads(_EN_CONVERSATION.read_text(encoding="utf-8"))
+
+        def find(tree: Any) -> Any:
+            if isinstance(tree, dict):
+                node = cast(dict[str, Any], tree)
+                if "refusalReasonOther" in node:
+                    return node
+                for value in node.values():
+                    found = find(value)
+                    if found is not None:
+                        return found
+            return None
+
+        outcome = find(copy)
+        assert outcome is not None, "the app's turn-outcome copy moved; point this test at it"
+
+        def fill(template: str, **values: str) -> str:
+            for key, value in values.items():
+                template = template.replace("{" + key + "}", value)
+            return template
+
+        for refusal in RoomTurnRefusal:
+            row = RoomMessage(seq=2, sender_id="scout", content="", error="raw", refusal=refusal)
+            reason = outcome["refusalReason"].get(refusal.value, outcome["refusalReasonOther"])
+            assert room_cmd.turn_failure_sentence(row) == fill(
+                outcome["refused"], label="scout", reason=reason
+            ), refusal
+        failure = ProviderFailure.of(ProviderAuthError(provider="Anthropic", model="m"))
+        row = RoomMessage(
+            seq=2, sender_id="scout", content="", error="raw", provider_failure=failure
+        )
+        assert room_cmd.turn_failure_sentence(row) == fill(
+            outcome["providerFailed"], label="scout", message=failure.message
+        )
+        stopped = RoomMessage(seq=2, sender_id="scout", content="", error="x", completed=False)
+        assert room_cmd.turn_failure_sentence(stopped) == fill(outcome["stopped"], label="scout")
+        wrong = RoomMessage(seq=2, sender_id="scout", content="", error="x")
+        assert room_cmd.turn_failure_sentence(wrong) == fill(outcome["wentWrong"], label="scout")
+
+
 class TestRetryCommand:
     def test_retry_drives_the_core_and_renders_what_came_back(
         self, rooms: RoomStore, monkeypatch: pytest.MonkeyPatch
@@ -543,6 +686,52 @@ class TestRoster:
         _run("create", "Room", "--id", "room_rn")
         result = _run("remove", "room_rn", "ghost")
         assert result.exit_code == 1
+
+
+class TestAHeadRoomIsNotRearrangedHere:
+    """`add`, `remove` and `responder` refuse a head's room, as `say` and `retry` do (#1885)."""
+
+    @staticmethod
+    def _head_room(rooms: RoomStore, room_id: str) -> RoomState:
+        from uclone_x.room.one_seat import HeadTurn, record_head_turn
+
+        return record_head_turn(
+            rooms,
+            room_id=room_id,
+            clone_id="scout",
+            turn=HeadTurn(prompt="what is in the index?", content="three tables"),
+            head="loop",
+        )
+
+    @pytest.mark.parametrize(
+        "args",
+        [
+            ("add", "{room}", "critic"),
+            ("add", "{room}", "alice", "--human"),
+            ("remove", "{room}", "scout"),
+            ("responder", "{room}", "scout"),
+            ("responder", "{room}", "--clear"),
+        ],
+    )
+    def test_the_refusal_is_plain_and_nothing_is_written(
+        self, rooms: RoomStore, args: tuple[str, ...]
+    ) -> None:
+        """Left alone, each command seats, unseats or re-points the head's one-seat room.
+
+        Killed by: src/uclone_x/room/service.py :: head = room_head(state)
+        Becomes: head = None
+        """
+        room_id = self._head_room(rooms, "room_head_cli").room_id
+        before = rooms.load(room_id)
+
+        result = _run(*(a.format(room=room_id) for a in args))
+
+        assert result.exit_code == 1, result.output
+        assert " ".join(result.output.split()) == (
+            "✖ This conversation belongs to ucx loop, so only ucx loop can continue it. "
+            "You can read it here."
+        )
+        assert rooms.load(room_id) == before
 
 
 class TestSay:
@@ -1029,3 +1218,42 @@ class TestTheCliSeatsAgentsWithMemory:
         assert alpha.storage_path != beta.storage_path
         assert alpha.storage_path is not None
         assert str(tmp_path) in str(alpha.storage_path)
+
+
+class TestARowSaysAnEarlierConversationWasKept:
+    """`ucx room` prints the row notice the room's web head shows (#1860)."""
+
+    def _printed(self, monkeypatch: pytest.MonkeyPatch, *, set_aside: bool) -> str:
+        import io
+
+        from rich.console import Console
+
+        from uclone_x.room.models import RoomMessage
+
+        out = io.StringIO()
+        monkeypatch.setattr(room_cmd, "console", Console(file=out, width=400))
+        before = RoomState(room_id="room_kept", title="t")
+        after = RoomState(
+            room_id="room_kept",
+            title="t",
+            transcript=(
+                RoomMessage(seq=1, sender_id="scout", content="hi", session_set_aside=set_aside),
+            ),
+        )
+        room_cmd._render_new_rows(before, after)  # pyright: ignore[reportPrivateUsage]
+        return out.getvalue()
+
+    def test_the_row_says_it_in_plain_words(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The speaker's earlier conversation was kept aside: the row says so, plainly.
+
+        Killed by: src/uclone_x/cli/commands/room.py :: if row.session_set_aside:
+        Becomes: if False:
+        """
+        printed = self._printed(monkeypatch, set_aside=True)
+        assert room_cmd._session_set_aside_line("scout") in printed  # pyright: ignore[reportPrivateUsage]
+
+    def test_a_row_without_it_says_nothing_of_the_kind(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        printed = self._printed(monkeypatch, set_aside=False)
+        assert "could not open" not in printed

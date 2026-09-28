@@ -26,7 +26,7 @@ world?* — and imports may only point downward.
  ├─ ADAPTER ── implements a kernel protocol against something real ───────────┤
  │  llm/connectors/*   tools/builtin/*   sandbox/{path_validator,               │
  │  workspace_runner}  telemetry/{otlp,langfuse,otel_sdk,exporter}             │
- │  memory/store  room/store  room/knowledge_store  story/{library,work,…}     │
+ │  memory/store  room/store  room/seat_knowledge_import  story/{library,…}    │
  │  artifacts/library  core/{log_writer,logging_setup,failure_journal,…}       │
  │  ontology/{engine,reasoner,rules,justification}  code_intel/  adapters/     │
  ├─ KERNEL ── pure Python; contracts, models, decisions ──────────────────────┤
@@ -180,8 +180,8 @@ not covered by it, because the test compares layers, not rows within one layer.
    id rule in `core/session.py`, `SessionState` and its anchor and snapshot types in
    `core/session_state.py`, and the persona, LLM-config and plan models it carries in
    `core/models.py`. `agent/session.py` and `agent/models.py` re-export them under their old
-   names, and `agent/session.py` keeps the file-backed `SessionStore`. `room/service.py` and
-   `room/knowledge_store.py` take the id rule from `core/session.py`; `room/store.py` still
+   names, and `agent/session.py` keeps the file-backed `SessionStore`. `room/service.py` takes
+   the id rule from `core/session.py`; `room/store.py` still
    imports `resolve_session_path` through `agent/session.py`.
 4. **Eager re-exports.** About half of `ACCEPTED_EDGES` is a package `__init__.py`
    re-exporting its own adapters, which is why importing `uclone_x.agent` loads provider

@@ -51,7 +51,6 @@ async def test_the_public_compaction_runs_the_agents_own_unguarded_pass() -> Non
         sid: str,
         reason: str,
         *,
-        hold_unseen_step: bool = False,
         reader_offered: bool | None = None,
     ) -> CompactionResult:
         calls.append((sid, reason))
@@ -67,9 +66,9 @@ async def test_the_public_compaction_runs_the_agents_own_unguarded_pass() -> Non
 async def test_the_auto_compaction_asks_the_agents_own_threshold_check() -> None:
     """`_auto_compact_if_needed` consults `_should_compact_session` through the agent.
 
-    `test_tool_binder.py` forces a compaction mid-turn by replacing that check on the
-    instance. Were the driver to hold its own, the forced pass would never run and those
-    tests would pass on a turn that compacted nothing.
+    `test_tool_binder.py` forces a compaction at a turn start by replacing that check on
+    the instance. Were the driver to hold its own, the forced pass would never run and
+    those tests would pass on a turn that compacted nothing.
 
     Killed by: src/uclone_x/agent/base.py :: should_compact_session=lambda: self._should_compact_session,
     Becomes: should_compact_session=lambda: self._compaction_driver.should_compact_session,
@@ -89,7 +88,6 @@ async def test_the_auto_compaction_asks_the_agents_own_threshold_check() -> None
         sid: str,
         reason: str,
         *,
-        hold_unseen_step: bool = False,
         reader_offered: bool | None = None,
     ) -> CompactionResult:
         reasons.append(reason)

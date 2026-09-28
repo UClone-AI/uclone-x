@@ -1,7 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { fireEvent, render, screen, within } from '@testing-library/react';
-import { RemembersPanel, editRefusedSentence, readFailedSentence } from './RemembersPanel';
-import type { KnownFact, SeatKnowledge } from '../../lib/roomDock';
+import {
+  RemembersPanel,
+  editRefusedSentence,
+  readFailedSentence,
+  workedOutFromSentence,
+} from './RemembersPanel';
+import type { KnownFact, SeatKnowledge, WorkedOut } from '../../lib/roomDock';
 import { ABSENCE_CLAIM } from '../../lib/absenceGuard';
 import { ko } from '../../i18n/ko';
 
@@ -109,20 +114,6 @@ describe('RemembersPanel: one clone-wide list in two groups (#1638 step 3)', () 
     expect(container.textContent ?? '').not.toMatch(FORBIDDEN);
   });
 
-  it('lists the facts whatever the per-seat record says, and does not show its reason', async () => {
-    const recordReason = 'Scout has no knowledge record in this conversation.';
-    answers[URL_A] = knowledge(
-      [fact('Kenny favourite colour teal', { learned_here: false })],
-      null,
-      'not_recorded',
-      recordReason,
-    );
-    render(<RemembersPanel roomId="room-a" seatId="scout" seatName="Scout" />);
-    expect(await screen.findAllByTestId('known-fact')).toHaveLength(1);
-    expect(screen.queryByText(recordReason)).toBeNull();
-    expect(screen.queryByTestId('remembers-here')).toBeNull();
-  });
-
   it('shows the Core’s sentence when there are no facts to list, or they could not be read', async () => {
     // Killed by: frontend/src/components/artifacts/RemembersPanel.tsx :: data.facts_reason ??
     // Becomes: null ??
@@ -137,7 +128,7 @@ describe('RemembersPanel: one clone-wide list in two groups (#1638 step 3)', () 
     unmount();
 
     const unread = 'What Scout knows could not be read, so it cannot be shown.';
-    answers[URL_A] = knowledge(null, unread, 'unreadable');
+    answers[URL_A] = knowledge(null, unread);
     render(<RemembersPanel roomId="room-a" seatId="scout" seatName="Scout" />);
     expect(await screen.findByTestId('remembers-reason')).toHaveTextContent(unread);
   });
@@ -172,6 +163,79 @@ describe('RemembersPanel: one clone-wide list in two groups (#1638 step 3)', () 
     rerender(<RemembersPanel roomId="room-a" seatId="critic" />);
     await screen.findByText(/ropes fray/);
     expect(screen.queryByText(/tide is a rhythm/)).toBeNull();
+  });
+});
+
+describe('RemembersPanel: what the clone worked out from its facts (#1870)', () => {
+  const postgres = fact('Project X uses Postgres 16', { fact_id: 'mem_pg' });
+  const hanbit = fact('Kenny works at Hanbit', {
+    fact_id: 'mem_hb',
+    learned_here: false,
+  });
+  const withWorkedOut = (
+    worked_out: WorkedOut[] | null,
+    facts: KnownFact[] | null = [postgres, hanbit],
+  ) => ({ ...knowledge(facts), worked_out }) as SeatKnowledge;
+
+  it('lists each worked-out statement after the facts, with the facts it rests on', async () => {
+    // Killed by: frontend/src/components/artifacts/RemembersPanel.tsx :: const workedOut: WorkedOut[] = (facts && data.worked_out) ?? [];
+    // Becomes: const workedOut: WorkedOut[] = [];
+    answers[URL_A] = withWorkedOut([
+      { statement: "Project X's database is relational", because: ['mem_pg'] },
+      { statement: 'Kenny works in Seoul', because: ['mem_hb', 'mem_pg'] },
+    ]);
+    const { container } = render(
+      <RemembersPanel roomId="room-a" seatId="scout" seatName="Scout" />,
+    );
+
+    const group = await screen.findByTestId('remembers-worked-out');
+    expect(group).toHaveTextContent('Worked out from these facts');
+    const lines = within(group).getAllByTestId('worked-out-line');
+    expect(lines.map((l) => l.textContent)).toEqual([
+      "Project X's database is relationalworked outFrom: Project X uses Postgres 16",
+      'Kenny works in Seoulworked outFrom: Kenny works at Hanbit; Project X uses Postgres 16',
+    ]);
+    // Corrected or forgotten through the facts it names, so it has no menu of its own.
+    expect(within(group).queryByTestId('fact-actions')).toBeNull();
+    // After both fact groups.
+    const order = Array.from(container.querySelectorAll('section')).map((n) => n.dataset.testid);
+    expect(order).toEqual(['remembers-here', 'remembers-elsewhere', 'remembers-worked-out']);
+    expect(container.textContent ?? '').not.toMatch(FORBIDDEN);
+  });
+
+  it.each([
+    ['nothing worked out', [] as WorkedOut[]],
+    ['could not be worked out', null],
+  ])('draws no group and says nothing more when %s', async (_label, worked) => {
+    answers[URL_A] = withWorkedOut(worked);
+    const { container } = render(
+      <RemembersPanel roomId="room-a" seatId="scout" seatName="Scout" />,
+    );
+    await screen.findByTestId('remembers-here');
+    expect(screen.queryByTestId('remembers-worked-out')).toBeNull();
+    expect(screen.queryByTestId('remembers-reason')).toBeNull();
+    expect(container.textContent ?? '').not.toMatch(ABSENCE_CLAIM);
+  });
+
+  it('names only facts it can say, never an id', () => {
+    // Killed by: frontend/src/components/artifacts/RemembersPanel.tsx :: .filter((statement): statement is string => Boolean(statement));
+    // Becomes: .map((statement) => statement ?? 'mem_unknown');
+    expect(workedOutFromSentence(['mem_gone', 'mem_pg'], [postgres])).toBe(
+      'From: Project X uses Postgres 16',
+    );
+    expect(workedOutFromSentence(['mem_gone'], [postgres])).toBeNull();
+  });
+
+  it('says it in Korean when the screen is Korean', () => {
+    const copy = ko.dock.remembers;
+    const said = workedOutFromSentence(['mem_pg', 'mem_hb'], [postgres, hanbit], copy);
+    expect(said).toBe('근거: Project X uses Postgres 16; Kenny works at Hanbit');
+    for (const line of [copy.workedOutHeading, copy.workedOut]) {
+      expect(line).toMatch(/[가-힣]/);
+      expect(line).not.toMatch(/[A-Za-z]/);
+    }
+    // 합니다체 headings are noun phrases; no line ends in a plain-form verb.
+    expect(copy.workedOutHeading).not.toMatch(/다\.?$/);
   });
 });
 
@@ -319,7 +383,9 @@ describe('RemembersPanel: a failed read shows no transport text (#1401)', () => 
 
     const { container } = render(<RemembersPanel roomId="room-a" seatId="scout" seatName="Scout" />);
     expect(
-      await screen.findByTestId('remembers-reason', undefined, { timeout: 5000 }),
+      await screen.findByTestId('remembers-reason', undefined, {
+        timeout: 5000,
+      }),
     ).toHaveTextContent(readFailedSentence('Scout'));
     expect(container.textContent ?? '').not.toMatch(TECHNICAL);
   });

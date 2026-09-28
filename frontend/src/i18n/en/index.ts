@@ -43,6 +43,7 @@ import toolSteps from '../locales/en/toolSteps.json';
 import usage from '../locales/en/usage.json';
 import avatar from '../locales/en/avatar.json';
 import images from '../locales/en/images.json';
+import links from '../locales/en/links.json';
 
 export const en = {
   settings,
@@ -64,6 +65,7 @@ export const en = {
   usage,
   avatar,
   images,
+  links,
 };
 
 export type Messages = typeof en;

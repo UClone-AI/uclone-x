@@ -350,8 +350,10 @@ class _FakeGenerateImage(BaseTool[_ImageParams]):
 
 
 class _PlanningLLM(BaseLLMConnector):
-    """Answers a structured request with `plan` (or raises), and turns by the step.
+    """Answers a planning request with `plan` (or raises), and turns by the step.
 
+    The Artist's case-skill extraction (#1828) is also a structured request; it is
+    answered with no facts and kept out of `structured`, which counts planning calls.
     The turn's step replies are keyed on whether a tool result is already in the request,
     not on a queue running out: the first step calls the tool, the step after the result
     answers in text, exactly as a model that obeys would.
@@ -369,6 +371,8 @@ class _PlanningLLM(BaseLLMConnector):
 
     async def generate(self, request: LLMRequest) -> ModelResponse:
         if request.response_schema is not None:
+            if "medium_quote" in str(request.response_schema.get("properties")):
+                return _reply('{"medium_quote": "", "minimal_quote": "", "attribute_quotes": []}')
             self.structured.append(request)
             if isinstance(self._plan, Exception):
                 raise self._plan
@@ -449,8 +453,8 @@ _ASK = "은발 엘프 궁수 캐릭터로 다양한 포즈 3장 그려줘"
 
 @pytest.mark.asyncio
 async def test_plan_note_follows_the_latest_user_message(tmp_path: Path) -> None:
-    """Killed by: src/uclone_x/agent/turn_executor.py :: turn_extra_sections = list(present_sections(undone_section, image_set_section))
-    Becomes: turn_extra_sections = list(present_sections(undone_section))
+    """Killed by: src/uclone_x/agent/turn_executor.py :: present_sections(undone_section, image_set_section, case_section)
+    Becomes: present_sections(undone_section, case_section)
     """
     llm = _PlanningLLM(_plan_json(3))
     result = await _agent(llm, tmp_path).execute_turn(_ASK)

@@ -22,6 +22,7 @@ import yaml
 from fastapi.testclient import TestClient
 from pydantic import BaseModel, Field
 
+from tests.support.app_clone import app_clone
 from uclone_x.agent import persona_registry
 from uclone_x.agent.base import BaseAgent
 from uclone_x.agent.models import BASE_PERSONA_TOOLS
@@ -106,16 +107,26 @@ def _client(workspace: Path, llm: MockLLMConnector | None = None) -> TestClient:
     return TestClient(app)
 
 
-async def _take_turn(manager: AgentSessionManager, agent_id: str, session_id: str) -> None:
-    """One chat turn with the persona, the way a room seat drives its clone."""
-    agent = await manager.get_or_create_agent(agent_id, session_id=session_id)
+async def _take_turn(agent: BaseAgent) -> None:
+    """One turn with the persona, the way a room seat drives its clone."""
     result = await agent.execute_turn("go")
     assert result.error is None, result.error
 
 
-def _turn(client: TestClient, agent_id: str, session_id: str) -> None:
-    manager = cast(AgentSessionManager, cast(Any, client.app).state.session_manager)
-    asyncio.run(_take_turn(manager, agent_id, session_id))
+def _manager(client: TestClient) -> AgentSessionManager:
+    return cast(AgentSessionManager, cast(Any, client.app).state.session_manager)
+
+
+def _saved(client: TestClient, name: str) -> Any:
+    """Persona `name` as the registry now reads it, after the head's writes."""
+    manager = _manager(client)
+    return persona_registry.get_default_persona_registry(
+        manager.workspace_dir, tool_names=[tool.name for tool in manager.tools.list_tools()]
+    ).get_persona(name)
+
+
+def _turn(client: TestClient, agent: BaseAgent) -> None:
+    asyncio.run(_take_turn(agent))
 
 
 def _draft(name: str = "surveyor", **overrides: Any) -> dict[str, Any]:
@@ -477,7 +488,7 @@ def test_an_invalid_payload_is_refused_not_trimmed(
 def test_a_running_agent_takes_the_edited_prompt_and_tools_on_its_next_turn(
     workspace: Path,
 ) -> None:
-    """An open conversation with the persona uses the edit on its next turn, tools included.
+    """An agent given the edited persona uses the edit on its next turn, tools included.
 
     The prompt alone would follow the registry by itself -- the agent re-resolves it on every
     read -- so asserting the prompt could not see the defect this pins. The tools are the
@@ -486,14 +497,19 @@ def test_a_running_agent_takes_the_edited_prompt_and_tools_on_its_next_turn(
     registry in a proxy fixed at creation. Either one kept the old tools in force behind the
     new prompt.
 
+    The agent is built as the app builds a clone and handed the edit by `define_persona`,
+    the call that puts an edited persona in force on a running agent (#1893 item 4: the
+    chat-only agent cache that used to make that call is no longer written).
+
     Killed by: src/uclone_x/agent/bootstrap.py :: allowed_tools=(),  # the persona's list, resolved by the agent
     Becomes: allowed_tools=persona.granted_tools,
     """
     llm = _RecordingConnector()
     client = _client(workspace, llm)
     assert client.post("/api/personas", json=_draft()).status_code == 201
+    agent = app_clone(_manager(client), "surveyor", "sess_survey")
 
-    _turn(client, "surveyor", "sess_survey")
+    _turn(client, agent)
     assert _system_sent(llm.requests[-1]) == "You survey.\nReport  \n what you map."
     assert _own_tools_sent(llm.requests[-1]) == ["map_area"]
 
@@ -502,36 +518,11 @@ def test_a_running_agent_takes_the_edited_prompt_and_tools_on_its_next_turn(
         json=_draft(system_prompt="You dig now.", allowed_tools=["dig_site"]),
     )
     assert res.status_code == 200, res.text
-    assert res.json()["live_agents_updated"] == 1
+    agent.define_persona(_saved(client, "surveyor"))
 
-    _turn(client, "surveyor", "sess_survey")
+    _turn(client, agent)
     assert _system_sent(llm.requests[-1]) == "You dig now."
     assert _own_tools_sent(llm.requests[-1]) == ["dig_site"]
-
-
-def test_an_edit_reaches_every_live_agent_seated_as_that_persona_and_no_other(
-    workspace: Path,
-) -> None:
-    """Two conversations with the persona both take the edit; another persona's does not.
-
-    Killed by: src/uclone_x/ui/app.py :: if agent.persona != persona.name or id(agent) in seen:
-    Becomes: if id(agent) in seen:
-    """
-    llm = _RecordingConnector()
-    client = _client(workspace, llm)
-    assert client.post("/api/personas", json=_draft()).status_code == 201
-    assert client.post("/api/personas", json=_draft(name="digger")).status_code == 201
-    for agent_id, session_id in (("surveyor", "s1"), ("surveyor", "s2"), ("digger", "s3")):
-        _turn(client, agent_id, session_id)
-
-    res = client.put(
-        "/api/personas/surveyor", json=_draft(system_prompt="Edited.", allowed_tools=["dig_site"])
-    )
-
-    assert res.json()["live_agents_updated"] == 2
-    _turn(client, "digger", "s3")
-    assert _system_sent(llm.requests[-1]) == "You survey.\nReport  \n what you map."
-    assert _own_tools_sent(llm.requests[-1]) == ["map_area"]
 
 
 def test_a_sub_agent_of_a_tool_scoped_persona_gets_only_the_parent_s_tools_edits_included(
@@ -562,9 +553,8 @@ def test_a_sub_agent_of_a_tool_scoped_persona_gets_only_the_parent_s_tools_edits
         portal = client.portal
         assert portal is not None
         assert client.post("/api/personas", json=_draft()).status_code == 201
-        portal.call(_take_turn, manager, "surveyor", "sess_sub")
-        parent = manager.get_agent("surveyor", "sess_sub")
-        assert parent is not None
+        parent = app_clone(manager, "surveyor", "sess_sub")
+        portal.call(_take_turn, parent)
 
         def offered_to_a_child(parent: BaseAgent) -> list[str]:
             child = portal.call(parent.spawn_subagent, "helper", "help")
@@ -575,6 +565,7 @@ def test_a_sub_agent_of_a_tool_scoped_persona_gets_only_the_parent_s_tools_edits
 
         edit = client.put("/api/personas/surveyor", json=_draft(allowed_tools=["dig_site"]))
         assert edit.status_code == 200, edit.text
+        parent.define_persona(_saved(client, "surveyor"))
         assert offered_to_a_child(parent) == ["dig_site"]
 
         child = portal.call(parent.spawn_subagent, "helper", "help")

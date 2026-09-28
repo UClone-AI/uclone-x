@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -12,14 +13,31 @@ from rich.markup import escape
 
 from uclone_x.agent.base import BaseAgent
 from uclone_x.agent.clone_builder import AppScope, build_clone, local_app_scope, memory_map
+from uclone_x.agent.models import TurnResult
 from uclone_x.agent.persona_registry import get_default_persona_registry
 from uclone_x.agent.persona_store import DEFAULT_PERSONA_NAME
 from uclone_x.agent.session import SessionStore
 from uclone_x.cli.agent_memory import memory_for_agent_id
 from uclone_x.engine.event_bus import EventBus
 from uclone_x.llm.connectors.factory import create_llm_connector, saved_choice_notice
+from uclone_x.room.one_seat import (
+    HeadTurn,
+    conversation_room_id,
+    head_room_person_names,
+    record_head_turn,
+    resolve_one_seat_room,
+)
+from uclone_x.room.service import RoomService, participant_session_id
+from uclone_x.room.store import RoomStore
 from uclone_x.shells.acp import ACPServer
-from uclone_x.shells.acp.server import SessionAgentFactory
+from uclone_x.shells.acp.server import (
+    DEFAULT_MAX_LIVE_AGENTS,
+    ACPTurnFailure,
+    PersonNames,
+    SeatSessionName,
+    SessionAgentFactory,
+    TurnRecorder,
+)
 from uclone_x.telemetry import TelemetryTracer
 from uclone_x.tools.registry import create_default_registry
 
@@ -33,8 +51,31 @@ console = Console()
 err_console = Console(stderr=True)
 
 
-def session_agent_factory(app: AppScope, **clone: Any) -> SessionAgentFactory:
+def acp_seat_session(clone_id: str) -> SeatSessionName:
+    """The seat session `clone_id` keeps for an ACP session id: its one-seat room's (§5.9).
+
+    Keyed by clone and ACP session id (owner ruling 2026-09-27), so two clones served
+    under one ACP session id never share a room. Pure: naming a session creates no room,
+    so `load_session` on an id never started finds nothing, as before.
+    """
+
+    def seat(session_id: str) -> str:
+        return participant_session_id(conversation_room_id("acp", clone_id, session_id), clone_id)
+
+    return seat
+
+
+def session_agent_factory(
+    app: AppScope, *, clone_id: str, room_store: RoomStore | None = None, **clone: Any
+) -> SessionAgentFactory:
     """Build each ACP session's agent: one clone, built per session (#1454, #1731).
+
+    Each ACP session is a one-seat room (§5.9): the room `acp_seat_session` names is
+    checked -- a stored one must seat the clone alone -- and the agent is built on the
+    clone's seat session in it. Nothing is written here: the room is stored with the
+    session's first turn (`acp_turn_recorder`), so a `session/new` whose save fails, or a
+    session never prompted, leaves no room behind (#1846). The room is kept in
+    `room_store` (the Core default).
 
     Every session gets an agent of its own, so no session's history reaches another's
     request, while everything that is the *agent's* rather than the conversation's -- the
@@ -45,9 +86,82 @@ def session_agent_factory(app: AppScope, **clone: Any) -> SessionAgentFactory:
     """
 
     def build(session_id: str) -> BaseAgent:
-        return build_clone(app, session_id=session_id, **clone).agent
+        room = resolve_one_seat_room(
+            RoomService(room_store if room_store is not None else RoomStore()),
+            room_id=conversation_room_id("acp", clone_id, session_id),
+            clone_id=clone_id,
+            head="acp",
+        )
+        return build_clone(app, clone_id=clone_id, session_id=room.session_id, **clone).agent
 
     return build
+
+
+def acp_turn_recorder(clone_id: str, room_store: RoomStore | None = None) -> TurnRecorder:
+    """Record each ACP turn in its session's one-seat room transcript (#1837).
+
+    The room is created with the session's first turn. A turn the room could not take
+    raises here, which the server logs; the client's answer is unaffected.
+    """
+    store = room_store if room_store is not None else RoomStore()
+
+    def record(
+        session_id: str,
+        prompt: str,
+        outcome: TurnResult | ACPTurnFailure,
+        session_set_aside: bool = False,
+    ) -> None:
+        turn = (
+            HeadTurn.failed(prompt, outcome.cause, completed=outcome.completed)
+            if isinstance(outcome, ACPTurnFailure)
+            else HeadTurn.from_result(prompt, outcome)
+        )
+        turn = replace(turn, session_set_aside=session_set_aside)
+        record_head_turn(
+            store,
+            room_id=conversation_room_id("acp", clone_id, session_id),
+            clone_id=clone_id,
+            turn=turn,
+            head="acp",
+        )
+
+    return record
+
+
+def acp_person_names(clone_id: str, room_store: RoomStore | None = None) -> PersonNames:
+    """The names the person goes by in an ACP session's one-seat room (#1893 item 1)."""
+    rooms = RoomService(room_store if room_store is not None else RoomStore())
+
+    def names(session_id: str) -> tuple[str, ...]:
+        return head_room_person_names(rooms, conversation_room_id("acp", clone_id, session_id))
+
+    return names
+
+
+def one_seat_acp_server(
+    app: AppScope,
+    *,
+    clone_id: str,
+    bus: EventBus | None = None,
+    room_store: RoomStore | None = None,
+    max_live_agents: int = DEFAULT_MAX_LIVE_AGENTS,
+    **clone: Any,
+) -> ACPServer:
+    """An ACP server answering as `clone_id`, each ACP session a one-seat room (§5.9).
+
+    The agent factory and the server's session names are made together here, because
+    one without the other would build every agent on a session the server never reads.
+    `bus` is the one in `app`, which the server subscribes to for a turn's events.
+    """
+    return ACPServer(
+        agent_factory=session_agent_factory(app, clone_id=clone_id, room_store=room_store, **clone),
+        seat_session=acp_seat_session(clone_id),
+        turn_recorder=acp_turn_recorder(clone_id, room_store),
+        person_names=acp_person_names(clone_id, room_store),
+        bus=bus,
+        store=app.host.store,
+        max_live_agents=max_live_agents,
+    )
 
 
 #: What `--agent-id` says it does. Shared by `ucx acp serve` and `ucx acp-server`.
@@ -106,11 +220,7 @@ def start_acp_server(agent_id: str | None = None, persona: str = DEFAULT_PERSONA
         skills=asyncio.run(load_runtime_skill_registry()),
     )
 
-    server = ACPServer(
-        agent_factory=session_agent_factory(app, clone_id=clone_id, persona=persona_def.name),
-        bus=bus,
-        store=store,
-    )
+    server = one_seat_acp_server(app, clone_id=clone_id, bus=bus, persona=persona_def.name)
 
     asyncio.run(server.run_stdio())
 

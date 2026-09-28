@@ -35,6 +35,7 @@ from uclone_x.skills.protocols import SkillSynthesizerProtocol
 
 __all__ = [
     "SkillSynthesizer",
+    "one_line",
 ]
 
 _IDENTIFIER_PATTERN: re.Pattern[str] = re.compile(r"^[a-zA-Z0-9_\-]+$")
@@ -43,11 +44,6 @@ _IDENTIFIER_PATTERN: re.Pattern[str] = re.compile(r"^[a-zA-Z0-9_\-]+$")
 _NO_SESSION_STEPS = (
     "No recorded steps were found for session '{session_id}', so there is nothing to turn "
     "into a skill."
-)
-
-#: Why a description holding `---` is refused.
-_DESCRIPTION_HOLDS_A_DELIMITER = (
-    "The description cannot contain '---', because that marks the end of the skill's header."
 )
 
 
@@ -90,7 +86,7 @@ _STEPS_LEAD = (
 )
 
 
-def _one_line(text: str) -> str:
+def one_line(text: str) -> str:
     """`text` as one line: breaks become spaces, control and format characters are dropped.
 
     Format characters (Unicode category Cf) include the bidirectional overrides that can
@@ -103,7 +99,7 @@ def _one_line(text: str) -> str:
 
 def _markdown_text(text: str) -> str:
     """`text` as one line of Markdown that reads as the plain text it holds."""
-    escaped = _MARKDOWN_PUNCTUATION.sub(r"\\\1", _one_line(text))
+    escaped = _MARKDOWN_PUNCTUATION.sub(r"\\\1", one_line(text))
     return _BLOCK_START.sub(
         lambda m: f"{m[1]}\\{m[2]}" if m[1] is not None else f"\\{m[3]}", escaped
     )
@@ -313,8 +309,15 @@ class SkillSynthesizer(SkillSynthesizerProtocol):
         task_name: str,
         workflow_steps: Sequence[str],
         when_to_use: str | None = None,
+        *,
+        note: str = _SYNTHESIZED_NOTE,
+        steps_lead: str = _STEPS_LEAD,
     ) -> str:
         """The `SKILL.md` body: when to use the skill, then the steps as instructions.
+
+        `note` (the line under the title) and `steps_lead` (the line before the steps) are
+        fixed text the caller owns, not session text, and are written as given: a clone's
+        proposal (`uclone_x.skills.proposals`) says it was proposed rather than recorded.
 
         Every step is free text from a recorded session, so each is written as one line of
         escaped Markdown text (`_markdown_text`): it cannot open a heading, a code block, an
@@ -332,9 +335,9 @@ class SkillSynthesizer(SkillSynthesizerProtocol):
         steps_list = "\n".join(f"{i + 1}. {step}" for i, step in enumerate(steps))
         return (
             f"# {_markdown_text(title)}\n\n"
-            f"{_SYNTHESIZED_NOTE}\n\n"
+            f"{note}\n\n"
             f"## When to use\n\n{when}\n\n"
-            f"## Steps\n\n{_STEPS_LEAD}\n\n{steps_list}\n"
+            f"## Steps\n\n{steps_lead}\n\n{steps_list}\n"
         )
 
     async def synthesize_skill(
@@ -356,8 +359,7 @@ class SkillSynthesizer(SkillSynthesizerProtocol):
         digest in the approvals ledger.
 
         Raises:
-            ValueError: The name is not an identifier, no step has any text, or the
-                description holds `---`, which would end the `SKILL.md` header early.
+            ValueError: The name is not an identifier, or no step has any text.
         """
         clean_name = task_name.strip().lower()
         if not clean_name or not _IDENTIFIER_PATTERN.match(clean_name):
@@ -366,11 +368,9 @@ class SkillSynthesizer(SkillSynthesizerProtocol):
                 f"with underscores or hyphens."
             )
 
-        # The description is written into the header, which the loader ends at the first
-        # `---` it finds, so one inside it would cut the header short.
-        given = _one_line(description or "")
-        if "---" in given:
-            raise ValueError(_DESCRIPTION_HOLDS_A_DELIMITER)
+        # A `---` inside the description is safe: the header ends only at a line that is
+        # exactly `---` (#1826), and `one_line` leaves the description one line.
+        given = one_line(description or "")
         instructions = self.format_instructions(clean_name, workflow_steps, given)
 
         # Determine target skill directory

@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.support.app_clone import app_clone
 from uclone_x.core.provenance import Provenance
 from uclone_x.engine.event_bus import EventBus
 from uclone_x.llm.models import (
@@ -249,11 +250,9 @@ async def test_ui_session_manager_wires_default_registry() -> None:
     assert len(session_mgr.tools.list_tools()) >= 8
 
     # Test agent instantiated with default tools
-    agent = await session_mgr.get_or_create_agent("test-ui-agent")
+    agent = app_clone(session_mgr, "test-ui-agent")
     assert agent._tools is session_mgr.tools  # pyright: ignore[reportPrivateUsage]
     assert session_mgr.tools.get("file_read") is not None
-
-    await session_mgr.clear()
 
 
 def test_create_ui_app_default_registry() -> None:

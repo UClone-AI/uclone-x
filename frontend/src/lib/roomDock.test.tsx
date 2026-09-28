@@ -7,7 +7,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, render } from '@testing-library/react';
-import { defaultSeat, useRoomRead } from './roomDock';
+import { defaultSeat, transcriptRefreshKey, useRoomRead } from './roomDock';
 import type { RoomState, RoomTranscriptMessage } from '../types';
 
 const said = (seq: number, sender_id: string, kind: RoomTranscriptMessage['kind'] = 'utterance') =>
@@ -123,5 +123,21 @@ describe('useRoomRead', () => {
     await settle();
     expect(fetch).not.toHaveBeenCalled();
     expect(seen[seen.length - 1]).toEqual({ url: null, data: null, loading: false });
+  });
+});
+
+// A clone learning from a turn lands on a row that is already there, so the dock's key moves
+// with what was learned as well as with new rows (#1404).
+describe('transcriptRefreshKey', () => {
+  it('moves when a row gains what its clone learned, or that learning failed', () => {
+    // Killed by: frontend/src/lib/roomDock.ts :: (key, m) => key + (m.knowledge_learned?.length ?? 0) + (m.knowledge_extract_error ? 1 : 0),
+    // Becomes: (key, m) => key,
+    const before = [said(1, 'user'), said(2, 'scout')];
+    const learned = [said(1, 'user'), { ...said(2, 'scout'), knowledge_learned: ['mem_a'] }];
+    const failed = [said(1, 'user'), { ...said(2, 'scout'), knowledge_extract_error: 'x' }];
+
+    expect(transcriptRefreshKey(learned)).not.toBe(transcriptRefreshKey(before));
+    expect(transcriptRefreshKey(failed)).not.toBe(transcriptRefreshKey(before));
+    expect(transcriptRefreshKey([...before, said(3, 'user')])).not.toBe(transcriptRefreshKey(before));
   });
 });

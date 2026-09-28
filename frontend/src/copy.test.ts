@@ -73,9 +73,9 @@ describe('user-facing copy (#1018)', () => {
     ]);
   });
 
-  // Killed by: frontend/src/components/layout/ModelCalls.tsx :: <span>Model calls</span>
-  // Becomes: <span>P6 Model calls</span>
   it('names no principle number anywhere a user can read one', () => {
+    // Killed by: frontend/src/components/TopologyTab.tsx :: >#{turn.seq}</span>
+    // Becomes: >P6 #{turn.seq}</span>
     const scanned = Object.keys(SOURCES).filter(isScanned);
     expect(scanned.length).toBeGreaterThan(20);
 

@@ -1185,7 +1185,9 @@ async def test_anthropic_connector_generate() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.headers["x-api-key"] == "ant_key"
         body: dict[str, Any] = json.loads(request.content.decode("utf-8"))
-        assert body["system"] == "Be helpful"
+        assert body["system"] == [
+            {"type": "text", "text": "Be helpful", "cache_control": {"type": "ephemeral"}}
+        ]
         assert body["model"] == "claude-3-5-sonnet"
 
         response_data: dict[str, Any] = {
@@ -3293,6 +3295,8 @@ async def test_anthropic_refuses_a_tool_result_with_no_recorded_content() -> Non
         ChatMessage(role=MessageRole.TOOL, name="t", tool_call_id="c1", content="")
     )
     block = cast("list[dict[str, Any]]", body["messages"][0]["content"])[0]
+    # The cache breakpoint on the last tool result (#1371) is not what this test pins.
+    block = {k: v for k, v in block.items() if k != "cache_control"}
     assert block == {"type": "tool_result", "tool_use_id": "c1", "content": ""}
 
 
@@ -3322,8 +3326,8 @@ async def test_anthropic_joins_an_empty_system_message_rather_than_filtering_it(
         ChatMessage(role=MessageRole.USER, content="hi"),
     )
 
-    assert with_empty["system"] == "A\n\n"
-    assert without["system"] == "A"
+    assert with_empty["system"][0]["text"] == "A\n\n"
+    assert without["system"][0]["text"] == "A"
     assert with_empty["system"] != without["system"]
 
 
@@ -5540,8 +5544,8 @@ async def test_a_stream_estimates_and_labels_a_count_its_usage_left_out(
     Becomes: out_tok = stream_usage.get("completion_tokens", 0)
     Killed by: src/uclone_x/llm/connectors/openai.py :: streamed.append(delta_content)
     Becomes: pass
-    Killed by: src/uclone_x/llm/connectors/anthropic.py :: input_tokens = reported_count(u, "input_tokens")
-    Becomes: input_tokens = 0
+    Killed by: src/uclone_x/llm/connectors/anthropic.py :: reported_count(u, "input_tokens"), cache_creation, cache_read
+    Becomes: 0, cache_creation, cache_read
     Killed by: src/uclone_x/llm/connectors/anthropic.py :: streamed.append(delta_content)
     Becomes: pass
     Killed by: src/uclone_x/llm/connectors/ollama.py :: out_tok = reported_count(data, "eval_count")

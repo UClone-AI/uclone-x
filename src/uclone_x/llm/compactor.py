@@ -125,6 +125,15 @@ def estimate_message_tokens(messages: Sequence[ChatMessage]) -> int:
     return total
 
 
+def _kept_ledger_origins(ledger_at: Sequence[int], retained: Sequence[ChatMessage]) -> list[int]:
+    """The input indices of the prior ledgers a pass keeps (#1848).
+
+    `_retain_ledgers` keeps the newest, so they are the last of `ledger_at`, the indices
+    of every prior ledger in order.
+    """
+    return list(ledger_at[len(ledger_at) - len(retained) :])
+
+
 def _turn_boundary_cut(dialog: Sequence[ChatMessage], keep: int) -> int | None:
     """Where to split `dialog` into summarised and kept parts: always a user turn's start.
 
@@ -155,9 +164,9 @@ def unseen_step_start(messages: Sequence[ChatMessage]) -> int | None:
 
     The group is an `ASSISTANT` message carrying `tool_calls` followed only by its `TOOL`
     results, at the very end. Between two steps of a turn this is the step that just ran:
-    the model has not seen its results yet, so a compaction there must leave it as
-    ingested (#1422). It is already held to the result cap, and pruning it would send the
-    model a request without the results it asked for.
+    the model has not seen its results yet, so the step budget may still cut them to
+    shares, or withhold the step when it is refused (#1480, #1509). Nothing a request
+    already carried is touched.
     """
     i = len(messages)
     while i > 0 and messages[i - 1].role == MessageRole.TOOL:
@@ -205,7 +214,25 @@ MODEL_CONTEXT_WINDOWS: dict[str, int] = {
     "gemini-1.5-flash": 1_000_000,
     "gemini-2.0-flash": 1_000_000,
     "gemini": 1_000_000,
-    # Claude family (200K)
+    # Claude family. Current models first (Anthropic's models overview, 2026-09-28): the
+    # lookup below takes the first key contained in the name, so a specific key must sit
+    # above the bare `"claude"` fallback.
+    "claude-fable-5-1": 1_000_000,
+    "claude-opus-5-5": 1_000_000,
+    "claude-sonnet-5": 1_000_000,
+    "claude-haiku-4-5": 200_000,
+    # Legacy but still served (each model's own page, 2026-09-28). A key that is a
+    # substring of another must sit below it: `claude-opus-5` is contained in
+    # `claude-opus-5-5`, and `claude-fable-5` in `claude-fable-5-1`.
+    "claude-fable-5": 1_000_000,
+    "claude-opus-5": 1_000_000,
+    "claude-opus-4-8": 1_000_000,
+    "claude-opus-4-7": 1_000_000,
+    "claude-opus-4-6": 1_000_000,
+    "claude-opus-4-5": 200_000,
+    "claude-sonnet-4-6": 1_000_000,
+    "claude-sonnet-4-5": 200_000,
+    # Retired `claude-3-*` IDs, kept so a saved config naming one still resolves.
     "claude-3-5-sonnet": 200_000,
     "claude-3-7-sonnet": 200_000,
     "claude-3-opus": 200_000,
@@ -451,6 +478,11 @@ class ContextCompactor(ContextCompactorProtocol):
                 readable=self.tool_result_reader,
             )
             if stub is not None:
+                if stub == msg.content and msg.form is None:
+                    # A stub written before forms were recorded on messages (#1854): the
+                    # stored body renders to exactly this text, so it is one, and it is
+                    # recorded as one here rather than read as `full` forever (#1866).
+                    return msg.model_copy(update={"form": "stub"})
                 if len(stub) >= len(msg.content):
                     return msg
                 return ChatMessage(
@@ -459,6 +491,7 @@ class ContextCompactor(ContextCompactorProtocol):
                     name=msg.name,
                     tool_call_id=msg.tool_call_id,
                     tool_calls=msg.tool_calls,
+                    form="stub",
                 )
         if msg.content.startswith("[Tool Output Offloaded") or msg.content.startswith(
             "[Tool Output Truncated"
@@ -490,6 +523,7 @@ class ContextCompactor(ContextCompactorProtocol):
             name=msg.name,
             tool_call_id=msg.tool_call_id,
             tool_calls=msg.tool_calls,
+            form="excerpt",
         )
 
     def _prune_tool_message(self, msg: ChatMessage) -> ChatMessage:
@@ -546,6 +580,7 @@ class ContextCompactor(ContextCompactorProtocol):
             name=msg.name,
             tool_call_id=msg.tool_call_id,
             tool_calls=msg.tool_calls,
+            form="stub",
         )
 
     def _build_heuristic_ledger(self, middle_messages: Sequence[ChatMessage]) -> str:
@@ -724,6 +759,20 @@ class ContextCompactor(ContextCompactorProtocol):
             m for m in messages if m.role == MessageRole.SYSTEM and m.compaction_ledger
         ]
         dialog_messages = [m for m in messages if m.role != MessageRole.SYSTEM]
+        # Where each output message comes from, by its index in `messages` (#1848): the
+        # three groups above, in the same order, so a kept or pruned message names the
+        # message it renders and the ledger this pass writes names none.
+        anchor_at = [
+            i
+            for i, m in enumerate(messages)
+            if m.role == MessageRole.SYSTEM and not m.compaction_ledger
+        ]
+        ledger_at = [
+            i
+            for i, m in enumerate(messages)
+            if m.role == MessageRole.SYSTEM and m.compaction_ledger
+        ]
+        dialog_at = [i for i, m in enumerate(messages) if m.role != MessageRole.SYSTEM]
 
         # Where the summarised part ends. Only ever before a `USER` message (#1422): a
         # cut at `-keep_recent_turns` fell wherever the count landed, and could keep a
@@ -738,8 +787,10 @@ class ContextCompactor(ContextCompactorProtocol):
         if cut is None:
             retained_ledgers = self._retain_ledgers(prior_ledgers, self.max_ledgers)
             pruned_dialog = [self._prune_tool_message(m) for m in dialog_messages]
+            kept_ledgers = _kept_ledger_origins(ledger_at, retained_ledgers)
             return CompactionOutcome(
                 messages=(*anchor_messages, *retained_ledgers, *pruned_dialog),
+                origins=(*anchor_at, *kept_ledgers, *dialog_at),
                 ledger_source=LedgerSource.NONE,
                 superseded_ledger_count=len(prior_ledgers) - len(retained_ledgers),
                 provenance=_local_provenance(_TOOL_PRUNER_MODEL),
@@ -814,8 +865,10 @@ class ContextCompactor(ContextCompactorProtocol):
         # 5. Prune oversized tool outputs in recent turns
         pruned_recent = [self._prune_tool_message(m) for m in recent_messages]
 
+        kept_ledgers = _kept_ledger_origins(ledger_at, retained_ledgers)
         return CompactionOutcome(
             messages=(*anchor_messages, *retained_ledgers, summary_msg, *pruned_recent),
+            origins=(*anchor_at, *kept_ledgers, None, *dialog_at[cut:]),
             ledger_source=ledger_source,
             superseded_ledger_count=superseded_now,
             provenance=ledger_provenance,

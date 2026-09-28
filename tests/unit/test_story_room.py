@@ -44,7 +44,6 @@ def _seat(agent_id: str) -> Participant:
         kind=ParticipantKind.AGENT,
         display_name=agent_id.title(),
         session_id=f"sess_room__r1__{agent_id}",
-        ontology_namespace=f"https://uclone-x.ai/ontology/r1/{agent_id}",
     )
 
 
@@ -92,7 +91,7 @@ class _Resolver:
     def __init__(self, seats: dict[str, _Seat]) -> None:
         self._seats = seats
 
-    async def resolve(self, participant: Participant) -> Any:
+    async def resolve(self, participant: Participant, *, one_seat: bool = False) -> Any:
         return self._seats[participant.id]
 
 

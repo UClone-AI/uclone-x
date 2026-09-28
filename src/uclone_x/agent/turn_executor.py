@@ -72,6 +72,11 @@ from uclone_x.agent.session import (
 from uclone_x.agent.text_tool_calls import detect_text_emitted_tool_calls
 from uclone_x.agent.tool_execution import tool_outcome_of
 from uclone_x.agent.tool_invoker import BoundToolsSession, ToolInvoker
+from uclone_x.core.context_state import (
+    EPOCH_PERSONA_EDITED,
+    ContextForm,
+    render_conversation,
+)
 from uclone_x.core.immutable import unwrap_immutable
 from uclone_x.core.provenance import (
     AttemptRecord,
@@ -79,14 +84,26 @@ from uclone_x.core.provenance import (
     Provenance,
     ServiceRef,
 )
+from uclone_x.core.session_log import (
+    LoggedMessage,
+    SessionLogEntry,
+    SessionLogKind,
+    logged_text,
+)
 from uclone_x.core.tool_results import (
     STEP_NO_ROOM_MESSAGE,
+    STEP_NO_ROOM_NO_COMPACTION_MESSAGE,
+    STEP_NO_ROOM_SETUP_MESSAGE,
+    STEP_NO_ROOM_SETUP_REPLY_MESSAGE,
     STEP_OVER_WINDOW_MESSAGE,
+    STEP_REPLY_RESERVE_TOKENS,
     TOOL_RESULT_READ_TOOL,
     artifacts_dir_for,
     canonical_tool_text,
+    contained_artifacts_dir,
     ingest_tool_text,
     step_result_caps,
+    store_tool_result,
 )
 from uclone_x.engine.event_bus import (
     AgentEvent,
@@ -104,6 +121,7 @@ from uclone_x.errors import (
     LLMStreamInterruptedError,
     LLMTimeoutError,
     ModelLacksToolSupportError,
+    PathTraversalError,
     ProviderFailureError,
     ProviderFailureKind,
     TokenBudgetExhaustedError,
@@ -322,9 +340,9 @@ def _repeats_unanswered_prompt(history: Sequence[ChatMessage], user_prompt: Chat
     it does not do is put the words in front of the model twice.
 
     `name` is compared beside the text because it is what distinguishes one sender from
-    another in a transcript that names them (`reconstruct_history` sets it from a stored
-    prompt). Only a sender's own unanswered prompt is a repeat of it: were a head to name
-    its users, two of them sending the same words would otherwise collapse into one.
+    another in a transcript that names them (`ChatMessage.name`). Only a sender's own
+    unanswered prompt is a repeat of it: were a head to name its users, two of them sending
+    the same words would otherwise collapse into one.
     """
     if not history:
         return False
@@ -373,6 +391,23 @@ class TurnSession(BoundToolsSession, Protocol):
     last_turn_tool_calls: list[ToolCallRequest]
     undone_tool_calls: list[ToolCallRequest]
     undone_tool_calls_shown: bool
+    recalled_memory: str | None
+
+    def log_history(self) -> None:
+        """Log every message the history gained since the last call (#1443)."""
+        ...
+
+    def declare_new_epoch(self, cause: str) -> None:
+        """Say the next request may not extend what the last one showed (§5.8, Rule 1)."""
+        ...
+
+    def shown_in_epoch(self, index: int) -> bool:
+        """Whether the history message at `index` is an entry the current epoch shows."""
+        ...
+
+    def log_entry(self, rendered: LoggedMessage) -> SessionLogEntry:
+        """Log something a request sent that is not a history message (#1849)."""
+        ...
 
 
 class _PrepareTurnLayers(Protocol):
@@ -400,7 +435,6 @@ class _AutoCompact(Protocol):
         extra_sections: Sequence[str] = ...,
         *,
         reason: str = ...,
-        hold_unseen_step: bool = ...,
     ) -> Awaitable[CompactionResult | None]: ...
 
 
@@ -540,6 +574,7 @@ class TurnScope:
         [], Callable[[LLMRequest, str, Sequence[str]], tuple[LLMRequest, RequestLayers]]
     ]
     image_set_section: Callable[[], _ImageSetSection]
+    case_skill_section: Callable[[], _ImageSetSection]
     auto_compact_if_needed: Callable[[], _AutoCompact]
     ingest_tool_message: Callable[[], _IngestToolMessage]
     execute_single_tool: Callable[[], _ExecuteSingleTool]
@@ -547,6 +582,7 @@ class TurnScope:
     invoke_model: Callable[[], _InvokeModel]
     fit_step_to_window: Callable[[], _FitStepToWindow]
     execute_tools: Callable[[], _ExecuteTools]
+    take_staged_persona: Callable[[], Callable[[], Callable[[], None] | None]]
 
 
 class TurnExecutor:
@@ -554,6 +590,8 @@ class TurnExecutor:
 
     def __init__(self, scope: TurnScope) -> None:
         self._scope = scope
+        #: The running turn's person's names, for its tool calls (#1857).
+        self._turn_person_names: tuple[str, ...] = ()
 
     # -- the agent's state, read through the scope ---------------------------------
 
@@ -746,8 +784,107 @@ class TurnExecutor:
         return self._scope.image_set_section()
 
     @property
+    def _case_skill_section(self) -> _ImageSetSection:
+        return self._scope.case_skill_section()
+
+    async def _turn_start_sections(
+        self,
+        turn_live: TurnSession,
+        message: str,
+        tool_defs: Sequence[ToolDefinition],
+        emit: Callable[[str, dict[str, Any]], Awaitable[None]],
+    ) -> tuple[list[str], str | None]:
+        """The turn's extra tail sections, and the image-set plan among them, if any.
+
+        Also recalls the memory section for `message` onto `turn_live`. Kept out of the
+        turn loop, whose body is at the type checker's complexity limit.
+        """
+        # What an undone attempt called, stated once per retry and kept for every
+        # step of it (#1495). Cleared when the turn that showed it was not rolled
+        # back: that turn is now in history and speaks for itself.
+        if turn_live.undone_tool_calls_shown:
+            turn_live.undone_tool_calls.clear()
+            turn_live.undone_tool_calls_shown = False
+        undone_section = undone_attempt_section(turn_live.undone_tool_calls)
+        turn_live.undone_tool_calls_shown = bool(undone_section)
+        image_set_section, case_section = await self._drawing_sections(message, tool_defs, emit)
+        # Recall, once per turn and before compaction counts the request: the clone's
+        # facts ranked against this message (clone-knowledge-graph §3.5). Held on the
+        # session so every step of the turn sends the same tail.
+        turn_live.recalled_memory = await self._prompt_assembler.recall_memory(message)
+        self._log_recalled_memory(turn_live)
+        sections = list(present_sections(undone_section, image_set_section, case_section))
+        return sections, image_set_section
+
+    def _log_recalled_memory(self, turn_live: TurnSession) -> None:
+        """Log the memory section this turn recalled as a `memory` entry (#1849).
+
+        The section is sent in every request of the turn, in the `[Turn Context]` tail,
+        and is not a history message, so nothing else logs it. It is also stored in the
+        tool-result store, so `tool_result_read` reads it by the entry's `tr_` handle
+        after the turn that sent it. What the requests send is unchanged: the section is
+        not rewritten and no handle is added to it. Without a workspace, or when the
+        write fails, the entry is logged without a handle.
+        """
+        section = turn_live.recalled_memory
+        if not section:
+            return
+        handle: str | None = None
+        workspace = self._resolve_workspace_root()
+        if workspace is not None:
+            try:
+                handle = store_tool_result(
+                    contained_artifacts_dir(workspace), self._context.session_id, section
+                )
+            except (OSError, ValueError, PathTraversalError) as exc:
+                logger.warning(
+                    "Could not store the recalled memory section for session %r; it is "
+                    "logged without a handle: %s",
+                    self._context.session_id,
+                    exc,
+                )
+        turn_live.log_entry(logged_text(SessionLogKind.MEMORY, section, blob=handle))
+
+    async def _drawing_sections(
+        self,
+        message: str,
+        tool_defs: Sequence[ToolDefinition],
+        emit: Callable[[str, dict[str, Any]], Awaitable[None]],
+    ) -> tuple[str | None, str | None]:
+        """The turn-start sections that steer drawing: an image-set plan, else case skills.
+
+        Both go at the tail, after the user's message, so the prefix stays cacheable.
+        The plan is kept until `generate_image` has run: a first step that reads a
+        character sheet must not cost it. The case skills stay for every step of the
+        turn. A planned set carries its own prompts, so it is not routed as well.
+        Kept out of the turn loop, whose body is at the type checker's complexity limit.
+        """
+        image_set_section = await self._image_set_section(message, tool_defs, emit=emit)
+        if image_set_section:
+            return image_set_section, None
+        return None, await self._case_skill_section(message, tool_defs)
+
+    @property
     def _auto_compact_if_needed(self) -> _AutoCompact:
         return self._scope.auto_compact_if_needed()
+
+    def _take_staged_persona(self) -> None:
+        """Apply a saved persona edit at this turn's start, and open an epoch for it.
+
+        Runs under the turn lock, so an edit saved while a turn is in flight waits for
+        the next one (#1899). The declared cause opens a new epoch at this turn's first
+        request even though the history only grew: the identity layer changed here, and
+        the session log records the boundary (`EPOCH_PERSONA_EDITED`).
+
+        The edit applies whole or not at all (#1904). Taking it works out the new prompt
+        and tool scope without applying either; the epoch is declared next; and only then
+        does the returned step assign. A raise at any point before that leaves the seat on
+        its old definition with no epoch opened, never the new prompt under the old tools.
+        """
+        apply_edit = self._scope.take_staged_persona()()
+        if apply_edit is not None:
+            self._active_session.declare_new_epoch(EPOCH_PERSONA_EDITED)
+            apply_edit()
 
     @property
     def _ingest_tool_message(self) -> _IngestToolMessage:
@@ -1147,6 +1284,7 @@ class TurnExecutor:
         caller_turn_id: str | None = None,
         room_id: str | None = None,
         story_id: str | None = None,
+        person_names: tuple[str, ...] = (),
     ) -> TurnResult:
         """Run one reasoning turn; see `BaseAgent.execute_turn`, which delegates here."""
         llm = self._llm
@@ -1202,6 +1340,9 @@ class TurnExecutor:
             self._turn_room_id = room_id
             self._turn_caller_turn_id = caller_turn_id
             self._turn_story_id = story_id
+            # Set under the turn lock, so a clone seated in two rooms never reads the
+            # other room's person (#1857).
+            self._turn_person_names = person_names
             self.transition_to(AgentState.INGESTING)
 
             # The `try` opens here, not after the REASONING transition. Ingestion and
@@ -1261,6 +1402,10 @@ class TurnExecutor:
                 }
             ]
             try:
+                # Inside the `try` (#1904): an edit that fails to apply is a failed turn
+                # result, like any other failure at the turn's start, not an exception out
+                # of `execute_turn`. It runs before the first request is built.
+                self._take_staged_persona()
                 if isinstance(input_data, str):
                     content_input = input_data
                 else:
@@ -1342,22 +1487,9 @@ class TurnExecutor:
                 if self._tools is not None:
                     tool_defs = await self._tool_invoker.tools_for_turn(content_input, turn_live)
 
-                # What an undone attempt called, stated once per retry and kept for every
-                # step of it (#1495). Cleared when the turn that showed it was not rolled
-                # back: that turn is now in history and speaks for itself.
-                if turn_live.undone_tool_calls_shown:
-                    turn_live.undone_tool_calls.clear()
-                    turn_live.undone_tool_calls_shown = False
-                undone_section = undone_attempt_section(turn_live.undone_tool_calls)
-                turn_live.undone_tool_calls_shown = bool(undone_section)
-                # An image set the persona is asked for is planned before the turn and
-                # handed over at the tail, after the user's message (the prefix stays
-                # cacheable). Kept until `generate_image` has run: a first step that reads
-                # a character sheet must not cost the plan.
-                image_set_section = await self._image_set_section(
-                    content_input, tool_defs, emit=_emit_stream
+                turn_extra_sections, image_set_section = await self._turn_start_sections(
+                    turn_live, content_input, tool_defs, _emit_stream
                 )
-                turn_extra_sections = list(present_sections(undone_section, image_set_section))
 
                 # Compact before dispatch (Requirement 3). Placed after the user message is
                 # appended, so the message that may itself tip the context over the
@@ -1569,6 +1701,7 @@ class TurnExecutor:
                             and self._history[-1] is superseded
                         ):
                             self._history.pop()
+                            self._active_session.declare_new_epoch("retry")
                         superseded = None
                         assistant_msg_idx = len(self._history)
                         self._history.append(
@@ -1582,6 +1715,9 @@ class TurnExecutor:
                                 )
                             )
                         )
+                        # Logged now, with the prompt before it: a retry, a declined nudge
+                        # or a post-turn hook can take it out again (#1443).
+                        self._active_session.log_history()
                         if resp_content:
                             durable_events.append(
                                 {
@@ -1698,6 +1834,9 @@ class TurnExecutor:
                                     "turn_index": self._turn_counter,
                                 }
                             )
+                            # The retry's answer was shown to no request of this turn,
+                            # but the next turn's would have extended it (§5.8, Rule 1).
+                            self._active_session.declare_new_epoch("retry")
                             if first_assistant_msg is not None:
                                 if assistant_msg_idx is not None and assistant_msg_idx < len(
                                     self._history
@@ -1849,34 +1988,17 @@ class TurnExecutor:
                         {"status": "thinking", "detail": "Processing tool results..."},
                     )
 
-                    # Between steps is a boundary too (#1422): a step whose results push
-                    # the next request over the threshold compacts now, before that
-                    # request is built, instead of sending it over. Safe mid-turn because
-                    # this step's calls and results are all in history, and compaction
-                    # cuts only before a user turn. This step itself is held out of the
-                    # pass: the model has not read its results yet.
-                    if await self._auto_compact_if_needed(
-                        tool_defs,
-                        turn_extra_sections,
-                        reason="auto_threshold_mid_turn",
-                        hold_unseen_step=True,
-                    ):
-                        # Compaction replaces the history list; point at this step's
-                        # assistant message in the new one.
-                        assistant_msg_idx = next(
-                            (
-                                index
-                                for index in range(len(self._history) - 1, -1, -1)
-                                if self._history[index].role == MessageRole.ASSISTANT
-                            ),
-                            None,
-                        )
-
+                    # No compaction runs here (§5.8, owner ruling 2026-09-27). An epoch
+                    # starts only at a turn boundary, so every request of this turn extends
+                    # the one before it, and nothing the model was already shown is
+                    # shrunk to make room for this step. This reverses #1422's pass
+                    # between steps; a step that does not fit is refused below instead.
+                    #
                     # The step's own results, together, must still fit the window (#1480).
                     # Each is under the result cap, but several can exceed what the
-                    # compacted history leaves; they are cut to excerpts of an equal share,
-                    # or, when even that cannot fit, the step is refused and nothing over
-                    # the window is sent.
+                    # history as this turn's requests sent it leaves; they are cut to
+                    # excerpts of an equal share, or, when even that cannot fit, the step
+                    # is refused and nothing over the window is sent.
                     step_refusal = self._fit_step_to_window(
                         step_results, tool_defs, turn_extra_sections, readable=reader_offered
                     )
@@ -1942,6 +2064,7 @@ class TurnExecutor:
                     if "content" in post_turn_decision.modified_payload:
                         resp_content = str(post_turn_decision.modified_payload["content"])
                         if assistant_msg_idx is not None and assistant_msg_idx < len(self._history):
+                            self._declare_rewrite(assistant_msg_idx, "post_turn_hook")
                             orig_msg = self._history[assistant_msg_idx]
                             self._history[assistant_msg_idx] = redact_message(
                                 ChatMessage(
@@ -2291,6 +2414,17 @@ class TurnExecutor:
                     event["session_id"] = turn_session_id
                 self._pending_durable_events.extend(durable_events)
 
+    def _declare_rewrite(self, index: int, cause: str) -> None:
+        """Declare `cause` for rewriting the history message at `index`, if it needs it.
+
+        Rewriting a message a request of this epoch already showed breaks Rule 1, so the
+        next request opens an epoch that names `cause`. Rewriting the final answer no
+        request has shown yet does not: the next request only appends it, and a cause
+        declared for it would label the next epoch -- a compaction's -- with it (#1854).
+        """
+        if self._active_session.shown_in_epoch(index):
+            self._active_session.declare_new_epoch(cause)
+
     def fit_step_to_window(
         self,
         step_results: Sequence[ChatMessage],
@@ -2305,18 +2439,26 @@ class TurnExecutor:
         history's trailing tool-call group holds them as ingested. The budget is the
         window less the room kept for the reply (`_reply_reserve`, #1509) and everything
         else the next request sends -- the system turn, the tool schemas, the turn
-        context and the already-compacted history. When the step's results exceed it,
+        context and the history as this turn's earlier requests sent it -- no pass between
+        steps shrinks it (§5.8). When the step's results exceed it,
         `step_result_caps` shares it out and each over-share result is ingested again at
         its share: an excerpt whose full body stays readable with `tool_result_read`.
         Nothing a request has shown is rewritten: the model has not seen this step yet.
 
         `None` when the next request fits. Otherwise the plain refusal the turn ends
         with: `STEP_NO_ROOM_MESSAGE` when the request leaves no room for the step at
-        all, so the conversation and not the tools is the cause (#1509), and
+        all, so the conversation and not the tools is the cause (#1509);
+        `STEP_NO_ROOM_SETUP_MESSAGE` when the system turn and the tool schemas alone
+        leave none, so no shortening would help (#1866), or
+        `STEP_NO_ROOM_SETUP_REPLY_MESSAGE` when a shorter reply length would (#1875); and
         `STEP_OVER_WINDOW_MESSAGE` when the step cannot fit even as excerpts or the
         fitted request is still over. Without a known window there is nothing to fit
         against, and the per-result cap is the only bound.
+
+        The step is logged first, as ingested (#1443): cutting it to shares or refusing it
+        takes results out of the history, never out of the session log.
         """
+        self._active_session.log_history()  # the step as ingested, before any cut
         window = self._context_window()
         if window is None:
             return None
@@ -2341,9 +2483,14 @@ class TurnExecutor:
             )
         ):
             return STEP_OVER_WINDOW_MESSAGE
+        # `total` counts the conversation as the request renders it, a repeated result as
+        # its one-line back-reference (§5.8, Rule 2); what is taken out of it here must be
+        # counted the same way, or a step holding a back-reference looks smaller outside
+        # itself and larger inside than it is (#1854).
+        rendered, refers = render_conversation(history)
         # Everything but the step itself -- its calls and its results -- already reaches
         # the window: no share of any size fits, and fewer calls would not help.
-        outside = total - estimate_message_tokens(history[start:])
+        outside = total - estimate_message_tokens(rendered[start:])
         if outside + reserve >= window:
             logger.warning(
                 "No room is left in a %d-token window for a step's %d tool results: the "
@@ -2353,8 +2500,26 @@ class TurnExecutor:
                 outside,
                 reserve,
             )
-            return STEP_NO_ROOM_MESSAGE
-        current = [history[i].content or "" for i in tail]
+            # The system turn and the tool schemas are sent whatever the conversation
+            # holds, so when they alone reach the window no shortening makes room (#1866).
+            prepared = self._prepare_turn_messages(extra_sections=extra_sections)
+            setup = tuple(
+                m for m in prepared if m.role is MessageRole.SYSTEM and not m.compaction_ledger
+            )
+            fixed = estimate_request_tokens(LLMRequest(messages=setup, tools=tuple(tools)))
+            if fixed + reserve >= window:
+                # A reply length above the default is the other cause: when the setup
+                # leaves room for a reply of the default size, a shorter one fits (#1875).
+                if fixed + STEP_REPLY_RESERVE_TOKENS < window:
+                    return STEP_NO_ROOM_SETUP_REPLY_MESSAGE
+                return STEP_NO_ROOM_SETUP_MESSAGE
+            if self._config.llm_config.auto_compact:
+                return STEP_NO_ROOM_MESSAGE
+            return STEP_NO_ROOM_NO_COMPACTION_MESSAGE
+        # A result sent as a back-reference is not shared out: it costs its one line
+        # whatever its size, and cutting it would send an excerpt in its place.
+        shared_out = [i for i in tail if refers[i] is None]
+        current = [history[i].content or "" for i in shared_out]
         rest = total - sum(estimate_text_tokens(c) for c in current if c)
         # Each message's estimate rounds up, so one token apiece is kept back, and two
         # more for a turn-context block merged into the last result.
@@ -2370,7 +2535,10 @@ class TurnExecutor:
             )
             return STEP_OVER_WINDOW_MESSAGE
         workspace = self._resolve_workspace_root()
-        for index, raw, content, cap in zip(tail, step_results, current, caps, strict=True):
+        raw_of = dict(zip(tail, step_results, strict=True))
+        cut: dict[int, ChatMessage] = {}
+        for index, content, cap in zip(shared_out, current, caps, strict=True):
+            raw = raw_of[index]
             if raw.content is None or len(content.encode("utf-8")) <= cap:
                 continue
             shared = ingest_tool_text(
@@ -2380,7 +2548,18 @@ class TurnExecutor:
                 readable=readable,
                 cap_bytes=cap,
             )
-            history[index] = history[index].model_copy(update={"content": shared})
+            history[index] = history[index].model_copy(
+                update={"content": shared, "form": ContextForm.EXCERPT.value}
+            )
+            cut[index] = history[index]
+        # A later result of the step that referred back to one just cut still carries the
+        # text it was the same as; given the cut text too, it stays a back-reference.
+        for index in tail:
+            earlier = refers[index]
+            if earlier is not None and earlier in cut:
+                history[index] = history[index].model_copy(
+                    update={"content": cut[earlier].content, "form": ContextForm.EXCERPT.value}
+                )
         fitted = request_tokens()
         if fitted + reserve > window:
             logger.warning(
@@ -2461,6 +2640,7 @@ class TurnExecutor:
             room_id=self._turn_room_id,
             turn_id=self._turn_caller_turn_id,
             story_id=self._turn_story_id,
+            person_names=self._turn_person_names,
         )
 
         if len(tool_calls) == 1:

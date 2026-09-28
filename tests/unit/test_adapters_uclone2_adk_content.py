@@ -469,6 +469,20 @@ def test_fields_with_no_adk_slot_raise_rather_than_being_dropped(message: ChatMe
         ADKContentAdapter.to_adk_content(message)
 
 
+def test_a_shortened_tool_result_is_refused_rather_than_losing_its_form() -> None:
+    """A FunctionResponse has no slot for ``form``; dropping it would read back as full.
+
+    Killed by: src/uclone_x/adapters/uclone2/adk_content.py :: if message.form is not None:
+    Becomes: if False:
+    """
+    message = ChatMessage(
+        role=MessageRole.TOOL, content="x", name="t", tool_call_id="c", form="excerpt"
+    )
+    with pytest.raises(ADKUnrepresentableMessageError) as excinfo:
+        ADKContentAdapter.to_adk_content(message)
+    assert "excerpt" in str(excinfo.value)
+
+
 def test_tool_calls_on_a_non_assistant_role_raise() -> None:
     message = ChatMessage(role=MessageRole.USER, content="x", tool_calls=(TOOL_CALL,))
     with pytest.raises(ADKUnrepresentableMessageError) as excinfo:

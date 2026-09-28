@@ -1025,7 +1025,7 @@ class _Seats:
     def __init__(self, agents: dict[str, Any]) -> None:
         self._agents = agents
 
-    async def resolve(self, participant: Participant) -> Any:
+    async def resolve(self, participant: Participant, *, one_seat: bool = False) -> Any:
         return self._agents[participant.id]
 
 

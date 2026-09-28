@@ -4,7 +4,7 @@
 room's seats were given one. The Writer opened as a plain chat therefore had no way to ask
 the Artist and could only promise to; the pictures it promised were never drawn.
 
-Pinned here, through `AgentSessionManager.get_or_create_agent` -- the path a chat takes:
+Pinned here, through `build_clone` over the app scope -- the path a 1:1 conversation takes:
 
 * a chat persona naming `a2a_peers` is given a transport, and `a2a_call` is offered to it;
 * a persona naming no peers is given none, so `a2a_call` stays hidden from it;
@@ -24,6 +24,7 @@ from typing import Any
 import pytest
 from pydantic import BaseModel, Field
 
+from tests.support.app_clone import app_clone
 from uclone_x.llm.connectors.mock import MockLLMConnector
 from uclone_x.llm.models import LLMRequest, MessageRole, ModelResponse, ToolCallRequest
 from uclone_x.tools.base import BaseTool
@@ -111,7 +112,7 @@ async def test_a_chat_writer_is_offered_a2a_call(tmp_path: Path) -> None:
     """
     manager = _manager(tmp_path, MockLLMConnector(), _FakeImage(tmp_path))
 
-    writer = await manager.get_or_create_agent("writer")
+    writer = app_clone(manager, "writer")
 
     assert writer.a2a_transport is not None
     assert A2A_CALL_TOOL_NAME in _offered(writer)
@@ -122,7 +123,7 @@ async def test_a_chat_persona_with_no_peers_gets_no_transport(tmp_path: Path) ->
     """The Artist names no peers, so it is given no one to call and no `a2a_call`."""
     manager = _manager(tmp_path, MockLLMConnector(), _FakeImage(tmp_path))
 
-    artist = await manager.get_or_create_agent("artist")
+    artist = app_clone(manager, "artist")
 
     assert artist.a2a_transport is None
     assert A2A_CALL_TOOL_NAME not in _offered(artist)
@@ -139,7 +140,7 @@ async def test_a_chat_writers_call_is_done_by_the_artist(tmp_path: Path) -> None
     llm = _ByOfferedTool()
     image = _FakeImage(tmp_path)
     manager = _manager(tmp_path, llm, image)
-    writer = await manager.get_or_create_agent("writer", session_id="sess_1659")
+    writer = app_clone(manager, "writer", "sess_1659")
 
     turn = await writer.execute_turn("Draw me the hero.")
 
@@ -174,7 +175,7 @@ async def test_a_chat_clones_call_is_done_by_the_artist(tmp_path: Path) -> None:
     llm = _ByOfferedTool()
     image = _FakeImage(tmp_path)
     manager = _manager(tmp_path, llm, image)
-    clone = await manager.get_or_create_agent("clone", session_id="sess_clone_a2a")
+    clone = app_clone(manager, "clone", "sess_clone_a2a")
 
     turn = await clone.execute_turn("Ask the artist to draw the hero.")
 
@@ -232,7 +233,7 @@ async def test_a_chat_writers_callee_refuses_an_approval_call_at_once(
     monkeypatch.setattr(PersonaTaskHandler, "_compose", recording)
     image = _ApprovalImage(tmp_path)
     manager = _manager(tmp_path, _DrawsWithApproval(), image)
-    writer = await manager.get_or_create_agent("writer", session_id="sess_1692")
+    writer = app_clone(manager, "writer", "sess_1692")
 
     turn = await writer.execute_turn("Draw me the hero.")
 

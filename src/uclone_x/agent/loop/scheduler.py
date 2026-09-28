@@ -22,8 +22,16 @@ class LoopScheduler:
         self,
         agent: BaseAgent,
         on_tick_completed: Callable[[LoopJob, LoopTickResult], None] | None = None,
+        *,
+        person_names: tuple[str, ...] = (),
     ) -> None:
+        """Schedule loop jobs on `agent`.
+
+        `person_names` are the names the head's person goes by, given to every tick's turn
+        as a room seat's turn is given them (#1893 item 1).
+        """
         self.agent = agent
+        self.person_names = person_names
         self.on_tick_completed = on_tick_completed
         self._jobs: dict[str, LoopJob] = {}
         self._tasks: dict[str, asyncio.Task[None]] = {}
@@ -117,7 +125,9 @@ class LoopScheduler:
 
             while job.status == LoopStatus.ACTIVE:
                 tick_index += 1
-                result = await execute_loop_tick(self.agent, job, tick_index)
+                result = await execute_loop_tick(
+                    self.agent, job, tick_index, person_names=self.person_names
+                )
 
                 if self.on_tick_completed:
                     try:

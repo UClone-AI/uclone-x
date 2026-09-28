@@ -41,9 +41,19 @@ from uclone_x.agent.session import (
     ContextSnapshot,
     SessionState,
     cleanup_session_artifacts,
+    redact_message,
     validate_session_id,
 )
 from uclone_x.agent.tool_invoker import ToolInvoker
+from uclone_x.core.context_state import EPOCH_RESTORED, ContextEntry, ContextEpoch, advance
+from uclone_x.core.session_log import (
+    LoggedMessage,
+    SessionLogEntry,
+    SessionLogProvenance,
+    history_entry_ids,
+    logged_message,
+    new_entry,
+)
 from uclone_x.core.session_store import SessionStoreProtocol
 from uclone_x.core.tool_results import artifacts_dir_for
 from uclone_x.engine.event_bus import UnauthorizedSubscriptionError
@@ -137,6 +147,11 @@ class _LiveSession:
     #: Whether a turn has shown `undone_tool_calls` since the last rollback. The next turn
     #: to start finds it set only if that turn was not rolled back, and clears the list.
     undone_tool_calls_shown: bool = False
+    #: The memory section recalled for the running turn's message (clone-knowledge-graph
+    #: §3.5), set once before the turn's first request and sent on each of its steps, so
+    #: the turn-context tail holds still within the turn. `None` until a turn with a
+    #: memory store starts; not persisted, since the next turn recomputes it.
+    recalled_memory: str | None = None
     #: Catalog tools host binding and `search_tools` have appended to this session's tools
     #: layer, in the order they were bound (design §5.1). Grow-only: cleared only at
     #: compaction, where the request prefix is rebuilt anyway. Not persisted as such: a
@@ -148,10 +163,43 @@ class _LiveSession:
     #: compaction. Pinning is a superset of any bound set, so falling back only grows the
     #: layer, and it never flips back, which would remove tools mid-session.
     tools_pin_all: bool = False
+    #: Every message that entered `messages`, append-only (#1443). Persisted as
+    #: `SessionState.session_log`; each entry's body waits in `pending_bodies` like a
+    #: snapshot layer's does. Written only by `log_history`.
+    session_log: list[SessionLogEntry] = field(default_factory=list[SessionLogEntry])
+    #: Each message now in `messages`, as of the last `log_history`: the message, its
+    #: rendering for the log, and the log entry it is. The message is held, not its
+    #: `id()`, so an id reused after collection never matches. `None` until the first
+    #: `log_history`, which then matches the history to the log by digest
+    #: (`history_entry_ids`). Not persisted: the record's log and messages rebuild it.
+    aligned: list[tuple[ChatMessage, LoggedMessage, str]] | None = None
+    #: What each request of this session showed, per epoch (#1443, design §5.8).
+    #: Persisted as `SessionState.context_epochs`. Written only by `record_shown`.
+    context_epochs: list[ContextEpoch] = field(default_factory=list[ContextEpoch])
+    #: Why the next request may not extend the current epoch, as declared since the last
+    #: request: a compaction, a rollback, a retry, a replaced or restored history. The
+    #: next `record_shown` that opens an epoch records them, and every request clears them.
+    #: Persisted as `SessionState.epoch_causes`, all but `restored`, so an epoch a
+    #: compaction opens is still named for it after a restart (#1848).
+    epoch_causes: list[str] = field(default_factory=list[str])
+    #: Log bodies already decoded back into messages, by digest (`logged_history`). Not
+    #: persisted: a cache of `ChatMessage.model_validate_json` over bodies the log holds.
+    decoded: dict[str, ChatMessage] = field(default_factory=dict[str, ChatMessage])
+    #: Per log entry of a compacted history, the entry it shows and its form, derived at
+    #: the compaction (`compacted_entries`, #1848), for the request that opens the new
+    #: epoch. A pruned message is the rendering of the entry it replaced. Set by the
+    #: compaction driver and cleared by `record_shown`. Persisted as
+    #: `SessionState.compacted_entries`, keyed here by `ContextEntry.body`, so a restart
+    #: before that request shows the same entries and renderings.
+    compacted_entries: dict[str, ContextEntry] = field(default_factory=dict[str, ContextEntry])
 
     @classmethod
     def from_state(
-        cls, state: SessionState, *, anchor_provenance: LiveAnchorProvenance
+        cls,
+        state: SessionState,
+        *,
+        anchor_provenance: LiveAnchorProvenance,
+        log_as: SessionLogProvenance = SessionLogProvenance.RECORDED,
     ) -> _LiveSession:
         """Adopt a persisted or seeded session as the live working copy.
 
@@ -159,8 +207,14 @@ class _LiveSession:
         it does not type-check: deciding who composed the anchor is part of putting a
         session into `_sessions`, and a default would let a new call inherit that answer
         by omission. The field's own default exists for the dataclass, not for callers.
+
+        `log_as` defaults to `RECORDED`; only `hydrate_session` passes `MIGRATED`. The
+        record's log is reconciled with its messages: a message the log does not account for gets an entry, `MIGRATED`
+        with no turn when the record was read from a store (it predates the log), or
+        `RECORDED` at the record's turn when a caller just supplied it. A record whose log
+        already accounts for every message gains nothing, so loading twice adds nothing.
         """
-        return cls(
+        live = cls(
             messages=list(state.messages),
             plan=state.plan,
             turn_counter=state.turn_counter,
@@ -169,7 +223,156 @@ class _LiveSession:
             revision=state.revision,
             anchor_provenance=anchor_provenance,
             context_snapshots=list(state.context_snapshots),
+            session_log=list(state.session_log),
+            context_epochs=list(state.context_epochs),
+            compacted_entries={shown.body: shown for shown in state.compacted_entries},
+            epoch_causes=list(state.epoch_causes),
         )
+        live.log_history(provenance=log_as)
+        return live
+
+    def log_history(
+        self, *, provenance: SessionLogProvenance = SessionLogProvenance.RECORDED
+    ) -> None:
+        """Log every message in `messages` the log does not yet account for (#1443).
+
+        The one writer of `session_log`. Called where a turn adds to the history, before a
+        rollback or a replacement removes from it, and by `to_state` and every save, so a
+        message is logged even if it leaves the history before the turn ends and no record
+        names an entry whose body is not queued for writing.
+
+        Each message is matched to an entry: first a message object that was already in
+        the history keeps its entry, then a message whose digest an entry of the previous
+        history carried and no message kept takes that entry, in order. What is left is
+        logged. So accounting is a multiset by digest against what the history held at the
+        last call: a message that stayed is not logged again, and one that left and came
+        back -- a retried prompt after a rollback -- is logged again, because it entered
+        again. A `RECORDED` entry carries the session's turn counter; a `MIGRATED` one, none.
+        """
+        rendering: list[LoggedMessage] = []
+        claimed: list[str | None] = [None] * len(self.messages)
+        taken: set[str] = set()
+        by_object = {id(m): (m, item, entry) for m, item, entry in self.aligned or ()}
+        for index, message in enumerate(self.messages):
+            known = by_object.get(id(message))
+            if known is not None and known[0] is message and known[2] not in taken:
+                claimed[index] = known[2]
+                taken.add(known[2])
+                rendering.append(known[1])
+            else:
+                rendering.append(logged_message(redact_message(message)))
+        if self.aligned is None:
+            pool_ids = history_entry_ids(self.session_log, [item.digest for item in rendering])
+            previous = [
+                (entry, item.digest)
+                for entry, item in zip(pool_ids, rendering, strict=True)
+                if entry is not None
+            ]
+        else:
+            previous = [(entry, item.digest) for _m, item, entry in self.aligned]
+        pools: dict[str, list[str]] = {}
+        for entry, digest in reversed(previous):
+            if entry not in taken:
+                pools.setdefault(digest, []).append(entry)
+        aligned: list[tuple[ChatMessage, LoggedMessage, str]] = []
+        for index, (message, item) in enumerate(zip(self.messages, rendering, strict=True)):
+            entry = claimed[index]
+            if entry is None and pools.get(item.digest):
+                entry = pools[item.digest].pop()
+            if entry is None:
+                logged = new_entry(
+                    len(self.session_log),
+                    item,
+                    turn=None if provenance is SessionLogProvenance.MIGRATED else self.turn_counter,
+                    provenance=provenance,
+                )
+                self.session_log.append(logged)
+                entry = logged.id
+                if item.digest not in self.stored_bodies:
+                    self.pending_bodies[item.digest] = item.body
+            aligned.append((message, item, entry))
+        self.aligned = aligned
+
+    def log_entry(self, rendered: LoggedMessage) -> SessionLogEntry:
+        """Log something a request sent that is not a history message (#1849).
+
+        The recalled memory section of a turn is one: it is sent in the `[Turn Context]`
+        tail, never in `messages`, so `log_history` does not see it. The history is logged
+        first, so the entry follows the message it was recalled for. Nothing a request
+        sends is changed: the entry is only a record, and its body waits in
+        `pending_bodies` like any other.
+        """
+        self.log_history()
+        logged = new_entry(
+            len(self.session_log),
+            rendered,
+            turn=self.turn_counter,
+            provenance=SessionLogProvenance.RECORDED,
+        )
+        self.session_log.append(logged)
+        if rendered.digest not in self.stored_bodies:
+            self.pending_bodies[rendered.digest] = rendered.body
+        return logged
+
+    def entry_ids(self) -> list[str]:
+        """The log entry each message in `messages` is, logging any that is not yet."""
+        self.log_history()
+        assert self.aligned is not None
+        return [entry for _message, _item, entry in self.aligned]
+
+    def logged_history(self) -> list[tuple[str, ChatMessage]]:
+        """Each message in `messages` as the session log holds it: its entry, and the
+        message decoded from the entry's body (#1848).
+
+        `messages` names which entries are in the history and in what order; the text a
+        request shows is read from the log.
+        """
+        self.log_history()
+        assert self.aligned is not None
+        logged: list[tuple[str, ChatMessage]] = []
+        for _message, item, entry in self.aligned:
+            message = self.decoded.get(item.digest)
+            if message is None:
+                message = ChatMessage.model_validate_json(item.body)
+                self.decoded[item.digest] = message
+            logged.append((entry, message))
+        return logged
+
+    def shown_in_epoch(self, index: int) -> bool:
+        """Whether the message at `index` of `messages` is an entry the current epoch shows.
+
+        A message no request of this epoch has shown -- a final answer the model just
+        returned -- can still be rewritten without breaking Rule 1: the next request only
+        appends it, so it does not declare a new epoch (#1854).
+        """
+        if not self.context_epochs or not 0 <= index < len(self.messages):
+            return False
+        entry = self.entry_ids()[index]
+        return any(shown.body == entry for shown in self.context_epochs[-1].entries)
+
+    def declare_new_epoch(self, cause: str) -> None:
+        """Say that the next request may show the history differently, and why (Rule 1)."""
+        if cause not in self.epoch_causes:
+            self.epoch_causes.append(cause)
+
+    def record_shown(self, shown: list[ContextEntry], *, step: int) -> ContextEpoch:
+        """Record what a request's conversation showed; returns the epoch it belongs to.
+
+        The epoch is extended when the request only appended to it, and a new one opens
+        otherwise, naming the causes declared since the last request (`declare_new_epoch`).
+        """
+        self.context_epochs = list(
+            advance(
+                self.context_epochs,
+                shown,
+                turn=self.turn_counter,
+                step=step,
+                opened_by=self.epoch_causes,
+            )
+        )
+        self.epoch_causes = []
+        self.compacted_entries = {}
+        return self.context_epochs[-1]
 
     def to_state(self, session_id: str, agent_id: str) -> SessionState:
         """Snapshot this session into the frozen shape the store persists.
@@ -179,6 +382,7 @@ class _LiveSession:
         an agent takes passes through here, so stamping it here rather than at each save
         is what keeps the record's account of its anchor and the anchor itself together.
         """
+        self.log_history()
         return SessionState(
             session_id=session_id,
             agent_id=agent_id,
@@ -190,6 +394,11 @@ class _LiveSession:
             revision=self.revision,
             anchor_provenance=persisted_anchor_provenance(self.anchor_provenance),
             context_snapshots=tuple(self.context_snapshots),
+            session_log=tuple(self.session_log),
+            context_epochs=tuple(self.context_epochs),
+            compacted_entries=tuple(self.compacted_entries.values()),
+            # `restored` is declared again by every load, so it is not saved (#1848).
+            epoch_causes=tuple(c for c in self.epoch_causes if c != EPOCH_RESTORED),
         )
 
 
@@ -430,6 +639,7 @@ class SessionLifecycle:
                 system_prompt=self.effective_system_prompt,
             ),
             anchor_provenance=self._resolved_persona(),
+            log_as=SessionLogProvenance.RECORDED,
         )
 
     def live_session(self, session_id: str) -> _LiveSession:
@@ -604,11 +814,14 @@ class SessionLifecycle:
         )
         # The caller composed these messages, so their anchor is not this agent's to
         # re-resolve on a later turn (#1081). See `_anchor_is_stale`.
-        replaced = _LiveSession.from_state(state, anchor_provenance=AnchorWriter.CALLER)
-        # The snapshots carry over, and so must the bodies they name that are not written
-        # yet: dropping them left the next save naming bodies that were never stored.
-        replaced.pending_bodies = live.pending_bodies
+        replaced = _LiveSession.from_state(
+            state, anchor_provenance=AnchorWriter.CALLER, log_as=SessionLogProvenance.RECORDED
+        )
+        # The snapshots and the log carry over, and so must the bodies they name that are
+        # not written yet: dropping them left the next save naming bodies never stored.
+        replaced.pending_bodies = {**live.pending_bodies, **replaced.pending_bodies}
         replaced.stored_bodies = live.stored_bodies
+        replaced.declare_new_epoch("history_replaced")
         self._tool_invoker.reseed_bound_tools_from_history(replaced)
         self._sessions[sid] = replaced
 
@@ -661,7 +874,11 @@ class SessionLifecycle:
         prefix_rewritten = tuple(live.messages[:kept]) != checkpoint.messages
         dropped = len(live.messages) - kept if not prefix_rewritten else len(live.messages)
         if dropped or prefix_rewritten:
+            # Logged first: the undone turn's messages leave the history, not the log.
+            live.log_history()
             live.messages = list(checkpoint.messages)
+            live.log_history()
+            live.declare_new_epoch("rollback")
             live.updated_at = _now_iso()
         # What the undone turn called leaves the conversation with it, and the next
         # attempt is told in its turn context instead (#1495): the calls' effects stay.
@@ -878,6 +1095,9 @@ class SessionLifecycle:
         if self._store is None:
             return
         live = self._live_session(sid)
+        # Log first, so the log entries `to_state` is about to record have their bodies
+        # queued here rather than after this write (#1443).
+        live.log_history()
         for digest, body in tuple(live.pending_bodies.items()):
             self._store.save_context_body(sid, digest, body)
             live.stored_bodies.add(digest)
@@ -954,7 +1174,12 @@ class SessionLifecycle:
                 sid,
                 self.agent_id,
             )
-        hydrated = _LiveSession.from_state(loaded, anchor_provenance=restored)
+        # A record from before the session log backfills one `MIGRATED` entry per message;
+        # one written since accounts for every message already, so this adds nothing.
+        hydrated = _LiveSession.from_state(
+            loaded, anchor_provenance=restored, log_as=SessionLogProvenance.MIGRATED
+        )
+        hydrated.declare_new_epoch(EPOCH_RESTORED)
         self._tool_invoker.reseed_bound_tools_from_history(hydrated)
         self._sessions[sid] = hydrated
         return loaded

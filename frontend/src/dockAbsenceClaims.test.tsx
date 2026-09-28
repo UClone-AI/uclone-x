@@ -208,11 +208,11 @@ describe('the dock makes no categorical absence claim (#1374)', () => {
     expect(allowed.filter((sentence) => ABSENCE_CLAIM.test(sentence))).toEqual([]);
   });
 
-  // Killed by: frontend/src/components/TopologyTab.tsx :: <p className="text-[11px] text-slate-500">No tool calls listed.</p>
-  // Becomes: <p className="text-[11px] text-slate-500">No tools called.</p>
+  // Killed by: frontend/src/components/TopologyTab.tsx :: >#{turn.seq}</span>
+  // Becomes: >#{turn.seq} No tools called.</span>
   // A form the #1374 pattern let through (#1389):
-  // Killed by: frontend/src/components/TopologyTab.tsx :: >No tool calls listed.<
-  // Becomes: >No tool calls were made.<
+  // Killed by: frontend/src/components/TopologyTab.tsx :: >#{turn.seq}</span>
+  // Becomes: >#{turn.seq} No tool calls were made.</span>
   it('holds no such claim in the copy of any dock source', () => {
     const offences = DOCK_SOURCES.flatMap((path) => {
       const body = SOURCES[path];
@@ -320,6 +320,8 @@ const DOCK_CATALOGS: Record<string, string> = import.meta.glob(
 describe('the dock catalogs (#1366, #1374)', () => {
   // `DOCK_SOURCES` are `.tsx` files; the sentences they rendered now live in these catalogs,
   // so the source scan above no longer reads them.
+  // Killed by: frontend/src/i18n/locales/en/dock.json :: "noToolCalls": "No tool calls listed.",
+  // Becomes: "noToolCalls": "No tool calls were made.",
   // Killed by: frontend/src/i18n/locales/en/dock.json :: "noneListed": "No facts are listed for {name}.",
   // Becomes: "noneListed": "{name} knows nothing.",
   it('holds no such claim in the English dock copy', () => {

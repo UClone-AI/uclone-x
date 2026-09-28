@@ -76,7 +76,6 @@ SCOUT = Participant(
     display_name="Scout",
     persona_summary="scout does scout things",
     session_id="sess_room__r1__scout",
-    ontology_namespace="https://uclone-x.ai/ontology/r1/scout",
 )
 
 _PROV = Provenance(
@@ -194,7 +193,7 @@ class _Seats:
     def __init__(self, agent: BaseAgent) -> None:
         self.agent = agent
 
-    async def resolve(self, participant: Participant) -> BaseAgent:
+    async def resolve(self, participant: Participant, *, one_seat: bool = False) -> BaseAgent:
         return self.agent
 
 

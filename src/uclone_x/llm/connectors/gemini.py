@@ -25,6 +25,7 @@ from uclone_x.llm.connectors.base import (
     named_model,
     parse_dict_payload,
     refuse_response_schema,
+    reported_count,
     resolve_model,
     resolve_token_counts,
 )
@@ -74,6 +75,21 @@ def _usage_counts(usage_meta: dict[str, Any]) -> tuple[int, int, int]:
         usage_meta.get("thoughtsTokenCount", 0)
     )
     return in_tokens, out_tokens, int(usage_meta.get("totalTokenCount", in_tokens + out_tokens))
+
+
+def _cache_read(usage_meta: dict[str, Any] | None) -> int | None:
+    """Of the input tokens, how many Gemini served from its context cache (#1371).
+
+    `cachedContentTokenCount` is inside `promptTokenCount`: Google's `UsageMetadata`
+    reference says the prompt count "includes the number of tokens in the cached content".
+    So it is a subset of `TokenUsage.input_tokens` and is not added to it, which is where
+    the Anthropic connector also puts its cache reads. Gemini reports no cache-write count.
+
+    An absent field stays `None`, unlike the counts `_usage_counts` reads. Gemini's JSON
+    omits a zero, so absence cannot tell "no cache hit" from "not reported"; recording 0
+    would claim a figure Gemini did not send (P6).
+    """
+    return reported_count(usage_meta, "cachedContentTokenCount")
 
 
 def _first_inline_image(data: object, *, model: str) -> tuple[bytes, str]:
@@ -497,6 +513,7 @@ class GeminiConnector(BaseLLMConnector):
             output_tokens=out_tokens,
             total_tokens=total_tokens,
             count_source=count_source,
+            cache_read_input_tokens=_cache_read(usage_meta),
         )
 
         finish_reason = (
@@ -595,6 +612,7 @@ class GeminiConnector(BaseLLMConnector):
                             input_tokens=in_tok,
                             output_tokens=out_tok,
                             total_tokens=total_tok,
+                            cache_read_input_tokens=_cache_read(usage_meta),
                         )
 
                     if delta_content or tool_calls or usage or finish_reason:

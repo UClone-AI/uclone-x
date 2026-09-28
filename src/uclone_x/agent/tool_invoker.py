@@ -184,14 +184,6 @@ class ToolInvoker:
         """
         return _PINNED_BASE_TOOLS
 
-    def reseed_bound_tools(
-        self, live: BoundToolsSession, tools: Sequence[ToolDefinition], *, pinned: bool
-    ) -> None:
-        """Make the session's bound set what `tools` carried, after an in-turn compaction."""
-        base_names = self.base_tool_names()
-        live.bound_tools[:] = [d.name for d in tools if d.name not in base_names]
-        live.tools_pin_all = pinned
-
     def reseed_bound_tools_from_history(self, live: BoundToolsSession) -> None:
         """Rebuild a restored session's bound set from the catalog tools its history called.
 
