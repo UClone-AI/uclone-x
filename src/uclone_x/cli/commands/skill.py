@@ -4,19 +4,24 @@ from __future__ import annotations
 
 import asyncio
 import datetime
-import subprocess
+import tempfile
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, TextIO
 
 import typer
 from rich.console import Console
 from rich.table import Table
 
 from uclone_x.errors import SkillAuditError
+from uclone_x.skills.approvals import SkillApprovalLedger, SkillPin
 from uclone_x.skills.auditor import (
+    Skill,
     SkillAuditor,
     SkillRegistry,
+    compute_skill_sha256,
+    copy_skill_package,
     load_skill_from_dir,
+    runtime_skill_store_dir,
     save_skill,
 )
 from uclone_x.skills.models import (
@@ -36,32 +41,77 @@ skill_app = typer.Typer(
 console = Console()
 
 
-def _repo_root() -> Path:
-    """Anchor paths to the repository root, or current directory if not in git."""
-    try:
-        out = subprocess.run(
-            ["git", "rev-parse", "--show-toplevel"],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        return Path(out.stdout.strip())
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        return Path.cwd()
-
-
 def _skills_dir(custom_path: Path | None = None) -> Path:
-    """Resolve the skills root directory."""
+    """Resolve the skills root directory, creating it when it does not exist yet.
+
+    The default is `runtime_skill_store_dir()`, the resolver the heads load approved skills
+    from at startup, so what `ucx skill approve` promotes is what a running agent sees.
+    """
     if custom_path is not None:
         return custom_path
-    # `ucx-agent-skills`, not `skills`: the store belongs to the Runtime Layer
-    # (`ucx agent`), and under the shorter name it twice collected Builder
-    # workflow prose instead — which surfaces here as an unaudited `pending`
-    # package and contradicts the threat model's premise that the store is empty.
-    # Builder skills live in `swarm/skills/`. See `ucx-agent-skills/README.md`.
-    path = _repo_root() / "ucx-agent-skills"
+    path = runtime_skill_store_dir()
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+#: What `skill approve` says when there is no terminal to ask the person at (#1589).
+APPROVE_NEEDS_TERMINAL = (
+    "Only you can approve a skill, so this command asks you in a terminal window, and it "
+    "could not find one to ask in. Run it yourself in a terminal window. Nothing was changed."
+)
+
+#: What `skill approve` says when the package changed while the person was being asked (#1777).
+APPROVE_CHANGED_MEANWHILE = (
+    "The skill changed while you were being asked, so it was not approved. Check what "
+    "changed, then run the command again."
+)
+
+#: What `skill approve` says when the person did not answer yes.
+APPROVE_NOT_CONFIRMED = "The skill was not approved, because you did not answer yes."
+
+
+def _open_terminal() -> TextIO:
+    """This process's controlling terminal: the window a person typed the command in.
+
+    Not standard input. A clone's `bash_run` starts every command in a new session
+    (`setsid`), which leaves it with no controlling terminal, so this open fails there. Its
+    standard input is another matter: it is inherited from the server, and is the person's
+    terminal when `ucx ui` runs in one, so a check of `stdin.isatty()` would pass under
+    `bash_run`, and `echo yes |` would answer a prompt read from it. Replaced in tests.
+    """
+    return open("/dev/tty", "r+", encoding="utf-8")  # noqa: SIM115 -- closed by the caller
+
+
+def _confirmed_at_terminal(name: str) -> bool | None:
+    """Whether the person answered yes at the terminal; None when there is none to ask at.
+
+    What this stops, and what it does not (#1589): a program without a terminal, the
+    model's `bash_run` included, cannot answer, and neither can one that pipes `yes` in.
+    A program that makes itself a terminal (`script`, a pseudo-terminal) can, and so can
+    one that edits the skill's files directly, which an unconfined shell may; only
+    confining that shell closes those.
+    """
+    try:
+        terminal = _open_terminal()
+    except OSError:
+        return None
+    with terminal:
+        terminal.write(f"Approve the skill '{name}'? Type yes to approve it: ")
+        terminal.flush()
+        answer = terminal.readline()
+    return answer.strip().lower() == "yes"
+
+
+def _is_pinned(ledger: SkillApprovalLedger, skill_dir: Path, name: str) -> bool:
+    """Whether the package as it is now is the version approved for `name`.
+
+    False when it cannot be told -- an unreadable package or ledger -- so `approve` goes on
+    to audit it and ask, rather than calling an unapproved skill approved.
+    """
+    try:
+        return compute_skill_sha256(skill_dir) in ledger.approved_digests(name, ledger.read())
+    except SkillAuditError:
+        return False
 
 
 def _now() -> str:
@@ -182,7 +232,11 @@ def skill_approve(
         typer.Option("--force", "-f", help="Force approval even if auditor flags security risks"),
     ] = False,
 ) -> None:
-    """Approve a pending/quarantined skill and promote it to active status."""
+    """Approve a pending/quarantined skill and promote it to active status.
+
+    Asks the person to type yes in the terminal the command runs in, so a program with no
+    terminal (a clone's `bash_run`) cannot approve on their behalf (#1589).
+    """
     root = _skills_dir(skills_dir)
     skill_dir = root / name
     if not skill_dir.is_dir() or not (skill_dir / "SKILL.md").is_file():
@@ -196,17 +250,52 @@ def skill_approve(
         raise typer.Exit(code=1) from exc
 
     manifest = skill.manifest
-    if manifest.status is SkillStatus.ACTIVE and not force:
+    ledger = SkillApprovalLedger()
+    if (
+        manifest.status is SkillStatus.ACTIVE
+        and not force
+        and _is_pinned(ledger, skill_dir, manifest.name)
+    ):
         console.print(
             f"[yellow]Skill '{name}' is already active (approved by "
             f"{_blank_if_unset(manifest.approved_by)} at {_blank_if_unset(manifest.approved_at)}).[/yellow]"
         )
         return
 
-    # Run auditor check
+    # Everything from the audit to the pin works on one copy of the package, each file read
+    # once (#1777): the person is asked about the bytes the auditor checked, and the pin is
+    # of those bytes, however long the question waits and whatever changes the package
+    # meanwhile.
+    with tempfile.TemporaryDirectory(prefix="ucx-skill-approve-") as scratch:
+        checked_dir = Path(scratch) / skill_dir.name
+        try:
+            copy_skill_package(skill_dir, checked_dir)
+            checked = load_skill_from_dir(checked_dir)
+        except SkillAuditError as unread:
+            console.print(f"[bold red]✖ Cannot approve skill '{name}':[/bold red] {unread}")
+            raise typer.Exit(code=1) from unread
+        _approve_checked(name, skill_dir, checked_dir, checked, approver, force, ledger)
+
+
+def _write_skill_md(skill_dir: Path, data: bytes) -> None:
+    """Put the approved `SKILL.md` in the package. Replaced in a test to change it meanwhile."""
+    (skill_dir / "SKILL.md").write_bytes(data)
+
+
+def _approve_checked(
+    name: str,
+    skill_dir: Path,
+    checked_dir: Path,
+    skill: Skill,
+    approver: str,
+    force: bool,
+    ledger: SkillApprovalLedger,
+) -> None:
+    """Audit the copy in `checked_dir`, ask, and pin the digest of what was audited."""
+    manifest = skill.manifest
     auditor = SkillAuditor(policy=AutoApprovalPolicy.SAFE_ONLY)
     try:
-        report = asyncio.run(auditor.audit_skill(skill_dir))
+        report = asyncio.run(auditor.audit_skill(checked_dir))
     except SkillAuditError as exc:
         # The skill stays as it was on disk: an audit that could not finish approves nothing.
         console.print(f"[bold red]✖ Cannot approve skill '{name}':[/bold red] {exc}")
@@ -225,19 +314,52 @@ def skill_approve(
         )
         raise typer.Exit(code=1)
 
+    # Asked last, after the audit's findings are on screen: the person decides with them.
+    confirmed = _confirmed_at_terminal(name)
+    if confirmed is None:
+        console.print(f"[bold red]✖ {APPROVE_NEEDS_TERMINAL}[/bold red]")
+        raise typer.Exit(code=1)
+    if not confirmed:
+        console.print(f"[yellow]{APPROVE_NOT_CONFIRMED}[/yellow]")
+        raise typer.Exit(code=1)
+
+    approved_at = _now()
     updated_manifest = manifest.model_copy(
         update={
             "status": SkillStatus.ACTIVE,
             "approved_by": approver,
-            "approved_at": _now(),
-            "content_sha256": report.content_sha256,
+            "approved_at": approved_at,
+            "content_sha256": None,
             "rejected_by": None,
             "rejected_at": None,
             "rejection_reason": None,
         }
     )
 
-    save_skill(skill_dir, updated_manifest, skill.instructions_markdown)
+    # The digest covers the file as approval leaves it -- `status: active` and the approver
+    # included -- so it is taken after the write, of the checked copy. Writing it into the
+    # file afterwards does not change it (the rule in `compute_skill_sha256`), and the pin in
+    # the ledger, not the copy in the file, is what a load checks (#1720).
+    try:
+        save_skill(checked_dir, updated_manifest, skill.instructions_markdown)
+        digest = compute_skill_sha256(checked_dir)
+        save_skill(
+            checked_dir,
+            updated_manifest.model_copy(update={"content_sha256": digest}),
+            skill.instructions_markdown,
+        )
+        if compute_skill_sha256(skill_dir) != report.content_sha256:
+            console.print(f"[bold red]✖ {APPROVE_CHANGED_MEANWHILE}[/bold red]")
+            raise typer.Exit(code=1)
+        _write_skill_md(skill_dir, (checked_dir / "SKILL.md").read_bytes())
+        ledger.pin(
+            manifest.name,
+            SkillPin(content_sha256=digest, approved_by=approver, approved_at=approved_at),
+        )
+    except (SkillAuditError, OSError) as exc:
+        detail = str(exc) if isinstance(exc, SkillAuditError) else "its files could not be saved"
+        console.print(f"[bold red]✖ Cannot approve skill '{name}':[/bold red] {detail}")
+        raise typer.Exit(code=1) from exc
     console.print(
         f"[bold green]✔ Approved skill:[/bold green] [cyan]{name}[/cyan] "
         f"(status: [green]active[/green], approver: [magenta]{approver}[/magenta])"
@@ -272,6 +394,11 @@ def skill_reject(
         raise typer.Exit(code=1) from exc
 
     manifest = skill.manifest
+    try:
+        SkillApprovalLedger().revoke(manifest.name)
+    except SkillAuditError as error:
+        console.print(f"[bold red]✖ Cannot reject skill '{name}':[/bold red] {error}")
+        raise typer.Exit(code=1) from error
     updated_manifest = manifest.model_copy(
         update={
             "status": SkillStatus.REJECTED,

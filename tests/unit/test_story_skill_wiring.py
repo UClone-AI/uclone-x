@@ -591,7 +591,7 @@ def _registry_with(skill_dir: Path, *, status: SkillStatus = SkillStatus.ACTIVE)
 def test_the_agent_puts_its_active_skills_folders_on_every_tool_call(tmp_path: Path) -> None:
     """End to end: a draw the model makes through the agent reaches the skill's table.
 
-    Killed by: src/uclone_x/agent/base.py :: skill_dirs=self.active_skill_dirs(),
+    Killed by: src/uclone_x/agent/turn_executor.py :: skill_dirs=self.active_skill_dirs(),
     Becomes: skill_dirs=(),
     """
     skill = _skill(tmp_path / "skills", "weird-west", {"muse/western.yaml": _WESTERN})

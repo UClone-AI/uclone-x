@@ -6,17 +6,23 @@ answers. What only the assembled product shows is that a person reaches the view
 Files, sees the proposed change before and after with the quote it rests on and the
 conversation that proposed it, and that pressing Approve or Reject changes the story's
 files on disk -- written as the conversation writing the story.
+
+It also shows the decision guard of #1589 item 6 end to end: a window the server did not
+open -- here, one navigated to directly, as any program could -- is refused and changes
+nothing, and the window the server opens on request (its address captured instead of handed
+to a real browser) is confirmed by the page itself and may decide.
 """
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
 import pytest
 import yaml
-from playwright.async_api import Page, async_playwright
+from playwright.async_api import Page, async_playwright, expect
 
 from tests.e2e.conftest import mock_llm, running_ui
 from uclone_x.story.library import StoryLibrary
@@ -33,9 +39,25 @@ def workspace(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
-def server(tmp_path: Path, workspace: Path) -> Iterator[str]:
+def opened() -> list[str]:
+    """The addresses the server asked the person's browser to open."""
+    return []
+
+
+@pytest.fixture
+def server(tmp_path: Path, workspace: Path, opened: list[str]) -> Iterator[str]:
+    def capture_windows(app: Any) -> None:
+        def _open(url: str) -> bool:
+            opened.append(url)
+            return True
+
+        app.state.person_gate.opener = _open
+
     with running_ui(
-        storage_dir=tmp_path / "sessions", llm=mock_llm(), workspace_dir=workspace
+        storage_dir=tmp_path / "sessions",
+        llm=mock_llm(),
+        workspace_dir=workspace,
+        configure=capture_windows,
     ) as url:
         yield url
 
@@ -94,21 +116,47 @@ def _write_story(workspace: Path, room_id: str) -> Path:
     return root
 
 
+async def _open_story(page: Page, root: Path) -> None:
+    await page.get_by_test_id("open-artifact-library").click()
+    row = page.locator(f'[data-testid="files-entry"][data-path="stories/{root.name}"]')
+    await row.wait_for(timeout=10_000)
+    await row.get_by_test_id("files-view-story").click()
+    await page.get_by_test_id("story-view").wait_for(timeout=10_000)
+
+
 @pytest.mark.asyncio
-async def test_a_person_decides_a_proposal_in_the_story_view(server: str, workspace: Path) -> None:
+async def test_a_person_decides_a_proposal_in_the_story_view(
+    server: str, workspace: Path, opened: list[str]
+) -> None:
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(headless=True)
         try:
-            page = await browser.new_page(viewport={"width": 1600, "height": 900})
+            context = await browser.new_context(viewport={"width": 1600, "height": 900})
+            page = await context.new_page()
             await page.goto(server, wait_until="networkidle")
             room_id = await _create_room(page, server, "Writing room")
             root = _write_story(workspace, room_id)
+            await _open_story(page, root)
 
-            await page.get_by_test_id("open-artifact-library").click()
-            row = page.locator(f'[data-testid="files-entry"][data-path="stories/{root.name}"]')
-            await row.wait_for(timeout=10_000)
-            await row.get_by_test_id("files-view-story").click()
-            await page.get_by_test_id("story-view").wait_for(timeout=10_000)
+            # A window the server did not open cannot decide, and nothing changes.
+            before = (root / "proposals/p001.yaml").read_bytes()
+            pending = page.locator('[data-testid="story-proposal"][data-proposal="p001"]')
+            await pending.get_by_test_id("story-approve").click()
+            notice = page.get_by_test_id("story-view-notice")
+            await notice.get_by_text("Only you can make this decision").wait_for(timeout=10_000)
+            assert (root / "proposals/p001.yaml").read_bytes() == before
+            await notice.get_by_test_id("story-open-confirmed-window").click()
+            await notice.get_by_text("A confirmed window opened").wait_for(timeout=10_000)
+            assert len(opened) == 1
+            assert opened[0].startswith(f"{server}/"), opened
+
+            # The window the server opens is a new tab of the same browser; it confirms
+            # itself and takes the code out of its own address.
+            page = await context.new_page()
+            await page.goto(opened[0], wait_until="networkidle")
+            await expect(page).not_to_have_url(re.compile("#pair="))
+            await _open_story(page, root)
+            notice = page.get_by_test_id("story-view-notice")
 
             # The change as it is and as it would be, its quote, and who proposed it.
             first = page.locator('[data-testid="story-proposal"][data-proposal="p001"]')
@@ -124,7 +172,6 @@ async def test_a_person_decides_a_proposal_in_the_story_view(server: str, worksp
 
             # Approving writes the entry and closes the proposal, as decided here.
             await first.get_by_test_id("story-approve").click()
-            notice = page.get_by_test_id("story-view-notice")
             await notice.get_by_text("The change to Lord Vane was applied.").wait_for(
                 timeout=10_000
             )
@@ -147,11 +194,12 @@ async def test_a_person_decides_a_proposal_in_the_story_view(server: str, worksp
             rejected = yaml.safe_load((root / "proposals/p002.yaml").read_text("utf-8"))
             assert (rejected["status"], rejected["reason"]) == ("rejected", "He stays calm.")
 
-            items = page.get_by_test_id("story-decided-item")
-            assert await items.count() == 2
-            assert (
-                "No change is waiting for a decision"
-                in await page.get_by_test_id("story-pending").inner_text()
+            # The notice lands before the decided list reloads, so wait for the list itself.
+            # The waits get the 10 s every other wait here has, not `expect`'s 5 s default:
+            # this step failed only on a loaded machine (#1611).
+            await expect(page.get_by_test_id("story-decided-item")).to_have_count(2, timeout=10_000)
+            await expect(page.get_by_test_id("story-pending")).to_contain_text(
+                "No change is waiting for a decision", timeout=10_000
             )
         finally:
             await browser.close()

@@ -42,7 +42,8 @@ related constraint on enums.
 route is a way to put a `str` where an `int` is declared and have it stick. There are
 two doors:
 
-* **`model_copy(update=...)` on the frozen model.** Closed *in this module*:
+* **`model_copy(update=...)` on the frozen model.** Closed in `SessionState` (defined in
+  `uclone_x.core.session_state` since #1734, re-exported here) and in this module:
   `SessionState.with_messages` and `SessionState.reset` construct rather than copy, and
   `SessionStore.save` re-validates the serialized payload at the persistence boundary as
   the backstop — which is also what lets it return a value identical to what `load` will
@@ -129,7 +130,6 @@ Nothing here reads or writes a UI transcript.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import os
@@ -139,30 +139,50 @@ import unicodedata
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
-from enum import StrEnum
 from pathlib import Path
 from typing import Any, cast
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field
 
-from uclone_x.agent.models import PersonaDefinition, PlanState
-from uclone_x.core.immutable import unwrap_immutable
 from uclone_x.core.log_offset import LogOffset, LogOffsetAllocatorProtocol
-from uclone_x.core.log_writer import LogWriterProtocol, RedactingLogWriter, redact_log_payload
+from uclone_x.core.log_writer import LogWriterProtocol, RedactingLogWriter
 from uclone_x.core.provenance import Provenance
 from uclone_x.core.secrets import redact_credentials
+from uclone_x.core.session import (
+    CORE_RECORD_SUBDIR,
+    DEFAULT_SESSION_STORAGE_DIR,
+    SESSION_STORAGE_DIR_ENV_VAR,
+    UI_TRANSCRIPT_SUBDIR,
+    default_session_root,
+    default_session_storage_dir,
+    resolve_session_path,
+    validate_session_id,
+)
+from uclone_x.core.session_state import (
+    AnchorAuthor,
+    AnchorProvenance,
+    ContextSnapshot,
+    SessionState,
+    content_digest,
+    redact_message,
+)
 from uclone_x.errors import (
     PathTraversalError,
     SessionEventLogNotConfiguredError,
     SessionIdCollisionError,
     StaleSessionWriteError,
 )
-from uclone_x.llm.models import ChatMessage, LedgerSource, MessageRole, ToolCallRequest
+from uclone_x.llm.models import LedgerSource
 from uclone_x.sandbox.path_validator import PathValidator
 
 logger = logging.getLogger(__name__)
 
+# The names imported from `uclone_x.core.session` and `uclone_x.core.session_state` above
+# are re-exported here under their old spelling (#1734); every caller of
+# `uclone_x.agent.session` keeps working.
 __all__ = [
+    "AnchorAuthor",
+    "AnchorProvenance",
     "DEFAULT_SESSION_STORAGE_DIR",
     "CONTEXT_BODY_SUBDIR",
     "CompactionResult",
@@ -187,31 +207,6 @@ __all__ = [
     "verify_record_identity",
 ]
 
-# Kept identical to the directory `AgentSessionManager` already defaults to, so the
-# extraction does not move anybody's existing session files.
-DEFAULT_SESSION_STORAGE_DIR = Path.home() / ".uclone" / "sessions"
-
-# Subdirectories under the family root. Both artifacts are namespaced, and the root
-# itself is **never written** by either.
-#
-# This is a correction: an earlier arrangement put the Core record for the UI under
-# `core/` while leaving the UI's *transcript* on the root path — which is the path the
-# CLI's own Core store owns. So `ucx run` wrote a Core record to
-# `<root>/<id>.json` and the UI wrote a UI transcript to the same file. Each destroyed
-# the other, and because a record that does not validate reads back as absent, the loss
-# was silent by construction: the conversation was destroyed and then reported as "no
-# session here". Measured on a real `~/.uclone/sessions`: 8 Core-shaped records, 16
-# UI-shaped, one hybrid (a UI envelope wrapping Core `ChatMessage`s), and `core/` empty.
-#
-# Namespacing both fixes it, and it also fixes the deeper error. The CLI and the UI
-# should share **one** Core record for a session — that is what P8's single store means
-# — not hold isolated copies. They now both resolve to `<root>/core/<id>.json`. The
-# transcript, which is genuinely a different artifact with a different schema, gets its
-# own `<root>/ui/`. Files already at the root are legacy: read for hydration, never
-# overwritten.
-CORE_RECORD_SUBDIR = "core"
-UI_TRANSCRIPT_SUBDIR = "ui"
-
 # Where a store that was given no log writer keeps each session's durable turn events:
 # `<storage_dir>/events/<session_id>.jsonl`, with the offset cursor beside it as
 # `<session_id>.cursor`. Under the store's own directory, so a store redirected to a
@@ -226,134 +221,10 @@ CONTEXT_BODY_SUBDIR = "context"
 
 _SHA256_HEX = re.compile(r"[0-9a-f]{64}")
 
-# Environment override for the default storage root. Exists because `SessionStore()` is
-# now constructed by the CLI, which has no `storage_dir` argument to pass down from a
-# command line, and a headless run must not be forced to write into the invoking user's
-# home directory — tests especially, since a unit test that persists a session under
-# `~/.uclone` has escaped its own sandbox.
-SESSION_STORAGE_DIR_ENV_VAR = "UCLONE_SESSION_DIR"
-
-
-def default_session_root() -> Path:
-    """Resolve the session **family root**, honouring `UCLONE_SESSION_DIR`.
-
-    Both layers derive from this one resolver, which is the point. `ui.app.
-    AgentSessionManager` used to compute its own default inline as
-    `Path.home() / ".uclone" / "sessions"`, so it ignored `UCLONE_SESSION_DIR`
-    entirely — the variable existed to keep a headless run out of the invoking user's
-    home, and the busiest writer to that directory was not consulting it. Two defaults
-    for one location is the same shape as two copies of a guard: one of them gets fixed.
-    """
-    override = os.environ.get(SESSION_STORAGE_DIR_ENV_VAR)
-    if override:
-        return Path(override).expanduser()
-    return DEFAULT_SESSION_STORAGE_DIR
-
-
-def default_session_storage_dir() -> Path:
-    """Resolve the Core store's default root, honouring `UCLONE_SESSION_DIR`.
-
-    Returns `<family root>/core`, **not** the family root. A `SessionStore()` built with
-    no argument is a Core store, and Core records live in the `core/` subdirectory so
-    they cannot collide with the UI transcript that used to occupy the root — see
-    `CORE_RECORD_SUBDIR`.
-
-    `UCLONE_SESSION_DIR` names the **family root**, so redirecting it moves the Core
-    records and the UI transcripts together and keeps the CLI and the UI agreeing on
-    which record is which session.
-    """
-    return default_session_root() / CORE_RECORD_SUBDIR
-
-
-# Characters that must never appear in a session ID, because it is interpolated into a
-# filename. Checked before any path arithmetic: `Path` normalises away a `..` segment
-# during `resolve()`, so a containment check alone cannot report *why* an ID was
-# rejected, and on a directory that is itself a symlink it can be made to pass.
-_FORBIDDEN_ID_SUBSTRINGS = ("..", "/", "\\", "\x00")
-
 
 def _now_iso() -> str:
     """Current UTC instant as an ISO-8601 string."""
     return datetime.now(UTC).isoformat()
-
-
-def validate_session_id(session_id: str) -> str:
-    """Return `session_id` if it is a legal session identifier, else raise (P3).
-
-    Separated from path resolution so that a caller holding no storage directory can
-    apply the same rule. `BaseAgent` is that caller: it addresses sessions by ID long
-    before anything is persisted, and without this it would accept `""` or
-    `"../../../etc/evil"` as a live session name and only discover the problem at the
-    first write — by which point the conversation exists and cannot be saved.
-
-    The rule is a *name* rule, not a containment check: containment additionally
-    requires the resolved path, which `resolve_session_path` does.
-
-    Raises:
-        PathTraversalError: If the ID is empty, or carries a path separator, a `..`
-            segment or a NUL.
-    """
-    # `None` already refused with a `PathTraversalError` via the falsiness check below,
-    # while any other non-`str` fell through to `bad in session_id` and raised a raw
-    # `TypeError`. Nothing was written either way, so this is error-type hygiene rather
-    # than a hole — but a guard that refuses one class of bad input with two different
-    # exception types is inconsistent with itself, and a caller catching
-    # `PathTraversalError` would not catch the other.
-    #
-    # Pyright is correct that a *typed* caller cannot reach this: the parameter is `str`
-    # and the boundary is checked statically. The guard is for the untyped arrivals the
-    # annotation cannot police — a session id lifted out of a deserialized JSON payload,
-    # or passed through `**kwargs` — which is exactly where a non-`str` comes from in
-    # practice. So the branch is deliberately kept and the diagnostic suppressed here
-    # rather than the check being dropped.
-    if not isinstance(session_id, str):  # pyright: ignore[reportUnnecessaryIsInstance]
-        raise PathTraversalError(
-            f"Session ID must be a string, got {type(session_id).__name__}: {session_id!r}"
-        )
-    if not session_id:
-        raise PathTraversalError(
-            "Session ID must be non-empty: an empty ID resolves to the storage directory itself."
-        )
-    for bad in _FORBIDDEN_ID_SUBSTRINGS:
-        if bad in session_id:
-            raise PathTraversalError(
-                f"Invalid session ID containing path traversal characters: {session_id!r}"
-            )
-    return session_id
-
-
-def resolve_session_path(storage_dir: Path, session_id: str, suffix: str = ".json") -> Path:
-    """Resolve `session_id` to a file under `storage_dir`, refusing anything that escapes (P3).
-
-    Module-level and public because it is a **security control with more than one
-    caller**: `SessionStore` uses it for Core session records and `ui.app.
-    AgentSessionManager.get_session_path` uses it for the UI's presentation transcript.
-    A duplicated containment guard is one that gets fixed in a single copy, so there is
-    one implementation and two callers rather than two implementations.
-
-    The name half is delegated to `validate_session_id` for the same reason, rather than
-    copied here: `BaseAgent` needs the name rule without a storage directory, and two
-    copies of a rule are two things to fix.
-
-    The containment check is the half that a hostile *string* never reaches — every such
-    string is stopped by the name rule above it. What reaches containment is a lexically
-    innocent ID whose record path is a planted symlink pointing out of the directory,
-    which is the case `test_a_lexically_clean_id_whose_record_symlinks_outside_is_refused`
-    pins.
-
-    Raises:
-        PathTraversalError: If the ID is illegal by name, or resolves outside
-            `storage_dir`. The check *raises* rather than returning `None` or silently
-            skipping the operation: a containment guard whose failure mode is "do
-            nothing" is fail-open, and the caller cannot tell a refused write from a
-            completed one.
-    """
-    validate_session_id(session_id)
-    root = storage_dir.resolve()
-    target = (root / f"{session_id}{suffix}").resolve()
-    if not target.is_relative_to(root):
-        raise PathTraversalError(f"Path traversal violation for session ID: {session_id!r}")
-    return target
 
 
 _MAX_PID = 2**31 - 1
@@ -615,423 +486,6 @@ def _describe_id_fold(asked: str, found: str) -> str:
     return ""
 
 
-def redact_message(message: ChatMessage) -> ChatMessage:
-    """Return `message` with any credential shapes in content or tool calls redacted on write.
-
-    Option A mitigation from #569: credentials pasted into chat or returned from tools
-    must not enter session state or durable persistence unmasked.
-
-    Known Limitations of Pattern-Based Redaction (Option A):
-    Pattern-based redaction is a heuristic mitigation, not an absolute guarantee.
-    It catches known credential shapes (e.g. OpenAI `sk-...`, GitHub `ghp_...`, Anthropic
-    `sk-ant-...`, AWS access keys, Bearer tokens, and explicit secret assignments), but cannot
-    detect arbitrary high-entropy strings, bespoke tokens without prefixes, or obfuscated
-    secrets without high false-positive rates. Per Principle 3 (P3) and threat model T3,
-    redaction on write reduces retention risk, but does not replace process-level isolation
-    or host egress boundaries.
-    """
-    if isinstance(message, dict):
-        raw_obj: object = message
-        clean_dict: dict[str, object] = dict(cast(dict[str, object], raw_obj))
-        content_val = clean_dict.get("content")
-        if isinstance(content_val, str):
-            clean_dict["content"] = redact_credentials(content_val)
-        tool_calls_val = clean_dict.get("tool_calls")
-        if isinstance(tool_calls_val, (list, tuple)):
-            clean_tcs: list[object] = []
-            for item in cast("list[object] | tuple[object, ...]", tool_calls_val):
-                if isinstance(item, dict):
-                    tc_dict = dict(cast(dict[str, object], item))
-                    args_val = tc_dict.get("arguments")
-                    if isinstance(args_val, dict):
-                        unwrapped = unwrap_immutable(cast(dict[str, object], args_val))
-                        tc_dict["arguments"] = redact_log_payload(unwrapped)
-                    clean_tcs.append(tc_dict)
-                else:
-                    clean_tcs.append(item)
-            clean_dict["tool_calls"] = clean_tcs
-        try:
-            return ChatMessage.model_validate(clean_dict)
-        except Exception:
-            return cast(ChatMessage, clean_dict)
-
-    new_content = message.content
-    if message.content is not None:
-        new_content = redact_credentials(message.content)
-
-    new_tool_calls: list[ToolCallRequest] = []
-    tool_calls_modified = False
-    for tc in message.tool_calls:
-        if tc.arguments:
-            unwrapped = cast(dict[str, Any], unwrap_immutable(tc.arguments))
-            sanitized_args = cast(dict[str, Any], redact_log_payload(unwrapped))
-            if sanitized_args != unwrapped:
-                tool_calls_modified = True
-                new_tool_calls.append(
-                    ToolCallRequest(
-                        id=tc.id,
-                        name=tc.name,
-                        arguments=sanitized_args,
-                    )
-                )
-                continue
-        new_tool_calls.append(tc)
-
-    if new_content == message.content and not tool_calls_modified:
-        return message
-
-    return ChatMessage(
-        role=message.role,
-        content=new_content,
-        name=message.name,
-        tool_call_id=message.tool_call_id,
-        tool_calls=tuple(new_tool_calls),
-        compaction_ledger=message.compaction_ledger,
-    )
-
-
-class AnchorAuthor(StrEnum):
-    """Who composed a session's anchored `SYSTEM` turn.
-
-    Two members, because the turn builder asks exactly one question of a restored anchor:
-    is it text this agent composed from its own persona axis, or text that arrived from
-    outside it? Only the first is the agent's to re-resolve.
-    """
-
-    AGENT = "agent"
-    CALLER = "caller"
-
-
-class AnchorProvenance(BaseModel):
-    """What composed a session's anchored `SYSTEM` turn, in the shape the store writes (#1152).
-
-    The agent's own working copy carries this as a `PersonaDefinition`, a `None` meaning
-    "the axis resolved to no persona", or a marker meaning "the caller wrote it". That
-    union is a Python type and does not survive a JSON record, so it is spelled here as
-    an author plus the persona resolution the author had — which is what makes a restored
-    session able to say whether its anchor is re-resolvable, instead of every restored
-    anchor reading as the caller's.
-
-    `persona` is the resolution in force when the agent composed the anchor, and `None`
-    under `AGENT` is a real answer — "composed under no persona" — not a missing one. That
-    is why the *absence of this whole object* is what records "unknown": a record written
-    before this field existed carries no `anchor_provenance` at all, and collapsing that
-    into `AGENT`/`None` would claim a provenance nobody stamped and make every legacy
-    anchor re-resolvable, discarding a caller's text (P6, and the mode #1081 records as
-    measured and rejected for PR #937).
-    """
-
-    model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
-
-    author: AnchorAuthor = Field(description="Whether the agent or the caller composed the anchor")
-    persona: PersonaDefinition | None = Field(
-        default=None,
-        description="The persona resolution the agent composed the anchor under; always "
-        "absent for a caller-composed anchor.",
-    )
-
-    @model_validator(mode="after")
-    def _caller_anchors_carry_no_persona(self) -> AnchorProvenance:
-        """Refuse the one combination that would be read as a claim nobody can make.
-
-        A caller-composed anchor has no axis position behind it by definition. A record
-        pairing `CALLER` with a persona would either be ignored — a field written and not
-        read — or be taken as "the caller wrote it under this persona", which is not a
-        thing the agent can know. Refused at the constructor so it cannot reach the store.
-        """
-        if self.author is AnchorAuthor.CALLER and self.persona is not None:
-            raise ValueError(
-                "A caller-composed anchor carries no persona: the agent did not compose "
-                "that text and has no axis position to attribute it to. Use "
-                "AnchorProvenance(author=AnchorAuthor.AGENT, persona=...) for an anchor "
-                "the agent composed."
-            )
-        return self
-
-
-def content_digest(text: str) -> str:
-    """SHA-256 hex of `text` as UTF-8: the address a layer body is stored under."""
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
-
-
-class ContextSnapshot(BaseModel):
-    """What one request carried besides the conversation: layers 1-3, turn context, model.
-
-    Appended to the session by the agent on every turn, and again within a turn when one of
-    these changes (a nudge adds to the turn context). A `REQUEST_CONTEXT` event names the
-    snapshot its request was built from, by `snapshot_id`, and records only the messages
-    the conversation gained since the previous request. The two together rebuild the
-    request exactly: see `uclone_x.agent.request_record.rebuild_requests`.
-
-    Every layer is stored by hash here and as a body in the session store, once per
-    distinct text: the tool schemas, the identity prompt, the slow context and the turn
-    context. The record grows by a few hashes per turn rather than by the prompt, the tool
-    list or the turn context, which would otherwise be copied into every snapshot and
-    rewritten with the whole record on every save. The bodies are redacted on disk; see
-    `SessionStore.save_context_body`.
-    """
-
-    model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
-
-    turn_index: int = Field(description="The session's turn counter when this was taken.")
-    tools_digest: str = Field(description="SHA-256 of the tool schemas, as sent, in order.")
-    identity_digest: str = Field(description="SHA-256 of the identity prompt.")
-    slow_context_digest: str = Field(
-        description="SHA-256 of the slow context: invariants, skills and workspace."
-    )
-    system_message: bool = Field(
-        description="Whether the request opened with a system message built from the "
-        "identity and slow context. False only when both were empty and there was no anchor."
-    )
-    turn_context_digest: str = Field(
-        description="SHA-256 of the `[Turn Context]` block, or of the empty text when there "
-        "was none."
-    )
-    model: str | None
-    temperature: float
-    max_tokens: int | None
-    auto_compact: bool
-    compaction_threshold_tokens: int
-
-    @field_validator(
-        "tools_digest", "identity_digest", "slow_context_digest", "turn_context_digest"
-    )
-    @classmethod
-    def _is_sha256(cls, value: str) -> str:
-        if not _SHA256_HEX.fullmatch(value):
-            raise ValueError("A layer digest is 64 lowercase hex characters (SHA-256).")
-        return value
-
-    @property
-    def snapshot_id(self) -> str:
-        """SHA-256 of this snapshot's canonical JSON: the name events refer to it by."""
-        canonical = json.dumps(
-            self.model_dump(mode="json"), sort_keys=True, separators=(",", ":"), ensure_ascii=False
-        )
-        return content_digest(canonical)
-
-
-class SessionState(BaseModel):
-    """One conversation session held by the Core Engine.
-
-    Frozen: a turn produces a new state rather than mutating the old one, so a state
-    handed to a caller cannot be changed underneath it. `turn_counter` travels with the
-    messages because the two are only meaningful together — the CLI `/reset` defect was
-    precisely that it replaced the messages and left the counter running.
-    """
-
-    model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
-
-    session_id: str
-    agent_id: str
-    messages: tuple[ChatMessage, ...] = Field(default_factory=tuple)
-
-    @field_validator("messages", mode="after")
-    @classmethod
-    def _redact_messages(cls, messages: tuple[ChatMessage, ...]) -> tuple[ChatMessage, ...]:
-        """Redact known credential shapes on write across all messages (#569)."""
-        return tuple(redact_message(m) for m in messages)
-
-    plan: PlanState | None = Field(
-        default=None, description="Active execution plan state for the session"
-    )
-    turn_counter: int = 0
-    created_at: str = Field(default_factory=_now_iso)
-    updated_at: str = Field(default_factory=_now_iso)
-    revision: int = Field(
-        default=0,
-        description="Monotonic write counter advanced by `SessionStore.save`. A state "
-        "carries the revision of the record it was read from, and `save` refuses it if "
-        "the record has moved on since — see `SessionStore.save` for the whole contract, "
-        "including the bound on what the precondition guarantees, and #219 for what it "
-        "replaces. `0` means 'never persisted', which is also what a legacy record with "
-        "no `revision` key reads back as. **Not tamper-proof**: no *snapshot* door "
-        "advances it, but a directly constructed or `model_copy`-ed `SessionState` can "
-        "carry any value, which `save` cannot distinguish from a genuine read. That is "
-        "accepted deliberately and the alternatives are rejected by name — see the #248 "
-        "decision in `SessionStore.save`, and do not read this field as a security "
-        "control: `save` is not the only route to the record.",
-    )
-    anchor_provenance: AnchorProvenance | None = Field(
-        default=None,
-        description="What composed `messages[0]` when it is a `SYSTEM` turn (#1152). "
-        "`None` means the record does not say — either it predates this field, or it was "
-        "built by a door that has no answer to give. It does **not** mean 'nobody' and it "
-        "does not mean 'no persona': a restored anchor with no recorded provenance is "
-        "left alone and reported, never re-resolved as though it had been stamped. Only "
-        "`BaseAgent`'s live session knows the answer, so only its snapshot writes this.",
-    )
-    context_snapshots: tuple[ContextSnapshot, ...] = Field(
-        default_factory=tuple,
-        description="What each turn's requests carried besides the conversation, oldest "
-        "first (#1421). A record written before this field reads back with none, and a "
-        "reset clears them together with the event log that refers to them.",
-    )
-
-    @classmethod
-    def seed(cls, session_id: str, agent_id: str, system_prompt: str = "") -> SessionState:
-        """Create a fresh session seeded exactly as `BaseAgent.__init__` seeds history.
-
-        A `SYSTEM` message if and only if `system_prompt` is non-empty. The `or ""`
-        spelling the CLI used produced an empty `SYSTEM` message instead, which is a
-        state no other path in the tree can construct.
-        """
-        messages: tuple[ChatMessage, ...] = ()
-        if system_prompt:
-            messages = (ChatMessage(role=MessageRole.SYSTEM, content=system_prompt),)
-        return cls(session_id=session_id, agent_id=agent_id, messages=messages, plan=None)
-
-    def reset(
-        self, system_prompt: str = "", anchor_provenance: AnchorProvenance | None = None
-    ) -> SessionState:
-        """Return this session purged back to its seeded state.
-
-        `anchor_provenance` travels beside `system_prompt` and not through `self` because
-        a reset *composes a new anchor*: whatever composed the old one has been discarded
-        along with it, so carrying the old stamp over would describe text that is no
-        longer there. The caller supplying the prompt is the only one that knows what
-        composed it; omitting it records "this record does not say", which is the honest
-        answer for a reset performed outside an agent.
-
-        `created_at` is carried over — a reset session is the same session, and losing
-        its creation time would make the store unable to say how long it has existed.
-
-        `revision` is carried over for a sharper reason: a reset is a *write to the same
-        record*, so it has to satisfy the same compare-and-swap as any other write. A
-        reset that zeroed the revision alongside the turn counter would be refused by
-        `SessionStore.save` on every already-persisted session — the reset would become
-        the one operation that could never be saved.
-
-        Constructed rather than `model_copy`-ed, for the reason in
-        "Validation is a property of the constructor, not of the type" in this module's
-        docstring, which also names the other door in this family.
-        """
-        seeded = SessionState.seed(
-            session_id=self.session_id,
-            agent_id=self.agent_id,
-            system_prompt=system_prompt,
-        )
-        # Constructed rather than `model_copy`-ed: `model_copy` does not validate, and
-        # every state this module hands back must be one `SessionStore.load` can read.
-        return SessionState(
-            session_id=seeded.session_id,
-            agent_id=seeded.agent_id,
-            messages=seeded.messages,
-            plan=seeded.plan,
-            turn_counter=0,
-            created_at=self.created_at,
-            updated_at=_now_iso(),
-            revision=self.revision,
-            anchor_provenance=anchor_provenance,
-        )
-
-    def with_messages(
-        self,
-        messages: Sequence[ChatMessage],
-        turn_counter: int | None = None,
-        updated_at: str | None = None,
-    ) -> SessionState:
-        """Return this session carrying a new message sequence.
-
-        Built through the constructor, **not** `model_copy`. `model_copy(update=...)`
-        performs no validation, so `with_messages(msgs, turn_counter="9")` used to be
-        accepted here, persist `"9"` to disk, and then read back as `None` from
-        `SessionStore.load` — a write that reported success and a record that
-        subsequently claimed no session existed. That is the silent-wipe shape, arriving
-        through this module's own public API, and `strict=True` cannot catch it unless
-        the value actually passes through validation.
-
-        See "Validation is a property of the constructor, not of the type" in this
-        module's docstring for the other door in this family and why closing one is
-        not enough.
-
-        `revision` is carried through unchanged and takes no parameter, which is what
-        makes the compare-and-swap in `SessionStore.save` work across a turn: the state a
-        caller builds from what it read still claims the revision it read, so a write
-        built on a stale read is still recognisably stale, and no caller can set it to
-        something else.
-
-        `anchor_provenance` is kept **only while the anchor itself is unchanged**. This
-        method replaces the whole sequence, so it can replace `messages[0]` — and a stamp
-        describing text that is no longer there is worse than no stamp, because it is the
-        one input `BaseAgent._anchor_is_stale` trusts. Compaction, which keeps the anchor
-        and drops turns behind it, therefore keeps its provenance; a wholesale
-        `load_history` does not.
-
-        `updated_at` is the contrast that explains why it is not the concurrency token.
-        It defaults to now here, and #223 made it *preservable* by parameter — so a
-        caller can carry one across a `with_messages`, which it could not before. That
-        still does not make it able to arbitrate, for three reasons that `revision`
-        avoids by construction: preserving it is **opt-in**, so a precondition built on it
-        would be silently unenforced for every caller that did not pass it; it is
-        **caller-settable**, so a stale writer can simply supply the value that will
-        match; and it is a wall-clock string rather than a counter, so two writes inside
-        one clock tick are indistinguishable. `SessionStore.save` stamps it again on the
-        way to disk in any case.
-        """
-        replacement = tuple(messages)
-        return SessionState(
-            session_id=self.session_id,
-            agent_id=self.agent_id,
-            messages=replacement,
-            plan=self.plan,
-            turn_counter=self.turn_counter if turn_counter is None else turn_counter,
-            created_at=self.created_at,
-            updated_at=_now_iso() if updated_at is None else updated_at,
-            revision=self.revision,
-            anchor_provenance=(
-                self.anchor_provenance if replacement[:1] == self.messages[:1] else None
-            ),
-            context_snapshots=self.context_snapshots,
-        )
-
-    def with_plan(self, plan: PlanState | None) -> SessionState:
-        """Return this session carrying a new plan state."""
-        return SessionState(
-            session_id=self.session_id,
-            agent_id=self.agent_id,
-            messages=self.messages,
-            plan=plan,
-            turn_counter=self.turn_counter,
-            created_at=self.created_at,
-            updated_at=_now_iso(),
-            revision=self.revision,
-            anchor_provenance=self.anchor_provenance,
-            context_snapshots=self.context_snapshots,
-        )
-
-    def append_message(
-        self,
-        message: ChatMessage,
-        turn_counter: int | None = None,
-        updated_at: str | None = None,
-    ) -> SessionState:
-        """Return this session carrying `message` appended to its history, with credentials redacted.
-
-        Redaction on write (Option A from #569) ensures that credential shapes
-        (such as OpenAI sk-..., GitHub ghp_..., Anthropic sk-ant-..., AWS keys)
-        do not enter session state or durable persistence.
-
-        Known limitation: Catches only known credential shapes; unrecognized or
-        unstructured secrets cannot be detected by pattern matching.
-        """
-        redacted = redact_message(message)
-        return SessionState(
-            session_id=self.session_id,
-            agent_id=self.agent_id,
-            messages=(*self.messages, redacted),
-            plan=self.plan,
-            turn_counter=self.turn_counter if turn_counter is None else turn_counter,
-            created_at=self.created_at,
-            updated_at=_now_iso() if updated_at is None else updated_at,
-            revision=self.revision,
-            # Appending cannot touch `messages[0]`, so the anchor — and what composed it —
-            # is exactly the one this stamp already describes.
-            anchor_provenance=self.anchor_provenance,
-            context_snapshots=self.context_snapshots,
-        )
-
-
 class CompactionResult(BaseModel):
     """What one session-level compaction did (P5, P6).
 
@@ -1098,9 +552,9 @@ class SessionStore:
 
     Writes are atomic by `os.replace` onto a same-directory temporary file. The
     temporary name is built from the process id and a random suffix, deliberately not
-    from `asyncio.get_running_loop().time()` as `AgentSessionManager.save_session_record`
-    does: that call raises `RuntimeError` outside a running event loop, which makes the
-    write unavailable to exactly the headless synchronous callers — the CLI REPL and the
+    from `asyncio.get_running_loop().time()` as the UI transcript writer once did: that
+    call raises `RuntimeError` outside a running event loop, which makes the write
+    unavailable to exactly the headless synchronous callers — the CLI REPL and the
     A2A path — that P8 says must be able to reach session state without the UI.
 
     Writes are also **optimistically concurrency-controlled** on `SessionState.revision`,

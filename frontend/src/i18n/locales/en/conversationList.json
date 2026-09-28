@@ -1,0 +1,31 @@
+{
+  "heading": "Conversations",
+  "newLabel": "New",
+  "newTitle": "Start a new conversation",
+  "collapse": "Collapse sidebar",
+  "rename": "Rename",
+  "renameLabel": "Rename “{name}”",
+  "delete": "Delete",
+  "deleteLabel": "Delete “{name}”",
+  "editor": {
+    "titleLabel": "Conversation title",
+    "save": "Save title",
+    "cancel": "Cancel rename"
+  },
+  "deleteDialog": {
+    "heading": "Delete “{name}”?",
+    "body": {
+      "one": "Its whole transcript ({count} entry) and its record of who was in it ({who}) will be removed, and any reply still being written in it is stopped. This cannot be undone.",
+      "other": "Its whole transcript ({count} entries) and its record of who was in it ({who}) will be removed, and any reply still being written in it is stopped. This cannot be undone."
+    },
+    "noAgents": "no clones",
+    "cancel": "Cancel",
+    "close": "Close",
+    "confirm": "Delete conversation",
+    "confirming": "Deleting…",
+    "unreadableHeading": "Delete the conversation that could not be read?",
+    "unreadableBody": "Its saved copy will be removed. This cannot be undone."
+  },
+  "unreadableTitle": "A conversation that could not be read",
+  "unreadableDeleteLabel": "Delete the conversation that could not be read"
+}

@@ -121,6 +121,35 @@ def in_story_library(resolved: Path, workspace_root: Path) -> bool:
     return False
 
 
+#: Where a workspace keeps its clones' definitions and pictures, as path components.
+_PERSONAS_PARTS: tuple[str, str] = (".uclone", "personas")
+
+
+def in_personas_dir(resolved: Path, workspace_root: Path) -> bool:
+    """Whether `resolved`, a path `resolve_safe_path` returned, is in `<workspace>/.uclone/personas`.
+
+    That folder holds each clone's definition and picture. The head changes them through
+    its own routes, and a clone changes its own picture with `set_avatar`, which checks
+    whose picture it is. A general writing tool reaching in could instead replace another
+    clone's definition or picture. Decided as `in_story_library` decides: the first two
+    components compared after case folding, then every existing folder on the way compared
+    by file identity with the personas folder, so another spelling or a link to it is refused.
+    """
+    root = workspace_root.resolve()
+    parts = resolved.relative_to(root).parts
+    if tuple(part.casefold() for part in parts[:2]) == _PERSONAS_PARTS:
+        return True
+    personas = root.joinpath(*_PERSONAS_PARTS)
+    if not personas.exists():
+        return False
+    for folder in (resolved, *resolved.parents):
+        if folder == root:
+            return False
+        if folder.exists() and folder.samefile(personas):
+            return True
+    return False
+
+
 def artifact_content_url(rel_path: str) -> str:
     """The rooted URL the UI serves a workspace file at -- the one link a reply should carry.
 
@@ -248,6 +277,18 @@ def tool_approval_timeout_note(tool: object) -> str | None:
     not happen and why, rather than that a request "timed out".
     """
     declared: object = getattr(tool, "approval_timeout_note", None)
+    return declared if isinstance(declared, str) and declared else None
+
+
+def tool_approval_unavailable_note(tool: object) -> str | None:
+    """What `tool` says when this app cannot ask a person at all, or `None`.
+
+    A host that has nobody to answer an approval request during a turn (the desktop app)
+    refuses such a call at once rather than waiting out the approval timeout. A tool whose
+    refusal the person will hear about declares `approval_unavailable_note`, which names
+    where a person can decide instead.
+    """
+    declared: object = getattr(tool, "approval_unavailable_note", None)
     return declared if isinstance(declared, str) and declared else None
 
 
@@ -567,6 +608,9 @@ class BaseTool(abc.ABC, Generic[TParams]):
     #: What the refusal says when nobody answered the approval request. See
     #: `tool_approval_timeout_note`.
     approval_timeout_note: ClassVar[str | None] = None
+    #: What the refusal says when this app cannot ask a person at all. See
+    #: `tool_approval_unavailable_note`.
+    approval_unavailable_note: ClassVar[str | None] = None
     #: What a call refused on its arguments did *not* do, in words the model reads next to
     #: the refusal. A refusal that names only a field and a type leaves the model to guess
     #: whether anything happened, and one model guessed that it had (#1375). A tool whose
@@ -633,7 +677,8 @@ class BaseTool(abc.ABC, Generic[TParams]):
 
         Raises:
             PathTraversalError: the path escapes the workspace.
-            PlainRefusalError: the path is in the story library (`in_story_library`).
+            PlainRefusalError: the path is in the story library (`in_story_library`), or
+                where clones' definitions and pictures are kept (`in_personas_dir`).
         """
         resolved = self.resolve_safe_path(target_path, workspace_root)
         if in_story_library(resolved, workspace_root):
@@ -642,6 +687,12 @@ class BaseTool(abc.ABC, Generic[TParams]):
                 "are changed with the story tools (story_manuscript, story_outline, "
                 "story_codex), which check which conversation is writing the story and ask "
                 "a person before a codex change. Reading the file is still allowed."
+            )
+        if in_personas_dir(resolved, workspace_root):
+            raise PlainRefusalError(
+                f"'{target_path}' is where clones' definitions and pictures are kept, so it "
+                "was not written. A clone changes its own picture with set_avatar, and a "
+                "person edits a clone from its settings. Reading the file is still allowed."
             )
         return resolved
 
@@ -800,6 +851,7 @@ class BaseTool(abc.ABC, Generic[TParams]):
             elapsed_ms = (time.perf_counter() - start_time) * 1000.0
             return ToolResult(
                 success=False,
+                output={"reason_code": e.reason_code} if e.reason_code else None,
                 error=str(e),
                 execution_time_ms=elapsed_ms,
                 isolation_level=actual_context.isolation.level,

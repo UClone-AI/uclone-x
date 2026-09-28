@@ -2,6 +2,7 @@ import React from 'react';
 import { Stethoscope } from 'lucide-react';
 import { AcpTab } from '../AcpTab';
 import { EvaluationsTab } from '../EvaluationsTab';
+import { useCopy } from '../../i18n';
 import { useApiRead } from '../../lib/useApiRead';
 import type { AcpStatusData, EvaluationsData } from '../../types';
 import { ReadFailure, ReadLoading } from './ReadState';
@@ -28,40 +29,41 @@ import { ReadFailure, ReadLoading } from './ReadState';
 export const DiagnosticsSection: React.FC = () => {
   const acp = useApiRead<AcpStatusData>('/api/acp/status');
   const evals = useApiRead<EvaluationsData>('/api/evaluations/latest');
+  const copy = useCopy().diagnostics.section;
 
   return (
     <div className="space-y-3" data-testid="settings-diagnostics">
       <label className="text-xs font-semibold uppercase tracking-wider text-slate-400 flex items-center gap-1.5">
         <Stethoscope className="w-3.5 h-3.5 text-cyan-400" />
-        Diagnostics
+        {copy.title}
       </label>
       <p className="text-[11px] text-slate-500">
-        What this build answers of the Agent Client Protocol, and its latest evaluation run.
+        {copy.intro}
       </p>
       <div className="dock-scope space-y-6">
         {acp.error !== null ? (
           <ReadFailure
             testId="diagnostics-acp-error"
-            what="ACP status could not be read from the runtime."
+            what={copy.acpFailed}
             cause={acp.error}
             onRetry={acp.reload}
             retrying={acp.loading}
           />
         ) : acp.data === null ? (
-          <ReadLoading testId="diagnostics-acp-loading">Reading ACP status…</ReadLoading>
+          <ReadLoading testId="diagnostics-acp-loading">{copy.acpLoading}</ReadLoading>
         ) : (
           <AcpTab acpStatus={acp.data} onRefresh={acp.reload} isLoading={acp.loading} />
         )}
         {evals.error !== null ? (
           <ReadFailure
             testId="diagnostics-evals-error"
-            what="Evaluation results could not be read from the runtime."
+            what={copy.evalsFailed}
             cause={evals.error}
             onRetry={evals.reload}
             retrying={evals.loading}
           />
         ) : evals.data === null ? (
-          <ReadLoading testId="diagnostics-evals-loading">Reading evaluation results…</ReadLoading>
+          <ReadLoading testId="diagnostics-evals-loading">{copy.evalsLoading}</ReadLoading>
         ) : (
           <EvaluationsTab
             evaluationsData={evals.data}

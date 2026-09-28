@@ -233,12 +233,12 @@ def test_the_loser_of_a_mint_race_reports_the_winners_id(tmp_path: Path) -> None
 
 
 def test_a_regular_file_where_a_home_belongs_is_an_agent_home_fault(tmp_path: Path) -> None:
-    """A bare `OSError` from here is reported by the UI as a session fault.
+    """A bare `OSError` from here would be reported as some other component's fault.
 
-    `_translate_session_error` names `AgentHomeError`; an `OSError` escaping `mkdir` falls
-    past it to a 500 labelled "Session operation failed" with
-    `component=uclone_x.agent.session` -- the mis-attribution this module exists to stop,
-    arriving through a different door (P6).
+    Callers catch `AgentHomeError` by name; an `OSError` escaping `mkdir` would fall past
+    them and be labelled by whatever layer caught it -- the mis-attribution this module
+    exists to stop, arriving through a different door (P6). (The chat route that once
+    translated it was retired in #1731.)
 
     Killed by: src/uclone_x/core/agent_home.py :: f"agent {self.username!r} has no usable home at {self.path}: {exc}"
     Becomes: f"agent has no usable home"

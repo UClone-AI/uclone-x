@@ -14,9 +14,11 @@ from typing import Any, Final, cast
 
 import uclone_x
 from uclone_x.agent.base import BaseAgent
-from uclone_x.agent.session import SessionStore, validate_session_id
+from uclone_x.agent.session import SessionStore
+from uclone_x.core.session import validate_session_id
 from uclone_x.core.session_store import SessionStoreProtocol
 from uclone_x.engine.event_bus import AgentEvent, EventBus, EventSubscription, EventType
+from uclone_x.errors import ProviderFailureKind
 from uclone_x.shells.acp.models import (
     ACP_PROTOCOL_VERSION,
     INTERNAL_ERROR,
@@ -78,14 +80,28 @@ BLOCKED_MESSAGE: Final[str] = (
     "it again is likely to be stopped the same way."
 )
 _PLAIN_ERROR_STOP_REASONS: Final[frozenset[str]] = frozenset(
-    {"step_results_over_window", "model_without_tools"}
+    {
+        "step_results_over_window",
+        "model_without_tools",
+        "usage_limit",
+        *(kind.value for kind in ProviderFailureKind),
+    }
 )
-"""Stop reasons whose `TurnResult.error` is written for the user and is sent as is."""
+"""Stop reasons whose `TurnResult.error` is written for the user and is sent as is. A
+hosted provider's failure is one (#1630): its sentence names the provider and whose side the
+cause is on, which is what an ACP client's user needs and `TURN_FAILED_MESSAGE` withheld. The
+user's paid-model usage limit is another: its sentence names the window, when it lifts and
+the remedies (`llm-token-gateway.md` §4.3)."""
 _PLAIN_ERROR_REMEDIES: Final[dict[str, str]] = {
     "model_without_tools": "Choose it in Settings, then send your message again.",
+    "model_unavailable": "Choose a model in Settings, then send your message again.",
+    "provider_auth": "Paste a new API key in Settings, then send your message again.",
+    "provider_unreachable": "If you set a custom endpoint in Settings, check that address too.",
 }
 """Where to act on a plain error, for an ACP client: the Core's sentence says what to pick
-and leaves where to this head, and here the model is chosen in Settings, not by a flag."""
+and leaves where to this head, and here the model is chosen in Settings, not by a flag.
+`model_unavailable` covers both a model the provider no longer serves and one never
+chosen ("No model is chosen for Google."), so its remedy says "a model", not "another"."""
 _STOP_REASON_MESSAGES: Final[dict[str, str]] = {
     "budget_exceeded": USAGE_LIMIT_MESSAGE,
     "step_budget_exceeded": TOO_MANY_STEPS_MESSAGE,

@@ -43,6 +43,8 @@ from __future__ import annotations
 
 import fnmatch
 import re
+from collections.abc import Mapping, Sequence
+from typing import Any, cast
 
 __all__ = [
     "REDACTED_PLACEHOLDER",
@@ -53,6 +55,7 @@ __all__ = [
     "contains_credential",
     "is_secret_env_name",
     "redact_credentials",
+    "redact_log_payload",
 ]
 
 
@@ -335,3 +338,18 @@ def redact_credentials(text: str, placeholder: str = REDACTED_PLACEHOLDER) -> st
         else:
             result = pattern.sub(repl, result)
     return result
+
+
+def redact_log_payload(payload: Any, placeholder: str = REDACTED_PLACEHOLDER) -> Any:
+    """Recursively redact credential shapes from strings within mappings and sequences."""
+    if isinstance(payload, str):
+        return redact_credentials(payload, placeholder=placeholder)
+    if isinstance(payload, Mapping):
+        return {
+            str(k): redact_log_payload(v, placeholder=placeholder)
+            for k, v in cast(Mapping[Any, Any], payload).items()
+        }
+    if isinstance(payload, (list, tuple)):
+        seq = cast("Sequence[object]", payload)
+        return [redact_log_payload(item, placeholder=placeholder) for item in seq]
+    return payload

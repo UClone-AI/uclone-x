@@ -457,7 +457,7 @@ def test_execute_tool_call_names_a_tool_that_is_not_registered() -> None:
     Without the check it surfaces as `IndexError` on an empty result list, which reads like
     the tool ran and returned nothing -- the one reading a preflight must never be given.
 
-    Killed by: src/uclone_x/agent/base.py :: if self._resolve_tool(name) is None:
+    Killed by: src/uclone_x/agent/base.py :: if self._tool_invoker.resolve(name) is None:
     Becomes: if False:
     """
     with pytest.raises(KeyError, match="not registered"):

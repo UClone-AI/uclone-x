@@ -1,0 +1,27 @@
+{
+  "mutation": {
+    "label": "파일 변경",
+    "on": "파일 변경: {target}",
+    "bare": "파일 변경 ({tool})"
+  },
+  "command": {
+    "label": "명령",
+    "on": "명령: {target}",
+    "bare": "명령 실행 ({tool})"
+  },
+  "web": {
+    "label": "웹 가져오기",
+    "on": "웹 가져오기: {target}",
+    "bare": "웹 가져오기 ({tool})"
+  },
+  "inspection": {
+    "label": "살펴보기",
+    "on": "살펴보기: {target}",
+    "bare": "살펴보기 ({tool})"
+  },
+  "tool": {
+    "label": "도구 호출",
+    "on": "도구 호출: {tool}",
+    "unknown": "알 수 없는 도구"
+  }
+}

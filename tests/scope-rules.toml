@@ -1,0 +1,87 @@
+# What a diff reaches, beyond what the import graph can see.
+#
+# Read by `./ucx test changed` (which tests a diff selects) and by `./ucx test check` (whether
+# the merge gate runs the browser suite). Loaded by `src/uclone_x/cli/scope_rules.py`, which
+# refuses an unknown key or a mistyped value rather than ignoring it: a rule that silently
+# stopped applying would narrow every run after it.
+#
+# A path matches a rule when it equals one of `files`, its last component equals one of
+# `names`, it starts with one of `prefixes`, or it ends with one of `suffixes`.
+#
+# A changed test file always selects itself, whichever rule it also matches: a test the PR
+# edits is run by the PR's own checks (`./ucx test changed`), never left to a later run.
+
+version = 1
+
+# A change here reaches every test, so `./ucx test changed` runs the whole gate without the
+# browser suite (`check --fast`), and the merge gate runs the browser suite in full.
+#
+# This file is one of them: no test imports it, and a changed rule changes every selection.
+[whole_suite]
+files = ["pyproject.toml", "uv.lock", "ucx", "tests/scope-rules.toml"]
+names = ["conftest.py"]
+prefixes = ["tests/support/"]
+
+# A change here can change what the browser renders, so the merge gate runs the whole browser
+# suite. Anything else — and not imported by the suite — runs only the browser test files the
+# diff itself changes; the suite as a whole is then vouched for by a recent full pass on main
+# (`[browser_freshness]`).
+#
+# `tests/e2e/` covers the suite's own support: its conftest, fixtures and helpers. A changed
+# `test_*.py` under it is the exception — it runs itself, and does not pull in the rest.
+#
+# Beyond these, any changed module the browser suite imports (directly or not) also calls for
+# the whole suite; the import graph decides that, and needs no rule. These rules name what
+# imports cannot show — assets, and the code that makes this very decision, which a PR must
+# not be able to narrow for itself. Any non-Python file under `src/` (package data the app
+# loads at run time) also calls for the whole suite, without a rule.
+[browser_suite]
+files = [
+  "src/uclone_x/cli/browser_plan.py",
+  "src/uclone_x/cli/changed_scope.py",
+  "src/uclone_x/cli/main.py",
+  "src/uclone_x/cli/quality_gate.py",
+  "src/uclone_x/cli/scope_rules.py",
+  "scripts/nightly-gate.sh",
+]
+prefixes = ["frontend/", "src/uclone_x/ui/", "src/uclone_x/ui_static/", "tests/e2e/"]
+
+# Judged by the frontend's own vitest suite and the bundle-freshness check.
+[frontend]
+prefixes = ["frontend/", "src/uclone_x/ui_static/"]
+
+# A governance document is judged by the fitness functions (testing principles R3).
+[fitness]
+prefixes = [".claude/", "docs/", "swarm/skills/"]
+suffixes = [".md"]
+tests = "tests/fitness/"
+
+# Checks over the whole tree rather than over what they import: every tracked file is
+# classified for export, every test file is declared, and every kill declaration still names
+# one line that exists. A new file of any kind, or an edit that moves a declared line, can fail
+# one of them, and no import edge leads to them, so they run on every diff. Each costs
+# seconds; the full gate failing on one costs a regate. Keep a check here only while it stays
+# cheap (under ~15 s alone).
+[always]
+tests = [
+  "tests/unit/test_oss_export.py",
+  "tests/unit/test_swarm_manifest.py",
+  "tests/fitness/test_oss_manifest.py",
+  "tests/fitness/test_mutation_kill_declarations.py",
+  "tests/fitness/test_frontend_kill_declarations.py",
+  "tests/fitness/test_kill_declaration_uniqueness.py",
+  "tests/fitness/test_kill_declaration_placement.py",
+  "tests/fitness/test_kill_declaration_becomes.py",
+]
+
+# The browser suite's home. Its tests run in one process after everything else.
+[browser_tests]
+dir = "tests/e2e/"
+
+# How recent a full browser-suite pass on main must be for the merge gate to skip the suite on
+# a diff no `[browser_suite]` rule matches. Both bounds apply: the pass must be on one of the
+# last `max_merges` first-parent commits of the merge base, and no older than `max_age_hours`.
+# Without one, the merge gate runs the suite in full and records the pass (a lazy nightly).
+[browser_freshness]
+max_age_hours = 24
+max_merges = 20

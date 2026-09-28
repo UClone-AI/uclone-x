@@ -7,6 +7,7 @@ approval step runs -- and the token budget stopped at the delegation boundary.
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import inspect
 from pathlib import Path
@@ -24,6 +25,7 @@ from uclone_x.agent.hooks import BaseHook, HookAction, HookContext, HookDecision
 from uclone_x.agent.models import AgentConfig
 from uclone_x.agent.session import SessionStore
 from uclone_x.core.provenance import Provenance
+from uclone_x.engine import AgentEvent, EventType
 from uclone_x.engine.event_bus import EventBus
 from uclone_x.llm.budget import TokenBudgetManager
 from uclone_x.llm.connectors.mock import MockLLMConnector
@@ -57,6 +59,18 @@ class _RefuseGuardedTool(BaseHook):
         return HookDecision(action=HookAction.ALLOW)
 
 
+class _AskForGuardedTool(BaseHook):
+    """Puts `guarded_tool` to a person, as `HumanApprovalHook` does for a write."""
+
+    def __init__(self) -> None:
+        super().__init__(name="ask_for_guarded_tool")
+
+    async def on_pre_tool_use(self, context: HookContext) -> HookDecision:
+        if context.payload.get("tool_name") == "guarded_tool":
+            return HookDecision(action=HookAction.ASK)
+        return HookDecision(action=HookAction.ALLOW)
+
+
 def _parent(
     tmp_path: Path,
     llm: MockLLMConnector,
@@ -64,15 +78,18 @@ def _parent(
     *,
     hooks: list[BaseHook] | None = None,
     budget: TokenBudgetManager | None = None,
+    bus: EventBus | None = None,
+    approvals_answered: bool = True,
 ) -> BaseAgent:
     host = HostDependencies(
-        bus=EventBus(),
+        bus=bus or EventBus(),
         llm=llm,
         tools=tools,
         tracer=TelemetryTracer(),
         store=SessionStore(storage_dir=tmp_path),
         hooks=hooks,
         budget=budget,
+        approvals_answered=approvals_answered,
     )
     config = AgentConfig(agent_id="lead", name="lead", enable_subagent_tools=True)
     return compose_agent(config=config, host=host)
@@ -169,3 +186,66 @@ def test_every_host_field_is_either_given_to_a_child_or_withheld_on_purpose(
 
     assert forwarded.isdisjoint(SUBAGENT_EXCLUDED_HOST_FIELDS)
     assert forwarded | SUBAGENT_EXCLUDED_HOST_FIELDS == every_field
+
+
+@pytest.mark.asyncio
+async def test_a_desktop_sub_agent_refuses_an_approval_call_at_once(tmp_path: Path) -> None:
+    """A child of a desktop agent is refused before anything is asked, as its parent is.
+
+    The desktop app answers no approval request during a conversation (owner decision
+    2026-09-26), so its agents are built with `approvals_answered=False`. A child that
+    inherited `True` would ask instead -- and here a listener stands ready to say yes, so
+    the call would run. It is never asked, and the tool does not run (#1692).
+
+    Killed by: src/uclone_x/agent/base.py :: "approvals_answered": self._approvals_answered,
+    Becomes: "approvals_answered": True,
+    """
+    tool = _CountingTool()
+    tools = ToolRegistry()
+    tools.register(tool)
+    bus = EventBus()
+    await bus.start()
+    parent = _parent(
+        tmp_path,
+        MockLLMConnector(responses=["done"]),
+        tools,
+        hooks=[_AskForGuardedTool()],
+        bus=bus,
+        approvals_answered=False,
+    )
+    child = await parent.spawn_subagent(role="helper", goal="help")
+    topic = f"session.{child.context.session_id}"
+    sub = bus.subscribe({topic})
+    asked: list[str] = []
+
+    async def person() -> None:
+        while True:
+            event = await sub.get()
+            if event.type == EventType.TOOL_APPROVAL_REQUEST:
+                asked.append(str(event.payload["request_id"]))
+                await bus.publish(
+                    AgentEvent(
+                        type=EventType.TOOL_APPROVAL_RESPONSE,
+                        topic=topic,
+                        sender_id="ui",
+                        payload={"request_id": event.payload["request_id"], "action": "allow"},
+                    )
+                )
+
+    await child.start()
+    answering = asyncio.create_task(person())
+    try:
+        record = await child.execute_tool_call("guarded_tool", {})
+    finally:
+        answering.cancel()
+        await child.stop()
+        await bus.stop()
+
+    assert child.approvals_answered is False
+    assert asked == []
+    assert record.status == "error"
+    assert record.error == (
+        "This call needs a person's approval, and this app cannot ask for it during a "
+        "conversation, so it did not run."
+    )
+    assert tool.runs == 0

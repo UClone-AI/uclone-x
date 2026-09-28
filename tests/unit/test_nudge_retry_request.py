@@ -30,12 +30,14 @@ import pytest
 from pydantic import BaseModel, Field
 
 from uclone_x.agent.base import (
-    EVIDENCE_REQUIRED_NUDGE,
-    GROUNDING_REQUIRED_NUDGE_PREFIX,
     BaseAgent,
-    _is_evidence_nudge_declined,  # pyright: ignore[reportPrivateUsage]
 )
 from uclone_x.agent.models import AgentConfig, AgentLLMConfig
+from uclone_x.agent.nudges import (
+    EVIDENCE_REQUIRED_NUDGE,
+    GROUNDING_REQUIRED_NUDGE_PREFIX,
+    is_evidence_nudge_declined,
+)
 from uclone_x.core.provenance import ExecutionPath, Provenance, ServiceRef
 from uclone_x.llm.connectors.base import BaseLLMConnector
 from uclone_x.llm.models import (
@@ -284,7 +286,7 @@ async def test_a_nudged_turn_persists_one_answer_the_one_it_returned(
     answered twice, as two consecutive `ASSISTANT` messages, in every later request. The
     next turn's request is checked too: that is where a left-behind answer would surface.
 
-    Killed by: src/uclone_x/agent/base.py :: self._history.pop()
+    Killed by: src/uclone_x/agent/turn_executor.py :: self._history.pop()
     Becomes: pass
     """
     llm = RecordingLLM([*script, _answer("next turn")])
@@ -320,7 +322,7 @@ async def test_an_evidence_retry_that_writes_nothing_leaves_the_rejected_answer_
     message, and every later request in the session opened with `USER · USER`. An empty
     reply is not hypothetical: a reasoning-only reply reaches the loop as one.
 
-    Killed by: src/uclone_x/agent/base.py :: superseded = first_assistant_msg
+    Killed by: src/uclone_x/agent/turn_executor.py :: superseded = first_assistant_msg
     Becomes: superseded = first_assistant_msg and self._history.pop()
     """
     llm = RecordingLLM([_answer(_REJECTED), _empty()])
@@ -342,7 +344,7 @@ async def test_a_grounding_retry_that_writes_nothing_leaves_the_rejected_answer_
     """The same on the grounding path, where the loss was quieter: history ended on the
     tool result, and the turn's answer was missing from the record altogether.
 
-    Killed by: src/uclone_x/agent/base.py :: superseded = (
+    Killed by: src/uclone_x/agent/turn_executor.py :: superseded = (
     Becomes: superseded = self._history.pop() if resp_content else None or (
     """
     llm = RecordingLLM([_call("tc_1"), _answer(_REJECTED), _empty()])
@@ -374,7 +376,7 @@ async def test_after_an_empty_first_answer_the_retrys_answer_stands(retried: str
     Treated as declined, the retry's answer was swapped for the empty first one: the turn
     returned "", nothing entered history, and every later request opened `USER · USER`.
 
-    Killed by: src/uclone_x/agent/base.py :: and first_answer
+    Killed by: src/uclone_x/agent/turn_executor.py :: and first_answer
     Becomes: and first_answer is not None
     """
     llm = RecordingLLM([_empty(), _answer(retried)])
@@ -401,9 +403,9 @@ def test_a_first_answer_with_no_words_matches_no_retry(first: str) -> None:
     """Stripped to nothing, the first answer made the phrase pattern `\\b\\b`, which
     matches every retry, so any retry read as a restatement of it.
 
-    Killed by: src/uclone_x/agent/base.py :: if clean_first and re.search(pattern, lowered_second):
+    Killed by: src/uclone_x/agent/nudges.py :: if clean_first and re.search(pattern, lowered_second):
     Becomes: if re.search(pattern, lowered_second):
     """
     assert (
-        _is_evidence_nudge_declined("I could not confirm it; the tool returned 2.", first) is False
+        is_evidence_nudge_declined("I could not confirm it; the tool returned 2.", first) is False
     )

@@ -457,7 +457,9 @@ class OntologyEngine:
             )
 
         results: list[OntologyAxiom] = []
-        for axiom in self._axioms.values():
+        # Sorted by name, the axioms' unique key, so the invariants section of the system
+        # message does not depend on the order they were taught or loaded (design §5.3).
+        for axiom in sorted(self._axioms.values(), key=lambda a: a.name):
             # Tier filtering
             if tier_filter == "asserted":
                 if axiom.tier not in (

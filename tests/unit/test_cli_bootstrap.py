@@ -246,7 +246,7 @@ def _report(
 def test_image_engine_report_is_not_ready_on_a_package_without_a_checkpoint() -> None:
     """`diffusers` importing is half the requirement; a load with no file would fail (P6).
 
-    Killed by: src/uclone_x/cli/commands/bootstrap.py :: return self.dependencies_ok and self.checkpoint is not None
+    Killed by: src/uclone_x/tools/builtin/image_status.py :: return self.dependencies_ok and self.checkpoint is not None
     Becomes: return self.dependencies_ok
     """
     report = _report(deps_ok=True, checkpoint=None)
@@ -259,7 +259,7 @@ def test_image_engine_report_is_not_ready_on_a_package_without_a_checkpoint() ->
 def test_image_engine_report_engine_order_matches_the_dispatcher() -> None:
     """A detected daemon outranks the in-process engine, and a remote worker outranks both.
 
-    Killed by: src/uclone_x/cli/commands/bootstrap.py :: if self.comfy_alive:
+    Killed by: src/uclone_x/tools/builtin/image_status.py :: if self.comfy_alive:
     Becomes: if False:
     """
     both = _report(comfy_alive=True, deps_ok=True, checkpoint="/m/c.safetensors")
@@ -286,7 +286,7 @@ def test_image_engine_report_does_not_count_a_remote_worker_that_never_answered(
     `RemoteCudaImageEngine.is_available` -- refused the very same environment with
     `ImageGenerationError` (reviewer, PR #1096).
 
-    Killed by: src/uclone_x/cli/commands/bootstrap.py :: return bool(self.remote_url) and self.remote_alive
+    Killed by: src/uclone_x/tools/builtin/image_status.py :: return bool(self.remote_url) and self.remote_alive
     Becomes: return bool(self.remote_url)
     """
     unreachable = _report(remote="http://127.0.0.1:59999", remote_alive=False)
@@ -313,7 +313,7 @@ def test_image_engine_report_is_ready_on_the_in_process_engine_alone() -> None:
     `ucx media status` would have reported "not ready" on a machine that can generate --
     the promise-the-wrong-way-round half of P6.
 
-    Killed by: src/uclone_x/cli/commands/bootstrap.py :: return self.remote_ready or self.comfy_alive or self.in_process_ready
+    Killed by: src/uclone_x/tools/builtin/image_status.py :: return self.remote_ready or self.comfy_alive or self.in_process_ready
     Becomes: return self.remote_ready or self.comfy_alive
     """
     alone = _report(deps_ok=True, checkpoint="/m/c.safetensors")
@@ -330,7 +330,7 @@ def test_probe_image_engines_reads_the_environment_and_the_disk(
 ) -> None:
     """The configured remote worker is probed, not assumed present from its variable.
 
-    Killed by: src/uclone_x/cli/commands/bootstrap.py :: asyncio.run(RemoteCudaImageEngine(base_url=remote_url).is_available())
+    Killed by: src/uclone_x/tools/builtin/image_status.py :: asyncio.run(RemoteCudaImageEngine(base_url=remote_url).is_available())
     Becomes: True
     """
     checkpoint = tmp_path / "c.safetensors"
@@ -384,7 +384,7 @@ def test_probe_image_engines_takes_the_in_process_verdict_from_the_probe_not_the
     that was stubbed, and every other field, including `ready` and `engine`, follows the
     stub rather than this interpreter's site-packages.
 
-    Killed by: src/uclone_x/cli/commands/bootstrap.py :: dependency_problems=tuple(
+    Killed by: src/uclone_x/tools/builtin/image_status.py :: dependency_problems=tuple(
     Becomes: dependency_problems=("'torch' is not installed (needs torch>=2.2.0)",) or tuple(
     """
     checkpoint = tmp_path / "c.safetensors"
@@ -427,7 +427,7 @@ def test_probe_image_engines_records_a_remote_worker_that_answers(
 ) -> None:
     """The same probe, answering: the engine is then reported ready and named.
 
-    Killed by: src/uclone_x/cli/commands/bootstrap.py :: remote_alive=remote_alive,
+    Killed by: src/uclone_x/tools/builtin/image_status.py :: remote_alive=remote_alive,
     Becomes: remote_alive=False,
     """
     monkeypatch.setenv("UCX_IMAGE_REMOTE_URL", "http://10.0.0.99:8000")
@@ -454,7 +454,7 @@ def test_probe_image_engines_makes_no_remote_probe_without_a_configured_address(
 ) -> None:
     """No address, no HTTP call -- and `remote_alive` stays false.
 
-    Killed by: src/uclone_x/cli/commands/bootstrap.py ::             if remote_url
+    Killed by: src/uclone_x/tools/builtin/image_status.py ::             if remote_url
     Becomes:             if True
     """
     monkeypatch.delenv("UCX_IMAGE_REMOTE_URL", raising=False)
@@ -482,7 +482,7 @@ def test_probe_image_engines_treats_a_raising_remote_probe_as_unreachable(
 ) -> None:
     """A probe that raises is a worker that is not there, not a crashed `ucx media status`.
 
-    Killed by: src/uclone_x/cli/commands/bootstrap.py :: remote_alive = False
+    Killed by: src/uclone_x/tools/builtin/image_status.py :: remote_alive = False
     Becomes: remote_alive = True
     """
     monkeypatch.setenv("UCX_IMAGE_REMOTE_URL", "http://10.0.0.99:8000")
@@ -507,7 +507,7 @@ def test_probe_image_engines_treats_a_failed_probe_as_no_daemon(
 ) -> None:
     """A probe that raises is a daemon that is not there, not a crashed `ucx start` (P6).
 
-    Killed by: src/uclone_x/cli/commands/bootstrap.py :: comfy_alive = False
+    Killed by: src/uclone_x/tools/builtin/image_status.py :: comfy_alive = False
     Becomes: comfy_alive = True
     """
     monkeypatch.delenv("UCX_IMAGE_REMOTE_URL", raising=False)
@@ -988,7 +988,7 @@ class _CapturedRun:
         self.returncode = returncode
         self.commands: list[list[str]] = []
 
-    def __call__(self, command: list[str], check: bool = False) -> _Completed:
+    def __call__(self, command: list[str], check: bool = False, **_: object) -> _Completed:
         self.commands.append(list(command))
         return _Completed(self.returncode)
 

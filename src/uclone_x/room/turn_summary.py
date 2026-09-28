@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from uclone_x.agent.models import ProviderFailure
 from uclone_x.core.provenance import Provenance
 from uclone_x.errors import RoomError
 from uclone_x.llm.models import TokenUsage
@@ -57,6 +58,7 @@ class TurnSummary(BaseModel):
     completed: bool = True
     error: str | None = None
     refusal: RoomTurnRefusal | str | None = None
+    provider_failure: ProviderFailure | None = None
     provenance: Provenance | None = None
     decision: SpeakerDecision | None = None
     rendered_through: int = 0
@@ -116,6 +118,7 @@ def summarize_turn(state: RoomState, seq: int) -> TurnSummary:
             completed=message.completed,
             error=message.error,
             refusal=message.refusal,
+            provider_failure=message.provider_failure,
             provenance=message.provenance,
             decision=message.decision,
             rendered_through=message.rendered_through,
@@ -137,6 +140,7 @@ def summarize_turn(state: RoomState, seq: int) -> TurnSummary:
             completed=message.completed,
             error=message.error,
             refusal=message.refusal,
+            provider_failure=message.provider_failure,
             provenance=message.provenance,
             decision=message.decision,
             rendered_through=message.rendered_through,
@@ -170,6 +174,7 @@ def summarize_turn(state: RoomState, seq: int) -> TurnSummary:
         completed=message.completed,
         error=message.error,
         refusal=message.refusal,
+        provider_failure=message.provider_failure,
         provenance=message.provenance,
         decision=message.decision,
         rendered_through=message.rendered_through,

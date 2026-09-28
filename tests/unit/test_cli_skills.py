@@ -2,18 +2,92 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import os
+import re
+import sys
 from pathlib import Path
+from types import TracebackType
 
 import pytest
 from typer.testing import CliRunner
 
+import uclone_x
+from uclone_x.cli.commands import skill as skill_cli
 from uclone_x.cli.main import app
 from uclone_x.sandbox.models import IsolationLevel
-from uclone_x.skills.auditor import load_skill_from_dir, save_skill
+from uclone_x.skills.approvals import SkillApprovalLedger
+from uclone_x.skills.auditor import (
+    SkillRegistry,
+    compute_skill_sha256,
+    load_skill_from_dir,
+    save_skill,
+)
 from uclone_x.skills.models import SkillManifest, SkillOrigin, SkillStatus
 
 runner = CliRunner()
+
+
+class _Terminal:
+    """A person at the terminal `skill approve` asks at, who answers `answer`."""
+
+    def __init__(self, answer: str) -> None:
+        self.answer = answer
+        self.asked: list[str] = []
+
+    def write(self, text: str) -> int:
+        self.asked.append(text)
+        return len(text)
+
+    def flush(self) -> None:
+        pass
+
+    def readline(self) -> str:
+        return self.answer
+
+    def __enter__(self) -> _Terminal:
+        return self
+
+    def __exit__(
+        self,
+        _type: type[BaseException] | None,
+        _value: BaseException | None,
+        _tb: TracebackType | None,
+    ) -> None:
+        pass
+
+
+@pytest.fixture(autouse=True)
+def person_at_terminal(monkeypatch: pytest.MonkeyPatch) -> _Terminal:
+    """A person who answers yes; never the real terminal, where a test would wait on a key."""
+    terminal = _Terminal("yes\n")
+    monkeypatch.setattr(skill_cli, "_open_terminal", lambda: terminal)
+    return terminal
+
+
+def _no_terminal() -> _Terminal:
+    raise OSError(6, "Device not configured", "/dev/tty")
+
+
+def _pending_skill(root: Path, name: str = "data_exporter") -> Path:
+    skill_dir = root / name
+    save_skill(
+        skill_dir,
+        SkillManifest(
+            name=name,
+            description="Export data",
+            origin=SkillOrigin.SYNTHESIZED,
+            status=SkillStatus.PENDING,
+            requested_isolation=IsolationLevel.WORKSPACE,
+        ),
+        "# Data Exporter",
+    )
+    return skill_dir
+
+
+#: Words that would describe the mechanism rather than what the person should do.
+_INTERNALS = re.compile(r"tty|/dev|stdin|setsid|session|isatty|bash_run|errno", re.IGNORECASE)
 
 
 def test_cli_skill_list_empty(tmp_path: Path) -> None:
@@ -139,6 +213,100 @@ def test_cli_skill_approve_promotes_skill(tmp_path: Path) -> None:
     )
     assert result2.exit_code == 0
     assert "already active" in result2.output
+
+
+def test_approve_pins_the_approved_version_outside_the_package(tmp_path: Path) -> None:
+    """The pin is the digest of the file approval leaves, and it is what makes the skill load.
+
+    Editing the skill afterwards makes `approve` ask again rather than call it approved.
+
+    Killed by: src/uclone_x/cli/commands/skill.py :: SkillPin(content_sha256=digest, approved_by=approver, approved_at=approved_at),
+    Becomes: SkillPin(content_sha256=report.content_sha256, approved_by=approver, approved_at=approved_at),
+
+    Killed by: src/uclone_x/cli/commands/skill.py :: and _is_pinned(ledger, skill_dir, manifest.name)
+    Becomes: and True
+    """
+    skill_dir = _pending_skill(tmp_path)
+    ledger = SkillApprovalLedger()
+    assert ledger.read() == {}
+
+    result = runner.invoke(
+        app,
+        ["skill", "approve", "data_exporter", "--approver", "human:alice", "--dir", str(tmp_path)],
+    )
+
+    assert result.exit_code == 0, result.output
+    pin = ledger.read()["data_exporter"]
+    assert pin.content_sha256 == compute_skill_sha256(skill_dir)
+    assert pin.approved_by == "human:alice"
+    assert load_skill_from_dir(skill_dir).manifest.content_sha256 == pin.content_sha256
+    registry = SkillRegistry(skills_dir=tmp_path)
+    assert [s.manifest.name for s in asyncio.run(registry.reload_approved())] == ["data_exporter"]
+
+    skill_md = skill_dir / "SKILL.md"
+    skill_md.write_text(skill_md.read_text(encoding="utf-8") + "\nAlso export secrets.\n")
+    again = runner.invoke(app, ["skill", "approve", "data_exporter", "--dir", str(tmp_path)])
+    assert "already active" not in again.output
+    assert again.exit_code == 0, again.output
+    assert ledger.read()["data_exporter"].content_sha256 == compute_skill_sha256(skill_dir)
+
+
+def test_approve_refuses_a_skill_changed_while_the_person_was_asked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The person said yes to the checked version; an edit made meanwhile is not approved (#1777).
+
+    Killed by: src/uclone_x/cli/commands/skill.py :: if compute_skill_sha256(skill_dir) != report.content_sha256:
+    Becomes: if False:
+    """
+    skill_dir = _pending_skill(tmp_path)
+    skill_md = skill_dir / "SKILL.md"
+
+    def edit_while_asking(_name: str) -> bool:
+        skill_md.write_text(skill_md.read_text(encoding="utf-8") + "\nAlso export secrets.\n")
+        return True
+
+    monkeypatch.setattr(skill_cli, "_confirmed_at_terminal", edit_while_asking)
+    result = runner.invoke(app, ["skill", "approve", "data_exporter", "--dir", str(tmp_path)])
+    edited = skill_md.read_text(encoding="utf-8")
+
+    assert result.exit_code == 1, result.output
+    assert " ".join(result.output.split()) == f"✖ {skill_cli.APPROVE_CHANGED_MEANWHILE}"
+    assert _INTERNALS.search(result.output) is None, result.output
+    assert SkillApprovalLedger().read() == {}
+    assert "Also export secrets." in edited
+    assert load_skill_from_dir(skill_dir).manifest.status is SkillStatus.PENDING
+
+
+def test_approve_pins_the_bytes_it_checked_even_if_the_package_changes_after(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A script changed between the last check and the pin is not what gets pinned (#1777).
+
+    Killed by: src/uclone_x/cli/commands/skill.py :: SkillPin(content_sha256=digest, approved_by=approver, approved_at=approved_at),
+    Becomes: SkillPin(content_sha256=compute_skill_sha256(skill_dir), approved_by=approver, approved_at=approved_at),
+    """
+    skill_dir = _pending_skill(tmp_path)
+    script = skill_dir / "scripts" / "export.py"
+    script.parent.mkdir()
+    script.write_text("print('rows')\n", encoding="utf-8")
+    write_skill_md = skill_cli._write_skill_md  # pyright: ignore[reportPrivateUsage]
+
+    def write_then_tamper(target: Path, data: bytes) -> None:
+        write_skill_md(target, data)
+        script.write_text("print('secrets')\n", encoding="utf-8")
+
+    monkeypatch.setattr(skill_cli, "_write_skill_md", write_then_tamper)
+    result = runner.invoke(app, ["skill", "approve", "data_exporter", "--dir", str(tmp_path)])
+
+    assert result.exit_code == 0, result.output
+    pin = SkillApprovalLedger().read()["data_exporter"]
+    assert pin.content_sha256 != compute_skill_sha256(skill_dir)  # the tampered package...
+    registry = SkillRegistry(skills_dir=tmp_path)
+    assert asyncio.run(registry.reload_approved()) == ()  # ...does not load
+    script.write_text("print('rows')\n", encoding="utf-8")
+    assert pin.content_sha256 == compute_skill_sha256(skill_dir)  # the checked one is pinned
+    assert [s.manifest.name for s in asyncio.run(registry.reload_approved())] == ["data_exporter"]
 
 
 def test_cli_skill_approve_blocks_dangerous_unless_forced(tmp_path: Path) -> None:
@@ -351,8 +519,16 @@ def test_cli_skill_synthesize_from_trace_file(tmp_path: Path) -> None:
     assert (skill_dir / "SKILL.md").is_file()
 
 
-def test_cli_skill_synthesize_from_session_id(tmp_path: Path) -> None:
-    """CLI synthesize extracts workflow from session identifier."""
+def test_cli_skill_synthesize_from_session_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CLI synthesize extracts workflow from the session's recorded trace."""
+    monkeypatch.chdir(tmp_path)
+    sessions = tmp_path / ".uclone_x" / "sessions"
+    sessions.mkdir(parents=True)
+    (sessions / "sess_prod_101.json").write_text(
+        json.dumps(["Read the ticket", "Draft the reply"]), encoding="utf-8"
+    )
     result = runner.invoke(
         app,
         [
@@ -370,6 +546,33 @@ def test_cli_skill_synthesize_from_session_id(tmp_path: Path) -> None:
     assert result.exit_code == 0
     assert "session_task_skill" in result.output
     assert (tmp_path / "session_task_skill" / "SKILL.md").is_file()
+    assert "Draft the reply" in (tmp_path / "session_task_skill" / "SKILL.md").read_text(
+        encoding="utf-8"
+    )
+
+
+def test_cli_skill_synthesize_from_a_session_with_no_trace_writes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A session that left no steps is refused in plain words, and no package is written."""
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(
+        app,
+        [
+            "skill",
+            "synthesize",
+            "--name",
+            "ghost_skill",
+            "--session-id",
+            "sess_none",
+            "--dir",
+            str(tmp_path / "store"),
+        ],
+        env={"COLUMNS": "200"},
+    )
+    assert result.exit_code == 1
+    assert "nothing to turn into a skill" in result.output
+    assert not (tmp_path / "store" / "ghost_skill").exists()
 
 
 def test_cli_skill_synthesize_auto_approve(tmp_path: Path) -> None:
@@ -442,8 +645,8 @@ def test_cli_skill_synthesize_invalid_policy_fails(tmp_path: Path) -> None:
 def test_cli_skill_approve_refuses_a_package_it_cannot_read_in_full(tmp_path: Path) -> None:
     """An audit that cannot hash the whole package approves nothing, and says why plainly.
 
-    Killed by: src/uclone_x/cli/commands/skill.py :: except SkillAuditError as exc:
-    Becomes: except ZeroDivisionError as exc:
+    Killed by: src/uclone_x/cli/commands/skill.py :: except SkillAuditError as unread:
+    Becomes: except ZeroDivisionError as unread:
     """
     if not hasattr(os, "geteuid") or os.geteuid() == 0:
         pytest.skip("root lists any folder, and the test needs one it cannot")
@@ -476,3 +679,88 @@ def test_cli_skill_approve_refuses_a_package_it_cannot_read_in_full(tmp_path: Pa
         "so it cannot be audited: 'resources' could not be read (Permission denied)."
     )
     assert load_skill_from_dir(skill_dir).manifest.status is SkillStatus.PENDING
+
+
+def test_approve_without_a_terminal_to_ask_at_changes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """What a clone's `bash_run` is: a command with no terminal of its own (#1589).
+
+    Killed by: src/uclone_x/cli/commands/skill.py :: return None
+    Becomes: return True
+    """
+    skill_dir = _pending_skill(tmp_path)
+    before = (skill_dir / "SKILL.md").read_bytes()
+    monkeypatch.setattr(skill_cli, "_open_terminal", _no_terminal)
+
+    result = runner.invoke(
+        app, ["skill", "approve", "data_exporter", "--dir", str(tmp_path)], env={"COLUMNS": "400"}
+    )
+
+    assert result.exit_code == 1
+    assert skill_cli.APPROVE_NEEDS_TERMINAL in " ".join(result.output.split())
+    assert (skill_dir / "SKILL.md").read_bytes() == before
+
+
+def test_approve_answered_anything_but_yes_changes_nothing(
+    tmp_path: Path, person_at_terminal: _Terminal
+) -> None:
+    """Killed by: src/uclone_x/cli/commands/skill.py :: return answer.strip().lower() == "yes"
+    Becomes: return True
+    """
+    skill_dir = _pending_skill(tmp_path)
+    before = (skill_dir / "SKILL.md").read_bytes()
+    person_at_terminal.answer = "no\n"
+
+    result = runner.invoke(
+        app, ["skill", "approve", "data_exporter", "--dir", str(tmp_path)], env={"COLUMNS": "400"}
+    )
+
+    assert result.exit_code == 1
+    assert skill_cli.APPROVE_NOT_CONFIRMED in result.output
+    assert "data_exporter" in "".join(person_at_terminal.asked)
+    assert (skill_dir / "SKILL.md").read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    "copy", [skill_cli.APPROVE_NEEDS_TERMINAL, skill_cli.APPROVE_NOT_CONFIRMED]
+)
+def test_the_approval_refusals_are_plain_words(copy: str) -> None:
+    """Killed by: src/uclone_x/cli/commands/skill.py :: "could not find one to ask in. Run it yourself in a terminal window. Nothing was changed."
+    Becomes: "could not open /dev/tty (errno 6). Nothing was changed."
+    """
+    assert _INTERNALS.search(copy) is None, copy
+    assert copy.endswith(".")
+
+
+@pytest.mark.asyncio
+async def test_a_clones_shell_cannot_approve_even_piping_yes(tmp_path: Path) -> None:
+    """The real channel, not a stand-in: the command run by `bash_run` with no isolation.
+
+    `echo yes |` is what a model would try; standard input is a pipe it controls, and the
+    terminal the prompt asks at is one the shell's new session does not have.
+
+    Killed by: src/uclone_x/cli/commands/skill.py :: return open("/dev/tty", "r+", encoding="utf-8")  # noqa: SIM115 -- closed by the caller
+    Becomes: return __import__("sys").stdin
+    """
+    from uclone_x.sandbox.models import NoIsolation
+    from uclone_x.tools import BashRunTool, ToolContext
+
+    skill_dir = _pending_skill(tmp_path / "skills")
+    before = (skill_dir / "SKILL.md").read_bytes()
+    shell_dir = tmp_path / "shell"
+    shell_dir.mkdir()
+    src = Path(uclone_x.__file__).resolve().parents[1]
+    command = (
+        f"echo yes | PYTHONPATH='{src}' '{sys.executable}' -m uclone_x.cli.main "
+        f"skill approve data_exporter --dir '{tmp_path / 'skills'}'"
+    )
+    context = ToolContext(
+        agent_id="clone", session_id="s", workspace_root=shell_dir, isolation=NoIsolation()
+    )
+
+    ran = await BashRunTool().execute({"command": command, "timeout_seconds": 60}, context)
+
+    output = " ".join(str(ran.output).split())
+    assert "Only you can approve a skill" in output, output
+    assert (skill_dir / "SKILL.md").read_bytes() == before

@@ -1,13 +1,12 @@
 # UClone-X Architecture Overview
 
 > [!IMPORTANT]
-> **This document is a specification, not a description of running software.**
-> As of 2026-09-02 the only executable code in this repository is the developer CLI
-> (`src/uclone_x/cli/`) and the reactive event bus (`src/uclone_x/engine/`). Every other
-> runtime subsystem described below is *specified and approved* but *not implemented*.
-> See [§0 Implementation Status](#0-implementation-status-specification-vs-shipped-code)
-> for the authoritative per-subsystem breakdown, and treat any statement in §1–§4 as
-> design intent unless §0 marks it **Implemented**.
+> **This document is the target architecture; §0 says how much of it is built.** Most
+> subsystems below now have code behind them, but several are partial, and §1's diagram
+> still draws the target topology rather than the running one. For the module layout as it
+> exists on `main` — packages, layers and the real dependency edges — read
+> [module-structure.md](module-structure.md). Treat any statement in §1–§4 as design
+> intent unless §0 or that document confirms it.
 
 ---
 
@@ -19,48 +18,32 @@ requirements in [`docs/PRD.md`](PRD.md). The principles are normative; most of t
 is not yet written. This section exists because this document was previously mistaken
 for a description of a working system.
 
-### What actually exists today
+### What exists today
 
-```text
-src/uclone_x/
-├── __init__.py                 # Version/author metadata only
-├── cli/
-│   ├── main.py                 # Typer application, `ucx` console entrypoint
-│   └── commands/
-│       └── dev.py              # Builder issue & task tracker (./ucx dev …)
-└── engine/
-    ├── __init__.py             # Public engine exports
-    └── event_bus.py            # AgentEvent, EventBus, EventSubscription, backpressure policies
-```
-
-Every other directory under `src/uclone_x/` (`agent/`, `a2a/`, `llm/`, `ontology/`,
-`skills/`, `sandbox/`, `code_intel/`, `telemetry/`, `ui_static/`) is an **empty
-directory** — it contains no modules and, lacking an `__init__.py`, is not yet an
-importable package. The repository-root `ontology/` and `ucx-agent-skills/` directories, which the
-runtime is specified to read from and write to, are likewise **empty**.
-
-`frontend/` contains a Vite + React scaffold (`index.html`, `src/main.tsx`,
-`src/App.tsx`) and is not yet wired to any backend. `tests/` covers the CLI dev tracker
-and the event bus only.
+As of 2026-09-26 (`a42a62d1`) every package listed in §3.2 has code. The as-built layout,
+the kernel / adapter / shell layer of each package and the known departures from the
+layering rule are in [module-structure.md](module-structure.md); this section keeps only
+the per-subsystem status.
 
 ### Per-subsystem status
 
 | Subsystem | Governing principle / FR | Specification | Code status |
 | :--- | :--- | :--- | :--- |
-| Developer CLI (`./ucx`) | P8, FR-8 | [cli-specification.md](cli-specification.md) | **Implemented (partial)** — `ucx version`, `ucx dev …` and `ucx test check` are functional; `ucx setup`, `ucx run` and `ucx ui` currently print placeholder output and start no runtime |
-| Builder issue/task protocol | — | builder-issue-resolution-protocol.md | **Implemented (partial)** — `src/uclone_x/cli/commands/dev.py` |
+| Developer CLI (`./ucx`) | P8, FR-8 | [cli-specification.md](cli-specification.md) | **Implemented (partial)** — `src/uclone_x/cli/`: `run`, `room`, `loop`, `ui`, `llm`, `key`, `skill`, `ontology`, `a2a`, `acp`, `eval`, `report`, `dev` and the test gate |
+| Builder issue/task protocol | — | builder-issue-resolution-protocol.md | **Implemented (partial)** — `src/uclone_x/cli/commands/dev.py`; issues themselves are tracked on GitHub |
 | Reactive event bus | P1, P3, FR-1 | [event-driven-agent-core.md](event-driven-agent-core.md), [local-collaboration-engine.md](local-collaboration-engine.md) | **Implemented (partial)** — `uclone_x.engine.event_bus` provides `AgentEvent`, priority-queue `EventBus`, subscriptions and backpressure policies |
-| Reactive scheduler, timer service & context registry | P1, P3, FR-1 | [local-collaboration-engine.md](local-collaboration-engine.md) | Specified only |
-| Agent state machine | P1, P4, FR-1 | [event-driven-agent-core.md](event-driven-agent-core.md) | Specified only |
-| A2A dual-transport adapter | P2, FR-2 | [a2a-protocol-spec.md](a2a-protocol-spec.md) | Specified only |
-| Dynamic persona & sub-agents | P4, FR-3 | [dynamic-persona-interface.md](dynamic-persona-interface.md) | Specified only |
-| Ontology Engine | P7, FR-4 | [agent-ontology-architecture.md](agent-ontology-architecture.md) | Specified only; `ontology/` empty |
-| Skill subsystem & registry | P9, FR-5 | [skill-system-architecture.md](skill-system-architecture.md) | Specified only; `ucx-agent-skills/` empty |
-| LLM-agnostic layer | P5, FR-6 | [llm-agnostic-interface.md](llm-agnostic-interface.md) | Specified only |
-| Sandbox Runner | P3, FR-7 | [sandbox-execution-architecture.md](sandbox-execution-architecture.md) | Specified only |
-| Developer UI dashboard | P8, FR-9 | [ui-dashboard-architecture.md](ui-dashboard-architecture.md) | Scaffold only (`frontend/`) |
-| OpenTelemetry exporter | P6, P8, FR-10 | [telemetry-opentelemetry.md](telemetry-opentelemetry.md) | Specified only |
-| Code Intelligence (AST/LSP/SCIP) | FR-11 | [code-intelligence-lsp-scip.md](code-intelligence-lsp-scip.md) | Specified only; dependencies declared in `pyproject.toml` |
+| Reactive scheduler, timer service & context registry | P1, P3, FR-1 | [local-collaboration-engine.md](local-collaboration-engine.md) | **Implemented (partial)** — recurring jobs in `uclone_x.agent.loop` (scheduler, runner with watchdog); no separate timer service or context registry package |
+| Agent state machine | P1, P4, FR-1 | [event-driven-agent-core.md](event-driven-agent-core.md) | **Implemented (partial)** — `uclone_x.agent.base.BaseAgent`, built by `agent.composition.compose_agent` |
+| Multi-agent rooms | P4 | design/multi-agent-conversational-orchestration.md | **Implemented (partial)** — `uclone_x.room`: orchestrator, speaker selectors, room service and store |
+| A2A dual-transport adapter | P2, FR-2 | [a2a-protocol-spec.md](a2a-protocol-spec.md) | **Implemented (partial)** — `uclone_x.a2a` (in-memory fastpath, HTTP transport, discovery) and `uclone_x.shells.a2a_server` |
+| Dynamic persona & sub-agents | P4, FR-3 | [dynamic-persona-interface.md](dynamic-persona-interface.md) | **Implemented (partial)** — persona registry and store in `uclone_x.agent`, bundled personas in `src/uclone_x/personas/`, `tools/builtin/subagent.py` |
+| Ontology Engine | P7, FR-4 | [agent-ontology-architecture.md](agent-ontology-architecture.md), design/clone-knowledge-graph.md | **Implemented (partial)**, re-read 2026-09-25: tiers, reasoner and `ucx ontology` CLI exist; no step learns from conversations (#1638) |
+| Skill subsystem & registry | P9, FR-5 | [skill-system-architecture.md](skill-system-architecture.md) | **Implemented (partial)** — `uclone_x.skills` (models, auditor, synthesizer) and `tools/builtin/skill_loader.py`; the web app and CLI heads load the approved skills in the runtime store `ucx-agent-skills/` at startup; the open-source release ships this store empty: its skill packages are kept with the development repository, so a fresh checkout or an installed package has none until `ucx skill` writes one |
+| LLM-agnostic layer | P5, FR-6 | [llm-agnostic-interface.md](llm-agnostic-interface.md) | **Implemented (partial)** — `uclone_x.llm`: router, budget, compactor, catalog; connectors for Anthropic, Gemini, OpenAI, Ollama and vLLM |
+| Sandbox Runner | P3, FR-7 | [sandbox-execution-architecture.md](sandbox-execution-architecture.md) | **Implemented (partial)** — `none` and `workspace` levels run (`sandbox/workspace_runner.py`); `container` and `wasm` exist as policy models only |
+| Developer UI dashboard | P8, FR-9 | [ui-dashboard-architecture.md](ui-dashboard-architecture.md) | **Implemented (partial)** — React head in `frontend/`, FastAPI backend in `uclone_x.ui`, bundle served from `ui_static/` |
+| OpenTelemetry exporter | P6, P8, FR-10 | [telemetry-opentelemetry.md](telemetry-opentelemetry.md) | **Implemented (partial)** — `uclone_x.telemetry`: in-memory tracer, OTLP and Langfuse exporters |
+| Code Intelligence (AST/LSP/SCIP) | FR-11 | [code-intelligence-lsp-scip.md](code-intelligence-lsp-scip.md) | **Implemented (partial)** — `uclone_x.code_intel`: Tree-sitter AST parser, symbol graph, SCIP indexer |
 
 Milestone sequencing for these subsystems is owned by [`docs/PRD.md`](PRD.md) §5, not by
 this document.
@@ -81,8 +64,8 @@ hot-reloadable skill (P9), every tool invocation routed through a selectable san
 every code edit validated against a real symbol graph (FR-11), and every span exported as
 OpenTelemetry (P6/P8).
 
-The diagram below is the **target** runtime topology. Only the `./ucx CLI` node and its
-edge into the event bus have any code behind them today.
+The diagram below is the **target** runtime topology. For what is built, and how the
+packages actually depend on each other, see [module-structure.md](module-structure.md).
 
 ```mermaid
 flowchart TD
@@ -274,61 +257,36 @@ uclone-x/
 ├── LICENSE                                     # Apache License 2.0
 ├── pyproject.toml                              # Hatchling build, src-layout, ruff/pyright/pytest config
 ├── ucx                                         # Developer CLI shim
-├── docs/                                       # Technical specifications (16 documents)
-│   ├── PRD.md                                  # Product requirements, FR/NFR, roadmap
-│   ├── architecture-overview.md                # THIS document — system architecture & philosophy
-│   ├── event-driven-agent-core.md              # Agent state machine, event envelope, reactive wakeup
-│   ├── local-collaboration-engine.md           # In-memory bus, scheduler, latency targets
-│   ├── a2a-protocol-spec.md                    # Google A2A contracts & dual transport
-│   ├── dynamic-persona-interface.md            # Persona specification & sub-agent lifecycle
-│   ├── llm-agnostic-interface.md               # Provider connectors, budgeting, compaction
-│   ├── agent-ontology-architecture.md          # Self-constructing & human-guided ontology
-│   ├── skill-system-architecture.md            # SKILL.md packaging, synthesizer, auditor, registry
-│   ├── sandbox-execution-architecture.md       # Three sandbox levels & execution adapters
-│   ├── code-intelligence-lsp-scip.md           # Tree-sitter, LSP client, SCIP symbol graph
-│   ├── telemetry-opentelemetry.md              # Span hierarchy, exporters, semantic conventions
-│   ├── ui-dashboard-architecture.md            # React 19 + Vite embedded dashboard
-│   ├── cli-specification.md                    # ./ucx command reference & quality gate
-│   ├── meta-agent-development-guide.md         # Builder swarm development guide
-│   ├── builder-issue-resolution-protocol.md    # Autonomous Builder issue & task lifecycle
-│   ├── principles/                             # NORMATIVE — never modified without the owner's approval
-│   │   ├── core-principles.md                  # The 9 inviolable laws (compact reference)
-│   │   └── details/p1…p9-*.md                  # One detail document per principle
-│   ├── issues/                                 # Historical builder-filed issues (archived)
-│   └── tasks/                                  # Historical builder resolution tasks (archived)
-
-├── src/uclone_x/                               # Python 3.11+ core package (src-layout)
-│   ├── cli/                                    # ./ucx Typer application — IMPLEMENTED
-│   │   ├── main.py                             #   console entrypoint `ucx`
-│   │   └── commands/dev.py                     #   Builder issue & task tracker
-│   ├── engine/                                 # P1/P3 — event bus IMPLEMENTED; scheduler & timers pending
-│   │   └── event_bus.py                        #   AgentEvent, EventBus, subscriptions, backpressure
-│   ├── agent/                                  # P1/P4 — BaseAgent state machine        [empty]
-│   ├── a2a/                                    # P2 — A2A adapter & dual transport      [empty]
-│   ├── llm/                                    # P5 — provider connectors & budgeting   [empty]
-│   ├── ontology/                               # P7 — ontology engine & validator       [empty]
-│   ├── skills/                                 # P9 — synthesizer, auditor, registry    [empty]
-│   ├── sandbox/                                # P3 — sandbox runner & adapters         [empty]
-│   ├── code_intel/                             # FR-11 — AST, LSP, SCIP, symbol graph   [empty]
-│   ├── telemetry/                              # P6/P8 — tracer & OTLP exporter         [empty]
-│   └── ui_static/                              # FR-9 — embedded dashboard build output [empty]
-├── frontend/                                   # TypeScript React 19 + Vite GUI (P8)   [scaffold]
-├── ontology/                                   # Runtime ontology store (LinkML/JSON-LD) [empty]
-├── ucx-agent-skills/                           # Runtime skill packages (SKILL.md)       [empty]
-└── tests/                                      # pytest suites — unit / integration / scenarios
+├── docs/                                       # Specifications, guides, design records — see docs/README.md
+├── src/uclone_x/                               # Python 3.11+ runtime package (src-layout)
+│   ├── core/  engine/  errors.py               # Foundation: contracts, event bus, error root
+│   ├── llm/  tools/  sandbox/  memory/         # Subsystems (kernel + their adapters)
+│   ├── ontology/  skills/  a2a/  acp/          #
+│   ├── telemetry/  log/  evaluation/  i18n/    #
+│   ├── code_intel/  adapters/                  # Adapter-only packages
+│   ├── agent/                                  # One agent: BaseAgent, composition root, sessions
+│   ├── room/                                   # Many agents: orchestrator, selectors, room store
+│   ├── story/  artifacts/                      # Writing domain: stories and the files clones wrote
+│   ├── cli/  ui/  shells/                      # Heads: ucx CLI, web backend, A2A / ACP servers
+│   ├── personas/                               # Bundled persona definitions
+│   └── ui_static/                              # Built dashboard bundle served by the web head
+├── frontend/                                   # TypeScript React 19 + Vite web head (P8)
+├── ontology/                                   # Runtime ontology store (LinkML/JSON-LD)
+├── ucx-agent-skills/                           # Runtime skill store (SKILL.md packages)
+└── tests/                                      # pytest suites — unit / integration / scenarios / fitness
 ```
 
-> `[empty]` marks a directory that exists but contains no modules. `docs/` currently holds
-> 16 specification documents plus the `principles/`, `issues/` and `tasks/` subtrees; keep
-> the list above in sync with `ls docs/*.md`.
+> Each package's layer and its real dependency edges are in
+> [module-structure.md](module-structure.md); the index of every document under `docs/` is
+> [docs/README.md](README.md).
 
 ### 3.2 Package-to-principle mapping
 
-There is no `core/` directory. The Python core lives under `src/uclone_x/` (src-layout,
-built by Hatchling per `pyproject.toml`). Note that the §1 diagram groups nodes by
-*logical plane*, not by package: the Dynamic Persona & Sub-Agent Manager is drawn beside
-the A2A adapter because both mediate delegation, but it belongs to `uclone_x.agent` —
-there is no separate `persona/` package.
+The Python runtime lives under `src/uclone_x/` (src-layout, built by Hatchling per
+`pyproject.toml`). Note that the §1 diagram groups nodes by *logical plane*, not by
+package: the Dynamic Persona & Sub-Agent Manager is drawn beside the A2A adapter because
+both mediate delegation, but it belongs to `uclone_x.agent` — there is no separate
+`persona/` package.
 
 | Package | Principle / FR | Responsibility |
 | :--- | :--- | :--- |
@@ -342,7 +300,16 @@ there is no separate `persona/` package.
 | `uclone_x.sandbox` | P3, FR-7 | Sandbox mode selection and `none` / `workspace` / `container` / `wasm` adapters |
 | `uclone_x.code_intel` | FR-11 | Tree-sitter AST, LSP client, SCIP indexer, code symbol graph |
 | `uclone_x.telemetry` | P6, P8, FR-10 | OTel tracer and meter, span conventions, OTLP exporter |
-| `uclone_x.ui_static` | FR-9 | Packaged dashboard assets served by the CLI |
+| `uclone_x.ui_static` | FR-9 | Packaged dashboard assets served by the web head |
+| `uclone_x.core` | P8 | Cross-subsystem contracts: `Host`, capabilities, session store protocol, workspace, secrets, provenance |
+| `uclone_x.room` | P4 | Multi-agent rooms: shared transcript, orchestrator, speaker selectors, room store |
+| `uclone_x.tools` | P3, P4 | `BaseTool`, tool registry and scoping, MCP manager, built-in tools |
+| `uclone_x.memory` | P7 | Cross-session memory, retrieval and vector store |
+| `uclone_x.story`, `uclone_x.artifacts` | P0 | Writing domain: open stories, codex proposals, the files clones wrote |
+| `uclone_x.ui`, `uclone_x.shells` | P8, FR-9 | Web backend routes; console entry point, A2A and ACP servers |
+| `uclone_x.acp` | P2 | Agent Client Protocol conformance registry |
+| `uclone_x.log`, `uclone_x.evaluation`, `uclone_x.i18n` | P6, P8 | Session log storage, evaluation backend seam, user-facing language |
+| `uclone_x.adapters` | P2 | Integrations with foreign ecosystems (uclone2) |
 
 ---
 
@@ -395,7 +362,8 @@ there is no separate `persona/` package.
 >
 > Concretely, the same commit must update:
 > 1. the **§1 Mermaid diagram** — the new node plus its real edges, not just the box;
-> 2. the **§3.1 repository layout** and the **§3.2 package-to-principle mapping**;
+> 2. the **§3.1 repository layout**, the **§3.2 package-to-principle mapping** and
+>    [module-structure.md](module-structure.md);
 > 3. the **§0 status table** — moving the subsystem's row to `Implemented` (or
 >    `Implemented (partial)`) as soon as any of its code lands, so the specification/code
 >    distinction in this document never goes stale again;

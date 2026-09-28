@@ -1,0 +1,16 @@
+{
+  "model": "Model",
+  "temperature": "Temperature",
+  "maxTokens": "Max tokens",
+  "tools": "Tools",
+  "notSet": "not set",
+  "noTools": "No tool list — this clone can use every tool the runtime has.",
+  "writeAccess": {
+    "on": "Can write files",
+    "off": "Cannot write files"
+  },
+  "subagentAccess": {
+    "on": "Can spawn sub-agents",
+    "off": "Cannot spawn sub-agents"
+  }
+}

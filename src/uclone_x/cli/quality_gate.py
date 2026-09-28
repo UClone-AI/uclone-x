@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import contextlib
 import datetime
 import errno
+import fcntl
 import importlib.util
 import json
 import os
@@ -12,12 +14,14 @@ import subprocess
 import sys
 import time
 import xml.etree.ElementTree as ET
+from collections.abc import Callable, Generator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final, Literal
 
 from rich.console import Console
 
+from uclone_x.cli.browser_plan import BrowserPlan
 from uclone_x.cli.bundle_freshness import BUILD_ENVIRONMENT, check_bundle_freshness
 from uclone_x.cli.environment_provenance import (
     BLOCKING_STATUSES,
@@ -114,15 +118,26 @@ _NO_COVERAGE_SCOPES: Final[frozenset[str]] = frozenset(
 # Whole run on workers: the scopes with no browser suite in them.
 _PARALLEL_SCOPES: Final[frozenset[str]] = frozenset({"fast", "unit", "fitness"})
 
-# Two steps: everything except the browser suite on workers, then the browser suite in one
-# process, with coverage appended so the threshold and the floors judge the combined data.
+# Two steps: everything except the browser suite on workers, then the browser suite on a few
+# workers of its own, with coverage appended so the threshold and the floors judge the
+# combined data.
 #
-# The browser suite is kept out of the workers by measurement, not caution. Its cases drive a
-# real Chromium against a server on the same machine, and two of them race the page's own
-# load-time requests (#942; #946 and #975). Running them beside eleven busy workers made those
-# races fire: the fully parallel gate passed 1 run in 3 even with #942's test fix applied,
-# against 3 in 3 for this split, which costs about 22 s of serial browser time.
+# The browser suite is kept out of the main workers by measurement, not caution. Its cases
+# drive a real Chromium against a server on the same machine, and two of them race the page's
+# own load-time requests (#942; #946 and #975). Running them beside eleven busy workers made
+# those races fire: the fully parallel gate passed 1 run in 3 even with #942's test fix
+# applied, against 3 in 3 for this split.
 _SPLIT_BROWSER_SCOPES: Final[frozenset[str]] = frozenset({"gate", "all"})
+
+# The browser step's own workers, once the main workers have finished. Serial, the step had
+# become the gate's longest (about 2 min 15 s). On 4 `loadfile` workers it took 37-44 s and
+# passed 6 runs in 6 at load averages of 3.7-7.5 (3 workers: 3 in 3 at 9.7-20.7), where
+# `load` — one file's cases spread over several workers — failed one of its first two runs
+# on a load-time race. `loadfile` also keeps each
+# file's cases in their written order on one worker. Few, because every worker is a Chromium
+# and a server, and the gain stops at the two longest files, which hold half the suite's time.
+_BROWSER_WORKERS: Final = 4
+_BROWSER_DIST_MODE: Final = "loadfile"
 
 # Kept serial throughout, each for a reason of its own:
 #   * `e2e` is the browser suite, for the reason above.
@@ -628,6 +643,22 @@ def pytest_worker_count(cpu_count: int | None = None) -> int:
     return max(1, min(available or 1, _MAX_PYTEST_WORKERS))
 
 
+def browser_worker_count(files: int | None = None, cpu_count: int | None = None) -> int:
+    """How many workers the gate's browser step starts: `_BROWSER_WORKERS`, fewer if less.
+
+    Never more than the main step's workers, and never more than the files it runs: with
+    `--dist=loadfile` a file is one worker's, so a second worker for one file only starts a
+    Chromium that waits.
+
+    Args:
+        files: How many browser test files the step names; None runs the whole suite.
+        cpu_count: CPUs to plan for. Defaults to `os.cpu_count()`.
+    """
+    workers = pytest_worker_count() if cpu_count is None else pytest_worker_count(cpu_count)
+    limit = min(_BROWSER_WORKERS, workers)
+    return max(1, limit if files is None else min(limit, files))
+
+
 def pytest_runs_in_parallel(test_scope: str, *, serial: bool = False) -> bool:
     """Whether any part of this scope's pytest stage is distributed across workers."""
     return (test_scope in _PARALLEL_SCOPES or test_scope in _SPLIT_BROWSER_SCOPES) and not serial
@@ -721,6 +752,7 @@ def build_pytest_steps(
     *,
     junit_path: Path = JUNIT_REPORT_PATH,
     serial: bool = False,
+    browser: BrowserPlan | None = None,
 ) -> list[PytestStep]:
     """The invocations that make up one scope's pytest stage, in the order they run.
 
@@ -730,11 +762,17 @@ def build_pytest_steps(
 
     1. everything except the browser suite, on workers, with `--cov-fail-under=0` because
        this step's coverage is partial and must not be judged on its own;
-    2. the browser suite, in one process, with `--cov-append`, so the `--cov-fail-under` in
-       `addopts` is applied to the combined data.
+    2. the browser suite, on `browser_worker_count` workers of its own (`--dist=loadfile`),
+       with `--cov-append`, so the `--cov-fail-under` in `addopts` is applied to the combined
+       data.
 
     Each step writes its own report beside `junit_path`; `merge_junit_reports` combines them
     into `junit_path`, which is where the failure extraction and people look.
+
+    `browser` narrows step 2 (`cli/browser_plan.py`): `files` runs only the named browser test
+    files, `none` drops the step — and with it the workers step's `--cov-fail-under=0`, since
+    that step's coverage is then the whole measurement and must be judged — and a `full` plan's
+    `deselect` is passed through as `--deselect`. None is the full suite, as before.
     """
     whole = build_pytest_command(test_scope, junit_path=junit_path, serial=serial)
     if serial or test_scope not in _SPLIT_BROWSER_SCOPES:
@@ -746,35 +784,53 @@ def build_pytest_steps(
     workers = pytest_worker_count()
     workers_report = junit_path.with_name(f"{junit_path.stem}.workers{junit_path.suffix}")
     browser_report = junit_path.with_name(f"{junit_path.stem}.browser{junit_path.suffix}")
-    return [
-        PytestStep(
-            label=f"everything except the browser suite, on {workers} workers",
-            argv=(
-                "pytest",
-                "-v",
-                f"--junitxml={workers_report}",
-                "-o",
-                "junit_family=xunit2",
-                "-n",
-                str(workers),
-                f"--dist={_PYTEST_DIST_MODE}",
-                "--cov-fail-under=0",
-                "-m",
-                f"({expression}) and not e2e",
-            ),
-            junit_path=workers_report,
+    browser_runs = browser is None or browser.mode != "none"
+    workers_step = PytestStep(
+        label=f"everything except the browser suite, on {workers} workers"
+        + ("" if browser_runs else " (coverage judged here: the browser step does not run)"),
+        argv=(
+            "pytest",
+            "-v",
+            f"--junitxml={workers_report}",
+            "-o",
+            "junit_family=xunit2",
+            "-n",
+            str(workers),
+            f"--dist={_PYTEST_DIST_MODE}",
+            *(("--cov-fail-under=0",) if browser_runs else ()),
+            "-m",
+            f"({expression}) and not e2e",
         ),
+        junit_path=workers_report,
+    )
+    if not browser_runs:
+        return [workers_step]
+    narrowed = browser is not None and browser.mode == "files"
+    selection: tuple[str, ...] = browser.files if browser is not None and narrowed else ()
+    deselect = browser.deselect if browser is not None else ()
+    what = f"{len(selection)} changed browser test file(s)" if narrowed else "the browser suite"
+    browser_workers = browser_worker_count(len(selection) if narrowed else None)
+    where = f"on {browser_workers} workers" if browser_workers > 1 else "in one process"
+    return [
+        workers_step,
         PytestStep(
-            label="the browser suite, in one process (coverage appended and judged here)",
+            label=f"{what}, {where} (coverage appended and judged here)",
             argv=(
                 "pytest",
                 "-v",
                 f"--junitxml={browser_report}",
                 "-o",
                 "junit_family=xunit2",
+                *(
+                    ("-n", str(browser_workers), f"--dist={_BROWSER_DIST_MODE}")
+                    if browser_workers > 1
+                    else ()
+                ),
                 "--cov-append",
                 "-m",
                 f"({expression}) and e2e",
+                *(arg for node in deselect for arg in ("--deselect", node)),
+                *selection,
             ),
             junit_path=browser_report,
         ),
@@ -977,6 +1033,11 @@ def describe_installed_hook_drift(
 #    "paths the gate reads" would go stale with the next test that reads a new one. Strictness
 #    costs one unrecorded run with its reason printed; looseness costs a record for a commit
 #    whose tree nobody ran.
+#
+# The full gate's browser step follows the plan `cli/browser_plan.py` prints: the whole suite
+# when the diff can change what the browser renders or no full pass on main is fresh, else
+# only the browser test files the diff changes. A run with a narrowed browser step is still
+# the full gate, because the fresh full pass on main is what vouches for the rest of the suite.
 GATE_PASS_SCOPES: Final[frozenset[str]] = frozenset({"gate"})
 
 
@@ -1084,6 +1145,44 @@ def record_gate_pass(
     return f"Gate pass recorded for {head} ({record})."
 
 
+@contextlib.contextmanager
+def hold_gate_lock(common: Path | None, *, announce: Callable[[str], None]) -> Generator[None]:
+    """Hold `<git-common-dir>/gate.lock` for the duration: one full gate at a time per machine.
+
+    Every worktree shares the common directory, so two builders' gates queue instead of
+    running side by side. Side by side, each starts a worker per CPU; together they
+    oversubscribe the machine, the browser suite's load-time races fire, and both gates fail
+    and are run again (owner pushback 2026-09-23). The lock is advisory (`flock`) and the
+    kernel releases it when the process dies, so a killed gate leaves nothing to clean up.
+
+    `common` None (not a git checkout) runs unlocked: there is no shared place to queue in.
+    """
+    if common is None:
+        yield
+        return
+    path = common / "gate.lock"
+    with open(path, "a+", encoding="utf-8") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            handle.seek(0)
+            holder = handle.read().strip() or "another process"
+            announce(f"Waiting for the gate already running ({holder}) to finish...")
+            started = time.monotonic()
+            fcntl.flock(handle, fcntl.LOCK_EX)
+            announce(f"Gate lock acquired after {time.monotonic() - started:.0f} s.")
+        handle.seek(0)
+        handle.truncate()
+        handle.write(f"pid {os.getpid()} in {Path.cwd()}")
+        handle.flush()
+        try:
+            yield
+        finally:
+            handle.seek(0)
+            handle.truncate()
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
 def run_quality_gate(
     *,
     quiet: bool = False,
@@ -1094,6 +1193,8 @@ def run_quality_gate(
     junit_path: Path = JUNIT_REPORT_PATH,
     failure_log_path: Path = FAILURE_LOG_PATH,
     serial: bool = False,
+    browser: BrowserPlan | None = None,
+    on_browser_step: Callable[[int], None] | None = None,
 ) -> int:
     """Run the automated quality gates, in order.
 
@@ -1280,7 +1381,9 @@ def run_quality_gate(
         if first_failure == 0:
             first_failure = _PARALLEL_RUNNER_MISSING_EXIT
     elif not skip_tests:
-        steps = build_pytest_steps(test_scope, junit_path=junit_path, serial=serial)
+        steps = build_pytest_steps(
+            test_scope, junit_path=junit_path, serial=serial, browser=browser
+        )
         # Every coverage claim below is conditional on this. A scope run with `--no-cov`
         # measured nothing, so reporting a floor for it is a claim about a check that did
         # not run (#882).
@@ -1299,6 +1402,10 @@ def run_quality_gate(
             if len(steps) > 1 and not quiet:
                 console.print(f"[bold]5.{number} Pytest step: {step.label}[/bold]")
             step_results.append(run_stage(list(step.argv), quiet=quiet))
+            # The browser step is the second of two; its outcome is what a browser record
+            # (`cli/browser_plan.py`) is written from.
+            if number == 2 and on_browser_step is not None:
+                on_browser_step(step_results[-1].returncode)
             if step_results[-1].returncode != 0 and fail_fast:
                 break
         if len(steps) > 1:

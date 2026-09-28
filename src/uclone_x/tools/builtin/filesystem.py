@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import bisect
 import fnmatch
 import os
 import re
@@ -239,12 +240,12 @@ class FileEditTool(BaseTool[FileEditParams]):
         if safe_path.is_dir():
             raise IsADirectoryError(f"Path is a directory, not a file: '{params.path}'")
 
-        # Read without newline translation, so a file whose lines end in CRLF can be
-        # written back with CRLF (#1589 follow-up c). The edit itself is made on the
-        # text with plain `\n` endings, as the model sees it in `file_read`.
+        # Read without newline translation, so every line ending outside the edit is
+        # written back exactly as it was (#1589 follow-up c, #1611). The edit itself is
+        # made on the text with plain `\n` endings, as the model sees it in `file_read`.
         raw_text = safe_path.read_bytes().decode(params.encoding)
-        crlf = "\r\n" in raw_text
-        content = raw_text.replace("\r\n", "\n").replace("\r", "\n")
+        endings = _LineEndings(raw_text)
+        content = endings.normalized
 
         # Handle line range scoping if requested
         if params.start_line is not None or params.end_line is not None:
@@ -261,11 +262,9 @@ class FileEditTool(BaseTool[FileEditParams]):
 
             before = "".join(lines[:start_idx])
             target_block = "".join(lines[start_idx:end_idx])
-            after = "".join(lines[end_idx:])
         else:
             before = ""
             target_block = content
-            after = ""
 
         # Validate occurrence count
         count = target_block.count(params.target_content)
@@ -283,25 +282,89 @@ class FileEditTool(BaseTool[FileEditParams]):
                 "Exactly 1 match required when allow_multiple is False."
             )
 
-        if params.allow_multiple:
-            new_block = target_block.replace(params.target_content, params.replacement_content)
-            replacements_made = count
-        else:
-            new_block = target_block.replace(params.target_content, params.replacement_content, 1)
-            replacements_made = 1
+        replacements_made = count if params.allow_multiple else 1
+        # The same matches `str.replace` makes: left to right, not overlapping.
+        matches: list[int] = []
+        search_from = 0
+        while len(matches) < replacements_made:
+            found = target_block.find(params.target_content, search_from)
+            if found < 0:
+                break
+            matches.append(len(before) + found)
+            search_from = found + max(len(params.target_content), 1)
 
-        new_content = before + new_block + after
-        if crlf:
-            new_content = new_content.replace("\r\n", "\n").replace("\n", "\r\n")
+        replacement = _LINE_END.sub("\n", params.replacement_content)
+        pieces: list[str] = []
+        kept_from = 0
+        for start in matches:
+            end = start + len(params.target_content)
+            pieces.append(endings.raw(kept_from, start))
+            pieces.append(replacement.replace("\n", endings.ending_at(start)))
+            kept_from = end
+        pieces.append(endings.raw(kept_from, len(content)))
+        edited = "".join(pieces).encode(params.encoding)
 
-        replace_file(safe_path, new_content.encode(params.encoding))
+        replace_file(safe_path, edited)
 
         rel_path = str(safe_path.relative_to(context.require_workspace().resolve()))
         return {
             "path": rel_path,
             "replacements_made": replacements_made,
-            "bytes_written": len(new_content.encode(params.encoding)),
+            "bytes_written": len(edited),
         }
+
+
+#: A line ending as `file_read` counts one: CRLF, a lone CR, or LF.
+_LINE_END = re.compile(r"\r\n|\r|\n")
+
+
+class _LineEndings:
+    """A file's text with plain `\\n` endings, and the way back to its own endings.
+
+    `file_edit` edits the plain text, then writes every part it did not replace as the
+    original bytes, so a file with mixed or CR-only endings keeps each line's ending
+    (#1611). A replacement's own line breaks take the ending of the line the replaced text
+    starts on: that is the convention the edited place already follows, which a file with
+    one kind of ending gives everywhere.
+    """
+
+    def __init__(self, raw: str) -> None:
+        self._raw = raw
+        #: Where each ending is in the plain text, and what it was.
+        self._positions: list[int] = []
+        self._endings: list[str] = []
+        #: How many characters longer than the plain text the original is, before each
+        #: ending (index `k`) and after all of them (the last entry).
+        self._extra: list[int] = [0]
+        parts: list[str] = []
+        kept = 0
+        for match in _LINE_END.finditer(raw):
+            parts.append(raw[kept : match.start()])
+            position = match.start() - self._extra[-1]
+            self._positions.append(position)
+            self._endings.append(match.group())
+            self._extra.append(self._extra[-1] + len(match.group()) - 1)
+            parts.append("\n")
+            kept = match.end()
+        parts.append(raw[kept:])
+        self.normalized = "".join(parts)
+
+    def _raw_offset(self, index: int) -> int:
+        return index + self._extra[bisect.bisect_left(self._positions, index)]
+
+    def raw(self, start: int, end: int) -> str:
+        """The original text of plain-text characters `start` to `end`."""
+        return self._raw[self._raw_offset(start) : self._raw_offset(end)]
+
+    def ending_at(self, index: int) -> str:
+        """The ending of the line plain-text character `index` is on.
+
+        A last line with no ending takes the one before it; a file with none takes `\\n`.
+        """
+        if not self._endings:
+            return "\n"
+        following = bisect.bisect_left(self._positions, index)
+        return self._endings[min(following, len(self._endings) - 1)]
 
 
 # ======================================================================================

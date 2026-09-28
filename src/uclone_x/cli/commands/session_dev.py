@@ -29,6 +29,7 @@ from uclone_x.core.session_diagnostics import (
     inspect_session,
     list_session_summaries,
 )
+from uclone_x.core.tool_results import handle_in
 from uclone_x.llm.models import MessageRole
 
 console = Console()
@@ -211,7 +212,9 @@ def session_show(
         elif msg.role == MessageRole.TOOL:
             cid = msg.tool_call_id or "missing"
             tool_detail = f"[dim]id=[/dim]{cid}"
-            if msg.content and "[Tool Output Offloaded" in msg.content:
+            if handle_in(msg.content) is not None:
+                tool_detail += " [cyan](stored)[/cyan]"
+            elif msg.content and "[Tool Output Offloaded" in msg.content:
                 tool_detail += " [cyan](offloaded)[/cyan]"
             elif msg.content and "[Tool Output Truncated" in msg.content:
                 tool_detail += " [yellow](truncated)[/yellow]"

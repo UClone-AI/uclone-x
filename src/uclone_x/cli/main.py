@@ -24,6 +24,7 @@ except ImportError as exc:
     ) from exc
 
 from uclone_x.agent.persona_store import DEFAULT_PERSONA_NAME
+from uclone_x.cli.browser_plan import common_dir, plan_browser_suite, record_browser_result
 from uclone_x.cli.commands.a2a import a2a_app
 from uclone_x.cli.commands.acp import AGENT_ID_HELP as ACP_AGENT_ID_HELP
 from uclone_x.cli.commands.acp import acp_app, start_acp_server
@@ -39,8 +40,10 @@ from uclone_x.cli.commands.room import room_app
 from uclone_x.cli.commands.skill import skill_app
 from uclone_x.cli.commands.ui import ui_app
 from uclone_x.cli.quality_gate import (
+    JUNIT_REPORT_PATH,
     describe_installed_hook_drift,
     gate_run_can_record,
+    hold_gate_lock,
     record_gate_pass,
     run_quality_gate,
     snapshot_committed_tree,
@@ -647,9 +650,10 @@ def start(
                 f"[bold green]✔ Local Private AI Model Ready:[/bold green] "
                 f"[cyan]{result.llm.model}[/cyan]"
             )
-            os.environ.setdefault("LLM_PROVIDER", "ollama")
-            os.environ.setdefault("OLLAMA_MODEL", result.llm.model)
-            os.environ.setdefault("OLLAMA_BASE_URL", result.llm.endpoint)
+            # Setup has already saved this model as the default in settings.json when none
+            # was saved. Exporting it into the environment as well would make it outrank the
+            # file for the whole process, so a provider or model picked in Settings later
+            # would never take effect.
 
     bound_port = find_available_port(port)
     if bound_port != port:
@@ -701,12 +705,20 @@ def test_check(
         help="Run pytest in one process instead of parallel workers: slower, same selection "
         "and coverage. For debugging an ordering or isolation failure (#967).",
     ),
+    full_browser: bool = typer.Option(
+        False,
+        "--full-browser",
+        help="Run the whole browser suite whatever the diff (the nightly runs this). A red "
+        "result on exactly origin/main is recorded, so merges deselect what main already fails.",
+    ),
 ) -> None:
     """Run automated quality gates: Ruff lint/format, Pyright strict typing, and Pytest.
 
-    The pytest selection includes the E2E Playwright suite. It used to be opt-in behind
-    `--all`, which meant a green gate said nothing about the rendered UI; `--fast` is the
-    opt-out for iterating, and `--all` is kept as a no-op synonym for the default.
+    The pytest selection includes the E2E Playwright suite, planned per diff: all of it when
+    the diff can change what the browser renders (`tests/scope-rules.toml`) or no full pass on
+    main is fresh, else only the browser test files the diff changes. The plan and its reason
+    are printed before the run. `--fast` drops the suite; `--all` is a no-op synonym for the
+    default. One full gate runs at a time per machine; a second waits and says so.
     """
     # Reported here rather than inside `run_quality_gate`: this is presentation, not a
     # verification step, and putting a git call inside the gate changed the subprocess
@@ -723,13 +735,42 @@ def test_check(
         if gate_run_can_record(test_scope, skip_tests=skip_tests)
         else None
     )
-    exit_code = run_quality_gate(
-        skip_tests=skip_tests,
-        check_frontend=check_frontend,
-        fail_fast=fail_fast,
-        test_scope=test_scope,
-        serial=serial,
+    plan = (
+        plan_browser_suite(repo=Path.cwd(), full=full_browser)
+        if test_scope == "gate" and not skip_tests and not serial
+        else None
     )
+    for line in plan.describe() if plan else ():
+        console.print(line, markup=False, highlight=False, soft_wrap=True)
+    browser_codes: list[int] = []
+    browser_report = JUNIT_REPORT_PATH.with_name(
+        f"{JUNIT_REPORT_PATH.stem}.browser{JUNIT_REPORT_PATH.suffix}"
+    )
+    with hold_gate_lock(
+        common_dir(Path.cwd()),
+        announce=lambda line: console.print(line, markup=False, highlight=False),
+    ):
+        # A step that dies before writing its report must not be judged by the last run's.
+        # Under the lock: a second gate must not delete the report of the one running.
+        browser_report.unlink(missing_ok=True)
+        exit_code = run_quality_gate(
+            skip_tests=skip_tests,
+            check_frontend=check_frontend,
+            fail_fast=fail_fast,
+            test_scope=test_scope,
+            serial=serial,
+            browser=plan,
+            on_browser_step=browser_codes.append,
+        )
+    if plan is not None and browser_codes:
+        written = record_browser_result(
+            plan,
+            passed=browser_codes[0] == 0,
+            report=browser_report,
+            repo=Path.cwd(),
+        )
+        if written:
+            console.print(written, markup=False, highlight=False, soft_wrap=True)
     console.print(
         record_gate_pass(
             exit_code=exit_code, test_scope=test_scope, skip_tests=skip_tests, before=before

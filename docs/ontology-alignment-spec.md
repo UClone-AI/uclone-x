@@ -3,19 +3,17 @@
 > [!IMPORTANT]
 > **This document specifies an intent. It does not describe working software.**
 >
-> Nothing under `src/uclone_x/` implements any part of this specification.
-> `src/uclone_x/ontology/models.py` and `src/uclone_x/ontology/protocols.py` are
-> type stubs for a single-agent ontology only (`EntitySchema`, `RelationSchema`,
-> `OntologyValidationResult`, and three `Protocol` classes) — none of them carry a
-> tier, a confidence score, an IRI, evidence metadata, or anything cross-agent. The
-> repository-root `ontology/` directory referenced by
-> [`agent-ontology-architecture.md`](agent-ontology-architecture.md) §3.2 as the home
-> of human-authored schemas is **empty**. `./ucx ontology validate`,
-> `./ucx ontology drift`, `./ucx ontology review`, `./ucx ontology forget` and
-> `./ucx ontology arbitrate` — every command named below — are **Planned**, in the
-> sense [`cli-specification.md`](cli-specification.md) uses the word: no such module
-> or command exists yet. Every normative statement below is a design commitment for
-> an implementation that has not started, not a report of current behaviour.
+> *Revised 2026-09-25.* A **single-agent** engine now exists
+> (`src/uclone_x/ontology/engine.py`: tiers, confidence, namespace IRIs, justification), and
+> `./ucx ontology validate`, `review` and `forget` exist for one agent's file. Nothing
+> **cross-agent** described here is implemented: there is no alignment, no drift detection
+> and no arbitration, and `./ucx ontology drift` and `./ucx ontology arbitrate` do not exist.
+> The repository-root `ontology/` directory referenced by
+> [`agent-ontology-architecture.md`](agent-ontology-architecture.md) §3.2 does not exist.
+> Clones never merge their knowledge
+> (`design/clone-knowledge-graph.md` G2), so alignment,
+> if built, reconciles vocabularies between graphs without merging them. Every normative
+> statement below is a design commitment, not a report of current behaviour.
 >
 > This document resolves `2026-09-02-012`
 > (the alignment mechanism P2 and P7 require had no specification) and answers the

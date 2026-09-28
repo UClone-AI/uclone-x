@@ -1,8 +1,8 @@
-import React from 'react';
-import { AlertTriangle, Clock, Coins, FileText, MessageSquare, Wrench } from 'lucide-react';
+import React, { useState } from 'react';
+import { AlertTriangle, Check, Clock, Coins, Copy, FileText, MessageSquare, Wrench } from 'lucide-react';
 import type { EventEnvelope, RoomState, RoomTurnRefusal } from '../../types';
 import { senderLabel, serviceRefLabel } from '../../lib/rooms';
-import { refusalRemedy, turnFailureSentence } from '../../lib/turnOutcome';
+import { providerFailureRemedy, refusalRemedy, turnFailureSentence } from '../../lib/turnOutcome';
 import {
   type TurnDocument,
   type TurnSummary,
@@ -62,6 +62,17 @@ export const TurnDetail: React.FC<TurnDetailProps> = ({
   const openInDocs = useOpenInDocs();
   const devMode =
     developerMode ?? (typeof window !== 'undefined' ? readDeveloperMode() : false);
+  const [copiedTurnId, setCopiedTurnId] = useState(false);
+
+  const copyTurnId = async (id: string): Promise<void> => {
+    try {
+      await navigator.clipboard.writeText(id);
+      setCopiedTurnId(true);
+      setTimeout(() => setCopiedTurnId(false), 2000);
+    } catch {
+      /* storage or clipboard write refused */
+    }
+  };
 
   if (!room || seq === null) {
     return (
@@ -123,6 +134,7 @@ export const TurnDetail: React.FC<TurnDetailProps> = ({
         completed: message.completed,
         error: message.error ?? null,
         refusal: message.refusal ?? null,
+        provider_failure: message.provider_failure ?? null,
         provenance: message.provenance ?? null,
         decision: message.decision ?? null,
         rendered_through:
@@ -234,33 +246,35 @@ export const TurnDetail: React.FC<TurnDetailProps> = ({
       ) : null}
 
       {/* Chosen by */}
-      <Field label="Chosen by">
-        {summary.decision ? (
-          <div data-testid="turn-detail-decision" className="space-y-1">
-            {devMode ? (
-              <p>{summary.decision.selector}</p>
-            ) : (
-              <p className="font-sans">
-                {summary.decision.selector === 'sole_agent'
-                  ? 'Only seated agent'
-                  : 'Selected agent'}
+      {(devMode || summary.decision?.selector !== 'sole_agent') && (
+        <Field label="Chosen by">
+          {summary.decision ? (
+            <div data-testid="turn-detail-decision" className="space-y-1">
+              {devMode ? (
+                <p>{summary.decision.selector}</p>
+              ) : (
+                <p className="font-sans">
+                  {summary.decision.selector === 'sole_agent'
+                    ? 'Only seated agent'
+                    : 'Selected agent'}
+                </p>
+              )}
+              {summary.decision.reasoning ? (
+                <p className="font-sans text-slate-400">{summary.decision.reasoning}</p>
+              ) : null}
+              <p className="font-sans text-[11px] text-slate-500">
+                {devMode
+                  ? `Selector reported confidence ${summary.decision.confidence.toFixed(2)}.`
+                  : `Confidence ${summary.decision.confidence.toFixed(2)}.`}
               </p>
-            )}
-            {summary.decision.reasoning ? (
-              <p className="font-sans text-slate-400">{summary.decision.reasoning}</p>
-            ) : null}
-            <p className="font-sans text-[11px] text-slate-500">
-              {devMode
-                ? `Selector reported confidence ${summary.decision.confidence.toFixed(2)}.`
-                : `Confidence ${summary.decision.confidence.toFixed(2)}.`}
-            </p>
-          </div>
-        ) : (
-          <span data-testid="turn-detail-no-decision" className="font-sans text-slate-400">
-            Nobody chose this speaker: the turn records no selection.
-          </span>
-        )}
-      </Field>
+            </div>
+          ) : (
+            <span data-testid="turn-detail-no-decision" className="font-sans text-slate-400">
+              Nobody chose this speaker: the turn records no selection.
+            </span>
+          )}
+        </Field>
+      )}
 
       {/* Saw through */}
       <Field label={devMode ? 'Saw through' : 'Context through'}>
@@ -275,8 +289,31 @@ export const TurnDetail: React.FC<TurnDetailProps> = ({
 
       {/* In developer mode, expose raw identifiers */}
       {devMode && (
-        <div className="pt-2 border-t border-slate-800 text-[10px] text-slate-500 space-y-0.5">
-          {summary.turn_id && <p>turn_id: {summary.turn_id}</p>}
+        <div className="pt-2 border-t border-slate-800 text-[10px] text-slate-500 space-y-1">
+          {summary.turn_id && (
+            <div className="flex items-center justify-between gap-2">
+              <span className="font-mono break-all">turn_id: {summary.turn_id}</span>
+              <button
+                type="button"
+                data-testid="turn-copy-id"
+                onClick={() => void copyTurnId(summary.turn_id!)}
+                className="flex items-center gap-1 text-[10px] text-slate-400 hover:text-slate-200 px-1.5 py-0.5 rounded bg-slate-900 hover:bg-slate-800 border border-slate-800 shrink-0 transition-colors cursor-pointer"
+                title="Copy turn ID"
+              >
+                {copiedTurnId ? (
+                  <>
+                    <Check className="w-3 h-3 text-emerald-400" />
+                    <span className="text-emerald-400">Copied</span>
+                  </>
+                ) : (
+                  <>
+                    <Copy className="w-3 h-3" />
+                    <span>Copy</span>
+                  </>
+                )}
+              </button>
+            </div>
+          )}
           <p>seq: {summary.seq}</p>
         </div>
       )}
@@ -328,6 +365,28 @@ export const TurnDetail: React.FC<TurnDetailProps> = ({
               <Coins className="w-3 h-3 text-slate-500" />
               {tokensText}
             </span>
+          ) : null}
+
+          {devMode && summary.turn_id ? (
+            <button
+              type="button"
+              data-testid="turn-chip-copy-id"
+              onClick={() => void copyTurnId(summary.turn_id!)}
+              className="flex items-center gap-1 bg-slate-900 hover:bg-slate-800 px-2 py-0.5 rounded text-slate-400 hover:text-slate-200 border border-slate-800/80 font-mono transition-colors cursor-pointer"
+              title={`turn_id: ${summary.turn_id} (click to copy)`}
+            >
+              {copiedTurnId ? (
+                <>
+                  <Check className="w-3 h-3 text-emerald-400" />
+                  <span className="text-emerald-400">Copied</span>
+                </>
+              ) : (
+                <>
+                  <Copy className="w-3 h-3 text-slate-500" />
+                  <span>{summary.turn_id.slice(0, 8)}…</span>
+                </>
+              )}
+            </button>
           ) : null}
         </div>
       </div>
@@ -408,8 +467,13 @@ export const TurnDetail: React.FC<TurnDetailProps> = ({
                   )}
 
                   {devMode && step.arguments_preview && (
-                    <pre className="text-[10px] font-mono text-slate-400 bg-slate-950 p-1.5 rounded overflow-x-auto">
-                      {step.arguments_preview}
+                    // Pretty-printed and wrapped: one long JSON line scrolled sideways
+                    // and hid every argument past the first screen width.
+                    <pre
+                      data-testid="turn-step-args"
+                      className="text-[10px] font-mono text-slate-400 bg-slate-950 p-1.5 rounded max-h-64 overflow-y-auto whitespace-pre-wrap break-words"
+                    >
+                      {typeof args === 'string' ? args : JSON.stringify(args, null, 2)}
                     </pre>
                   )}
                 </div>
@@ -509,11 +573,16 @@ export const TurnDetail: React.FC<TurnDetailProps> = ({
               speakerName,
               summary.refusal as RoomTurnRefusal | null,
               summary.completed,
+              summary.provider_failure,
             )}
           </p>
           {summary.refusal ? (
             <p className="font-sans text-[10px] text-slate-400">
               {refusalRemedy(summary.refusal as RoomTurnRefusal)}
+            </p>
+          ) : summary.provider_failure && providerFailureRemedy(summary.provider_failure.kind) ? (
+            <p data-testid="turn-detail-remedy" className="font-sans text-[10px] text-slate-400">
+              {providerFailureRemedy(summary.provider_failure.kind)}
             </p>
           ) : null}
           {devMode && (

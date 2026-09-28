@@ -479,6 +479,13 @@ def parse_file(model: type[_M], text: str, where: str) -> _M:
         line = getattr(mark, "line", None)
         at = f" near line {line + 1}" if isinstance(line, int) else ""
         raise StoryFileError(f"{where} could not be read as YAML{at}.") from exc
+    except ValueError as exc:
+        # YAML reads a value as a number or a date before any field sees it, and Python
+        # refuses a number of more than 4300 digits and a date that does not exist (#1613).
+        raise StoryFileError(
+            f"{where} has a value that could not be read: a number too long or a date that "
+            "does not exist. Put it in quotes to keep it as text."
+        ) from exc
     if raw is None:
         raw = {}
     if not isinstance(raw, dict):

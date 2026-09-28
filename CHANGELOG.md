@@ -13,6 +13,118 @@ names does.
 Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Each date is
 the date that version was published.
 
+## [0.3.0] - 2026-09-27
+
+### Added
+
+- Novel co-writing with the Writer. Stories are saved in the workspace as an outline,
+  a codex (characters, places, items, threads) and a manuscript, and outlive the
+  conversation that started them. New tools `story_library`, `story_outline`,
+  `story_codex`, `story_manuscript`, `story_context` and `story_audit` belong to the
+  Writer. Only one conversation writes a story at a time; opening it from another gives a
+  read-only copy until you take it over. Scenes can carry a `story_time`, so a flashback
+  sees the story as it was then. `muse_spark` draws idea cards for a genre.
+- Codex changes the Writer proposes (a death, a lost item) wait for your decision, with
+  the quote that shows them. **View story** lists them under "Waiting for your decision"
+  with **Approve** and **Reject**; nothing changes until you choose.
+- A **Files** button in the header lists the files clones saved, across every
+  conversation, filtered by kind and by conversation. Files can be archived and restored;
+  "Delete for good" is offered only on archived files. A story opens in a new
+  conversation with its story view.
+- In a one-to-one chat, Clone can ask Writer, Artist, Scout, Pioneer or Guardian for help
+  through the new `a2a_call` tool, and Writer can ask Artist for illustrations. A clone
+  that is called cannot call a further one.
+- Google Gemini can draw pictures. The `image_engine` setting takes `auto` (the default),
+  `local` or `gemini`, and `image_model` picks the Gemini model (default
+  `gemini-2.5-flash-image`). On `auto`, Gemini draws only when no local engine or remote
+  GPU is ready and your chat already uses Gemini with a saved key; on `local`, no picture
+  request leaves your machines. Settings › Images (previously Tools) offers the same
+  choice and shows what is drawing pictures now. `ucx media status` lists Gemini too.
+- Clones can have their own pictures. Choose one from a clone's profile ("Upload
+  picture…", "Ask {name} to make one", "Reset to default"), or with **Use as avatar**
+  under a picture in the conversation, with Undo. Uploads must be PNG, JPEG or WebP and
+  10 MB or smaller. Clones can set their own with the `set_avatar` tool. Pictures show in
+  the rail, including the Group Chats list, and in the conversation.
+- Settings has a "Remote GPU Worker (SSH Auto-Tunnel)" section that connects to a
+  workstation over SSH and starts ComfyUI there. By default only image generation runs on
+  it; tick "Also run the LLM on this worker (Ollama)" to move the chat model too. The
+  previous LLM address comes back when you disconnect.
+- Settings › Usage limits how many tokens paid models may use, across every conversation
+  and clone, over 10 minutes, 5 hours and a week, with presets or your own numbers. Local
+  models are not counted. A banner appears at 80% of a limit. At a limit, the next paid
+  call is refused before anything is sent, and the message says when paid models can be
+  used again. `UCLONE_USAGE_LIMIT_10_MINUTES`, `UCLONE_USAGE_LIMIT_5_HOURS` and
+  `UCLONE_USAGE_LIMIT_WEEK` set the same limits.
+- A "Fast model" for quick background work, such as choosing who speaks next, separate
+  from the chat model. It follows the chat model unless you choose one, in Settings or with
+  `ucx llm use --fast <model>`.
+- For OpenAI, Anthropic and Gemini, Settings lists the models the provider offers for your
+  key, marks one "(recommended)", and has "Refresh list"; it works before you save, and
+  says in plain words when the list cannot load. You can still type any model name.
+- `ucx key set <provider>` and `ucx key remove <provider>`; `ucx key list` shows each
+  saved key masked and whether an environment variable overrides it.
+- One Language setting (System default, English, Korean). Settings, the rail, the
+  conversation, the composer, tool steps and the dock are translated; the Files screen and
+  the story view are English only for now. Clones still answer in the language you write in.
+- When a provider refuses a turn, you are told which provider and why (key rejected,
+  quota, outage, unreachable, model not available), with a suggested fix.
+- If `ucx-agent-skills` is missing from the project UClone-X was started from, the CLI
+  and Settings › Skills say so.
+- The package metadata links to the GitHub repository: homepage, source, issues and this
+  changelog.
+
+### Changed
+
+- **API keys are saved per provider** in the settings file, so saving or switching one
+  provider never drops another's key, and each key is sent only to its own provider. An
+  old single saved key is read as its provider's key and rewritten in the new layout the
+  next time settings are saved; a key with no known provider is sent nowhere until you save
+  it again. `ucx key setup` now saves to the settings file and no longer writes `.env`.
+  UClone-X does not read `.env` itself: if you relied on one, load it into your shell or run
+  `ucx key set <provider>`.
+- **Environment variables outrank Settings.** `LLM_PROVIDER`, `*_MODEL`, `*_BASE_URL` and
+  `*_API_KEY` set in your shell win over saved settings, and Settings, `ucx key` and
+  `ucx llm use` say which variable is in effect. `ucx start` no longer sets `LLM_PROVIDER`
+  or the model for you, so the ones chosen in Settings take effect; unset your own exports
+  to let Settings decide. With no model set anywhere, a request is refused with a plain
+  message instead of falling back to a built-in model.
+- The per-session token limit is gone by default; the Usage limits above replace it.
+- **Skills approved before this release must be approved again.** `ucx skill approve` now
+  records approvals in `~/.uclone/skills/approvals.json`, asks you to type yes in the
+  terminal, and refuses when there is no terminal, so a script or a clone cannot approve a
+  skill. A skill edited after approval is not loaded, and Settings › Skills says why each
+  skill is not in use.
+- A persona's `allowed_tools` is the range of tools it may use, not a list that is always
+  loaded. With a local Ollama model and an embedder, each message gets a base set of tools
+  plus up to three matching ones, and a new `search_tools` tool lets the model add others.
+  Other providers get every allowed tool.
+- The image prompt skills `media-prompt-danbooru`, `media-prompt-flux` and
+  `media-prompt-generic` are replaced by `media-character`, `media-architecture` and
+  `media-engineering`, which load the section for the active image model.
+- Removed HTTP routes: `POST /api/turn`, `GET` and `DELETE /api/session/history`,
+  `POST /api/session/history/truncate` and `GET /api/agents`. Every conversation runs as a
+  room; use the rooms API, and `GET /api/personas` for the list of clones. Saved history is
+  kept.
+- Approving codex changes and changing diagnostics consent work only from a browser window
+  UClone-X opened; any other window offers "Open a confirmed window".
+- The rail no longer shows which clones are active.
+
+### Fixed
+
+- Gemini models can use tools; before, nearly every built-in tool was refused.
+- Ollama's model list uses the address typed in Settings, and says when nothing answers
+  there. `localhost`, `127.0.0.1` and `[::1]` on one port count as the same server.
+- A dashboard started with its own storage folder uses the model and usage limits saved
+  there.
+- Clicking a clone in the rail no longer jumps to a group chat it is in, and only one clone
+  is selected at a time.
+- Typing in the message box no longer redraws the whole conversation on every keystroke.
+- Gemini pictures keep the format Gemini returned (JPEG or PNG), and image links in
+  replies open.
+- Shell commands a clone runs no longer wait for keyboard input, `file_edit` keeps a
+  file's line endings, a tool call with wrong arguments names each one, and a sandbox that
+  cannot start is reported in a plain sentence.
+
 ## [0.2.2] - 2026-09-24
 
 ### Added

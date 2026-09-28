@@ -10,8 +10,9 @@ How scenes are ordered:
 - `story_time` is compared naturally: `day 3` comes before `day 10`, `5` equals `"5"`,
   and `-5` comes before `3`. Dotted numbers compare part by part, so `1.2.1` comes after
   `1.2` and before `1.10`, and `2024.9.30` before `2024.10.01`: a dot is never a decimal
-  point. A number of any length compares by its digits, so no `story_time` is too long
-  to order (#1601).
+  point, so an author who means a day and a half writes `day 1, hour 12`, not `1.5`
+  (§10 Q3). A number of any length compares by its digits, so no `story_time` is too
+  long to order (#1601), whether it is written as text or given as an `int` (#1613).
 - A scene without a `story_time` happens when the scene before it in reading order does
   (it continues it). A scene with none and no timed scene before it happens first. Each
   such placement is an **assumption**, and `assumptions` lists them so the context can say
@@ -75,6 +76,25 @@ def _number(digits: str, negative: bool) -> NumberKey:
     return (2, len(plain), plain)
 
 
+#: How many decimal digits `_decimal` converts at once: under the 4300 that `str` allows.
+_CHUNK_DIGITS = 4000
+_CHUNK = 10**_CHUNK_DIGITS
+
+
+def _decimal(value: int) -> str:
+    """The decimal digits of the non-negative `value`, however many there are.
+
+    `str` refuses an `int` of more than 4300 digits, and a `story_time` string has no
+    limit, so an `int` has none either: `10**5000` orders as its 5001 digits do (#1613).
+    """
+    chunks: list[str] = []
+    while value >= _CHUNK:
+        value, low = divmod(value, _CHUNK)
+        chunks.append(f"{low:0{_CHUNK_DIGITS}d}")
+    chunks.append(str(value))
+    return "".join(reversed(chunks))
+
+
 def _number_parts(token: str, signed: bool) -> list[NumberKey]:
     """The numbers one numeric token stands for, its first carrying the sign.
 
@@ -97,7 +117,7 @@ def time_key(value: str | int | None) -> TimeKey:
     if value is None:
         return ()
     if isinstance(value, int):
-        return ((0, _number(str(abs(value)), value < 0)),)
+        return ((0, _number(_decimal(abs(value)), value < 0)),)
     text = value.strip()
     key: list[tuple[int, NumberKey | str]] = []
     pending = ""

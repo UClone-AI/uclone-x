@@ -1053,7 +1053,7 @@ class TestAFileOnDiskIsNeverReportedAsNoneWritten:
     ) -> None:
         """Path 2: `execute_turn`'s error handler returned `tool_executions=()`.
 
-        Killed by: src/uclone_x/agent/base.py :: tool_executions=tuple(tool_executions),  # ran before the failure
+        Killed by: src/uclone_x/agent/turn_executor.py :: tool_executions=tuple(tool_executions),  # ran before the failure
         Becomes: tool_executions=(),  # ran before the failure
         """
         room_id = _create(client, ["scout"])

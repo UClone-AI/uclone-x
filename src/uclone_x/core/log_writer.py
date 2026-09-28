@@ -17,32 +17,21 @@ or host egress boundaries.
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Protocol, TextIO, cast
+from typing import Any, Protocol, TextIO
 
-from uclone_x.core.secrets import REDACTED_PLACEHOLDER, redact_credentials
+from uclone_x.core.secrets import redact_credentials
+
+# Lowered to `uclone_x.core.secrets` (#1734): a pure function, needed by the kernel's
+# `core/session_state.py`, which may not import this file-writing adapter.
+from uclone_x.core.secrets import redact_log_payload as redact_log_payload
 
 __all__ = [
     "LogWriterProtocol",
     "RedactingLogWriter",
     "redact_log_payload",
 ]
-
-
-def redact_log_payload(payload: Any, placeholder: str = REDACTED_PLACEHOLDER) -> Any:
-    """Recursively redact credential shapes from strings within mappings and sequences."""
-    if isinstance(payload, str):
-        return redact_credentials(payload, placeholder=placeholder)
-    if isinstance(payload, Mapping):
-        return {
-            str(k): redact_log_payload(v, placeholder=placeholder)
-            for k, v in cast(Mapping[Any, Any], payload).items()
-        }
-    if isinstance(payload, (list, tuple)):
-        seq = cast("Sequence[object]", payload)
-        return [redact_log_payload(item, placeholder=placeholder) for item in seq]
-    return payload
 
 
 class LogWriterProtocol(Protocol):

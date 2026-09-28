@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import re
 from pathlib import Path
 
 import pytest
@@ -12,12 +11,13 @@ from uclone_x.agent.base import BaseAgent
 from uclone_x.agent.models import AgentConfig, AgentLLMConfig
 from uclone_x.agent.session import SessionStore
 from uclone_x.core.provenance import Provenance
+from uclone_x.core.tool_results import artifacts_dir_for, handle_in, load_tool_result
 from uclone_x.engine.event_bus import AgentEvent, EventBus, EventType
 from uclone_x.errors import PathTraversalError
 from uclone_x.llm.compactor import ContextCompactor
 from uclone_x.llm.connectors.mock import MockLLMConnector
 from uclone_x.llm.models import ChatMessage, MessageRole, ToolCallRequest
-from uclone_x.tools.builtin.filesystem import FileReadParams, FileReadTool
+from uclone_x.tools.builtin.filesystem import FileReadTool
 from uclone_x.tools.models import ToolContext, ToolResult
 from uclone_x.tools.registry import LocalTool, ToolRegistry
 
@@ -26,8 +26,8 @@ from uclone_x.tools.registry import LocalTool, ToolRegistry
 async def test_tool_output_offload_recovery_and_cleanup(tmp_path: Path) -> None:
     """L2 integration test:
     1. Tool produces oversized output exceeding max_tool_output_chars.
-    2. Context compactor offloads to sandbox filesystem instead of truncating.
-    3. FileReadTool reads back full content including middle section.
+    2. Context compactor offloads to the session's result store instead of truncating.
+    3. The stored body holds the full content, including the middle section.
     4. Path traversal attempt during offload is refused.
     5. Session deletion cleans up tool artifacts from disk.
     """
@@ -128,21 +128,19 @@ async def test_tool_output_offload_recovery_and_cleanup(tmp_path: Path) -> None:
         messages = agent._live_session(agent.session_id).messages  # pyright: ignore[reportPrivateUsage]
         tool_msg = next(m for m in messages if m.role == MessageRole.TOOL)
         assert tool_msg.content is not None
-        assert "[Tool Output Offloaded" in tool_msg.content
-        assert "path=offload" in tool_msg.content
+        # Since #1640 the offload goes to the `tr_` result store. This agent has
+        # `file_read` but not `tool_result_read`, so the stub names neither.
+        handle = handle_in(tool_msg.content)
+        assert handle is not None, f"No stored-result handle in: {tool_msg.content}"
+        assert "file_read" not in tool_msg.content
+        assert "tool_result_read" not in tool_msg.content
 
-        # 3. Extract the artifact path and verify recovery via FileReadTool
-        match = re.search(r"Full output saved to '([^']+)'", tool_msg.content)
-        assert match is not None, f"Artifact path not found in: {tool_msg.content}"
-        artifact_rel_path = match.group(1)
-
-        tool_ctx = ToolContext(
-            agent_id=agent.agent_id, workspace_root=ws, session_id=agent.session_id
-        )
-        read_result = read_tool.run(FileReadParams(path=artifact_rel_path), tool_ctx)
-
-        assert read_result["content"] == large_payload
-        assert "RECOVERABLE_KEY_#472" in read_result["content"]
+        # 3. The stored body is the whole output, middle section included
+        artifacts = artifacts_dir_for(ws)
+        stored = load_tool_result(artifacts, agent.session_id, handle)
+        assert stored == large_payload
+        assert "RECOVERABLE_KEY_#472" in stored
+        artifact_rel_path = f".sandbox/tool_artifacts/{agent.session_id}/{handle}.txt"
 
         # 4. Assert traversal refusal
         compactor_bad = ContextCompactor(

@@ -1,5 +1,6 @@
 import React from 'react';
 import { AlertTriangle, RefreshCw } from 'lucide-react';
+import { useCopy } from '../../i18n';
 
 /**
  * A Settings section's read, still out (#1369).
@@ -33,27 +34,30 @@ export const ReadFailure: React.FC<{
   onRetry: () => void;
   retrying: boolean;
   plain?: boolean;
-}> = ({ testId, what, cause, onRetry, retrying, plain = false }) => (
-  <div
-    role="alert"
-    data-testid={testId}
-    className="p-3 rounded-xl border border-rose-800/80 bg-rose-950/50 space-y-2"
-  >
-    <div className="flex items-center gap-2 text-xs text-rose-200">
-      <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0" />
-      <span>{what}</span>
-    </div>
-    <p className="text-[11px] text-rose-300/80">
-      Reason: <span className={plain ? 'break-words' : 'font-mono break-all'}>{cause}</span>
-    </p>
-    <button
-      type="button"
-      onClick={onRetry}
-      disabled={retrying}
-      className="inline-flex items-center gap-1.5 text-[11px] px-2.5 py-1 rounded-lg bg-slate-800 text-slate-200 hover:bg-slate-700 disabled:opacity-60"
+}> = ({ testId, what, cause, onRetry, retrying, plain = false }) => {
+  const copy = useCopy().skills.readState;
+  return (
+    <div
+      role="alert"
+      data-testid={testId}
+      className="p-3 rounded-xl border border-rose-800/80 bg-rose-950/50 space-y-2"
     >
-      <RefreshCw className="w-3 h-3" />
-      {retrying ? 'Trying again…' : 'Try again'}
-    </button>
-  </div>
-);
+      <div className="flex items-center gap-2 text-xs text-rose-200">
+        <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0" />
+        <span>{what}</span>
+      </div>
+      <p className="text-[11px] text-rose-300/80">
+        {copy.reason} <span className={plain ? 'break-words' : 'font-mono break-all'}>{cause}</span>
+      </p>
+      <button
+        type="button"
+        onClick={onRetry}
+        disabled={retrying}
+        className="inline-flex items-center gap-1.5 text-[11px] px-2.5 py-1 rounded-lg bg-slate-800 text-slate-200 hover:bg-slate-700 disabled:opacity-60"
+      >
+        <RefreshCw className="w-3 h-3" />
+        {retrying ? copy.retrying : copy.retry}
+      </button>
+    </div>
+  );
+};

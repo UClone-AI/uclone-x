@@ -1,0 +1,32 @@
+{
+  "clones": "Clones",
+  "newClone": "New clone",
+  "expandLabel": "Show {name}'s conversations",
+  "collapseLabel": "Hide {name}'s conversations",
+  "expandTitle": "Show conversations",
+  "collapseTitle": "Hide conversations",
+  "inspectLabel": "View {name}'s profile",
+  "inspectTitle": "View profile in dock",
+  "editLabel": "Edit {name}'s settings",
+  "editTitle": "Edit settings in dock",
+  "pinLabel": "Pin {name} to top",
+  "unpinLabel": "Unpin {name}",
+  "pinTitle": "Pin clone to top",
+  "unpinTitle": "Unpin clone",
+  "moreLabel": "More actions for {name}",
+  "moreTitle": "More actions",
+  "pinnedHeading": "Pinned",
+  "cloneConversations": {
+    "heading": "Conversations",
+    "none": "In no conversation yet.",
+    "start": "Start one",
+    "openLabel": "Open {title}, a conversation {clone} is in",
+    "startLabel": "Start a conversation with {clone}",
+    "thread": "Start thread",
+    "threadLabel": "Start thread with {clone}"
+  },
+  "groupChats": {
+    "heading": "Group Chats",
+    "newTitle": "Start a new group chat"
+  }
+}

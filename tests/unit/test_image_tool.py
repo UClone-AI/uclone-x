@@ -12,15 +12,22 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from uclone_x.core.tool_results import canonical_tool_text
+from uclone_x.errors import PlainRefusalError
 from uclone_x.tools.builtin.comfy_client import COMFY_DEFAULT_CHECKPOINT
 from uclone_x.tools.builtin.image import (
     ACCELERATE_MISSING_SENTENCE,
     COMFY_URL_ENV,
+    COUNT_FOR_VARIETY_REFUSAL,
     DEFAULT_CHECKPOINTS,
+    DIFFUSERS_GUIDANCE,
+    DIFFUSERS_STEPS,
+    GENERIC_FALLBACK_MODEL_ID,
     GPU_OUT_OF_MEMORY_MESSAGE,
     IMAGE_CHECKPOINT_ENV,
     IN_PROCESS_INSTALL_REQUIREMENTS,
     IN_PROCESS_REQUIREMENTS,
+    SDXL_MEGAPIXEL_BUCKETS,
+    STYLE_SUFFIXES,
     CheckpointResolution,
     ComfyUIImageEngine,
     GenerateImageParams,
@@ -35,10 +42,13 @@ from uclone_x.tools.builtin.image import (
     device_wide_free_bytes,
     diffusers_install_hint,
     expand_checkpoint_path,
+    find_prompt_conflicts,
     in_process_dependency_problems,
+    long_prompt_embeds,
     out_of_memory_message,
     parse_nvidia_smi_free_bytes,
     resolve_aspect_dimensions,
+    resolve_sampling,
     running_under_wsl,
     select_torch_device,
     style_guided_prompt,
@@ -366,6 +376,50 @@ async def test_generate_image_tool_run_writes_artifact_and_returns_provenance(
 
 
 @pytest.mark.asyncio
+async def test_generate_image_recipe_hash_includes_negative_prompt(tmp_path: Path) -> None:
+    """Recipe hash must differ when negative_prompt differs.
+
+    Killed by: src/uclone_x/tools/builtin/image.py :: f"{params.prompt}__{params.negative_prompt}__{actual_seed}__{gen_result.engine_name}"
+    Becomes: f"{params.prompt}____{actual_seed}__{gen_result.engine_name}"
+    """
+    mock_dispatcher = AsyncMock(spec=ImagePipelineDispatcher)
+    mock_dispatcher.dispatch.return_value = ImageGenerationResult(
+        image_bytes=b"fake_png",
+        seed=12345,
+        engine_name="diffusers-sdxl",
+        device_info="Apple M3",
+        duration_seconds=1.0,
+        width=512,
+        height=512,
+    )
+    tool = GenerateImageTool(dispatcher=mock_dispatcher)
+    context = ToolContext(
+        agent_id="test-agent",
+        workspace_root=tmp_path,
+        session_id="sess_hash_test",
+    )
+
+    res1 = await tool.run(
+        GenerateImageParams(
+            prompt="portrait of a wizard",
+            negative_prompt="blurry",
+            seed_override=12345,
+        ),
+        context,
+    )
+    res2 = await tool.run(
+        GenerateImageParams(
+            prompt="portrait of a wizard",
+            negative_prompt="cartoon, oversaturated",
+            seed_override=12345,
+        ),
+        context,
+    )
+
+    assert res1["recipe_hash"] != res2["recipe_hash"]
+
+
+@pytest.mark.asyncio
 async def test_generate_image_tool_execute_decorates_artifacts_field(
     tmp_path: Path,
 ) -> None:
@@ -453,6 +507,169 @@ async def test_generate_image_tool_run_batch_count(tmp_path: Path) -> None:
         f_path = tmp_path / img_meta["path"]
         assert f_path.is_file()
         assert f_path.read_bytes() == f"png_{img_meta['seed']}".encode()
+
+
+def test_find_prompt_conflicts_detection_and_safeguards() -> None:
+    """Exclusion tags from negative prompt are detected in positive prompt, ignoring boilerplate and substrings.
+
+    Killed by: src/uclone_x/tools/builtin/image.py :: if len(clean) < 2 or clean in GENERIC_NEGATIVE_BOILERPLATE or clean in seen:
+    Becomes: if len(clean) < 2 or clean in seen:
+    """
+    # 1. Contradiction detected
+    assert find_prompt_conflicts(
+        prompt="1girl, semi-transparent skin-toned underwear, solo",
+        negative_prompt="worst quality, blurry, underwear, panties",
+    ) == ["underwear"]
+
+    # 2. Case-insensitive and weighted tags handled
+    assert find_prompt_conflicts(
+        prompt="1girl, Cute Panties, bedroom",
+        negative_prompt="(panties:1.2), (bad anatomy:1.1)",
+    ) == ["panties"]
+
+    # 3. Substring false-positive prevention (e.g. pants vs panties)
+    assert (
+        find_prompt_conflicts(
+            prompt="1girl, denim pants, walking outside",
+            negative_prompt="panties, underwear",
+        )
+        == []
+    )
+
+    # 4. Generic quality boilerplate is ignored in conflict detection
+    assert (
+        find_prompt_conflicts(
+            prompt="1girl, garden, blurry background, bokeh",
+            negative_prompt="worst quality, blurry, bad anatomy",
+        )
+        == []
+    )
+
+
+@pytest.mark.asyncio
+async def test_generate_image_tool_rejects_conflicting_positive_and_negative_terms(
+    tmp_path: Path,
+) -> None:
+    """Contradictory positive and negative prompts fail fast with PlainRefusalError before GPU dispatch.
+
+    Killed by: src/uclone_x/tools/builtin/image.py :: conflicts = find_prompt_conflicts(params.prompt, params.negative_prompt)
+    Becomes: conflicts = []
+    """
+    mock_dispatcher = AsyncMock(spec=ImagePipelineDispatcher)
+    tool = GenerateImageTool(dispatcher=mock_dispatcher)
+    context = ToolContext(
+        agent_id="test-artist",
+        workspace_root=tmp_path,
+        session_id="sess_conflict",
+    )
+
+    params = GenerateImageParams(
+        prompt="1girl, semi-transparent skin-toned underwear, solo",
+        negative_prompt="worst quality, blurry, underwear",
+    )
+
+    with pytest.raises(PlainRefusalError) as exc_info:
+        await tool.run(params, context)
+
+    assert "Prompt conflict detected" in str(exc_info.value)
+    assert "'underwear'" in str(exc_info.value)
+    # GPU dispatch should never be called when conflict is present
+    mock_dispatcher.dispatch.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_generate_image_tool_supports_diverse_prompts_list(
+    tmp_path: Path,
+) -> None:
+    """GenerateImageTool accepts a list of distinct prompts for multi-pose / multi-scene generation.
+
+    Killed by: src/uclone_x/tools/builtin/image.py :: params.prompts if params.prompts is not None else [params.prompt] * params.count
+    Becomes: [params.prompt] * params.count
+    """
+    mock_dispatcher = AsyncMock(spec=ImagePipelineDispatcher)
+
+    def _fake_multi_prompt_dispatch(
+        prompt: str,
+        negative_prompt: str,
+        aspect_ratio: str,
+        seed: int,
+        style: str,
+    ) -> ImageGenerationResult:
+        return ImageGenerationResult(
+            image_bytes=f"png_{prompt[:10]}_{seed}".encode(),
+            seed=seed,
+            engine_name="diffusers-sdxl",
+            device_info="Apple M3",
+            duration_seconds=0.5,
+            width=768,
+            height=768,
+        )
+
+    mock_dispatcher.dispatch.side_effect = _fake_multi_prompt_dispatch
+
+    tool = GenerateImageTool(dispatcher=mock_dispatcher)
+    context = ToolContext(
+        agent_id="test-artist",
+        workspace_root=tmp_path,
+        session_id="sess_multi_prompt",
+    )
+
+    distinct_prompts = [
+        "1girl, silver hair, confident standing hero pose, eye level",
+        "1girl, silver hair, sitting on chair crossed legs, casual",
+        "1girl, silver hair, dynamic sprint action pose, low angle",
+    ]
+    params = GenerateImageParams(
+        prompts=distinct_prompts,
+        negative_prompt="worst quality, blurry",
+        seed_override=5000,
+    )
+
+    result = await tool.run(params, context)
+
+    assert result["status"] == "success"
+    assert result["count"] == 3
+    assert result["prompts"] == distinct_prompts
+    assert mock_dispatcher.dispatch.call_count == 3
+
+    # Dispatcher was called with each distinct prompt
+    assert mock_dispatcher.dispatch.call_args_list[0].kwargs["prompt"] == distinct_prompts[0]
+    assert mock_dispatcher.dispatch.call_args_list[1].kwargs["prompt"] == distinct_prompts[1]
+    assert mock_dispatcher.dispatch.call_args_list[2].kwargs["prompt"] == distinct_prompts[2]
+
+    # Verify per-image prompt in metadata
+    assert result["images"][0]["prompt"] == distinct_prompts[0]
+    assert result["images"][1]["prompt"] == distinct_prompts[1]
+    assert result["images"][2]["prompt"] == distinct_prompts[2]
+
+
+@pytest.mark.asyncio
+async def test_generate_image_tool_rejects_crammed_multiple_poses_when_count_greater_than_one(
+    tmp_path: Path,
+) -> None:
+    """A single prompt listing multiple poses with count > 1 fails fast with PlainRefusalError.
+
+    Killed by: src/uclone_x/tools/builtin/image.py :: if re.search(composite_pose_pattern, params.prompt, re.IGNORECASE):
+    Becomes: if False:
+    """
+    mock_dispatcher = AsyncMock(spec=ImagePipelineDispatcher)
+    tool = GenerateImageTool(dispatcher=mock_dispatcher)
+    context = ToolContext(
+        agent_id="test-artist",
+        workspace_root=tmp_path,
+        session_id="sess_crammed_poses",
+    )
+
+    params = GenerateImageParams(
+        prompt="K-pop idol, dynamic poses including standing gracefully, seated on chair, reclining on sofa",
+        count=3,
+    )
+
+    with pytest.raises(PlainRefusalError) as exc_info:
+        await tool.run(params, context)
+
+    assert "Multiple poses detected in a single prompt" in str(exc_info.value)
+    mock_dispatcher.dispatch.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -1413,6 +1630,9 @@ async def test_local_diffusers_image_engine_generate_offloads_to_worker_thread(
         height: int,
         seed: int,
         style: str,
+        steps: int | None = None,
+        cfg: float | None = None,
+        family: Any = None,
     ) -> bytes:
         worker_thread_ids.append(threading.get_ident())
         return b"fake_png_bytes"
@@ -1487,6 +1707,11 @@ class _SdxlPipelineSpec:
     each name against the installed diffusers.
     """
 
+    tokenizer: Any = None
+    tokenizer_2: Any = None
+    text_encoder: Any = None
+    text_encoder_2: Any = None
+
     def to(self, device: str) -> _SdxlPipelineSpec: ...
 
     def enable_model_cpu_offload(self) -> None: ...
@@ -1529,7 +1754,10 @@ def test_the_pipeline_spec_names_only_what_diffusers_has() -> None:
     for name in ("to", "enable_model_cpu_offload", "__call__"):
         assert callable(getattr(sdxl, name)), name
     assert callable(sdxl.from_single_file)
-    vae = inspect.signature(sdxl.__init__).parameters["vae"]
+    parameters = inspect.signature(sdxl.__init__).parameters
+    for component in ("tokenizer", "tokenizer_2", "text_encoder", "text_encoder_2"):
+        assert component in parameters, component
+    vae = parameters["vae"]
     assert vae.annotation is diffusers.AutoencoderKL
     assert callable(diffusers.AutoencoderKL.enable_tiling)
     assert not hasattr(sdxl, "enable_vae_tiling")
@@ -2250,3 +2478,917 @@ def test_older_torch_out_of_memory_class_is_recognised() -> None:
     old_torch.cuda.OutOfMemoryError = _OldCudaOom
 
     assert torch_out_of_memory_types(old_torch) == (_OldCudaOom,)
+
+
+# --- Profile sizes and sampling reach the engines (Artist round 6, appendix F) -------------
+
+
+def _default_registry(tmp_path: Path) -> Any:
+    """The shipped registry, with this machine's `~/.uclone` override kept out (P8)."""
+    from uclone_x.tools.builtin.media_registry import ModelRegistry
+
+    return ModelRegistry(user_config_path=tmp_path / "no-user-models.yaml")
+
+
+def test_the_illustrious_profile_renders_at_sdxl_megapixel_buckets(tmp_path: Path) -> None:
+    """The shipped anillustrious_v4 profile gets ~1MP sizes for every offered ratio.
+
+    Killed by: src/uclone_x/tools/builtin/image.py :: and profile.width * profile.height >= MEGAPIXEL_PROFILE_MIN_PIXELS
+    Becomes: and profile.width * profile.height < MEGAPIXEL_PROFILE_MIN_PIXELS
+    """
+    profile = _default_registry(tmp_path).resolve("anillustrious_v4.safetensors")
+    assert profile.model_id == "anillustrious_v4"
+
+    sizes = {ratio: resolve_aspect_dimensions(ratio, profile) for ratio in SDXL_MEGAPIXEL_BUCKETS}
+
+    assert sizes == {
+        "1:1": (1024, 1024),
+        "3:4": (896, 1152),
+        "4:3": (1152, 896),
+        "9:16": (768, 1344),
+        "16:9": (1344, 768),
+    }
+    for width, height in sizes.values():
+        assert width % 64 == 0 and height % 64 == 0
+        assert min(width, height) >= 768  # Illustrious's training floor
+        assert 0.95 <= width * height / 1024**2 <= 1.0
+
+
+def test_the_generic_fallback_keeps_the_legacy_sizes_and_engine_defaults(tmp_path: Path) -> None:
+    """An unrecognised checkpoint's profile is a guess, so nothing about it changes.
+
+    Killed by: src/uclone_x/tools/builtin/image.py :: return profile is not None and profile.model_id != GENERIC_FALLBACK_MODEL_ID
+    Becomes: return profile is not None
+    """
+    fallback = _default_registry(tmp_path).resolve("mystery.safetensors")
+    assert fallback.model_id == GENERIC_FALLBACK_MODEL_ID
+
+    assert resolve_aspect_dimensions("1:1", fallback) == (768, 768)
+    assert resolve_aspect_dimensions("3:4", fallback) == (576, 768)
+    assert resolve_sampling(fallback) == (None, None)
+    assert resolve_sampling(None) == (None, None)
+
+
+def test_a_small_canvas_profile_keeps_the_legacy_sizes() -> None:
+    """A registered SD 1.5-class profile (512x768) is not pushed to SDXL buckets."""
+    from uclone_x.tools.builtin.media_registry import ModelProfile, PromptFamily
+
+    small = ModelProfile(
+        model_id="sd15_anime",
+        display_name="SD 1.5",
+        family=PromptFamily.DANBOORU,
+        width=512,
+        height=768,
+    )
+
+    assert resolve_aspect_dimensions("3:4", small) == (576, 768)
+
+
+def test_a_registered_profile_supplies_its_steps_and_guidance(tmp_path: Path) -> None:
+    """Killed by: src/uclone_x/tools/builtin/image.py :: return profile.steps, profile.cfg
+    Becomes: return None, None
+    """
+    profile = _default_registry(tmp_path).resolve("anillustrious_v4.safetensors")
+
+    assert resolve_sampling(profile) == (30, 5.5)
+
+
+def _generating_engine(
+    tmp_path: Path, pipeline: MagicMock
+) -> tuple[LocalDiffusersImageEngine, _FakeTorch]:
+    """An in-process engine whose pipeline is `pipeline`, generating with a fake torch."""
+    from PIL import Image
+
+    checkpoint = tmp_path / "anillustrious_v4.safetensors"
+    checkpoint.write_bytes(b"dummy")
+    engine = LocalDiffusersImageEngine(checkpoint_path=str(checkpoint))
+    pipeline.return_value = MagicMock(images=[Image.new("RGB", (8, 8))])
+    engine._pipeline = pipeline  # pyright: ignore[reportPrivateUsage]
+    return engine, _FakeTorch(cuda=False, mps=False)
+
+
+@pytest.mark.asyncio
+async def test_the_dispatcher_runs_the_illustrious_profile_at_its_own_settings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End to end through the real dispatcher and in-process engine: 30 steps, cfg 5.5, 1MP.
+
+    Before, the engine used DIFFUSERS_STEPS=20 and DIFFUSERS_GUIDANCE=7.0 and rendered 3:4
+    at 576x768 whatever the profile said.
+
+    Killed by: src/uclone_x/tools/builtin/image.py :: steps, cfg = resolve_sampling(profile)
+    Becomes: steps, cfg = None, None
+    """
+    import importlib
+
+    pipeline = _sdxl_pipeline()
+    engine, fake_torch = _generating_engine(tmp_path, pipeline)
+    monkeypatch.setattr(engine, "is_available", AsyncMock(return_value=True))
+    real_import = importlib.import_module
+
+    def import_module(name: str, package: str | None = None) -> Any:
+        return fake_torch if name == "torch" else real_import(name, package)
+
+    monkeypatch.setattr(importlib, "import_module", import_module)
+    remote, comfy, _ = _dispatcher_mocks(remote=False, comfy=False, local=True)
+    dispatcher = ImagePipelineDispatcher(
+        remote_engine=remote,
+        comfy_engine=comfy,
+        local_engine=engine,
+        registry=_default_registry(tmp_path),
+    )
+
+    result = await dispatcher.dispatch(
+        prompt="1girl, solo", negative_prompt="", aspect_ratio="3:4", seed=1, style="anime"
+    )
+
+    kwargs = pipeline.call_args.kwargs
+    assert kwargs["num_inference_steps"] == 30
+    assert kwargs["guidance_scale"] == 5.5
+    assert (kwargs["width"], kwargs["height"]) == (896, 1152)
+    assert (result.width, result.height) == (896, 1152)
+
+
+def test_the_in_process_engine_uses_the_given_steps_and_guidance(tmp_path: Path) -> None:
+    """Killed by: src/uclone_x/tools/builtin/image.py :: guidance_scale=cfg if cfg is not None else DIFFUSERS_GUIDANCE,
+    Becomes: guidance_scale=DIFFUSERS_GUIDANCE,
+    """
+    pipeline = _sdxl_pipeline()
+    engine, fake_torch = _generating_engine(tmp_path, pipeline)
+
+    with patch("importlib.import_module", return_value=fake_torch):
+        engine._run_in_process_generation(  # pyright: ignore[reportPrivateUsage]
+            prompt="1girl",
+            negative_prompt="",
+            width=896,
+            height=1152,
+            seed=1,
+            style="anime",
+            steps=30,
+            cfg=5.5,
+        )
+
+    assert pipeline.call_args.kwargs["num_inference_steps"] == 30
+    assert pipeline.call_args.kwargs["guidance_scale"] == 5.5
+
+
+def test_without_a_profile_the_in_process_engine_keeps_its_defaults(tmp_path: Path) -> None:
+    """Killed by: src/uclone_x/tools/builtin/image.py :: num_inference_steps=steps if steps is not None else DIFFUSERS_STEPS,
+    Becomes: num_inference_steps=steps,
+    """
+    pipeline = _sdxl_pipeline()
+    engine, fake_torch = _generating_engine(tmp_path, pipeline)
+
+    with patch("importlib.import_module", return_value=fake_torch):
+        engine._run_in_process_generation(  # pyright: ignore[reportPrivateUsage]
+            prompt="a cat",
+            negative_prompt="",
+            width=768,
+            height=768,
+            seed=1,
+            style="photorealistic",
+        )
+
+    assert pipeline.call_args.kwargs["num_inference_steps"] == DIFFUSERS_STEPS == 20
+    assert pipeline.call_args.kwargs["guidance_scale"] == DIFFUSERS_GUIDANCE == 7.0
+
+
+@pytest.mark.asyncio
+async def test_the_comfy_engine_puts_profile_steps_and_guidance_into_the_graph() -> None:
+    """Killed by: src/uclone_x/tools/builtin/image.py :: sampling["cfg"] = cfg
+    Becomes: pass
+    """
+    engine = ComfyUIImageEngine(base_url="http://127.0.0.1:8188", checkpoint="ckpt.safetensors")
+    client = AsyncMock()
+    client.queue_prompt.return_value = "prompt-1"
+    client.wait_for_output.return_value = ["out.png"]
+    client.download_image.return_value = b"png"
+
+    with patch("uclone_x.tools.builtin.image.ComfyClient", return_value=client):
+        await engine.generate(
+            prompt="a castle",
+            negative_prompt="",
+            width=1152,
+            height=896,
+            seed=7,
+            style="anime",
+            steps=12,
+            cfg=3.0,
+        )
+        await engine.generate(
+            prompt="a castle", negative_prompt="", width=768, height=768, seed=7, style="anime"
+        )
+
+    profiled, default = (call.args[0] for call in client.queue_prompt.await_args_list)
+    assert (profiled["3"]["inputs"]["steps"], profiled["3"]["inputs"]["cfg"]) == (12, 3.0)
+    assert (profiled["5"]["inputs"]["width"], profiled["5"]["inputs"]["height"]) == (1152, 896)
+    # No profile: the workflow's own defaults, unchanged.
+    assert (default["3"]["inputs"]["steps"], default["3"]["inputs"]["cfg"]) == (30, 5.5)
+
+
+@pytest.mark.asyncio
+async def test_the_remote_worker_is_sent_steps_and_guidance_only_when_a_profile_set_them() -> None:
+    """Killed by: src/uclone_x/tools/builtin/image.py :: payload["steps"] = steps
+    Becomes: pass
+    """
+    engine = RemoteCudaImageEngine(base_url="http://10.0.0.50:8000")
+    response = MagicMock(status_code=200, headers={"content-type": "image/png"}, content=b"png")
+
+    with patch("httpx.AsyncClient.post", return_value=response) as post:
+        await engine.generate(
+            prompt="p",
+            negative_prompt="",
+            width=896,
+            height=1152,
+            seed=1,
+            style="anime",
+            steps=30,
+            cfg=5.5,
+        )
+        await engine.generate(
+            prompt="p", negative_prompt="", width=768, height=768, seed=1, style="anime"
+        )
+
+    profiled, legacy = (call.kwargs["json"] for call in post.await_args_list)
+    assert (profiled["steps"], profiled["cfg"]) == (30, 5.5)
+    assert (profiled["width"], profiled["height"]) == (896, 1152)
+    assert "steps" not in legacy and "cfg" not in legacy
+
+
+# --- Prompts past one CLIP window are encoded in windows, not truncated -------------------
+
+
+class _FakeClipTokenizer:
+    """Whitespace tokenizer: word `wN` is token id N. CLIP's begin/end ids, a chosen pad."""
+
+    bos_token_id = 49406
+    eos_token_id = 49407
+
+    def __init__(self, pad_token_id: int) -> None:
+        self.pad_token_id = pad_token_id
+        self.calls: list[dict[str, Any]] = []
+
+    def __call__(self, text: str, **kwargs: Any) -> Any:
+        from types import SimpleNamespace
+
+        self.calls.append(kwargs)
+        return SimpleNamespace(input_ids=[int(word[1:]) for word in text.split()])
+
+
+class _FakeTensor:
+    """A (1, sequence, width) tensor recorded as one label per sequence position."""
+
+    def __init__(self, positions: list[Any], width: int) -> None:
+        self.positions = positions
+        self.width = width
+
+
+class _FakeIds:
+    def __init__(self, ids: list[int], device: Any) -> None:
+        self.ids = ids
+        self.device = device
+
+
+class _FakeClipEncoder:
+    """Returns, per window, `[0]` (pooled) and hidden states tagged by layer and token."""
+
+    def __init__(self, name: str, width: int) -> None:
+        self.name = name
+        self.width = width
+        self.devices: list[Any] = []
+
+    def __call__(self, ids: _FakeIds, output_hidden_states: bool = False) -> Any:
+        assert output_hidden_states
+        self.devices.append(ids.device)
+
+        class _Output(tuple[_FakeTensor]):  # noqa: SLOT001 - a test double for CLIP's output tuple
+            hidden_states: list[_FakeTensor]
+
+        layers = [
+            _FakeTensor([(self.name, layer, token) for token in ids.ids], self.width)
+            for layer in ("early", "penultimate", "last")
+        ]
+        output = _Output((_FakeTensor([("pooled", self.name, tuple(ids.ids))], 1280),))
+        output.hidden_states = layers
+        return output
+
+
+class _FakeTensorTorch:
+    """`tensor`, `cat`, `zeros_like` and `no_grad` over `_FakeTensor`."""
+
+    def __init__(self) -> None:
+        self.grad_disabled = False
+
+    def tensor(self, rows: list[list[int]], device: Any = None) -> _FakeIds:
+        assert len(rows) == 1
+        return _FakeIds(rows[0], device)
+
+    def cat(self, tensors: list[_FakeTensor], dim: int) -> _FakeTensor:
+        assert self.grad_disabled, "encoding must run under no_grad"
+        if dim == 1:
+            assert len({t.width for t in tensors}) == 1
+            return _FakeTensor([p for t in tensors for p in t.positions], tensors[0].width)
+        assert dim == -1
+        assert len({len(t.positions) for t in tensors}) == 1
+        joined = [tuple(position) for position in zip(*(t.positions for t in tensors), strict=True)]
+        return _FakeTensor(joined, sum(t.width for t in tensors))
+
+    def zeros_like(self, tensor: _FakeTensor) -> _FakeTensor:
+        return _FakeTensor(["zero"] * len(tensor.positions), tensor.width)
+
+    def no_grad(self) -> Any:
+        import contextlib
+
+        @contextlib.contextmanager
+        def disabled() -> Any:
+            self.grad_disabled = True
+            try:
+                yield
+            finally:
+                self.grad_disabled = False
+
+        return disabled()
+
+
+def _words(count: int, start: int = 1) -> str:
+    return " ".join(f"w{n}" for n in range(start, start + count))
+
+
+def _clip_pipeline(*, force_zeros: bool = True) -> MagicMock:
+    """A specced SDXL pipeline with fake tokenizers and encoders (768 + 1280 wide)."""
+    pipeline = _sdxl_pipeline()
+    pipeline.tokenizer = _FakeClipTokenizer(pad_token_id=49407)
+    pipeline.tokenizer_2 = _FakeClipTokenizer(pad_token_id=0)
+    pipeline.text_encoder = _FakeClipEncoder("te1", 768)
+    pipeline.text_encoder_2 = _FakeClipEncoder("te2", 1280)
+    pipeline.config = MagicMock(force_zeros_for_empty_prompt=force_zeros)
+    return pipeline
+
+
+def test_a_prompt_that_fits_one_window_keeps_the_plain_path() -> None:
+    """Exactly 75 tokens still fits, so nothing about a short prompt's encoding changes.
+
+    Killed by: src/uclone_x/tools/builtin/image.py :: if longest <= CLIP_CHUNK_TOKENS:
+    Becomes: if longest < CLIP_CHUNK_TOKENS:
+    """
+    pipeline = _clip_pipeline()
+
+    assert long_prompt_embeds(pipeline, _FakeTensorTorch(), _words(75), _words(10)) is None
+    for tokenizer in (pipeline.tokenizer, pipeline.tokenizer_2):
+        assert tokenizer.calls[0]["add_special_tokens"] is False
+        assert tokenizer.calls[0]["truncation"] is False
+
+
+def test_a_long_prompt_is_encoded_in_windows_and_keeps_every_token() -> None:
+    """100 tokens: two windows of 77, both encoders' penultimate layers joined to 2048 wide.
+
+    Killed by: src/uclone_x/tools/builtin/image.py :: hidden.append(output.hidden_states[-2])
+    Becomes: hidden.append(output.hidden_states[-1])
+    """
+    pipeline = _clip_pipeline()
+    embeds = long_prompt_embeds(pipeline, _FakeTensorTorch(), _words(100), "w900 w901")
+
+    assert embeds is not None
+    positive = embeds["prompt_embeds"]
+    assert (len(positive.positions), positive.width) == (2 * 77, 768 + 1280)
+    te1_tokens = [position[0][2] for position in positive.positions]
+    te2_tokens = [position[1][2] for position in positive.positions]
+    assert {position[0][1] for position in positive.positions} == {"penultimate"}
+    # Window 1: begin, tokens 1-75, end. Window 2: begin, tokens 76-100, end, then pad.
+    assert te1_tokens[:77] == [49406, *range(1, 76), 49407]
+    assert te1_tokens[77:104] == [49406, *range(76, 101), 49407]
+    assert te1_tokens[104:] == [49407] * 50  # tokenizer 1 pads with its end token
+    assert te2_tokens[104:] == [0] * 50  # tokenizer 2 pads with its own pad token
+    # The negative is brought to the same two windows, the second empty.
+    negative = embeds["negative_prompt_embeds"]
+    assert len(negative.positions) == 2 * 77
+    assert [p[0][2] for p in negative.positions[77:79]] == [49406, 49407]
+
+
+def test_the_pooled_embedding_is_text_encoder_2s_on_the_first_window() -> None:
+    """Killed by: src/uclone_x/tools/builtin/image.py :: pooled = first  # the last encoder's is kept: text_encoder_2's
+    Becomes: pooled = pooled or first
+    """
+    pipeline = _clip_pipeline(force_zeros=False)
+    embeds = long_prompt_embeds(pipeline, _FakeTensorTorch(), _words(80), _words(3, 500))
+
+    assert embeds is not None
+    (pooled,) = embeds["pooled_prompt_embeds"].positions
+    assert pooled[:2] == ("pooled", "te2")
+    assert pooled[2] == (49406, *range(1, 76), 49407)
+    (negative_pooled,) = embeds["negative_pooled_prompt_embeds"].positions
+    assert negative_pooled[:2] == ("pooled", "te2")
+    assert negative_pooled[2][:4] == (49406, 500, 501, 502)
+
+
+def test_a_negative_longer_than_the_prompt_sets_the_window_count() -> None:
+    """Killed by: src/uclone_x/tools/builtin/image.py :: longest = max(len(sequence) for pair in ids for sequence in pair)
+    Becomes: longest = max(len(pair[0]) for pair in ids)
+    """
+    pipeline = _clip_pipeline()
+    embeds = long_prompt_embeds(pipeline, _FakeTensorTorch(), _words(5), _words(160, 300))
+
+    assert embeds is not None
+    assert len(embeds["prompt_embeds"].positions) == 3 * 77
+    assert len(embeds["negative_prompt_embeds"].positions) == 3 * 77
+
+
+def test_an_empty_negative_is_zeros_when_the_checkpoint_asks_for_it() -> None:
+    """Diffusers zeroes an absent negative when `force_zeros_for_empty_prompt` is set.
+
+    Killed by: src/uclone_x/tools/builtin/image.py :: zero_negative = not negative_prompt and bool(
+    Becomes: zero_negative = False and bool(
+    """
+    embeds = long_prompt_embeds(_clip_pipeline(), _FakeTensorTorch(), _words(90), "")
+    assert embeds is not None
+    assert set(embeds["negative_prompt_embeds"].positions) == {"zero"}
+    assert len(embeds["negative_prompt_embeds"].positions) == 2 * 77
+    assert embeds["negative_pooled_prompt_embeds"].positions == ["zero"]
+
+    encoded = long_prompt_embeds(
+        _clip_pipeline(force_zeros=False), _FakeTensorTorch(), _words(90), ""
+    )
+    assert encoded is not None
+    assert "zero" not in encoded["negative_prompt_embeds"].positions
+
+
+def test_a_long_prompt_reaches_the_pipeline_as_embeddings(tmp_path: Path) -> None:
+    """The regression: the 76th token onward used to be cut by the pipeline's encoder.
+
+    Killed by: src/uclone_x/tools/builtin/image.py :: embeds = long_prompt_embeds(pipeline, torch, guided, negative_prompt)
+    Becomes: embeds = None
+    """
+    pipeline = _clip_pipeline()
+    engine, _ = _generating_engine(tmp_path, pipeline)
+    fake_torch = _FakeTensorTorch()
+    fake_torch.Generator = MagicMock()  # type: ignore[attr-defined]
+
+    with patch("importlib.import_module", return_value=fake_torch):
+        engine._run_in_process_generation(  # pyright: ignore[reportPrivateUsage]
+            prompt=_words(120),
+            negative_prompt="w999",
+            width=1024,
+            height=1024,
+            seed=1,
+            style="unknown-style",
+        )
+
+    kwargs = pipeline.call_args.kwargs
+    assert "prompt" not in kwargs and "negative_prompt" not in kwargs
+    tokens = [position[0][2] for position in kwargs["prompt_embeds"].positions]
+    assert 120 in tokens
+    for key in ("negative_prompt_embeds", "pooled_prompt_embeds", "negative_pooled_prompt_embeds"):
+        assert key in kwargs
+
+
+def test_a_short_prompt_reaches_the_pipeline_as_text(tmp_path: Path) -> None:
+    pipeline = _clip_pipeline()
+    engine, fake_torch = _generating_engine(tmp_path, pipeline)
+
+    with patch("importlib.import_module", return_value=fake_torch):
+        engine._run_in_process_generation(  # pyright: ignore[reportPrivateUsage]
+            prompt="w1 w2",
+            negative_prompt="",
+            width=1024,
+            height=1024,
+            seed=1,
+            style="unknown-style",
+        )
+
+    kwargs = pipeline.call_args.kwargs
+    assert kwargs["prompt"] == "w1 w2"
+    assert kwargs["negative_prompt"] is None
+    assert "prompt_embeds" not in kwargs
+
+
+# --- `count` is for seed variations of one scene, not for different scenes ----------------
+
+
+def _context_with_request(tmp_path: Path, *requests: str) -> ToolContext:
+    """A tool context whose agent's history holds `requests` as user messages, in order."""
+    from types import SimpleNamespace
+
+    from uclone_x.llm.models import ChatMessage, MessageRole
+
+    history: list[ChatMessage] = []
+    for request in requests:
+        history.append(ChatMessage(role=MessageRole.USER, content=request))
+        history.append(ChatMessage(role=MessageRole.ASSISTANT, content="ok"))
+    return ToolContext(
+        agent_id="artist",
+        session_id="sess_variety",
+        workspace_root=tmp_path,
+        agent_delegate=SimpleNamespace(history=tuple(history[:-1])),
+    )
+
+
+def _counting_dispatcher() -> AsyncMock:
+    dispatcher = AsyncMock(spec=ImagePipelineDispatcher)
+    dispatcher.dispatch.return_value = ImageGenerationResult(
+        image_bytes=b"png",
+        seed=1,
+        engine_name="diffusers-sdxl",
+        device_info="cpu",
+        duration_seconds=0.1,
+        width=1024,
+        height=1024,
+    )
+    return dispatcher
+
+
+VARIED_REQUESTS = (
+    "이 캐릭터로 5개 장면 그려줘",
+    "장면 5개 만들어줘",
+    "다섯 장면으로 그려줘",
+    "같은 캐릭터로 다양한 포즈 5장",
+    "여러 가지 의상으로 4장",
+    "각각 다른 배경으로 3장",
+    "서로 다른 표정 4장",
+    "3가지 버전으로 그려줘",
+    "draw her in 5 different scenes",
+    "various poses please, 4 images",
+    "give me 3 distinct outfits",
+)
+SAME_SCENE_REQUESTS = (
+    "같은 그림 5장 뽑아줘",
+    "시드만 바꿔서 4장",
+    "give me 5 variations of this",
+    "이 그림 4장 더",
+    "same image, 3 more seeds",
+    "draw her 4 times",
+    # A variety word is present, but the request is still one scene re-seeded.
+    "포즈 그대로 시드만 바꿔서 4장",
+    "same scene with different seeds",
+    "각각 다른 시드로 같은 그림 3장",
+    # Review of the first guard: bare nouns and "each" refused these seed requests.
+    "같은 포즈로 5장 더 뽑아줘",
+    "give me 4 versions, each looking at viewer",
+    "여러 장 뽑아줘",
+    "이 의상 그대로 4장",
+)
+
+
+@pytest.mark.parametrize("request_text", VARIED_REQUESTS)
+@pytest.mark.asyncio
+async def test_count_is_refused_when_the_user_asked_for_different_images(
+    tmp_path: Path, request_text: str
+) -> None:
+    """The misuse: "5 different scenes" became one prompt rendered five times.
+
+    Killed by: src/uclone_x/tools/builtin/image.py :: if request is not None and asks_for_varied_images(request):
+    Becomes: if False:
+    """
+    dispatcher = _counting_dispatcher()
+    tool = GenerateImageTool(dispatcher=dispatcher)
+
+    with pytest.raises(PlainRefusalError) as caught:
+        await tool.run(
+            GenerateImageParams(prompt="1girl, solo", count=5),
+            _context_with_request(tmp_path, request_text),
+        )
+
+    assert str(caught.value) == COUNT_FOR_VARIETY_REFUSAL
+    dispatcher.dispatch.assert_not_awaited()
+
+
+@pytest.mark.parametrize("request_text", SAME_SCENE_REQUESTS)
+@pytest.mark.asyncio
+async def test_count_is_allowed_for_variations_of_one_scene(
+    tmp_path: Path, request_text: str
+) -> None:
+    """Killed by: src/uclone_x/tools/builtin/image_set_intent.py :: if _SAME_PICTURE.search(message) is not None:
+    Becomes: if False:
+    """
+    dispatcher = _counting_dispatcher()
+    tool = GenerateImageTool(dispatcher=dispatcher)
+
+    result = await tool.run(
+        GenerateImageParams(prompt="1girl, solo", count=3),
+        _context_with_request(tmp_path, request_text),
+    )
+
+    assert result["count"] == 3
+    assert dispatcher.dispatch.await_count == 3
+
+
+@pytest.mark.asyncio
+async def test_only_the_latest_user_request_decides(tmp_path: Path) -> None:
+    """Killed by: src/uclone_x/tools/builtin/image.py :: for message in reversed(messages):
+    Becomes: for message in messages:
+    """
+    tool = GenerateImageTool(dispatcher=_counting_dispatcher())
+    params = GenerateImageParams(prompt="1girl, solo", count=2)
+
+    allowed = await tool.run(
+        params, _context_with_request(tmp_path, "5개 장면 그려줘", "같은 그림 2장 더")
+    )
+    assert allowed["count"] == 2
+
+    with pytest.raises(PlainRefusalError):
+        await tool.run(
+            params, _context_with_request(tmp_path, "같은 그림 2장", "이번엔 서로 다른 포즈로")
+        )
+
+
+@pytest.mark.asyncio
+async def test_the_variety_guard_leaves_prompts_single_images_and_direct_calls_alone(
+    tmp_path: Path,
+) -> None:
+    dispatcher = _counting_dispatcher()
+    tool = GenerateImageTool(dispatcher=dispatcher)
+    varied = _context_with_request(tmp_path, "5개 장면 그려줘")
+
+    await tool.run(GenerateImageParams(prompts=["scene one", "scene two"]), varied)
+    await tool.run(GenerateImageParams(prompt="scene one"), varied)
+    no_agent = ToolContext(agent_id="artist", session_id="s", workspace_root=tmp_path)
+    await tool.run(GenerateImageParams(prompt="scene one", count=2), no_agent)
+
+    assert dispatcher.dispatch.await_count == 5
+
+
+def test_the_variety_refusal_is_plain_and_points_at_prompts() -> None:
+    assert "'prompts'" in COUNT_FOR_VARIETY_REFUSAL
+    assert "generate_image(prompts=" in COUNT_FOR_VARIETY_REFUSAL
+    for internal in ("Error", "Traceback", "regex", "agent_delegate", "history", "_"):
+        assert internal not in COUNT_FOR_VARIETY_REFUSAL.replace("generate_image", "")
+
+
+def test_the_count_description_says_it_repeats_one_prompt() -> None:
+    description = GenerateImageParams.model_fields["count"].description or ""
+    assert "SAME" in description
+    assert "'prompts'" in description
+    for kind in ("scenes", "poses", "outfits"):
+        assert kind in description
+
+
+# --- Family x domain routing: image domain skills resolved per prompt family ---------------
+
+
+def test_a_danbooru_prompt_gets_no_style_suffix_and_a_prose_one_does() -> None:
+    """A tag list already carries the domain skill's style tags (design §3.6).
+
+    Killed by: src/uclone_x/tools/builtin/image.py :: if family is PromptFamily.DANBOORU:
+    Becomes: if False:
+    """
+    from uclone_x.tools.builtin.media_registry import PromptFamily
+
+    tags = "modern architecture, glass facade, blue sky"
+
+    assert style_guided_prompt(tags, "photorealistic", PromptFamily.DANBOORU) == tags
+    assert style_guided_prompt(tags, "photorealistic", PromptFamily.NATURAL_PROSE) != tags
+    assert style_guided_prompt(tags, "photorealistic") != tags
+
+
+_PHOTO_SUFFIX = STYLE_SUFFIXES["photorealistic"]
+
+
+@pytest.mark.asyncio
+async def test_the_comfy_engine_submits_a_danbooru_prompt_without_the_style_suffix() -> None:
+    """Killed by: src/uclone_x/tools/builtin/image.py :: prompt=style_guided_prompt(prompt, style, family),
+    Becomes: prompt=style_guided_prompt(prompt, style),
+    """
+    from uclone_x.tools.builtin.media_registry import PromptFamily
+
+    engine = ComfyUIImageEngine(base_url="http://127.0.0.1:8188", checkpoint="ckpt.safetensors")
+    client = AsyncMock()
+    client.queue_prompt.return_value = "prompt-1"
+    client.wait_for_output.return_value = ["out.png"]
+    client.download_image.return_value = b"png"
+
+    with patch("uclone_x.tools.builtin.image.ComfyClient", return_value=client):
+        for family in (PromptFamily.DANBOORU, PromptFamily.NATURAL_PROSE, None):
+            await engine.generate(
+                prompt="1girl, solo",
+                negative_prompt="",
+                width=1024,
+                height=1024,
+                seed=7,
+                style="photorealistic",
+                family=family,
+            )
+
+    danbooru, prose, generic = (
+        call.args[0]["6"]["inputs"]["text"] for call in client.queue_prompt.await_args_list
+    )
+    assert danbooru == "1girl, solo"
+    assert prose == generic == f"1girl, solo, {_PHOTO_SUFFIX}"
+
+
+@pytest.mark.asyncio
+async def test_the_in_process_engine_submits_a_danbooru_prompt_without_the_style_suffix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Killed by: src/uclone_x/tools/builtin/image.py :: guided = style_guided_prompt(prompt, style, family)
+    Becomes: guided = style_guided_prompt(prompt, style)
+    """
+    import importlib
+
+    from uclone_x.tools.builtin.media_registry import PromptFamily
+
+    pipeline = _sdxl_pipeline()
+    engine, fake_torch = _generating_engine(tmp_path, pipeline)
+    real_import = importlib.import_module
+
+    def import_module(name: str, package: str | None = None) -> Any:
+        return fake_torch if name == "torch" else real_import(name, package)
+
+    monkeypatch.setattr(importlib, "import_module", import_module)
+
+    submitted: list[str] = []
+    for family in (PromptFamily.DANBOORU, PromptFamily.NATURAL_PROSE, None):
+        await engine.generate(
+            prompt="1girl, solo",
+            negative_prompt="",
+            width=1024,
+            height=1024,
+            seed=7,
+            style="photorealistic",
+            family=family,
+        )
+        submitted.append(pipeline.call_args.kwargs["prompt"])
+
+    assert submitted == [
+        "1girl, solo",
+        f"1girl, solo, {_PHOTO_SUFFIX}",
+        f"1girl, solo, {_PHOTO_SUFFIX}",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_the_dispatcher_tells_the_engine_the_active_prompt_family(tmp_path: Path) -> None:
+    """Killed by: src/uclone_x/tools/builtin/image.py :: family=profile.family,
+    Becomes: family=None,
+    """
+    from uclone_x.tools.builtin.media_registry import PromptFamily
+
+    mock_remote, mock_comfy, mock_local = _dispatcher_mocks(remote=False, comfy=False, local=True)
+    dispatcher = ImagePipelineDispatcher(
+        remote_engine=mock_remote,
+        comfy_engine=mock_comfy,
+        local_engine=mock_local,
+        registry=_default_registry(tmp_path),
+    )
+
+    await dispatcher.dispatch(
+        prompt="a house", negative_prompt="", aspect_ratio="1:1", seed=1, style="anime"
+    )
+
+    assert mock_local.generate.call_args.kwargs["family"] is PromptFamily.DANBOORU
+
+
+class _SwitchableDispatcher(ImagePipelineDispatcher):
+    """A dispatcher whose active profile a test sets directly."""
+
+    def __init__(self, profile: Any) -> None:
+        super().__init__()
+        self.profile = profile
+
+    def get_active_profile(self) -> Any:
+        return self.profile
+
+
+class _ListedSkills:
+    """The one `SkillRegistryProtocol` method the description reads."""
+
+    def __init__(self, skills: list[Any]) -> None:
+        self._skills = skills
+
+    def list_skills(self) -> list[Any]:
+        return self._skills
+
+
+def _listed_skill(name: str, *, family_sections: bool, status: Any = None) -> Any:
+    from uclone_x.skills.models import SkillManifest, SkillOrigin, SkillStatus
+
+    manifest = SkillManifest(
+        name=name,
+        description=name,
+        origin=SkillOrigin.HUMAN,
+        status=status or SkillStatus.ACTIVE,
+        family_sections=family_sections,
+    )
+    return MagicMock(manifest=manifest)
+
+
+def _profile(model_id: str, family: Any) -> Any:
+    from uclone_x.tools.builtin.media_registry import ModelProfile
+
+    return ModelProfile(model_id=model_id, display_name=model_id, family=family)
+
+
+def test_the_description_follows_the_active_model_on_every_read() -> None:
+    """The model a turn will use, and its grammar, are read when the tool list is built.
+
+    Killed by: src/uclone_x/tools/builtin/image.py :: parts.append(grammar)
+    Becomes: pass
+    """
+    from uclone_x.tools.builtin.image import FAMILY_GRAMMAR
+    from uclone_x.tools.builtin.media_registry import PromptFamily
+
+    dispatcher = _SwitchableDispatcher(_profile("anime_model", PromptFamily.DANBOORU))
+    tool = GenerateImageTool(dispatcher=dispatcher)
+
+    first = tool.description
+    dispatcher.profile = _profile("flux_model", PromptFamily.NATURAL_PROSE)
+    second = tool.description
+
+    assert "Active model: 'anime_model' (danbooru prompt family)." in first
+    assert "Active model: 'flux_model' (prose prompt family)." in second
+    assert FAMILY_GRAMMAR[PromptFamily.DANBOORU] in first
+    assert FAMILY_GRAMMAR[PromptFamily.NATURAL_PROSE] in second
+    assert FAMILY_GRAMMAR[PromptFamily.NATURAL_PROSE] not in first
+    assert first != second
+    for text in (first, second):
+        assert "media-prompt" not in text
+        assert "automatically merged" not in text
+        assert "load_skill" not in text  # no domain skills bound
+
+
+def test_the_description_lists_only_active_family_sections_skills() -> None:
+    """Killed by: src/uclone_x/tools/builtin/image.py :: if skill.manifest.family_sections and skill.manifest.status == SkillStatus.ACTIVE
+    Becomes: if skill.manifest.status == SkillStatus.ACTIVE
+    """
+    from uclone_x.skills.models import SkillStatus
+    from uclone_x.tools.builtin.media_registry import PromptFamily
+
+    tool = GenerateImageTool(dispatcher=_SwitchableDispatcher(_profile("m", PromptFamily.DANBOORU)))
+    tool.bind_skill_registry(
+        cast(
+            Any,
+            _ListedSkills(
+                [
+                    _listed_skill("media-portrait", family_sections=True),
+                    _listed_skill("media-architecture", family_sections=True),
+                    _listed_skill("code_review", family_sections=False),
+                    _listed_skill(
+                        "media-draft", family_sections=True, status=SkillStatus.QUARANTINED
+                    ),
+                ]
+            ),
+        )
+    )
+
+    text = tool.description
+
+    assert "load_skill('media-architecture'), load_skill('media-portrait')." in text
+    assert "code_review" not in text
+    assert "media-draft" not in text
+
+
+def test_a_failing_profile_lookup_leaves_the_base_description_and_a_log(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Killed by: src/uclone_x/tools/builtin/image.py :: return self.BASE_DESCRIPTION
+    Becomes: raise
+    """
+
+    class _Broken(ImagePipelineDispatcher):
+        def get_active_profile(self) -> Any:
+            raise OSError("checkpoint directory unreadable")
+
+    tool = GenerateImageTool(dispatcher=_Broken())
+
+    with caplog.at_level("ERROR"):
+        text = tool.description
+
+    assert text == GenerateImageTool.BASE_DESCRIPTION
+    assert "Could not resolve the active image model" in caplog.text
+
+
+_ANATOMY_TERMS = ("anatomy", "hands", "fingers", "limbs", "animal", "deformed", "extra")
+
+
+def test_the_heuristic_negative_is_domain_neutral() -> None:
+    """A building, a chart or a product has no hands to get wrong (design §3.7).
+
+    Killed by: src/uclone_x/tools/builtin/media_registry.py :: DOMAIN_NEUTRAL_NEGATIVE = "
+    Becomes: DOMAIN_NEUTRAL_NEGATIVE = "bad anatomy, extra fingers, " + "
+    """
+    from uclone_x.tools.builtin.media_registry import ModelRegistry
+
+    registry = ModelRegistry(user_config_path=Path("/nonexistent/no-user-models.yaml"))
+    for checkpoint in ("my_pony_mix.safetensors", "mystery.safetensors"):
+        negative = registry.resolve(checkpoint).default_negative.lower()
+        assert negative, checkpoint
+        for term in _ANATOMY_TERMS:
+            assert term not in negative, (checkpoint, term)
+
+
+def test_an_architecture_prompt_gets_no_anatomy_negative_from_any_shipped_profile(
+    tmp_path: Path,
+) -> None:
+    """The negative an architecture render actually receives, per shipped model."""
+    from uclone_x.tools.builtin.media_registry import optimize_prompts
+
+    registry = _default_registry(tmp_path)
+    for checkpoint in (
+        "anillustrious_v4.safetensors",
+        "Illustrious-XL-v0.1.safetensors",
+        "flux-2-klein-base-4b.safetensors",
+        "mystery.safetensors",
+    ):
+        _, negative = optimize_prompts(
+            "modern architecture, glass facade, no humans", "", registry.resolve(checkpoint)
+        )
+        for term in _ANATOMY_TERMS:
+            assert term not in negative.lower(), (checkpoint, term)

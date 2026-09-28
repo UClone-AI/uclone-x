@@ -31,6 +31,7 @@ import json
 import logging
 import os
 import re
+import tempfile
 from collections.abc import Sequence
 from pathlib import Path, PurePath
 from typing import Final, cast
@@ -39,6 +40,7 @@ from pydantic import BaseModel
 
 from uclone_x.core.immutable import unwrap_immutable
 from uclone_x.core.secrets import redact_credentials
+from uclone_x.errors import PathTraversalError
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +57,7 @@ __all__ = [
     "StoredResultNotFoundError",
     "artifacts_dir_for",
     "canonical_tool_text",
+    "contained_artifacts_dir",
     "excerpt_tool_result",
     "handle_in",
     "ingest_tool_text",
@@ -63,6 +66,7 @@ __all__ = [
     "result_handle",
     "store_tool_result",
     "step_result_caps",
+    "stored_result_stub",
     "stub_tool_result",
 ]
 
@@ -152,6 +156,21 @@ def artifacts_dir_for(workspace_root: Path) -> Path:
     return workspace_root / ARTIFACT_SUBDIR
 
 
+def contained_artifacts_dir(workspace_root: Path) -> Path:
+    """The artifact directory of `workspace_root`, resolved and held inside it (P3).
+
+    `store_tool_result` and `load_tool_result` keep a blob inside the artifact directory;
+    this keeps that directory inside the workspace, so a `.sandbox` symlinked out of it
+    cannot move the whole store (#1653).
+
+    Raises:
+        PathTraversalError: the artifact directory resolves outside `workspace_root`.
+    """
+    from uclone_x.sandbox.path_validator import PathValidator
+
+    return PathValidator().resolve_safe_path(artifacts_dir_for(workspace_root), workspace_root)
+
+
 class StoredResultNotFoundError(LookupError):
     """A handle that does not name a stored result in this session. The message is plain."""
 
@@ -222,8 +241,8 @@ def _session_dir(artifacts_dir: Path, session_id: str) -> Path:
 
     A session id with no separator, no `..` and no NUL is one path component, and a
     handle matches `tr_[0-9a-f]{16}`, so `<artifacts_dir>/<session_id>/<handle>.txt`
-    cannot name anything outside `artifacts_dir`. Checked on the characters rather than
-    by resolving, which keeps the one resolving guard in `resolve_session_path`.
+    cannot name anything outside `artifacts_dir` by its characters. A planted symlink can
+    still point the directory elsewhere; `store_tool_result` resolves before it writes.
     """
     if (
         not session_id
@@ -249,29 +268,62 @@ def store_tool_result(artifacts_dir: Path, session_id: str, body: str) -> str:
     Credentials are redacted before the body is hashed or written, so neither the file
     nor the handle derives from a secret (#569). The write is atomic -- a temporary file
     and `os.replace` -- and skipped when the blob exists, since the name is its content.
+
+    Raises:
+        PathTraversalError: the session directory or the blob resolves outside
+            `artifacts_dir`, as through a planted symlink (P3). Nothing is written.
     """
+    # The session id and handle are single path components, but a symlink can still move
+    # the directory or the blob out of the store. The one workspace containment guard
+    # resolves the path and refuses it then.
+    from uclone_x.sandbox.path_validator import PathValidator
+
     redacted = redact_credentials(body)
     handle = result_handle(redacted)
-    path = _blob_path(artifacts_dir, session_id, handle)
+    path = PathValidator().resolve_safe_path(
+        _blob_path(artifacts_dir, session_id, handle), artifacts_dir
+    )
     if path.is_file():
         return handle
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    tmp.write_text(redacted, encoding="utf-8")
-    os.replace(tmp, path)
+    # `mkstemp` names the temporary file at random and opens it with `O_CREAT|O_EXCL`
+    # (and `O_NOFOLLOW` where the platform has it), so a symlink planted at a name the
+    # writer would use is refused rather than written through (#1653). A PID-derived name
+    # was predictable, and `write_text` followed a link at it.
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as tmp:
+            tmp.write(redacted)
+        os.replace(tmp_name, path)
+    except BaseException:
+        Path(tmp_name).unlink(missing_ok=True)
+        raise
     return handle
 
 
 def load_tool_result(artifacts_dir: Path, session_id: str, handle: str) -> str:
-    """The full stored body `handle` names in this session, or a plain refusal."""
-    path = _blob_path(artifacts_dir, session_id, handle)
+    """The full stored body `handle` names in this session, or a plain refusal.
+
+    The blob is resolved before it is read, as `store_tool_result` resolves it before it
+    writes: a session directory or blob that is a symlink out of `artifacts_dir` is
+    treated as absent, and the escape is logged (#1653, P3).
+    """
+    from uclone_x.sandbox.path_validator import PathValidator
+
+    not_found = StoredResultNotFoundError(
+        f"No stored tool result named '{handle}' exists in this conversation. It may "
+        "have been cleared with the conversation, or the name was mistyped."
+    )
+    blob = _blob_path(artifacts_dir, session_id, handle)
+    try:
+        path = PathValidator().resolve_safe_path(blob, artifacts_dir)
+    except PathTraversalError as exc:
+        logger.warning("Refused to read a stored tool result outside the store: %s", exc)
+        raise not_found from None
     try:
         return path.read_text(encoding="utf-8")
     except FileNotFoundError:
-        raise StoredResultNotFoundError(
-            f"No stored tool result named '{handle}' exists in this conversation. It may "
-            "have been cleared with the conversation, or the name was mistyped."
-        ) from None
+        raise not_found from None
 
 
 def _head_within(text: str, max_bytes: int) -> str:
@@ -340,12 +392,15 @@ def ingest_tool_text(
     session_id: str,
     readable: bool = True,
     cap_bytes: int = TOOL_RESULT_CAP_BYTES,
+    workspace_root: Path | None = None,
 ) -> str:
     """`text` as the history should hold it: unchanged under the cap, else an excerpt.
 
     With no `artifacts_dir`, or when the write fails, the full text has nowhere to go:
     the excerpt says so in band and the failure is logged, rather than the turn failing
-    over a result the tool did produce.
+    over a result the tool did produce. With `workspace_root`, the artifact directory
+    must also resolve inside it, the check the compactor makes (#1653); one that does
+    not is a failed write like any other.
     """
     if _fits(text, cap_bytes):
         return text
@@ -353,8 +408,12 @@ def ingest_tool_text(
     body = redact_credentials(text)
     if artifacts_dir is not None:
         try:
+            if workspace_root is not None:
+                from uclone_x.sandbox.path_validator import PathValidator
+
+                artifacts_dir = PathValidator().resolve_safe_path(artifacts_dir, workspace_root)
             handle = store_tool_result(artifacts_dir, session_id, text)
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError, PathTraversalError) as exc:
             logger.warning(
                 "Could not store an over-cap tool result for session %r; the history "
                 "keeps an excerpt only: %s",
@@ -409,19 +468,38 @@ def read_tool_result_page(
     return f"{header}\n{page}"
 
 
+def stored_result_stub(handle: str, body: str, *, keep_chars: int, readable: bool = True) -> str:
+    """The compacted form of the stored `body` named `handle`: a header and its start.
+
+    It keeps the first `keep_chars` characters, so the model still sees what the result
+    was about. With `readable=False` -- this agent cannot call the reader -- the header
+    says the rest was kept but cannot be read, rather than naming a tool that is not
+    offered, as `excerpt_tool_result` does (P6).
+    """
+    if readable:
+        where = f'Read it with {TOOL_RESULT_READ_TOOL}(handle="{handle}", offset=0).]'
+    else:
+        where = "It was kept, but this agent has no tool to read it.]"
+    header = (
+        f"{STORED_RESULT_PREFIX}{handle}: {len(body):,} characters, not shown here since "
+        f"the conversation was compacted. {where}"
+    )
+    return f"{header}\n{body[: max(keep_chars, 0)]}"
+
+
 def stub_tool_result(
     content: str,
     artifacts_dir: Path,
     session_id: str,
     *,
     keep_chars: int,
+    readable: bool = True,
 ) -> str | None:
     """The smaller form compaction gives an excerpt or a page, or `None` to leave it be.
 
     `None` unless `content` names a handle whose blob exists in this session: the stub
-    drops text, and text may be dropped only when it can still be read back. The stub
-    keeps the first `keep_chars` characters of the stored body -- what an offloaded
-    result keeps -- so the model still sees what the result was about.
+    drops text, and text may be dropped only when it can still be read back. The form is
+    `stored_result_stub`'s.
     """
     handle = handle_in(content)
     if handle is None:
@@ -430,12 +508,7 @@ def stub_tool_result(
         body = load_tool_result(artifacts_dir, session_id, handle)
     except (StoredResultNotFoundError, ValueError):
         return None
-    header = (
-        f"{STORED_RESULT_PREFIX}{handle}: {len(body):,} characters, not shown here since "
-        f"the conversation was compacted. Read it with {TOOL_RESULT_READ_TOOL}"
-        f'(handle="{handle}", offset=0).]'
-    )
-    return f"{header}\n{body[: max(keep_chars, 0)]}"
+    return stored_result_stub(handle, body, keep_chars=keep_chars, readable=readable)
 
 
 def step_result_caps(

@@ -1,0 +1,27 @@
+{
+  "mutation": {
+    "label": "File Mutation",
+    "on": "File Mutation: {target}",
+    "bare": "File Mutation ({tool})"
+  },
+  "command": {
+    "label": "Command",
+    "on": "Command: {target}",
+    "bare": "Command Execution ({tool})"
+  },
+  "web": {
+    "label": "Web Retrieval",
+    "on": "Web Retrieval: {target}",
+    "bare": "Web Retrieval ({tool})"
+  },
+  "inspection": {
+    "label": "Inspection",
+    "on": "Inspection: {target}",
+    "bare": "Inspection ({tool})"
+  },
+  "tool": {
+    "label": "Tool Call",
+    "on": "Tool Call: {tool}",
+    "unknown": "Unknown Tool"
+  }
+}

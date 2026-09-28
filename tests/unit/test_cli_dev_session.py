@@ -265,3 +265,34 @@ def test_cli_dev_session_show_renders_nested_tool_arguments(
         assert res.exit_code == 0
         # The call is rendered, not merely survived: the preview is what the crash ate.
         assert "read_file" in res.output
+
+
+def test_cli_dev_session_show_marks_a_stored_tool_result(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A `tr_` excerpt or stub is marked as stored, as the legacy offload form was (#1653).
+
+    Killed by: src/uclone_x/cli/commands/session_dev.py :: if handle_in(msg.content) is not None:
+    Becomes: if False:
+    """
+    with TemporaryDirectory() as tmp:
+        monkeypatch.setenv("UCLONE_SESSION_DIR", tmp)
+        store = SessionStore()
+        state = SessionState.seed("sess_stored", "champion")
+        state = state.with_messages(
+            (
+                ChatMessage(
+                    role=MessageRole.ASSISTANT,
+                    content="",
+                    tool_calls=(ToolCallRequest(id="c1", name="dump", arguments={}),),
+                ),
+                ChatMessage(
+                    role=MessageRole.TOOL,
+                    content="[Stored tool result tr_0123456789abcdef: 9,000 characters]\nx",
+                    tool_call_id="c1",
+                ),
+            ),
+            turn_counter=1,
+        )
+        store.save(state)
+        res = runner.invoke(main.app, ["dev", "session", "show", "sess_stored"])
+        assert res.exit_code == 0
+        assert "(stored)" in res.output

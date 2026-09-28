@@ -7,15 +7,24 @@ import logging
 import os
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, Protocol, cast, runtime_checkable
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+if TYPE_CHECKING:
+    from uclone_x.skills.protocols import SkillRegistryProtocol
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_CONFIG_PATH = Path(__file__).parent.parent.parent / "config" / "default_models.yaml"
 USER_CONFIG_PATH = Path.home() / ".uclone" / "media" / "models.yaml"
+
+#: The negative a profile applies to every prompt of every domain (design §3.7). Only
+#: domain-neutral quality terms belong here: anatomy terms (`bad anatomy`, `bad hands`)
+#: are character rules and live in the `media-character` skill, because merged into an
+#: architecture or engineering prompt they fight the domain skill behind its back.
+DOMAIN_NEUTRAL_NEGATIVE = "worst quality, low quality, blurry, watermark, text"
 
 
 class PromptFamily(StrEnum):
@@ -36,7 +45,21 @@ class ModelProfile(BaseModel):
     display_name: str = Field(description="Human-readable model name")
     filename: str = Field(default="", description="Target safetensors filename")
     family: PromptFamily = Field(description="Prompt grammar family guiding agent generation")
-    skill_name: str = Field(description="Associated P9 skill directory name under skills/")
+    skill_name: str | None = Field(
+        default=None,
+        description=(
+            "Override: a P9 runtime skill (ucx-agent-skills/<name>) that replaces family x "
+            "domain routing for this model. When set, `load_skill` of any family-sections "
+            "domain skill returns this skill whole. Last resort: a model that differs in one "
+            "domain gets a `## model: <model_id>` section there, and one that differs by a "
+            "few lines gets `prompt_notes` (design §3.4)."
+        ),
+    )
+    prompt_notes: str = Field(
+        default="",
+        description="A few lines appended to whatever `load_skill` returns for an image "
+        "domain skill, e.g. a Pony checkpoint's score_9 quality tags (design §3.4).",
+    )
     engine_type: Literal["comfyui", "diffusers", "mlx", "auto"] = Field(default="auto")
     width: int = Field(default=1024, ge=64, le=4096)
     height: int = Field(default=1024, ge=64, le=4096)
@@ -56,6 +79,23 @@ class ModelProfile(BaseModel):
         if isinstance(v, str):
             return PromptFamily(v)
         return v
+
+
+@runtime_checkable
+class ImageModelSource(Protocol):
+    """What an agent needs from the image tool to route prompt skills (design §3.1-3.2).
+
+    Declared here, in the kernel, so the agent can reach the registered `generate_image`
+    tool without importing the adapter that implements it.
+    """
+
+    def active_profile(self) -> ModelProfile:
+        """The profile of the checkpoint a generation would use now."""
+        ...
+
+    def bind_skill_registry(self, registry: SkillRegistryProtocol) -> None:
+        """Give the tool the skill store its description lists image domains from."""
+        ...
 
 
 def optimize_prompts(
@@ -106,7 +146,6 @@ class ModelRegistry:
             display_name="Universal Image Generation Model",
             filename="",
             family=PromptFamily.GENERIC,
-            skill_name="media-prompt-generic",
             engine_type="auto",
             width=1024,
             height=1024,
@@ -114,7 +153,7 @@ class ModelRegistry:
             cfg=7.0,
             sampler="euler",
             scheduler="normal",
-            default_negative="worst quality, blurry, deformed, bad anatomy, bad hands, text",
+            default_negative=DOMAIN_NEUTRAL_NEGATIVE,
         )
         self._load_registry()
 
@@ -222,14 +261,13 @@ class ModelRegistry:
                 display_name=f"Auto-detected Anime ({filename})",
                 filename=filename,
                 family=PromptFamily.DANBOORU,
-                skill_name="media-prompt-danbooru",
                 width=832,
                 height=1216,
                 steps=30,
                 cfg=5.5,
                 sampler="dpmpp_2m",
                 scheduler="karras",
-                default_negative="worst quality, bad anatomy, deformed, bad hands, animal, blurry, text",
+                default_negative=DOMAIN_NEUTRAL_NEGATIVE,
             )
         if any(k in name_lower for k in ("flux", "klein", "sd3")):
             return ModelProfile(
@@ -237,7 +275,6 @@ class ModelRegistry:
                 display_name=f"Auto-detected FLUX ({filename})",
                 filename=filename,
                 family=PromptFamily.NATURAL_PROSE,
-                skill_name="media-prompt-flux",
                 width=1024,
                 height=1024,
                 steps=4 if "schnell" in name_lower or "klein" in name_lower else 20,

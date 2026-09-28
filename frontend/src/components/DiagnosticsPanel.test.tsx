@@ -1,8 +1,12 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { DiagnosticsPanel } from './DiagnosticsPanel';
 import { expectPlain } from '../test/plainCopy';
-import { SETTINGS_FAILURE } from '../lib/settingsCopy';
+import { en } from '../i18n/en';
+import { LocaleProvider, useLocale } from '../i18n';
+
+const SETTINGS_FAILURE = en.settings.failure;
+const PANEL = en.diagnostics.panel;
 
 /**
  * The panel's job is to ask a question and then not act on its own.
@@ -290,7 +294,7 @@ describe('DiagnosticsPanel', () => {
     it.each([
       ...faults,
     ])('says problem reporting could not be loaded after %s', async (_label, fault) => {
-      // Killed by: frontend/src/components/DiagnosticsPanel.tsx :: setFetchError(SETTINGS_FAILURE.diagnosticsRead);
+      // Killed by: frontend/src/components/DiagnosticsPanel.tsx :: setFetchError(failureRef.current.diagnosticsRead);
       // Becomes: setFetchError(String(err));
       stubFailing('GET', fault);
       render(<DiagnosticsPanel />);
@@ -303,8 +307,8 @@ describe('DiagnosticsPanel', () => {
     it.each([
       ...faults,
     ])('says saving the choice went wrong after %s', async (_label, fault) => {
-      // Killed by: frontend/src/components/DiagnosticsPanel.tsx :: setFetchError(SETTINGS_FAILURE.diagnosticsChoice);
-      // Becomes: setFetchError(String(err));
+      // Killed by: frontend/src/components/DiagnosticsPanel.tsx :: setFetchError(refusedHere ? copy.unconfirmed : failure.diagnosticsChoice);
+      // Becomes: setFetchError(refusedHere ? copy.unconfirmed : String(err));
       stubFailing('POST', fault);
       render(<DiagnosticsPanel />);
       fireEvent.click(await screen.findByRole('button', { name: /record failures locally/i }));
@@ -317,7 +321,7 @@ describe('DiagnosticsPanel', () => {
     it.each([
       ...faults,
     ])('says deleting the recorded failures went wrong after %s', async (_label, fault) => {
-      // Killed by: frontend/src/components/DiagnosticsPanel.tsx :: setFetchError(SETTINGS_FAILURE.diagnosticsClear);
+      // Killed by: frontend/src/components/DiagnosticsPanel.tsx :: setFetchError(failure.diagnosticsClear);
       // Becomes: setFetchError(String(err));
       stubFailing('DELETE', fault, 'granted');
       render(<DiagnosticsPanel />);
@@ -334,8 +338,8 @@ describe('DiagnosticsPanel', () => {
       ({ ok: false, status: 500, json: async () => ({ detail }) }) as unknown as Response;
 
     it("keeps the Core's reason off the screen when saving the choice fails", async () => {
-      // Killed by: frontend/src/components/DiagnosticsPanel.tsx :: setFetchError(SETTINGS_FAILURE.diagnosticsChoice);
-      // Becomes: setFetchError(`${SETTINGS_FAILURE.diagnosticsChoice} ${(err as { coreDetail?: string }).coreDetail ?? ''}`);
+      // Killed by: frontend/src/components/DiagnosticsPanel.tsx :: setFetchError(refusedHere ? copy.unconfirmed : failure.diagnosticsChoice);
+      // Becomes: setFetchError(refusedHere ? copy.unconfirmed : `${failure.diagnosticsChoice} ${(err as { coreDetail?: string }).coreDetail ?? ''}`);
       stubFailing(
         'POST',
         coreRefusal(
@@ -351,8 +355,8 @@ describe('DiagnosticsPanel', () => {
     });
 
     it("keeps the Core's reason off the screen when deleting the recorded failures fails", async () => {
-      // Killed by: frontend/src/components/DiagnosticsPanel.tsx :: setFetchError(SETTINGS_FAILURE.diagnosticsClear);
-      // Becomes: setFetchError(`${SETTINGS_FAILURE.diagnosticsClear} ${(err as { coreDetail?: string }).coreDetail ?? ''}`);
+      // Killed by: frontend/src/components/DiagnosticsPanel.tsx :: setFetchError(failure.diagnosticsClear);
+      // Becomes: setFetchError(`${failure.diagnosticsClear} ${(err as { coreDetail?: string }).coreDetail ?? ''}`);
       stubFailing(
         'DELETE',
         coreRefusal(
@@ -367,6 +371,112 @@ describe('DiagnosticsPanel', () => {
       const failure = await screen.findByTestId('diagnostics-failure');
       expect(failure).toHaveTextContent(SETTINGS_FAILURE.diagnosticsClear);
       expectPlain(failure.textContent);
+    });
+  });
+
+  describe('when the language changes', () => {
+    const Switch = () => {
+      const { setChoice } = useLocale();
+      return <button onClick={() => void setChoice('ko')}>ko</button>;
+    };
+
+    // Killed by: frontend/src/components/DiagnosticsPanel.tsx :: }, []);
+    // Becomes: }, [failure]);
+    it('does not read again, so a read failure stays on screen', async () => {
+      const reads: string[] = [];
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async (url: string, init?: RequestInit) => {
+          if (url.includes('/api/settings')) {
+            return { ok: true, status: 200, json: async () => ({ ui_language: 'en' }) } as Response;
+          }
+          if ((init?.method ?? 'GET') === 'GET') reads.push(url);
+          return { ok: false, status: 500, json: async () => ({ detail: 'boom' }) } as Response;
+        }),
+      );
+      render(
+        <LocaleProvider hints={['en-US']}>
+          <Switch />
+          <DiagnosticsPanel />
+        </LocaleProvider>,
+      );
+      await screen.findByTestId('diagnostics-failure');
+      const readsBefore = reads.length;
+
+      await act(async () => screen.getByText('ko').click());
+
+      expect(document.documentElement.lang).toBe('ko');
+      expect(reads.length).toBe(readsBefore);
+      expect(screen.getByTestId('diagnostics-failure')).toBeTruthy();
+    });
+  });
+
+  describe('a choice from a window the Core did not open (#1589)', () => {
+    /** Answers `POST /consent` with `consentStatus` and `POST /api/person/window` with `windowStatus`. */
+    const gated = (consentStatus: number, windowStatus = 200) => {
+      const calls: Array<{ url: string; method: string }> = [];
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async (url: string, init?: RequestInit) => {
+          const method = init?.method ?? 'GET';
+          calls.push({ url, method });
+          if (method === 'POST' && url.includes('/consent')) {
+            const detail = 'Only you can make this decision.';
+            return { ok: false, status: consentStatus, json: async () => ({ detail }) } as Response;
+          }
+          if (url === '/api/person/window') {
+            const ok = windowStatus === 200;
+            const body = ok ? { opened: true } : { detail: 'A confirmed window was opened a moment ago.' };
+            return { ok, status: windowStatus, json: async () => body } as Response;
+          }
+          const payload = url.includes('/consent')
+            ? consent('unasked')
+            : { ...reportBody, state: 'unasked', count: 0, distinct: 0 };
+          return { ok: true, status: 200, json: async () => payload } as Response;
+        }),
+      );
+      return calls;
+    };
+
+    it('says it could not show the choice is yours, and opens a confirmed window when asked', async () => {
+      // Killed by: frontend/src/components/DiagnosticsPanel.tsx :: const refusedHere = err instanceof CoreFailure && err.status === 403;
+      // Becomes: const refusedHere = false;
+      const calls = gated(403);
+      render(<DiagnosticsPanel />);
+
+      fireEvent.click(await screen.findByRole('button', { name: /record failures locally/i }));
+
+      const alert = await screen.findByTestId('diagnostics-failure');
+      expect(alert).toHaveTextContent(PANEL.unconfirmed);
+      expectPlain(alert.textContent);
+      fireEvent.click(screen.getByTestId('diagnostics-open-confirmed-window'));
+      expect(await screen.findByText(PANEL.windowOpened)).toBeTruthy();
+      expect(calls.filter((c) => c.url === '/api/person/window' && c.method === 'POST')).toHaveLength(1);
+    });
+
+    it('says a window opened a moment ago when the Core will not open another yet', async () => {
+      // Killed by: frontend/src/components/DiagnosticsPanel.tsx :: const tooSoon = err instanceof CoreFailure && err.status === 429;
+      // Becomes: const tooSoon = false;
+      gated(403, 429);
+      render(<DiagnosticsPanel />);
+
+      fireEvent.click(await screen.findByRole('button', { name: /record failures locally/i }));
+      fireEvent.click(await screen.findByTestId('diagnostics-open-confirmed-window'));
+
+      expect(await screen.findByText(PANEL.windowTooSoon)).toBeTruthy();
+      expectPlain(PANEL.windowTooSoon);
+    });
+
+    it('offers no confirmed window for a failure that is not about the window', async () => {
+      // Killed by: frontend/src/components/DiagnosticsPanel.tsx :: const refusedHere = err instanceof CoreFailure && err.status === 403;
+      // Becomes: const refusedHere = err instanceof CoreFailure;
+      gated(500);
+      render(<DiagnosticsPanel />);
+
+      fireEvent.click(await screen.findByRole('button', { name: /record failures locally/i }));
+
+      expect(await screen.findByText(SETTINGS_FAILURE.diagnosticsChoice)).toBeTruthy();
+      expect(screen.queryByTestId('diagnostics-open-confirmed-window')).toBeNull();
     });
   });
 });

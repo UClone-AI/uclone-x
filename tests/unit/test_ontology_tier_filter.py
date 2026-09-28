@@ -317,3 +317,37 @@ def test_session_knowledge_extractor_tier_filtering() -> None:
     prompt_all = extractor.inject_rules_to_prompt(base_prompt, tier_filter="all")
     assert "AssertedRule" in prompt_all
     assert "CandidateRule" in prompt_all
+
+
+def test_get_active_invariants_does_not_depend_on_teaching_order() -> None:
+    """The invariants section is the same however the axioms were taught (design §5.3).
+
+    The engine keeps axioms in a dict, so the order they were taught or loaded leaked into
+    the system message. They come back sorted by name, the axioms' unique key.
+
+    Killed by: src/uclone_x/ontology/engine.py :: for axiom in sorted(self._axioms.values(), key=lambda a: a.name):
+    Becomes: for axiom in self._axioms.values():
+    """
+    specs = [
+        ("RequireTls", "NetworkService", "tls_enabled == true"),
+        ("PositiveBalance", "Account", "balance >= 0"),
+        ("MaxRetries", "Job", "retries <= 3"),
+    ]
+
+    def active(order: list[tuple[str, str, str]]) -> list[str]:
+        engine = OntologyEngine(agent_id="test_agent")
+        for name, subject, rule in order:
+            engine.teach_axiom(
+                name=name,
+                subject_entity=subject,
+                predicate="holds",
+                rule_expression=rule,
+                domain="ops",
+                tier=OntologyTier.ASSERTED,
+            )
+        return [axiom.name for axiom in engine.get_active_invariants()]
+
+    forward = active(specs)
+    backward = active(list(reversed(specs)))
+
+    assert forward == backward == ["MaxRetries", "PositiveBalance", "RequireTls"]

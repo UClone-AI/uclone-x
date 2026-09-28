@@ -50,13 +50,6 @@ const baseProps: RailProps = {
   // This test is about words and glyphs, so Escape goes unclaimed: a head that keeps no
   // registry passes a hook that does nothing, and the kit still renders.
   useEscape: () => {},
-  // `AgentState` values, because that is what `/api/agents` sends: `list_agents` puts
-  // `ag.state.value` in this field. A fixture inventing `idle`/`busy` exercises a shape the
-  // endpoint never produces, and the row's own mapping then goes untested.
-  agents: [
-    { id: 'ag_1', label: 'ag one', role: 'r1', status: 'IDLE' },
-    { id: 'ag_2', label: 'ag two', role: 'r2', status: 'CALLING_TOOL' },
-  ],
   personas: [
     {
       name: 'pers_a',
@@ -125,7 +118,7 @@ describe('the kit rail holds no words of its own (#1158)', () => {
   // Killed by: frontend/src/ui-kit/rail/Rail.tsx :: {copy.conversations.emptyCause(modelConfigured, clones.length)}
   // Becomes: {'No agents configured.'}
   it('states an empty Clones section with the cause function it is passed', () => {
-    render(<Rail {...baseProps} agents={[]} personas={[]} rooms={[]} />);
+    render(<Rail {...baseProps} personas={[]} rooms={[]} />);
 
     expect(screen.getByTestId('agents-empty-cause')).toHaveTextContent(
       '«conversations.emptyCause(true,0)»',
@@ -181,12 +174,6 @@ describe('the kit rail holds no words of its own (#1158)', () => {
     const avatar = screen.getByTestId('clone-avatar-pers_a');
     expect(avatar).toHaveClass('w-10');
     expect(avatar).toHaveClass('h-10');
-
-    const livenessDot = screen.getByTestId('clone-liveness-pers_a');
-    expect(livenessDot.parentElement).toHaveClass('flex');
-    expect(livenessDot.parentElement).toHaveClass('items-center');
-    expect(livenessDot.parentElement).toHaveClass('justify-center');
-    expect(livenessDot.parentElement).toHaveClass('rounded-full');
 
     const label = item.querySelector('.text-sm.font-medium.text-slate-200');
     expect(label).toBeInTheDocument();

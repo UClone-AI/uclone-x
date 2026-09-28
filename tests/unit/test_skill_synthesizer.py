@@ -197,17 +197,34 @@ def test_extract_workflow_from_trace_invalid_raises(tmp_path: Path) -> None:
         synth.extract_workflow_from_trace(bad_file)
 
 
-def test_extract_workflow_from_session(tmp_path: Path) -> None:
-    """extract_workflow_from_session handles both synthetic fallback and on-disk session files."""
+def test_a_session_with_no_trace_is_refused_rather_than_given_invented_steps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No trace for the session means no steps, said in plain words (#1723, P6).
+
+    It used to return three generic steps naming the session, so `ucx skill synthesize
+    --session` built a skill out of nothing and reported it as distilled.
+
+    Killed by: src/uclone_x/skills/synthesizer.py :: raise SkillAuditError(_NO_SESSION_STEPS.format(session_id=session_id))
+    Becomes: return []
+    """
+    monkeypatch.chdir(tmp_path)  # no session folders here, so no candidate trace exists
     synth = SkillSynthesizer()
 
-    # 1. Fallback deterministic session steps
-    steps = synth.extract_workflow_from_session("sess_alpha_99")
-    assert len(steps) == 3
-    assert "sess_alpha_99" in steps[0]
-    assert "sess_alpha_99" in steps[1]
+    with pytest.raises(SkillAuditError) as caught:
+        synth.extract_workflow_from_session("sess_alpha_99")
 
-    # 2. Existing session file on disk
+    message = str(caught.value)
+    assert "sess_alpha_99" in message
+    assert "nothing to turn into a skill" in message
+    for internal in ("/", "trace", "json", "Error", "Exception"):
+        assert internal not in message, f"the refusal shows `{internal}`"
+
+
+def test_extract_workflow_from_session(tmp_path: Path) -> None:
+    """extract_workflow_from_session reads an on-disk session file."""
+    synth = SkillSynthesizer()
+
     sess_file = tmp_path / "custom_sess.json"
     sess_file.write_text(json.dumps(["Step A", "Step B"]), encoding="utf-8")
     steps_disk = synth.extract_workflow_from_session("custom_sess", session_file=sess_file)
@@ -226,6 +243,48 @@ def test_generate_skill_code() -> None:
     assert "execute_workflow" in func_names
     assert "main" in func_names
     assert "data_cleaner" in code
+
+
+#: Steps a trace can really hold: both quote kinds, backslashes, a docstring delimiter.
+_AWKWARD_STEPS = [
+    'Reply "done" to the user',
+    r"Open C:\Users\me\notes.txt",
+    "Say \"\"\"hi\"\"\" and '''bye'''",
+]
+
+
+def _run_generated(code: str) -> dict[str, Any]:
+    namespace: dict[str, Any] = {}
+    exec(compile(code, "main.py", "exec"), namespace)  # noqa: S102 - the stub this test generated
+    result: dict[str, Any] = namespace["execute_workflow"]()
+    return result
+
+
+def test_a_step_with_a_double_quote_survives_into_the_generated_code() -> None:
+    """A step holding a double quote is written as a valid literal, read back unchanged (#1723).
+
+    The steps list was written as `"{step}"`, so one double quote in a step ended the
+    literal early and the generated `main.py` failed to parse.
+
+    Killed by: src/uclone_x/skills/synthesizer.py :: f"            {step!r}" for step in workflow_steps)
+    Becomes: f'            "{step}"' for step in workflow_steps)
+    """
+    code = SkillSynthesizer().generate_skill_code("replier", _AWKWARD_STEPS[:1])
+
+    assert _run_generated(code)["steps_executed"] == _AWKWARD_STEPS[:1]
+
+
+def test_any_step_text_survives_into_the_generated_code() -> None:
+    """Backslashes and triple quotes, in the steps list and in the docstring (#1723).
+
+    Killed by: src/uclone_x/skills/synthesizer.py :: f"        {i + 1}. {_docstring_text(step)}" for i, step in enumerate(workflow_steps)
+    Becomes: f"        {i + 1}. {step}" for i, step in enumerate(workflow_steps)
+    """
+    code = SkillSynthesizer().generate_skill_code("awkward", _AWKWARD_STEPS)
+
+    result = _run_generated(code)
+    assert result["steps_executed"] == _AWKWARD_STEPS
+    assert result["skill"] == "awkward"
 
 
 def test_generate_manifest_yaml() -> None:

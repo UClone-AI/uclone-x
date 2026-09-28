@@ -12,9 +12,14 @@ import errno
 import hashlib
 import logging
 import os
+import re
 import stat
+import subprocess
+import sys
+from collections.abc import Iterable
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Final, cast
 
 import yaml
 
@@ -24,6 +29,7 @@ from uclone_x.sandbox.models import (
     IsolationLevel,
     is_weaker_isolation,
 )
+from uclone_x.skills.approvals import SkillApprovalLedger, SkillPin
 from uclone_x.skills.models import (
     AuditVerdict,
     AutoApprovalPolicy,
@@ -32,18 +38,27 @@ from uclone_x.skills.models import (
     SkillOrigin,
     SkillStatus,
 )
-from uclone_x.skills.protocols import SkillAuditorProtocol, SkillProtocol
+from uclone_x.skills.protocols import SkillAuditorProtocol, SkillProtocol, SkillStoreProtocol
+from uclone_x.skills.refusals import SkillRefusalCode, refusal_reason
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "RUNTIME_SKILL_STORE_DIRNAME",
+    "FileSystemSkillStore",
+    "InMemorySkillStore",
     "Skill",
     "SkillAuditor",
+    "SkillRefusal",
     "SkillRegistry",
     "compute_skill_sha256",
+    "copy_skill_package",
+    "load_approved_skills",
+    "load_runtime_skill_registry",
     "load_skill_from_dir",
     "manifest_from_dict",
     "parse_skill_markdown",
+    "runtime_skill_store_dir",
     "save_skill",
     "serialize_skill_markdown",
 ]
@@ -245,6 +260,13 @@ def manifest_from_dict(data: dict[str, Any]) -> SkillManifest:
         for item in cast(tuple[object, ...], tags_val):
             tags_list.append(str(item))
 
+    family_sections_val: object = data.get("family_sections", False)
+    if not isinstance(family_sections_val, bool):
+        raise ValueError(
+            "SKILL.md frontmatter 'family_sections' must be true or false, "
+            f"not {family_sections_val!r}"
+        )
+
     return SkillManifest(
         name=name,
         description=str(data.get("description", "")),
@@ -256,6 +278,7 @@ def manifest_from_dict(data: dict[str, Any]) -> SkillManifest:
         scripts=tuple(scripts_list),
         tags=tuple(tags_list),
         entrypoint=str(data["entrypoint"]) if data.get("entrypoint") else None,
+        family_sections=family_sections_val,
         content_sha256=str(data["content_sha256"]) if data.get("content_sha256") else None,
         approved_by=str(data["approved_by"]) if data.get("approved_by") else None,
         approved_at=str(data["approved_at"]) if data.get("approved_at") else None,
@@ -265,19 +288,56 @@ def manifest_from_dict(data: dict[str, Any]) -> SkillManifest:
     )
 
 
+#: A line of a `SKILL.md` frontmatter that holds the package's own digest. The digest rule
+#: leaves exactly this out -- the key at the start of the line, one space, and 64 lowercase
+#: hex digits, bare or in single quotes -- so a file can carry its own digest (#1751). Any
+#: other spelling of the key is hashed like every other line: were it left out too, a
+#: value such as a YAML anchor could change what the rest of the frontmatter says without
+#: changing the digest.
+_OWN_DIGEST_LINE: Final[re.Pattern[bytes]] = re.compile(
+    rb"content_sha256: (?:[0-9a-f]{64}|'[0-9a-f]{64}')\r?\n?"
+)
+
+
+def _skill_md_digest_bytes(data: bytes) -> bytes:
+    """The bytes of a `SKILL.md` that its digest covers: all of them but its own digest line.
+
+    The frontmatter is what `parse_skill_markdown` reads as one: from the leading `---` to
+    the next `---`. Only a line inside it can be left out, so the same line in the body is
+    hashed.
+    """
+    if not data.startswith(b"---"):
+        return data
+    end = data.find(b"---", 3)
+    if end == -1:
+        return data
+    kept = (
+        line
+        for line in data[:end].splitlines(keepends=True)
+        if _OWN_DIGEST_LINE.fullmatch(line) is None
+    )
+    return b"".join(kept) + data[end:]
+
+
 def compute_skill_sha256(skill_dir: Path) -> str:
     """Compute a deterministic SHA-256 digest of a skill package.
 
-    The walk hashes each regular file it lists whose name does not start with a dot, by
-    its path inside the package and its bytes, in sorted path order. A link to a file is
-    hashed through. A link to a folder is not descended into, so files under it are not in
-    the digest, and neither are FIFOs, sockets, devices or broken links. A folder the walk
-    cannot list, a file it cannot read, or a link that loops under a name that does not
-    start with a dot raises `SkillAuditError` naming it instead of being skipped.
+    **The digest rule** (#1720, #1751), the one statement of it: the walk hashes each regular
+    file it lists whose name does not start with a dot, by its path inside the package and
+    its bytes, in sorted path order, except that the package's own `SKILL.md` is hashed
+    without the frontmatter line `content_sha256: <64 hex digits>`. So writing the digest
+    into the file does not change the digest, and a stored digest can match its own file.
+
+    A link to a file is hashed through. A link to a folder is not descended into, so files
+    under it are not in the digest, and neither are FIFOs, sockets, devices or broken links.
+    A folder the walk cannot list, a file it cannot read, or a link that loops under a name
+    that does not start with a dot raises `SkillAuditError` naming it instead of being
+    skipped.
     """
     hasher = hashlib.sha256()
     if skill_dir.is_file():
-        hasher.update(skill_dir.read_bytes())
+        data = skill_dir.read_bytes()
+        hasher.update(_skill_md_digest_bytes(data) if skill_dir.name == "SKILL.md" else data)
         return hasher.hexdigest()
 
     if not skill_dir.exists() or not skill_dir.is_dir():
@@ -288,7 +348,8 @@ def compute_skill_sha256(skill_dir: Path) -> str:
             if _is_file(path) and not path.name.startswith("."):
                 rel_path = path.relative_to(skill_dir).as_posix()
                 hasher.update(rel_path.encode("utf-8"))
-                hasher.update(path.read_bytes())
+                data = path.read_bytes()
+                hasher.update(_skill_md_digest_bytes(data) if rel_path == "SKILL.md" else data)
             elif not path.name.startswith(".") and path.is_symlink():
                 _refuse_a_loop(path)
     except OSError as exc:
@@ -297,6 +358,38 @@ def compute_skill_sha256(skill_dir: Path) -> str:
             f"'{_inside(skill_dir, exc.filename)}' could not be read ({exc.strerror})."
         ) from exc
     return hasher.hexdigest()
+
+
+def copy_skill_package(skill_dir: Path, into: Path) -> None:
+    """Copy into `into` exactly the files the digest rule hashes, each read once (#1777).
+
+    The copy is what `ucx skill approve` audits, asks about and pins, so the digest it pins
+    is of the bytes it checked even if the package changes while the person is being asked.
+    It walks the package as `compute_skill_sha256` does, so the copy's digest is the
+    package's digest at the moment each file was read: a link to a file is copied as the
+    file, and a link to a folder, a dot-named file and anything that is not a regular file
+    are left out. Raises `SkillAuditError` as `compute_skill_sha256` does.
+    """
+    if not skill_dir.is_dir():
+        raise SkillAuditError(f"Cannot copy an invalid skill directory: {skill_dir}")
+    # Read everything first, then write: an error while reading is the package's, and one
+    # while writing is the copy's, which is not reported as the package being unreadable.
+    files: list[tuple[Path, bytes]] = []
+    try:
+        for path in sorted(_package_entries(skill_dir)):
+            if _is_file(path) and not path.name.startswith("."):
+                files.append((path.relative_to(skill_dir), path.read_bytes()))
+            elif not path.name.startswith(".") and path.is_symlink():
+                _refuse_a_loop(path)
+    except OSError as exc:
+        raise SkillAuditError(
+            f"The skill package could not be read in full, so it cannot be audited: "
+            f"'{_inside(skill_dir, exc.filename)}' could not be read ({exc.strerror})."
+        ) from exc
+    for relative, data in files:
+        target = into / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
 
 
 #: The errors after which `Path.is_file()` on Python 3.11 to 3.13 answers False rather than
@@ -382,6 +475,8 @@ def serialize_skill_markdown(manifest: SkillManifest, instructions: str) -> str:
         data["scripts"] = list(manifest.scripts)
     if manifest.tags:
         data["tags"] = list(manifest.tags)
+    if manifest.family_sections:
+        data["family_sections"] = True
     if manifest.content_sha256:
         data["content_sha256"] = manifest.content_sha256
     if manifest.approved_by:
@@ -662,16 +757,88 @@ class SkillAuditor:
         )
 
 
+def _summary_entry(
+    manifest: SkillManifest, report: SkillAuditReport | None, refusal: SkillRefusal | None
+) -> dict[str, Any]:
+    """One skill as `SkillRegistry.get_summary` lists it; a refused one as `quarantined`."""
+    if report is not None:
+        audit_report_dict: dict[str, Any] = {
+            "skill_name": report.skill_name,
+            "is_safe": report.is_safe,
+            "recommendation": (
+                report.recommendation.value
+                if hasattr(report.recommendation, "value")
+                else str(report.recommendation)
+            ),
+            "risk_score": report.risk_score if report.risk_score is not None else 0.0,
+            "detected_risks": list(report.detected_risks),
+            "auditor_version": report.auditor_version or "0.1.0",
+            "content_sha256": report.content_sha256 or "",
+        }
+    else:
+        audit_report_dict = {
+            "skill_name": manifest.name,
+            "is_safe": manifest.status == SkillStatus.ACTIVE,
+            "recommendation": (
+                AuditVerdict.APPROVE.value
+                if manifest.status == SkillStatus.ACTIVE
+                else AuditVerdict.REQUIRE_HUMAN_REVIEW.value
+            ),
+            "risk_score": 0.0 if manifest.status == SkillStatus.ACTIVE else 0.5,
+            "detected_risks": [],
+            "auditor_version": "0.1.0",
+            "content_sha256": manifest.content_sha256 or "",
+        }
+    status = SkillStatus.QUARANTINED if refusal is not None else manifest.status
+    return {
+        "name": manifest.name,
+        "description": manifest.description,
+        "version": manifest.version,
+        "author": manifest.author or "unknown",
+        "origin": (
+            manifest.origin.value if hasattr(manifest.origin, "value") else str(manifest.origin)
+        ),
+        "status": status.value,
+        "isolation_level": (
+            manifest.requested_isolation.value
+            if manifest.requested_isolation is not None
+            else "workspace"
+        ),
+        "content_sha256": manifest.content_sha256 or "",
+        "scripts": list(manifest.scripts),
+        "tags": list(manifest.tags),
+        "approved_by": manifest.approved_by,
+        "approved_at": manifest.approved_at,
+        "rejected_by": manifest.rejected_by,
+        "rejected_at": manifest.rejected_at,
+        "rejection_reason": manifest.rejection_reason,
+        "not_loaded_reason": refusal.reason if refusal is not None else None,
+        "not_loaded_code": refusal.code if refusal is not None else None,
+        "not_loaded_params": {"name": manifest.name} if refusal is not None else None,
+        "audit_report": audit_report_dict,
+    }
+
+
 class SkillRegistry:
     """Registry for hot-reloading skill discovery and runtime management.
 
     Implements SkillRegistryProtocol with quarantine enforcement.
     """
 
-    def __init__(self, skills_dir: Path | None = None) -> None:
-        self._skills_dir = skills_dir
+    def __init__(
+        self,
+        skills_dir: Path | None = None,
+        *,
+        store: SkillStoreProtocol | None = None,
+    ) -> None:
+        if skills_dir is not None and store is not None:
+            raise ValueError("Give a SkillRegistry a skills_dir or a store, not both")
+        self._store: SkillStoreProtocol | None = (
+            FileSystemSkillStore(skills_dir) if skills_dir is not None else store
+        )
         self._skills: dict[str, SkillProtocol] = {}
         self._audit_reports: dict[str, SkillAuditReport] = {}
+        self._refused: dict[str, SkillRefusal] = {}
 
     def register(self, skill: SkillProtocol, report: SkillAuditReport) -> None:
         """Register a skill, admitting it only on a passing audit of *this* code."""
@@ -714,72 +881,36 @@ class SkillRegistry:
         """List all active skills."""
         return list(self._skills.values())
 
+    @property
+    def store_missing(self) -> bool:
+        """Whether this registry reads a skill folder that does not exist (#1721).
+
+        A process started outside a project with a store (an installed release, or another
+        folder) resolves a store that is not there, loads nothing, and would otherwise say
+        nothing. A registry with no store at all (a test, or an injected one) is not missing
+        one. Read at the time of asking, so a folder created later is seen.
+        """
+        return isinstance(self._store, FileSystemSkillStore) and not self._store.root.is_dir()
+
     def get_summary(self) -> dict[str, Any]:
-        """Return JSON-serializable list of registered skills and security audit summary."""
+        """Return JSON-serializable list of registered skills and security audit summary.
+
+        `store_missing` says the skill folder this registry reads does not exist, so the
+        Settings Skills panel can say why nothing is listed (#1721).
+
+        A skill the last reload refused (#1720) is listed too, as `quarantined`, with the
+        reason in plain words in `not_loaded_reason`, so the Settings Skills panel shows it
+        rather than letting it disappear.
+        """
         skills_list: list[dict[str, Any]] = []
         for skill in self._skills.values():
             manifest = skill.manifest
-            report = self._audit_reports.get(manifest.name)
-            if report is not None:
-                audit_report_dict: dict[str, Any] = {
-                    "skill_name": report.skill_name,
-                    "is_safe": report.is_safe,
-                    "recommendation": (
-                        report.recommendation.value
-                        if hasattr(report.recommendation, "value")
-                        else str(report.recommendation)
-                    ),
-                    "risk_score": report.risk_score if report.risk_score is not None else 0.0,
-                    "detected_risks": list(report.detected_risks),
-                    "auditor_version": report.auditor_version or "0.1.0",
-                    "content_sha256": report.content_sha256 or "",
-                }
-            else:
-                audit_report_dict = {
-                    "skill_name": manifest.name,
-                    "is_safe": manifest.status == SkillStatus.ACTIVE,
-                    "recommendation": (
-                        AuditVerdict.APPROVE.value
-                        if manifest.status == SkillStatus.ACTIVE
-                        else AuditVerdict.REQUIRE_HUMAN_REVIEW.value
-                    ),
-                    "risk_score": 0.0 if manifest.status == SkillStatus.ACTIVE else 0.5,
-                    "detected_risks": [],
-                    "auditor_version": "0.1.0",
-                    "content_sha256": manifest.content_sha256 or "",
-                }
-
-            skill_dict: dict[str, Any] = {
-                "name": manifest.name,
-                "description": manifest.description,
-                "version": manifest.version,
-                "author": manifest.author or "unknown",
-                "origin": (
-                    manifest.origin.value
-                    if hasattr(manifest.origin, "value")
-                    else str(manifest.origin)
-                ),
-                "status": (
-                    manifest.status.value
-                    if hasattr(manifest.status, "value")
-                    else str(manifest.status)
-                ),
-                "isolation_level": (
-                    manifest.requested_isolation.value
-                    if manifest.requested_isolation is not None
-                    else "workspace"
-                ),
-                "content_sha256": manifest.content_sha256 or "",
-                "scripts": list(manifest.scripts),
-                "tags": list(manifest.tags),
-                "approved_by": manifest.approved_by,
-                "approved_at": manifest.approved_at,
-                "rejected_by": manifest.rejected_by,
-                "rejected_at": manifest.rejected_at,
-                "rejection_reason": manifest.rejection_reason,
-                "audit_report": audit_report_dict,
-            }
-            skills_list.append(skill_dict)
+            skills_list.append(
+                _summary_entry(manifest, self._audit_reports.get(manifest.name), None)
+            )
+        for name, refusal in self._refused.items():
+            if name not in self._skills:
+                skills_list.append(_summary_entry(refusal.manifest, refusal.report, refusal))
 
         active_count = sum(1 for s in skills_list if s["status"] == SkillStatus.ACTIVE.value)
         pending_count = sum(1 for s in skills_list if s["status"] == SkillStatus.PENDING.value)
@@ -790,6 +921,7 @@ class SkillRegistry:
         return {
             "skills": skills_list,
             "total": len(skills_list),
+            "store_missing": self.store_missing,
             "summary": {
                 "total_skills": len(skills_list),
                 "active_count": active_count,
@@ -831,13 +963,114 @@ class SkillRegistry:
         skills_dir: Path | None = None,
         auditor: SkillAuditorProtocol | None = None,
     ) -> tuple[SkillProtocol, ...]:
-        """Scan skills_dir on disk, audit all packages, and hot-reload approved ones into the registry."""
-        target_dir = skills_dir or self._skills_dir
-        if target_dir is None or not target_dir.exists() or not target_dir.is_dir():
+        """Load the approved skills of `skills_dir`, or else of this registry's store, into it."""
+        store = FileSystemSkillStore(skills_dir) if skills_dir is not None else self._store
+        if store is None:
+            return ()
+        reloaded: list[SkillProtocol] = []
+        for skill, report in await store.load_approved(auditor):
+            try:
+                self.register(skill, report)
+            except SkillNotApprovedError as exc:
+                logger.warning("The skill '%s' was not loaded: %s", skill.manifest.name, exc)
+                continue
+            reloaded.append(skill)
+        if isinstance(store, FileSystemSkillStore):
+            # A skill refused now is taken out even if an earlier reload admitted it: an
+            # edit after approval must stop it at the next reload, not at the next restart.
+            self._refused = {refusal.manifest.name: refusal for refusal in store.refused}
+            for name in self._refused:
+                self._skills.pop(name, None)
+                self._audit_reports.pop(name, None)
+        return tuple(reloaded)
+
+
+@dataclass(frozen=True)
+class SkillRefusal:
+    """A skill the store did not load, why (`code`), and its audit when it got that far.
+
+    `report` is None when the package could not be read or its audit could not finish; the
+    panel then lists it from `manifest`, which for an unreadable package holds only its folder
+    name. `reason` is the English sentence (`uclone_x.skills.refusals`); the panel words `code`
+    in the person's language.
+    """
+
+    manifest: SkillManifest
+    report: SkillAuditReport | None
+    code: SkillRefusalCode
+
+    @property
+    def reason(self) -> str:
+        """The English sentence for `code`, for the log, the CLI and an older head."""
+        return refusal_reason(self.code, self.manifest.name)
+
+
+def _unreadable_manifest(folder: Path) -> SkillManifest:
+    """A stand-in for a package whose `SKILL.md` could not be read: its folder name only."""
+    return SkillManifest(
+        name=folder.name,
+        description="",
+        origin=SkillOrigin.SYNTHESIZED,
+        status=SkillStatus.QUARANTINED,
+    )
+
+
+class FileSystemSkillStore:
+    """The skills in a directory of `<name>/SKILL.md` packages, each audited as it loads.
+
+    This is the store every head uses (`SkillRegistry(skills_dir=...)`). A directory that
+    does not exist holds no skills; one that cannot be listed raises `OSError`, which
+    `load_approved_skills` logs.
+
+    An active package loads only when its audit approves it **and** its current digest is
+    the one pinned for its name (#1720): in the person's approvals ledger, or, for a skill
+    that ships with the code, in `SHIPPED_SKILL_PINS`. The digest written in the package is
+    not consulted; the package cannot vouch for itself. What was refused, and why, is kept in
+    `refused` for the Settings Skills panel.
+    """
+
+    def __init__(self, root: Path, approvals: SkillApprovalLedger | None = None) -> None:
+        self._root = root
+        self._approvals = approvals if approvals is not None else SkillApprovalLedger()
+        self._refused: tuple[SkillRefusal, ...] = ()
+
+    @property
+    def root(self) -> Path:
+        """The directory the packages live in."""
+        return self._root
+
+    @property
+    def refused(self) -> tuple[SkillRefusal, ...]:
+        """The packages the last `load_approved` did not load: an active one it refused, or
+        one it could not read at all."""
+        return self._refused
+
+    def _read_pins(self) -> dict[str, SkillPin]:
+        """The person's pins; an unreadable ledger is logged and approves nothing (P6)."""
+        try:
+            return self._approvals.read()
+        except SkillAuditError as exc:
+            logger.warning(
+                "The skill approvals ledger at %s could not be read, so only shipped skills "
+                "can load: %s",
+                self._approvals.path,
+                exc.__cause__ or exc,
+            )
+            return {}
+
+    async def load_approved(
+        self, auditor: SkillAuditorProtocol | None = None
+    ) -> tuple[tuple[SkillProtocol, SkillAuditReport], ...]:
+        """Audit every package marked active and return the approved ones with their reports."""
+        target_dir = self._root
+        if not target_dir.exists() or not target_dir.is_dir():
+            self._refused = ()
             return ()
 
         active_auditor = auditor or SkillAuditor(policy=AutoApprovalPolicy.SAFE_ONLY)
-        reloaded: list[SkillProtocol] = []
+        pins = await asyncio.to_thread(self._read_pins)
+        approved: list[tuple[SkillProtocol, SkillAuditReport]] = []
+        refused: list[SkillRefusal] = []
         for child in sorted(target_dir.iterdir()):
             if child.is_dir() and (child / "SKILL.md").is_file():
                 # Why a package failed to load or to be audited, or why an active one was
@@ -845,11 +1078,34 @@ class SkillRegistry:
                 # that stops loading is otherwise invisible and the tools that read its data
                 # quietly lose it (P6). A package that is not active is skipped unlogged.
                 dropped: str | None = None
+                skill: Skill | None = None
                 try:
                     skill = load_skill_from_dir(child)
                     if skill.manifest.status == SkillStatus.ACTIVE:
                         report = await active_auditor.audit_skill(child)
-                        if report.is_safe and report.recommendation is AuditVerdict.APPROVE:
+                        name = skill.manifest.name
+                        digests = self._approvals.approved_digests(name, pins)
+                        code: SkillRefusalCode
+                        if not (report.is_safe and report.recommendation is AuditVerdict.APPROVE):
+                            dropped = (
+                                "it is marked active, but its audit did not approve it "
+                                f"(safe: {report.is_safe}, recommendation: "
+                                f"{report.recommendation.value}, "
+                                f"{len(report.detected_risks)} risk(s) found)"
+                            )
+                            code = "failed_safety_check"
+                        elif report.content_sha256 not in digests:
+                            pinned = ", ".join(sorted(digests)) or "none"
+                            dropped = f"its content ({report.content_sha256}) is not the approved version ({pinned})"
+                            if digests:
+                                code = "changed_after_approval"
+                            elif skill.manifest.approved_by:
+                                # Approved with `ucx skill approve` before approvals were pinned
+                                # (#1776), so the approval lives only in the file (#1777).
+                                code = "approved_before_pins"
+                            else:
+                                code = "never_approved"
+                        else:
                             bound_manifest = skill.manifest.model_copy(
                                 update={"content_sha256": report.content_sha256}
                             )
@@ -858,17 +1114,112 @@ class SkillRegistry:
                                 instructions_markdown=skill.instructions_markdown,
                                 directory=child,
                             )
-                            self.register(bound_skill, report)
-                            reloaded.append(bound_skill)
-                        else:
-                            dropped = (
-                                "it is marked active, but its audit did not approve it "
-                                f"(safe: {report.is_safe}, recommendation: "
-                                f"{report.recommendation.value}, "
-                                f"{len(report.detected_risks)} risk(s) found)"
-                            )
+                            approved.append((bound_skill, report))
+                            continue
+                        refused.append(SkillRefusal(skill.manifest, report, code))
                 except Exception as exc:
+                    # Logged in full; the panel is told only which of the two it was (#1777).
                     dropped = str(exc)
+                    if skill is None:
+                        unreadable = _unreadable_manifest(child)
+                        refused.append(SkillRefusal(unreadable, None, "unreadable"))
+                    elif skill.manifest.status == SkillStatus.ACTIVE:
+                        refused.append(SkillRefusal(skill.manifest, None, "check_not_finished"))
                 if dropped is not None:
                     logger.warning("The skill '%s' was not loaded: %s", child.name, dropped)
-        return tuple(reloaded)
+        self._refused = tuple(refused)
+        return tuple(approved)
+
+
+class InMemorySkillStore:
+    """Skills held in memory with the reports that approved them; no directory is read.
+
+    For a host that keeps skills somewhere other than local folders (a database, a
+    service), and for tests. There are no files to audit, so `auditor` is ignored and
+    the given reports stand; the registry's `register` still refuses a report that does
+    not approve, or does not bind, the skill it is paired with.
+    """
+
+    def __init__(self, entries: Iterable[tuple[SkillProtocol, SkillAuditReport]] = ()) -> None:
+        self._entries = tuple(entries)
+
+    async def load_approved(
+        self, auditor: SkillAuditorProtocol | None = None
+    ) -> tuple[tuple[SkillProtocol, SkillAuditReport], ...]:
+        """Every held skill marked active, with its report."""
+        del auditor
+        return tuple(
+            (skill, report)
+            for skill, report in self._entries
+            if skill.manifest.status is SkillStatus.ACTIVE
+        )
+
+
+#: The runtime skill store's directory, under the repository root (PRD FR-5.1).
+#: `ucx-agent-skills`, not `skills`: the store belongs to the Runtime Layer (`ucx agent`),
+#: and under the shorter name it twice collected Builder workflow prose instead -- which
+#: surfaced as an unaudited `pending` package. Builder skills live in `swarm/skills/`.
+#: See `ucx-agent-skills/README.md`.
+RUNTIME_SKILL_STORE_DIRNAME: Final[str] = "ucx-agent-skills"
+
+#: What a CLI head says at startup when the skill folder it resolved does not exist (#1721).
+#: Plain words: the folder's name is what `ucx skill` writes, so it is the user's word too.
+NO_SKILL_STORE_NOTICE: Final[str] = (
+    f"No skills are loaded: there is no {RUNTIME_SKILL_STORE_DIRNAME} folder in the project "
+    "UClone-X was started from. To see how to add a skill, run: ucx skill --help"
+)
+
+
+def runtime_skill_store_dir(start: Path | None = None) -> Path:
+    """Where the runtime skill store is, for a process working in `start` (default: cwd).
+
+    The store is `<git top level>/ucx-agent-skills`, or `<start>/ucx-agent-skills` outside
+    a git checkout. This is the one resolver: `ucx skill` reads and writes the store it
+    names, and the heads load approved skills from it at startup, so the two cannot drift
+    onto different directories. It only resolves; it never creates the directory.
+    """
+    base = start if start is not None else Path.cwd()
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=base,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        root = Path(out.stdout.strip())
+    except (subprocess.CalledProcessError, OSError):
+        root = base
+    return root / RUNTIME_SKILL_STORE_DIRNAME
+
+
+async def load_approved_skills(registry: SkillRegistry) -> tuple[SkillProtocol, ...]:
+    """Load the approved skills in `registry`'s store into it, at a head's startup (P9).
+
+    Every package marked `active` is audited again and registered only on a passing audit
+    of its current bytes (`reload_approved`). A registry with no store, or a store that
+    does not exist, loads nothing; a store that cannot be read is logged and loads nothing.
+    So a missing or broken store never stops a head from starting.
+    """
+    try:
+        return await registry.reload_approved()
+    except OSError as exc:
+        logger.warning("The runtime skill store could not be read, so no skill is loaded: %s", exc)
+        return ()
+
+
+async def load_runtime_skill_registry(skills_dir: Path | None = None) -> SkillRegistry:
+    """A registry over the runtime skill store, with its approved skills already loaded.
+
+    The store defaults to `runtime_skill_store_dir()`. This is what a CLI head hands
+    `HostDependencies.skills`, so that `load_skill` is registered on its agent. When that
+    folder does not exist, one line on stderr says so (#1721); stderr, so a head that speaks
+    a protocol on stdout (`ucx acp serve`) is not disturbed.
+    """
+    registry = SkillRegistry(
+        skills_dir=skills_dir if skills_dir is not None else runtime_skill_store_dir()
+    )
+    await load_approved_skills(registry)
+    if registry.store_missing:
+        print(NO_SKILL_STORE_NOTICE, file=sys.stderr)
+    return registry

@@ -22,6 +22,7 @@ from uclone_x.agent.models import (
     PlanStep,
     SubagentInvocation,
     SubAgentSpec,
+    ToolExecutionRecord,
     TurnResult,
 )
 from uclone_x.agent.session import CompactionResult, SessionState
@@ -29,6 +30,24 @@ from uclone_x.engine.event_bus import AgentEvent
 from uclone_x.ontology.protocols import OntologyEngineProtocol
 from uclone_x.skills.protocols import SkillRegistryProtocol
 from uclone_x.telemetry.protocols import TracerProtocol
+from uclone_x.tools.models import ToolContext
+
+
+class TurnLifecycleHookProtocol(Protocol):
+    """Behaviour a host adds to every turn without the agent importing its domain (#1732).
+
+    The agent runs a turn's tool calls one step at a time. After each step it hands the
+    step's records and the `ToolContext` those calls ran with to every hook in order, each
+    receiving what the previous one returned. A hook that has nothing to change returns
+    `context` itself. The agent keeps only the returned `story_id` for the next step (the
+    open story, which `uclone_x.story`'s hook moves); a change to any other field is dropped.
+    """
+
+    def after_tool_step(
+        self, records: Sequence[ToolExecutionRecord], context: ToolContext
+    ) -> ToolContext:
+        """The context the next step of this turn runs with, after `records` ran."""
+        ...
 
 
 class BaseAgentProtocol(Protocol):

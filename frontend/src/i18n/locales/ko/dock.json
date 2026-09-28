@@ -1,0 +1,117 @@
+{
+  "tabs": {
+    "clone": "클론",
+    "turn": "턴",
+    "artifacts": "문서 및 결과물",
+    "remembers": "기억",
+    "activity": "활동 및 도구",
+    "resource": "리소스"
+  },
+  "chrome": {
+    "resize": "끌어서 작업 패널 크기 조절",
+    "close": "작업 패널 닫기",
+    "showing": "보기"
+  },
+  "remembers": {
+    "title": "{name}이(가) 기억하는 내용",
+    "theClone": "클론",
+    "thisClone": "이 클론",
+    "loading": "{name}이(가) 기억하는 내용을 읽는 중입니다…",
+    "noRoom": "열린 대화가 없습니다. 사이드바에서 대화를 열면 그 대화의 클론이 기억하는 내용을 볼 수 있습니다.",
+    "noSeat": "이 대화에 아직 참여한 클론이 없어 물어볼 대상이 없습니다.",
+    "readFailed": "{name}이(가) 기억하는 내용을 읽지 못했습니다.",
+    "savedNotListed": "{name}의 저장된 사실은 목록에 없습니다.",
+    "noneKnown": "{name}의 기억 문장이 목록에 없습니다.",
+    "savedHeading": "기억에 저장됨",
+    "savedHere": "이 대화에서 저장됨",
+    "knownHeading": "이 대화에서 아는 내용",
+    "workedOutTitle": "들은 것이 아니라 알고 있던 다른 내용에서 추론했습니다",
+    "workedOut": "추론함"
+  },
+  "activity": {
+    "readFailed": "{name}의 활동을 읽지 못했습니다.",
+    "thisClone": "이 클론",
+    "theClone": "클론",
+    "noRoom": "열린 대화가 없습니다. 사이드바에서 대화를 열면 그 대화의 클론이 한 일을 볼 수 있습니다.",
+    "noSeat": "이 대화에 참여한 클론이 없어 활동을 보여 줄 클론이 없습니다.",
+    "loading": "{name}의 활동을 읽는 중입니다…",
+    "noTurns": "이 대화에서 {name}의 턴이 목록에 없습니다.",
+    "noneRecorded": "이 대화에서 {name}의 턴 중 어떤 도구를 썼는지 기록한 턴이 없습니다.",
+    "noCalls": {
+      "one": "{name}의 기록된 턴 {count}개에 대해 목록에 있는 도구 호출이 없습니다.",
+      "other": "{name}의 기록된 턴 {count}개에 대해 목록에 있는 도구 호출이 없습니다."
+    },
+    "heading": "{name}의 도구 호출",
+    "listed": "목록 {count}개",
+    "subtitle": "이 대화에서 기록된 도구 호출과 각 호출의 입력, 출력, 걸린 시간입니다",
+    "search": "작업, 파일, 인자 검색...",
+    "category": {
+      "all": "전체",
+      "mutation": "변경",
+      "command": "명령",
+      "web": "웹",
+      "inspection": "살펴보기"
+    },
+    "status": {
+      "all": "모든 상태",
+      "success": "성공",
+      "error": "오류"
+    },
+    "notRecorded": {
+      "one": "턴 {count}개가 사용한 도구를 모두 기록하지 않아, 그 호출이 여기에 전부 나오지 않을 수 있습니다.",
+      "other": "턴 {count}개가 사용한 도구를 모두 기록하지 않아, 그 호출이 여기에 전부 나오지 않을 수 있습니다."
+    },
+    "hiddenByFilters": {
+      "one": "이 필터에 맞는 항목이 없습니다. 호출 {count}개가 필터로 숨겨져 있습니다.",
+      "other": "이 필터에 맞는 항목이 없습니다. 호출 {count}개가 필터로 숨겨져 있습니다."
+    },
+    "pass": "성공",
+    "running": "실행 중",
+    "stopped": "중지됨",
+    "error": "오류",
+    "wrote": "{path} 작성함",
+    "openInDocs": "문서에서 열기",
+    "wroteUnnamed": "이름을 밝히지 않고 파일에 썼을 수 있어, 여기서 열 수 있는 것이 없습니다.",
+    "helper": "도우미 에이전트를 시작했습니다 ({id})",
+    "executionTime": "실행 시간",
+    "stillRunning": "아직 실행 중",
+    "notTimed": "측정되지 않음",
+    "copyTraceTitle": "이 호출의 전체 기록을 JSON으로 복사",
+    "copyTrace": "트레이스 복사",
+    "inputParameters": "입력 매개변수",
+    "copyJson": "JSON 복사",
+    "outputPayload": "출력 내용",
+    "truncated": "이 출력은 표시를 위해 잘렸습니다. 클론은 전체를 받았습니다.",
+    "errorTrace": "실행 오류 기록"
+  },
+  "docs": {
+    "filesReadFailed": "이 대화의 파일 목록을 가져오지 못했습니다.",
+    "fileReadFailed": "이 파일을 표시할 수 없습니다.",
+    "noRoom": "열린 대화가 없습니다. 사이드바에서 대화를 열면 그 대화에서 쓴 파일을 볼 수 있습니다.",
+    "noneListed": "아직 목록에 있는 파일이 없습니다. {scope}",
+    "noFilesOption": "(목록에 파일 없음)",
+    "openedFrom": "{name} (대화에서 열림)",
+    "refresh": "이 대화의 파일을 다시 읽기",
+    "renderTitle": "마크다운 렌더링",
+    "rawTitle": "원본 소스 보기",
+    "rendered": "렌더링",
+    "raw": "원본",
+    "copyTitle": "마크다운 텍스트 복사",
+    "writtenTimes": " · {count}번 작성됨",
+    "mayBeMissing": "다음 이유로 빠진 파일이 있을 수 있습니다:",
+    "turnRunning": "턴이 아직 실행 중입니다. 그 턴이 저장하는 파일은 턴이 끝나면 목록에 나옵니다.",
+    "noLongerOnDisk": "이 파일은 이 대화에서 작성되었지만 더 이상 디스크에 없어 표시할 내용이 없습니다. 작성된 뒤 옮겨졌거나 삭제되었을 수 있습니다.",
+    "loadingContent": "문서 내용을 불러오는 중입니다...",
+    "readingFiles": "이 대화의 파일을 읽는 중입니다…",
+    "pickFile": "위에서 읽을 파일을 고르십시오.",
+    "openOriginal": "새 탭에서 원본 열기",
+    "generationDetails": "생성 정보",
+    "seed": "시드",
+    "prompt": "프롬프트",
+    "negativePrompt": "네거티브 프롬프트",
+    "style": "스타일",
+    "aspect": "비율",
+    "size": "크기",
+    "time": "시간"
+  }
+}

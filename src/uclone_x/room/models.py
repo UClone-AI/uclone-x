@@ -24,15 +24,19 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime
 from enum import StrEnum
+from typing import cast, get_args
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from uclone_x.agent.models import AgentLLMConfig
+from uclone_x.agent.models import AgentLLMConfig, ProviderFailure
 from uclone_x.core.immutable import ImmutableStrMapping
 from uclone_x.core.provenance import Provenance
 from uclone_x.llm.models import TokenUsage
+from uclone_x.room.notices import NoticeCode, NoticeParams
 
 __all__ = [
+    "DEFAULT_MAX_SPAN_TOKENS",
+    "SPAN_WINDOW_SHARE",
     "Participant",
     "ParticipantKind",
     "RoomMessage",
@@ -46,7 +50,9 @@ __all__ = [
     "SpeakerDecision",
     "SpeakerRequest",
     "TurnState",
+    "is_loop_command",
     "turn_refusal",
+    "with_legacy_loop_rows_as_notes",
 ]
 
 
@@ -145,6 +151,12 @@ class RoomMessageKind(StrEnum):
     UTTERANCE = "utterance"
     JOIN = "join"
     LEAVE = "leave"
+    #: A note the application writes for the people reading the room: the `/loop` help,
+    #: its status and its acknowledgements (#1641). Shown in the conversation and never
+    #: somebody's word, so it is kept out of every seat's span and out of the
+    #: interjection check the same way a membership row is: design doc
+    #: `llm-request-layering.md` §8 Q4 settles that such notes are not seat context.
+    NOTE = "note"
 
 
 class RoomTurnRefusal(StrEnum):
@@ -161,9 +173,22 @@ class RoomTurnRefusal(StrEnum):
     #: retry too; a new conversation starts with budgets of its own.
     BUDGET_EXCEEDED = "budget_exceeded"
 
+    #: The user's own limit on paid-model tokens is reached (`llm-token-gateway.md` §4.3).
+    #: It is system-wide, so a new conversation meets it too: the remedy is waiting until
+    #: the time the error names, raising the limit in Settings, or a local model. The
+    #: turn's `error` says so in words written for the user.
+    USAGE_LIMIT = "usage_limit"
+
     #: The speaker's model cannot use tools, which every clone turn sends. A retry on the
     #: same model is refused the same way; choosing another model is the remedy.
     MODEL_WITHOUT_TOOLS = "model_without_tools"
+
+    #: The provider does not serve the speaker's model -- retired, or misspelled (#1630).
+    #: Every retry asks for the same model; choosing another is the remedy.
+    MODEL_UNAVAILABLE = "model_unavailable"
+
+    #: The provider refused the API key (#1630). Every retry sends the same key.
+    PROVIDER_AUTH = "provider_auth"
 
 
 def turn_refusal(stop_reason: str | None) -> RoomTurnRefusal | None:
@@ -171,13 +196,20 @@ def turn_refusal(stop_reason: str | None) -> RoomTurnRefusal | None:
 
     The one mapping, shared by the room orchestrator and the chat head's `/api/chat`, so
     the two heads cannot disagree about which failures a retry is refused on. The token
-    ceiling and a model without tool support qualify: `step_budget_exceeded` is not a
+    ceiling, the user's paid-model usage limit, a model without tool support, a model the
+    provider does not serve and a rejected API key qualify: `step_budget_exceeded` is not a
     refusal, since `run_steps` resets per turn and a retry starts with the whole step budget.
     """
     if stop_reason == "budget_exceeded":
         return RoomTurnRefusal.BUDGET_EXCEEDED
+    if stop_reason == "usage_limit":
+        return RoomTurnRefusal.USAGE_LIMIT
     if stop_reason == "model_without_tools":
         return RoomTurnRefusal.MODEL_WITHOUT_TOOLS
+    if stop_reason == "model_unavailable":
+        return RoomTurnRefusal.MODEL_UNAVAILABLE
+    if stop_reason == "provider_auth":
+        return RoomTurnRefusal.PROVIDER_AUTH
     return None
 
 
@@ -189,8 +221,9 @@ class RoomMessage(BaseModel):
     session. A reader of the room sees the conversation; a reader of a session sees how one
     participant produced its half of it.
 
-    The exception is a membership row (`RoomMessageKind`), which records a join or a leave
-    in the same ordered record so the conversation can explain its own gaps. Check
+    The exceptions are a membership row (`RoomMessageKind`), which records a join or a leave
+    in the same ordered record so the conversation can explain its own gaps, and a note the
+    application writes for the reader (`RoomMessageKind.NOTE`). Check
     `is_utterance` — never `kind is UTTERANCE` inline, and never `content` — before
     treating a row as something somebody said.
     """
@@ -207,9 +240,24 @@ class RoomMessage(BaseModel):
     content: str
     kind: RoomMessageKind = Field(
         default=RoomMessageKind.UTTERANCE,
-        description="Speech, or a roster change. Defaults to speech so that transcripts "
+        description="Speech, a roster change, or an application note. Defaults to speech "
+        "so that transcripts "
         "written before membership rows existed still load — `extra='forbid'` with "
         "`strict` would otherwise reject every stored room.",
+    )
+    code: NoticeCode | None = Field(
+        default=None,
+        description="Which notice a `NOTE` row is, for the head to word in the reader's "
+        "language (`room/notices.py`). A stored sentence would keep the language it was "
+        "written in; a code is worded again every time the row is drawn. `content` still "
+        "holds the English fallback for exports, the CLI and a head that predates the code. "
+        "`None` on every other row, and on a note stored before codes existed.",
+    )
+    params: NoticeParams | None = Field(
+        default=None,
+        description="The values `code`'s sentence uses, by placeholder name: numbers raw "
+        "(`interval_seconds`) so that each head formats them in its own language. `None` "
+        "wherever `code` is.",
     )
     created_at: str = Field(default_factory=_now_iso)
     decision: SpeakerDecision | None = Field(
@@ -245,6 +293,14 @@ class RoomMessage(BaseModel):
         default=None,
         description="Set, beside `error`, when the failure is one a retry would meet "
         "again (#969). `None` on every other row, and on rows stored before it existed.",
+    )
+    provider_failure: ProviderFailure | None = Field(
+        default=None,
+        description="Set, beside `error`, when the turn failed on a hosted provider's "
+        "failure the connector classified (#1630): the kind, and the plain sentence a head "
+        "shows for it. `error` is for the log's reader and is never shown; this is what "
+        "tells the user whether their model was retired, their key refused, or the "
+        "provider down. `None` on every other row, and on rows stored before it existed.",
     )
     completed: bool = Field(
         default=True,
@@ -334,6 +390,94 @@ class RoomMessage(BaseModel):
         that spelled the check itself and hoping none was missed.
         """
         return self.kind is RoomMessageKind.UTTERANCE
+
+    @field_validator("kind", mode="before")
+    @classmethod
+    def _an_unknown_kind_loads_as_a_note(cls, value: object) -> object:
+        """Read a row kind a newer build wrote as a note, instead of refusing the room (#1661).
+
+        A build that met `kind: "note"` before notes existed refused the whole room, so
+        rolling back past #1641 made every room with a `/loop` row unreadable. A note is
+        the safe reading of a kind this build does not know: it is shown, and it is kept
+        out of every seat's span and out of the interjection check, so an unknown row is
+        never put in somebody's mouth. Only the kind is read forward; a field this build
+        does not know is still refused by `extra="forbid"`.
+        """
+        known = {kind.value for kind in RoomMessageKind}
+        if isinstance(value, str) and value not in known:
+            return RoomMessageKind.NOTE.value
+        return value
+
+    @field_validator("code", mode="before")
+    @classmethod
+    def _an_unknown_notice_code_loads_as_none(cls, value: object) -> object:
+        """Drop a notice code a newer build wrote, and keep the row (#1661).
+
+        `content` holds the English sentence for exactly this case, and a head words a
+        row with no code from `content`.
+        """
+        if isinstance(value, str) and value not in get_args(NoticeCode):
+            return None
+        return value
+
+
+def is_loop_command(content: str) -> bool:
+    """Whether `content` is a typed `/loop` command, as `ui/rooms.py` recognises one."""
+    text = content.strip()
+    return text == "/loop" or text.startswith("/loop ")
+
+
+def with_legacy_loop_rows_as_notes(state: RoomState) -> RoomState:
+    """Return `state` with the `/loop` rows older builds saved as speech made notes (#1661).
+
+    Two shapes were saved as `UTTERANCE` and belong out of every seat's span:
+
+    *   The application's `/loop` help, status and acknowledgement rows, which builds
+        before #1641 wrote with the sender `system`. The `/loop` route was the only writer
+        of that sender, and `system` is not a participant, so no participant's word is
+        converted. A room that seats a participant called `system` is left as it is.
+    *   The person's typed `/loop ...` command, which builds before #1661 saved as their
+        message. Converted only when a `system` row follows it, which is the one sign that
+        the command was handled as a command and not merely typed as text.
+
+    Applied when a room is read, not by rewriting files: the room is saved in the new
+    shape at its next write. Returns `state` itself when nothing needs converting.
+    """
+    if any(p.id == _LOOP_NOTICE_SENDER for p in state.participants):
+        return state
+    humans = {p.id for p in state.participants if p.kind is ParticipantKind.HUMAN}
+    rows = state.transcript
+
+    def is_notice(index: int) -> bool:
+        row = rows[index]
+        return row.sender_id == _LOOP_NOTICE_SENDER and row.kind in (
+            RoomMessageKind.UTTERANCE,
+            RoomMessageKind.NOTE,
+        )
+
+    converted: list[RoomMessage] = []
+    changed = False
+    for i, row in enumerate(rows):
+        legacy_notice = row.is_utterance and is_notice(i)
+        legacy_command = (
+            row.is_utterance
+            and row.sender_id in humans
+            and is_loop_command(row.content)
+            and i + 1 < len(rows)
+            and is_notice(i + 1)
+        )
+        if legacy_notice or legacy_command:
+            converted.append(row.model_copy(update={"kind": RoomMessageKind.NOTE}))
+            changed = True
+        else:
+            converted.append(row)
+    if not changed:
+        return state
+    return state.model_copy(update={"transcript": tuple(converted)})
+
+
+#: The sender of the application's `/loop` notes. Not a participant: `ui/rooms.py` writes it.
+_LOOP_NOTICE_SENDER = "system"
 
 
 class SelectionVerdict(StrEnum):
@@ -427,6 +571,17 @@ class TurnState(BaseModel):
     )
 
 
+#: The span ceiling a room policy starts with, in estimated tokens (#1641). About a quarter
+#: of a 32k window. With the default Ollama window (16k) the seat's own share is smaller,
+#: and that is what binds.
+DEFAULT_MAX_SPAN_TOKENS: int = 8_000
+
+#: The share of a seat's context window its span may take: one part in this many (#1641).
+#: The rest carries the fixed prefix (tools, identity, slow context), the seat's own
+#: history, the turn context and the reply.
+SPAN_WINDOW_SHARE: int = 4
+
+
 class RoomPolicy(BaseModel):
     """The knobs that bound a room's cost and pace."""
 
@@ -439,20 +594,20 @@ class RoomPolicy(BaseModel):
         "room's P4 step budget and the only structural defence against an agent-to-agent "
         "loop; a selector's judgement is a probabilistic one and does not substitute.",
     )
-    max_span_messages: int = Field(
-        default=40,
+    max_span_tokens: int = Field(
+        default=DEFAULT_MAX_SPAN_TOKENS,
         ge=1,
-        description="Ceiling on how many transcript messages one turn hands its speaker. "
-        "Distinct from `transcript_window`, which bounds what a *selector* reads: this "
-        "bounds what an *agent* is given, and nothing bounded it before. An agent "
-        "addressed for the first time in a long room was handed the whole backlog, so a "
-        "room's per-turn cost grew with its length without bound. A *count* ceiling is not a "
-        "context guarantee — forty long messages still overrun a window, and bounding "
-        "characters is the separate job of compaction inside each agent's own session — "
-        "but it removes the unbounded growth, which is what made a long room's cost "
-        "unpredictable. When the span is longer, the most recent are kept and the drop is "
-        "stated in the prompt — conversation the agent has never seen is a real loss, and "
-        "a silent one would leave it answering confidently from a gap it cannot see.",
+        description="Ceiling, in estimated tokens, on the transcript span one turn hands "
+        "its speaker (#1641). Distinct from `transcript_window`, which bounds what a "
+        "*selector* reads: this bounds what an *agent* is given. An agent addressed for the "
+        "first time in a long room was once handed the whole backlog, so a room's per-turn "
+        "cost grew with its length without bound. Counted in tokens, not messages, because "
+        "a count bounds the wrong thing: one long message could still overrun the window, "
+        "and forty short ones were cut for no reason. The budget a turn uses is the smaller "
+        "of this and `1 / SPAN_WINDOW_SHARE` of the seat's context window, when the seat "
+        "reports one. The newest messages are kept, and the drop is stated in the prompt -- "
+        "conversation the agent has never seen is a real loss, and a silent one would leave "
+        "it answering confidently from a gap it cannot see.",
     )
     transcript_window: int = Field(
         default=15,
@@ -497,6 +652,21 @@ class RoomPolicy(BaseModel):
         description="Whether agents discuss and collaborate autonomously as long as the "
         "user is actively viewing the room, bounded by a 20-turn safety circuit breaker.",
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _drop_the_retired_span_count(cls, data: object) -> object:
+        """Load a policy saved with `max_span_messages`, the count this replaced (#1641).
+
+        `extra="forbid"` would otherwise refuse every room stored before the span was
+        counted in tokens. The count is dropped rather than converted: a message count
+        says nothing about tokens, and the default token ceiling is what such a room
+        would have been given had it been created now.
+        """
+        if not isinstance(data, dict):
+            return data
+        fields = cast(dict[str, object], data)
+        return {k: v for k, v in fields.items() if k != "max_span_messages"}
 
     @model_validator(mode="after")
     def _window_must_outlast_the_turn_ceiling(self) -> RoomPolicy:

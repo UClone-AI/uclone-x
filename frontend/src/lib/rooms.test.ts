@@ -11,6 +11,7 @@ import {
   NEW_CONVERSATION_TITLE,
   participantLabel,
   resolveMention,
+  restoreLiveFromActiveTurn,
   roomResponseIsStale,
   RoomReadOrder,
   roomReadReason,
@@ -530,7 +531,7 @@ describe('seededTitle', () => {
     turn_state: { agent_turns_since_human: 0 },
     policy: {
       max_agent_turns_per_human_message: 3,
-      max_span_messages: 40,
+      max_span_tokens: 8000,
       transcript_window: 15,
       hesitation_seconds: 0,
       default_responder_id: '',
@@ -1223,16 +1224,16 @@ describe('roomReadReason (#1389)', () => {
     expect(roomReadReason(new RoomsApiError('500 Internal Server Error', 500, null))).toBe(ROOM_READ_NO_REASON);
   });
 
-  // Killed by: frontend/src/lib/rooms.ts :: else if (err instanceof RoomsNoAnswerError) reason = ROOM_READ_NO_ANSWER;
-  // Becomes: else if (err instanceof RoomsNoAnswerError) reason = ROOM_APP_FAULT;
+  // Killed by: frontend/src/lib/rooms.ts :: else if (err instanceof RoomsNoAnswerError) reason = words.noAnswer;
+  // Becomes: else if (err instanceof RoomsNoAnswerError) reason = words.appFault;
   it('says the service did not answer when the fetch itself failed', () => {
     expect(roomReadReason(new RoomsNoAnswerError(new TypeError('Failed to fetch')))).toBe(ROOM_READ_NO_ANSWER);
     expect(roomReadReason(new RoomsNoAnswerError(new TypeError('Load failed')))).toBe(ROOM_READ_NO_ANSWER);
   });
 
   // A `TypeError` is also what the head's own bugs throw, and the service did nothing (#1441).
-  // Killed by: frontend/src/lib/rooms.ts :: else reason = ROOM_APP_FAULT;
-  // Becomes: else reason = ROOM_READ_NO_ANSWER;
+  // Killed by: frontend/src/lib/rooms.ts :: else reason = words.appFault;
+  // Becomes: else reason = words.noAnswer;
   it("does not blame the service for the app's own fault", () => {
     for (const fault of [new TypeError("Cannot read properties of undefined (reading 'seq')"), 'something odd']) {
       const reason = roomReadReason(fault);
@@ -1365,7 +1366,7 @@ describe('what a failed send can say (#1441)', () => {
     turn_state: { agent_turns_since_human: 0 },
     policy: {
       max_agent_turns_per_human_message: 3,
-      max_span_messages: 40,
+      max_span_tokens: 8000,
       transcript_window: 15,
       hesitation_seconds: 0,
       default_responder_id: '',
@@ -1397,8 +1398,8 @@ describe('what a failed send can say (#1441)', () => {
     expect(sendWasRefused(new RoomsNoAnswerError(new TypeError('Failed to fetch')))).toBe(false);
   });
 
-  // Killed by: frontend/src/lib/rooms.ts :: if (err.outcome === 'absent') return `${reason} Your message is not in this conversation.`;
-  // Becomes: if (err.outcome === 'absent') return `Not sent: ${reason}`;
+  // Killed by: frontend/src/lib/rooms.ts :: if (err.outcome === 'absent') return fmt(copy.absent, { reason });
+  // Becomes: if (err.outcome === 'absent') return fmt(copy.refused, { reason });
   it('says "Not sent" for a refusal alone, and never shows raw error text', () => {
     const noAnswer = new RoomsNoAnswerError(new TypeError('Failed to fetch'));
     const bare500 = new RoomsApiError('500 Internal Server Error', 500, null);
@@ -1423,5 +1424,54 @@ describe('what a failed send can say (#1441)', () => {
       expect(text).not.toMatch(/\bsent\b/i);
     }
     for (const text of [refused, absent, unconfirmed, ownFault]) expectPlain(text);
+  });
+});
+
+describe('restoreLiveFromActiveTurn', () => {
+  it('returns original live state when activeTurn is missing or in_flight is false', () => {
+    const live = { turn: null, error: null };
+    expect(restoreLiveFromActiveTurn(live, null)).toBe(live);
+    expect(restoreLiveFromActiveTurn(live, undefined)).toBe(live);
+    expect(restoreLiveFromActiveTurn(live, { in_flight: false, agent_id: null, turn_id: null })).toBe(live);
+  });
+
+  it('restores live turn from activeTurn when idle', () => {
+    const live = { turn: null, error: null };
+    const restored = restoreLiveFromActiveTurn(live, {
+      in_flight: true,
+      agent_id: 'scout',
+      turn_id: 'turn-123',
+      status: 'generating',
+      detail: 'Searching...',
+      accumulated_text: 'Hello ',
+    });
+    expect(restored).toEqual({
+      turn: {
+        agentId: 'scout',
+        turnId: 'turn-123',
+        text: 'Hello ',
+        statusText: 'Searching...',
+      },
+      error: null,
+    });
+  });
+
+  it('leaves existing live turn undisturbed if already tracking the same turn', () => {
+    const live = {
+      turn: {
+        agentId: 'scout',
+        turnId: 'turn-123',
+        text: 'Mock',
+        statusText: undefined,
+      },
+      error: null,
+    };
+    const restored = restoreLiveFromActiveTurn(live, {
+      in_flight: true,
+      agent_id: 'scout',
+      turn_id: 'turn-123',
+      accumulated_text: 'Mock response',
+    });
+    expect(restored).toBe(live);
   });
 });

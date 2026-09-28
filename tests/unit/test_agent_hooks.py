@@ -268,7 +268,7 @@ async def test_hook_runner_ask_after_modify_asks_about_the_rewritten_call() -> N
 
     The call's fixed keys stay as the agent built them.
 
-    Killed by: src/uclone_x/agent/hooks/runner.py :: if decision.action == HookAction.ASK and modified:
+    Killed by: src/uclone_x/agent/hooks/runner.py :: if decision.action == HookAction.ASK and (modified or decision.modified_payload):
     Becomes: if False:
 
     Killed by: src/uclone_x/agent/hooks/runner.py :: asked = _with_fixed_keys(asked, fixed)
@@ -301,6 +301,42 @@ async def test_hook_runner_ask_after_modify_asks_about_the_rewritten_call() -> N
     assert decision.modified_payload is not None
     assert decision.modified_payload["arguments"] == {"orig": 0, "a": 1}
     assert decision.modified_payload["tool_name"] == "echo"
+
+
+@pytest.mark.asyncio
+async def test_hook_runner_ask_with_its_own_rewrite_carries_the_merged_call() -> None:
+    """#1613: an ASK with no MODIFY before it returns the payload an ASK after one does.
+
+    The asking hook's rewrite goes on top of the call the agent built, and the fixed keys
+    are restored, so both ASK paths hand the approval step one shape.
+
+    Killed by: src/uclone_x/agent/hooks/runner.py :: if decision.action == HookAction.ASK and (modified or decision.modified_payload):
+    Becomes: if decision.action == HookAction.ASK and modified:
+    """
+
+    class AskAndRewrite(BaseHook):
+        async def on_pre_tool_use(self, context: HookContext) -> HookDecision:
+            return HookDecision(
+                action=HookAction.ASK,
+                reason="check with the person",
+                modified_payload={"arguments": {"orig": 0, "a": 1}, "tool_name": "other_tool"},
+            )
+
+    runner = HookRunner(hooks=[AskAndRewrite()])
+    ctx = HookContext(
+        agent_id="a1",
+        event_type=HookEvent.PRE_TOOL_USE,
+        payload={"tool_name": "echo", "tool_call_id": "c1", "arguments": {"orig": 0}},
+    )
+
+    decision = await runner.run_hooks(HookEvent.PRE_TOOL_USE, ctx)
+    assert decision.action == HookAction.ASK
+    assert decision.reason == "check with the person"
+    assert decision.modified_payload == {
+        "tool_name": "echo",
+        "tool_call_id": "c1",
+        "arguments": {"orig": 0, "a": 1},
+    }
 
 
 @pytest.mark.asyncio
@@ -860,7 +896,8 @@ async def test_script_hook_receives_nested_tool_arguments(tmp_path: Path) -> Non
     would pass against the broken code. Both halves are asserted here: the script saw
     `PRE_TOOL_USE`, and the tool it guards actually executed.
 
-    Killed by: src/uclone_x/agent/base.py :: "arguments": cast(dict[str, Any], unwrap_immutable(tc.arguments)),
+    Killed by: src/uclone_x/agent/tool_execution.py :: "arguments": cast(dict[str, Any], unwrap_immutable(tc.arguments)),
+    Becomes: "arguments": cast(dict[str, Any], tc.arguments),
     """
     seen_path = tmp_path / "events_seen.txt"
     script_path = tmp_path / "pre_tool_hook.py"
@@ -922,7 +959,8 @@ async def test_blocked_tool_call_records_nested_arguments() -> None:
     and the BLOCK branch raised `ValidationError` out of `_execute_single_tool` instead of
     returning the refusal it exists to return.
 
-    Killed by: src/uclone_x/agent/base.py :: arguments=cast(dict[str, Any], unwrap_immutable(tc.arguments)),
+    Killed by: src/uclone_x/agent/tool_execution.py :: arguments=cast(dict[str, Any], unwrap_immutable(tc.arguments)),
+    Becomes: arguments=cast(dict[str, Any], tc.arguments),
     """
     nested_arguments: dict[str, Any] = {
         "msg": "hello",

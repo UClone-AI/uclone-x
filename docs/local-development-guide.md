@@ -103,9 +103,12 @@ UClone-X provides built-in CLI automation through `./ucx` to inspect, download, 
 * Configures Python 3.11+ virtual environment paths.
 
 ### Step 2: Configure Environment Variables
-Copy `.env.example` to `.env`:
+Copy `.env.example` to `.env`, then load it into the shell. `ucx` reads the process
+environment and does **not** open a `.env` file itself, so a copied file that is never
+loaded changes nothing:
 ```bash
 cp .env.example .env
+set -a; . ./.env; set +a
 ```
 Default values for 2-Tier setup are pre-configured:
 ```bash

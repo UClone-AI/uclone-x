@@ -21,7 +21,7 @@ from uclone_x.core.agent_home import AgentHome
 from uclone_x.core.provenance import Provenance, require_provenance
 from uclone_x.errors import MemoryStoreUnreadableError
 from uclone_x.llm.protocols import EmbedderProtocol
-from uclone_x.memory.models import MemoryFact, utc_now_iso
+from uclone_x.memory.models import FactOrigin, MemoryFact, utc_now_iso
 from uclone_x.memory.retrieval import FactRanking, rank_facts
 from uclone_x.memory.vector_store import BruteForceVectorStore
 from uclone_x.ontology.models import EvidenceRecord
@@ -185,8 +185,15 @@ class CrossSessionMemory:
         tags: Sequence[str] = (),
         metadata: dict[str, Any] | None = None,
         auto_retract_conflicts: bool = True,
+        origin: FactOrigin = "saved",
+        source_room_id: str | None = None,
+        source_turn_id: str | None = None,
     ) -> MemoryFact:
-        """Record a new verified cross-session fact carrying P6 provenance."""
+        """Record a new verified cross-session fact carrying P6 provenance.
+
+        `origin`, `source_room_id` and `source_turn_id` say how, and in which conversation
+        and turn, the fact was learned (clone-knowledge-graph design §3.2).
+        """
         verified_prov = require_provenance(provenance, "MemoryFact")
 
         subj = subject.strip()
@@ -212,6 +219,9 @@ class CrossSessionMemory:
             confidence=confidence,
             tags=tuple(tags),
             metadata=dict(metadata or {}),
+            origin=origin,
+            source_room_id=source_room_id,
+            source_turn_id=source_turn_id,
         )
 
         contradicted_id: str | None = None
@@ -385,7 +395,9 @@ class CrossSessionMemory:
                 )
             return ""
 
-        active_facts.sort(key=lambda f: (f.confidence, f.created_at), reverse=True)
+        # `fact_id` breaks ties, so facts of equal confidence and age do not come out in
+        # insertion order.
+        active_facts.sort(key=lambda f: (f.confidence, f.created_at, f.fact_id), reverse=True)
 
         limit = max_facts if max_facts is not None else self._max_facts_in_prompt
         selected = active_facts[:limit]
@@ -394,10 +406,10 @@ class CrossSessionMemory:
             "[Cross-Session Memory Facts]",
             "The following verified durable facts from prior sessions are active:",
         ]
+        # The source session and the confidence rank the facts but are not rendered: they
+        # change the text between sessions without telling the model anything it acts on.
         for f in selected:
-            lines.append(
-                f"- {f.summary()} (session: {f.source_session_id}, confidence: {f.confidence:.2f})"
-            )
+            lines.append(f"- {f.summary()}")
 
         if len(active_facts) > limit:
             omitted = len(active_facts) - limit

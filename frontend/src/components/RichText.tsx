@@ -1,11 +1,13 @@
 import React, { useEffect, useRef, useState } from 'react';
-import ReactMarkdown from 'react-markdown';
+import ReactMarkdown, { type Components, type Options } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import remarkMath from 'remark-math';
 import rehypeKatex from 'rehype-katex';
 import 'katex/dist/katex.min.css';
-import { Play, ExternalLink, Copy, Check, FileText } from 'lucide-react';
+import { Play, ExternalLink, Copy, Check, FileText, ImageOff } from 'lucide-react';
 import { useOpenInDocs } from '../lib/roomDock';
+import { UseAsAvatar } from './avatar/UseAsAvatar';
+import { fmt, useCopy } from '../i18n';
 import { cn } from '../lib/utils';
 
 // Single source of truth for rendering user/agent text (chat messages, logs, tool traces).
@@ -69,6 +71,59 @@ export const preprocessImageTags = (text: string): string => {
     .split(CODE_SEGMENT_RE)
     .map((part) => (part.startsWith('`') ? part : normalizeImageSegment(part)))
     .join('');
+};
+
+/**
+ * A missing artifact, as the Core's `artifact_validation` hook marks it (multilingual-ui.md §3.3).
+ *
+ * The hook replaces an image or link to a file that was never written with a remark-directive
+ * text directive, `:missing-image{file="…"}` or `:missing-image-link{file="…"}`, the filename
+ * percent-encoded so it cannot end the directive or start Markdown of its own. This head mounts
+ * no remark-directive, so the directive is rewritten here, outside code, into a link to a
+ * reserved fragment, and the `a` override below draws the notice from the catalog in the
+ * reader's language. A directive whose file is not in the encoded alphabet is left as text.
+ */
+const MISSING_IMAGE_RE = /:missing-image(-link)?\{file="([A-Za-z0-9._~%-]+)"\}/g;
+const MISSING_IMAGE_HREF = '#ucx-missing-image/';
+const MISSING_IMAGE_LINK_HREF = '#ucx-missing-image-link/';
+
+export const preprocessMissingImages = (text: string): string => {
+  if (!text || !text.includes(':missing-image')) return text;
+  return text
+    .split(CODE_SEGMENT_RE)
+    .map((part) =>
+      part.startsWith('`')
+        ? part
+        : part.replace(
+            MISSING_IMAGE_RE,
+            (_match, link: string | undefined, file: string) =>
+              `[missing-image](${link ? MISSING_IMAGE_LINK_HREF : MISSING_IMAGE_HREF}${file})`,
+          ),
+    )
+    .join('');
+};
+
+const decodeFile = (encoded: string): string => {
+  try {
+    return decodeURIComponent(encoded);
+  } catch {
+    return encoded;
+  }
+};
+
+export const MissingImageNotice: React.FC<{ href: string }> = ({ href }) => {
+  const t = useCopy().notices.missingImage;
+  const link = href.startsWith(MISSING_IMAGE_LINK_HREF);
+  const file = decodeFile(href.slice((link ? MISSING_IMAGE_LINK_HREF : MISSING_IMAGE_HREF).length));
+  return (
+    <span
+      data-testid="missing-image-notice"
+      className="inline-flex items-baseline gap-1.5 rounded-md border border-amber-500/30 bg-amber-500/5 px-2 py-0.5 text-[0.95em] italic text-amber-200/90"
+    >
+      <ImageOff size={12} className="shrink-0 self-center" aria-hidden />
+      <span>{fmt(link ? t.link : t.image, { file })}</span>
+    </span>
+  );
 };
 
 const getTitleText = (children: unknown): string => {
@@ -189,6 +244,9 @@ export const ArtifactImageCard: React.FC<{ url: string; name: string; alt?: stri
         </button>
       )}
     </span>
+    {/* Only for a picture in the workspace, and only inside a clone's message: the
+        component itself renders nothing outside one. */}
+    {path && <UseAsAvatar path={path} />}
   </span>
   );
 };
@@ -393,9 +451,62 @@ export interface RichTextProps {
   className?: string;
 }
 
-export const RichText: React.FC<RichTextProps> = ({ children, content, className }) => {
+/**
+ * The renderer's configuration, built once rather than on every render.
+ *
+ * These were literals inside `RichText`'s JSX, so each render handed react-markdown a new
+ * `table`, `img` and `a` function. A new function is a new component type to React, and it
+ * unmounted every link, table and image in every message and mounted a fresh one -- on every
+ * keystroke in the composer, because the composer's draft re-renders the transcript. With a
+ * 131-message conversation that was 256 elements rebuilt per key, each table's
+ * `ResizeObserver` torn down and re-attached, and a played YouTube card reset to its poster.
+ * Nothing here reads props or state, so nothing is lost by building it at module load.
+ */
+const REMARK_PLUGINS: Options['remarkPlugins'] = [remarkGfm, remarkMath];
+const REHYPE_PLUGINS: Options['rehypePlugins'] = [[rehypeKatex, { throwOnError: false }]];
+const MARKDOWN_COMPONENTS: Components = {
+  pre: PreBlock,
+  table: ({ node, ...props }) => (
+    <TableScroll>
+      <table {...props} />
+    </TableScroll>
+  ),
+  img: ({ node, src, alt, ...props }) => {
+    const resolvedSrc = artifactImageSrc(src);
+    const artifact = findArtifactImage(resolvedSrc);
+    if (artifact) {
+      return <ArtifactImageCard url={artifact.url} name={artifact.name} alt={alt} />;
+    }
+    return <img src={resolvedSrc} alt={alt} {...props} />;
+  },
+  a: ({ node, href, children: linkChildren, ...props }) => {
+    if (href?.startsWith(MISSING_IMAGE_HREF) || href?.startsWith(MISSING_IMAGE_LINK_HREF)) {
+      return <MissingImageNotice href={href} />;
+    }
+    const match = href?.match(YOUTUBE_RE);
+    if (match && match[1]) {
+      return <YoutubePreviewCard url={href || ''} videoId={match[1]} title={getTitleText(linkChildren)} />;
+    }
+    const artifact = findArtifactImage(href);
+    if (artifact) {
+      return <ArtifactImageCard url={artifact.url} name={artifact.name} />;
+    }
+    return (
+      <a href={href} target="_blank" rel="noopener noreferrer" className="text-indigo-400 hover:underline" {...props}>
+        {linkChildren}
+      </a>
+    );
+  },
+};
+
+/**
+ * Memoized on its props, which are all strings: a message whose text has not changed is not
+ * parsed again. The conversation re-renders on every keystroke in the composer, and re-parsing
+ * every message's markdown each time made typing slower the longer the conversation grew.
+ */
+export const RichText = React.memo<RichTextProps>(function RichText({ children, content, className }) {
   const rawText = children ?? content ?? '';
-  const preprocessed = preprocessLaTeX(preprocessImageTags(rawText));
+  const preprocessed = preprocessLaTeX(preprocessImageTags(preprocessMissingImages(rawText)));
   return (
     <div
       className={cn(
@@ -409,45 +520,15 @@ export const RichText: React.FC<RichTextProps> = ({ children, content, className
       )}
     >
       <ReactMarkdown
-        remarkPlugins={[remarkGfm, remarkMath]}
-        rehypePlugins={[[rehypeKatex, { throwOnError: false }]]}
-        components={{
-          pre: PreBlock,
-          table: ({ node, ...props }) => (
-            <TableScroll>
-              <table {...props} />
-            </TableScroll>
-          ),
-          img: ({ node, src, alt, ...props }) => {
-            const resolvedSrc = artifactImageSrc(src);
-            const artifact = findArtifactImage(resolvedSrc);
-            if (artifact) {
-              return <ArtifactImageCard url={artifact.url} name={artifact.name} alt={alt} />;
-            }
-            return <img src={resolvedSrc} alt={alt} {...props} />;
-          },
-          a: ({ node, href, children: linkChildren, ...props }) => {
-            const match = href?.match(YOUTUBE_RE);
-            if (match && match[1]) {
-              return <YoutubePreviewCard url={href || ''} videoId={match[1]} title={getTitleText(linkChildren)} />;
-            }
-            const artifact = findArtifactImage(href);
-            if (artifact) {
-              return <ArtifactImageCard url={artifact.url} name={artifact.name} />;
-            }
-            return (
-              <a href={href} target="_blank" rel="noopener noreferrer" className="text-indigo-400 hover:underline" {...props}>
-                {linkChildren}
-              </a>
-            );
-          },
-        }}
+        remarkPlugins={REMARK_PLUGINS}
+        rehypePlugins={REHYPE_PLUGINS}
+        components={MARKDOWN_COMPONENTS}
       >
         {preprocessed}
       </ReactMarkdown>
     </div>
   );
-};
+});
 
 export const MarkdownRenderer = RichText;
 export default RichText;

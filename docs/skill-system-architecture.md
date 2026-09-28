@@ -34,7 +34,12 @@ implements structurally rather than by convention:
 
 ## 2. Skill Package Structure — *Implemented*
 
-Every skill lives in an isolated folder under `ucx-agent-skills/<skill_name>/`:
+Every skill lives in an isolated folder under `ucx-agent-skills/<skill_name>/`, at the top
+level of the git checkout the head runs in (or in the working folder outside one). Note
+that the open-source release ships this store empty: its skill packages are kept with the development repository, so a fresh checkout or an installed package has none until `ucx skill` writes one. The shipped skills and their pins described below exist only where
+those packages do. When the folder is not there, a head says so rather than starting
+with no skills in silence: a CLI head prints one line on stderr, and Settings › Skills says
+no skill folder was found (`store_missing` in `/api/skills`).
 
 ```text
 ucx-agent-skills/
@@ -134,12 +139,15 @@ class SkillManifest(BaseModel):
 | `origin: SkillOrigin` | **Required, no default.** A skill that cannot say who wrote it cannot be governed. `SkillOrigin` is `HUMAN` / `SYNTHESIZED`; the distinction is load-bearing because a synthesized skill is code an LLM authored, and the runtime must tell the two apart without inferring it from a directory name. |
 | `status: SkillStatus` | **Defaults to `PENDING`** — quarantine. A package exists on disk and is inert until something promotes it. `SkillStatus` is the closed set `PENDING` / `ACTIVE` / `QUARANTINED` / `REJECTED`. |
 | `requested_isolation` | **Advisory only.** It is what the `SKILL.md` *asked for*. The runtime decides the actual level, because an agent that writes its own manifest would otherwise grant itself host execution. |
-| `content_sha256` | Digest of the package contents at audit time, so a later edit is detectable and **an audit cannot be inherited by different code**. |
+| `content_sha256` | The digest `ucx skill approve` took, recorded for a reader. **Informational only** (#1720): a load checks the digest pinned outside the package (§7.2), never this field, because whoever edits the package can rewrite it in the same edit. |
 | `approved_by` / `approved_at` / `rejected_by` / `rejected_at` / `rejection_reason` | Promotion and rejection provenance, written by the CLI gate (§7). |
 
 `compute_skill_sha256(dir)` hashes the regular files it lists under the package whose names
 do not start with a dot, in sorted order, mixing in each POSIX-relative path so a rename
-changes the digest. It raises `SkillAuditError` on a non-existent or non-directory path (a
+changes the digest. Its docstring is the one statement of **the digest rule** (#1751): the
+package's own `SKILL.md` is hashed without the frontmatter line
+`content_sha256: <64 lowercase hex digits>` (bare or single-quoted), so recording the digest
+does not change it. A line in any other form, and the same line in the body, is hashed. It raises `SkillAuditError` on a non-existent or non-directory path (a
 single file is hashed directly). It follows a link to a file and does not descend into a
 link to a folder; files under a folder link, FIFOs, sockets, devices and broken links are
 not in the digest. It fails closed: a folder it cannot list, a file it cannot read, or a
@@ -150,7 +158,8 @@ and exits 1 with the skill unchanged, and `reload_approved` does not load the sk
 `reload_approved` logs at warning level, with the reason, each package that fails to load
 or to be audited, and each skill marked active whose audit does not approve it (#1604);
 a package that is not active, or a folder without a `SKILL.md`, is skipped without a log
-line. On Python 3.14,
+line. An active package whose audit passes is still refused unless its digest is pinned
+(§7.2). On Python 3.14,
 where `Path.is_file()` answers False for every error, the walk stats each entry itself,
 so a file whose stat is refused still fails the audit instead of being left out.
 
@@ -363,7 +372,7 @@ flowchart TD
     Verdict -->|approve / require_human_review| Approve
     Verdict -->|reject| Blocked["Blocked<br/>(--force overrides)"]
     Blocked -.->|"--force"| Approve
-    Approve --> Active["status: active<br/>+ approved_by, approved_at,<br/>+ content_sha256 from the report"]
+    Approve --> Active["status: active<br/>+ approved_by, approved_at, content_sha256<br/>+ pin in the approvals ledger"]
     Reject --> Rejected["status: rejected<br/>+ rejected_by, rejected_at, rejection_reason"]
     Active --> Registry["SkillRegistry.register(skill, report)"]
 ```
@@ -377,13 +386,14 @@ The transitions are **writes to the `SKILL.md` frontmatter on disk**, performed 
 | :--- | :--- |
 | `./ucx skill list [--pending] [--all] [--dir PATH]` | Loads every `<dir>/*/SKILL.md` and tables name, version, origin, status, requested isolation, approver, description. `--pending` filters to `PENDING` and `QUARANTINED`; `REJECTED` is hidden unless `--all`. Unparseable packages are skipped silently. |
 | `./ucx skill audit <name> [--policy safe_only\|never\|always]` | Runs the auditor and prints verdict, `is_safe`, risk score, evaluated policy, content digest and every detected risk. **Read-only** — it changes no status. Exits 1 on an audit error or an invalid policy. |
-| `./ucx skill approve <name> [--approver ID] [--force]` | Re-runs the auditor, then on a non-`REJECT` verdict writes `status: active`, `approved_by`, `approved_at` (UTC ISO-8601), and `content_sha256` **from the fresh report** — binding the approval to the bytes that were just audited. Clears any prior rejection fields. A `REJECT` verdict exits 1 and lists the risks unless `--force` is given. An already-`ACTIVE` skill is a no-op without `--force`. An audit that cannot finish (`SkillAuditError`, e.g. a folder the hash cannot list) exits 1 with the reason and changes nothing, `--force` included. |
-| `./ucx skill reject <name> [--reason TEXT] [--rejecter ID]` | Writes `status: rejected` plus `rejected_by`, `rejected_at`, `rejection_reason`. Runs **no** audit and has no `--force`; rejection needs no justification from the auditor. |
+| `./ucx skill approve <name> [--approver ID] [--force]` | Re-runs the auditor and asks for a typed "yes" at the terminal it was run from (#1589), then on a non-`REJECT` verdict writes `status: active`, `approved_by`, `approved_at` (UTC ISO-8601), takes the digest of the package **as that write left it**, records it as `content_sha256`, and pins it in the approvals ledger (§7.2, #1720). Clears any prior rejection fields. A `REJECT` verdict exits 1 and lists the risks unless `--force` is given. An `ACTIVE` skill whose current digest is already pinned is a no-op without `--force`; one edited since its approval is audited and asked about again. An audit that cannot finish (`SkillAuditError`, e.g. a folder the hash cannot list) exits 1 with the reason and changes nothing, `--force` included. |
+| `./ucx skill reject <name> [--reason TEXT] [--rejecter ID]` | Removes the skill's pin from the approvals ledger, then writes `status: rejected` plus `rejected_by`, `rejected_at`, `rejection_reason`. Runs **no** audit and has no `--force`; rejection needs no justification from the auditor. |
 
 Reachable states: `PENDING` (the default on disk) → `ACTIVE` via `approve`, or
 → `REJECTED` via `reject`; `REJECTED` → `ACTIVE` via `approve` (which clears the
 rejection fields). `QUARANTINED` is a defined `SkillStatus` that **no shipped code
-path ever writes** — only `list` reads it. There is no `./ucx skill revoke`.
+path ever writes** to a `SKILL.md` — only `list` reads it there. `get_summary` reports a
+skill the store refused as `quarantined` (§7.2). There is no `./ucx skill revoke`.
 
 `--force` is worth naming plainly: it is a documented override that promotes a skill the
 auditor rejected. It records the human approver in `approved_by`, so the act is
@@ -393,6 +403,40 @@ attributable — but it means a `REJECT` verdict is advisory at the CLI, not bin
 `test_cli_skill_approve_blocks_dangerous_unless_forced`,
 `test_cli_skill_reject_records_provenance`, `test_cli_skill_audit_command`,
 `test_cli_skill_list_and_filtering` and the two missing-skill exit-code cases.
+
+### 7.2 Approval pins (Implemented, #1720)
+
+An approval names the bytes that were approved, and it is kept where an edit to the package
+cannot reach it:
+
+* **A person's skills** are pinned in their approvals ledger,
+  `~/.uclone/skills/approvals.json` (`UCLONE_SKILL_APPROVALS_DIR` overrides the folder),
+  one pin per skill name (`src/uclone_x/skills/approvals.py`). `approve` writes it, `reject`
+  removes it, and the file is replaced in one step.
+* **The skills that ship in `ucx-agent-skills/`** are pinned in
+  `src/uclone_x/skills/shipped_pins.py`. Nobody is at a terminal when they are installed, so
+  their approval is reviewed code instead: changing a shipped `SKILL.md` means changing its
+  pin in the same change, and a unit test recomputes every shipped digest against
+  it. Rejected alternative: a committed manifest file beside the
+  packages — it would be one more file an edit to the store could change alongside the
+  skill, and a Python constant is imported, not parsed.
+
+`FileSystemSkillStore` loads an active package only when the audit approves it **and** its
+current digest is its ledger pin or its shipped pin. A refused package is kept in
+`store.refused`; `SkillRegistry.get_summary` lists it as `quarantined` with the reason as a
+code, `not_loaded_code` with `not_loaded_params` (#1777). The codes are
+`SkillRefusalCode` in `src/uclone_x/skills/refusals.py`: changed after approval, approved
+before pins, never approved, failed the safety check, check not finished (the audit could
+not read the package), and unreadable (the instructions did not parse; listed under the
+folder name). The Settings Skills panel words the code from its catalog, in the person's
+language, under "Why it is not used"; `not_loaded_reason` carries the English sentence for
+the log, the CLI and a head that does not know the code. `InMemorySkillStore` is trusted and
+checks no pin.
+
+Cost accepted: a skill approved before this change has no pin, and the digest rule changed,
+so it is refused until it is approved again. Such a skill still names its approver in its
+file, so it is told apart (`approved_before_pins`), and the panel shows one line listing
+every such skill with the command to run.
 
 ---
 
@@ -429,8 +473,12 @@ class AutoApprovalPolicy(StrEnum):
 > divergence: the concrete `SkillAuditor.__init__` and `./ucx skill approve` both pass
 > `AutoApprovalPolicy.SAFE_ONLY`, carried over from the pre-decision status quo in P9 /
 > PRD FR-5.4. That constructor value is an unratified implementation placeholder and
-> must not be read as the settled position. It also currently costs nothing in practice:
-> with no synthesizer implemented, every package in `ucx-agent-skills/` was written by a human.
+> must not be read as the settled position. The packages that ship in
+> `ucx-agent-skills/` are prose with no scripts. Builder agents wrote them, so their
+> manifests record `origin: synthesized`, which `SkillOrigin` defines as code an LLM
+> authored; none was produced by the runtime synthesizer (`ucx skill synthesize`). They
+> were approved with `ucx skill approve` under an agent approver string, not by a human.
+> Their approval is now the pin in `src/uclone_x/skills/shipped_pins.py` (§7.2).
 
 ---
 
@@ -452,7 +500,9 @@ findings.
    `SkillRegistry.register` checks `skill.manifest.status is SkillStatus.ACTIVE`
    **before** the `is_safe`/`APPROVE` test and returns early on a match. A package whose
    own frontmatter says `status: active` therefore registers even against a `REJECT`
-   report — confirmed by direct execution. The content-hash binding does not close this,
+   report — confirmed by direct execution. *(2026-09-27: the file-system store every head
+   uses no longer hands `register` such a package unless its audit approves it and its
+   digest is pinned outside it, §7.2; `register`'s own branch is unchanged.)* The content-hash binding does not close this,
    because it is skipped whenever *either* digest is `None`, and nothing requires a
    manifest to carry one. Since `status` is a field a synthesized `SKILL.md` writes
    about itself, this is the same self-granted-privilege shape that
@@ -462,21 +512,29 @@ findings.
    self-declared field is not.
 3. **Nothing verifies an approval.** `approved_by` is whatever string `--approver` was
    given (default `human:developer`); there is no signature, no identity check, and no
-   audit log outside the frontmatter itself. The same file the skill controls records who
-   approved it.
+   audit log outside the frontmatter itself. The approvals ledger (§7.2) now holds what
+   was approved outside the package, but it is a plain file in the person's home, writable
+   by anything that runs as them.
 4. **No synthesizer** (§5.1), so autonomous synthesis — P9's headline claim and PRD
    FR-5.2 — is unimplemented. Consequently the whole quarantine mechanism is currently
    unexercised by real synthesized code.
-5. **No hot-reload, and no binding path.** PRD FR-5.3's runtime hot-reload does not
-   exist. `SkillRegistry` is an in-process dict with no watcher; `registry.load_all()`
-   and `agent.bind_skill(...)` — shown in earlier revisions of this document — are not
-   defined anywhere in `src/`. Nothing consumes a registered skill yet.
+5. **Loaded once, at startup; no hot-reload.** The web app (`create_ui_app`'s lifespan)
+   and the CLI heads (`run`, `loop`, `room`, `a2a`, `acp`) build their registry over
+   `runtime_skill_store_dir()` and call `load_approved_skills`, which re-audits every
+   `active` package and registers those that pass. An agent given that registry gets the
+   `load_skill` tool and lists the approved skills in its system turn. PRD FR-5.3's
+   runtime hot-reload does not exist: `SkillRegistry` is an in-process dict with no
+   watcher, so a skill approved while a head runs reaches it only after a restart.
+   `registry.load_all()` and `agent.bind_skill(...)` — shown in earlier revisions of this
+   document — are not defined anywhere in `src/`.
 6. **`./ucx skill add` and `./ucx skill teach` do not exist.** Earlier revisions of this
    document showed both. The implemented commands are exactly `list`, `audit`,
    `approve`, `reject`.
-7. **No revoke, no version pinning, no TTL or size bound** on `ucx-agent-skills/`, all of which
-   `2026-09-02-002` asked for.
-8. **`QUARANTINED` is unreachable** (§7.1).
+7. **No revoke, no TTL or size bound** on `ucx-agent-skills/`, all of which
+   `2026-09-02-002` asked for, alongside version pinning. Pinning now exists (§7.2);
+   `reject` removes a pin, which is the nearest thing to a revoke.
+8. **`QUARANTINED` is never written to disk** (§7.1). `get_summary` reports a skill the store
+   refused as `quarantined` (§7.2), but nothing records that status in a `SKILL.md`.
 9. **The auditor parses only Python.** Bash, SQL and every other script in a package is
    unexamined except for the shell-pattern scan of the markdown body.
 10. **`requested_isolation` is advisory and nothing consumes it.** No execution path

@@ -128,8 +128,10 @@ class _Classes:
 
     `half dead`, `HalfDead`, `HALF_DEAD` and `halfdead` are one class, and so are `dead`,
     `DEAD` and `Dead`. A class is spelled as it was first seen in one check, each word's
-    first letter raised: `half dead` is `HalfDead`, and `HalfDead` stays `HalfDead`. The
-    rules are read first, so a class a rule names is shown as the rule spells it
+    first letter raised: `half dead` is `HalfDead`, and `HalfDead` stays `HalfDead`. In a
+    name of several words, a word in capitals is written as a word, so `HALF-dead` and
+    `HALF_DEAD` are `HalfDead` rather than `HALFDead` (#1613); a one-word name keeps its
+    capitals (`DEAD`, `NPCAlive`). The rules are read first, so a class a rule names is shown as the rule spells it
     (`NPCAlive`, not `NpcAlive` from a codex `npc alive`); then the scene's facts, then
     the codex.
     """
@@ -138,9 +140,10 @@ class _Classes:
         self._spelling: dict[str, str] = {}
 
     def __call__(self, raw: str) -> str:
-        spelled = "".join(
-            part[:1].upper() + part[1:] for part in _WORD_JOIN.split(_nfc(raw)) if part
-        )
+        words = [part for part in _WORD_JOIN.split(_nfc(raw)) if part]
+        if len(words) > 1:
+            words = [word.capitalize() if word.isupper() else word for word in words]
+        spelled = "".join(word[:1].upper() + word[1:] for word in words)
         return self._spelling.setdefault(spelled.casefold(), spelled)
 
 

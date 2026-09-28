@@ -13,6 +13,7 @@ explicitly: the default workspace is the process's cwd, which here is the checko
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import Any, cast
 
@@ -103,6 +104,18 @@ def _client(workspace: Path, llm: MockLLMConnector | None = None) -> TestClient:
         workspace_dir=workspace,
     )
     return TestClient(app)
+
+
+async def _take_turn(manager: AgentSessionManager, agent_id: str, session_id: str) -> None:
+    """One chat turn with the persona, the way a room seat drives its clone."""
+    agent = await manager.get_or_create_agent(agent_id, session_id=session_id)
+    result = await agent.execute_turn("go")
+    assert result.error is None, result.error
+
+
+def _turn(client: TestClient, agent_id: str, session_id: str) -> None:
+    manager = cast(AgentSessionManager, cast(Any, client.app).state.session_manager)
+    asyncio.run(_take_turn(manager, agent_id, session_id))
 
 
 def _draft(name: str = "surveyor", **overrides: Any) -> dict[str, Any]:
@@ -479,9 +492,8 @@ def test_a_running_agent_takes_the_edited_prompt_and_tools_on_its_next_turn(
     llm = _RecordingConnector()
     client = _client(workspace, llm)
     assert client.post("/api/personas", json=_draft()).status_code == 201
-    turn = {"message": "go", "agent_id": "surveyor", "session_id": "sess_survey"}
 
-    assert client.post("/api/turn", json=turn).status_code == 200
+    _turn(client, "surveyor", "sess_survey")
     assert _system_sent(llm.requests[-1]) == "You survey.\nReport  \n what you map."
     assert _own_tools_sent(llm.requests[-1]) == ["map_area"]
 
@@ -492,7 +504,7 @@ def test_a_running_agent_takes_the_edited_prompt_and_tools_on_its_next_turn(
     assert res.status_code == 200, res.text
     assert res.json()["live_agents_updated"] == 1
 
-    assert client.post("/api/turn", json=turn).status_code == 200
+    _turn(client, "surveyor", "sess_survey")
     assert _system_sent(llm.requests[-1]) == "You dig now."
     assert _own_tools_sent(llm.requests[-1]) == ["dig_site"]
 
@@ -510,20 +522,14 @@ def test_an_edit_reaches_every_live_agent_seated_as_that_persona_and_no_other(
     assert client.post("/api/personas", json=_draft()).status_code == 201
     assert client.post("/api/personas", json=_draft(name="digger")).status_code == 201
     for agent_id, session_id in (("surveyor", "s1"), ("surveyor", "s2"), ("digger", "s3")):
-        chat = {"message": "go", "agent_id": agent_id, "session_id": session_id}
-        assert client.post("/api/turn", json=chat).status_code == 200
+        _turn(client, agent_id, session_id)
 
     res = client.put(
         "/api/personas/surveyor", json=_draft(system_prompt="Edited.", allowed_tools=["dig_site"])
     )
 
     assert res.json()["live_agents_updated"] == 2
-    assert (
-        client.post(
-            "/api/turn", json={"message": "go", "agent_id": "digger", "session_id": "s3"}
-        ).status_code
-        == 200
-    )
+    _turn(client, "digger", "s3")
     assert _system_sent(llm.requests[-1]) == "You survey.\nReport  \n what you map."
     assert _own_tools_sent(llm.requests[-1]) == ["map_area"]
 
@@ -556,8 +562,7 @@ def test_a_sub_agent_of_a_tool_scoped_persona_gets_only_the_parent_s_tools_edits
         portal = client.portal
         assert portal is not None
         assert client.post("/api/personas", json=_draft()).status_code == 201
-        turn = {"message": "go", "agent_id": "surveyor", "session_id": "sess_sub"}
-        assert client.post("/api/turn", json=turn).status_code == 200
+        portal.call(_take_turn, manager, "surveyor", "sess_sub")
         parent = manager.get_agent("surveyor", "sess_sub")
         assert parent is not None
 

@@ -9,7 +9,7 @@
  * name was the more reassuring of the two statements, so it was the one likelier to be
  * believed.
  *
- * `emptyCause` returns one of the three sentences below. A region that shows it shows
+ * `emptyCause` returns one of the three sentences in the `emptyStates` catalog. A region that shows it shows
  * the same cause and the same remedy as every other region calling this function with
  * the same arguments.
  *
@@ -17,26 +17,30 @@
  * with three different remedies and a bare empty container renders them identically.
  */
 
-/** No model is configured: the setting exists and holds nothing. */
-export const NO_MODEL_CAUSE = 'No model is configured. Pick one in Settings.';
+import { en, type Messages } from '../i18n/en';
+
+/** No model is configured: the setting exists and holds nothing. English; `emptyStates.noModel`. */
+export const NO_MODEL_CAUSE = en.emptyStates.noModel;
 
 /** A model is configured, but the runtime offers no clone to send a message to. */
-export const NO_AGENTS_CAUSE = 'No clones are set up yet — add one in Settings.';
+export const NO_AGENTS_CAUSE = en.emptyStates.noAgents;
 
 /** Model and clones are both present; the user simply has not started anything. */
-export const NO_CONVERSATIONS_CAUSE = 'No conversations yet. Press New to start one.';
+export const NO_CONVERSATIONS_CAUSE = en.emptyStates.noConversations;
 
 /**
  * Why this region is empty, in one sentence naming a cause and a remedy.
  *
  * @param modelConfigured Whether a model is configured. `null` is "the runtime has not
  *   answered yet" and is deliberately not collapsed onto `false`.
- * @param agentCount How many clones the runtime can offer. The parameter keeps the wire's
- *   word: it is fed from `AgentInfo[]`, which is Core contract and does not get renamed.
+ * @param agentCount How many clones the runtime can offer: the rail's clone list, which the
+ *   persona catalog fills.
+ * @param copy The sentences, in the screen's language (`useCopy().emptyStates`). English when
+ *   omitted, which is what a caller outside a `LocaleProvider` reads anyway.
  */
-export const emptyCause = (modelConfigured: boolean | null, agentCount: number): string =>
-  modelConfigured === false
-    ? NO_MODEL_CAUSE
-    : agentCount === 0
-      ? NO_AGENTS_CAUSE
-      : NO_CONVERSATIONS_CAUSE;
+export const emptyCause = (
+  modelConfigured: boolean | null,
+  agentCount: number,
+  copy: Messages['emptyStates'] = en.emptyStates,
+): string =>
+  modelConfigured === false ? copy.noModel : agentCount === 0 ? copy.noAgents : copy.noConversations;

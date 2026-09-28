@@ -1,0 +1,11 @@
+sessions:
+  - room_id: writer-session-1
+    opened_at: "2026-09-21T10:00:00Z"
+    closed_at: "2026-09-21T12:00:00Z"
+    scenes_written: [ch01.s01, ch01.s02, ch01.s03]
+    summary: 1장을 마쳤다. 예린이 라온에게 월광검을 물려주었고, 은월성 습격 때 라온을 지키다 카엘의 칼에 전사했다.
+  - room_id: writer-session-2
+    opened_at: "2026-09-22T10:00:00Z"
+    closed_at: "2026-09-22T11:00:00Z"
+    scenes_written: [ch02.s01]
+    summary: 라온과 도윤이 안개숲으로 피했고, 카엘이 라온에게서 월광검을 빼앗아 사라졌다. 라온에게는 빈 칼집만 남았다. 다음은 모닥불 씬(ch02.s02).

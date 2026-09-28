@@ -61,7 +61,7 @@ def compose_system_message(identity: str, slow_context: str) -> str:
 
 
 def place_turn_context(messages: list[ChatMessage], block: str) -> list[ChatMessage]:
-    """Put the turn-context `block` at the tail of `messages`; see `BaseAgent`'s `_turn_context_block`.
+    """Put the turn-context `block` at the tail of `messages`; see `agent.prompt_assembler.turn_context_block`.
 
     It joins the last message when that is the user's, so no two user messages are
     adjacent, and follows as a message of its own otherwise.

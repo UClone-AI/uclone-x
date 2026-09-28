@@ -2,9 +2,12 @@ import { describe, expect, it, vi } from 'vitest';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import React from 'react';
 import { PersonaManager, type PersonaManagerProps } from './PersonaManager';
-import { PERSONA_EDITOR_COPY } from '../../lib/personaCopy';
+import { en } from '../../i18n/en';
+import { fmt, plural } from '../../i18n/format';
 import type { PersonaSaveResult } from '../../lib/personaDraft';
 import { makePersonaInfo } from '../../test/fixtures';
+
+const PERSONA_EDITOR_COPY = en.personaEditor;
 
 /**
  * The persona list and its editor (#892). Saving is a callback whose result decides what
@@ -53,7 +56,7 @@ describe('PersonaManager', () => {
 
     expect(screen.getByTestId('persona-row-guide')).toHaveTextContent(PERSONA_EDITOR_COPY.builtinBadge);
     expect(screen.getByTestId('persona-row-reader')).toHaveTextContent(PERSONA_EDITOR_COPY.overrideBadge);
-    expect(screen.getByText(PERSONA_EDITOR_COPY.savedTo('/work/.uclone/personas'))).toBeInTheDocument();
+    expect(screen.getByText(fmt(PERSONA_EDITOR_COPY.savedTo, { dir: '/work/.uclone/personas' }))).toBeInTheDocument();
   });
 
   it('states why the list is empty', () => {
@@ -88,7 +91,7 @@ describe('PersonaManager', () => {
     fireEvent.click(screen.getByRole('button', { name: PERSONA_EDITOR_COPY.save }));
 
     await waitFor(() =>
-      expect(screen.getByRole('status')).toHaveTextContent(PERSONA_EDITOR_COPY.saved('surveyor', 1)),
+      expect(screen.getByRole('status')).toHaveTextContent(plural(PERSONA_EDITOR_COPY.savedWithLive, 1, { name: 'surveyor' })),
     );
     expect(props.onSave).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -256,7 +259,7 @@ describe('PersonaManager', () => {
     renderManager({ loadError: 'The clones folder is missing.' });
 
     expect(screen.getByRole('alert')).toHaveTextContent(
-      PERSONA_EDITOR_COPY.loadFailed('The clones folder is missing.'),
+      fmt(PERSONA_EDITOR_COPY.loadFailedBecause, { reason: 'The clones folder is missing.' }),
     );
   });
 });

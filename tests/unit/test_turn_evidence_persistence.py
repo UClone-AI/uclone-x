@@ -17,13 +17,18 @@ nothing.
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from typing import Any
+from typing import Any, NoReturn
 
 import pytest
 from pydantic import BaseModel, Field
 
-from uclone_x.agent.base import EVIDENCE_REQUIRED_NUDGE, BaseAgent
+from uclone_x.agent.base import (
+    BaseAgent,
+)
 from uclone_x.agent.models import AgentConfig, AgentLLMConfig
+from uclone_x.agent.nudges import (
+    EVIDENCE_REQUIRED_NUDGE,
+)
 from uclone_x.core.provenance import ExecutionPath, Provenance, ServiceRef
 from uclone_x.llm.connectors.base import BaseLLMConnector
 from uclone_x.llm.models import (
@@ -122,7 +127,7 @@ async def test_the_turn_reports_how_many_steps_it_took() -> None:
     tool executions a turn produced but not how many model round-trips produced them. The
     eval harness needs both to compare effort against a task's declared horizon.
 
-    Killed by: src/uclone_x/agent/base.py :: self._run_steps = step
+    Killed by: src/uclone_x/agent/turn_executor.py :: self._run_steps = step
     Becomes: self._run_steps = step + 1
     """
     llm = ScriptedLLM([_call("tc_1"), _answer("done")])
@@ -144,7 +149,7 @@ async def test_an_unevidenced_answer_is_sent_back_for_evidence() -> None:
     as a message — a continuation the model never sees is the #584 failure in another
     costume.
 
-    Killed by: src/uclone_x/agent/base.py :: EVIDENCE_REQUIRED_NUDGE,
+    Killed by: src/uclone_x/agent/turn_executor.py :: nudges.EVIDENCE_REQUIRED_NUDGE,
     Becomes: "",
     """
     llm = ScriptedLLM([_answer("It is 100, inferred from common defaults."), _call("tc_1")])
@@ -167,7 +172,8 @@ async def test_the_nudge_is_sent_once_and_then_the_answer_stands() -> None:
     terminated only by the step budget — turning a cheap wrong answer into an expensive
     one. One nudge, then the second answer is returned as it is.
 
-    Killed by: src/uclone_x/agent/base.py :: evidence_nudged = True
+    Killed by: src/uclone_x/agent/turn_executor.py :: evidence_nudged = True
+    Becomes: evidence_nudged = False
     """
     llm = ScriptedLLM([_answer("still no tools")])
     agent = _agent(llm, require_evidence=True)
@@ -203,7 +209,8 @@ async def test_an_answer_that_used_a_tool_is_not_nudged() -> None:
     only that. What the old data actually demonstrated now has its own test,
     `test_an_answer_whose_figure_was_never_read_is_sent_back_once`.
 
-    Killed by: src/uclone_x/agent/base.py :: and not tool_executions
+    Killed by: src/uclone_x/agent/turn_executor.py :: tool_outcome_of(record) == ToolOutcome.PRODUCTIVE.value
+    Becomes: tool_outcome_of(record) == "never"
     """
     llm = ScriptedLLM([_call("tc_1"), _answer("the tool returned result 2")])
     agent = _agent(llm, require_evidence=True)
@@ -224,7 +231,7 @@ async def test_an_agent_with_no_tools_is_not_nudged() -> None:
     A toolless agent has nothing to call, so the nudge would be answered in prose every
     time. The guard has to be on the means, not only on the setting.
 
-    Killed by: src/uclone_x/agent/base.py :: and nothing_found  # evidence nudge when tools found nothing
+    Killed by: src/uclone_x/agent/turn_executor.py :: and nothing_found  # evidence nudge when tools found nothing
     Becomes: or nothing_found  # evidence nudge when tools found nothing
     """
     llm = ScriptedLLM([_answer("no tools here")])
@@ -286,7 +293,7 @@ async def test_a_blocked_turn_does_not_report_the_previous_turns_steps() -> None
 
     Found in review of #702, after four of five return paths turned out to be unpinned.
 
-    Killed by: src/uclone_x/agent/base.py :: stop_reason: TurnStopReason = "not_started"
+    Killed by: src/uclone_x/agent/turn_executor.py :: stop_reason: TurnStopReason = "not_started"
     Becomes: stop_reason: TurnStopReason = "not_started"; self._run_steps = 3
     """
     llm = ScriptedLLM([_call("tc_1"), _call("tc_2"), _answer("done")])
@@ -296,7 +303,9 @@ async def test_a_blocked_turn_does_not_report_the_previous_turns_steps() -> None
     first = await agent.execute_turn("do some work")
     assert first.steps_taken >= 2, "the first turn needs steps for the bug to be visible"
 
-    async def _raise_before_the_loop(*_args: object, **_kwargs: object) -> None:
+    # `_prepare_turn_layers` is synchronous: an `async def` here returns an un-awaited
+    # coroutine instead of raising, and the turn fails later on an attribute error.
+    def _raise_before_the_loop(*_args: object, **_kwargs: object) -> NoReturn:
         raise RuntimeError("blocked before any step ran")
 
     monkeypatch = pytest.MonkeyPatch()
@@ -307,6 +316,7 @@ async def test_a_blocked_turn_does_not_report_the_previous_turns_steps() -> None
         monkeypatch.undo()
 
     assert second.is_completed is False
+    assert second.error == "blocked before any step ran"
     assert second.steps_taken == 0, (
         f"a turn that ran no step reported {second.steps_taken}, which is the previous turn's count"
     )
@@ -357,7 +367,7 @@ async def test_a_self_contained_answer_survives_when_evidence_nudge_is_declined(
     restore it, rather than turning it into an abstention or leaving duplicate assistant
     messages in history.
 
-    Killed by: src/uclone_x/agent/base.py :: resp_content = first_answer
+    Killed by: src/uclone_x/agent/turn_executor.py :: resp_content = first_answer
     Becomes: pass
     """
     llm = ScriptedLLM(
@@ -387,7 +397,7 @@ async def test_a_materially_equivalent_answer_declines_evidence_nudge() -> None:
     answer (materially equivalent in prose without tool use), the nudge cost a turn and had
     nothing to add: the first answer survives and an EVIDENCE_NUDGE_DECLINED event is recorded.
 
-    Killed by: src/uclone_x/agent/base.py :: "type": "EVIDENCE_NUDGE_DECLINED",
+    Killed by: src/uclone_x/agent/turn_executor.py :: "type": "EVIDENCE_NUDGE_DECLINED",
     Becomes: "type": "EVIDENCE_NUDGE",
     """
     llm = ScriptedLLM(

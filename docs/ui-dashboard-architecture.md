@@ -36,7 +36,15 @@ semantics — one of three reset implementations in the repository that disagree
 each other. The conversation now lives in `uclone_x.agent.session.SessionStore` and this
 class is its client.
 
-What remains here is the **presentation transcript**: per-message ids, timestamps,
+**Since #1731 nothing writes the presentation transcript.** The single-agent chat routes
+that wrote and served it (`/api/turn`, `/api/session/history`) are removed, and every
+conversation is a room (D1 Rev 23). Transcripts already on disk are kept and are still read
+when an agent is resumed: when its Core session record exists, the transcript's messages are
+loaded as they are; only when it does not does `reconstruct_history` rebuild the model's
+history from the transcript (#183; corrected 2026-09-27, #1775). The paragraphs below
+describe what such a file holds.
+
+What remained here was the **presentation transcript**: per-message ids, timestamps,
 latency, token counts, the display provenance block, and on a prompt the optional
 `client_turn_id` the head sent the turn with (#1000) — how a head reloading the
 conversation recognises its own turn's saved copy without comparing prompt text — which
@@ -55,9 +63,9 @@ holds its failures as assistant rows reading `Error: ...` under degraded provena
 are served as they were saved and, by that shape, are also kept out of a rebuilt context.
 
 **How a turn ended is a structured field, and the head names it from nothing else** (#1007
-item 4). The `/api/turn` result and every saved agent row carry `outcome`
-(`ChatTurnOutcome` in `uclone_x.ui.app`), and a failed turn also carries `error` and
-`refusal`. The chat head shows one chip per turn from it:
+item 4). Every saved agent row carries `outcome` (`ChatTurnOutcome`, in
+`uclone_x.ui.app` until #1731), and a failed turn also carries `error` and `refusal`. The
+chat head showed one chip per turn from it:
 
 | `outcome` | Chip | Covers | Detail |
 | :--- | :--- | :--- | :--- |
@@ -85,12 +93,14 @@ exists yet; when one is built, each `role: "failure"` row is exported marked as 
 with its `error` -- never as assistant text, and never as model context. A failure is not
 something the agent said, in an export any more than on screen.
 
-| Endpoint | Delegates to | Notes |
-| :--- | :--- | :--- |
-| `DELETE /api/session/history` | `AgentSessionManager.clear_session_history` | Clears the transcript and resets the Core session. |
+The single-agent history routes are gone: #1731 removed `DELETE /api/session/history`,
+`GET /api/session/history` and `POST /api/session/history/truncate` with `/api/turn`. A
+conversation's history is cleared and rewound through `DELETE /api/rooms/{room_id}/history`
+and `POST /api/rooms/{room_id}/history/truncate`; both reset each seat through
+`AgentSessionManager.clear_session_history`.
 
 `POST /api/chat/reset` (`BaseAgent.reset_session`) and `POST /api/chat/compact`
-(`BaseAgent.compact_session`) were rows in this table until #1208 retired the playground
+(`BaseAgent.compact_session`) were routes of the same head until #1208 retired the playground
 that called them, and they have **no** successor: nothing else on the head reset or
 compacted a session by hand. Neither capability is lost at the Core, and neither is
 reachable from a browser. A room's agents compact themselves --- `AgentLLMConfig.auto_compact`
@@ -99,7 +109,7 @@ conversation is what a reset now means, which is the design's §3.2.5 reading an
 re-implementation of the routes. The manual triggers are listed as **missing** there.
 
 Path resolution for both the transcript and the Core record goes through the single
-`uclone_x.agent.session.resolve_session_path`. It previously existed twice, and a
+`uclone_x.core.session.resolve_session_path`. It previously existed twice, and a
 duplicated security control is one that gets fixed in a single copy.
 
 **One P8 gap remains, deliberately**: `get_or_create_agent` still reconstructs
@@ -124,7 +134,7 @@ flowchart TD
 
     subgraph BackendAPI["UClone-X Local Runtime (FastAPI / SSE)"]
         SSEEndpoint["GET /api/stream (Server-Sent Events)"]
-        StateEndpoint["GET /api/agents & /api/ontologies"]
+        StateEndpoint["GET /api/personas & /api/ontologies"]
         DispatchEndpoint["POST /api/dispatch (Task Injection)"]
     end
 
@@ -219,6 +229,9 @@ off):
    failed read shows the Core's own `detail` or a fixed sentence, never transport text. A seat that is not running is read from its saved knowledge
    record (#1367); a turn that set an unreadable record aside says so on its row; the clone's saved memory facts are another file and stay listed. This is U0's view of the same knowledge the developer Knowledge Graph draws; nothing
    on it names the graph's parts (#1357).
+   *Planned (#1638, owner ruling 2026-09-25, relayed by an agent; P7 amended to match, #1654):* one clone-wide list, "What {name} knows", with what
+   this conversation taught first, and **Correct** / **Forget** on each fact; the turn that taught
+   something says so on its row. See design/clone-knowledge-graph.md §3.6.
 5. **Activity & Tools** — the seat's tool calls in this conversation (`ActivityTimeline`):
    the recorded ones from `GET /api/rooms/{id}/seats/{pid}/history`, plus live `TOOL_CALL` /
    `TOOL_RESULT` envelopes on topic `room.{id}.tool`, matched without regard to case (#1353).
@@ -294,7 +307,10 @@ off):
 Developer drawer (rendered only in developer mode; see below):
 
 7. **Knowledge Graph** — the seat's knowledge graph in this conversation
-   (`KnowledgeGraphViewer`, `GET /api/rooms/{id}/knowledge?agent_id=`).
+   (`KnowledgeGraphViewer`, `GET /api/rooms/{id}/knowledge?agent_id=`). *Planned
+   (clone-knowledge-graph.md step 6):* it is to draw the
+   clone's graph across conversations, with a "this conversation only" filter. Until then it
+   draws the per-seat record, which nothing fills.
 8. **DAG** — the conversation's seats, its turns in order, the tools each called and the
    helpers a seat started (`TopologyTab`, `GET /api/rooms/{id}/topology`), in the order the
    Core's edges give (#1355).
@@ -383,7 +399,7 @@ records what each one replaced:
 | Knowledge Graph (developer drawer) | `GET /api/rooms/{id}/knowledge?agent_id=<seat>` | `GET /api/knowledge-graph`, which reads the manager's shared engine. That engine is never a seat's (P7). A seat not running in this process is read from its saved knowledge (#1367); with none saved the room read answers `status: "not_recorded"` with `null` lists, never an empty graph |
 | Remembers | `saved_facts[]` and `remembers[]` of the same knowledge read | Nothing: U0 had no view of what a clone remembers. The saved facts are listed on every status; `not_recorded`, `unreadable` and `no_ontology` show the Core's `reason` for the conversation's record |
 | Activity & Tools | `GET /api/rooms/{id}/seats/{seat}/history`, live on `room.{id}.tool` | The session's tool trace, which a seat's traces never reach (G2). A turn whose tools were not recorded carries `tools: null` and a reason, never `[]` |
-| DAG (developer drawer) | `GET /api/rooms/{id}/topology` | `GET /api/agents`, which lists the chat manager's agents. A seat is not among them. Every seated agent is a node, including an idle one |
+| DAG (developer drawer) | `GET /api/rooms/{id}/topology` | `GET /api/agents`, which listed the chat manager's agents (2026-09-27: `/api/agents` removed, #1775). A seat was not among them. Every seated agent is a node, including an idle one |
 
 Response shapes and the bus rows are in
 `design/unified-conversations-and-room-ui.md`

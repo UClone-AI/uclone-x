@@ -187,25 +187,20 @@ class VLLMConnector(OpenAIConnector):
     and its credential, to OpenAI if any future path reached it.
     """
 
-    _default_model: ClassVar[str] = ""
-    """Never read: `_resolve_request_model` is overridden and consults `VLLM_MODEL`.
-
-    Declared for the same reason as `_default_base_url`: the inherited value is `gpt-4o`,
-    which no vLLM server serves.
-    """
-
     def __init__(
         self,
         api_key: str | None = None,
         base_url: str | None = None,
         timeout: float = 60.0,
         http_client: httpx.AsyncClient | None = None,
+        model: str | None = None,
     ) -> None:
         super().__init__(
             api_key=api_key,
             base_url=resolve_vllm_base_url(base_url),
             timeout=timeout,
             http_client=http_client,
+            model=model,
         )
 
     @property
@@ -213,17 +208,16 @@ class VLLMConnector(OpenAIConnector):
         return "vllm"
 
     def _resolve_request_model(self, request: LLMRequest) -> str:
-        """The model to ask for: the caller's, else `VLLM_MODEL`, else a refusal.
+        """The model to ask for: the caller's, else the connector's, else `VLLM_MODEL`.
 
-        The base class defaults to `gpt-4o` here. Inheriting that would send a request no
-        vLLM server can answer and report the operator's missing configuration as the
-        model's non-existence.
+        With none of them, a refusal naming `VLLM_MODEL`: a vLLM server serves the one
+        model it was started with, so there is nothing a connector could fill in.
 
         Raises:
             LLMProviderNotConfiguredError: neither the request nor the environment names a
                 model.
         """
-        named = named_model(request)
+        named = named_model(request) or self._default_model
         if named is not None:
             return named
 

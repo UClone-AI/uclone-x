@@ -151,11 +151,11 @@ class TestTurnRecordEnrichment:
         finish reason exactly, and each tool result's `duration_ms` is the measured duration
         on the turn's own `ToolExecutionRecord` -- not merely a number (#1489 acceptance).
 
-        Killed by: src/uclone_x/agent/base.py :: "arguments": unwrap_immutable(tc.arguments),
+        Killed by: src/uclone_x/agent/turn_executor.py :: "arguments": unwrap_immutable(tc.arguments),
         Becomes: "arguments": {},
-        Killed by: src/uclone_x/agent/base.py :: "usage": usage.model_dump(mode="json") if usage is not None else None,
+        Killed by: src/uclone_x/agent/turn_executor.py :: "usage": usage.model_dump(mode="json") if usage is not None else None,
         Becomes: "usage": {"x": 1},
-        Killed by: src/uclone_x/agent/base.py :: "duration_ms": tr.duration_ms,
+        Killed by: src/uclone_x/agent/turn_executor.py :: "duration_ms": tr.duration_ms,
         Becomes: "duration_ms": 0.0,
         """
         store = SessionStore(storage_dir=tmp_path / "sessions")
@@ -319,9 +319,9 @@ class TestTurnRecordEnrichment:
         states and the turn's `usage` sums: the three figures agree (P6), and the thinking
         that streamed before the drop is kept.
 
-        Killed by: src/uclone_x/agent/base.py :: step_usages.append(progress.usage)
+        Killed by: src/uclone_x/agent/turn_executor.py :: step_usages.append(progress.usage)
         Becomes: pass
-        Killed by: src/uclone_x/agent/base.py :: progress.usage = self._book_partial_stream(
+        Killed by: src/uclone_x/agent/turn_executor.py :: progress.usage = self._book_partial_stream(
         Becomes: _ = self._book_partial_stream(
         """
         store = SessionStore(storage_dir=tmp_path / "sessions")
@@ -439,11 +439,11 @@ class TestTurnRecordEnrichment:
         and a provider count arrived. `MODEL_RESPONSE` keeps all three and names the
         `CancelledError`; the task still ends cancelled, not with a turn error.
 
-        Killed by: src/uclone_x/agent/base.py :: partial_content = progress.content if progress.content_chunks else None
+        Killed by: src/uclone_x/agent/turn_executor.py :: partial_content = progress.content if progress.content_chunks else None
         Becomes: partial_content = None
-        Killed by: src/uclone_x/agent/base.py :: "thinking": progress.thinking,
+        Killed by: src/uclone_x/agent/turn_executor.py :: "thinking": progress.thinking,
         Becomes: "thinking": None,
-        Killed by: src/uclone_x/agent/base.py :: progress.usage = cancelled_usage
+        Killed by: src/uclone_x/agent/turn_executor.py :: progress.usage = cancelled_usage
         Becomes: progress.usage = None
         """
         store = SessionStore(storage_dir=tmp_path / "sessions")
@@ -521,7 +521,7 @@ class TestTurnRecordEnrichment:
         `MODEL_RESPONSE` events in the log -- the tool call that ran and the failure that
         ended it.
 
-        Killed by: src/uclone_x/agent/base.py :: self._pending_durable_events.append(
+        Killed by: src/uclone_x/agent/session_lifecycle.py :: self._pending_durable_events.append(
         Becomes: self._pending_durable_events = [e for e in self._pending_durable_events if e.get("type") != "MODEL_RESPONSE"]; self._pending_durable_events.append(
         """
         sessions = SessionStore(tmp_path / "sessions")

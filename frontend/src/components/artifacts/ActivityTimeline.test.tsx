@@ -373,8 +373,8 @@ describe('ActivityTimeline labels the tools this runtime registers (#1463)', () 
  * real `Response` carrying the plain-text 500 the server sends.
  */
 describe('ActivityTimeline: a failed read shows no transport text (#1435)', () => {
-  // Killed by: frontend/src/components/artifacts/ActivityTimeline.tsx :: return read.fault.detail ?? activityReadFailedSentence(name);
-  // Becomes: return read.error ?? activityReadFailedSentence(name);
+  // Killed by: frontend/src/components/artifacts/ActivityTimeline.tsx :: return read.fault.detail ?? activityReadFailedSentence(name, t);
+  // Becomes: return read.error ?? activityReadFailedSentence(name, t);
   it('an unreachable runtime reads as a plain sentence', async () => {
     vi.unstubAllGlobals();
     const realFetch = globalThis.fetch;
@@ -414,8 +414,8 @@ describe('ActivityTimeline: a failed read shows no transport text (#1435)', () =
     expectPlain(screen.getByTestId('activity-empty-state').textContent);
   });
 
-  // Killed by: frontend/src/components/artifacts/ActivityTimeline.tsx :: return read.fault.detail ?? activityReadFailedSentence(name);
-  // Becomes: return activityReadFailedSentence(name);
+  // Killed by: frontend/src/components/artifacts/ActivityTimeline.tsx :: return read.fault.detail ?? activityReadFailedSentence(name, t);
+  // Becomes: return activityReadFailedSentence(name, t);
   it('a refusal in the Core’s own plain words is shown as it gave them', async () => {
     const detail = 'Scout is not seated in this conversation.';
     vi.stubGlobal(

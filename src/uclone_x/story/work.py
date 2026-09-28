@@ -433,6 +433,22 @@ class StoryWork:
             notes.append(f"The scene was written, but its revision was not logged: {exc}")
         return digest, notes
 
+    def last_writer(self, scene_id: str) -> str | None:
+        """The conversation that wrote the scene's current text, or None when unknown.
+
+        Unknown covers a scene never written through the log and a log that cannot be read:
+        the caller treats both as someone else's text.
+        """
+        relative = f"{HISTORY_DIR}/{scene_id}/revisions.yaml"
+        try:
+            found = self.read(relative)
+            if found is None:
+                return None
+            log = parse_file(RevisionLog, found.text, relative)
+        except (StoryError, StoryFileError):
+            return None
+        return log.revisions[-1].room_id if log.revisions else None
+
     def _log_revision(self, scene_id: str, revision: Revision, *, room_id: str) -> None:
         relative = f"{HISTORY_DIR}/{scene_id}/revisions.yaml"
         found = self.read(relative)

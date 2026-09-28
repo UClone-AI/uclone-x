@@ -18,8 +18,6 @@ export type { ConversationListProps } from './rail/ConversationList';
 export { PersonaDetail } from './rail/PersonaDetail';
 export type {
   CloneConversationsCopy,
-  CloneLiveness,
-  CloneLivenessCopy,
   ConversationListCopy,
   ConversationListIcons,
   ConversationTitleEditorCopy,
@@ -27,7 +25,6 @@ export type {
   EmptyCause,
   KitEscapeLayer,
   PersonaDetailCopy,
-  RailAgent,
   RailCopy,
   RailIcons,
   RailPersona,

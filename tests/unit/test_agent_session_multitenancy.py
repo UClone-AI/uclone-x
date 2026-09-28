@@ -21,7 +21,6 @@ from typing import Any, NamedTuple, cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from fastapi.testclient import TestClient
 from pydantic import BaseModel, ValidationError
 from typer.testing import CliRunner
 
@@ -42,6 +41,7 @@ from uclone_x.agent.session import (
     validate_session_id,
     verify_record_identity,
 )
+from uclone_x.agent.session_lifecycle import SessionLifecycle
 from uclone_x.cli import main as cli_main
 from uclone_x.cli.commands import run as run_module
 from uclone_x.core.provenance import ExecutionPath, Provenance, ServiceRef
@@ -71,7 +71,7 @@ from uclone_x.llm.models import (
 )
 from uclone_x.llm.protocols import ContextCompactorProtocol, LLMProviderProtocol
 from uclone_x.ontology.protocols import OntologyEngineProtocol
-from uclone_x.ui.app import AgentSessionManager, create_ui_app
+from uclone_x.ui.app import AgentSessionManager
 
 SYSTEM_PROMPT = "You are a careful assistant."
 
@@ -246,11 +246,12 @@ def test_save_is_atomic_and_leaves_no_temporary_files(tmp_path: Path) -> None:
 def test_save_works_without_a_running_event_loop(tmp_path: Path) -> None:
     """Headless synchronous callers must be able to persist a session.
 
-    `AgentSessionManager.save_session_record` builds its temporary filename from
-    `asyncio.get_running_loop().time()`, which raises `RuntimeError` when no loop is
-    running — so the UI's writer is unusable from the CLI REPL and the A2A path, the very
-    callers P8 says must reach session state without the UI. This test is synchronous on
-    purpose: it fails if that spelling is reintroduced here.
+    The UI's transcript writer, `AgentSessionManager.save_session_record` (since
+    retired), built its temporary filename from `asyncio.get_running_loop().time()`,
+    which raises `RuntimeError` when no loop is running — so it was unusable from the CLI
+    REPL and the A2A path, the very callers P8 says must reach session state without the
+    UI. This test is synchronous on purpose: it fails if that spelling is reintroduced
+    here.
     """
     store = SessionStore(storage_dir=tmp_path)
     saved = store.save(SessionState.seed("sess_sync", "agent-a", SYSTEM_PROMPT))
@@ -834,7 +835,9 @@ def test_the_store_default_root_is_read_from_the_module_constant(
     """
     fake_root = tmp_path / "elsewhere" / "sessions"
     monkeypatch.delenv(SESSION_STORAGE_DIR_ENV_VAR, raising=False)
-    monkeypatch.setattr("uclone_x.agent.session.DEFAULT_SESSION_STORAGE_DIR", fake_root)
+    # The resolver reads the constant from `core.session`, where it now lives (#1734);
+    # patching the name `agent.session` re-exports would redirect nothing.
+    monkeypatch.setattr("uclone_x.core.session.DEFAULT_SESSION_STORAGE_DIR", fake_root)
 
     store = SessionStore()
 
@@ -1640,7 +1643,8 @@ def test_a_directly_constructed_state_can_force_a_revision(tmp_path: Path) -> No
       never passed validation; this one is a valid `int`. See
       `test_the_constructor_door_family_closure_would_not_close_this_one`.
     * "No code under `src/` constructs a `SessionState` outside that module."
-      `agent/base.py` does. The true and now *enforced* bound is that nothing under `src/`
+      `agent/session_lifecycle.py` does (`agent/base.py` did, before #1736). The true and
+      now *enforced* bound is that nothing under `src/`
       **outside the store module** names a revision value — the store itself must, since
       it is what issues them. See `test_no_module_under_src_names_a_revision_value`.
 
@@ -1885,9 +1889,10 @@ def test_no_module_under_src_names_a_revision_value() -> None:
 
     **This replaces a sentence that was false when it was written.** `save`'s docstring
     said "no code under `src/` constructs or `model_copy`s a `SessionState` outside this
-    module, so it cannot happen by accident". `agent/base.py` does construct one — it is
-    where a live working copy becomes a record, and it has to. The bound was doing real
-    work in the decision to leave the forge open, and nothing was holding it up.
+    module, so it cannot happen by accident". `agent/base.py` did construct one — it was
+    where a live working copy becomes a record, and it has to; that site is
+    `agent/session_lifecycle.py` since #1736 moved `_LiveSession` there. The bound was
+    doing real work in the decision to leave the forge open, and nothing was holding it up.
 
     The true statement is narrower and stronger, and it is what this asserts: no module
     under `src/` ever **names** a revision. Every construction outside the store either
@@ -1944,7 +1949,9 @@ def test_no_module_under_src_names_a_revision_value() -> None:
     #
     # The guard is also a check, not a lock: `load` -> `if state is None` -> `save` is a
     # TOCTOU window.
-    assert constructors == {"agent.session", "agent.base", "agent.bootstrap"}, (
+    # `core.session_state`, not `agent.session`, since #1734 moved `SessionState` and the
+    # `with_messages` / `reset` constructions with it.
+    assert constructors == {"core.session_state", "agent.session_lifecycle", "agent.bootstrap"}, (
         f"the set of modules constructing a SessionState changed: {sorted(constructors)}. "
         "That set is not itself the rule — a new construction site is fine if it forwards "
         "a revision — but it is how this test knows its own visitor still resolves callee "
@@ -1962,10 +1969,10 @@ def test_no_module_under_src_names_a_revision_value() -> None:
         "If the store legitimately stopped writing the key as a string, re-point this "
         "witness at whatever site now exercises the clause — do not delete the check."
     )
-    assert "agent.base" in sweep.keyword_witnesses, (
+    assert "agent.session_lifecycle" in sweep.keyword_witnesses, (
         "the `revision=` keyword matcher fired in no module, so it is no longer observing "
-        "anything and an empty `offending` list below would prove nothing. `agent.base` "
-        "forwards a revision when a live working copy becomes a record; witnesses: "
+        "anything and an empty `offending` list below would prove nothing. "
+        "`agent.session_lifecycle` forwards a revision when a live working copy becomes a record; witnesses: "
         f"{sorted(sweep.keyword_witnesses)}. A site counts as a witness whether it forwards "
         "or offends, so this fires only when the matcher itself has gone dead."
     )
@@ -3308,8 +3315,11 @@ def test_the_second_door_points_back_at_the_family_too() -> None:
     code is split is what keeps both PRs' paragraphs true at their own SHA — the defect
     two reviewers converged on was a sentence in one seam claiming something about call
     sites in another.
+
+    The docstring moved with the body into `SessionLifecycle.load_history` (#1736);
+    `BaseAgent.load_history` is a one-line delegator to it, so that is where it is read.
     """
-    doc = BaseAgent.load_history.__doc__ or ""
+    doc = SessionLifecycle.load_history.__doc__ or ""
     assert _mentions_family(doc), "load_history does not point back at the family paragraph"
     # And it names the concrete door it closes, which the store seam deliberately cannot:
     # `_LiveSession` does not exist there, and naming it was the forward reference that
@@ -3876,6 +3886,39 @@ def test_the_traversal_guard_has_one_implementation_and_two_callers(tmp_path: Pa
             manager.get_session_path(bad)
 
 
+def _write_transcript(
+    manager: AgentSessionManager,
+    *,
+    session_id: str,
+    agent_id: str,
+    messages: list[dict[str, Any]],
+    turns: int = 1,
+) -> Path:
+    """Put a UI transcript on disk in the shape the retired writer left, and return its path.
+
+    `save_session_record` went with the legacy chat route: nothing in the product writes
+    transcripts any more, but installs carry them and `load_session_record` and
+    `clear_session_history` still read and remove them. So the readers are exercised
+    against a file written here, at the path the manager resolves.
+    """
+    path = manager.get_session_path(session_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "session_id": session_id,
+                "agent_id": agent_id,
+                "created_at": "2026-09-27T00:00:00+00:00",
+                "updated_at": "2026-09-27T00:00:00+00:00",
+                "turns": turns,
+                "messages": messages,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
 def test_the_ui_transcript_and_the_core_conversation_do_not_share_a_file(tmp_path: Path) -> None:
     """They have different schemas, so one filename would mean silent mutual overwrite.
 
@@ -3883,11 +3926,11 @@ def test_the_ui_transcript_and_the_core_conversation_do_not_share_a_file(tmp_pat
     for existing installs — and the Core conversation goes under `<storage_dir>/core/`.
     """
     manager = AgentSessionManager(storage_dir=tmp_path, fallback_to_mock=True)
-    manager.save_session_record(
+    _write_transcript(
+        manager,
         session_id="sess_a",
         agent_id="agent-a",
         messages=[{"sender": "user", "content": "a UI presentation record"}],
-        turns=1,
     )
     manager.core_store.save(
         SessionState(session_id="sess_a", agent_id="agent-a", messages=_dialogue(), turn_counter=1)
@@ -3951,35 +3994,6 @@ def test_clearing_refuses_a_traversal_before_deleting_anything(tmp_path: Path) -
 # --------------------------------------------------------------------------------------
 # The two UI endpoints delegate to the Core rather than reimplementing it
 # --------------------------------------------------------------------------------------
-
-
-def _ui_client(tmp_path: Path) -> TestClient:
-    app = create_ui_app(
-        static_dir=tmp_path / "static",
-        llm=MockLLMConnector(),
-        storage_dir=tmp_path / "sessions",
-    )
-    return TestClient(app)
-
-
-def _post_json(
-    client: TestClient, path: str, payload: dict[str, Any]
-) -> tuple[int, dict[str, Any]]:
-    """Typed wrapper over `TestClient.post`, confining one untyped boundary.
-
-    `TestClient`'s request methods are untyped under `pyright --strict`, which is why
-    `tests/unit/test_ui_server.py` carries a file-level
-    `reportUnknownMemberType=false` header. This file deliberately does not: that
-    suppression would also cover the Core-level tests above, where an unknown type is
-    exactly what should be caught. Three pragmas in one helper, rather than sixteen
-    spread across the endpoint tests or a blanket header over all of them.
-    """
-    response = client.post(  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
-        path, json=payload
-    )
-    status = response.status_code  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]
-    body = cast(dict[str, Any], response.json())  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]
-    return status, body
 
 
 def test_the_cli_repl_no_longer_reaches_into_private_agent_state() -> None:
@@ -4108,55 +4122,17 @@ def test_the_cli_core_path_and_the_ui_transcript_path_are_never_the_same_file(
     assert manager.core_store.session_path("sess_shared") == cli_core_path
 
 
-def test_a_ui_transcript_write_does_not_destroy_the_cli_conversation(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The measured destruction, pinned end to end.
-
-    Before: `ucx run` wrote a Core record to `<root>/<id>.json`, the UI wrote a UI
-    transcript to the same file, and the CLI's next read returned `None` — a silent
-    total loss of the conversation.
-    """
-    monkeypatch.setenv(SESSION_STORAGE_DIR_ENV_VAR, str(tmp_path))
-    cli_core = SessionStore()
-    cli_core.save(
-        SessionState(
-            session_id="sess_shared",
-            agent_id="agent-a",
-            messages=_dialogue(),
-            turn_counter=3,
-        )
-    )
-    manager = AgentSessionManager(fallback_to_mock=True)
-
-    manager.save_session_record(
-        session_id="sess_shared",
-        agent_id="agent-a",
-        messages=[{"sender": "user", "content": "a UI presentation record"}],
-        turns=1,
-    )
-
-    survived = cli_core.load("sess_shared")
-    assert survived is not None, "the UI transcript write destroyed the CLI conversation"
-    assert survived.turn_counter == 3
-    assert survived.messages == _dialogue()
-    # And the transcript is readable too — neither destroyed the other.
-    record = manager.load_session_record("sess_shared")
-    assert record is not None
-    assert record["messages"][0]["sender"] == "user"
-
-
 def test_a_cli_core_write_does_not_destroy_the_ui_transcript(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The other direction, which was equally lossy."""
     monkeypatch.setenv(SESSION_STORAGE_DIR_ENV_VAR, str(tmp_path))
     manager = AgentSessionManager(fallback_to_mock=True)
-    manager.save_session_record(
+    _write_transcript(
+        manager,
         session_id="sess_shared",
         agent_id="agent-a",
         messages=[{"sender": "user", "content": "keep me"}],
-        turns=1,
     )
 
     SessionStore().save(SessionState.seed("sess_shared", "agent-a", SYSTEM_PROMPT))
@@ -4170,7 +4146,12 @@ def test_a_legacy_root_transcript_is_still_readable_and_never_overwritten(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Installs predating the namespacing have transcripts at the root, and some of
-    those files are Core records or collision hybrids. They are read, never written."""
+    those files are Core records or collision hybrids. They are read, never written.
+
+    The write half -- a later `save_session_record` landing under `ui/` and leaving the
+    root file alone -- went with that writer; nothing writes transcripts any more. What
+    remains is that reading one neither moves nor rewrites it.
+    """
     monkeypatch.setenv(SESSION_STORAGE_DIR_ENV_VAR, str(tmp_path))
     tmp_path.mkdir(parents=True, exist_ok=True)
     legacy = tmp_path / "sess_old.json"
@@ -4185,13 +4166,9 @@ def test_a_legacy_root_transcript_is_still_readable_and_never_overwritten(
     assert record is not None
     assert record["turns"] == 2
 
-    manager.save_session_record(
-        session_id="sess_old", agent_id="agent-a", messages=[{"sender": "agent"}], turns=3
-    )
-
-    # The legacy file is untouched; the new write went to the namespaced path.
+    # The legacy file is untouched, and reading it created nothing at the namespaced path.
     assert legacy.read_bytes() == legacy_bytes
-    assert (tmp_path / UI_TRANSCRIPT_SUBDIR / "sess_old.json").is_file()
+    assert not (tmp_path / UI_TRANSCRIPT_SUBDIR / "sess_old.json").exists()
 
 
 @pytest.mark.asyncio
@@ -4209,10 +4186,9 @@ async def test_a_failing_core_reset_leaves_the_transcript_intact(
     manager = AgentSessionManager(llm=MockLLMConnector(), fallback_to_mock=True)
     agent = await manager.get_or_create_agent(agent_id="agent-a", session_id="sess_a")
     agent.load_history(_dialogue(), turn_counter=2, session_id="sess_a")
-    manager.save_session_record(
-        session_id="sess_a", agent_id="agent-a", messages=[{"sender": "user"}], turns=1
+    transcript = _write_transcript(
+        manager, session_id="sess_a", agent_id="agent-a", messages=[{"sender": "user"}]
     )
-    transcript = manager.get_session_path("sess_a")
     assert transcript.is_file()
 
     def _boom(session_id: str | None = None) -> object:
@@ -4245,75 +4221,6 @@ def test_the_autouse_fixture_keeps_session_writes_out_of_the_real_home() -> None
         assert not observed.is_relative_to(real_home_sessions), (
             f"{observed} is inside the developer's real session directory"
         )
-
-
-# --------------------------------------------------------------------------------------
-# #215 review: the Core refusal must be translated at the HTTP boundary
-#
-# Every route caught `PathTraversalError` for its 400 and let everything else reach
-# Starlette as a bare 500 with no body. So the mid-turn guard was implemented in the
-# Core and, from a client's point of view, did not exist.
-# --------------------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    ("raised", "expected_status"),
-    [
-        (PathTraversalError("bad id"), 400),
-        (SessionMutationDuringTurnError("turn in flight"), 409),
-        (SessionStoreNotConfiguredError("no store"), 500),
-        (OSError("read-only file system"), 500),
-        (RuntimeError("something else"), 500),
-    ],
-)
-def test_core_session_failures_are_translated_to_their_own_status(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    raised: Exception,
-    expected_status: int,
-) -> None:
-    """409 for a mid-turn refusal in particular: the request is legal, just not yet.
-
-    A 500 tells the frontend the server is broken and gives it nothing to say, when the
-    correct answer is "retry when the turn finishes".
-
-    Ported from `/api/chat/reset` and `/api/chat/compact` when #1208 retired them. The
-    translation is `_translate_session_error`, one function reached by every session
-    route; `/api/session/history/truncate` is the surviving route that reaches it from a
-    JSON body, so it is where the mapping is pinned now.
-    """
-
-    def _raise(*args: object, **kwargs: object) -> None:
-        raise raised
-
-    monkeypatch.setattr(AgentSessionManager, "truncate_session_history", _raise)
-
-    status, _ = _post_json(
-        _ui_client(tmp_path),
-        "/api/session/history/truncate",
-        {"agent_id": "agent-a", "session_id": "sess_a", "index": 0},
-    )
-
-    assert status == expected_status
-
-
-def test_the_history_delete_route_translates_too(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """`DELETE /api/session/history` is the route the frontend actually calls, so an
-    untranslated refusal here is the one a user meets."""
-
-    def _raise(*args: object, **kwargs: object) -> None:
-        raise SessionMutationDuringTurnError("turn in flight")
-
-    monkeypatch.setattr(AgentSessionManager, "clear_session_history", _raise)
-    client = _ui_client(tmp_path)
-
-    response = client.delete(  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
-        "/api/session/history?agent_id=agent-a&session_id=sess_a"
-    )
-
-    assert response.status_code == 409  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]
 
 
 @pytest.mark.asyncio
@@ -4512,43 +4419,6 @@ def test_an_empty_cli_session_id_is_refused_not_redirected(
     assert SessionStore().load("sess_cli_bot") is None
 
 
-def test_a_ui_turn_makes_the_core_conversation_durable(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The freeze, pinned.
-
-    `execute_turn` deliberately does not persist — a disk failure must not discard an
-    answer a model already produced — so the caller owns the cadence. The UI did not,
-    which meant the Core record froze at whatever it held when it was created while the
-    transcript kept growing: measured at agent history 6 against a displayed transcript
-    of 12, and turn counters 6 against 3, silently.
-
-    This was the one control in this seam that survived its own mutation check, so it is
-    pinned rather than reported.
-    """
-    monkeypatch.setenv(SESSION_STORAGE_DIR_ENV_VAR, str(tmp_path))
-    client = _ui_client(tmp_path)
-
-    for _ in range(2):
-        status, _ = _post_json(
-            client,
-            "/api/turn",
-            {"message": "hello", "agent_id": "agent-orchestrator", "session_id": "sess_durable"},
-        )
-        assert status == 200
-
-    # Resolved through a manager rooted the same way the app is, rather than by
-    # reconstructing the path — reconstruction is what hid the collision.
-    core = AgentSessionManager(storage_dir=tmp_path / "sessions", fallback_to_mock=True).core_store
-    on_disk = core.load("sess_durable")
-    assert on_disk is not None, "two UI turns left no Core record: the conversation is not durable"
-    assert on_disk.turn_counter == 2, (
-        f"Core record froze at {on_disk.turn_counter} turn(s) while the transcript grew"
-    )
-    # And the Core record holds the actual conversation, not just its seed.
-    assert any("hello" == (m.content or "") for m in on_disk.messages)
-
-
 # --------------------------------------------------------------------------------------
 # The P3 guard's single-implementation property, pinned structurally (#215 review, B)
 #
@@ -4567,7 +4437,7 @@ def test_a_ui_turn_makes_the_core_conversation_durable(
 
 #: Every function in `src/` permitted to perform a path-containment check, and why.
 #:
-#: `agent.session.resolve_session_path` is the session-storage guard: one implementation,
+#: `core.session.resolve_session_path` is the session-storage guard: one implementation,
 #: called by `SessionStore.session_path` and by both of `AgentSessionManager`'s path
 #: resolvers. Re-inlining it in `ui/app.py` is what silently reintroduced the collision,
 #: because a pasted copy resolves against the storage root rather than the transcript
@@ -4579,7 +4449,7 @@ def test_a_ui_turn_makes_the_core_conversation_durable(
 #: Consolidating the two is a real question and not this issue's; it is noted on #183.
 _CONTAINMENT_ALLOWLIST = frozenset(
     {
-        "agent.session.resolve_session_path",
+        "core.session.resolve_session_path",
         "sandbox.path_validator.resolve_safe_path",
     }
 )
@@ -4620,7 +4490,7 @@ def test_the_containment_check_exists_in_exactly_one_session_storage_function() 
     assert not unexpected, (
         "path containment is checked in a function outside the allow-list: "
         f"{sorted(unexpected)}. The session-storage guard has exactly one "
-        "implementation, `agent.session.resolve_session_path`; a second copy is the "
+        "implementation, `core.session.resolve_session_path`; a second copy is the "
         "defect that reintroduced the CLI/UI collision, because a pasted copy resolves "
         "against the storage root rather than the transcript subdirectory. If a new "
         "boundary genuinely needs its own check, add it to _CONTAINMENT_ALLOWLIST with "
@@ -4955,7 +4825,8 @@ def test_the_ui_transcript_refuses_a_record_that_identifies_a_different_session(
     `load_session_record("SESSA")` returned `SessA`'s transcript and `get_session_history`
     cached it under `"SESSA"`, so the dashboard showed one session's conversation as
     another's. #256 names only the Core store; this door was found by enumerating the
-    id-bearing surface.
+    id-bearing surface. Both of those methods have since been retired with the legacy
+    chat route; the reader and the clear that remain are what is pinned.
     """
     manager = AgentSessionManager(storage_dir=tmp_path, llm=MockLLMConnector())
     transcript = manager.get_session_path("SessA")
@@ -4972,8 +4843,6 @@ def test_the_ui_transcript_refuses_a_record_that_identifies_a_different_session(
 
     with pytest.raises(SessionIdCollisionError):
         manager.load_session_record("SESSA")
-    with pytest.raises(SessionIdCollisionError):
-        manager.get_session_history("agent-b", "SESSA")
     with pytest.raises(SessionIdCollisionError):
         manager.clear_session_history(agent_id="agent-b", session_id="SESSA")
 
@@ -5053,33 +4922,6 @@ def test_a_matching_id_is_not_refused() -> None:
     verify_record_identity("sess_a", "sess_a", Path("/tmp/sess_a.json"))
     nfd = unicodedata.normalize("NFD", "séance")
     verify_record_identity(nfd, nfd, Path("/tmp/x.json"))
-
-
-def test_the_ui_translates_a_collision_to_409_not_500(tmp_path: Path) -> None:
-    """A refusal implemented in the Core and not translated at the boundary does not exist.
-
-    409 rather than 400: #256 states the P3 guard is not implicated, so the id is legal
-    and the request well-formed. What makes it unserviceable is the current state of the
-    store, which is what 409 describes.
-    """
-    manager = AgentSessionManager(storage_dir=tmp_path, llm=MockLLMConnector())
-    core = manager.core_store
-    _write_raw_record(core.storage_dir / "SESSA.json", session_id="SessA", turn_counter=4)
-    transcript = manager.get_session_path("SESSA")
-    transcript.parent.mkdir(parents=True, exist_ok=True)
-    transcript.write_text(json.dumps({"session_id": "SessA", "messages": []}), encoding="utf-8")
-
-    app = create_ui_app(static_dir=tmp_path / "static", session_manager=manager)
-    with TestClient(app) as client:
-        # Pragmas rather than a file-level header, matching `_post_json` above: this file
-        # deliberately keeps unknown types fatal for the Core-level tests.
-        response = client.delete(  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
-            "/api/session/history?agent_id=agent-b&session_id=SESSA"
-        )
-
-    assert response.status_code == 409, response.text  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]
-    body = cast(dict[str, Any], response.json())  # pyright: ignore[reportUnknownMemberType]
-    assert "SessA" in body["detail"]
 
 
 def test_the_cli_reports_an_unusable_session_id_instead_of_resuming_another_session(

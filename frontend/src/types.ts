@@ -1,3 +1,5 @@
+import type { UiLanguage } from './i18n/language';
+
 /**
  * The surfaces the right-hand workspace dock can show.
  *
@@ -105,23 +107,15 @@ export interface AcpStatusData {
   counts: { agent: AcpSideCounts; client: AcpSideCounts };
 }
 
-export interface AgentInfo {
+/**
+ * A clone a conversation can invite: an installed persona, by name.
+ *
+ * It replaced `AgentInfo`, the row of `GET /api/agents`, which overlaid live-instance state
+ * (status, uptime, sub-agents) onto these (2026-09-27: `/api/agents` removed, #1775).
+ */
+export interface CloneChoice {
   id: string;
   label: string;
-  role: string;
-  status: string;
-  tier: string;
-  isolation_level: string;
-  capabilities: string[];
-  /** The tools in `capabilities` a turn outside a conversation is not offered (#1576). */
-  capabilities_needing_room?: string[];
-  uptime_s: number;
-  current_task: string;
-  parent_id: string | null;
-  subagents: string[];
-  max_steps?: number;
-  /** @deprecated alias for max_steps */
-  max_turns?: number;
 }
 
 export interface PersonaInfo {
@@ -145,9 +139,17 @@ export interface PersonaInfo {
   builtin?: boolean;
   /** A workspace file that replaces a built-in persona of the same name. */
   overrides_builtin?: boolean;
+  /**
+   * Where its picture is shown from, with a `?v=` that changes with the picture; `null` for
+   * a clone with none. Absent from a runtime too old to say.
+   */
+  avatar_url?: string | null;
+  /** Whether the picture was chosen in this workspace, not shipped with the clone. */
+  avatar_chosen?: boolean;
 }
 
-export type PersonaModelTier = 'inherit' | 'fast' | 'pro' | 'flash_lite' | 'custom';
+/** Which Settings model a persona's turns run on: the deep one (`inherit`) or the fast one. */
+export type PersonaModelTier = 'inherit' | 'fast';
 
 /** `GET /api/personas`: the catalogue, plus what an editor needs to offer choices. */
 export interface PersonaCatalog {
@@ -263,8 +265,8 @@ export interface ChatMessage {
 }
 
 /**
- * `ChatTurnOutcome` (`uclone_x.ui.app`): how a chat turn ended (#1007 item 4). `degraded`
- * is the Core's meaning only: an answer from a model other than the one requested.
+ * `ChatTurnOutcome` (`uclone_x.ui.app` until #1731): how a chat turn ended (#1007 item 4).
+ * `degraded` is the Core's meaning only: an answer from a model other than the one requested.
  */
 export type ChatTurnOutcome = 'completed' | 'degraded' | 'failed' | 'interrupted';
 
@@ -356,11 +358,26 @@ export interface SkillManifest {
   rejected_by?: string | null;
   rejected_at?: string | null;
   rejection_reason?: string | null;
+  /**
+   * Why the skill is not used, in English (#1720). The panel shows it only when it cannot word
+   * `not_loaded_code` itself (#1777).
+   */
+  not_loaded_reason?: string | null;
+  /**
+   * Which reason it is (`uclone_x/skills/refusals.py`'s `SkillRefusalCode`), worded by the head
+   * from the `skills.notLoaded.codes` catalog. Typed `string`, not the closed set: a newer Core
+   * may send a code this head does not know, and that falls back to `not_loaded_reason`.
+   */
+  not_loaded_code?: string | null;
+  /** The values `not_loaded_code`'s sentence uses, by placeholder name (`name`). */
+  not_loaded_params?: Readonly<Record<string, string | number>> | null;
   audit_report: SkillAuditReport;
 }
 
 export interface SkillsData {
   skills: SkillManifest[];
+  /** The skill folder this runtime reads does not exist, so nothing could be loaded (#1721). */
+  store_missing?: boolean;
   summary: {
     total_skills: number;
     active_count: number;
@@ -395,28 +412,149 @@ export interface CompactionRecord {
 
 export interface BudgetData {
   session_budget: {
-    max_tokens: number;
+    /** `null` when the session has no token ceiling, the default since the usage limits (#1685). */
+    max_tokens: number | null;
     used_input_tokens: number;
     used_output_tokens: number;
     total_used_tokens: number;
-    remaining_tokens: number;
-    budget_used_pct: number;
+    remaining_tokens: number | null;
+    budget_used_pct: number | null;
   };
   providers: Record<string, ProviderBudget>;
   roles: Record<string, RoleBudget>;
   compaction_history: CompactionRecord[];
 }
 
+/** One model a cloud provider's own listing returned (#1631). */
+export interface CatalogEntry {
+  id: string;
+  display_name: string | null;
+  /** `null` when the provider did not say. */
+  context_window: number | null;
+  max_output_tokens: number | null;
+  /** False for embedding, speech and image models. */
+  chat_capable: boolean;
+  created_at: string | null;
+}
+
+/**
+ * What a cloud provider's model listing said, as the Core read it (#1631).
+ *
+ * `entries` is empty unless `status` is `live`, and `recommended` is always one of their ids or
+ * `null`: the head never recommends a model the provider did not list. For a non-live status,
+ * `detail` says why in plain words.
+ */
+export interface CatalogResult {
+  provider: string;
+  status: 'live' | 'no_key' | 'key_rejected' | 'unreachable' | 'no_listing';
+  entries: CatalogEntry[];
+  recommended: string | null;
+  fetched_at: string | null;
+  detail: string | null;
+}
+
+/** `GET /api/models`, optionally with `?refresh=1` to ask the provider again. */
+export interface ModelsResponse {
+  provider: string;
+  models: string[];
+  current_model: string;
+  catalog?: CatalogResult | null;
+}
+
+/** `POST /api/models/catalog`: a picked provider's listing, before it is saved (#1657). */
+export interface CatalogPreviewResponse {
+  provider: string;
+  models: string[];
+  /** Local providers only: whether anything answered at the address (#1666). */
+  reachable?: boolean;
+  /** Local providers only: the server answered, and refused the key (#1672). */
+  key_refused?: boolean;
+  catalog: CatalogResult | null;
+}
+
+export interface RemoteGpuInfo {
+  name: string;
+  total_mb: number;
+  used_mb: number;
+  driver: string;
+}
+
+export interface RemotePortMapping {
+  service_name: string;
+  remote_port: number;
+  local_port: number;
+}
+
+export interface RemoteGpuStatus {
+  host: string;
+  connected: boolean;
+  pid?: number | null;
+  mappings?: RemotePortMapping[];
+  gpu?: RemoteGpuInfo | null;
+  error?: string | null;
+  comfyui_autostarted?: boolean;
+  ollama_models?: string[];
+  restored_settings?: {
+    llm_provider?: string;
+    llm_base_url?: string;
+    comfyui_base_url?: string;
+  };
+}
+
+/** One provider's key, as `/api/settings` reports it whichever provider is active. */
+export interface ProviderKeyState {
+  id: string;
+  key_set: boolean;
+  /** The first and last few characters, never the key. Empty when no key is held. */
+  key_masked: string;
+  /** Where the key comes from: saved in Settings, or an environment variable that overrides it. */
+  key_source: 'settings' | 'env' | '';
+  /** The variable carrying it when `key_source` is `'env'`. */
+  key_env_var?: string | null;
+}
+
+/** A setting an environment variable decides while it stays set; the file still saves. */
+export interface EnvOverride {
+  field: 'llm_provider' | 'llm_model' | 'llm_base_url';
+  env_var: string;
+  /** The Core's English sentence; the screen shows its own translation instead. */
+  message?: string;
+}
+
 export interface RuntimeSettings {
   llm_provider: string;
   llm_base_url: string;
+  /** The chat (deep) model: the one a clone's turn runs on when its persona names none. */
   llm_model: string;
+  /** The fast model for auxiliary calls; empty means it follows `llm_model`. */
+  llm_model_fast?: string | null;
   llm_api_key_set: boolean;
   llm_api_key_masked: string;
+  llm_api_key_source?: 'settings' | 'env' | '';
+  llm_api_key_env_var?: string | null;
+  /** Every provider's key state, so a key never looks lost when another provider is active. */
+  providers?: ProviderKeyState[];
+  /** Where the provider, model and endpoint in use come from; `'env'` wins over the file. */
+  llm_provider_source?: 'settings' | 'env' | '';
+  llm_provider_env_var?: string;
+  llm_model_source?: 'settings' | 'env' | '';
+  llm_model_env_var?: string;
+  llm_base_url_source?: 'settings' | 'env' | '';
+  llm_base_url_env_var?: string;
+  /** Each setting an environment variable decides instead of the saved choice. */
+  env_overrides?: EnvOverride[];
   comfyui_base_url: string;
+  /** What draws pictures: `auto`, `local` or `gemini`, as saved. */
+  image_engine?: string;
+  /** The Gemini picture model, as saved; the runtime's default when none is. */
+  image_model?: string;
+  /** Why the saved picture choice cannot be used, or `''` when it can. */
+  image_settings_problem?: string;
   providers_available: string[];
   workspace_dir?: string;
   available_models?: string[];
+  /** The cloud provider's model listing; `null` for Ollama, vLLM and mock. */
+  catalog?: CatalogResult | null;
   /** Folders outside the workspace that clones may read but never write, as entered. */
   read_roots?: string[];
   /** The subset of `read_roots` that no longer exists on disk. */
@@ -425,6 +563,11 @@ export interface RuntimeSettings {
   read_roots_env?: string[];
   /** UCLONE_READ_ROOTS entries that were ignored, each with the reason. */
   read_roots_env_ignored?: string[];
+  /**
+   * The screens' language as chosen, `'system'` included.
+   * `LocaleProvider` owns it; the Settings form neither shows nor sends it.
+   */
+  ui_language?: UiLanguage;
 }
 
 /** One tool an external tool server offers, as it describes itself. */
@@ -484,6 +627,8 @@ export interface ConnectionTestResult {
   models?: string[];
   online?: boolean;
   error?: string;
+  /** vLLM only: the server answered 401 or 403 (#1672). */
+  key_refused?: boolean;
   stats?: Record<string, unknown>;
 }
 
@@ -633,6 +778,8 @@ export interface RoomParticipant {
    */
   aliases?: string[];
   persona_summary?: string;
+  /** The clone this seat is (`Participant.persona`); the id when the Core sends none. */
+  persona?: string;
 }
 
 /**
@@ -682,20 +829,62 @@ export interface RoomSpeakerDecision {
 }
 
 /** `RoomTurnRefusal`: why a failed turn would fail the same way if retried (#969). */
-export type RoomTurnRefusal = 'budget_exceeded' | 'model_without_tools';
+export type RoomTurnRefusal =
+  | 'budget_exceeded'
+  | 'usage_limit'
+  | 'model_without_tools'
+  | 'model_unavailable'
+  | 'provider_auth';
+
+/** `ProviderFailureKind`: what went wrong on a hosted provider's side (#1630). */
+export type ProviderFailureKind =
+  | 'model_unavailable'
+  | 'provider_auth'
+  | 'provider_quota'
+  | 'provider_unreachable'
+  | 'provider_outage'
+  | 'provider_error';
+
+/**
+ * `ProviderFailure`: a hosted provider's failure as the Core tells it (#1630). `message` is
+ * written to be shown as is -- it names the provider and says whose side the problem is on,
+ * with no status code or response body -- unlike the row's `error`.
+ */
+export interface RoomProviderFailure {
+  kind: ProviderFailureKind;
+  message: string;
+  retryable: boolean;
+  /** The provider's display name ("Google"); absent on a row stored before it was carried. */
+  provider?: string | null;
+}
 
 export interface RoomTranscriptMessage {
   seq: number;
   sender_id: string;
   content: string;
-  /** `RoomMessageKind` — speech, or a change to who is in the conversation. */
-  kind: 'utterance' | 'join' | 'leave';
+  /**
+   * `RoomMessageKind` — speech, a change to who is in the conversation, or a note the
+   * application wrote for the reader (the `/loop` help and status, #1641).
+   */
+  kind: 'utterance' | 'join' | 'leave' | 'note';
+  /**
+   * Which notice a `note` row is (`room/notices.py`'s `NoticeCode`), worded by the head in the
+   * reader's language from the `notices` catalog. Absent on every other row and on a note
+   * stored before codes existed; `content` is then what shows, and it is always the English
+   * fallback. Typed `string`, not the closed set: a newer Core may send a code this head does
+   * not know, and that falls back to `content` too.
+   */
+  code?: string | null;
+  /** The values `code`'s sentence uses, by placeholder name; `interval_seconds` is raw seconds. */
+  params?: Readonly<Record<string, string | number>> | null;
   created_at: string;
   decision?: RoomSpeakerDecision | null;
   provenance?: RoomProvenance | null;
   error?: string | null;
   /** Set beside `error` when a retry would meet the same refusal (#969). */
   refusal?: RoomTurnRefusal | null;
+  /** Set beside `error` when the turn failed at a hosted provider (#1630). */
+  provider_failure?: RoomProviderFailure | null;
   completed: boolean;
   /**
    * The last `seq` this utterance's turn actually saw when it started, per
@@ -744,7 +933,7 @@ export interface RoomTranscriptMessage {
 export interface RoomPolicy {
   /** Resets on every human message. Not a conversation-lifetime budget. */
   max_agent_turns_per_human_message: number;
-  max_span_messages: number;
+  max_span_tokens: number;
   transcript_window: number;
   hesitation_seconds: number;
   default_responder_id: string;
@@ -800,6 +989,15 @@ export interface RoomFileRecord {
   turns_landed: number;
 }
 
+export interface RoomActiveTurn {
+  in_flight: boolean;
+  agent_id: string | null;
+  turn_id: string | null;
+  status?: string;
+  detail?: string | null;
+  accumulated_text?: string;
+}
+
 export interface RoomState {
   room_id: string;
   title: string;
@@ -811,6 +1009,7 @@ export interface RoomState {
   tool_uses?: RoomToolUse[];
   written_files?: RoomWrittenFile[];
   file_record?: RoomFileRecord;
+  active_turn?: RoomActiveTurn | null;
 }
 
 /**
@@ -957,6 +1156,7 @@ export interface RoomTurnLanded {
   completed: boolean;
   error?: string;
   refusal?: RoomTurnRefusal;
+  provider_failure?: RoomProviderFailure;
 }
 
 /** `ui/rooms.py`'s `_announce_failure`: no agent and no turn, because nobody spoke. */

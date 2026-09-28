@@ -82,10 +82,9 @@ def test_sessions_listing_reports_saturation_flag(tmp_path: Path) -> None:
 def test_reconstruct_history_reaches_the_shared_presentable_rule(tmp_path: Path) -> None:
     """Rehydration keeps a ledger and drops a plain system anchor (#872, P6).
 
-    `reconstruct_history` makes this decision on persisted transcript *dicts*, where
-    `_is_presentable` cannot reach, so it carried an independent copy of the same rule.
-    Two copies that agree today is exactly the defect the single predicate was extracted
-    to prevent, one layer down; both sides now reach it through `_is_presentable_role`.
+    `reconstruct_history` makes this decision on persisted transcript *dicts*, and once
+    carried its own copy of the rule the message-side predicate applied. It reaches the
+    one rule through `_is_presentable_role`.
 
     Killed by: src/uclone_x/ui/app.py :: if not _is_presentable_role(role_str, bool(item_dict.get("compaction_ledger", False))):
     Becomes: if False:
@@ -108,56 +107,3 @@ def test_reconstruct_history_reaches_the_shared_presentable_rule(tmp_path: Path)
     assert history[0].content == "[Compacted] earlier turns"
     # The presentation view is untouched -- it keeps every persisted entry verbatim.
     assert len(transcript) == 3
-
-
-def test_save_session_record_changes_the_view_only_after_the_record_lands(
-    tmp_path: Path,
-) -> None:
-    """The in-memory view must not run ahead of the record on disk (#872, P6).
-
-    `save_session_record` is the single write path for both stores, and it assigned the
-    in-memory transcript *before* the disk write. An `OSError` from the write therefore
-    left the view rewritten over a stale record, and the compaction path re-raises —
-    answering 5xx over a view it had already mutated, which is the one outcome a caller
-    reading that status would rule out.
-
-    Both halves matter, and the in-memory store is asserted directly rather than through
-    `get_session_history`: that accessor falls back to the record on disk when the
-    session is not cached, so it reports the right answer even when the memory write
-    never happened at all — which would leave this test passing over a store that is
-    simply never written.
-
-    Killed by: src/uclone_x/ui/app.py :: self._session_messages[session_id] = list(messages)
-    Becomes:
-    """
-    from unittest.mock import patch
-
-    from uclone_x.ui.app import AgentSessionManager
-
-    mgr = AgentSessionManager(storage_dir=tmp_path)
-    in_memory = mgr._session_messages  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
-    session_id = "sess_872_atomicity"
-    first: list[dict[str, Any]] = [{"role": "user", "content": "kept"}]
-
-    mgr.save_session_record(session_id=session_id, agent_id="champion", messages=first, turns=1)
-    # One call writes both stores.
-    assert in_memory[session_id] == first
-    assert mgr.get_session_history("champion", session_id) == first
-
-    doomed: list[dict[str, Any]] = [{"role": "user", "content": "never persisted"}]
-    with patch("builtins.open", side_effect=OSError("disk full")):
-        try:
-            mgr.save_session_record(
-                session_id=session_id, agent_id="champion", messages=doomed, turns=2
-            )
-        except OSError:
-            pass
-        else:  # pragma: no cover - the write is patched to fail
-            raise AssertionError("expected the failing write to raise")
-
-    # The record never changed, so neither may the view the user is served.
-    assert in_memory[session_id] == first
-    assert mgr.get_session_history("champion", session_id) == first
-    record = mgr.load_session_record(session_id)
-    assert record is not None
-    assert record["messages"] == first

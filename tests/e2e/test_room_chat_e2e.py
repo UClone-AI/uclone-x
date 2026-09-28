@@ -153,23 +153,19 @@ async def test_a_group_conversation_names_each_speaker_and_the_model_that_served
 async def test_a_conversation_can_seat_another_agent_while_it_is_open(
     ui_test_server: str,
 ) -> None:
-    """F2: add someone mid-conversation, chosen from a list rather than typed."""
+    """F2: add someone mid-conversation, chosen from a list rather than typed.
+
+    The room must then seat the agent that was picked: the strip showing `scout`, who was
+    seated from the start, said nothing about the invite (#1775).
+
+    Killed by: src/uclone_x/ui/rooms.py :: state = service.add_participant(room_id, participant_id, kind=kind)
+    Becomes: state = service.get(room_id)
+    """
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(headless=True)
         page: Page = await browser.new_page(viewport={"width": 1600, "height": 900})
         errors: list[str] = []
         page.on("pageerror", lambda err: errors.append(str(err)))
-
-        # An agent is only offered once the runtime has one running, and it reports none
-        # until one has answered something. One ordinary chat turn is what makes the
-        # invite list have anybody in it -- which is a fact about this product, not about
-        # this test, and is why the empty list states that cause rather than claiming
-        # everyone is already seated.
-        warmed = await page.request.post(
-            f"{ui_test_server}/api/turn",
-            data={"message": "hello", "agent_id": "champion"},
-        )
-        assert warmed.ok, await warmed.text()
 
         room_id = await _create_room(page, ui_test_server, "Architecture triage", ["scout"])
         await page.goto(ui_test_server, wait_until="commit")
@@ -179,13 +175,31 @@ async def test_a_conversation_can_seat_another_agent_while_it_is_open(
 
         await page.click("[data-testid='add-someone']")
         await page.wait_for_selector("[data-testid='invite-list']", timeout=10000)
-        invitable = page.locator("[data-testid='invite-list'] button").first
-        invited = (await invitable.inner_text()).strip()
-        assert invited, "the invite list offered nobody, so nothing was chosen from it"
+        invitable = page.locator("[data-testid='invite-list'] button[data-testid^='invite-']").first
+        testid = await invitable.get_attribute("data-testid")
+        assert testid, "the invite list offered nobody, so nothing was chosen from it"
+        invited = testid.removeprefix("invite-")
+        strip = page.locator("[data-testid='participant-strip']")
+        seated = strip.locator(":scope > span:not([data-testid])")
+        await strip.get_by_text("scout").first.wait_for(timeout=10000)
+        before = await seated.count()
         await invitable.click()
 
-        strip = page.locator("[data-testid='participant-strip']")
-        await strip.get_by_text("scout").first.wait_for(timeout=10000)
+        participants: list[str] = []
+        for _ in range(50):
+            response = await page.request.get(f"{ui_test_server}/api/rooms/{room_id}")
+            assert response.ok, await response.text()
+            body: dict[str, Any] = await response.json()
+            participants = [str(p["id"]) for p in body["participants"]]
+            if invited in participants:
+                break
+            await asyncio.sleep(0.2)
+        assert invited in participants, f"{invited} was picked but the room seats {participants}"
+        for _ in range(50):
+            if await seated.count() == before + 1:
+                break
+            await asyncio.sleep(0.2)
+        assert await seated.count() == before + 1, "the strip did not gain the invited agent"
         assert not errors, f"the conversation raised in the browser: {errors}"
         await browser.close()
 

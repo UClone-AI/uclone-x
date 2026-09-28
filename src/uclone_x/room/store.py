@@ -19,14 +19,14 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
-from uclone_x.agent.session import resolve_session_path
+from uclone_x.core.session import resolve_session_path
 from uclone_x.errors import (
     PathTraversalError,
     RoomIdError,
     StaleRoomWriteError,
     UnreadableRoomRecordError,
 )
-from uclone_x.room.models import RoomState
+from uclone_x.room.models import RoomState, with_legacy_loop_rows_as_notes
 
 __all__ = ["ROOM_STORAGE_DIR_ENV_VAR", "RoomStore", "default_room_storage_dir"]
 
@@ -119,9 +119,11 @@ class RoomStore:
         if not path.exists():
             return None
         try:
-            return RoomState.model_validate_json(path.read_text(encoding="utf-8"))
+            state = RoomState.model_validate_json(path.read_text(encoding="utf-8"))
         except ValidationError as exc:
             raise UnreadableRoomRecordError(room_id) from exc
+        # A room saved before `/loop` rows were notes still holds them as speech (#1661).
+        return with_legacy_loop_rows_as_notes(state)
 
     def save(self, state: RoomState) -> RoomState:
         """Persist `state` at the next revision, refusing a write that would lose an update.

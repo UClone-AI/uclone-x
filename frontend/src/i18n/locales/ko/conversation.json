@@ -1,0 +1,105 @@
+{
+  "you": "나",
+  "row": {
+    "retry": "다시 시도",
+    "silentFinished": "{label}이(가) 이 턴을 마쳤지만 보낸 글이 없습니다.",
+    "silentStopped": "{label}이(가) 이 턴 도중에 멈췄고 보낸 글이 없습니다.",
+    "unsaved": "{label}은(는) 다시 시작한 뒤 이 턴을 기억하지 못합니다. 저장하지 못했습니다.",
+    "knowledgeUnsaved": "{label}은(는) 다시 시작한 뒤 이 턴에서 알게 된 것을 알지 못합니다. 저장하지 못했습니다.",
+    "knowledgeSetAside": "이 대화에 대한 {label}의 지식 기록을 읽을 수 없어서 따로 옮겨 보관했습니다.",
+    "why": "이유 ›",
+    "servedInstead": "{served} ({requested} 요청)"
+  },
+  "membership": {
+    "joined": "{name}이(가) 이 대화에 참여했습니다",
+    "left": "{name}이(가) 이 대화에서 나갔습니다"
+  },
+  "header": {
+    "writing": "작성 중…",
+    "modelLabel": "이 대화의 모델",
+    "useDefaultNamed": "기본값 사용 ({model})",
+    "useDefault": "기본 모델 사용",
+    "autonomousOnLabel": "자율 토론 켜짐",
+    "autonomousOffLabel": "자율 토론 꺼짐",
+    "autonomousOnTitle": "자율 토론 중입니다 (보고 있는 동안 에이전트끼리 대화합니다)",
+    "autonomousOffTitle": "자율 토론 켜기 (보고 있는 동안 에이전트끼리 대화합니다)",
+    "autoDiscuss": "자율 토론",
+    "on": "켜짐",
+    "off": "꺼짐",
+    "addSomeone": "참여자 추가",
+    "clearLabel": "이 대화 비우기",
+    "clear": "비우기"
+  },
+  "invite": {
+    "noClones": "아직 실행 중인 클론이 없습니다. 먼저 채팅에서 메시지를 보내면 답한 클론을 여기에 추가할 수 있습니다.",
+    "everyoneHere": "참여할 수 있는 클론이 모두 이 대화에 있습니다."
+  },
+  "empty": {
+    "noOne": "아직 이 대화에 아무도 없습니다. 답을 받으려면 참여자를 추가하십시오.",
+    "nothingSaid": "아직 아무 말도 없습니다. 메시지를 보내 시작하십시오."
+  },
+  "live": {
+    "thinkingLabel": "생각 중",
+    "thinking": "생각 중...",
+    "stopped": "이 대화가 멈췄습니다: {error}"
+  },
+  "notices": {
+    "ceiling": "답장 {count}개 뒤에 멈췄습니다. 계속하려면 메시지를 보내십시오.",
+    "silence": "마지막 메시지에 아무도 답하지 않았고, 앞으로도 답하지 않습니다. 답을 받으려면 @로 상대를 지정하십시오.",
+    "decidedBy": "{selector}이(가) 정했습니다.",
+    "jumpToLatest": "최신 메시지로 이동"
+  },
+  "reset": {
+    "notReset": {
+      "one": "{names}은(는) 여기서 지운 내용을 아직 기억하므로 답에서 그 내용을 언급할 수 있습니다. 메시지를 보내 다시 시작하거나 이 대화를 비우십시오.",
+      "other": "{names}은(는) 여기서 지운 내용을 아직 기억하므로 답에서 그 내용을 언급할 수 있습니다. 메시지를 보내 다시 시작하거나 이 대화를 비우십시오."
+    },
+    "saturated": "{names}이(가) 컨텍스트 한도인 {threshold}턴에 도달했습니다. 계속하려면 이 대화를 줄이거나 새 대화를 시작하십시오.",
+    "fromRecord": "{names}의 수치는 저장된 기록에서 셌습니다. 이 서버가 시작된 뒤로 그곳에서 아무 말도 없었습니다.",
+    "shortening": "줄이는 중…",
+    "shorten": "이 대화 줄이기",
+    "compactBlocked": "턴이 실행 중입니다. 도중에 잘려 나가는 것이 없도록 끝날 때까지 기다렸다가 줄입니다."
+  },
+  "clearConfirm": {
+    "question": {
+      "one": "이 대화를 비울까요? 메시지 1개가 영구히 삭제됩니다. 이름과 참여자는 그대로 남습니다.",
+      "other": "이 대화를 비울까요? 메시지 {count}개가 영구히 삭제됩니다. 이름과 참여자는 그대로 남습니다."
+    },
+    "blocked": "턴이 실행 중이라 지금은 거부됩니다. 턴이 끝나면 할 수 있습니다.",
+    "confirm": "비우기",
+    "keep": "모두 유지"
+  },
+  "outcome": {
+    "refusalRemedy": {
+      "budget_exceeded": "다시 시도해도 거부됩니다. 계속하려면 새 대화를 시작하십시오.",
+      "model_without_tools": "설정에서 도구를 지원하는 모델(예: qwen3:8b)을 고른 뒤 메시지를 다시 보내십시오.",
+      "model_unavailable": "설정에서 다른 모델을 고른 뒤 메시지를 다시 보내십시오.",
+      "provider_auth": "설정에 새 API 키를 붙여 넣은 뒤 메시지를 다시 보내십시오.",
+      "usage_limit": "설정 → 사용량에서 한도를 올리거나 이 클론을 로컬 모델로 바꾼 뒤 메시지를 다시 보내십시오. 유료 모델을 다시 쓸 수 있는 시각은 설정 → 사용량에 나옵니다."
+    },
+    "refusalRemedyOther": "다시 시도해도 같은 이유로 거부됩니다.",
+    "refusalReason": {
+      "budget_exceeded": "이 대화에 허용된 토큰을 모두 썼습니다",
+      "model_without_tools": "모델이 클론에 필요한 도구를 쓸 수 없습니다",
+      "model_unavailable": "선택된 모델이 없거나, 선택한 모델을 Provider에서 쓸 수 없습니다",
+      "provider_auth": "Provider가 API 키를 받아들이지 않았습니다",
+      "usage_limit": "유료 모델 사용 한도에 도달했습니다"
+    },
+    "refusalReasonOther": "앱이 실행을 거부했습니다",
+    "providerRemedy": {
+      "provider_unreachable": "설정에서 사용자 지정 Endpoint를 지정했다면 그 주소도 확인하십시오."
+    },
+    "providerFailed": "{label}이(가) 이 턴을 마치지 못했습니다. {message}",
+    "refused": "{label}이(가) 이 턴을 마치지 못했습니다: {reason}.",
+    "stopped": "{label}이(가) 이 턴을 마치기 전에 중지되었습니다.",
+    "wentWrong": "{label}이(가) 답하는 도중 문제가 생겨 이 턴을 마치지 못했습니다.",
+    "memoryNoneSaved": {
+      "one": "{label}이(가) 무언가를 기억에 저장하려 했지만 아무것도 저장되지 않았습니다.",
+      "other": "{label}이(가) {count}가지를 기억에 저장하려 했지만 하나도 저장되지 않았습니다."
+    },
+    "memorySomeUnsaved": {
+      "one": "{label}이(가) {total}가지를 기억에 저장하려 했지만 그중 {count}가지가 저장되지 않았습니다.",
+      "other": "{label}이(가) {total}가지를 기억에 저장하려 했지만 그중 {count}가지가 저장되지 않았습니다."
+    }
+  }
+}

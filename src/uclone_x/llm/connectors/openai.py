@@ -13,15 +13,21 @@ from uclone_x.core.immutable import unwrap_immutable
 from uclone_x.core.provenance import Provenance
 from uclone_x.errors import (
     LLMCredentialsNotConfiguredError,
-    LLMProviderError,
     UnmappableChatMessageError,
 )
+from uclone_x.llm.catalog import CatalogEntry
 from uclone_x.llm.connectors.base import (
     BaseLLMConnector,
+    is_local_endpoint,
     parse_dict_payload,
+    refuse_response_schema,
     reported_count,
+    resolve_model,
     resolve_token_counts,
 )
+from uclone_x.llm.connectors.base import named_model as _named
+from uclone_x.llm.connectors.failures import failed_request, failed_status, unusable_response
+from uclone_x.llm.connectors.listing import from_unix, get_listing_page, listed_items, optional_str
 from uclone_x.llm.models import (
     FinishReason,
     LLMRequest,
@@ -32,47 +38,34 @@ from uclone_x.llm.models import (
     ToolCallRequest,
 )
 
-_DEFAULT_MODEL = "gpt-4o"
+#: Id fragments of the models an OpenAI-compatible listing mixes in with the chat models:
+#: embeddings, speech, transcription, images, moderation and the legacy completion bases.
+#: Their ids are the only thing OpenAI's listing says about them.
+_NOT_CHAT_FRAGMENTS = (
+    "embedding",
+    "tts",
+    "whisper",
+    "transcribe",
+    "dall-e",
+    "image",
+    "moderation",
+    "davinci",
+    "babbage",
+    "sora",
+)
 
 
 def named_model(request: LLMRequest) -> str | None:
     """The model the caller named, or `None` when they left the choice to the connector.
 
-    Public, and separate from `_requested_model`, because a connector whose endpoint has no
-    honest default has to distinguish "the caller named one" from "fall back" — and reaching
-    into another module for a private helper is how that two-branch test ends up copied and
-    then corrected in only one of its copies. `VLLMConnector._resolve_request_model` is the
-    caller (#1304).
+    Public so that `VLLMConnector._resolve_request_model` does not reach into another
+    module for a private helper (#1304).
 
     `"default"` is treated as naming nothing, because the UI sends that string for "whatever
     this provider uses" and a provider asked for a model literally called `default` answers
     404.
     """
-    if request.model is not None:
-        stripped = request.model.strip()
-        if stripped and stripped != "default":
-            return stripped
-    return None
-
-
-def _requested_model(request: LLMRequest, default_model: str = _DEFAULT_MODEL) -> str:
-    """The model this connector asks its endpoint for, defaulted when the caller named none.
-
-    One expression, used by the request builder, the streaming path and the
-    `Provenance.requested` it reports. It was written out three times with the same
-    literal; if one copy were ever changed and not the others, provenance would name
-    a `requested` model that was never sent and `degraded` would flip — in the exact
-    field #149 exists to make trustworthy.
-
-    `default_model` is a parameter rather than the module constant it reads as a default,
-    because an OpenAI-compatible endpoint that is not OpenAI has a different default and
-    there is no OpenAI model name that is an honest stand-in for it (#1304). Each call site
-    passes `self._default_model`, so the three copies still cannot diverge from one another.
-    """
-    named = named_model(request)
-    if named is not None:
-        return named
-    return default_model
+    return _named(request.model)
 
 
 class OpenAIConnector(BaseLLMConnector):
@@ -102,9 +95,6 @@ class OpenAIConnector(BaseLLMConnector):
     never involved.
     """
 
-    _default_model: ClassVar[str] = _DEFAULT_MODEL
-    """The model requested when the caller names none. Passed to `_requested_model`."""
-
     _api_key_env_var: ClassVar[str] = "OPENAI_API_KEY"
     _base_url_env_var: ClassVar[str] = "OPENAI_BASE_URL"
     _default_base_url: ClassVar[str] = "https://api.openai.com/v1"
@@ -123,7 +113,12 @@ class OpenAIConnector(BaseLLMConnector):
         base_url: str | None = None,
         timeout: float = 60.0,
         http_client: httpx.AsyncClient | None = None,
+        model: str | None = None,
     ) -> None:
+        """``model`` is what a request naming no model is sent to; see ``resolve_model``."""
+        #: The model a request naming none asks for, or ``None``: then such a request is
+        #: refused before the network rather than sent to a model id written here.
+        self._default_model: str | None = _named(model)
         key_env_var = self._api_key_env_var
         resolved_key = api_key if api_key is not None else os.getenv(key_env_var)
         if self._requires_api_key and (resolved_key is None or not resolved_key.strip()):
@@ -145,8 +140,44 @@ class OpenAIConnector(BaseLLMConnector):
         )
 
     @property
+    def paid(self) -> bool:
+        """Paid unless the endpoint is on this machine or a private network.
+
+        The same connector reaches OpenAI and any OpenAI-compatible server (vLLM, a local
+        gateway), so the endpoint decides, not the class.
+        """
+        return not is_local_endpoint(self.base_url)
+
+    @property
     def provider_name(self) -> str:
         return "openai"
+
+    async def list_models(self) -> list[CatalogEntry]:
+        """The models this key can use, from `GET /models` (#1631).
+
+        OpenAI's listing reports an id, an owner and a publish time, and no context window;
+        whether a model can chat is read from its id (`_NOT_CHAT_FRAGMENTS`).
+        """
+        page = await get_listing_page(
+            self,
+            provider=self._display_name,
+            url=f"{self.base_url}/models",
+            headers=self._auth_headers(),
+        )
+        entries: list[CatalogEntry] = []
+        for item in listed_items(page, "data"):
+            model_id = optional_str(item.get("id"))
+            if model_id is None:
+                continue
+            lowered = model_id.lower()
+            entries.append(
+                CatalogEntry(
+                    id=model_id,
+                    chat_capable=not any(fragment in lowered for fragment in _NOT_CHAT_FRAGMENTS),
+                    created_at=from_unix(item.get("created")),
+                )
+            )
+        return entries
 
     def _auth_headers(self) -> dict[str, str]:
         """The credential headers for this endpoint, or none when it has no credential.
@@ -162,15 +193,12 @@ class OpenAIConnector(BaseLLMConnector):
         return {"Authorization": f"Bearer {self._require_api_key()}"}
 
     def _resolve_request_model(self, request: LLMRequest) -> str:
-        """The model this connector asks its endpoint for, defaulted when none was named.
+        """The model this connector asks its endpoint for: the request's, else its own.
 
-        A method rather than three direct calls to `_requested_model`, because a subclass
-        may have no honest default to fall back to. `VLLMConnector` overrides this to refuse
-        instead: a vLLM server serves the one model it was started with, so inheriting
-        `gpt-4o` would send a request it cannot answer and report the operator's missing
-        configuration as that model not existing (#1304).
+        With neither, the request is refused before the network (``resolve_model``). A
+        method, so `VLLMConnector` can also consult `VLLM_MODEL` before refusing (#1304).
         """
-        return _requested_model(request, self._default_model)
+        return resolve_model(request.model, self._default_model, self._display_name)
 
     def _map_finish_reason(self, reason: str | None) -> FinishReason:
         """Map OpenAI's `finish_reason` onto `FinishReason`, or report it as unknown.
@@ -228,6 +256,7 @@ class OpenAIConnector(BaseLLMConnector):
             UnmappableChatMessageError: a message has no faithful OpenAI
                 representation. The offending value is named in the message.
         """
+        refuse_response_schema(request, self.provider_name)
         model = self._resolve_request_model(request)
         messages_payload: list[dict[str, Any]] = []
 
@@ -304,6 +333,7 @@ class OpenAIConnector(BaseLLMConnector):
 
     async def generate(self, request: LLMRequest) -> ModelResponse:
         """Generate response from OpenAI endpoint."""
+        model = self._resolve_request_model(request)
         payload = self._build_payload(request, stream=False)
         url = f"{self.base_url}/chat/completions"
         headers: dict[str, str] = {
@@ -316,21 +346,26 @@ class OpenAIConnector(BaseLLMConnector):
         try:
             resp = await client.post(url, json=payload, headers=headers, timeout=self.timeout)
             if resp.status_code != 200:
-                raise LLMProviderError(
-                    f"{self._display_name} error {resp.status_code}: {resp.text}"
+                raise failed_status(
+                    provider=self._display_name,
+                    model=model,
+                    status_code=resp.status_code,
+                    body=resp.text,
                 )
             data: dict[str, Any] = resp.json()
         except httpx.RequestError as exc:
-            raise LLMProviderError(f"{self._display_name} connection error: {exc}") from exc
+            raise failed_request(provider=self._display_name, model=model, exc=exc) from exc
         except json.JSONDecodeError as exc:
-            raise LLMProviderError(f"Invalid JSON from {self._display_name}: {exc}") from exc
+            raise unusable_response(
+                provider=self._display_name, model=model, detail=str(exc)
+            ) from exc
         finally:
             if should_close:
                 await client.aclose()
 
         choices: list[dict[str, Any]] = data.get("choices", [])
         if not choices:
-            raise LLMProviderError(f"{self._display_name} returned empty choices in response")
+            raise unusable_response(provider=self._display_name, model=model, detail="no choices")
 
         choice = choices[0]
         msg: dict[str, Any] = choice.get("message", {})
@@ -359,8 +394,7 @@ class OpenAIConnector(BaseLLMConnector):
         in_tokens, out_tokens, count_source = resolve_token_counts(
             request, in_tokens, out_tokens, reply=content, tool_calls=tool_calls
         )
-        requested_model = self._resolve_request_model(request)
-        model_name = str(data.get("model", requested_model))
+        model_name = str(data.get("model", model))
 
         usage = TokenUsage(
             provider=self.provider_name,
@@ -376,7 +410,7 @@ class OpenAIConnector(BaseLLMConnector):
         # says ran. Collapsing both onto the served name erased a provider-side alias
         # and reported `degraded=False` for a model the caller never named (#149).
         provenance = Provenance.primary(
-            provider=self.provider_name, model=requested_model, served_model=model_name
+            provider=self.provider_name, model=model, served_model=model_name
         )
 
         return ModelResponse(
@@ -390,6 +424,7 @@ class OpenAIConnector(BaseLLMConnector):
 
     async def stream(self, request: LLMRequest) -> AsyncIterator[StreamChunk]:
         """Stream response chunks from OpenAI SSE endpoint."""
+        model = self._resolve_request_model(request)
         payload = self._build_payload(request, stream=True)
         url = f"{self.base_url}/chat/completions"
         headers: dict[str, str] = {
@@ -407,9 +442,11 @@ class OpenAIConnector(BaseLLMConnector):
             ) as resp:
                 if resp.status_code != 200:
                     err_body = await resp.aread()
-                    raise LLMProviderError(
-                        f"{self._display_name} stream error {resp.status_code}: "
-                        f"{err_body.decode('utf-8', errors='replace')}"
+                    raise failed_status(
+                        provider=self._display_name,
+                        model=model,
+                        status_code=resp.status_code,
+                        body=err_body.decode("utf-8", errors="replace"),
                     )
 
                 async for raw_line in resp.aiter_lines():
@@ -504,7 +541,7 @@ class OpenAIConnector(BaseLLMConnector):
                             model=served_model,
                         )
         except httpx.RequestError as exc:
-            raise LLMProviderError(f"{self._display_name} stream connection error: {exc}") from exc
+            raise failed_request(provider=self._display_name, model=model, exc=exc) from exc
         finally:
             if should_close:
                 await client.aclose()

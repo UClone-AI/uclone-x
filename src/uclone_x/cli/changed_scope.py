@@ -7,37 +7,37 @@ other modules, or by naming its path. It records no gate pass, because a selecti
 from a diff can miss a test the full run would not.
 
 It errs wide. A change to anything every test depends on — a `conftest.py`, the shared test
-support, the dependency set — selects the whole suite rather than guessing.
+support, the dependency set — selects the whole suite rather than guessing. Which paths those
+are, and every other rule the import graph cannot see, is `tests/scope-rules.toml`.
+
+A changed test file always runs, browser tests included: the PR that edits a test is the one
+that runs it. The rest of the browser suite is left to the merge gate, which plans it per
+diff (`cli/browser_plan.py`). A changed test that holds opt-in tiers (`live`, `recorded`,
+`pre_release`) is named as not run by this check, since those tiers cost money or the network.
 """
 
 from __future__ import annotations
 
 import ast
+import re
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
-# A change to any of these reaches every test, so the selection is the whole suite.
-_WHOLE_SUITE_FILES = frozenset({"pyproject.toml", "uv.lock", "ucx"})
-_WHOLE_SUITE_PREFIXES = ("tests/support/",)
+from uclone_x.cli.scope_rules import ScopeRules, ScopeRulesError, load_scope_rules
 
 # The top-level directories importable Python lives in. Under `src` the package root is
 # one level down; everywhere else the directory is itself the top-level package.
 _SOURCE_ROOTS = ("src", "swarm", "evals", "oss", "scripts", "tests")
 _STRIPPED_ROOT = "src"
 
-# A change here is judged by the frontend's own suite and the bundle check.
-_FRONTEND_PREFIXES = ("frontend/", "src/uclone_x/ui_static/")
-
-# A change to a governance document is judged by the fitness functions (R3).
-_FITNESS_DIR = ("tests", "fitness")
-
-_E2E_DIR = "tests/e2e/"
-
-# Checks over the whole tree rather than over what they import: every tracked file is
-# classified for export, and every test file is declared. A new file of any kind can
-# fail either, and no import edge leads to them, so they run on every diff.
-_TREE_WIDE_TESTS = ("tests/unit/test_oss_export.py", "tests/unit/test_swarm_manifest.py")
+# The tiers the gate's marker expression leaves out. A changed test file holding one of them
+# is named as not run, so the diff's own tests are never silently partly skipped. Anchored to
+# a decorator or a `pytestmark =` line: a marker named inside a string (a test that writes a
+# fixture file) marks nothing.
+_OPT_IN_MARKER = re.compile(
+    r"^[ \t]*(?:@|pytestmark[ \t]*=.*?)pytest\.mark\.(live|recorded|pre_release)\b", re.MULTILINE
+)
 
 
 @dataclass
@@ -50,6 +50,10 @@ class ChangedSelection:
     lint_files: list[str] = field(default_factory=list[str])
     typecheck_files: list[str] = field(default_factory=list[str])
     frontend: bool = False
+    # Browser test files the diff itself changes: they run here, whatever else is deferred.
+    changed_browser_tests: list[str] = field(default_factory=list[str])
+    # Changed test files holding opt-in tiers, with the tiers found: reported as not run.
+    opt_in_tests: dict[str, list[str]] = field(default_factory=dict[str, list[str]])
 
 
 def changed_paths(base: str = "origin/main", cwd: Path | None = None) -> list[str]:
@@ -155,26 +159,65 @@ def _reaches(graph: dict[str, set[str]], start: str, targets: set[str]) -> bool:
     return False
 
 
+def first_path_imported_from(repo: Path, prefix: str, changed: list[str]) -> str | None:
+    """The first changed `.py` path that a module under `prefix` imports, directly or not.
+
+    A deleted module counts: whatever imported it has changed behaviour, and its file is gone,
+    so nothing but the import graph can say it was reached.
+    """
+    candidates = {name: path for path in changed if (name := module_name(path)) is not None}
+    if not candidates:
+        return None
+    absent = frozenset(name for name, path in candidates.items() if not (repo / path).exists())
+    files, graph = _import_graph(repo, absent)
+    seen: set[str] = set()
+    stack = [name for name, rel in files.items() if rel.startswith(prefix)]
+    while stack:
+        node = stack.pop()
+        if node in seen:
+            continue
+        seen.add(node)
+        stack.extend(graph.get(node, ()))
+    return next(
+        (path for name, path in sorted(candidates.items(), key=lambda kv: kv[1]) if name in seen),
+        None,
+    )
+
+
 def _is_test_file(path: str) -> bool:
     name = path.rsplit("/", 1)[-1]
     return path.startswith("tests/") and name.startswith("test_") and name.endswith(".py")
 
 
-def select_for_diff(changed: list[str], repo: Path) -> ChangedSelection:
-    """Decide what the changed paths reach. Pure over the tree at `repo`."""
+def _opt_in_tiers(path: Path) -> list[str]:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return []
+    return sorted(set(_OPT_IN_MARKER.findall(text)))
+
+
+def select_for_diff(
+    changed: list[str], repo: Path, rules: ScopeRules | None = None
+) -> ChangedSelection:
+    """Decide what the changed paths reach. Pure over the tree at `repo`.
+
+    `rules` defaults to `repo`'s own `tests/scope-rules.toml`; a missing or malformed file
+    raises `ScopeRulesError` rather than selecting by rules nobody wrote.
+    """
+    rules = rules or load_scope_rules(repo)
     selection = ChangedSelection(changed=list(changed))
     for path in changed:
-        if (
-            path in _WHOLE_SUITE_FILES
-            or path.rsplit("/", 1)[-1] == "conftest.py"
-            or path.startswith(_WHOLE_SUITE_PREFIXES)
-        ):
+        if rules.whole_suite.matches(path):
             selection.whole_suite = f"{path} reaches every test"
             break
 
     existing_py = [p for p in changed if p.endswith(".py") and (repo / p).is_file()]
     selection.lint_files = existing_py
-    selection.frontend = any(p.startswith(_FRONTEND_PREFIXES) for p in changed)
+    selection.frontend = any(rules.frontend.matches(p) for p in changed)
+    changed_tests = [p for p in existing_py if _is_test_file(p)]
+    selection.changed_browser_tests = [p for p in changed_tests if rules.is_browser_test(p)]
+    selection.opt_in_tests = {p: tiers for p in changed_tests if (tiers := _opt_in_tiers(repo / p))}
     if selection.whole_suite:
         return selection
 
@@ -182,8 +225,8 @@ def select_for_diff(changed: list[str], repo: Path) -> ChangedSelection:
     files, graph = _import_graph(repo, frozenset(changed_modules))
     all_tests = sorted(rel for rel in files.values() if _is_test_file(rel))
 
-    selected: set[str] = {p for p in existing_py if _is_test_file(p)}
-    selected.update(_TREE_WIDE_TESTS)
+    selected: set[str] = set(changed_tests)
+    selected.update(rules.always)
     for rel in all_tests:
         name = module_name(rel)
         if name and _reaches(graph, name, changed_modules):
@@ -200,11 +243,8 @@ def select_for_diff(changed: list[str], repo: Path) -> ChangedSelection:
             if any(p in text for p in named):
                 selected.add(rel)
 
-    governance = any(
-        p.endswith(".md") or p.startswith((".claude/", "docs/", "swarm/skills/")) for p in named
-    )
-    if governance:
-        selected.update(rel for rel in all_tests if tuple(rel.split("/")[:2]) == _FITNESS_DIR)
+    if any(rules.fitness.matches(p) for p in named):
+        selected.update(rel for rel in all_tests if rel.startswith(rules.fitness_tests))
 
     selection.test_files = sorted(p for p in selected if (repo / p).is_file())
 
@@ -217,10 +257,10 @@ def select_for_diff(changed: list[str], repo: Path) -> ChangedSelection:
     return selection
 
 
-def split_browser_tests(test_files: list[str]) -> tuple[list[str], list[str]]:
+def split_browser_tests(test_files: list[str], rules: ScopeRules) -> tuple[list[str], list[str]]:
     """(tests that run on workers, browser tests that run in one process after them)."""
-    browser = [p for p in test_files if p.startswith(_E2E_DIR)]
-    return [p for p in test_files if not p.startswith(_E2E_DIR)], browser
+    browser = [p for p in test_files if p.startswith(rules.browser_tests)]
+    return [p for p in test_files if not p.startswith(rules.browser_tests)], browser
 
 
 _NOTHING_TO_TYPECHECK = 0
@@ -235,8 +275,10 @@ def run_changed_gate(
 ) -> int:
     """Run the gate's checks over what the diff against `base` reaches. Records nothing.
 
-    The browser suite is left to the merge-time gate and `./ucx test e2e`, and said so: it is
-    the slowest step of the full gate and the one a diff-scoped run is for avoiding.
+    The browser test files the diff changes run, in one process after the rest. The other
+    browser tests the diff reaches are left to the merge-time gate and `./ucx test e2e`, and
+    said so: the suite is the slowest step of the full gate and the one a diff-scoped run is
+    for avoiding.
 
     A selection that holds no test is reported and passes — this is not a tier, so R5's
     "an empty tier is a failure" does not apply; the full gate at the merge head is the
@@ -258,15 +300,46 @@ def run_changed_gate(
     if not changed:
         console.print(f"Nothing differs from {base}; nothing to check.")
         return 0
-    selection = select_for_diff(changed, root)
+    try:
+        rules = load_scope_rules(root)
+    except ScopeRulesError as exc:
+        print(f"ucx: {exc}", file=qg.sys.stderr)
+        return qg.SCOPE_RESOLUTION_EXIT_CODE
+    selection = select_for_diff(changed, root, rules)
     console.print(f"[dim]{len(changed)} path(s) differ from the merge base with {base}.[/dim]")
+    for path, tiers in selection.opt_in_tests.items():
+        console.print(
+            f"[yellow]{path} holds {', '.join(tiers)} test(s), which this check does not run: "
+            f"run them with `./ucx test {tiers[0].replace('_', '-')}`.[/yellow]"
+        )
+    marker = qg.gate_marker_expression()
+    junit_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def run_changed_browser_tests() -> int:
+        files = selection.changed_browser_tests
+        if not files:
+            return 0
+        console.print(
+            f"\n[bold]Pytest over the {len(files)} browser test file(s) the diff changes, "
+            "in one process[/bold]"
+        )
+        argv = ["pytest", "-q", "--no-cov", f"--junitxml={junit_path}", "-m", marker]
+        code = qg.run_stage([*argv, *files]).returncode
+        if code == qg.PYTEST_NO_TESTS_COLLECTED:
+            console.print("[dim]The changed browser test files hold no gate-tier test.[/dim]")
+            return 0
+        return code
 
     if selection.whole_suite:
         console.print(
             f"[yellow]{selection.whole_suite}: running the whole gate without the browser "
             "suite (`./ucx test check --fast`).[/yellow]"
         )
-        return qg.run_quality_gate(fail_fast=fail_fast, test_scope="fast")
+        code = qg.run_quality_gate(fail_fast=fail_fast, test_scope="fast")
+        if code != 0 and fail_fast:
+            return code
+        browser_code = run_changed_browser_tests()
+        return code or browser_code
 
     first_failure = 0
 
@@ -302,11 +375,9 @@ def run_changed_gate(
         if failed(qg.run_stage(["pyright", *selection.typecheck_files]).returncode):
             return first_failure
 
-    workers, browser = split_browser_tests(selection.test_files)
+    workers, browser = split_browser_tests(selection.test_files, rules)
     if not selection.test_files:
         console.print("\n[dim]No test reaches this diff.[/dim]")
-    marker = qg.gate_marker_expression()
-    junit_path.parent.mkdir(parents=True, exist_ok=True)
     if workers:
         console.print(f"\n[bold]Pytest over {len(workers)} test file(s) the diff reaches[/bold]")
         argv = ["pytest", "-q", "--no-cov", f"--junitxml={junit_path}", "-m", marker]
@@ -317,10 +388,13 @@ def run_changed_gate(
             console.print("[dim]The selected files hold no gate-tier test.[/dim]")
         elif failed(code):
             return first_failure
-    if browser:
+    if failed(run_changed_browser_tests()):
+        return first_failure
+    deferred = [p for p in browser if p not in selection.changed_browser_tests]
+    if deferred:
         console.print(
-            f"\n[dim]{len(browser)} browser test file(s) reach this diff and are left to "
-            "`./ucx test e2e` and the merge-time gate.[/dim]"
+            f"\n[dim]{len(deferred)} other browser test file(s) reach this diff and are left "
+            "to `./ucx test e2e` and the merge-time gate.[/dim]"
         )
 
     if selection.frontend:

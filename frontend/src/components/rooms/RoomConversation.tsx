@@ -1,7 +1,8 @@
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { UsageBanner } from './UsageBanner';
 import { ArrowDown, Bot, Cpu, Loader2, Mic, Plus, Send, Sparkles, Square, Trash2 } from 'lucide-react';
 import type {
-  AgentInfo,
+  CloneChoice,
   RoomContext,
   RoomState,
   RoomTranscriptMessage,
@@ -27,27 +28,42 @@ import {
   type RoomLiveState,
   type RoomLiveTurn,
 } from '../../lib/rooms';
-import { memoryUnsavedNotice, refusalRemedy, turnFailureSentence } from '../../lib/turnOutcome';
+import {
+  memoryUnsavedNotice,
+  providerFailureRemedy,
+  refusalRemedy,
+  turnFailureSentence,
+} from '../../lib/turnOutcome';
 import { useEscapeOwner } from '../../lib/escapePrecedence';
+import { noticeText } from '../../lib/notices';
 import { cn } from '../../lib/utils';
 import { appendPhrase, useDictation } from '../../lib/useDictation';
-import { personaAvatarUrl } from '../../lib/personaAvatar';
+import { dictationLang, dictationSentence } from '../../lib/dictation';
+import { fmt, plural, useCopy, useLocale } from '../../i18n';
+import { AvatarAuthorContext, personaOfSeat, pictureOf, type AvatarUrls } from '../../lib/avatarChoice';
 import { Avatar, FillRing } from '../../ui-kit';
 import { Button } from '../ui/Button';
 import { RichText } from '../RichText';
 
 interface RoomConversationProps {
   room: RoomState;
+  /** Opens Settings on its Usage tab, from the usage banner's link (llm-token-gateway.md §4.5.3). */
+  onOpenSettings?: () => void;
   /** Agents the runtime can offer, for the invite list. Never a typed id. */
-  availableAgents: AgentInfo[];
+  availableAgents: CloneChoice[];
   live: RoomLiveState;
   /**
-   * What is in the composer, and where a keystroke goes (#1290).
+   * What the composer starts with for this conversation, and where every change goes (#1290).
    *
-   * Controlled from above rather than held here, because this component does not survive
-   * a conversation switch: `openRoom` nulls the room synchronously, so anything typed and
-   * kept in local state is destroyed by the switch. The owner keys it by conversation, so
-   * coming back gives the text back.
+   * The owner keeps the text because this component does not survive a conversation switch:
+   * `openRoom` nulls the room synchronously, so anything kept only in local state is
+   * destroyed by the switch. The owner keys it by conversation, so coming back gives the text
+   * back, and `onDraftChange` is called on every change so its copy is never behind.
+   *
+   * What is on screen is held here, though, and `draft` is read only when a conversation is
+   * opened. Controlled from above, a keystroke re-rendered the owner -- the whole
+   * application, every message in the transcript included -- and typing slowed down as a
+   * conversation grew.
    */
   draft: string;
   onDraftChange: (next: string) => void;
@@ -107,6 +123,17 @@ interface RoomConversationProps {
    * would keep showing a failed turn that has since been retried.
    */
   onOpenTurn: (seq: number) => void;
+  /**
+   * Each clone's `avatar_url` by persona name, from the app's clone list. It changes with the
+   * picture, so a picture chosen anywhere shows here at the next read of that list. A clone
+   * missing from it is drawn from the fixed address.
+   */
+  avatarUrls?: AvatarUrls;
+  /**
+   * Text to add to the composer, such as a prepared request for a picture. Added once per
+   * `id`, after what is already typed, and never sent: the person sends it.
+   */
+  insertDraft?: { id: number; text: string } | null;
 }
 
 /**
@@ -179,7 +206,13 @@ const MessageBody: React.FC<{ text: string }> = ({ text }) => (
   />
 );
 
-const TranscriptRow: React.FC<{
+/**
+ * One settled message. Memoized, as are the two rows below, because the conversation
+ * re-renders on every keystroke in the composer and a row whose message, seats and
+ * attribution have not changed has nothing new to draw. Its callbacks are held stable by
+ * `RoomConversation` for the same reason: a fresh arrow each render would defeat the memo.
+ */
+const TranscriptRow = React.memo<{
   room: RoomState;
   message: RoomTranscriptMessage;
   shape: ConversationShape;
@@ -193,19 +226,22 @@ const TranscriptRow: React.FC<{
    * selection makes (#1300).
    */
   onOpenTurn: (seq: number) => void;
-}> = ({ room, message, shape, attribution, onRetry, onOpenTurn }) => {
-  const label = senderLabel(room, message.sender_id);
+  avatarUrls: AvatarUrls | undefined;
+}>(function TranscriptRow({ room, message, shape, attribution, onRetry, onOpenTurn, avatarUrls }) {
+  const t = useCopy().conversation;
+  const label = senderLabel(room, message.sender_id, t.you);
   const mine = senderKind(room, message.sender_id) === 'human';
   const isAgent = senderKind(room, message.sender_id) === 'agent';
   // This turn's own model, whether or not the turn prints a line. FR-13.4 requires it to
   // be reachable *on the turn*, and the header is a statement about the conversation, not
   // an answer for a particular row. Read from `provenance`, never from what was said.
-  const servedHere = servedByLabel(message.provenance);
+  const servedHere = servedByLabel(message.provenance, t.row.servedInstead);
   const showWhy = Boolean(message.decision || servedHere || (isAgent && message.turn_id));
   const unsavedNotice = memoryUnsavedNotice(
     label,
     message.memory_facts_tried,
     message.memory_facts_unsaved,
+    t.outcome,
   );
 
   return (
@@ -230,7 +266,7 @@ const TranscriptRow: React.FC<{
             // its single default, which is a kind marker rather than a likeness.
             imageSrc={
               senderKind(room, message.sender_id) === 'agent'
-                ? personaAvatarUrl(message.sender_id)
+                ? pictureOf(personaOfSeat(room, message.sender_id), avatarUrls)
                 : undefined
             }
           />
@@ -266,15 +302,34 @@ const TranscriptRow: React.FC<{
           <div data-testid={`row-error-${message.seq}`} className="text-sm text-slate-300">
             {/* A plain sentence, never `message.error`: that field is the raw cause, kept
                 for the log's reader (#1408). */}
-            <p>{turnFailureSentence(label, message.refusal, message.completed)}</p>
+            <p>
+              {turnFailureSentence(
+                label,
+                message.refusal,
+                message.completed,
+                message.provider_failure,
+                t.outcome,
+              )}
+            </p>
             {message.refusal ? (
               <p data-testid={`row-remedy-${message.seq}`} className="mt-1 text-xs text-slate-400">
-                {refusalRemedy(message.refusal)}
+                {refusalRemedy(message.refusal, t.outcome)}
               </p>
             ) : (
-              <Button data-testid="retry-turn" onClick={onRetry} className="mt-1">
-                Retry
-              </Button>
+              <>
+                {message.provider_failure &&
+                providerFailureRemedy(message.provider_failure.kind, t.outcome) ? (
+                  <p
+                    data-testid={`row-remedy-${message.seq}`}
+                    className="mt-1 text-xs text-slate-400"
+                  >
+                    {providerFailureRemedy(message.provider_failure.kind, t.outcome)}
+                  </p>
+                ) : null}
+                <Button data-testid="retry-turn" onClick={onRetry} className="mt-1">
+                  {t.row.retry}
+                </Button>
+              </>
             )}
           </div>
         ) : message.content.trim() === '' ? (
@@ -288,15 +343,19 @@ const TranscriptRow: React.FC<{
           <div data-testid={`row-silent-${message.seq}`} className="text-sm text-slate-300">
             <p>
               {message.completed
-                ? `${label} finished this turn without sending any text.`
-                : `${label} stopped partway through this turn and sent no text.`}
+                ? fmt(t.row.silentFinished, { label })
+                : fmt(t.row.silentStopped, { label })}
             </p>
             <Button data-testid="retry-turn" onClick={onRetry} className="mt-1">
-              Retry
+              {t.row.retry}
             </Button>
           </div>
         ) : (
-          <MessageBody text={message.content} />
+          // The clone that wrote it, for a picture's "Use as avatar" (#1300); nobody's for
+          // the person's own words.
+          <AvatarAuthorContext.Provider value={isAgent ? personaOfSeat(room, message.sender_id) : null}>
+            <MessageBody text={message.content} />
+          </AvatarAuthorContext.Provider>
         )}
 
         {/* The reply stands, but the clone's own record of this turn was not saved, so it
@@ -305,7 +364,7 @@ const TranscriptRow: React.FC<{
             field's text is the cause, for the log's reader; it is not shown here (#1408). */}
         {message.persist_error ? (
           <p data-testid={`row-unsaved-${message.seq}`} className="mt-1 text-[11px] text-slate-500">
-            {label} will not remember this turn after a restart; it could not be saved.
+            {fmt(t.row.unsaved, { label })}
           </p>
         ) : null}
 
@@ -317,8 +376,7 @@ const TranscriptRow: React.FC<{
             data-testid={`row-knowledge-unsaved-${message.seq}`}
             className="mt-1 text-[11px] text-slate-500"
           >
-            {label} will not know what it learned in this turn after a restart; it could not be
-            saved.
+            {fmt(t.row.knowledgeUnsaved, { label })}
           </p>
         ) : null}
 
@@ -331,8 +389,7 @@ const TranscriptRow: React.FC<{
             data-testid={`row-knowledge-reset-${message.seq}`}
             className="mt-1 text-[11px] text-slate-500"
           >
-            {label}&apos;s knowledge record for this conversation could not be read, so it was
-            set aside and kept.
+            {fmt(t.row.knowledgeSetAside, { label })}
           </p>
         ) : null}
 
@@ -386,7 +443,7 @@ const TranscriptRow: React.FC<{
                 onClick={() => onOpenTurn(message.seq)}
                 className="hover:text-slate-300"
               >
-                why ›
+                {t.row.why}
               </button>
             ) : null}
           </div>
@@ -394,24 +451,44 @@ const TranscriptRow: React.FC<{
       </div>
     </div>
   );
-};
+});
 
 /**
  * A roster change, in the conversation where the question about it gets asked.
  *
- * `RoomMessageKind` is `utterance | join | leave` and the three are not interchangeable:
+ * `RoomMessageKind` is `utterance | join | leave | note` and they are not interchangeable:
  * putting a membership row through `TranscriptRow` renders the room's own bookkeeping as
  * something a participant said.
  */
-const MembershipRow: React.FC<{ room: RoomState; message: RoomTranscriptMessage }> = ({
+const MembershipRow = React.memo<{ room: RoomState; message: RoomTranscriptMessage }>(function MembershipRow({
   room,
   message,
-}) => (
-  <p data-testid={`membership-${message.seq}`} className="py-1.5 text-[11px] text-slate-500">
-    {senderLabel(room, message.sender_id)}{' '}
-    {message.kind === 'join' ? 'joined this conversation' : 'left this conversation'}
-  </p>
-);
+}) {
+  const t = useCopy().conversation;
+  const name = senderLabel(room, message.sender_id, t.you);
+  return (
+    <p data-testid={`membership-${message.seq}`} className="py-1.5 text-[11px] text-slate-500">
+      {fmt(message.kind === 'join' ? t.membership.joined : t.membership.left, { name })}
+    </p>
+  );
+});
+
+/**
+ * A note from the application -- the `/loop` help and status lines -- in the conversation
+ * where the command was typed. Worded from its `code` in the reader's language, so an old note
+ * follows the language control too; `content` (English) only when the code is absent or unknown.
+ *
+ * It is shown, because the person asked for it, but it is nobody's speech: no seat reads it
+ * as conversation (#1641), so it carries no sender and none of a spoken row's controls.
+ */
+const NoteRow = React.memo<{ message: RoomTranscriptMessage }>(function NoteRow({ message }) {
+  const t = useCopy().notices;
+  return (
+    <div data-testid={`note-${message.seq}`} className="py-1.5 text-slate-400 opacity-80">
+      <MessageBody text={noticeText(message, t)} />
+    </div>
+  );
+});
 
 /**
  * Whether a seat in a room can carry a model of its own.
@@ -450,8 +527,8 @@ export const RoomConversation: React.FC<RoomConversationProps> = ({
   room,
   availableAgents,
   live,
-  draft,
-  onDraftChange,
+  draft: openingDraft,
+  onDraftChange: reportDraft,
   onSend,
   onStop,
   onRetry,
@@ -468,8 +545,15 @@ export const RoomConversation: React.FC<RoomConversationProps> = ({
   onSelectAgentModel,
   onToggleAutonomous,
   onOpenTurn,
+  onOpenSettings,
+  avatarUrls,
+  insertDraft = null,
 }) => {
   const isAutonomous = Boolean(room.policy?.autonomous);
+  const copy = useCopy();
+  const t = copy.conversation;
+  const c = copy.composer;
+  const { language } = useLocale();
 
   useEffect(() => {
     if (!isAutonomous) return;
@@ -511,10 +595,35 @@ export const RoomConversation: React.FC<RoomConversationProps> = ({
     };
   }, [room.room_id, isAutonomous]);
 
+  // What is in the box. Local, so a keystroke re-renders this component and not its owner;
+  // re-seeded from the owner's copy when a different conversation is put on screen.
+  const [draft, setDraft] = useState(openingDraft);
+  const [draftRoomId, setDraftRoomId] = useState(room.room_id);
+  if (draftRoomId !== room.room_id) {
+    setDraftRoomId(room.room_id);
+    setDraft(openingDraft);
+  }
+  const onDraftChange = useCallback(
+    (next: string) => {
+      setDraft(next);
+      reportDraft(next);
+    },
+    [reportDraft],
+  );
+
+
+  // The owner's callbacks, called through a ref so the rows' props stay the same object
+  // across renders and `TranscriptRow`'s memo holds. The owner passes fresh arrows each time.
+  const rowCallbacksRef = useRef({ onRetry, onOpenTurn });
+  rowCallbacksRef.current = { onRetry, onOpenTurn };
+  const retryRow = useCallback(() => rowCallbacksRef.current.onRetry(), []);
+  const openRowTurn = useCallback((seq: number) => rowCallbacksRef.current.onOpenTurn(seq), []);
+
   const [caret, setCaret] = useState(0);
   const [completionOpen, setCompletionOpen] = useState(false);
   const [inviting, setInviting] = useState(false);
-  const [sendError, setSendError] = useState<string | null>(null);
+  // The failure itself, not its sentence, so the line follows the language control.
+  const [sendError, setSendError] = useState<{ cause: unknown } | null>(null);
   const [sending, setSending] = useState(false);
   const [showSilenceReason, setShowSilenceReason] = useState(false);
   /**
@@ -530,6 +639,22 @@ export const RoomConversation: React.FC<RoomConversationProps> = ({
   // to the draft as it stood when the mic was pressed -- discarding everything typed since.
   const draftRef = useRef(draft);
   draftRef.current = draft;
+
+  // A prepared request from elsewhere -- the profile's "Ask … to make one" -- added after
+  // what is typed, once per id, and left unsent. The ref, not `draft`, so adding it does not
+  // depend on a render that has seen the latest keystroke.
+  const insertedRef = useRef<number | null>(null);
+  useEffect(() => {
+    if (insertDraft === null || insertedRef.current === insertDraft.id) return;
+    insertedRef.current = insertDraft.id;
+    const current = draftRef.current;
+    // Asked twice, the request is still there once: it is added only when not already in the box.
+    if (!current.includes(insertDraft.text)) {
+      const next = current.trim() === '' ? insertDraft.text : `${current.trimEnd()}\n\n${insertDraft.text}`;
+      onDraftChange(next);
+    }
+    composerRef.current?.focus();
+  }, [insertDraft, onDraftChange]);
 
   // ---- chat auto-scroll (adapted from uclone2 MessageList) ------------------------
   const transcriptRef = useRef<HTMLDivElement | null>(null);
@@ -793,13 +918,14 @@ export const RoomConversation: React.FC<RoomConversationProps> = ({
   const stripModel =
     servedModel !== null && servedModel === headerServedBy
       ? null
-      : (servedModel ?? 'No answer yet');
+      : (servedModel ?? c.seat.noAnswerYet);
 
   const dictation = useDictation(
     useCallback(
       (phrase: string) => onDraftChange(appendPhrase(draftRef.current, phrase)),
       [onDraftChange],
     ),
+    dictationLang(language, typeof navigator === 'undefined' ? undefined : navigator.language),
   );
 
   const hint = useMemo(
@@ -809,12 +935,14 @@ export const RoomConversation: React.FC<RoomConversationProps> = ({
         draft,
         room.policy.default_responder_id,
         room.policy.max_agent_turns_per_human_message,
+        c.hint,
       ),
     [
       room.participants,
       room.policy.default_responder_id,
       room.policy.max_agent_turns_per_human_message,
       draft,
+      c.hint,
     ],
   );
 
@@ -840,7 +968,7 @@ export const RoomConversation: React.FC<RoomConversationProps> = ({
 
   const saturatedSeats = (context?.seats ?? []).filter((seat) => seat.is_saturated);
   const seatLabel = (participantId: string): string =>
-    senderLabel(room, participantId);
+    senderLabel(room, participantId, t.you);
 
   /**
    * How many messages the asked-about change would remove, which is what the confirmation
@@ -920,7 +1048,7 @@ export const RoomConversation: React.FC<RoomConversationProps> = ({
       // The draft is deliberately left where it was. A refusal that also erases what you
       // wrote costs you the message twice. The line says only what is known: "Not sent" for
       // a refusal, and never for a send that got no answer (#1441).
-      setSendError(sendFailureNotice(err));
+      setSendError({ cause: err });
     } finally {
       setSending(false);
     }
@@ -955,12 +1083,12 @@ export const RoomConversation: React.FC<RoomConversationProps> = ({
                 kind="agent"
                 agentIcon={Bot}
                 size="2xs"
-                imageSrc={personaAvatarUrl(agent.id)}
+                imageSrc={pictureOf(personaOfSeat(room, agent.id), avatarUrls)}
               />
               <span>{participantLabel(agent)}</span>
               {live.turn?.agentId === agent.id ? (
                 <span data-testid={`writing-${agent.id}`} className="text-slate-500">
-                  Writing…
+                  {t.header.writing}
                 </span>
               ) : null}
             </span>
@@ -989,7 +1117,7 @@ export const RoomConversation: React.FC<RoomConversationProps> = ({
         availableModels.length > 0 ? (
           <label className="flex min-w-0 shrink items-center gap-1.5 text-xs text-slate-400">
             <Cpu className="w-3.5 h-3.5 shrink-0" />
-            <span className="sr-only">Model for this conversation</span>
+            <span className="sr-only">{t.header.modelLabel}</span>
             <select
               data-testid="room-model-select"
               value={agentModelOverride ?? '__default__'}
@@ -1002,7 +1130,9 @@ export const RoomConversation: React.FC<RoomConversationProps> = ({
               className="min-w-0 max-w-full truncate bg-transparent text-xs text-slate-300 outline-none"
             >
               <option value="__default__" className="bg-slate-950 text-slate-200">
-                {currentModel ? `Use default (${currentModel})` : 'Use the default model'}
+                {currentModel
+                  ? fmt(t.header.useDefaultNamed, { model: currentModel })
+                  : t.header.useDefault}
               </option>
               {availableModels.map((model) => (
                 <option key={model} value={model} className="bg-slate-950 text-slate-200">
@@ -1017,12 +1147,8 @@ export const RoomConversation: React.FC<RoomConversationProps> = ({
           <Button
             data-testid="toggle-autonomous"
             onClick={() => onToggleAutonomous(!isAutonomous)}
-            aria-label={isAutonomous ? 'Autonomous discussion on' : 'Autonomous discussion off'}
-            title={
-              isAutonomous
-                ? 'Autonomous discussion active (agents converse while you view)'
-                : 'Turn on autonomous discussion (agents converse while you view)'
-            }
+            aria-label={isAutonomous ? t.header.autonomousOnLabel : t.header.autonomousOffLabel}
+            title={isAutonomous ? t.header.autonomousOnTitle : t.header.autonomousOffTitle}
             className={cn(
               'shrink-0 whitespace-nowrap text-xs flex items-center gap-1.5 transition-colors',
               isAutonomous
@@ -1031,9 +1157,9 @@ export const RoomConversation: React.FC<RoomConversationProps> = ({
             )}
           >
             <Sparkles className={cn('w-3 h-3', isAutonomous ? 'text-amber-300' : 'text-slate-400')} />
-            <span className="column-icon-only">Auto discuss</span>
+            <span className="column-icon-only">{t.header.autoDiscuss}</span>
             <span className="text-[10px] uppercase tracking-wider font-semibold opacity-90">
-              {isAutonomous ? 'ON' : 'OFF'}
+              {isAutonomous ? t.header.on : t.header.off}
             </span>
           </Button>
         ) : null}
@@ -1041,23 +1167,23 @@ export const RoomConversation: React.FC<RoomConversationProps> = ({
         <Button
           data-testid="add-someone"
           onClick={() => setInviting((open) => !open)}
-          aria-label="Add someone"
+          aria-label={t.header.addSomeone}
           className="shrink-0 whitespace-nowrap"
         >
           <Plus className="w-3 h-3" />
-          <span className="column-icon-only">Add someone</span>
+          <span className="column-icon-only">{t.header.addSomeone}</span>
         </Button>
 
         {onClearHistory ? (
           <Button
             data-testid="clear-history"
             onClick={() => setPending({ kind: 'clear' })}
-            aria-label="Clear this conversation"
-            title="Clear this conversation"
+            aria-label={t.header.clearLabel}
+            title={t.header.clearLabel}
             className="shrink-0 whitespace-nowrap"
           >
             <Trash2 className="w-3 h-3" />
-            <span className="column-icon-only">Clear</span>
+            <span className="column-icon-only">{t.header.clear}</span>
           </Button>
         ) : null}
         </div>
@@ -1071,9 +1197,7 @@ export const RoomConversation: React.FC<RoomConversationProps> = ({
             // install was told everybody was already here -- which was not true, and left
             // nothing to do about it.
             <span data-testid="invite-empty-cause" className="text-xs text-slate-500">
-              {availableAgents.length === 0
-                ? 'No clones are running yet. Send a message in a chat first, and whoever answers can be added here.'
-                : 'Everyone available is already in this conversation.'}
+              {availableAgents.length === 0 ? t.invite.noClones : t.invite.everyoneHere}
             </span>
           ) : (
             invitable.map((agent) => (
@@ -1090,7 +1214,7 @@ export const RoomConversation: React.FC<RoomConversationProps> = ({
                   kind="agent"
                   agentIcon={Bot}
                   size="2xs"
-                  imageSrc={personaAvatarUrl(agent.id)}
+                  imageSrc={pictureOf(agent.id, avatarUrls)}
                 />
                 {agent.label || agent.id}
               </Button>
@@ -1123,9 +1247,12 @@ export const RoomConversation: React.FC<RoomConversationProps> = ({
               message={message}
               shape={shape}
               attribution={attribution.get(message.seq)}
-              onRetry={onRetry}
-              onOpenTurn={onOpenTurn}
+              onRetry={retryRow}
+              onOpenTurn={openRowTurn}
+              avatarUrls={avatarUrls}
             />
+          ) : message.kind === 'note' ? (
+            <NoteRow key={message.seq} message={message} />
           ) : (
             <MembershipRow key={message.seq} room={room} message={message} />
           ),
@@ -1138,9 +1265,7 @@ export const RoomConversation: React.FC<RoomConversationProps> = ({
             "nobody is here to speak" have different remedies. */}
         {!hasSpoken && !inFlight && !live.error ? (
           <p data-testid="transcript-empty" className="py-6 text-sm text-slate-500">
-            {agents.length === 0
-              ? 'No one is in this conversation yet. Add someone to get a reply.'
-              : 'Nothing has been said here yet. Send a message to start.'}
+            {agents.length === 0 ? t.empty.noOne : t.empty.nothingSaid}
           </p>
         ) : null}
 
@@ -1151,13 +1276,13 @@ export const RoomConversation: React.FC<RoomConversationProps> = ({
             {shape === 'multi' ? (
               <div className="flex items-center gap-1.5 pb-1 text-xs font-medium text-slate-300">
                 <Avatar
-                  label={senderLabel(room, liveTurn.agentId)}
+                  label={senderLabel(room, liveTurn.agentId, t.you)}
                   kind="agent"
                   agentIcon={Bot}
                   size="xs"
-                  imageSrc={personaAvatarUrl(liveTurn.agentId)}
+                  imageSrc={pictureOf(personaOfSeat(room, liveTurn.agentId), avatarUrls)}
                 />
-                {senderLabel(room, liveTurn.agentId)}
+                {senderLabel(room, liveTurn.agentId, t.you)}
               </div>
             ) : null}
             <div
@@ -1175,9 +1300,16 @@ export const RoomConversation: React.FC<RoomConversationProps> = ({
                   data-testid="live-turn-indicator"
                   className="flex items-center gap-2 text-slate-400 py-1"
                 >
-                  <Loader2 className="w-3.5 h-3.5 animate-spin text-slate-400 shrink-0" aria-label="Thinking" />
+                  <Loader2
+                    className="w-3.5 h-3.5 animate-spin text-slate-400 shrink-0"
+                    aria-label={t.live.thinkingLabel}
+                  />
                   <span className="text-xs font-mono text-slate-400">
-                    {liveTurn.statusText || 'Thinking...'}
+                    {/* `Thinking...` is the head's own placeholder status (`applyReply`), so it
+                        is said in the reader's language; any other status is the Core's. */}
+                    {!liveTurn.statusText || liveTurn.statusText === 'Thinking...'
+                      ? t.live.thinking
+                      : liveTurn.statusText}
                   </span>
                 </div>
               ) : (
@@ -1200,34 +1332,30 @@ export const RoomConversation: React.FC<RoomConversationProps> = ({
 
         {live.error ? (
           <p data-testid="cascade-error" className="py-2 text-sm text-slate-300">
-            This conversation stopped: {live.error}
+            {fmt(t.live.stopped, { error: live.error })}
           </p>
         ) : null}
 
         {ceilingReached && !running ? (
           <p data-testid="ceiling-notice" className="py-2 text-xs text-slate-500">
-            Paused after {room.policy.max_agent_turns_per_human_message} replies. Send a message
-            to continue.
+            {fmt(t.notices.ceiling, { count: room.policy.max_agent_turns_per_human_message })}
           </p>
         ) : null}
 
         {silence && !running && !ceilingReached && !live.error ? (
           <div data-testid="silence-notice" className="py-2 text-xs text-slate-500">
-            <p>
-              No one answered your last message, and no one is going to. Address someone with
-              @ to get a reply.
-            </p>
+            <p>{t.notices.silence}</p>
             <button
               type="button"
               data-testid="why-silence"
               onClick={() => setShowSilenceReason((open) => !open)}
               className="mt-1 text-slate-500 hover:text-slate-300"
             >
-              why ›
+              {t.row.why}
             </button>
             {showSilenceReason ? (
               <div data-testid="why-silence-detail" className="mt-1">
-                <p>Decided by {silence.selector}.</p>
+                <p>{fmt(t.notices.decidedBy, { selector: silence.selector })}</p>
                 {silence.reasoning ? <p>{silence.reasoning}</p> : null}
               </div>
             ) : null}
@@ -1250,7 +1378,7 @@ export const RoomConversation: React.FC<RoomConversationProps> = ({
               className="bg-slate-900 text-slate-200 shadow-sm"
             >
               <ArrowDown className="w-3 h-3" aria-hidden="true" />
-              Jump to latest
+              {t.notices.jumpToLatest}
             </Button>
           </div>
         ) : null}
@@ -1265,10 +1393,9 @@ export const RoomConversation: React.FC<RoomConversationProps> = ({
             data-testid="participants-not-reset"
             className="px-4 py-2 text-[11px] text-slate-300 mx-auto w-full max-w-3xl"
           >
-            {participantsNotReset.map(seatLabel).join(', ')}{' '}
-            {participantsNotReset.length === 1 ? 'still remembers' : 'still remember'} what was
-            removed here, so a reply may refer to it. Send a message to start again, or clear
-            this conversation.
+            {plural(t.reset.notReset, participantsNotReset.length, {
+              names: participantsNotReset.map(seatLabel).join(', '),
+            })}
           </p>
         </div>
       ) : null}
@@ -1283,21 +1410,22 @@ export const RoomConversation: React.FC<RoomConversationProps> = ({
         >
           <div className="px-4 py-2 text-[11px] text-slate-300 mx-auto w-full max-w-3xl">
             <p>
-              {saturatedSeats.map((seat) => seatLabel(seat.participant_id)).join(', ')} reached the{' '}
-              {context.saturation_threshold}-turn limit on context. Shorten this conversation to
-              keep going, or start a new one.
+              {fmt(t.reset.saturated, {
+                names: saturatedSeats.map((seat) => seatLabel(seat.participant_id)).join(', '),
+                threshold: context.saturation_threshold,
+              })}
             </p>
             {/* Which copy the figure came from. A seat nothing has spoken in since this
                 server started answers from its saved record, which is behind any turn an
                 earlier run did not write (P6). */}
             {saturatedSeats.some((seat) => !seat.live) ? (
               <p data-testid="saturation-from-record" className="mt-1 text-slate-500">
-                Counted from the saved record for{' '}
-                {saturatedSeats
-                  .filter((seat) => !seat.live)
-                  .map((seat) => seatLabel(seat.participant_id))
-                  .join(', ')}
-                , which nothing has spoken in since this server started.
+                {fmt(t.reset.fromRecord, {
+                  names: saturatedSeats
+                    .filter((seat) => !seat.live)
+                    .map((seat) => seatLabel(seat.participant_id))
+                    .join(', '),
+                })}
               </p>
             ) : null}
             {onCompact ? (
@@ -1307,13 +1435,12 @@ export const RoomConversation: React.FC<RoomConversationProps> = ({
                 disabled={compacting || running}
                 className="mt-1"
               >
-                {compacting ? 'Shortening\u2026' : 'Shorten this conversation'}
+                {compacting ? t.reset.shortening : t.reset.shorten}
               </Button>
             ) : null}
             {running ? (
               <p data-testid="compact-blocked" className="mt-1 text-slate-500">
-                A turn is running. Shortening waits until it finishes, so nothing is cut out
-                from under it.
+                {t.reset.compactBlocked}
               </p>
             ) : null}
           </div>
@@ -1330,14 +1457,11 @@ export const RoomConversation: React.FC<RoomConversationProps> = ({
         >
           <div className="px-4 py-2 text-[11px] text-slate-300 mx-auto w-full max-w-3xl">
             <p>
-              {`Clear this conversation? Its ${
-                removedByPending === 1 ? 'one message is' : `${removedByPending} messages are`
-              } removed for good. It keeps its name and who is in it.`}
+              {plural(t.clearConfirm.question, removedByPending)}
             </p>
             {running ? (
               <p data-testid="confirm-blocked" className="mt-1 text-slate-500">
-                A turn is running, so this would be refused. It can be done once that
-                finishes.
+                {t.clearConfirm.blocked}
               </p>
             ) : null}
             <div className="mt-1 flex items-center gap-2">
@@ -1349,10 +1473,10 @@ export const RoomConversation: React.FC<RoomConversationProps> = ({
                   void onClearHistory?.();
                 }}
               >
-                Clear
+                {t.clearConfirm.confirm}
               </Button>
               <Button data-testid="confirm-history-change-no" onClick={() => setPending(null)}>
-                Keep everything
+                {t.clearConfirm.keep}
               </Button>
             </div>
           </div>
@@ -1360,6 +1484,7 @@ export const RoomConversation: React.FC<RoomConversationProps> = ({
       ) : null}
 
       <div data-testid="composer-column" className="px-4 pt-2 pb-3 mx-auto w-full max-w-3xl">
+        <UsageBanner refreshKey={room.transcript.length} onOpenSettings={onOpenSettings} />
         {mention && candidates.length > 0 ? (
           <div data-testid="mention-completion" className="mb-1 flex flex-wrap gap-1">
             {candidates.map((participant, index) => (
@@ -1443,7 +1568,7 @@ export const RoomConversation: React.FC<RoomConversationProps> = ({
               event.preventDefault();
               void submit();
             }}
-            placeholder="Send a message"
+            placeholder={c.placeholder}
             className="w-full bg-transparent text-sm text-slate-200 outline-none resize-none placeholder:text-slate-600"
           />
 
@@ -1473,7 +1598,9 @@ export const RoomConversation: React.FC<RoomConversationProps> = ({
                 if (dictation.state.kind === 'error') dictation.dismissError();
                 dictation.toggle();
               }}
-              aria-label={dictation.state.kind === 'listening' ? 'Stop listening' : 'Speak the message'}
+              aria-label={
+                dictation.state.kind === 'listening' ? c.dictate.stopLabel : c.dictate.startLabel
+              }
               aria-pressed={dictation.state.kind === 'listening'}
               className={cn(
                 'shrink-0 py-1',
@@ -1485,7 +1612,7 @@ export const RoomConversation: React.FC<RoomConversationProps> = ({
             >
               <Mic className="w-3 h-3" />
               <span className="column-icon-only">
-                {dictation.state.kind === 'listening' ? 'Listening' : 'Speak'}
+                {dictation.state.kind === 'listening' ? c.dictate.listening : c.dictate.speak}
               </span>
             </Button>
 
@@ -1547,8 +1674,8 @@ export const RoomConversation: React.FC<RoomConversationProps> = ({
                       }
                       label={
                         tokenWindow
-                          ? `${participantLabel(soleAnswerer)} has used ${tokenWindow.used.toLocaleString()} of ${tokenWindow.max.toLocaleString()} tokens of context`
-                          : `${participantLabel(soleAnswerer)} has used ${answererContext.active_turns} of ${context.saturation_threshold} turns of context`
+                          ? fmt(c.seat.ringTokens, { name: participantLabel(soleAnswerer), used: tokenWindow.used.toLocaleString(), max: tokenWindow.max.toLocaleString() })
+                          : fmt(c.seat.ringTurns, { name: participantLabel(soleAnswerer), used: answererContext.active_turns, max: context.saturation_threshold })
                       }
                     />
                     <span
@@ -1557,15 +1684,15 @@ export const RoomConversation: React.FC<RoomConversationProps> = ({
                         tokenWindow === null
                           ? undefined
                           : tokenWindow.source === 'loaded'
-                            ? 'The server serving this model reported this context window when it loaded it.'
+                            ? c.seat.windowLoaded
                             : tokenWindow.source === 'published'
-                              ? 'The published context window for this model, which its provider enforces.'
+                              ? c.seat.windowPublished
                               : undefined
                       }
                     >
                       {tokenWindow
-                        ? `${tokenWindow.used.toLocaleString()}/${tokenWindow.max.toLocaleString()} tokens`
-                        : `${answererContext.active_turns}/${context.saturation_threshold} turns`}
+                        ? fmt(c.seat.tokensOf, { used: tokenWindow.used.toLocaleString(), max: tokenWindow.max.toLocaleString() })
+                        : fmt(c.seat.turnsOf, { used: answererContext.active_turns, max: context.saturation_threshold })}
                     </span>
                   </span>
                 ) : null}
@@ -1581,11 +1708,11 @@ export const RoomConversation: React.FC<RoomConversationProps> = ({
                       // the browser as a crash rather than as a sentence.
                       tokenWindow !== null
                         ? (answererContext.cumulative_tokens ?? null) !== null
-                          ? `Active context: ${tokenWindow.used.toLocaleString()} / ${tokenWindow.max.toLocaleString()} tokens. Session spend: ${(answererContext.cumulative_tokens ?? 0).toLocaleString()} tokens.`
+                          ? fmt(c.seat.activeContext, { used: tokenWindow.used.toLocaleString(), max: tokenWindow.max.toLocaleString(), spent: (answererContext.cumulative_tokens ?? 0).toLocaleString() })
                           : undefined
                         : (answererContext.used_tokens ?? null) === null
-                          ? 'Token counts are kept for the current run. This seat has not answered since it started, so nothing has been booked against it here.'
-                          : 'No context window was reported for this model, so the ring counts turns instead of tokens.'
+                          ? c.seat.notCountedYet
+                          : c.seat.noWindow
                     }
                   >
                     {/* Whichever fact the ring is not showing. Both ceilings are real and a
@@ -1594,13 +1721,13 @@ export const RoomConversation: React.FC<RoomConversationProps> = ({
                         window it keeps the token count, which is what this said before the
                         ring had a denominator at all. */}
                     {tokenWindow
-                      ? `${answererContext.active_turns}/${context.saturation_threshold} turns`
+                      ? fmt(c.seat.turnsOf, { used: answererContext.active_turns, max: context.saturation_threshold })
                       : (answererContext.used_tokens ?? null) === null
-                        ? 'tokens not counted this run'
+                        ? c.seat.tokensNotCounted
                         : // Grouped the way the Budget surface writes the same quantity. A
                           // second format for one figure is how two readings of it start
                           // looking like two quantities.
-                          `${(answererContext.used_tokens ?? 0).toLocaleString()} tokens`}
+                          fmt(c.seat.tokens, { count: (answererContext.used_tokens ?? 0).toLocaleString() })}
                   </span>
                 ) : null}
               </span>
@@ -1609,18 +1736,18 @@ export const RoomConversation: React.FC<RoomConversationProps> = ({
                 data-testid="answering-several"
                 className="shrink-0 text-[11px] text-slate-500"
               >
-                Each answers from its own context
+                {c.seat.several}
               </span>
             ) : null}
             {running ? (
               <Button
                 data-testid="stop-turn"
                 onClick={onStop}
-                aria-label="Stop"
+                aria-label={c.stop}
                 className="ml-auto shrink-0 text-slate-200 py-1"
               >
                 <Square className="w-3 h-3" />
-                <span className="column-icon-only">Stop</span>
+                <span className="column-icon-only">{c.stop}</span>
               </Button>
             ) : (
               <Button
@@ -1629,11 +1756,11 @@ export const RoomConversation: React.FC<RoomConversationProps> = ({
                 onClick={() => {
                   void submit();
                 }}
-                aria-label="Send (Enter)"
+                aria-label={c.sendLabel}
                 className="ml-auto shrink-0 text-slate-200 py-1"
               >
                 <Send className="w-3 h-3" />
-                <span className="column-icon-only">Send</span>
+                <span className="column-icon-only">{c.send}</span>
               </Button>
             )}
           </div>
@@ -1641,7 +1768,7 @@ export const RoomConversation: React.FC<RoomConversationProps> = ({
 
         {sendError ? (
           <p data-testid="send-error" className="pt-1.5 text-[11px] text-slate-300">
-            {sendError}
+            {sendFailureNotice(sendError.cause, c.sendFailure)}
           </p>
         ) : null}
 
@@ -1652,8 +1779,8 @@ export const RoomConversation: React.FC<RoomConversationProps> = ({
           // gets nothing is told nothing about why, or about what would let it through.
           <p data-testid="dictation-message" className="pt-1.5 text-[11px] text-slate-300">
             {dictation.state.kind === 'unsupported'
-              ? dictation.state.reason
-              : dictation.state.message}
+              ? c.dictation.unsupported
+              : dictationSentence(dictation.state.code, c.dictation)}
           </p>
         ) : null}
       </div>

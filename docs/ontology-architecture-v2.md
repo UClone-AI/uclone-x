@@ -1139,6 +1139,7 @@ Authoritative. Where this table and the prose above disagree, this table is corr
 | Three tiers, `EvidenceRecord`, promote/demote/forget, `content_hash` over asserted only | **Implemented** — `engine.py`, `models.py` |
 | `validate` (as `validate_entity`, S1-only, no inheritance, `rule_expression` inert) | **Implemented, and defective** — [§1.2](#12-three-demonstrations-verified-by-execution) |
 | The thirteen capabilities, S3 with justifications, `entail`, `explain` | **In progress** — issue #138, phase 2. Target modules `src/uclone_x/ontology/{justification,rules,reasoner}.py`, being written concurrently with this document |
+| Learning from conversations (any step that writes what a clone was told into an engine) | **Not implemented** (re-read 2026-09-25) — `OntologyInducer` / `SessionKnowledgeExtractor` have no caller. Redesigned in `design/clone-knowledge-graph.md` (#1638): memory facts are the graph, and the engine holds rules only |
 | S2 bi-temporal assertion store | **Planned** — phase 6, no code |
 | S4 hypothesis store with retained counterexamples | **Planned** — phase 5, no code. `EvidenceRecord.contradicting_observations` exists but holds free-text reasons, not counterexample references |
 | S5 crosswalk store, `CrosswalkAssertion`, `ArbitrationRecord` | **Planned** — phase 7, no code. Specified in [`ontology-alignment-spec.md`](ontology-alignment-spec.md) |

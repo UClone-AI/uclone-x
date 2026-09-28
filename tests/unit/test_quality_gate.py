@@ -14,6 +14,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from uclone_x.cli import quality_gate
+from uclone_x.cli.browser_plan import BrowserPlan
 from uclone_x.cli.bundle_freshness import BundleStatus
 from uclone_x.cli.environment_provenance import BLOCKING_STATUSES, ProvenanceStatus
 from uclone_x.cli.quality_gate import (
@@ -306,9 +307,13 @@ def test_quality_gate_test_scopes(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(subprocess, "run", fake_run)
     # The worker flags a scope without the browser suite carries (#967).
     parallel = ["-n", str(quality_gate.pytest_worker_count()), "--dist=load"]
+    browser_workers = quality_gate.browser_worker_count()
+    browser_parallel = (
+        ["-n", str(browser_workers), "--dist=loadfile"] if browser_workers > 1 else []
+    )
 
     # Gate scope: what `./ucx test check` runs — everything offline and free, in two steps:
-    # everything but the browser suite on workers, then the browser suite in one process.
+    # everything but the browser suite on workers, then the browser suite on workers of its own.
     calls.clear()
     assert run_quality_gate(quiet=True, test_scope="gate") == 0
     assert calls[3] == [
@@ -328,6 +333,7 @@ def test_quality_gate_test_scopes(monkeypatch: pytest.MonkeyPatch) -> None:
         "--junitxml=.pytest_cache/junit.browser.xml",
         "-o",
         "junit_family=xunit2",
+        *browser_parallel,
         "--cov-append",
         "-m",
         "(not recorded and not live) and e2e",
@@ -2393,7 +2399,7 @@ def test_the_browser_suite_and_the_scopes_outside_the_gate_stay_serial(scope: st
 
 
 @pytest.mark.parametrize("scope", _SPLIT_SCOPES)
-def test_the_gate_runs_the_browser_suite_after_the_workers_in_one_process(scope: str) -> None:
+def test_the_gate_runs_the_browser_suite_after_the_workers_on_its_own(scope: str) -> None:
     """Step 1 is everything but E2E on workers; step 2 is E2E alone, appending coverage.
 
     Killed by: src/uclone_x/cli/quality_gate.py :: f"({expression}) and e2e",
@@ -2408,7 +2414,11 @@ def test_the_gate_runs_the_browser_suite_after_the_workers_in_one_process(scope:
         "--dist=load",
     ]
     assert _marker(workers.argv) == f"({expression}) and not e2e"
-    assert _worker_flags(browser.argv) == []
+    assert _worker_flags(browser.argv) == (
+        ["-n", str(quality_gate.browser_worker_count()), "--dist=loadfile"]
+        if quality_gate.browser_worker_count() > 1
+        else []
+    )
     assert _marker(browser.argv) == f"({expression}) and e2e"
     assert workers.junit_path != browser.junit_path
     assert _junit_argument(workers.argv) == workers.junit_path
@@ -2485,7 +2495,11 @@ def test_the_gate_merges_both_steps_into_the_report_it_reads(
     )
 
     assert code == 1
-    assert [len(_worker_flags(c)) > 0 for c in calls if c[0] == "pytest"] == [True, False]
+    dist = [
+        [f for f in _worker_flags(c) if f.startswith("--dist")] for c in calls if c[0] == "pytest"
+    ]
+    browser_dist = ["--dist=loadfile"] if quality_gate.browser_worker_count() > 1 else []
+    assert dist == [["--dist=load"], browser_dist]
     names = [tc.get("name") for tc in ET.parse(junit).getroot().iter("testcase")]
     assert names == ["test_unit_ok", "test_browser_broke"]
     history = junit.with_name("failure_history.jsonl").read_text(encoding="utf-8")
@@ -2571,9 +2585,8 @@ def test_merge_reports_what_it_left_out(tmp_path: Path) -> None:
 def test_the_serial_flag_reaches_the_pytest_stage(monkeypatch: pytest.MonkeyPatch) -> None:
     """`serial=True` reaches the pytest stage as one serial invocation.
 
-    Killed by: src/uclone_x/cli/quality_gate.py ::
-        steps = build_pytest_steps(test_scope, junit_path=junit_path, serial=serial)
-    Becomes: steps = build_pytest_steps(test_scope, junit_path=junit_path)
+    Killed by: src/uclone_x/cli/quality_gate.py :: junit_path=junit_path, serial=serial, browser=browser
+    Becomes: junit_path=junit_path, browser=browser
     """
     code, calls = _run_gate_recording_commands(monkeypatch, serial=True)
     pytest_calls = [cmd for cmd in calls if cmd[0] == "pytest"]
@@ -2890,3 +2903,38 @@ def test_a_quiet_gate_does_not_report_a_restore_after_a_stage(
     assert exit_code == 0
     assert len(started) == 7, started
     assert capfd.readouterr() == ("", "")
+
+
+@pytest.mark.parametrize(
+    ("files", "cpus", "expected"),
+    [
+        (None, 16, 4),  # the whole suite: the browser step's own cap
+        (None, 2, 2),  # never more than the main step's workers
+        (None, 1, 1),
+        (1, 16, 1),  # one file is one worker's under loadfile
+        (3, 16, 3),
+        (9, 16, 4),
+    ],
+)
+def test_the_browser_step_starts_no_more_workers_than_it_can_use(
+    files: int | None, cpus: int, expected: int
+) -> None:
+    """Killed by: src/uclone_x/cli/quality_gate.py :: limit if files is None else min(limit, files)
+    Becomes: limit
+    """
+    assert quality_gate.browser_worker_count(files, cpu_count=cpus) == expected
+
+
+def test_a_one_file_browser_step_runs_in_one_process(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A narrowed run of one changed file starts no workers: xdist would only add a Chromium.
+
+    Killed by: src/uclone_x/cli/quality_gate.py :: if browser_workers > 1 else "in one process"
+    Becomes: if True else "in one process"
+    """
+    monkeypatch.setattr(quality_gate.os, "cpu_count", lambda: 16)
+    plan = BrowserPlan("files", "r", files=("tests/e2e/test_a.py",))
+    _, browser = quality_gate.build_pytest_steps("gate", browser=plan)
+    assert _worker_flags(browser.argv) == []
+    assert "in one process" in browser.label
+    whole = quality_gate.build_pytest_steps("gate")[1]
+    assert _worker_flags(whole.argv) == ["-n", "4", "--dist=loadfile"]

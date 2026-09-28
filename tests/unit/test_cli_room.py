@@ -300,6 +300,106 @@ class TestShowMakesTheRecordedOutcomesVisible:
         for internal in ("Traceback", "status 400", "{", "LLMProviderError"):
             assert internal not in output, internal
 
+    def test_a_retired_model_is_shown_with_a_retry_on_another_model(self, rooms: RoomStore) -> None:
+        """The same model would fail the same way, so the retry names `--model` (#1630).
+
+        Killed by: src/uclone_x/cli/commands/room.py :: elif last.refusal == RoomTurnRefusal.MODEL_UNAVAILABLE:
+        Becomes: elif False:
+        """
+        from uclone_x.errors import ModelNotAvailableError
+        from uclone_x.room.models import RoomMessage, RoomTurnRefusal
+
+        _seed(
+            rooms,
+            "room_mu",
+            RoomMessage(seq=1, sender_id="alice", content="caching?"),
+            RoomMessage(
+                seq=2,
+                sender_id="scout",
+                content="",
+                error=str(ModelNotAvailableError(provider="Google", model="gemini-1.5-pro")),
+                refusal=RoomTurnRefusal.MODEL_UNAVAILABLE,
+            ),
+        )
+
+        result = _run("show", "room_mu")
+
+        assert result.exit_code == 0, result.output
+        output = " ".join(result.output.split())
+        assert "The model gemini-1.5-pro is not available from Google" in output
+        assert "ucx room retry room_mu --model <model>" in output
+        assert "retry that turn with: ucx room retry room_mu" not in output
+
+    def test_a_rejected_key_is_offered_no_retry(
+        self, rooms: RoomStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A new key is the remedy, and retrying with the old one cannot succeed.
+
+        Killed by: src/uclone_x/room/models.py :: return RoomTurnRefusal.PROVIDER_AUTH
+        Becomes: return None
+        """
+        from uclone_x.agent.models import ProviderFailure
+        from uclone_x.errors import ProviderAuthError
+        from uclone_x.room.models import RoomMessage, RoomTurnRefusal, turn_refusal
+
+        assert turn_refusal("provider_auth") is RoomTurnRefusal.PROVIDER_AUTH
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)  # else it names the variable
+        exc = ProviderAuthError(provider="Anthropic", model="claude-sonnet-4-5")
+        _seed(
+            rooms,
+            "room_pa",
+            RoomMessage(seq=1, sender_id="alice", content="caching?"),
+            RoomMessage(
+                seq=2,
+                sender_id="scout",
+                content="",
+                error=str(exc),
+                refusal=RoomTurnRefusal.PROVIDER_AUTH,
+                provider_failure=ProviderFailure.of(exc),
+            ),
+        )
+
+        result = _run("show", "room_pa")
+
+        assert result.exit_code == 0, result.output
+        output = " ".join(result.output.split())
+        assert "Anthropic did not accept the API key." in output
+        assert "Save a new key with `ucx key set anthropic`." in output
+        assert "ucx room retry" not in output
+
+    def test_an_unreachable_provider_names_the_endpoint_and_offers_the_retry(
+        self, rooms: RoomStore
+    ) -> None:
+        """A mistyped custom endpoint is one cause of "could not reach"; the line says to check it.
+
+        Killed by: src/uclone_x/cli/commands/room.py :: if failure is not None and failure.kind == "provider_unreachable":
+        Becomes: if False:
+        """
+        from uclone_x.agent.models import ProviderFailure
+        from uclone_x.errors import ProviderUnreachableError
+        from uclone_x.room.models import RoomMessage
+
+        exc = ProviderUnreachableError(provider="OpenAI", model="gpt-5-mini")
+        _seed(
+            rooms,
+            "room_pu",
+            RoomMessage(seq=1, sender_id="alice", content="caching?"),
+            RoomMessage(
+                seq=2,
+                sender_id="scout",
+                content="",
+                error=str(exc),
+                provider_failure=ProviderFailure.of(exc),
+            ),
+        )
+
+        result = _run("show", "room_pu")
+
+        assert result.exit_code == 0, result.output
+        output = " ".join(result.output.split())
+        assert "If you set a custom endpoint, check that address too." in output
+        assert "retry that turn with: ucx room retry room_pu" in output
+
     def test_a_spent_budget_is_offered_no_retry(self, rooms: RoomStore) -> None:
         """A retry of a turn refused for its usage budget is refused the same way.
 
@@ -903,8 +1003,8 @@ class TestTheCliSeatsAgentsWithMemory:
         there is handed to every seat — so the per-participant factory is what gives a
         room agent a memory at all.
 
-        Killed by: src/uclone_x/cli/commands/room.py :: memory_factory=default_cross_session_memory,
-        Becomes: memory_factory=None,
+        Killed by: src/uclone_x/agent/clone_builder.py :: memory_for=memory_for if memory_for is not None else memory_map(),
+        Becomes: memory_for=memory_for,
         """
         from uclone_x.cli.commands.room import build_orchestrator
         from uclone_x.core.agent_home import AGENTS_DIR_ENV_VAR
@@ -921,7 +1021,7 @@ class TestTheCliSeatsAgentsWithMemory:
             "RoomAgentResolver",
             orchestrator._resolver,  # pyright: ignore[reportPrivateUsage, reportAttributeAccessIssue, reportUnknownMemberType]
         )
-        factory = resolver._memory_factory  # pyright: ignore[reportPrivateUsage]
+        factory = resolver.app.memory_for
         assert factory is not None
 
         alpha, again, beta = factory("alpha"), factory("alpha"), factory("beta")

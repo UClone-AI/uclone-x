@@ -1,0 +1,75 @@
+chapters:
+  - id: ch01
+    title: 은월성의 밤
+    act: "1"
+    scenes:
+      - id: ch01.s01
+        title: 물려받은 검
+        summary: 예린이 제자 라온에게 월광검을 물려준다.
+        characters: [raon, yerin]
+        places: [eunwol_castle]
+        story_time: 1
+        beats:
+          - 은월성 수련장에서 마지막 대련을 한다
+          - 예린이 월광검을 라온에게 건넨다
+      - id: ch01.s02
+        title: 습격
+        summary: 카엘의 그림자 도적단이 은월성을 습격한다.
+        characters: [raon, yerin, doyun, kael]
+        places: [eunwol_castle]
+        story_time: 2
+        beats:
+          - 성벽의 종이 울린다
+          - 도윤이 활로 성문을 지킨다
+      - id: ch01.s03
+        title: 스승의 최후
+        summary: 예린이 라온을 지키다 카엘의 칼에 쓰러진다.
+        characters: [raon, yerin, kael]
+        places: [eunwol_castle]
+        story_time: 3
+        beats:
+          - 예린이 라온 앞을 막아선다
+          - 예린이 숨을 거둔다
+  - id: ch02
+    title: 안개숲
+    act: "2"
+    scenes:
+      - id: ch02.s01
+        title: 빼앗긴 검
+        summary: 안개숲으로 도망친 라온은 카엘에게 월광검을 빼앗긴다.
+        characters: [raon, doyun, kael]
+        places: [misty_forest]
+        story_time: 4
+        beats:
+          - 안개 속에서 카엘이 나타난다
+          - 카엘이 월광검을 빼앗아 사라진다
+      - id: ch02.s02
+        title: 모닥불
+        summary: 안개숲의 밤, 라온과 도윤은 모닥불 앞에서 다음 길을 정한다.
+        characters: [raon, doyun]
+        places: [misty_forest]
+        story_time: 5
+        beats:
+          - 라온이 개울물에 비친 자기 얼굴을 들여다본다
+          - 모닥불 앞에서 도윤이 예린 이야기를 꺼낸다
+          - 라온은 카엘을 쫓기로 결심하고 떠날 채비를 한다
+      - id: ch02.s03
+        title: 회상 - 첫 검
+        summary: 몇 해 전, 어린 라온이 예린에게 처음 검을 배우던 날.
+        characters: [raon, yerin]
+        places: [eunwol_castle]
+        story_time: 0
+        beats:
+          - 예린이 어린 라온에게 검 쥐는 법을 가르친다
+          - 라온이 예린의 얼굴을 올려다본다
+          - 예린이 허리에 찬 월광검을 보여 주며 언젠가 물려주겠다고 약속한다
+      - id: ch02.s04
+        title: 새벽 수련
+        summary: 안개숲의 새벽, 라온은 검술 수련을 하며 카엘을 쫓을 힘을 기른다.
+        characters: [raon, doyun]
+        places: [misty_forest]
+        story_time: 6
+        beats:
+          - 라온이 새벽 안개 속에서 몸을 푼다
+          - 라온이 검술 자세를 되풀이한다
+          - 도윤이 멀리서 지켜본다

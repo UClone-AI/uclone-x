@@ -5,6 +5,8 @@ from __future__ import annotations
 from uclone_x.agent.loop.models import LoopJob, LoopStatus, LoopTickResult
 from uclone_x.agent.loop.parser import (
     MIN_INTERVAL_SECONDS,
+    LoopParseError,
+    LoopParseReason,
     parse_interval_string,
     parse_loop_command_input,
 )
@@ -14,6 +16,8 @@ from uclone_x.agent.loop.scheduler import LoopScheduler
 __all__ = [
     "MIN_INTERVAL_SECONDS",
     "LoopJob",
+    "LoopParseError",
+    "LoopParseReason",
     "LoopScheduler",
     "LoopStatus",
     "LoopTickResult",

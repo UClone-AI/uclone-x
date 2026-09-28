@@ -34,6 +34,10 @@ import {
   argsRecord,
   type ActivityCategory,
 } from '../../lib/toolLabels';
+import { en, type Messages } from '../../i18n/en';
+import { fmt, plural, useCopy } from '../../i18n';
+
+type ToolStepCopy = Messages['toolSteps'];
 
 export type { ActivityCategory };
 
@@ -81,8 +85,10 @@ export interface ActivityItem {
 }
 
 /** What the timeline says when its read fails and the Core gave no plain reason of its own. */
-export const activityReadFailedSentence = (name: string): string =>
-  `${name}'s activity could not be read.`;
+export const activityReadFailedSentence = (
+  name: string,
+  copy: Messages['dock']['activity'] = en.dock.activity,
+): string => fmt(copy.readFailed, { name });
 
 export interface ActivityTimelineProps {
   /** The conversation on screen; `null` when none is open. */
@@ -99,9 +105,13 @@ export interface ActivityTimelineProps {
   onOpenInDocs?: (path: string) => void;
 }
 
-const itemFromUse = (use: RoomToolUse, index: number): ActivityItem => {
+const itemFromUse = (
+  use: RoomToolUse,
+  index: number,
+  steps: ToolStepCopy = en.toolSteps,
+): ActivityItem => {
   const args = parseArgs(use.arguments_preview);
-  const { category, label, summaryTitle } = classifyTool(use.tool_name, argsRecord(args));
+  const { category, label, summaryTitle } = classifyTool(use.tool_name, argsRecord(args), steps);
   return {
     id: use.tool_call_id || `${use.turn_id}:${index}`,
     category,
@@ -137,6 +147,7 @@ function liveItems(
   roomId: string,
   seatId: string,
   history: SeatHistory | null,
+  steps: ToolStepCopy = en.toolSteps,
 ): ActivityItem[] {
   const recordedCalls = new Set<string>();
   const recordedTurns = new Set<string>();
@@ -177,7 +188,7 @@ function liveItems(
   for (const [key, { call, result, at }] of rows) {
     const name = str(call?.name) ?? str(result?.name) ?? 'tool';
     const args = parseArgs(str(call?.arguments_preview));
-    const { category, label, summaryTitle } = classifyTool(name, argsRecord(args));
+    const { category, label, summaryTitle } = classifyTool(name, argsRecord(args), steps);
     items.push({
       id: key,
       category,
@@ -230,14 +241,17 @@ export const ActivityTimeline: React.FC<ActivityTimelineProps> = ({
   const url = roomId && seatId ? roomDockUrls.seatHistory(roomId, seatId) : null;
   const read = useRoomRead<SeatHistory>(url, `${String(refreshKey ?? '')}:${resultsSeen}`);
   const history = read.data;
+  const copy = useCopy();
+  const t = copy.dock.activity;
+  const steps = copy.toolSteps;
 
-  const name = history?.display_name || seatName || seatId || 'This clone';
+  const name = history?.display_name || seatName || seatId || t.thisClone;
 
   const activities: ActivityItem[] = useMemo(() => {
     if (!roomId || !seatId) return [];
-    const recorded = (history?.tool_uses ?? []).map(itemFromUse).reverse();
-    return [...liveItems(events, roomId, seatId, history), ...recorded];
-  }, [events, history, roomId, seatId]);
+    const recorded = (history?.tool_uses ?? []).map((use, i) => itemFromUse(use, i, steps)).reverse();
+    return [...liveItems(events, roomId, seatId, history, steps), ...recorded];
+  }, [events, history, roomId, seatId, steps]);
 
   const unrecorded = (history?.turns ?? []).filter((t) => t.tools === null);
   const recordedTurns = (history?.turns ?? []).length - unrecorded.length;
@@ -246,15 +260,15 @@ export const ActivityTimeline: React.FC<ActivityTimelineProps> = ({
   // what the seat's saved turns reported, so an empty one is "no tool calls are listed",
   // never "it used no tools" (#1366); the Core's `reason` and `tools_note` say the rest.
   const emptyCause = (): string => {
-    if (!roomId) return 'No conversation is open. Open one from the rail to see what its clones did.';
-    if (!seatId) return 'No clone is seated in this conversation, so there is no clone to show activity for.';
+    if (!roomId) return t.noRoom;
+    if (!seatId) return t.noSeat;
     // The Core's own plain words where it gave them, else ours; never transport text (#1435).
-    if (read.fault) return read.fault.detail ?? activityReadFailedSentence(name);
-    if (!history) return `Reading ${name}'s activity…`;
+    if (read.fault) return read.fault.detail ?? activityReadFailedSentence(name, t);
+    if (!history) return fmt(t.loading, { name });
     if (history.reason) return history.reason;
-    if (history.turns.length === 0) return `No turns by ${name} are listed in this conversation.`;
-    if (recordedTurns === 0) return `None of ${name}'s turns here recorded which tools they used.`;
-    return `No tool calls are listed for ${name}'s ${recordedTurns} recorded ${recordedTurns === 1 ? 'turn' : 'turns'} here.`;
+    if (history.turns.length === 0) return fmt(t.noTurns, { name });
+    if (recordedTurns === 0) return fmt(t.noneRecorded, { name });
+    return plural(t.noCalls, recordedTurns, { name });
   };
 
   const filteredActivities = useMemo(() => {
@@ -326,14 +340,12 @@ export const ActivityTimeline: React.FC<ActivityTimelineProps> = ({
           </div>
           <div className="min-w-0">
             <h2 className="text-xs font-bold text-white flex items-center gap-2 flex-wrap">
-              Tool calls by {seatId ? name : 'the clone'}
+              {fmt(t.heading, { name: seatId ? name : t.theClone })}
               <Badge tone="neutral" className="text-[10px] font-mono">
-                {filteredActivities.length} listed
+                {fmt(t.listed, { count: filteredActivities.length })}
               </Badge>
             </h2>
-            <p className="text-[11px] text-slate-400">
-              The tool calls recorded in this conversation, with what went in, what came out, and how long each took
-            </p>
+            <p className="text-[11px] text-slate-400">{t.subtitle}</p>
           </div>
         </div>
       </div>
@@ -344,7 +356,7 @@ export const ActivityTimeline: React.FC<ActivityTimelineProps> = ({
           <Search className="w-3.5 h-3.5 absolute left-2.5 top-1/2 -translate-y-1/2 text-slate-500" />
           <input
             type="text"
-            placeholder="Search actions, files, args..."
+            placeholder={t.search}
             value={searchTerm}
             onChange={(e) => setSearchTerm(e.target.value)}
             className="w-full bg-slate-900 border border-slate-800 text-slate-200 text-xs rounded-xl pl-8 pr-3 py-1.5 focus:outline-none focus:border-amber-500/60 transition-colors"
@@ -354,11 +366,11 @@ export const ActivityTimeline: React.FC<ActivityTimelineProps> = ({
         <div className="flex flex-wrap items-center gap-1 bg-slate-900/80 p-1 rounded-xl border border-slate-800 text-[11px]">
           {(
             [
-              { id: 'all', label: 'All' },
-              { id: 'mutation', label: 'Mutations' },
-              { id: 'command', label: 'Commands' },
-              { id: 'web', label: 'Web' },
-              { id: 'inspection', label: 'Inspection' },
+              { id: 'all', label: t.category.all },
+              { id: 'mutation', label: t.category.mutation },
+              { id: 'command', label: t.category.command },
+              { id: 'web', label: t.category.web },
+              { id: 'inspection', label: t.category.inspection },
             ] as const
           ).map((tab) => (
             <button
@@ -379,9 +391,9 @@ export const ActivityTimeline: React.FC<ActivityTimelineProps> = ({
         <div className="flex flex-wrap items-center gap-1 bg-slate-900/80 p-1 rounded-xl border border-slate-800 text-[11px]">
           {(
             [
-              { id: 'all', label: 'All Status' },
-              { id: 'success', label: 'Passed' },
-              { id: 'error', label: 'Errors' },
+              { id: 'all', label: t.status.all },
+              { id: 'success', label: t.status.success },
+              { id: 'error', label: t.status.error },
             ] as const
           ).map((st) => (
             <button
@@ -419,11 +431,7 @@ export const ActivityTimeline: React.FC<ActivityTimelineProps> = ({
           data-testid="activity-not-recorded"
           className="p-2.5 rounded-xl bg-slate-900/70 border border-slate-800 text-[11px] text-slate-300 space-y-1"
         >
-          <p>
-            {unrecorded.length} {unrecorded.length === 1 ? 'turn' : 'turns'} did not record which
-            tools {unrecorded.length === 1 ? 'it' : 'they'} used in full, so {unrecorded.length === 1 ? 'its' : 'their'} calls
-            may not all be listed here.
-          </p>
+          <p>{plural(t.notRecorded, unrecorded.length)}</p>
           {Array.from(new Set(unrecorded.map((t) => t.tools_not_recorded_reason).filter(Boolean))).map(
             (why) => (
               <p key={why} className="text-slate-400">
@@ -444,7 +452,7 @@ export const ActivityTimeline: React.FC<ActivityTimelineProps> = ({
             <Layers className="w-8 h-8 mx-auto text-slate-600" />
             <p className="text-xs text-slate-400 font-medium max-w-sm mx-auto">
               {activities.length > 0
-                ? `Nothing matches these filters; ${activities.length} ${activities.length === 1 ? 'call is' : 'calls are'} hidden by them.`
+                ? plural(t.hiddenByFilters, activities.length)
                 : emptyCause()}
             </p>
           </div>
@@ -504,24 +512,24 @@ export const ActivityTimeline: React.FC<ActivityTimelineProps> = ({
                     {act.status === 'success' ? (
                       <Badge tone="success" className="text-[10px] font-bold">
                         <CheckCircle2 className="w-3 h-3" />
-                        <span>Pass</span>
+                        <span>{t.pass}</span>
                       </Badge>
                     ) : act.status === 'running' ? (
                       // In flight: no outcome yet, neither a pass nor an error (#1051).
                       <Badge tone="warning" className="text-[10px] font-bold">
                         <Clock className="w-3 h-3" />
-                        <span>Running</span>
+                        <span>{t.running}</span>
                       </Badge>
                     ) : act.status === 'stopped' ? (
                       // Same word and icon as the transcript's own mark (#1031).
                       <Badge tone="neutral" className="text-[10px] font-bold">
                         <AlertOctagon className="w-3 h-3" />
-                        <span>Stopped</span>
+                        <span>{t.stopped}</span>
                       </Badge>
                     ) : (
                       <Badge tone="danger" className="text-[10px] font-bold">
                         <XCircle className="w-3 h-3" />
-                        <span>Error</span>
+                        <span>{t.error}</span>
                       </Badge>
                     )}
                     <div className="p-1 text-slate-500 hover:text-slate-300">
@@ -535,7 +543,9 @@ export const ActivityTimeline: React.FC<ActivityTimelineProps> = ({
                   <div className="px-3 pb-2.5 -mt-1 flex flex-wrap items-center gap-2 text-[11px] text-slate-400">
                     {act.written_path && (
                       <>
-                        <span className="font-mono truncate max-w-full">Wrote {act.written_path}</span>
+                        <span className="font-mono truncate max-w-full">
+                          {fmt(t.wrote, { path: act.written_path })}
+                        </span>
                         {onOpenInDocs && (
                           <button
                             type="button"
@@ -544,18 +554,18 @@ export const ActivityTimeline: React.FC<ActivityTimelineProps> = ({
                             className="inline-flex items-center gap-1 px-2 py-0.5 rounded-lg border border-slate-700 text-slate-200 hover:border-slate-500"
                           >
                             <FileText className="w-3 h-3" />
-                            Open in Docs
+                            {t.openInDocs}
                           </button>
                         )}
                       </>
                     )}
                     {!act.written_path && act.wrote_unnamed && (
-                      <span>May have written to a file without naming it, so nothing can be opened from here.</span>
+                      <span>{t.wroteUnnamed}</span>
                     )}
                     {act.subagent_id && (
                       <span className="inline-flex items-center gap-1">
                         <GitBranch className="w-3 h-3" />
-                        Started a helper agent ({act.subagent_id})
+                        {fmt(t.helper, { id: act.subagent_id })}
                       </span>
                     )}
                   </div>
@@ -566,12 +576,12 @@ export const ActivityTimeline: React.FC<ActivityTimelineProps> = ({
                     {/* Execution time, stated even when absent (P6). */}
                     <div className="flex items-center justify-between gap-2">
                       <div className="space-y-0.5">
-                        <div className="text-[10px] text-slate-500 uppercase font-sans">Execution Time</div>
+                        <div className="text-[10px] text-slate-500 uppercase font-sans">{t.executionTime}</div>
                         <div data-testid={`activity-duration-${act.id}`} className="text-slate-300">
                           {act.duration_ms == null
                             ? act.status === 'running'
-                              ? 'still running'
-                              : 'not timed'
+                              ? t.stillRunning
+                              : t.notTimed
                             : `${act.duration_ms.toFixed(1)} ms`}
                         </div>
                       </div>
@@ -581,14 +591,14 @@ export const ActivityTimeline: React.FC<ActivityTimelineProps> = ({
                           data-testid={`activity-copy-trace-${act.id}`}
                           onClick={() => handleCopyJson(`${act.id}:trace`, act.raw)}
                           className="text-[10px] text-slate-400 hover:text-white flex items-center gap-1 font-mono"
-                          title="Copy the whole record of this call as JSON"
+                          title={t.copyTraceTitle}
                         >
                           {copiedId === `${act.id}:trace` ? (
                             <Check className="w-3 h-3 text-emerald-400" />
                           ) : (
                             <Copy className="w-3 h-3" />
                           )}
-                          <span>Copy trace</span>
+                          <span>{t.copyTrace}</span>
                         </button>
                       )}
                     </div>
@@ -596,7 +606,7 @@ export const ActivityTimeline: React.FC<ActivityTimelineProps> = ({
                     {act.arguments !== undefined && (
                       <div className="space-y-1">
                         <div className="flex items-center justify-between text-[10px] text-slate-500 uppercase font-sans">
-                          <span>Input Parameters</span>
+                          <span>{t.inputParameters}</span>
                           <button
                             type="button"
                             onClick={() => handleCopyJson(act.id, act.arguments)}
@@ -607,7 +617,7 @@ export const ActivityTimeline: React.FC<ActivityTimelineProps> = ({
                             ) : (
                               <Copy className="w-3 h-3" />
                             )}
-                            <span>Copy JSON</span>
+                            <span>{t.copyJson}</span>
                           </button>
                         </div>
                         <pre className="p-2.5 rounded-xl bg-slate-950 text-slate-300 text-[11px] overflow-x-auto border border-slate-800/60 max-h-48 whitespace-pre-wrap">
@@ -618,13 +628,13 @@ export const ActivityTimeline: React.FC<ActivityTimelineProps> = ({
 
                     {act.output !== undefined && (
                       <div className="space-y-1">
-                        <div className="text-[10px] text-slate-500 uppercase font-sans">Output Payload</div>
+                        <div className="text-[10px] text-slate-500 uppercase font-sans">{t.outputPayload}</div>
                         <pre className="p-2.5 rounded-xl bg-slate-950 text-slate-300 text-[11px] overflow-x-auto border border-slate-800/60 max-h-56 whitespace-pre-wrap">
                           {act.output}
                         </pre>
                         {act.truncated && (
                           <p className="text-[10px] text-slate-500 font-sans">
-                            This output was cut to fit; the clone received all of it.
+                            {t.truncated}
                           </p>
                         )}
                       </div>
@@ -634,7 +644,7 @@ export const ActivityTimeline: React.FC<ActivityTimelineProps> = ({
                       <div className="p-2.5 rounded-xl bg-rose-950/30 border border-rose-900/50 space-y-1">
                         <div className="flex items-center gap-1.5 text-rose-400 font-semibold text-[11px]">
                           <AlertTriangle className="w-3.5 h-3.5" />
-                          <span>Execution Error Trace</span>
+                          <span>{t.errorTrace}</span>
                         </div>
                         <pre className="text-rose-300 text-[10px] whitespace-pre-wrap overflow-x-auto">
                           {act.error}

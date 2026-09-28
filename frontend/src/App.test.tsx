@@ -23,6 +23,21 @@ import { App } from './App';
 import { NEW_CONVERSATION_TITLE } from './lib/rooms';
 import { DEVELOPER_MODE_KEY } from './lib/developerMode';
 import { expectPlain } from './test/plainCopy';
+import type { RoomActiveTurn } from './types';
+
+/**
+ * How many times `App` has drawn its rail: a count of `App`'s own renders, since the rail is
+ * redrawn with every one of them. A passthrough otherwise -- every case here gets the real rail.
+ */
+const railRenders = vi.hoisted(() => ({ count: 0 }));
+vi.mock('./components/layout/WorkspaceSidebar', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./components/layout/WorkspaceSidebar')>();
+  const Counted: typeof actual.WorkspaceSidebar = (props) => {
+    railRenders.count += 1;
+    return <actual.WorkspaceSidebar {...props} />;
+  };
+  return { ...actual, WorkspaceSidebar: Counted };
+});
 
 /** A JSON response the page can read, without a body stream to drain. */
 const answer = (body: unknown, status = 200) =>
@@ -74,10 +89,10 @@ class SilentEventSource {
 const summaryOf = (roomId: string, title: string) => ({
   room_id: roomId,
   title,
-  agent_ids: ['champion'],
+  agent_ids: listedSeatsOnServer.get(roomId) ?? ['champion'],
   human_ids: ['user'],
   message_count: 2,
-  updated_at: '2026-09-19T00:00:00Z',
+  updated_at: listedUpdatedOnServer.get(roomId) ?? '2026-09-19T00:00:00Z',
 });
 
 const stateOf = (roomId: string, title: string) => ({
@@ -91,16 +106,18 @@ const stateOf = (roomId: string, title: string) => ({
   turn_state: { agent_turns_since_human: 0 },
   policy: {
     max_agent_turns_per_human_message: 3,
-    max_span_messages: 40,
+    max_span_tokens: 8000,
     transcript_window: 15,
     hesitation_seconds: 0,
     default_responder_id: '',
   },
+  active_turn: activeTurnOnServer.get(roomId) ?? null,
 });
 
 const missing = (roomId: string) =>
   `No room '${roomId}' in the store: it has been deleted, or was never created. List the rooms to see the ones that exist.`;
 
+let activeTurnOnServer: Map<string, RoomActiveTurn | null>;
 /** The conversations the Core holds, by id and title, most recently updated first. */
 let roomsOnServer: Map<string, string>;
 /** Ids of records the Core has and will not load, which it lists apart (#1440). */
@@ -119,6 +136,10 @@ let sendFault:
   | null;
 /** The agents seated in a conversation, by room id; `champion` alone where unnamed. */
 let seatsOnServer: Map<string, string[]>;
+/** The agents the room *list* names for a conversation; `champion` alone where unnamed. */
+let listedSeatsOnServer: Map<string, string[]>;
+/** When the room list says a conversation was last updated; one shared instant where unnamed. */
+let listedUpdatedOnServer: Map<string, string>;
 /**
  * How `GET /api/rooms/{id}` fails for a room, when it fails without the Core saying why:
  * the fetch itself rejects (the Core is not answering), or a 500 comes back with no JSON body.
@@ -131,7 +152,6 @@ let roomReadFault: Map<string, 'no-answer' | 'bare-500'>;
 let routeFault: Map<string, 'no-answer' | 'bare-500'>;
 /** A conversation's rows, by room id; empty where unnamed. */
 let transcriptsOnServer: Map<string, unknown[]>;
-let agentsOnServer: { id: string; name: string; capabilities_needing_room?: string[] }[];
 let personasOnServer: { name: string }[];
 let modelsOnServer: string[];
 let currentModelOnServer: string;
@@ -231,14 +251,16 @@ beforeEach(() => {
     ['r1', 'Index tuning'],
     ['r2', 'Release notes'],
   ]);
+  activeTurnOnServer = new Map();
   unreadableOnServer = new Set();
   sendFault = null;
   seatsOnServer = new Map();
+  listedSeatsOnServer = new Map();
+  listedUpdatedOnServer = new Map();
   roomReadFault = new Map();
   routeFault = new Map();
   transcriptsOnServer = new Map();
-  agentsOnServer = [{ id: 'champion', name: 'champion' }];
-  personasOnServer = [];
+  personasOnServer = [{ name: 'champion' }];
   modelsOnServer = [];
   currentModelOnServer = '';
   createRefusal = null;
@@ -415,8 +437,6 @@ beforeEach(() => {
           return Promise.resolve(answer(stateOf(room[1], title)));
         }
         switch (path) {
-          case '/api/agents':
-            return Promise.resolve(answer({ agents: agentsOnServer }));
           case '/api/personas':
             return Promise.resolve(answer({ personas: personasOnServer }));
           case '/api/models':
@@ -605,19 +625,19 @@ describe('App opens a conversation by itself (#1208)', () => {
     expect(sent('POST', '/api/rooms')).toHaveLength(0);
   });
 
-  it('waits for the agent list, so the conversation it starts is not seated with nobody', async () => {
+  it('waits for the persona list, so the conversation it starts is not seated with nobody', async () => {
     // Killed by: frontend/src/App.tsx :: if (!roomsListed || !metadataListed) return;
     // Becomes: if (!roomsListed) return;
     roomsOnServer = new Map();
-    hold('GET /api/agents');
+    hold('GET /api/personas');
     render(<App />);
     await settle();
 
     expect(sent('POST', '/api/rooms')).toHaveLength(0);
 
-    await release('GET /api/agents');
+    await release('GET /api/personas');
     await openedConversation();
-    // Seated, not empty: `handleNewRoom` reads `selectedAgent`, which the agent list sets.
+    // Seated, not empty: `handleNewRoom` reads `selectedAgent`, which the persona list sets.
     expect(JSON.parse(sent('POST', '/api/rooms')[0].body ?? '{}')).toMatchObject({
       agent_ids: ['champion'],
     });
@@ -651,23 +671,23 @@ describe('App opens a conversation by itself (#1208)', () => {
     // Killed by: frontend/src/App.tsx :: || createInFlightRef.current) return;
     // Becomes: ) return;
     roomsOnServer = new Map();
-    hold('GET /api/agents');
+    hold('GET /api/personas');
     hold('POST /api/rooms');
     render(<App />);
     await settle();
 
-    // The auto-open is still waiting on the agent list, so nothing of its own exists yet.
+    // The auto-open is still waiting on the persona list, so nothing of its own exists yet.
     expect(sent('POST', '/api/rooms')).toHaveLength(0);
 
     fireEvent.click(screen.getByTestId('new-conversation-button'));
     await settle();
     expect(sent('POST', '/api/rooms')).toHaveLength(1);
 
-    // The agent list lands while that create is still in flight. `currentRoomId` is set
+    // The persona list lands while that create is still in flight. `currentRoomId` is set
     // two awaits later -- after the create and after the list re-read -- so for the whole
     // of the user's click the effect's own guard reads "nothing open, latch free", which
     // is the reading that starts a second conversation beside the one being made (#1288).
-    await release('GET /api/agents');
+    await release('GET /api/personas');
     await release('POST /api/rooms');
     await openedConversation();
 
@@ -688,14 +708,14 @@ describe('App opens a conversation by itself (#1208)', () => {
     // from the latch rather than being it -- the latch is spent deliberately and released
     // by a delete, and a click that produced no conversation may not spend it by accident.
     createRefusal = 'The room store is read-only.';
-    hold('GET /api/agents');
+    hold('GET /api/personas');
     hold('POST /api/rooms');
     render(<App />);
     await settle();
 
     fireEvent.click(screen.getByTestId('new-conversation-button'));
     await settle();
-    await release('GET /api/agents');
+    await release('GET /api/personas');
     // Held while the create is in flight -- the guard doing its job.
     expect(sent('GET', '/api/rooms/r1')).toHaveLength(0);
 
@@ -773,11 +793,11 @@ describe('App opens a story from Files in a new conversation (#1554)', () => {
     // Killed by: frontend/src/App.tsx :: guard.current = false;
     // Becomes:
     //
-    // The auto-open is held on the agent list while the story open is refused. The guard
+    // The auto-open is held on the persona list while the story open is refused. The guard
     // the handler took must be free by the time that list lands, or the effect reads "a
     // create is in flight" for the rest of the session and nothing is ever opened.
     storyOpenRefusal = { status: 409, detail: 'That story could not be read, so it was not opened.' };
-    hold('GET /api/agents');
+    hold('GET /api/personas');
     render(<App />);
     await settle();
 
@@ -787,7 +807,7 @@ describe('App opens a story from Files in a new conversation (#1554)', () => {
     );
     expect(sent('GET', '/api/rooms/r1')).toHaveLength(0);
 
-    await release('GET /api/agents');
+    await release('GET /api/personas');
     await waitFor(() => expect(sent('GET', '/api/rooms/r1')).toHaveLength(1));
   });
 });
@@ -1027,9 +1047,9 @@ describe('App no default agent (#1125)', () => {
   it('adopts the first agent the server names, rather than opening on a literal name', async () => {
     // The head opened on `champion` whether or not this install had ever registered that
     // name, so a fresh install asked for a conversation addressed to nobody.
-    // Killed by: frontend/src/App.tsx :: if (loaded.length > 0) firstNamed = loaded[0].id;
+    // Killed by: frontend/src/App.tsx :: if (loaded.length > 0) firstNamed = loaded[0].name;
     // Becomes: if (loaded.length > 0) firstNamed = 'champion';
-    agentsOnServer = [{ id: 'novelist', name: 'novelist' }];
+    personasOnServer = [{ name: 'novelist' }];
     roomsOnServer = new Map();
     render(<App />);
 
@@ -1272,7 +1292,7 @@ describe('App re-asks a saturation read the record moved under (#1256)', () => {
   it('raises the banner without waiting for a turn that may never come', async () => {
     saturatedOnServer = true;
     // A clone not yet seated, for the act below to seat.
-    agentsOnServer = [...agentsOnServer, { id: 'scout', name: 'scout' }];
+    personasOnServer = [...personasOnServer, { name: 'scout' }];
     // Parked before the render, so `openRoom`'s forced read cannot answer until released.
     hold('GET /api/rooms/r1/context');
     render(<App />);
@@ -1473,7 +1493,7 @@ describe('App lands only the last read of a room it issued (#1412)', () => {
     sendHeld = new Promise<void>((resolve) => {
       release = resolve;
     });
-    agentsOnServer = [...agentsOnServer, { id: 'scout', name: 'scout' }];
+    personasOnServer = [...personasOnServer, { name: 'scout' }];
     await deferReads();
     transcriptsOnServer.set('r1', [HUMAN]);
     fireEvent.change(screen.getByTestId('room-composer'), { target: { value: HUMAN.content } });
@@ -1606,6 +1626,27 @@ describe('App keeps a half-written message across a conversation switch (#1290)'
     expect(screen.getByTestId('room-composer')).toHaveValue('half-written message');
     expect(screen.getByTestId('send-message')).toBeEnabled();
   });
+
+  it('keeps the draft without re-rendering the page on every keystroke', async () => {
+    // The draft used to be `App` state, so each key redrew the rail, the header and every
+    // message in the transcript, and typing slowed down as a conversation grew. The map is
+    // kept where nothing draws it; the case above proves it is still kept.
+    // Killed by: frontend/src/App.tsx :: else draftsRef.current[roomId] = next;
+    // Becomes: else { draftsRef.current[roomId] = next; setParticipantsNotReset([]); }
+    render(<App />);
+    await openedConversation();
+    await settle();
+    const before = railRenders.count;
+
+    const box = screen.getByTestId('room-composer');
+    for (const value of ['h', 'he', 'hel', 'hell', 'hello']) {
+      fireEvent.change(box, { target: { value } });
+    }
+    await settle();
+
+    expect(box).toHaveValue('hello');
+    expect(railRenders.count).toBe(before);
+  });
 });
 
 /**
@@ -1637,24 +1678,6 @@ describe('App opens the picked clone (#1300)', () => {
     expect(screen.getByTestId('clone-profile-surveyor')).toBeInTheDocument();
   });
 
-  it('names the tools the picked clone is given only inside a conversation (#1595)', async () => {
-    // Killed by: frontend/src/App.tsx :: agents.find((a) => a.id === selectedAgent)?.capabilities_needing_room
-    // Becomes: agents.find((a) => a.id !== selectedAgent)?.capabilities_needing_room
-    personasOnServer = [{ name: 'champion' }, { name: 'surveyor' }];
-    agentsOnServer = [
-      { id: 'champion', name: 'champion', capabilities_needing_room: [] },
-      { id: 'surveyor', name: 'surveyor', capabilities_needing_room: ['story_outline'] },
-    ];
-    render(<App />);
-    await openedConversation();
-
-    fireEvent.click(await screen.findByTestId('clone-avatar-surveyor'));
-
-    expect(screen.getByTestId('persona-tools-conversation-only-surveyor')).toHaveTextContent(
-      'Only available inside a conversation: story_outline',
-    );
-  });
-
   it('opens the dock on that clone in edit mode when clicking settings', async () => {
     personasOnServer = [{ name: 'champion' }, { name: 'surveyor' }];
     render(<App />);
@@ -1681,6 +1704,34 @@ describe('App opens the picked clone (#1300)', () => {
     expect(postRooms.length).toBeGreaterThan(0);
     const lastBody = JSON.parse(postRooms[postRooms.length - 1].body || '{}');
     expect(lastBody.agent_ids).toContain('surveyor');
+  });
+
+  // Killed by: frontend/src/App.tsx :: onSelectAgent={handleSelectAgent}
+  // Becomes: onSelectAgent={(id) => { handleSelectAgent(id); const g = [...rooms].filter((r) => r.agent_ids.includes(id)).sort((a, b) => (a.updated_at < b.updated_at ? 1 : -1))[0]; if (g && g.room_id !== currentRoomId) void openRoom(g.room_id); }}
+  it('keeps the clone in its own conversation rather than a newer group chat it sits in', async () => {
+    personasOnServer = [{ name: 'champion' }, { name: 'surveyor' }];
+    roomsOnServer = new Map([
+      ['r1', 'Surveyor alone'],
+      ['r2', 'Everyone'],
+    ]);
+    listedSeatsOnServer = new Map([
+      ['r1', ['surveyor']],
+      ['r2', ['champion', 'surveyor']],
+    ]);
+    listedUpdatedOnServer = new Map([
+      ['r1', '2026-09-18T00:00:00Z'],
+      ['r2', '2026-09-19T00:00:00Z'],
+    ]);
+    render(<App />);
+    await openedConversation();
+    fireEvent.click(await screen.findByTestId('conversation-r1'));
+    await settle();
+    const r2Reads = sent('GET', '/api/rooms/r2').length;
+
+    fireEvent.click(screen.getByTestId('persona-item-surveyor'));
+    await settle();
+
+    expect(sent('GET', '/api/rooms/r2')).toHaveLength(r2Reads);
   });
 });
 
@@ -1888,10 +1939,7 @@ describe('App room notices say what happened plainly (#1411)', () => {
   it.each([
     ...FAULTS,
   ])('adding someone (%s)', async (fault: Fault) => {
-    agentsOnServer = [
-      { id: 'champion', name: 'champion' },
-      { id: 'critic', name: 'critic' },
-    ];
+    personasOnServer = [{ name: 'champion' }, { name: 'critic' }];
     render(<App />);
     await openedConversation();
     routeFault.set('POST /api/rooms/r1/participants', fault);
@@ -2057,8 +2105,8 @@ describe('App says what it knows about a send that got no answer (#1441)', () =>
     expect(copiesOnServer()).toBe(1);
   });
 
-  // Killed by: frontend/src/lib/rooms.ts :: if (err.outcome === 'refused') return `Not sent: ${reason}`;
-  // Becomes: return `Not sent: ${reason}`;
+  // Killed by: frontend/src/lib/rooms.ts :: if (err.outcome === 'refused') return fmt(copy.refused, { reason });
+  // Becomes: return fmt(copy.refused, { reason });
   it('says the message is not there when the re-read does not have it', async () => {
     render(<App />);
     await openedConversation();
@@ -2134,8 +2182,7 @@ describe('App says what it knows about a send that got no answer (#1441)', () =>
 });
 
 describe('App room clone invites and group chat creation', () => {
-  it('populates room invite choices from personas when agents is empty', async () => {
-    agentsOnServer = [];
+  it('populates room invite choices from personas', async () => {
     personasOnServer = [{ name: 'champion' }, { name: 'surveyor' }];
 
     render(<App />);
@@ -2171,5 +2218,26 @@ describe('App room clone invites and group chat creation', () => {
     expect(createReqs.length).toBeGreaterThan(0);
     const lastCreateBody = JSON.parse(createReqs[createReqs.length - 1].body ?? '{}');
     expect(lastCreateBody.agent_ids).toEqual(['champion']);
+  });
+});
+
+describe('App restores in-flight turn on refresh (#1789)', () => {
+  it('restores live turn and shows thinking indicator and stop button when room has active_turn', async () => {
+    activeTurnOnServer.set('r1', {
+      in_flight: true,
+      agent_id: 'champion',
+      turn_id: 'turn-refresh-1',
+      status: 'generating',
+      detail: 'Formulating reply...',
+      accumulated_text: '',
+    });
+
+    render(<App />);
+    await openedConversation();
+
+    expect(screen.getByTestId('live-turn')).toBeInTheDocument();
+    expect(screen.getByTestId('live-turn-indicator')).toHaveTextContent('Formulating reply...');
+    expect(screen.getByTestId('stop-turn')).toBeInTheDocument();
+    expect(screen.queryByTestId('send-message')).toBeNull();
   });
 });

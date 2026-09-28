@@ -18,8 +18,13 @@ from typing import Any
 import pytest
 from pydantic import BaseModel
 
-from uclone_x.agent.base import EVIDENCE_REQUIRED_NUDGE, BaseAgent
+from uclone_x.agent.base import (
+    BaseAgent,
+)
 from uclone_x.agent.models import AgentConfig, AgentLLMConfig
+from uclone_x.agent.nudges import (
+    EVIDENCE_REQUIRED_NUDGE,
+)
 from uclone_x.core.provenance import ExecutionPath, Provenance, ServiceRef
 from uclone_x.llm.connectors.base import BaseLLMConnector
 from uclone_x.llm.models import (
@@ -135,7 +140,7 @@ async def test_a_search_that_found_nothing_earns_a_second_chance() -> None:
     nudge used not to fire; the answer states no specific, so the grounding nudge does not
     either.
 
-    Killed by: src/uclone_x/agent/base.py :: and nothing_found  # evidence nudge when tools found nothing
+    Killed by: src/uclone_x/agent/turn_executor.py :: and nothing_found  # evidence nudge when tools found nothing
     Becomes: and False  # evidence nudge when tools found nothing
     """
     llm = _Scripted([_call("empty_search"), _answer("The line does not appear in the file.")])
@@ -155,7 +160,7 @@ async def test_a_search_that_found_something_is_left_alone() -> None:
     This is the other side of the disjointness: once a tool has produced something, an
     answer that goes past it is the *grounding* nudge's business, not this one's.
 
-    Killed by: src/uclone_x/agent/base.py :: _tool_outcome_of(record) == ToolOutcome.PRODUCTIVE.value
+    Killed by: src/uclone_x/agent/turn_executor.py :: tool_outcome_of(record) == ToolOutcome.PRODUCTIVE.value
     Becomes: False
     """
     llm = _Scripted([_call("finding_search"), _answer("The value is on line 7.")])
@@ -175,7 +180,7 @@ async def test_the_unproductive_stop_is_named_in_the_log() -> None:
     different diagnoses, and only the log can carry the difference to whoever reads the run
     afterwards.
 
-    Killed by: src/uclone_x/agent/base.py :: stop_reason = "model_stopped_after_nudge"
+    Killed by: src/uclone_x/agent/turn_executor.py :: stop_reason = "model_stopped_after_nudge"
     Becomes: stop_reason = "model_stopped"
     """
     llm = _Scripted(
@@ -200,7 +205,7 @@ async def test_the_unproductive_stop_is_named_in_the_log() -> None:
 async def test_the_nudge_still_fires_once() -> None:
     """Widening what counts as "nothing found" must not widen how often it asks.
 
-    Killed by: src/uclone_x/agent/base.py :: and not evidence_nudged
+    Killed by: src/uclone_x/agent/turn_executor.py :: and not evidence_nudged
     Becomes:
     """
     llm = _Scripted([_call("empty_search"), _answer("nothing"), _answer("still nothing")])
@@ -225,7 +230,7 @@ async def test_the_specific_nudge_goes_first() -> None:
     `model_stopped_after_both_nudges` -- but not for the same answer, and not in the order
     that would make the generic one pre-empt the specific one.
 
-    Killed by: src/uclone_x/agent/base.py :: and not defer_to_grounding
+    Killed by: src/uclone_x/agent/turn_executor.py :: and not defer_to_grounding
     Becomes:
     """
     llm = _Scripted(

@@ -45,6 +45,12 @@ from uclone_x.room.models import (
 # --------------------------------------------------------------------------------------
 
 
+def _withheld_notice(withheld: int) -> str:
+    """The line a span opens with when `withheld` earlier messages are not in it."""
+    plural = "s" if withheld != 1 else ""
+    return f"[...{withheld} earlier message{plural} in this room are not shown]"
+
+
 def unwrap(payload: Any) -> Any:
     """A payload as plain data, so a text search over it cannot miss a nested mapping."""
     return {str(k): v for k, v in dict(payload).items()}
@@ -425,13 +431,6 @@ class TestOrchestratorDecides:
 
         assert [m.sender_id for m in state.transcript] == ["alice"]
         assert selector.calls == 1
-
-    @pytest.mark.asyncio
-    async def test_a_speaker_who_is_not_in_the_room_is_refused(self, built: Any) -> None:
-        orch = _orchestrator(built, [ScriptedSelector("s", [speak("ghost")])])
-
-        with pytest.raises(SpeakerSelectionError, match="ghost"):
-            await orch.post("r1", "alice", "hi")
 
     @pytest.mark.asyncio
     async def test_a_human_named_as_speaker_is_refused(self, built: Any) -> None:
@@ -1778,16 +1777,30 @@ class TestStoreDeclaresItsEncoding:
 
 
 class TestTheSpanIsBounded:
-    """A span had no ceiling, so a long room's cost grew without bound per new speaker."""
+    """A span had no ceiling, so a long room's cost grew without bound per new speaker.
+
+    The ceiling is an estimated token budget (#1641), not a message count: forty one-word
+    lines and forty pasted logs are not the same load on a seat's window.
+    """
+
+    @staticmethod
+    def _budget_for(*lines: str) -> int:
+        """The budget that holds exactly `lines`, costed as `_render_span` costs them."""
+        from uclone_x.llm.compactor import estimate_text_tokens
+
+        return sum(estimate_text_tokens(line) + 1 for line in lines)
 
     @pytest.mark.asyncio
     async def test_a_long_unseen_span_is_truncated_to_the_most_recent(self, built: Any) -> None:
         store, _, agents = built
         state = store.load("r1")
         assert state is not None
+        budget = self._budget_for(
+            _withheld_notice(7), "[alice]: line 4", "[alice]: line 5", "[alice]: now answer"
+        )
         store.save(
             state.model_copy(
-                update={"policy": RoomPolicy(max_span_messages=3, transcript_window=50)}
+                update={"policy": RoomPolicy(max_span_tokens=budget, transcript_window=50)}
             )
         )
         orch = _orchestrator(built, [ScriptedSelector("s", [speak("scout")] * 20)])
@@ -1797,7 +1810,8 @@ class TestTheSpanIsBounded:
         await orch.post("r1", "alice", "now answer")
 
         prompt = agents["scout"].prompts[0]
-        assert "line 0" not in prompt, "the oldest unseen messages must fall off the front"
+        assert "line 3" not in prompt, "the oldest unseen messages must fall off the front"
+        assert "line 4" in prompt, "the budget holds three lines, and all three must be kept"
         assert "now answer" in prompt, "the most recent must always be present"
         assert prompt.count("\n") == 3, prompt
 
@@ -1807,7 +1821,8 @@ class TestTheSpanIsBounded:
         store, _, agents = built
         state = store.load("r1")
         assert state is not None
-        store.save(state.model_copy(update={"policy": RoomPolicy(max_span_messages=2)}))
+        budget = self._budget_for(_withheld_notice(5), "[alice]: line 3", "[alice]: go")
+        store.save(state.model_copy(update={"policy": RoomPolicy(max_span_tokens=budget)}))
         orch = _orchestrator(built, [ScriptedSelector("s", [speak("scout")] * 20)])
 
         for i in range(4):
@@ -1817,6 +1832,118 @@ class TestTheSpanIsBounded:
         assert "3 earlier message" in agents["scout"].prompts[0]
 
     @pytest.mark.asyncio
+    async def test_the_latest_line_over_budget_is_cut_to_fit_and_says_so(self, built: Any) -> None:
+        """The message the turn answers is never dropped, and never overruns the budget.
+
+        It was kept whole (#1661), so one pasted log could fill the seat's window. It is
+        cut instead, keeping its sender and saying that it goes on; the notice about the
+        earlier line is paid for out of the same budget.
+
+        Killed by: src/uclone_x/room/orchestrator.py :: shown[-1] = _cut_to_fit(*said[-1], allowance)
+        Becomes: pass
+        """
+        from uclone_x.llm.compactor import estimate_text_tokens
+
+        store, _, agents = built
+        state = store.load("r1")
+        assert state is not None
+        budget = 40
+        store.save(state.model_copy(update={"policy": RoomPolicy(max_span_tokens=budget)}))
+        orch = _orchestrator(built, [ScriptedSelector("s", [speak("scout")] * 20)])
+
+        store.save(orch.append_human(store.load("r1"), "alice", "an earlier line"))  # type: ignore[arg-type]
+        await orch.post("r1", "alice", "a long question " * 40)
+
+        prompt = agents["scout"].prompts[0]
+        notice, latest = prompt.split("\n")
+        assert notice == _withheld_notice(1)
+        assert latest.startswith("[alice]: a long question")
+        assert latest.endswith("[...the rest of this message is not shown]")
+        assert sum(estimate_text_tokens(line) + 1 for line in (notice, latest)) <= budget
+
+    @pytest.mark.asyncio
+    async def test_the_withheld_notice_is_paid_for_out_of_the_budget(self, built: Any) -> None:
+        """A budget that holds the notice and the latest line keeps only those two.
+
+        The notice was sent on top of the budget (#1661), so a span that dropped lines
+        overran it by the notice's size. Each earlier line here costs less than the notice
+        and more than half of it, so the budget would hold the latest line and one earlier
+        line if the notice were free.
+
+        Killed by: src/uclone_x/room/orchestrator.py :: allowance = budget - (estimate_text_tokens(_withheld_notice(len(owed))) + 1)
+        Becomes: allowance = budget
+        """
+        store, _, agents = built
+        state = store.load("r1")
+        assert state is not None
+        budget = self._budget_for(_withheld_notice(3), "[alice]: go")
+        store.save(state.model_copy(update={"policy": RoomPolicy(max_span_tokens=budget)}))
+        orch = _orchestrator(built, [ScriptedSelector("s", [speak("scout")] * 20)])
+
+        for i in range(2):
+            store.save(orch.append_human(store.load("r1"), "alice", f"line {i} " + "x" * 24))  # type: ignore[arg-type]
+        await orch.post("r1", "alice", "go")
+
+        assert agents["scout"].prompts[0] == f"{_withheld_notice(2)}\n[alice]: go"
+
+    @pytest.mark.asyncio
+    async def test_a_window_under_four_tokens_still_sends_who_spoke(self, built: Any) -> None:
+        """A window below `SPAN_WINDOW_SHARE` clamps the budget to 1, the smallest there is.
+
+        Nothing fits in one token, and the turn still needs the line it answers: the
+        sender and the cut are sent, and nothing of an earlier line is.
+        """
+        from uclone_x.room.orchestrator import span_token_budget
+
+        store, _, agents = built
+        state = store.load("r1")
+        assert state is not None
+
+        class Tiny:
+            def context_window(self) -> int:
+                return 3
+
+        assert span_token_budget(state, Tiny()) == 1
+        store.save(state.model_copy(update={"policy": RoomPolicy(max_span_tokens=1)}))
+        orch = _orchestrator(built, [ScriptedSelector("s", [speak("scout")] * 20)])
+
+        store.save(orch.append_human(store.load("r1"), "alice", "an earlier line"))  # type: ignore[arg-type]
+        await orch.post("r1", "alice", "what now?")
+
+        assert agents["scout"].prompts[0] == (
+            f"{_withheld_notice(1)}\n[alice]: [...the rest of this message is not shown]"
+        )
+
+    def test_a_seat_that_reports_a_window_gets_a_share_of_it(self) -> None:
+        """The smaller of the policy ceiling and a quarter of the seat's window (#1641)."""
+        from uclone_x.room.models import SPAN_WINDOW_SHARE
+        from uclone_x.room.orchestrator import span_token_budget
+
+        class Windowed:
+            def __init__(self, window: int | None) -> None:
+                self._window = window
+
+            def context_window(self) -> int | None:
+                return self._window
+
+        state = RoomState(room_id="r1", policy=RoomPolicy(max_span_tokens=8_000))
+
+        assert span_token_budget(state, Windowed(4_096)) == 4_096 // SPAN_WINDOW_SHARE
+        assert span_token_budget(state, Windowed(1_000_000)) == 8_000
+        assert span_token_budget(state, Windowed(None)) == 8_000
+        assert span_token_budget(state, object()) == 8_000
+
+    def test_a_policy_saved_with_the_retired_message_count_still_loads(self) -> None:
+        """`max_span_messages` is on disk in rooms saved before #1641; loading must not fail."""
+        from uclone_x.room.models import DEFAULT_MAX_SPAN_TOKENS
+
+        policy = RoomPolicy.model_validate({"max_span_messages": 40, "transcript_window": 20})
+
+        assert policy.max_span_tokens == DEFAULT_MAX_SPAN_TOKENS
+        assert policy.transcript_window == 20
+        assert "max_span_messages" not in policy.model_dump()
+
+    @pytest.mark.asyncio
     async def test_a_short_span_is_untouched_and_unannotated(self, built: Any) -> None:
         _, _, agents = built
         orch = _orchestrator(built, [ScriptedSelector("s", [speak("scout")])])
@@ -1824,6 +1951,192 @@ class TestTheSpanIsBounded:
         await orch.post("r1", "alice", "just the one")
 
         assert agents["scout"].prompts[0] == "[alice]: just the one"
+
+
+class TestANoteIsNotConversation:
+    """`/loop` help and status are notes for the reader, not seat context (#1641, §8 Q4)."""
+
+    @staticmethod
+    def _with_note(state: RoomState, content: str) -> RoomState:
+        from uclone_x.room.models import RoomMessage, RoomMessageKind
+
+        note = RoomMessage(
+            seq=len(state.transcript) + 1,
+            sender_id="system",
+            content=content,
+            kind=RoomMessageKind.NOTE,
+        )
+        return state.model_copy(update={"transcript": (*state.transcript, note)})
+
+    @pytest.mark.asyncio
+    async def test_a_note_stays_out_of_the_next_speakers_span(self, built: Any) -> None:
+        store, _, agents = built
+        orch = _orchestrator(built, [ScriptedSelector("s", [speak("scout")])])
+        store.save(self._with_note(store.load("r1"), "LOOP-STATUS"))  # type: ignore[arg-type]
+
+        await orch.post("r1", "alice", "hello")
+
+        assert agents["scout"].prompts == ["[alice]: hello"]
+
+    def test_a_note_is_not_an_interjection(self) -> None:
+        """A note written mid-loop must not read as a human cutting in."""
+        from uclone_x.room.orchestrator import RoomOrchestrator
+
+        state = self._with_note(RoomState(room_id="r1"), "LOOP-STATUS")
+
+        assert not RoomOrchestrator._interjected(state, 0)  # pyright: ignore[reportPrivateUsage]
+
+    def test_a_note_is_not_a_legacy_agent_turn(self) -> None:
+        """The dock counted a `system` note as an agent turn saved without a tool record."""
+        from uclone_x.ui.room_dock import (
+            _legacy_agent_turns,  # pyright: ignore[reportPrivateUsage]
+        )
+
+        state = self._with_note(RoomState(room_id="r1", participants=(ALICE,)), "LOOP-STATUS")
+
+        assert _legacy_agent_turns(state) == 0
+
+    @pytest.mark.asyncio
+    async def test_a_typed_command_is_a_note_no_seat_is_handed(self, built: Any) -> None:
+        """The person's `/loop ...` reached the next seat as `[alice]: /loop ...` (#1661).
+
+        Killed by: src/uclone_x/room/orchestrator.py :: kind=RoomMessageKind.NOTE,
+        Becomes: kind=RoomMessageKind.UTTERANCE,
+        """
+        from uclone_x.room.models import RoomMessageKind
+
+        _, _, agents = built
+        orch = _orchestrator(built, [ScriptedSelector("s", [speak("scout")])])
+
+        state = await orch.accept_command("r1", "alice", "/loop 30s check the build")
+        command = state.transcript[-1]
+        assert (command.kind, command.sender_id, command.code) == (
+            RoomMessageKind.NOTE,
+            "alice",
+            None,
+        )
+        await orch.post("r1", "alice", "hello")
+
+        assert agents["scout"].prompts == ["[alice]: hello"]
+
+    @pytest.mark.asyncio
+    async def test_a_typed_command_leaves_the_turn_budget_and_a_running_exchange(
+        self, built: Any
+    ) -> None:
+        """A command is not a message: it resets no budget and stops no exchange (#1661).
+
+        Killed by: src/uclone_x/room/orchestrator.py :: state.model_copy(update={"transcript": (*state.transcript, note)})
+        Becomes: self.append_human(state, sender_id, content)
+        """
+        store, _, _ = built
+        orch = _orchestrator(built, [ScriptedSelector("s", [speak("scout")])])
+        state = store.load("r1")
+        assert state is not None
+        turns = state.turn_state.model_copy(update={"agent_turns_since_human": 3})
+        store.save(state.model_copy(update={"turn_state": turns}))
+        generation = orch._generation.get("r1", 0)  # pyright: ignore[reportPrivateUsage]
+
+        state = await orch.accept_command("r1", "alice", "/loop list")
+
+        assert state.turn_state.agent_turns_since_human == 3
+        assert orch._generation.get("r1", 0) == generation  # pyright: ignore[reportPrivateUsage]
+
+    @pytest.mark.asyncio
+    async def test_only_the_rooms_human_may_type_a_command(self, built: Any) -> None:
+        from uclone_x.errors import UnknownRoomParticipantError
+
+        orch = _orchestrator(built, [])
+
+        with pytest.raises(UnknownRoomParticipantError):
+            await orch.accept_command("r1", "scout", "/loop list")
+        with pytest.raises(UnknownRoomParticipantError):
+            await orch.accept_command("r1", "nobody", "/loop list")
+
+    @staticmethod
+    def _legacy_room(*rows: tuple[str, str], seat: Participant | None = None) -> RoomState:
+        """A room holding `rows` as speech, the way builds before notes saved them."""
+        from uclone_x.room.models import RoomMessage
+
+        transcript = tuple(
+            RoomMessage(seq=i, sender_id=sender, content=content)
+            for i, (sender, content) in enumerate(rows, start=1)
+        )
+        roster = (ALICE, SCOUT) if seat is None else (ALICE, SCOUT, seat)
+        return RoomState(room_id="r1", participants=roster, transcript=transcript)
+
+    def test_a_room_saved_before_notes_reads_its_loop_rows_as_notes(self, tmp_path: Any) -> None:
+        """Rooms saved before #1641 kept `system` rows, and the command before them, as speech.
+
+        A `/loop` the person typed with no `system` row after it was never handled as a
+        command, and stays their message.
+
+        Killed by: src/uclone_x/room/models.py :: legacy_notice = row.is_utterance and is_notice(i)
+        Becomes: legacy_notice = False
+        Killed by: src/uclone_x/room/models.py :: and is_notice(i + 1)
+        Becomes: and True
+        Killed by: src/uclone_x/room/store.py :: return with_legacy_loop_rows_as_notes(state)
+        Becomes: return state
+        """
+        from uclone_x.room.models import RoomMessageKind
+        from uclone_x.room.store import RoomStore
+        from uclone_x.ui.room_dock import (
+            _legacy_agent_turns,  # pyright: ignore[reportPrivateUsage]
+        )
+
+        store = RoomStore(tmp_path)
+        store.save(
+            self._legacy_room(
+                ("alice", "/loop 30s check the build"),
+                ("system", "🔄 **Repeating task started** (every 30 seconds)"),
+                ("alice", "what does /loop do?"),
+                ("alice", "/loop list"),
+                ("alice", "hello"),
+                ("alice", "/loop"),
+            )
+        )
+
+        loaded = store.load("r1")
+        assert loaded is not None
+        assert [m.kind for m in loaded.transcript] == [
+            RoomMessageKind.NOTE,
+            RoomMessageKind.NOTE,
+            RoomMessageKind.UTTERANCE,
+            RoomMessageKind.UTTERANCE,
+            RoomMessageKind.UTTERANCE,
+            RoomMessageKind.UTTERANCE,
+        ]
+        assert _legacy_agent_turns(loaded) == 0
+
+    def test_a_room_that_seats_a_participant_called_system_is_left_alone(self) -> None:
+        """Only the `/loop` route wrote `system`; a seat of that name speaks for itself.
+
+        Killed by: src/uclone_x/room/models.py :: if any(p.id == _LOOP_NOTICE_SENDER for p in state.participants):
+        Becomes: if False:
+        """
+        from uclone_x.room.models import with_legacy_loop_rows_as_notes
+
+        seat = agent_participant("system")
+        state = self._legacy_room(("alice", "/loop list"), ("system", "a reply"), seat=seat)
+
+        assert with_legacy_loop_rows_as_notes(state) is state
+
+    def test_a_row_kind_from_a_newer_build_loads_as_a_note(self) -> None:
+        """A build that met an unknown kind refused the whole room (#1661, rollback).
+
+        Killed by: src/uclone_x/room/models.py :: return RoomMessageKind.NOTE.value
+        Becomes: return value
+        Killed by: src/uclone_x/room/models.py :: if isinstance(value, str) and value not in get_args(NoticeCode):
+        Becomes: if False:
+        """
+        from uclone_x.room.models import RoomMessage, RoomMessageKind
+
+        row = RoomMessage.model_validate_json(
+            '{"seq": 1, "sender_id": "system", "content": "Topic changed", '
+            '"kind": "topic", "code": "topic.changed"}'
+        )
+
+        assert (row.kind, row.code, row.content) == (RoomMessageKind.NOTE, None, "Topic changed")
+        assert not row.is_utterance
 
 
 class TestEveryAddressedAgentAnswers:
@@ -3419,6 +3732,128 @@ class TestARealAgentsFailuresInTheRoom:
         assert "qwen3:8b" in row.error
         for internal in ("Traceback", "status 400", "{", "LLMProviderError"):
             assert internal not in row.error, internal
+
+    @pytest.mark.asyncio
+    async def test_a_retired_model_lands_as_a_refusal_that_names_it(self, built: Any) -> None:
+        """Retrying on the same model cannot succeed, so the row is a refusal (#1630).
+
+        Killed by: src/uclone_x/room/models.py :: return RoomTurnRefusal.MODEL_UNAVAILABLE
+        Becomes: return None
+        Killed by: src/uclone_x/room/orchestrator.py :: provider_failure = result.provider_failure
+        Becomes: provider_failure = None
+        """
+        from uclone_x.errors import ModelNotAvailableError
+        from uclone_x.llm import MockLLMConnector
+        from uclone_x.llm.models import LLMRequest, ModelResponse
+        from uclone_x.room.models import RoomTurnRefusal
+
+        class Retired(MockLLMConnector):
+            async def generate(self, request: LLMRequest) -> ModelResponse:
+                raise ModelNotAvailableError(provider="Google", model="gemini-1.5-pro")
+
+        store, _, agents = built
+        _cap(built, 1)
+        agents["scout"] = _real_agent(SCOUT, Retired(responses=[]))
+
+        row = (
+            await _orchestrator(built, [ScriptedSelector("s", [speak("scout")])]).post(
+                "r1", "alice", "discuss"
+            )
+        ).transcript[-1]
+
+        assert row.refusal is RoomTurnRefusal.MODEL_UNAVAILABLE
+        assert row.provider_failure is not None
+        assert row.provider_failure.kind == "model_unavailable"
+        assert row.provider_failure.retryable is False
+        assert row.error is not None
+        assert row.error.startswith("The model gemini-1.5-pro is not available from Google")
+        for internal in ("Traceback", "404", "{", "LLMProviderError", "ModelNotAvailable"):
+            assert internal not in row.error, internal
+        stored = store.load("r1")
+        assert stored is not None
+        assert stored.transcript[-1].provider_failure == row.provider_failure
+
+    @pytest.mark.asyncio
+    async def test_a_spent_quota_is_a_failure_retry_can_try_and_says_why(self, built: Any) -> None:
+        """A quota comes back, so it is not a refusal, but the row still says the cause.
+
+        Killed by: src/uclone_x/room/orchestrator.py :: provider_failure=provider_failure,
+        Becomes: provider_failure=None,
+        """
+        from uclone_x.errors import ProviderQuotaError
+        from uclone_x.llm import MockLLMConnector
+        from uclone_x.llm.models import LLMRequest, ModelResponse
+
+        class Spent(MockLLMConnector):
+            async def generate(self, request: LLMRequest) -> ModelResponse:
+                raise ProviderQuotaError(provider="Anthropic", model="claude-sonnet-4-5")
+
+        _, _, agents = built
+        _cap(built, 1)
+        agents["scout"] = _real_agent(SCOUT, Spent(responses=[]))
+
+        row = (
+            await _orchestrator(built, [ScriptedSelector("s", [speak("scout")])]).post(
+                "r1", "alice", "discuss"
+            )
+        ).transcript[-1]
+
+        assert row.refusal is None
+        assert row.provider_failure is not None
+        assert row.error == row.provider_failure.message
+        assert row.provider_failure.kind == "provider_quota"
+        assert row.provider_failure.retryable is True
+        assert "Anthropic's usage limit" in row.provider_failure.message
+
+    @pytest.mark.asyncio
+    async def test_the_landed_event_carries_the_provider_failure(self, built: Any) -> None:
+        """A head listening on the topic learns the cause where it learns the failure.
+
+        Killed by: src/uclone_x/room/orchestrator.py :: payload["provider_failure"] = message.provider_failure.model_dump(mode="json")
+        Becomes: pass
+        """
+        from uclone_x.engine.event_bus import AgentEvent, EventBus, EventType
+        from uclone_x.errors import ProviderAuthError
+        from uclone_x.llm import MockLLMConnector
+        from uclone_x.llm.models import LLMRequest, ModelResponse
+        from uclone_x.room.orchestrator import RoomOrchestrator
+
+        class Rejected(MockLLMConnector):
+            async def generate(self, request: LLMRequest) -> ModelResponse:
+                raise ProviderAuthError(provider="OpenAI", model="gpt-5-mini")
+
+        store, resolver, agents = built
+        _cap(built, 1)
+        agents["scout"] = _real_agent(SCOUT, Rejected(responses=[]))
+        async with EventBus() as bus:
+            sub = bus.subscribe({"room.r1"})
+            orch = RoomOrchestrator(
+                store=store,
+                selectors=[ScriptedSelector("s", [speak("scout")])],
+                resolver=resolver,
+                bus=bus,
+            )
+            await orch.post("r1", "alice", "discuss")
+            events: list[AgentEvent] = []
+            while True:
+                try:
+                    events.append(await asyncio.wait_for(sub.get(), 0.3))
+                except TimeoutError:
+                    break
+
+        landed = [
+            e.payload
+            for e in events
+            if e.type is EventType.AGENT_REPLY and e.payload.get("status") == "final"
+        ]
+        assert len(landed) == 1
+        assert landed[0]["refusal"] == "provider_auth"
+        assert landed[0]["provider_failure"] == {
+            "kind": "provider_auth",
+            "message": "OpenAI did not accept the API key.",
+            "retryable": False,
+            "provider": "OpenAI",
+        }
 
     @pytest.mark.asyncio
     async def test_the_landed_event_carries_the_refusal(self, built: Any) -> None:

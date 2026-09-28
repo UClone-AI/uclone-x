@@ -13,14 +13,26 @@ from uclone_x.core.immutable import unwrap_immutable
 from uclone_x.core.provenance import Provenance
 from uclone_x.errors import (
     LLMCredentialsNotConfiguredError,
-    LLMProviderError,
     UnmappableChatMessageError,
 )
+from uclone_x.llm.catalog import CatalogEntry
 from uclone_x.llm.connectors.base import (
     BaseLLMConnector,
+    named_model,
     parse_dict_payload,
+    refuse_response_schema,
     reported_count,
+    resolve_model,
     resolve_token_counts,
+)
+from uclone_x.llm.connectors.failures import failed_request, failed_status, unusable_response
+from uclone_x.llm.connectors.listing import (
+    MAX_LISTING_PAGES,
+    from_iso,
+    get_listing_page,
+    listed_items,
+    optional_int,
+    optional_str,
 )
 from uclone_x.llm.models import (
     FinishReason,
@@ -32,7 +44,8 @@ from uclone_x.llm.models import (
     ToolCallRequest,
 )
 
-_DEFAULT_MODEL = "claude-3-5-sonnet"
+#: Who the person using the app holds the key with, as a failure names it (#1630).
+_PROVIDER = "Anthropic"
 
 ANTHROPIC_REQUIRED_MAX_TOKENS_DEFAULT = 4096
 """The ceiling sent when a caller names none, because Anthropic requires the field.
@@ -51,22 +64,6 @@ literal_for_a_missing_value` is the in-repo, control-bearing replacement for tha
 """
 
 
-def _requested_model(request: LLMRequest) -> str:
-    """The model this connector asks Anthropic for, defaulted when the caller named none.
-
-    One expression, used by the request builder, the streaming path and the
-    `Provenance.requested` it reports. It was written out three times with the same
-    literal; if one copy were ever changed and not the others, provenance would name
-    a `requested` model that was never sent and `degraded` would flip — in the exact
-    field #149 exists to make trustworthy.
-    """
-    if request.model is not None:
-        stripped = request.model.strip()
-        if stripped and stripped != "default":
-            return stripped
-    return _DEFAULT_MODEL
-
-
 class AnthropicConnector(BaseLLMConnector):
     """Anthropic Claude API connector."""
 
@@ -76,7 +73,12 @@ class AnthropicConnector(BaseLLMConnector):
         base_url: str | None = None,
         timeout: float = 60.0,
         http_client: httpx.AsyncClient | None = None,
+        model: str | None = None,
     ) -> None:
+        """``model`` is what a request naming no model is sent to; see ``resolve_model``."""
+        #: The model a request naming none asks for, or ``None``: then such a request is
+        #: refused before the network rather than sent to a model id written here.
+        self._default_model: str | None = named_model(model)
         resolved_key = api_key if api_key is not None else os.getenv("ANTHROPIC_API_KEY")
         if resolved_key is None or not resolved_key.strip():
             raise LLMCredentialsNotConfiguredError(
@@ -101,6 +103,50 @@ class AnthropicConnector(BaseLLMConnector):
     @property
     def provider_name(self) -> str:
         return "anthropic"
+
+    def _requested_model(self, request: LLMRequest) -> str:
+        """The model this connector asks Anthropic for: the request's, else its own, else refused.
+
+        One expression, used by the request builder, the streaming path and the
+        `Provenance.requested` it reports, so provenance cannot name a `requested` model
+        that was never sent (#149).
+        """
+        return resolve_model(request.model, self._default_model, _PROVIDER)
+
+    async def list_models(self) -> list[CatalogEntry]:
+        """The models this key can use, from Anthropic's `GET /v1/models` (#1631).
+
+        Every model Anthropic lists can chat. Newer listings report `max_input_tokens` and
+        `max_tokens`; where they are absent the window is left unknown.
+        """
+        entries: list[CatalogEntry] = []
+        params: dict[str, str] = {"limit": "1000"}
+        for _ in range(MAX_LISTING_PAGES):
+            page = await get_listing_page(
+                self,
+                provider=_PROVIDER,
+                url=f"{self.base_url}/models",
+                headers={"x-api-key": self._require_api_key(), "anthropic-version": "2023-06-01"},
+                params=params,
+            )
+            for item in listed_items(page, "data"):
+                model_id = optional_str(item.get("id"))
+                if model_id is None:
+                    continue
+                entries.append(
+                    CatalogEntry(
+                        id=model_id,
+                        display_name=optional_str(item.get("display_name")),
+                        context_window=optional_int(item.get("max_input_tokens")),
+                        max_output_tokens=optional_int(item.get("max_tokens")),
+                        created_at=from_iso(item.get("created_at")),
+                    )
+                )
+            last_id = optional_str(page.get("last_id"))
+            if page.get("has_more") is not True or last_id is None:
+                break
+            params = {"limit": "1000", "after_id": last_id}
+        return entries
 
     def _map_finish_reason(self, stop_reason: str | None) -> FinishReason:
         """Map Anthropic's `stop_reason` onto `FinishReason`, or report it as unknown.
@@ -151,7 +197,8 @@ class AnthropicConnector(BaseLLMConnector):
             UnmappableChatMessageError: a message has no faithful Anthropic
                 representation. The offending value is named in the message.
         """
-        model = _requested_model(request)
+        refuse_response_schema(request, self.provider_name)
+        model = self._requested_model(request)
         system_prompts: list[str] = []
         messages_payload: list[dict[str, Any]] = []
 
@@ -264,6 +311,7 @@ class AnthropicConnector(BaseLLMConnector):
 
     async def generate(self, request: LLMRequest) -> ModelResponse:
         """Generate response from Anthropic API."""
+        model = self._requested_model(request)
         payload = self._build_payload(request, stream=False)
         url = f"{self.base_url}/messages"
         headers: dict[str, str] = {
@@ -277,12 +325,14 @@ class AnthropicConnector(BaseLLMConnector):
         try:
             resp = await client.post(url, json=payload, headers=headers, timeout=self.timeout)
             if resp.status_code != 200:
-                raise LLMProviderError(f"Anthropic error {resp.status_code}: {resp.text}")
+                raise failed_status(
+                    provider=_PROVIDER, model=model, status_code=resp.status_code, body=resp.text
+                )
             data: dict[str, Any] = resp.json()
         except httpx.RequestError as exc:
-            raise LLMProviderError(f"Anthropic connection error: {exc}") from exc
+            raise failed_request(provider=_PROVIDER, model=model, exc=exc) from exc
         except json.JSONDecodeError as exc:
-            raise LLMProviderError(f"Invalid JSON from Anthropic: {exc}") from exc
+            raise unusable_response(provider=_PROVIDER, model=model, detail=str(exc)) from exc
         finally:
             if should_close:
                 await client.aclose()
@@ -309,8 +359,7 @@ class AnthropicConnector(BaseLLMConnector):
         in_tokens, out_tokens, count_source = resolve_token_counts(
             request, in_tokens, out_tokens, reply=content, tool_calls=tool_calls
         )
-        requested_model = _requested_model(request)
-        model_name = data.get("model", requested_model)
+        model_name = data.get("model", model)
 
         usage = TokenUsage(
             provider="anthropic",
@@ -323,9 +372,7 @@ class AnthropicConnector(BaseLLMConnector):
 
         finish_reason = self._map_finish_reason(data.get("stop_reason"))
         # P6: see the note in `openai.py` — the alias stays visible (#149).
-        provenance = Provenance.primary(
-            provider="anthropic", model=requested_model, served_model=model_name
-        )
+        provenance = Provenance.primary(provider="anthropic", model=model, served_model=model_name)
 
         return ModelResponse(
             content=content,
@@ -338,6 +385,7 @@ class AnthropicConnector(BaseLLMConnector):
 
     async def stream(self, request: LLMRequest) -> AsyncIterator[StreamChunk]:
         """Stream response chunks from Anthropic SSE API."""
+        requested_model = self._requested_model(request)
         payload = self._build_payload(request, stream=True)
         url = f"{self.base_url}/messages"
         headers: dict[str, str] = {
@@ -359,8 +407,11 @@ class AnthropicConnector(BaseLLMConnector):
             ) as resp:
                 if resp.status_code != 200:
                     err_body = await resp.aread()
-                    raise LLMProviderError(
-                        f"Anthropic stream error {resp.status_code}: {err_body.decode('utf-8', errors='replace')}"
+                    raise failed_status(
+                        provider=_PROVIDER,
+                        model=requested_model,
+                        status_code=resp.status_code,
+                        body=err_body.decode("utf-8", errors="replace"),
                     )
 
                 async for raw_line in resp.aiter_lines():
@@ -405,7 +456,7 @@ class AnthropicConnector(BaseLLMConnector):
                             reported_count(u, "output_tokens"),
                             reply="".join(streamed),
                         )
-                        model_name = _requested_model(request)
+                        model_name = requested_model
                         usage = TokenUsage(
                             provider="anthropic",
                             model=model_name,
@@ -423,7 +474,7 @@ class AnthropicConnector(BaseLLMConnector):
                             finish_reason=finish_reason,
                         )
         except httpx.RequestError as exc:
-            raise LLMProviderError(f"Anthropic stream connection error: {exc}") from exc
+            raise failed_request(provider=_PROVIDER, model=requested_model, exc=exc) from exc
         finally:
             if should_close:
                 await client.aclose()

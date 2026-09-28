@@ -47,7 +47,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
-    from uclone_x.agent.session import SessionState
+    from uclone_x.core.session_state import SessionState
 
 __all__ = ["SessionStoreProtocol"]
 

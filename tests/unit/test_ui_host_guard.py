@@ -47,24 +47,29 @@ def test_a_rebound_page_cannot_read_the_dashboard(tmp_path: Path) -> None:
     assert "http://127.0.0.1:5180" in detail
 
 
-def test_a_rebound_page_cannot_post_a_chat_turn(tmp_path: Path) -> None:
+def test_a_rebound_page_cannot_send_a_room_message(tmp_path: Path) -> None:
     """The consequence that made this a security issue: a turn runs tools in the workspace.
 
-    The refused turn reaches no model: the first reply is still waiting for the next turn.
+    The refused send is never posted, so no seat is asked to answer it; the same send
+    without the rebound headers is admitted.
 
     Killed by: src/uclone_x/ui/app.py :: app.add_middleware(LoopbackHostGuard)
     Becomes: pass
     """
     llm = MockLLMConnector(responses=["first", "second"])
-    client = _client(tmp_path, llm=llm)
-    turn = {"message": "run bash_run", "agent_id": "agent-a", "session_id": "sess_rebound"}
+    with _client(tmp_path, llm=llm) as client:
+        created = client.post("/api/rooms", json={"title": "Rebound", "agent_ids": ["scout"]})
+        assert created.status_code == 201, created.text
+        room_id = created.json()["room_id"]
+        send = {"content": "run bash_run"}
+        before = client.get(f"/api/rooms/{room_id}").json()["transcript"]
 
-    refused = client.post("/api/turn", json=turn, headers=REBOUND)
-    admitted = client.post("/api/turn", json=turn)
+        refused = client.post(f"/api/rooms/{room_id}/messages", json=send, headers=REBOUND)
+        assert refused.status_code == 403
+        assert client.get(f"/api/rooms/{room_id}").json()["transcript"] == before
 
-    assert refused.status_code == 403
-    assert admitted.status_code == 200
-    assert admitted.json()["response"] == "first"
+        admitted = client.post(f"/api/rooms/{room_id}/messages", json=send)
+        assert admitted.status_code == 202, admitted.text
 
 
 @pytest.mark.parametrize("host", ["localhost:5180", "127.0.0.1:5180", "[::1]:5180", "LOCALHOST"])

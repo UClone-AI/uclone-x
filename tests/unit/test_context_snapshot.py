@@ -22,13 +22,13 @@ pin the five things the issue asks for, and what review found around them:
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
 import pytest
-from fastapi.testclient import TestClient
 from pydantic import BaseModel, Field
 
 from uclone_x.agent.base import BaseAgent
@@ -226,7 +226,7 @@ async def test_a_room_seats_stored_anchor_is_the_identity_its_request_sends(
     request carried. The persona now reaches the agent at construction, so the anchor and
     the request come from one builder.
 
-    Killed by: src/uclone_x/room/resolver.py :: persona_definitions=(persona_def,),
+    Killed by: src/uclone_x/agent/clone_builder.py :: persona_definitions=(persona_def,),
     Becomes: persona_definitions=(),
     """
     registry = PersonaRegistry(workspace_root=tmp_path, include_defaults=False)
@@ -276,19 +276,23 @@ async def test_a_room_seats_stored_anchor_is_the_identity_its_request_sends(
 def test_a_one_to_one_clones_stored_anchor_is_the_identity_its_request_sends(
     tmp_path: Path,
 ) -> None:
-    """The same for an agent the UI builds for a direct conversation, through its turn route.
+    """The same for an agent the UI's session manager builds for a direct conversation.
 
-    Killed by: src/uclone_x/agent/base.py :: if not seat_framing:
+    Killed by: src/uclone_x/agent/prompt_assembler.py :: if not seat_framing:
     Becomes: if False:
     """
-    from uclone_x.ui.app import create_ui_app
+    from uclone_x.ui.app import AgentSessionManager
 
     llm = RecordingLLM()
-    app = create_ui_app(static_dir=tmp_path, llm=llm, storage_dir=tmp_path)
-    client = TestClient(app)
+    manager = AgentSessionManager(llm=llm, storage_dir=tmp_path)
     session_id = "sess_clone"
-    turn = {"message": "hello", "agent_id": "agent-clone", "session_id": session_id}
-    assert client.post("/api/turn", json=turn).json()["status"] == "success"
+
+    async def turn() -> None:
+        agent = await manager.get_or_create_agent("agent-clone", session_id=session_id)
+        assert (await agent.execute_turn("hello")).error is None
+        agent.persist_session(session_id=session_id)
+
+    asyncio.run(turn())
 
     store = SessionStore(tmp_path / CORE_RECORD_SUBDIR)
     record = store.load(session_id)
@@ -316,7 +320,7 @@ async def test_every_request_of_a_session_is_rebuilt_from_its_record(tmp_path: P
 
     Killed by: src/uclone_x/agent/request_record.py :: conversation = conversation[:kept] + appended
     Becomes: conversation = appended
-    Killed by: src/uclone_x/agent/base.py :: turn_context_digest=content_digest(layers.turn_context),
+    Killed by: src/uclone_x/agent/prompt_assembler.py :: turn_context_digest=content_digest(layers.turn_context),
     Becomes: turn_context_digest=content_digest(""),
     """
     store, sent = await _three_turns_with_a_restart(tmp_path)
@@ -342,7 +346,7 @@ async def test_a_turn_adds_one_snapshot_and_a_changed_layer_adds_another(
 ) -> None:
     """A snapshot is recorded when what it holds changes, not once per step.
 
-    Killed by: src/uclone_x/agent/base.py :: if not session.context_snapshots or session.context_snapshots[-1] != candidate:
+    Killed by: src/uclone_x/agent/prompt_assembler.py :: if not session.context_snapshots or session.context_snapshots[-1] != candidate:
     Becomes: if True:
     """
     store = SessionStore(tmp_path)
@@ -381,8 +385,8 @@ async def test_a_turns_first_step_records_only_what_the_turn_added(tmp_path: Pat
     A turn's first step used to record its whole request, so every turn re-recorded the
     conversation so far and a long session's log grew with the square of its turns.
 
-    Killed by: src/uclone_x/agent/base.py :: kept, appended = _request_context_delta(session.last_conversation, conversation)
-    Becomes: kept, appended = _request_context_delta([] if step == 1 else session.last_conversation, conversation)
+    Killed by: src/uclone_x/agent/prompt_assembler.py :: kept, appended = request_context_delta(session.last_conversation, conversation)
+    Becomes: kept, appended = request_context_delta([] if step == 1 else session.last_conversation, conversation)
     """
     store = SessionStore(tmp_path)
     llm = RecordingLLM()
@@ -411,7 +415,7 @@ async def test_a_turns_first_step_records_only_what_the_turn_added(tmp_path: Pat
 async def test_a_record_written_before_snapshots_loads_and_runs(tmp_path: Path) -> None:
     """A record in the shape written before #1421, with no `context_snapshots` key.
 
-    Killed by: src/uclone_x/agent/session.py :: default_factory=tuple,
+    Killed by: src/uclone_x/core/session_state.py :: default_factory=tuple,
     Becomes:
     """
     store = SessionStore(tmp_path)
@@ -615,7 +619,7 @@ def _missing_bodies(store: SessionStore, session_id: str = "sess_snap") -> list[
 async def test_a_history_loaded_before_a_save_keeps_the_bodies_to_write(tmp_path: Path) -> None:
     """A rewind replaces the working copy and then saves it; the record's bodies are there.
 
-    Killed by: src/uclone_x/agent/base.py :: replaced.pending_bodies = live.pending_bodies
+    Killed by: src/uclone_x/agent/session_lifecycle.py :: replaced.pending_bodies = live.pending_bodies
     Becomes: pass
     """
     store = SessionStore(tmp_path)
@@ -633,7 +637,7 @@ async def test_a_history_loaded_before_a_save_keeps_the_bodies_to_write(tmp_path
 async def test_a_compaction_writes_the_bodies_its_record_names(tmp_path: Path) -> None:
     """Compaction saves the record itself; that save writes the bodies too.
 
-    Killed by: src/uclone_x/agent/base.py :: self._write_pending_bodies(sid)  # before the record that names them
+    Killed by: src/uclone_x/agent/compaction_driver.py :: self._write_pending_bodies(sid)  # before the record that names them
     Becomes: pass
     """
     store = SessionStore(tmp_path)

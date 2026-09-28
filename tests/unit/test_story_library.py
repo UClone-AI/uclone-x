@@ -25,7 +25,7 @@ from uclone_x.agent.base import BaseAgent
 from uclone_x.agent.models import AgentConfig, AgentLLMConfig, ToolExecutionRecord
 from uclone_x.llm.connectors.mock import MockLLMConnector
 from uclone_x.llm.models import LLMRequest, ModelResponse, ToolCallRequest
-from uclone_x.story import OPEN_STORY_KEY, story_after
+from uclone_x.story import OPEN_STORY_KEY, StoryLifecycleHook, story_after
 from uclone_x.story.library import (
     NoConversationError,
     NoOpenStoryError,
@@ -428,6 +428,8 @@ def _writer(workspace: Path, llm: MockLLMConnector, *tools: BaseTool[Any]) -> Ba
         ),
         llm=llm,
         tools=ToolRegistry(tools=list(tools)),
+        # What every head composes in (`with_app_lifecycle_hooks`); the agent imports none.
+        lifecycle_hooks=(StoryLifecycleHook(),),
     )
 
 
@@ -436,7 +438,7 @@ class TestTheStoryReachesToolCalls:
     async def test_the_turns_conversation_and_story_reach_the_tool_context(
         self, tmp_path: Path
     ) -> None:
-        """Killed by: src/uclone_x/agent/base.py :: story_id=self._turn_story_id,
+        """Killed by: src/uclone_x/agent/turn_executor.py :: story_id=self._turn_story_id,
         Becomes: story_id=None,
         """
         probe = _ProbeTool()
@@ -451,7 +453,7 @@ class TestTheStoryReachesToolCalls:
     async def test_a_story_created_in_a_turn_is_the_one_its_later_steps_see(
         self, tmp_path: Path
     ) -> None:
-        """Killed by: src/uclone_x/agent/base.py :: self._turn_story_id = story_after((rec,), self._turn_story_id)
+        """Killed by: src/uclone_x/agent/turn_executor.py :: self._after_tool_step((rec,), tool_ctx)
         Becomes: pass
         """
         probe = _ProbeTool()
@@ -475,6 +477,33 @@ class TestTheStoryReachesToolCalls:
         assert len(created) == 1
         assert probe.seen == [(ROOM_A, created[0])]
         assert [r.opens_story for r in result.tool_executions] == [True, False]
+
+    @pytest.mark.asyncio
+    async def test_the_turns_result_names_the_story_it_left_open(self, tmp_path: Path) -> None:
+        """A room keeps `TurnResult.story_id` rather than re-reading the records (#1775).
+
+        Killed by: src/uclone_x/agent/base.py :: return result.model_copy(update={"story_id": self._turn_story_id})
+        Becomes: return result
+        """
+        llm = _StepLLM(
+            [
+                [
+                    ToolCallRequest(
+                        id="c1",
+                        name="story_library",
+                        arguments={"action": "create", "title": "Tide"},
+                    )
+                ]
+            ]
+        )
+        agent = _writer(tmp_path, llm, StoryLibraryTool())
+
+        result = await agent.execute_turn("start a story", room_id=ROOM_A, story_id=None)
+
+        created = [s.story_id for s in StoryLibrary(tmp_path).list().stories]
+        assert len(created) == 1
+        assert result.is_completed
+        assert result.story_id == created[0]
 
     def test_only_a_declaring_tool_that_succeeded_moves_the_story(self) -> None:
         """Killed by: src/uclone_x/story/__init__.py :: if not record.opens_story or record.status

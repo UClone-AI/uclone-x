@@ -1,9 +1,17 @@
 # Agent-Specific Ontology Architecture: Self-Constructing & Human-Guided Knowledge
 
 > [!IMPORTANT]
-> **Implementation status.** Nothing in this document is implemented.
-> `src/uclone_x/ontology/` holds type stubs only, and the repository-root
-> `ontology/` directory is empty. Read every section below as design intent.
+> **Implementation status (2026-09-25).** The engine exists: `src/uclone_x/ontology/engine.py`
+> implements the three tiers (asserted / induced_enforcing / induced_candidate), a Datalog
+> reasoner (`reasoner.py`, `rules.py`), justification, YAML persistence, and the CLI
+> `ucx ontology list | teach | review | forget | validate`. What is **not** implemented is the
+> learning loop: nothing extracts concepts or relations from conversations (the regex
+> `OntologyInducer` / `SessionKnowledgeExtractor` have no caller), and the repository-root
+> `ontology/` directory does not exist. §3.3 (4)'s scope is per clone since P7 was amended on
+> 2026-09-25 (#1654), for the design in
+> `design/clone-knowledge-graph.md` (issue #1638). That design
+> also redesigns how a clone learns: memory facts are the knowledge graph, and this engine
+> holds a clone's rules and computes what follows from them.
 > Cross-agent alignment — how two independently induced ontologies are reconciled —
 > is specified separately in
 > [`docs/ontology-alignment-spec.md`](ontology-alignment-spec.md).
@@ -97,11 +105,9 @@ To prevent knowledge poisoning, obsolete assertions, and context bloat, all self
    - Successful task execution utilizing the assertion increments confidence (+2).
    - Invalidation by compiler/linter error or human rejection decrements confidence (-5).
    - Assertions unreinforced over time experience temporal decay; items dropping below threshold are automatically pruned to prevent knowledge rot.
-4. **User & Workspace Isolation**:
-   - Ontologies are strictly partitioned across namespaces:
-     * `~/.ucx/knowledge/users/<user_id>/`: Personal developer preferences and coding idioms.
-     * `~/.ucx/knowledge/workspaces/<workspace_id>/`: Project-specific architectural invariants and service schemas.
-   - Prevents cross-project contamination while enabling reusable cross-session intelligence.
+4. **Per-Clone Isolation** (P7, amended 2026-09-25, #1654):
+   - A clone's knowledge is not partitioned by conversation or workspace. No clone reads, writes, or merges another clone's knowledge.
+   - The per-user and per-workspace namespaces this item used to name (`~/.ucx/knowledge/users/`, `~/.ucx/knowledge/workspaces/`) are not named anywhere under `src/` or `tests/` (`grep -rnE 'knowledge/(users|workspaces)' src tests` finds nothing). The clone's store is `design/clone-knowledge-graph.md` §3.1.
 
 ---
 

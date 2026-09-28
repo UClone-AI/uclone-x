@@ -131,7 +131,7 @@ async def test_execute_turn_cancellation_releases_lock_and_resets_idle() -> None
 async def test_execute_turn_cancellation_records_cancelled_durable_event() -> None:
     """Test that cancelling an execute_turn turn records a TURN_END event with outcome=cancelled.
 
-    Killed by: src/uclone_x/agent/base.py :: outcome = "cancelled"
+    Killed by: src/uclone_x/agent/turn_executor.py :: outcome = "cancelled"
     Becomes: outcome = "completed"
     """
     bus = EventBus()

@@ -1,0 +1,10 @@
+{
+  "now": "지금",
+  "minutes": "{count}분",
+  "hours": "{count}시간",
+  "days": "{count}일",
+  "weeks": "{count}주",
+  "months": "{count}개월",
+  "years": "{count}년",
+  "lastActive": "마지막 활동: {when}"
+}

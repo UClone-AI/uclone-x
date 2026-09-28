@@ -93,6 +93,12 @@ class ToolContext(BaseModel):
         "conversation's. `None` outside a conversation, and for an agent asked from outside "
         "one.",
     )
+    turn_id: str | None = Field(
+        default=None,
+        description="The room turn this call runs in: the id the room gives the turn and "
+        "its row carries (`caller_turn_id` on `execute_turn`). `record_memory_fact` stores "
+        "it as the fact's `source_turn_id`. `None` for a turn no room started.",
+    )
     story_id: str | None = Field(
         default=None,
         description="The story the conversation has open, filled from the room for every "

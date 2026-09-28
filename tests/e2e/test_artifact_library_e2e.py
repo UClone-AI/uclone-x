@@ -88,13 +88,20 @@ async def test_files_are_managed_apart_from_any_conversation(server: str, worksp
             assert (workspace / "artifacts" / "orphan.txt").is_file()
             await page.get_by_test_id("files-show-archived").uncheck()
 
-            # Delete asks first, and nothing is gone until the answer is yes.
-            await orphan.get_by_test_id("files-delete").click()
+            # Permanent delete lives in the archive only (owner decision 2026-09-26): a file
+            # outside it offers archive, and the archived copy asks before it is gone.
+            assert await orphan.get_by_test_id("files-delete").count() == 0
+            await orphan.get_by_test_id("files-archive").click()
+            await page.get_by_text("orphan.txt was archived.").wait_for(timeout=5_000)
+            await page.get_by_test_id("files-show-archived").check()
+            await archived.get_by_test_id("files-delete").click()
             await page.get_by_role("alertdialog").wait_for(timeout=5_000)
-            assert (workspace / "artifacts" / "orphan.txt").is_file()
+            assert (workspace / ".archive" / "artifacts" / "orphan.txt").is_file()
             await page.get_by_test_id("files-confirm-delete").click()
             await page.get_by_text("orphan.txt was deleted.").wait_for(timeout=5_000)
+            assert not (workspace / ".archive" / "artifacts" / "orphan.txt").exists()
             assert not (workspace / "artifacts" / "orphan.txt").exists()
+            await page.get_by_test_id("files-show-archived").uncheck()
 
             # A story opens into a new conversation that carries its id.
             stories = await _json(page, f"{server}/api/artifacts/library")

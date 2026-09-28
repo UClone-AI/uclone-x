@@ -6,11 +6,9 @@ import json
 import sys
 from collections.abc import AsyncIterator
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 
-from uclone_x.cli.commands.run import run_agent_repl_async
 from uclone_x.core.provenance import Provenance
 from uclone_x.engine.event_bus import EventBus
 from uclone_x.llm.models import (
@@ -151,20 +149,21 @@ def test_create_default_registry_contains_all_core_tools() -> None:
     assert "delegate_subagent" in tool_names
     assert "a2a_call" in tool_names
     assert "tool_result_read" in tool_names
-    assert len(tools) == 23
+    assert "set_avatar" in tool_names
+    assert len(tools) == 24
 
     for name in expected_names:
         assert registry.get(name) is not None
 
     # Test alias
     reg_alias = create_default_tool_registry(enable_mcp=False)
-    assert len(reg_alias.list_tools()) == 23
+    assert len(reg_alias.list_tools()) == 24
 
     # Test classmethod factories
     reg_builtins = ToolRegistry.with_builtins(enable_mcp=False)
-    assert len(reg_builtins.list_tools()) == 23
+    assert len(reg_builtins.list_tools()) == 24
     reg_default = ToolRegistry.default(enable_mcp=False)
-    assert len(reg_default.list_tools()) == 23
+    assert len(reg_default.list_tools()) == 24
 
 
 def test_create_default_registry_with_mcp_auto_wiring(tmp_path: Path) -> None:
@@ -196,7 +195,7 @@ def test_create_default_registry_with_mcp_auto_wiring(tmp_path: Path) -> None:
     assert "web_fetch" in tool_names
     assert "web_search" in tool_names
     assert "custom_mcp_action" in tool_names
-    assert len(registry.list_tools()) == 24
+    assert len(registry.list_tools()) == 25
 
 
 def test_create_default_registry_graceful_on_broken_mcp(tmp_path: Path) -> None:
@@ -223,7 +222,7 @@ def test_create_default_registry_graceful_on_broken_mcp(tmp_path: Path) -> None:
     )
 
     # All built-in tools remain registered despite MCP failure
-    assert len(registry.list_tools()) == 23
+    assert len(registry.list_tools()) == 24
     assert registry.get("file_read") is not None
     assert registry.get("bash_run") is not None
     assert registry.get("web_fetch") is not None
@@ -269,39 +268,3 @@ def test_create_ui_app_default_registry() -> None:
 # ======================================================================================
 # 3. CLI REPL Tool Registry Wiring Tests
 # ======================================================================================
-
-
-@pytest.mark.asyncio
-async def test_cli_run_agent_repl_wires_default_registry() -> None:
-    """run_agent_repl_async wires default tool registry and makes tools accessible in turns."""
-    mock_llm = DummyLLMConnector()
-
-    with patch(
-        "uclone_x.cli.commands.run.create_llm_connector",
-        return_value=mock_llm,
-    ):
-        # Run single-shot turn
-        await run_agent_repl_async(
-            agent_name="test_cli_agent",
-            provider="mock",
-            prompt="Perform a test action",
-            tools=None,
-        )
-
-
-@pytest.mark.asyncio
-async def test_cli_run_agent_repl_custom_tools() -> None:
-    """run_agent_repl_async accepts an explicit custom tool registry."""
-    mock_llm = DummyLLMConnector()
-    custom_reg = ToolRegistry()
-
-    with patch(
-        "uclone_x.cli.commands.run.create_llm_connector",
-        return_value=mock_llm,
-    ):
-        await run_agent_repl_async(
-            agent_name="test_custom_agent",
-            provider="mock",
-            prompt="Test with custom registry",
-            tools=custom_reg,
-        )

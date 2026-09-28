@@ -74,6 +74,13 @@ class SkillManifest(BaseModel):
     scripts: tuple[str, ...] = Field(default_factory=tuple)
     tags: tuple[str, ...] = Field(default_factory=tuple)
     entrypoint: str | None = None
+    family_sections: bool = Field(
+        default=False,
+        description="The body is split into `## family: <family>` / `## model: <model_id>` "
+        "sections, and `load_skill` returns the preamble plus the one section matching the "
+        "active image model. A read-time view: the approval hash still covers the "
+        "whole file.",
+    )
     origin: SkillOrigin = Field(
         description="Required. A skill that cannot say who wrote it cannot be governed.",
     )

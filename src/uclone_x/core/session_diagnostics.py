@@ -16,14 +16,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
-from uclone_x.agent.session import (
-    SessionStore,
-    validate_session_id,
-)
+from uclone_x.core.session import validate_session_id
+from uclone_x.core.session_store import SessionStoreProtocol
+from uclone_x.core.tool_results import ARTIFACT_SUBDIR, handle_in
 from uclone_x.llm.models import ChatMessage, MessageRole
 
 logger = logging.getLogger(__name__)
 
+#: The legacy offload marker's path. Current stored results are named by a `tr_` handle
+#: instead (`handle_in`), and are checked alongside it.
 OFFLOAD_PATH_PATTERN = re.compile(r"saved to '([^']+)'")
 # An advisory threshold on *interaction turns* — how many times a human has gone back and
 # forth with the agent — used only to label a session "saturated" in diagnostics output.
@@ -125,7 +126,7 @@ def _list_session_artifacts(
     """Enumerate offloaded tool output artifacts for a session."""
     if workspace_root is None:
         return 0, 0, []
-    artifacts_dir = workspace_root / ".sandbox" / "tool_artifacts" / session_id
+    artifacts_dir = workspace_root / ARTIFACT_SUBDIR / session_id
     if not artifacts_dir.is_dir():
         return 0, 0, []
 
@@ -143,7 +144,7 @@ def _list_session_artifacts(
 
 def inspect_session(
     session_id: str,
-    store: SessionStore | None = None,
+    store: SessionStoreProtocol,
     workspace_root: Path | None = None,
     max_conversation_turns: int = DEFAULT_MAX_CONVERSATION_TURNS,
 ) -> SessionDetails | None:
@@ -151,8 +152,7 @@ def inspect_session(
 
     Returns None if the session does not exist or cannot be read.
     """
-    effective_store = store if store is not None else SessionStore()
-    state = effective_store.load(session_id)
+    state = store.load(session_id)
     if state is None:
         return None
 
@@ -215,16 +215,15 @@ def inspect_session(
 
 
 def list_session_summaries(
-    store: SessionStore | None = None,
+    store: SessionStoreProtocol,
     max_conversation_turns: int = DEFAULT_MAX_CONVERSATION_TURNS,
     limit: int = 50,
 ) -> list[SessionSummary]:
     """Enumerate and summarize persisted sessions, sorted by updated_at descending."""
-    effective_store = store if store is not None else SessionStore()
     summaries: list[SessionSummary] = []
 
-    for sid in effective_store.list_session_ids():
-        state = effective_store.load(sid)
+    for sid in store.list_session_ids():
+        state = store.load(sid)
         if state is None:
             continue
         has_compaction = any(m.compaction_ledger for m in state.messages)
@@ -256,7 +255,7 @@ def list_session_summaries(
 
 def check_session_health(
     session_id: str,
-    store: SessionStore | None = None,
+    store: SessionStoreProtocol,
     workspace_root: Path | None = None,
     max_conversation_turns: int = DEFAULT_MAX_CONVERSATION_TURNS,
 ) -> SessionHealthReport:
@@ -271,7 +270,8 @@ def check_session_health(
        - Missing tool_call_id on TOOL messages.
        - Unresolved tool calls (assistant calls tools but conversation proceeds without results).
        - Empty messages (no content and no tool calls).
-    5. Offloaded tool output artifact integrity (referenced file exists on disk).
+    5. Offloaded tool output artifact integrity (referenced file exists on disk), for
+       the legacy `saved to '...'` form and for stored results named by a `tr_` handle.
     """
     issues: list[SessionHealthIssue] = []
 
@@ -296,15 +296,17 @@ def check_session_health(
         )
 
     # 2. Existence check
-    effective_store = store if store is not None else SessionStore()
-    state = effective_store.load(session_id)
+    state = store.load(session_id)
     if state is None:
+        # `storage_dir` is the file store's, not the protocol's: a store with no directory
+        # is reported by its type rather than by a path it does not have.
+        storage_dir = getattr(store, "storage_dir", type(store).__name__)
         issues.append(
             SessionHealthIssue(
                 severity="error",
                 code="SESSION_NOT_FOUND",
-                message=f"Session '{session_id}' not found in store at '{effective_store.storage_dir}'.",
-                details={"session_id": session_id, "storage_dir": str(effective_store.storage_dir)},
+                message=f"Session '{session_id}' not found in store at '{storage_dir}'.",
+                details={"session_id": session_id, "storage_dir": str(storage_dir)},
             )
         )
         return SessionHealthReport(
@@ -431,6 +433,25 @@ def check_session_health(
                             details={"artifact_path": rel_path},
                         )
                     )
+
+        # 5b. A stored tool result (#1422): an excerpt, page or compaction stub names a
+        # `tr_` handle, whose blob lives in the session's own artifact directory (#1653).
+        handle = handle_in(msg.content) if msg.role == MessageRole.TOOL else None
+        if handle is not None and workspace_root is not None:
+            rel_blob = f"{ARTIFACT_SUBDIR}/{session_id}/{handle}.txt"
+            if not (workspace_root / rel_blob).is_file():
+                issues.append(
+                    SessionHealthIssue(
+                        severity="warning",
+                        code="MISSING_OFFLOAD_ARTIFACT",
+                        message=(
+                            f"Turn #{idx} names stored tool result '{handle}', but its file "
+                            f"'{rel_blob}' does not exist on disk."
+                        ),
+                        turn_index=idx,
+                        details={"artifact_path": rel_blob, "handle": handle},
+                    )
+                )
 
     if pending_tool_calls:
         issues.append(

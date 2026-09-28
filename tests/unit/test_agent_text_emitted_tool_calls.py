@@ -117,7 +117,8 @@ async def test_a_tool_call_written_into_content_is_counted(tmp_path: Path) -> No
     tool calls, a completed turn, and a string that grades. That indistinguishability is
     what let a hundred discarded invocations reach a published capability figure.
 
-    Killed by: src/uclone_x/agent/base.py :: detect_text_emitted_tool_calls(resp_content, shown_tool_names)
+    Killed by: src/uclone_x/agent/turn_executor.py :: detect_text_emitted_tool_calls(resp_content, shown_tool_names)
+    Becomes: detect_text_emitted_tool_calls("", shown_tool_names)
     """
     agent, _, _llm = _agent(tmp_path, _answer(QWEN_CONTENT))
 
@@ -142,7 +143,8 @@ async def test_content_alongside_a_real_call_is_not_counted(tmp_path: Path) -> N
     metric fire on working runs -- a field that asserts work was discarded, on a turn where
     the tools ran.
 
-    Killed by: src/uclone_x/agent/base.py :: if not tool_calls:
+    Killed by: src/uclone_x/agent/turn_executor.py :: if not tool_calls:
+    Becomes: if True:
     """
     agent, tool, llm = _agent(
         tmp_path,
@@ -269,7 +271,7 @@ async def test_the_discarded_call_is_not_executed(tmp_path: Path) -> None:
     `test_a_tool_call_written_into_content_is_counted`, and a marker that cannot fail alone
     is not evidence about this test.)
 
-    Killed by: src/uclone_x/agent/base.py :: resp_content = resp.content or ""
+    Killed by: src/uclone_x/agent/turn_executor.py :: resp_content = resp.content or ""
     Becomes: resp_content = (resp.content or "") + " "
     """
     agent, tool, _ = _agent(tmp_path, _answer(QWEN_CONTENT))
@@ -300,11 +302,12 @@ async def test_the_runtime_warns_and_names_the_remedy(
     advice is deleted from the message -- a warning that says only "this happened" is the
     version this test exists to prevent. The condition itself is pinned by the test below.
 
-    Killed by: src/uclone_x/agent/base.py :: (qwen3:8b, qwen2.5:7b-instruct are verified)
+    Killed by: src/uclone_x/agent/turn_executor.py :: (qwen3:8b, qwen2.5:7b-instruct are verified)
+    Becomes: (no model is verified)
     """
     agent, _, _llm = _agent(tmp_path, _answer(QWEN_CONTENT))
 
-    with caplog.at_level("WARNING", logger="uclone_x.agent.base"):
+    with caplog.at_level("WARNING", logger="uclone_x.agent.turn_executor"):
         await agent.execute_turn("Read pyproject.toml.")
 
     warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
@@ -323,7 +326,8 @@ async def test_a_turn_whose_tools_ran_does_not_warn(
     non-empty and the work happened anyway. Warning here would fire on healthy turns, which
     is how the warning above stops reaching the people it was written for.
 
-    Killed by: src/uclone_x/agent/base.py :: if text_emitted and not tool_executions:
+    Killed by: src/uclone_x/agent/turn_executor.py :: if text_emitted and not tool_executions:
+    Becomes: if text_emitted:
     """
     agent, tool, llm = _agent(
         tmp_path,
@@ -335,7 +339,7 @@ async def test_a_turn_whose_tools_ran_does_not_warn(
     # Step 1 invokes properly; step 2 answers with the blob and no structured call.
     llm.generate.side_effect = [llm.generate.return_value, _answer(QWEN_CONTENT)]
 
-    with caplog.at_level("WARNING", logger="uclone_x.agent.base"):
+    with caplog.at_level("WARNING", logger="uclone_x.agent.turn_executor"):
         turn = await agent.execute_turn("Read pyproject.toml.")
 
     assert tool.runs == 1

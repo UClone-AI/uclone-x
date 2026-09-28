@@ -2,15 +2,24 @@
 
 # ⚡ UClone-X
 
-**Event-driven AI agent core and multi-agent collaboration framework**
+**AI clones that run on your own machine — chat with them one-to-one or in a group,
+and let them remember, read your files, search and draw.**
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Python](https://img.shields.io/badge/Python-3.11+-blue.svg)](https://www.python.org/)
-[![LLM Agnostic](https://img.shields.io/badge/LLM-Gemini_|_Claude_|_OpenAI_|_Local-orange.svg)](docs/llm-agnostic-interface.md)
+[![LLM Agnostic](https://img.shields.io/badge/LLM-Gemini_|_Claude_|_OpenAI_|_Local-orange.svg)](https://github.com/UClone-AI/uclone-x/blob/main/docs/llm-agnostic-interface.md)
 
 </div>
 
 ---
+
+UClone-X is a local AI workspace. You install it, open the dashboard in your
+browser, and talk to *clones* — agents with their own instructions, memory and
+tools. A local model through Ollama works with no account and no API key; a
+Gemini, Claude or OpenAI key works too.
+
+Underneath is an event-driven agent runtime you can also use on its own: see
+[For developers](#for-developers).
 
 ## What it looks like
 
@@ -91,53 +100,83 @@ pip install "uclone-x[all]"
 
 Every extra resolves on Python 3.11, 3.12 and 3.13.
 
-### From a terminal
+### Models
 
-`ucx run` is an interactive terminal REPL with streaming responses, tool calls
-and slash commands. It reads its model from the environment — an API key such as
-`OPENAI_API_KEY`, or a local Ollama:
+`ucx install` downloads the local language model and the image checkpoint and
+checks that each one actually works; it reports a partial setup as incomplete
+rather than as success. You can also do this later from the dashboard.
 
-```bash
-OLLAMA_FAST_BASE_URL=http://localhost:11434/v1 OLLAMA_FAST_MODEL=qwen3:8b ucx run
-```
+As a rough guide to what fits, from the installer's own advice:
 
-`ucx llm status` reports which models are reachable.
+| Memory | Local model | Image generation |
+| :--- | :--- | :--- |
+| under 8 GB | use a cloud model (API key) | no |
+| 8–16 GB | `qwen3:1.7b`, or a cloud model | no |
+| 16–24 GB | `qwen3:8b` | 512 px |
+| 24 GB and up | `qwen3:8b` | 768 px |
 
-## What UClone-X is
+## Connecting a model
 
-An agent runtime built around a non-blocking reactive event loop rather than a
-blocking request/response cycle. Agents yield when idle and wake on tool
-returns, interrupts or messages from other agents. The same event bus carries
-single-agent execution and multi-agent collaboration on one machine, without an
-external broker.
+Pick **one** of these:
 
-* **Event-driven agent core** — a six-stage reactive state machine over an
-  in-memory priority event bus with backpressure policies and immutable event
-  envelopes.
-* **LLM-agnostic** — Gemini, Claude, OpenAI and local models (Ollama, vLLM)
-  behind one interface, with schema translation and fallback routing.
-* **Dynamic personas and sub-agents** — agents create, supervise and terminate
-  child agents with their own prompts and strict tool boundaries.
-* **Pluggable sandboxing** — host, workspace, container or WASM isolation
-  selected per tool rather than globally.
-* **Ontology grounding** — LinkML domain schemas and a semantic graph the agent
-  reasons against instead of inventing structure per prompt.
-* **OpenTelemetry native** — traces, metrics and OTLP export built in.
+* **Local, no key.** Install [Ollama](https://ollama.com). `ucx start` finds it
+  and offers a model that fits; models can also be added and removed from
+  Settings, or with `ucx llm pull` and `ucx llm rm`.
+* **In the dashboard.** Open Settings, choose Gemini, Anthropic, OpenAI, vLLM or
+  Ollama, and enter the key or server address there. It is remembered for the
+  next start, in `~/.uclone/sessions/settings.json` as plain text — treat that
+  file like the key itself.
+* **From the environment.** `ucx` reads provider settings from environment
+  variables, which take precedence over what Settings saved:
 
-## Implementation status
+  ```bash
+  export ANTHROPIC_API_KEY=...        # or GEMINI_API_KEY, OPENAI_API_KEY
+  ucx start
+  ```
 
-UClone-X is pre-1.0 and under active development. Read this section before
-depending on it.
+  `ucx` does **not** read a `.env` file by itself. The repository's
+  `.env.example` lists every variable it understands; if you keep yours in a
+  `.env`, load it into the shell first (`set -a; . ./.env; set +a`).
 
-| Area | State |
-| :--- | :--- |
-| Event bus, agent state machine, sessions | Implemented |
-| Tool runtime, MCP client, built-in tools | Implemented |
-| LLM connectors (Gemini, Claude, OpenAI, Ollama, vLLM) | Implemented |
-| Sandbox isolation modes | Implemented (host and workspace); container and WASM partial |
-| Ontology engine, skills, code intelligence | Implemented, evolving |
-| Developer dashboard | Implemented |
-| A2A protocol | **Specified, not implemented.** No conformance is claimed |
+`ucx llm status` shows which providers it can reach.
+
+## What you can do
+
+* **Clones.** Six ship built in — clone (the default), writer, artist,
+  guardian, pioneer and scout. Create your own, or edit one, from Settings; the
+  connected model can draft its instructions for you. Each clone is a YAML file
+  in your workspace.
+* **Conversations.** One-to-one chats and group chats with several clones,
+  listed most recent first, with pinning, rename and delete. Replies stream as
+  they are written, including each tool call; messages render Markdown and math.
+  Group conversations can also be driven from the terminal with `ucx room`.
+* **Memory.** Every clone can record, look up and retract facts, and remembers
+  them across conversations. The dock's Remembers tab lists what each clone
+  saved.
+* **Files and images.** Clones read files in your workspace and in folders you
+  mark read-only, write only inside the workspace, and generate images in-process
+  (or through ComfyUI when one is running). What each turn produced appears in
+  the dock beside the conversation.
+* **Tools from elsewhere.** Connect MCP servers from Settings — a remote one by
+  URL, a local one by command, or by pasting a vendor's `mcpServers` snippet.
+* **The terminal.** `ucx run` is the same agent as an interactive REPL, with
+  streaming, tool calls and slash commands; `ucx run --prompt "…"` answers once.
+* **Your editor.** `ucx acp serve` lets an editor that speaks the Agent Client
+  Protocol talk to a clone.
+
+`ucx --help` lists every command.
+
+## Where your data lives
+
+UClone-X has no server of its own and no account. Conversations and dashboard
+settings are kept under `~/.uclone/sessions/` (`UCLONE_SESSION_DIR` moves them),
+each clone's memory under `~/.uclone/agents/` (`UCLONE_AGENTS_DIR`), and clone
+definitions are YAML files in the workspace folder.
+
+What leaves the machine is what you connect it to: your messages go to the model
+provider you chose, a web search goes to the search service, and an MCP server
+you add receives what its tools are called with. With a local model and no
+remote tools, nothing leaves at all.
 
 ## Something went wrong?
 
@@ -168,26 +207,83 @@ sent, and why the text is the last word on what leaves your machine.
 Turn it off with `ucx report --disable` and delete what was recorded with
 `ucx report --clear`.
 
-## Documentation
+Common first-run problems:
 
-* [Architecture overview](docs/architecture-overview.md)
-* [Event-driven agent core](docs/event-driven-agent-core.md)
-* [Core principles P0–P9](docs/principles/core-principles.md) — the normative
+* **"No active LLM provider connected."** No model is reachable. Start Ollama
+  (`ollama serve`), or set a key in Settings or the environment — see
+  [Connecting a model](#connecting-a-model). `ucx llm status` says which
+  providers answered.
+* **A key in `.env` is ignored.** `ucx` reads the environment, not `.env`; load
+  the file into your shell first.
+* **`ucx: command not found` after the installer.** It is not on your PATH yet;
+  add the `export PATH=…` line the installer printed to `~/.zshrc` (or
+  `~/.bashrc`), or run it as `~/.local/bin/ucx` until then — see [Install](#install).
+
+## For developers
+
+### The runtime
+
+An agent runtime built around a non-blocking reactive event loop rather than a
+blocking request/response cycle. Agents yield when idle and wake on tool
+returns, interrupts or messages from other agents. The same event bus carries
+single-agent execution and multi-agent collaboration on one machine, without an
+external broker.
+
+* **Event-driven agent core** — a six-stage reactive state machine over an
+  in-memory priority event bus with backpressure policies and immutable event
+  envelopes.
+* **LLM-agnostic** — Gemini, Claude, OpenAI and local models (Ollama, vLLM)
+  behind one interface, with schema translation and fallback routing.
+* **Dynamic personas and sub-agents** — agents create, supervise and terminate
+  child agents with their own prompts and strict tool boundaries.
+* **Pluggable sandboxing** — host, workspace, container or WASM isolation
+  selected per tool rather than globally.
+* **Ontology grounding** — LinkML domain schemas and a semantic graph the agent
+  reasons against instead of inventing structure per prompt.
+* **OpenTelemetry native** — traces, metrics and OTLP export built in.
+
+### Implementation status
+
+UClone-X is pre-1.0 and under active development. Read this section before
+depending on it.
+
+| Area | State |
+| :--- | :--- |
+| Event bus, agent state machine, sessions | Implemented |
+| Tool runtime, MCP client, built-in tools | Implemented |
+| LLM connectors (Gemini, Claude, OpenAI, Ollama, vLLM) | Implemented |
+| Dashboard: conversations, clones, memory, settings | Implemented |
+| Local image generation | Implemented |
+| Sandbox isolation modes | Implemented (host and workspace); container and WASM partial |
+| Ontology engine, skills, code intelligence | Implemented, evolving |
+| A2A protocol | **Specified, not implemented.** No conformance is claimed |
+
+### Documentation
+
+The documents below are the design and specification of the runtime; they are
+written for contributors rather than as a user manual.
+
+* [Documentation index](https://github.com/UClone-AI/uclone-x/blob/main/docs/README.md)
+* [Module structure](https://github.com/UClone-AI/uclone-x/blob/main/docs/module-structure.md) — the packages as built, their layers
+  and dependency edges
+* [Architecture overview](https://github.com/UClone-AI/uclone-x/blob/main/docs/architecture-overview.md)
+* [Event-driven agent core](https://github.com/UClone-AI/uclone-x/blob/main/docs/event-driven-agent-core.md)
+* [Core principles P0–P9](https://github.com/UClone-AI/uclone-x/blob/main/docs/principles/core-principles.md) — the normative
   rules every part of the runtime is built against
-* [Product requirements](docs/PRD.md)
-* [CLI specification](docs/cli-specification.md)
-* [LLM-agnostic interface](docs/llm-agnostic-interface.md)
-* [Dynamic persona and sub-agent interface](docs/dynamic-persona-interface.md)
-* [Local collaboration engine](docs/local-collaboration-engine.md)
-* [Sandbox execution](docs/sandbox-execution-architecture.md)
-* [Ontology architecture](docs/agent-ontology-architecture.md)
-* [Skill system](docs/skill-system-architecture.md)
-* [Code intelligence (AST, LSP, SCIP)](docs/code-intelligence-lsp-scip.md)
-* [Telemetry](docs/telemetry-opentelemetry.md)
-* [A2A protocol specification](docs/a2a-protocol-spec.md)
-* [Security threat model](docs/security-threat-model.md)
+* [Product requirements](https://github.com/UClone-AI/uclone-x/blob/main/docs/PRD.md)
+* [CLI specification](https://github.com/UClone-AI/uclone-x/blob/main/docs/cli-specification.md)
+* [LLM-agnostic interface](https://github.com/UClone-AI/uclone-x/blob/main/docs/llm-agnostic-interface.md)
+* [Dynamic persona and sub-agent interface](https://github.com/UClone-AI/uclone-x/blob/main/docs/dynamic-persona-interface.md)
+* [Local collaboration engine](https://github.com/UClone-AI/uclone-x/blob/main/docs/local-collaboration-engine.md)
+* [Sandbox execution](https://github.com/UClone-AI/uclone-x/blob/main/docs/sandbox-execution-architecture.md)
+* [Ontology architecture](https://github.com/UClone-AI/uclone-x/blob/main/docs/agent-ontology-architecture.md)
+* [Skill system](https://github.com/UClone-AI/uclone-x/blob/main/docs/skill-system-architecture.md)
+* [Code intelligence (AST, LSP, SCIP)](https://github.com/UClone-AI/uclone-x/blob/main/docs/code-intelligence-lsp-scip.md)
+* [Telemetry](https://github.com/UClone-AI/uclone-x/blob/main/docs/telemetry-opentelemetry.md)
+* [A2A protocol specification](https://github.com/UClone-AI/uclone-x/blob/main/docs/a2a-protocol-spec.md)
+* [Security threat model](https://github.com/UClone-AI/uclone-x/blob/main/docs/security-threat-model.md)
 
-## Development
+### Working on UClone-X
 
 An installed build is for *using* the agent. To change it, work from a checkout:
 the development commands — `setup`, `test`, `dev` — exist only there, because
@@ -206,19 +302,19 @@ npm ci --prefix frontend   # the gate runs the frontend's vitest suite
 strict mode, the test suite at or above 70% branch coverage, and a passing
 frontend vitest suite. A change that does not pass it is not ready.
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for how patches reach this repository,
-and [docs/local-development-guide.md](docs/local-development-guide.md) for the
+See [CONTRIBUTING.md](https://github.com/UClone-AI/uclone-x/blob/main/CONTRIBUTING.md) for how patches reach this repository,
+and the [local development guide](https://github.com/UClone-AI/uclone-x/blob/main/docs/local-development-guide.md) for the
 longer setup walkthrough.
 
 ## About this repository
 
-This repository is the UClone-X runtime and its documentation. It is published
-from a private development repository, in periodic snapshots rather than as a
-mirror of that repository's history. The evaluation suites and multi-agent
-build tooling used to develop it are not part of the published subset; the
-runtime detects their absence and degrades cleanly, so `ucx eval` reports that
-no evaluation backend is installed rather than failing to start.
+This repository is the UClone-X runtime, its dashboard and its documentation. It
+is published from a private development repository, in periodic snapshots rather
+than as a mirror of that repository's history. The evaluation suites and
+multi-agent build tooling used to develop it are not part of the published
+subset; the runtime detects their absence and degrades cleanly, so `ucx eval`
+reports that no evaluation backend is installed rather than failing to start.
 
 ## License
 
-Apache 2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE).
+Apache 2.0 — see [LICENSE](https://github.com/UClone-AI/uclone-x/blob/main/LICENSE) and [NOTICE](https://github.com/UClone-AI/uclone-x/blob/main/NOTICE).

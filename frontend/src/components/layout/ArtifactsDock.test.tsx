@@ -545,7 +545,7 @@ const twoSeats = (roomId: string): RoomState => ({
   turn_state: { agent_turns_since_human: 0 },
   policy: {
     max_agent_turns_per_human_message: 4,
-    max_span_messages: 8,
+    max_span_tokens: 8000,
     transcript_window: 40,
     hesitation_seconds: 0,
     default_responder_id: 'scout',

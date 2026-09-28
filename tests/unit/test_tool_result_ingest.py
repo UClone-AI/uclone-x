@@ -298,7 +298,7 @@ async def test_the_reader_tool_reads_within_its_own_session(tmp_path: Path) -> N
 
 @pytest.mark.asyncio
 async def test_the_agent_keeps_a_dict_result_as_canonical_json(tmp_path: Path) -> None:
-    """Killed by: src/uclone_x/agent/base.py :: content = canonical_tool_text(res.output) if res.success
+    """Killed by: src/uclone_x/agent/tool_execution.py :: content = canonical_tool_text(res.output) if res.success
     Becomes: content = str(res.output) if res.success
     """
     llm = _ScriptedLLM([[ToolCallRequest(id="c1", name="facts", arguments={})]])
@@ -316,7 +316,7 @@ async def test_an_over_cap_result_reaches_history_as_an_excerpt_and_reads_back(
 ) -> None:
     """The model reads the stored body with the reader; nothing earlier is rewritten.
 
-    Killed by: src/uclone_x/agent/base.py :: self._ingest_tool_message(m, readable=reader_offered)
+    Killed by: src/uclone_x/agent/turn_executor.py :: self._ingest_tool_message(m, readable=reader_offered)
     Becomes: m
     """
     body = _big_text()
@@ -344,7 +344,7 @@ async def test_an_over_cap_result_reaches_history_as_an_excerpt_and_reads_back(
 
 @pytest.mark.asyncio
 async def test_an_agent_without_the_reader_is_not_told_to_call_it(tmp_path: Path) -> None:
-    """Killed by: src/uclone_x/agent/base.py :: reader_offered = any(d.name == TOOL_RESULT_READ_TOOL for d in tool_defs)
+    """Killed by: src/uclone_x/agent/turn_executor.py :: reader_offered = any(d.name == TOOL_RESULT_READ_TOOL for d in tool_defs)
     Becomes: reader_offered = True
     """
     llm = _ScriptedLLM([[ToolCallRequest(id="c1", name="dump", arguments={})]])
@@ -428,7 +428,7 @@ async def test_a_mid_turn_overflow_compacts_before_the_next_step(tmp_path: Path)
     The pass prunes what the model has already read -- the earlier step's result -- and
     leaves the step that just ran alone: the model has not seen it yet (#1422 review B1).
 
-    Killed by: src/uclone_x/agent/base.py :: if await self._auto_compact_if_needed(
+    Killed by: src/uclone_x/agent/turn_executor.py :: if await self._auto_compact_if_needed(
     Becomes: if False and await self._auto_compact_if_needed(
     """
     older = "o" * 2_000
@@ -478,7 +478,7 @@ async def test_a_freshly_read_file_survives_mid_turn_compaction_on_an_8k_window(
     Every later request must carry the read it follows exactly as ingested; before the
     fix each carried a 410-character offload line and the model re-read forever.
 
-    Killed by: src/uclone_x/agent/base.py :: hold_unseen_step=True,
+    Killed by: src/uclone_x/agent/turn_executor.py :: hold_unseen_step=True,
     Becomes: hold_unseen_step=False,
     """
     from uclone_x.tools.registry import create_default_registry
@@ -532,7 +532,7 @@ async def test_a_mid_turn_compaction_is_rebuilt_from_the_request_record(tmp_path
     comparing prefixes. A pass between steps rewrites an earlier result, so the delta must
     start there, and the rebuilt request must equal the one sent.
 
-    Killed by: src/uclone_x/agent/base.py :: if before != now:
+    Killed by: src/uclone_x/agent/prompt_assembler.py :: if before != now:
     Becomes: if False:
     """
     from uclone_x.agent.models import AgentContext, AgentState
@@ -597,7 +597,7 @@ async def test_a_mid_turn_compaction_is_rebuilt_from_the_request_record(tmp_path
 
 @pytest.mark.asyncio
 async def test_the_turn_start_check_counts_the_tool_schemas(tmp_path: Path) -> None:
-    """Killed by: src/uclone_x/agent/base.py :: await self._auto_compact_if_needed(tool_defs, turn_extra_sections)
+    """Killed by: src/uclone_x/agent/turn_executor.py :: await self._auto_compact_if_needed(tool_defs, turn_extra_sections)
     Becomes: await self._auto_compact_if_needed((), turn_extra_sections)
     """
     wide = LocalTool(
@@ -732,8 +732,8 @@ async def test_compaction_shrinks_a_stored_excerpt_to_a_stub(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
-async def test_without_the_reader_compaction_does_not_stub(tmp_path: Path) -> None:
-    """The short form names `tool_result_read`, so it is not used when that is not offered.
+async def test_without_the_reader_compaction_does_not_name_it(tmp_path: Path) -> None:
+    """The stub names `tool_result_read` only when that is offered; otherwise it says so.
 
     Killed by: src/uclone_x/llm/compactor.py :: self.tool_result_reader = tool_result_reader
     Becomes: self.tool_result_reader = True
@@ -752,6 +752,7 @@ async def test_without_the_reader_compaction_does_not_stub(tmp_path: Path) -> No
     tool_msg = _tool_messages(outcome.messages)[0]
     assert tool_msg.content is not None
     assert "tool_result_read" not in tool_msg.content
+    assert "no tool to read it" in tool_msg.content
     assert len(tool_msg.content) < len(excerpt)
 
 
@@ -759,8 +760,8 @@ async def test_without_the_reader_compaction_does_not_stub(tmp_path: Path) -> No
 async def test_an_agent_without_the_reader_is_not_told_to_call_it_after_compaction(
     tmp_path: Path,
 ) -> None:
-    """Killed by: src/uclone_x/agent/base.py :: self._tools is not None and self._tools.get(TOOL_RESULT_READ_TOOL) is not None
-    Becomes: True
+    """Killed by: src/uclone_x/agent/compaction_driver.py :: reader_offered = any(
+    Becomes: reader_offered = True or any(
     """
     llm = _ScriptedLLM([[ToolCallRequest(id="c1", name="dump", arguments={})]])
     agent = _agent(tmp_path, llm, [_returning("dump", _big_text())])
@@ -769,6 +770,29 @@ async def test_an_agent_without_the_reader_is_not_told_to_call_it_after_compacti
 
     for message in agent.history:
         assert "tool_result_read" not in (message.content or "")
+
+
+def test_ingest_keeps_an_excerpt_when_the_session_directory_links_outside(
+    tmp_path: Path,
+) -> None:
+    """A symlinked session directory is refused, and the turn keeps an excerpt (P3).
+
+    Nothing is written outside the store. The refusal is logged like any other failed
+    write, so the tool's result still reaches the history as an excerpt with no handle.
+
+    Killed by: src/uclone_x/core/tool_results.py :: except (OSError, ValueError, PathTraversalError) as exc:
+    Becomes: except (OSError, ValueError) as exc:
+    """
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    artifacts = artifacts_dir_for(tmp_path / "ws")
+    artifacts.mkdir(parents=True)
+    (artifacts / "s1").symlink_to(outside, target_is_directory=True)
+
+    excerpt = ingest_tool_text(_big_text(), artifacts_dir=artifacts, session_id="s1")
+
+    assert handle_in(excerpt) is None
+    assert list(outside.iterdir()) == []
 
 
 def test_text_that_only_looks_like_a_stored_result_is_not_stubbed(tmp_path: Path) -> None:
@@ -785,7 +809,7 @@ def test_text_that_only_looks_like_a_stored_result_is_not_stubbed(tmp_path: Path
 async def test_resetting_or_deleting_a_session_removes_its_stored_results(
     tmp_path: Path,
 ) -> None:
-    """Killed by: src/uclone_x/agent/base.py :: cleanup_session_artifacts(artifacts_dir_for(ws_root), sid)
+    """Killed by: src/uclone_x/agent/session_lifecycle.py :: cleanup_session_artifacts(artifacts_dir_for(ws_root), sid)
     Becomes: None
     """
     for action in ("reset", "delete"):
@@ -884,7 +908,7 @@ async def test_a_step_over_the_window_reaches_the_next_request_as_readable_excer
     The next request stays within the window, and every result is in it as an excerpt
     whose handle reads back the whole file.
 
-    Killed by: src/uclone_x/agent/base.py :: step_refusal = self._fit_step_to_window(
+    Killed by: src/uclone_x/agent/turn_executor.py :: step_refusal = self._fit_step_to_window(
     Becomes: step_refusal = None and self._fit_step_to_window(
     """
     from uclone_x.llm.compactor import estimate_request_tokens
@@ -929,7 +953,7 @@ async def test_a_step_that_cannot_fit_even_as_excerpts_is_refused_in_plain_words
     The step is refused; the over-window request is never sent, and the refusal says so
     without a path, a handle, a class name or any other internal.
 
-    Killed by: src/uclone_x/agent/base.py :: error=step_refusal,
+    Killed by: src/uclone_x/agent/turn_executor.py :: error=step_refusal,
     Becomes: error=repr(step_results[0]),
     """
     names = [f"f{i:02d}.txt" for i in range(40)]
@@ -959,7 +983,7 @@ async def test_a_step_that_cannot_fit_even_as_excerpts_is_refused_in_plain_words
 async def test_a_refused_step_sends_nothing_over_the_window(tmp_path: Path) -> None:
     """With the refusal gone, the same step goes out over the window.
 
-    Killed by: src/uclone_x/agent/base.py :: if step_refusal is not None:
+    Killed by: src/uclone_x/agent/turn_executor.py :: if step_refusal is not None:
     Becomes: if False:
     """
     from uclone_x.llm.compactor import estimate_request_tokens
@@ -1008,7 +1032,7 @@ async def test_the_turns_after_a_refused_step_stay_within_the_window(
     turn is told, in its turn context, which calls ran. Every request sent, on every
     turn, stays within the window, and the turns after the refusal answer.
 
-    Killed by: src/uclone_x/agent/base.py :: del history[start:]
+    Killed by: src/uclone_x/agent/turn_executor.py :: del history[start:]
     Becomes: del history[len(history):]
     """
     from uclone_x.llm.compactor import estimate_request_tokens
@@ -1121,7 +1145,7 @@ async def test_a_step_of_many_one_byte_results_is_fitted_not_refused(tmp_path: P
     The window is set from the step's own size, measured on an agent with no window, so
     the step is over it by a fixed amount whatever the fixed part weighs.
 
-    Killed by: src/uclone_x/agent/base.py :: budget = window - reserve - rest - len(tail) - 2
+    Killed by: src/uclone_x/agent/turn_executor.py :: budget = window - reserve - rest - len(tail) - 2
     Becomes: budget = window - reserve - rest
     """
     from uclone_x.llm.compactor import estimate_request_tokens
@@ -1171,16 +1195,16 @@ async def test_a_step_still_over_the_window_after_cutting_is_refused_not_sent(
 
     The shares are replaced with ones that cut nothing, the fault the check exists for.
 
-    Killed by: src/uclone_x/agent/base.py :: if fitted + reserve > window:
+    Killed by: src/uclone_x/agent/turn_executor.py :: if fitted + reserve > window:
     Becomes: if False:
     """
-    import uclone_x.agent.base as base_module
+    import uclone_x.agent.turn_executor as turn_executor_module
     from uclone_x.llm.compactor import estimate_request_tokens
 
     def cut_nothing(sizes: Sequence[int], budget_bytes: int, **_: Any) -> list[int]:
         return list(sizes)
 
-    monkeypatch.setattr(base_module, "step_result_caps", cut_nothing)
+    monkeypatch.setattr(turn_executor_module, "step_result_caps", cut_nothing)
     llm = _ScriptedLLM([_near_cap_reads(tmp_path)])
     agent = _budget_agent(tmp_path, llm)
     result = await agent.execute_turn("read all five")
@@ -1201,7 +1225,7 @@ async def test_a_step_refused_for_a_full_conversation_does_not_blame_the_tools(
 
     The window is set just above the first request, measured on an agent with no window.
 
-    Killed by: src/uclone_x/agent/base.py :: if outside + reserve >= window:
+    Killed by: src/uclone_x/agent/turn_executor.py :: if outside + reserve >= window:
     Becomes: if False:
     """
     from uclone_x.llm.compactor import estimate_request_tokens
@@ -1233,3 +1257,164 @@ async def test_a_step_refused_for_a_full_conversation_does_not_blame_the_tools(
     assert result.error == STEP_NO_ROOM_MESSAGE
     for internal in ("/", "\\", "tr_", "Error", "Traceback", "token", str(tmp_path), "{"):
         assert internal not in STEP_NO_ROOM_MESSAGE
+
+
+# ======================================================================================
+# Store hardening (#1653)
+# ======================================================================================
+
+
+def test_a_symlink_at_the_old_temporary_name_is_not_written_through(tmp_path: Path) -> None:
+    """The temporary file is created exclusively at an unpredictable name, never followed.
+
+    Before #1653 the writer used `.<handle>.txt.<pid>.tmp` and `write_text`, so a symlink
+    planted at that name sent the stored body outside the store.
+
+    Killed by: src/uclone_x/core/tool_results.py :: fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    Becomes: fd, tmp_name = os.open(path.parent / f".{path.name}.{os.getpid()}.tmp", os.O_WRONLY | os.O_CREAT), str(path.parent / f".{path.name}.{os.getpid()}.tmp")
+    """
+    import os
+
+    artifacts = tmp_path / "store"
+    body = _big_text()
+    handle = result_handle(body)
+    session_dir = artifacts / "s1"
+    session_dir.mkdir(parents=True)
+    victim = tmp_path / "victim.txt"
+    victim.write_text("untouched", encoding="utf-8")
+    (session_dir / f".{handle}.txt.{os.getpid()}.tmp").symlink_to(victim)
+
+    excerpt = ingest_tool_text(body, artifacts_dir=artifacts, session_id="s1")
+
+    assert victim.read_text(encoding="utf-8") == "untouched"
+    assert handle_in(excerpt) == handle
+    assert load_tool_result(artifacts, "s1", handle) == body
+
+
+def test_a_blob_symlinked_out_of_the_store_is_not_read(tmp_path: Path) -> None:
+    """A planted blob symlink reads as absent, in plain words, not as the file it names.
+
+    Killed by: src/uclone_x/core/tool_results.py :: path = PathValidator().resolve_safe_path(blob, artifacts_dir)
+    Becomes: path = blob
+    """
+    outside = tmp_path / "private.txt"
+    outside.write_text("private text", encoding="utf-8")
+    artifacts = tmp_path / "store"
+    (artifacts / "s1").mkdir(parents=True)
+    handle = "tr_0123456789abcdef"
+    (artifacts / "s1" / f"{handle}.txt").symlink_to(outside)
+
+    with pytest.raises(StoredResultNotFoundError) as info:
+        load_tool_result(artifacts, "s1", handle)
+    assert "No stored tool result named" in str(info.value)
+    assert str(tmp_path) not in str(info.value)
+
+
+def test_ingest_refuses_an_artifact_directory_outside_the_workspace(tmp_path: Path) -> None:
+    """Killed by: src/uclone_x/core/tool_results.py :: artifacts_dir = PathValidator().resolve_safe_path(artifacts_dir, workspace_root)
+    Becomes: pass
+    """
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (workspace / ".sandbox").symlink_to(outside, target_is_directory=True)
+
+    excerpt = ingest_tool_text(
+        _big_text(),
+        artifacts_dir=artifacts_dir_for(workspace),
+        session_id="s1",
+        workspace_root=workspace,
+    )
+
+    assert handle_in(excerpt) is None
+    assert list(outside.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_the_agent_stores_nothing_through_a_sandbox_linked_outside(tmp_path: Path) -> None:
+    """Killed by: src/uclone_x/agent/base.py :: workspace_root=workspace,
+    Becomes: workspace_root=None,
+    """
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (workspace / ".sandbox").symlink_to(outside, target_is_directory=True)
+    llm = _ScriptedLLM([[ToolCallRequest(id="c1", name="dump", arguments={})]])
+    agent = _agent(workspace, llm, [_returning("dump", _big_text())])
+
+    await agent.execute_turn("go")
+
+    assert not (outside / "tool_artifacts").exists()
+    tool_msg = _tool_messages(agent.history)[0]
+    assert "could not be kept" in (tool_msg.content or "")
+
+
+@pytest.mark.asyncio
+async def test_a_compactor_with_no_session_truncates_rather_than_storing(tmp_path: Path) -> None:
+    """With no session there is no directory the reader looks in, so nothing is stored.
+
+    Killed by: src/uclone_x/llm/compactor.py :: if self.workspace_root is not None and self.session_id is not None:
+    Becomes: if self.workspace_root is not None:
+    """
+    messages = [
+        ChatMessage(role=MessageRole.USER, content="go"),
+        ChatMessage(role=MessageRole.ASSISTANT, tool_calls=(ToolCallRequest(id="c1", name="t"),)),
+        ChatMessage(role=MessageRole.TOOL, content="r" * 5_000, tool_call_id="c1", name="t"),
+    ]
+    compactor = ContextCompactor(workspace_root=tmp_path, max_tool_output_chars=300)
+
+    outcome = await compactor.compact(messages)
+
+    tool_msg = _tool_messages(outcome.messages)[0]
+    assert (tool_msg.content or "").startswith("[Tool Output Truncated")
+    assert not artifacts_dir_for(tmp_path).exists()
+
+
+@pytest.mark.asyncio
+async def test_a_reader_outside_allowed_tools_is_not_named_after_compaction(
+    tmp_path: Path,
+) -> None:
+    """The registry has the reader, but the operator's list leaves it out: not offered.
+
+    Killed by: src/uclone_x/agent/compaction_driver.py :: t.name == TOOL_RESULT_READ_TOOL for t in self._tool_invoker.held_tools()
+    Becomes: t.name == TOOL_RESULT_READ_TOOL for t in (self._tools.list_tools() if self._tools is not None else [])
+    """
+    llm = _ScriptedLLM([[ToolCallRequest(id="c1", name="dump", arguments={})]])
+    agent = _agent(
+        tmp_path,
+        llm,
+        [_returning("dump", _big_text()), ToolResultReadTool()],
+        allowed_tools=("dump",),
+    )
+    await agent.execute_turn("go")
+    await agent.compact_session()
+
+    assert any("since the conversation was compacted" in (m.content or "") for m in agent.history)
+    for message in agent.history:
+        assert "tool_result_read" not in (message.content or "")
+
+
+@pytest.mark.asyncio
+async def test_the_reader_tool_refuses_a_store_linked_outside_the_workspace(
+    tmp_path: Path,
+) -> None:
+    """Killed by: src/uclone_x/tools/builtin/tool_results.py :: contained_artifacts_dir(context.require_workspace()),
+    Becomes: context.require_workspace() / ".sandbox" / "tool_artifacts",
+    """
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    body = _big_text()
+    handle = handle_in(
+        ingest_tool_text(body, artifacts_dir=outside / "tool_artifacts", session_id="s1")
+    )
+    (workspace / ".sandbox").symlink_to(outside, target_is_directory=True)
+    context = ToolContext(agent_id="a", session_id="s1", trace_id="t", workspace_root=workspace)
+
+    result = await ToolResultReadTool().execute({"handle": handle}, context)
+
+    assert result.success is False
+    assert body[:40] not in str(result.output)

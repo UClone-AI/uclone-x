@@ -4,7 +4,7 @@
 
 * **Core Law**: Every agent operates over a structured domain ontology that the agent actively self-constructs, expands through experience, and refines via developer guidance.
 * **Strict Rule**: 
-  - **Self-Evolution & User/Workspace Isolation**: Agents autonomously extract, structure, and accumulate domain entities, relations, state rules, and proven problem-solving patterns into scoped ontologies isolated per user and per workspace. Cross-workspace contamination is strictly prevented.
+  - **Self-Evolution & Per-Clone Isolation**: Agents autonomously extract, structure, and accumulate domain entities, relations, state rules, and proven problem-solving patterns into an ontology owned by one clone (one agent identity), not partitioned by conversation or workspace. No clone reads, writes, or merges another clone's ontology.
   - **Automated Curation & Filtering**: Ingested knowledge must pass a multi-stage curation pipeline:
     1. *Durable Knowledge Gate*: Filters out ephemeral conversation noise and transient outputs, capturing only reusable domain rules.
     2. *Semantic Deduplication & Conflict Resolution*: Merges semantically equivalent assertions and supersedes contradicted historical knowledge.

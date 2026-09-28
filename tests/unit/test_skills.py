@@ -11,6 +11,7 @@ from pydantic import ValidationError
 
 from uclone_x.errors import SkillAuditError, SkillNotApprovedError
 from uclone_x.sandbox.models import IsolationLevel
+from uclone_x.skills.approvals import SkillApprovalLedger, SkillPin
 from uclone_x.skills.auditor import (
     Skill,
     SkillAuditor,
@@ -833,6 +834,9 @@ def _skill_with_locked_folder(skills_dir: Path, status: SkillStatus) -> Path:
     data = skill_dir / "resources" / "story" / "muse" / "western.yaml"
     data.parent.mkdir(parents=True)
     data.write_text("genre: western\n", encoding="utf-8")
+    if status is SkillStatus.ACTIVE:
+        digest = compute_skill_sha256(skill_dir)
+        SkillApprovalLedger().pin("locked_skill", SkillPin(digest, "developer:human", "t0"))
     return skill_dir
 
 

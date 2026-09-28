@@ -15,6 +15,7 @@ import { createContext, useContext, useEffect, useRef, useState } from 'react';
 import type {
   EventEnvelope,
   KnowledgeGraphResponse,
+  RoomProviderFailure,
   RoomProvenance,
   RoomSpeakerDecision,
   RoomState,
@@ -61,6 +62,7 @@ export interface TurnSummary {
   completed: boolean;
   error: string | null;
   refusal: string | null;
+  provider_failure?: RoomProviderFailure | null;
   provenance: RoomProvenance | null;
   decision: RoomSpeakerDecision | null;
   rendered_through: string | null;

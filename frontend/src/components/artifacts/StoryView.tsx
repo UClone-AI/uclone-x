@@ -1,7 +1,8 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { ArrowLeft, RefreshCw } from 'lucide-react';
 import { Button } from '../ui/Button';
-import { plainFailure } from '../../lib/coreFailure';
+import { CoreFailure, plainFailure } from '../../lib/coreFailure';
+import { openConfirmedWindow } from '../../lib/person';
 import {
   artifactLibraryApi,
   type ChangeView,
@@ -19,9 +20,11 @@ import {
  * Everything shown is the Core's (`StoryView.show`), and so is every decision: Approve and
  * Reject send the proposal's digest as it was shown, and the Core applies it only if the
  * proposal and its entry are still what this screen drew. A refusal is the Core's sentence.
- * No story or file tool reaches this path. A persona with an unconfined shell (Clone's
- * `bash_run`) can call the same local API (#1589), so "Applied here" is not yet proof that
- * a person pressed the button.
+ * No story or file tool reaches this path. Any program on this computer can call the same
+ * local API, a persona's unconfined shell (Clone's `bash_run`) included, so the Core accepts a
+ * decision only from a window it opened itself (#1589, `lib/person.ts`); that is what makes
+ * "Applied here" mean a person pressed the button. A window opened any other way is refused,
+ * shows the Core's sentence, and offers to open a confirmed one.
  */
 
 export const STORY_COPY = {
@@ -58,6 +61,9 @@ export const STORY_COPY = {
   rejectReason: 'Why, if you want to say (optional)',
   confirmReject: 'Reject this change',
   keep: 'Keep deciding',
+  openConfirmed: 'Open a confirmed window',
+  windowOpened: 'A confirmed window opened in your browser. Decide there.',
+  windowFailed: 'No confirmed window could be opened.',
   applied: (name: string) => `The change to ${name} was applied.`,
   rejected: (name: string) => `The change to ${name} was rejected.`,
   decision: (p: ProposalView) =>
@@ -87,6 +93,8 @@ export const StoryView: React.FC<StoryViewProps> = ({ storyId, onBack }) => {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string[] | null>(null);
   const [busy, setBusy] = useState(false);
+  // The Core refused a decision from this window: it was not opened by the Core (#1589).
+  const [unconfirmed, setUnconfirmed] = useState(false);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -111,6 +119,7 @@ export const StoryView: React.FC<StoryViewProps> = ({ storyId, onBack }) => {
     const name = proposal.entry_name ?? proposal.entry_id;
     setBusy(true);
     setNotice(null);
+    setUnconfirmed(false);
     try {
       const done =
         reject === null
@@ -119,11 +128,22 @@ export const StoryView: React.FC<StoryViewProps> = ({ storyId, onBack }) => {
       setNotice([done.decision === 'applied' ? STORY_COPY.applied(name) : STORY_COPY.rejected(name), ...done.notes]);
     } catch (err) {
       console.error('Story view: a decision failed', err);
+      setUnconfirmed(err instanceof CoreFailure && err.status === 403);
       setNotice([plainFailure(err, STORY_COPY.decideFailed)]);
     } finally {
       setBusy(false);
     }
     await load();
+  };
+
+  const openWindow = async () => {
+    try {
+      await openConfirmedWindow();
+      setNotice([STORY_COPY.windowOpened]);
+    } catch (err) {
+      console.error('Story view: no confirmed window opened', err);
+      setNotice([plainFailure(err, STORY_COPY.windowFailed)]);
+    }
   };
 
   return (
@@ -154,6 +174,16 @@ export const StoryView: React.FC<StoryViewProps> = ({ storyId, onBack }) => {
           {notice.map((line) => (
             <p key={line}>{line}</p>
           ))}
+          {unconfirmed && (
+            <Button
+              variant="bordered"
+              className="mt-2"
+              onClick={() => void openWindow()}
+              data-testid="story-open-confirmed-window"
+            >
+              {STORY_COPY.openConfirmed}
+            </Button>
+          )}
         </div>
       )}
 

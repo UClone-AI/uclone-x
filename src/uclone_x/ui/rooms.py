@@ -14,7 +14,6 @@ has landed and a route that awaited it would hold one request across several mod
 from __future__ import annotations
 
 import asyncio
-import dataclasses
 import logging
 import uuid
 from collections.abc import Callable, Coroutine, Mapping
@@ -59,7 +58,9 @@ from uclone_x.room.models import (
     RoomState,
     SelectionVerdict,
     SpeakerDecision,
+    is_loop_command,
 )
+from uclone_x.room.notices import NoticeCode, NoticeParams, notice_content
 from uclone_x.room.orchestrator import (
     AUTONOMOUS_CIRCUIT_BREAKER_TURNS,
     RoomOrchestrator,
@@ -222,55 +223,10 @@ class RoomStack:
                 continue
             if state is not None:
                 runtime.orchestrator.replace_selectors(
-                    build_selector_chain(state.policy, provider=llm)
+                    build_selector_chain(
+                        state.policy, provider=llm, default_model=self._session_mgr.fast_model
+                    )
                 )
-
-    def _host(self) -> Any:
-        from uclone_x.agent.composition import HostDependencies
-
-        mgr = self._session_mgr
-        tool_scoper = None
-        settings = mgr.get_settings()
-        provider = str(settings.get("llm_provider") or "").strip().lower()
-        llm_base_url = str(settings.get("llm_base_url") or "").strip()
-        if provider == "ollama" and llm_base_url:
-            try:
-                from uclone_x.llm.connectors.ollama_embedder import OllamaEmbedder
-                from uclone_x.tools.tool_scoper import SemanticToolScoper
-
-                embedder = OllamaEmbedder(base_url=llm_base_url)
-                reg = mgr.skill_registry
-
-                def skills_prov() -> list[tuple[str, str]]:
-                    return [(s.manifest.name, s.manifest.description) for s in reg.list_skills()]
-
-                tool_scoper = SemanticToolScoper(
-                    embedder,
-                    top_k=5,
-                    threshold=0.30,
-                    always_include=("record_memory_fact",),
-                    skills_provider=skills_prov,
-                )
-            except Exception:
-                from uclone_x.tools.tool_scoper import LexicalToolScoper
-
-                tool_scoper = LexicalToolScoper(top_k=5)
-        else:
-            from uclone_x.tools.tool_scoper import LexicalToolScoper
-
-            tool_scoper = LexicalToolScoper(top_k=5)
-
-        return HostDependencies(
-            bus=mgr.bus,
-            llm=mgr.llm,
-            tools=mgr.tools,
-            tracer=mgr.tracer,
-            store=mgr.core_store,
-            budget=mgr.budget_tracker,
-            skills=mgr.skill_registry,
-            ontology=mgr.ontology_engine,
-            tool_scoper=tool_scoper,
-        )
 
     def orchestrator(self, state: RoomState) -> RoomOrchestrator:
         """The orchestrator driving this room, built on first use from its policy."""
@@ -281,25 +237,19 @@ class RoomStack:
         # agent built for the one call from the same host as the seats (#1558).
         transport = A2AInMemoryTransport()
         resolver = RoomAgentResolver(
-            dataclasses.replace(self._host(), a2a_transport=transport),
+            # The scope a 1:1 chat of the same clone is built from: its memory map, its
+            # personas, its binder, its models. A seat adds only what the room has
+            # (owner ruling 2026-09-27). The manager's memory map and not one of this
+            # class's own: a store is per agent id, and a second map would hand
+            # `champion` in a room a different object than `champion` in chat, each
+            # `save()` dropping what the other recorded.
+            self._session_mgr.app_scope(),
             # Each participant induces into its own graph (P7, G4). Without this the
             # resolver refuses every seated agent, because the host carries one shared
             # engine and handing it to all of them merges what each learned separately.
             ontology_factory=lambda namespace: OntologyEngine(namespace_iri=namespace),
-            # ...and each keeps its own memory. Without this the room's agents are
-            # composed with no store, so `record_memory_fact` is neither advertised to
-            # them nor resolvable: a room agent could not remember anything at all.
-            #
-            # The session manager's map, not one of this class's own. A store is per agent
-            # id, and an id names one file: a second map here would hand `champion` in a
-            # room a different object than `champion` in chat, and since `save()` rewrites
-            # the whole document each would drop what the other recorded, with nothing
-            # reporting it. One resolver per room also rules out holding it in the
-            # resolver, which is what makes the manager's the only correct home.
-            memory_factory=self._session_mgr.memory_for,
-            workspace_root=self._session_mgr.workspace_dir,
-            read_roots=lambda: self._session_mgr.read_roots,
             knowledge=self.knowledge,  # read before a seat's first turn (#1367)
+            a2a_transport=transport,
         )
         register_persona_handlers(
             transport,
@@ -309,10 +259,16 @@ class RoomStack:
             workspace_root=resolver.workspace_root,
             llm_config=resolver.llm_config,
             read_roots=resolver.read_roots,
+            global_models=self._session_mgr.global_models,
         )
         built = RoomOrchestrator(
             store=self.store,
-            selectors=build_selector_chain(state.policy, provider=self._session_mgr.llm),
+            # Routing is an auxiliary call, so it asks for the fast model.
+            selectors=build_selector_chain(
+                state.policy,
+                provider=self._session_mgr.llm,
+                default_model=self._session_mgr.fast_model,
+            ),
             resolver=resolver,
             bus=self._session_mgr.bus,
             knowledge=self.knowledge,  # written after each turn (#1367)
@@ -343,6 +299,30 @@ class RoomStack:
         """
         runtime = self._rooms.get(room_id)
         return runtime is not None and runtime.orchestrator.turn_unlanded(room_id)
+
+    def get_active_turn(self, room_id: str) -> dict[str, Any] | None:
+        """Return the active turn in progress for `room_id`, if any."""
+        runtime = self._rooms.get(room_id)
+        if runtime is not None:
+            active = runtime.orchestrator.active_turn(room_id)
+            if active is not None:
+                return active
+        if self.turn_in_flight(room_id):
+            state = self.store.load(room_id)
+            default_agent_id = None
+            if state is not None:
+                agents = [p.id for p in state.participants if p.kind is ParticipantKind.AGENT]
+                if len(agents) == 1:
+                    default_agent_id = agents[0]
+            return {
+                "in_flight": True,
+                "agent_id": default_agent_id,
+                "turn_id": None,
+                "status": "generating",
+                "detail": None,
+                "accumulated_text": "",
+            }
+        return None
 
     def note_presence(self, state: RoomState, active: bool = True) -> None:
         """Report presence for a room, ensuring its orchestrator is built."""
@@ -662,10 +642,11 @@ def _http_error(exc: Exception) -> HTTPException:
         # A room route reaches the session store through the seats -- `/context` reads
         # every seat's record -- so it can meet a refusal the Core raises about a
         # *session* rather than about the room. The status is not decided here: #256
-        # settled it at 409 in `ui/app._translate_session_error`, and a second surface
-        # answering 400 or 500 for the same refusal is the divergence P6 forbids. Without
-        # this branch the fall-through below answers 500 with a message of our own, which
-        # throws away the one sentence that says which two ids fold together (#1212).
+        # settled it at 409 for the session routes (retired with the legacy chat path,
+        # #1731), and answering 400 or 500 for the same refusal is the divergence P6
+        # forbids. Without this branch the fall-through below answers 500 with a message
+        # of our own, which throws away the one sentence that says which two ids fold
+        # together (#1212).
         return HTTPException(status_code=409, detail=str(exc))
     if isinstance(exc, SessionMutationDuringTurnError):
         # The refusal that actually covers `/compact` (#1213), and it was arriving as a
@@ -673,10 +654,9 @@ def _http_error(exc: Exception) -> HTTPException:
         # docstring -- so the Core's own per-seat check is, and a guard whose answer is
         # "the conversation service failed, see the server log" is one no caller can act
         # on: the Core's sentence names the seat, the session and the remedy ("await the
-        # turn first"), and none of it reached the browser. 409, because that is what
-        # `ui/app._translate_session_error` already answers for this exact class; a
-        # second surface answering 500 for the same refusal is the divergence the
-        # collision branch above names (#1212, #256).
+        # turn first"), and none of it reached the browser. 409, because that is what the
+        # session routes answered for this exact class; answering 500 for the same refusal
+        # is the divergence the collision branch above names (#1212, #256).
         return HTTPException(status_code=409, detail=str(exc))
     if isinstance(exc, MissingCapabilityError) and "llm" in exc.missing:
         # A retry builds its seat inside the request, so it meets the same missing model a
@@ -792,7 +772,9 @@ def register_room_routes(app: FastAPI, stack: RoomStack) -> None:
     @app.get("/api/rooms/{room_id}")
     async def get_room(room_id: str) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
         """One conversation, roster and transcript included."""
-        return _room(room_id).model_dump(mode="json")
+        state = _room(room_id)
+        active = stack.get_active_turn(room_id)
+        return {**state.model_dump(mode="json"), "active_turn": active}
 
     @app.patch("/api/rooms/{room_id}")
     async def rename_room(room_id: str, req: dict[str, Any]) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
@@ -872,26 +854,37 @@ def register_room_routes(app: FastAPI, stack: RoomStack) -> None:
         raw_sender = req.get("sender_id")
         sender_id = raw_sender if isinstance(raw_sender, str) and raw_sender else _sole_human(state)
         clean_content = content.strip()
-        if clean_content.startswith("/loop"):
-            from uclone_x.agent.loop.parser import parse_loop_command_input
+        # `is_loop_command`, not a bare prefix test: `/loopy` is a message, and the prefix
+        # test recorded it once as a command and again as the message it fell through to.
+        if is_loop_command(clean_content):
+            from uclone_x.agent.loop.parser import (
+                MIN_INTERVAL_SECONDS,
+                LoopParseError,
+                parse_loop_command_input,
+            )
 
+            # A note, not the person's message: a seat is not handed the command as
+            # something to answer (#1661).
             try:
-                state = await orch.accept(room_id, sender_id, content)
+                state = await orch.accept_command(room_id, sender_id, content)
             except Exception as exc:
                 raise _http_error(exc) from exc
 
-            if clean_content in ("/loop", "/loop help"):
-                help_msg = (
-                    "ℹ️ **`/loop` 명령어 안내:**\n\n"
-                    "• `/loop <간격> <프롬프트>`: 주기적으로 프롬프트 실행 (예: `/loop 1분마다 하나씩 만들어보자` 또는 `/loop 30s 상태 확인`)\n"
-                    "• `/loop list`: 현재 대화방의 활성 반복 작업 확인\n"
-                    "• `/loop stop`: 현재 대화방의 반복 작업 중지 (상단 중단 버튼으로도 중지 가능)"
-                )
+            def _notice(code: NoticeCode, params: NoticeParams | None = None) -> JSONResponse:
+                """Append one `/loop` notice to the transcript and answer with its seq.
+
+                The note carries `code` and `params` for the head to word in the reader's
+                language, and the English sentence in `content` for everything else.
+                """
+                nonlocal state
+                values = params or {}
                 note = RoomMessage(
                     seq=len(state.transcript) + 1,
                     sender_id="system",
-                    content=help_msg,
-                    kind=RoomMessageKind.UTTERANCE,
+                    content=notice_content(code, values),
+                    kind=RoomMessageKind.NOTE,
+                    code=code,
+                    params=params,
                 )
                 state = stack.store.save(
                     state.model_copy(update={"transcript": (*state.transcript, note)})
@@ -900,73 +893,37 @@ def register_room_routes(app: FastAPI, stack: RoomStack) -> None:
                     status_code=202, content={"room_id": room_id, "seq": state.transcript[-1].seq}
                 )
 
+            if clean_content in ("/loop", "/loop help"):
+                return _notice("loop.help")
+
             if clean_content == "/loop list":
                 loop_info = stack.get_room_loop_info(room_id)
-                if loop_info is not None:
-                    job_id, interval, prompt_text = loop_info
-                    intvl_display = (
-                        f"{int(interval)}초" if interval < 60 else f"{int(interval // 60)}분"
-                    )
-                    list_msg = (
-                        f"🔄 **활성 반복 작업:** `{job_id}` ({intvl_display} 주기)\n"
-                        f'프롬프트: "{prompt_text}"'
-                    )
-                else:
-                    list_msg = "ℹ️ 현재 이 대화방에 실행 중인 반복 작업이 없습니다."
-                note = RoomMessage(
-                    seq=len(state.transcript) + 1,
-                    sender_id="system",
-                    content=list_msg,
-                    kind=RoomMessageKind.UTTERANCE,
-                )
-                state = stack.store.save(
-                    state.model_copy(update={"transcript": (*state.transcript, note)})
-                )
-                return JSONResponse(
-                    status_code=202, content={"room_id": room_id, "seq": state.transcript[-1].seq}
+                if loop_info is None:
+                    return _notice("loop.none_active")
+                job_id, interval, prompt_text = loop_info
+                return _notice(
+                    "loop.active",
+                    {"job_id": job_id, "interval_seconds": interval, "prompt": prompt_text},
                 )
 
             if clean_content in ("/loop stop", "/loop stop all") or clean_content.startswith(
                 "/loop stop "
             ):
                 stopped = stack.cancel_room_loop(room_id)
-                stop_msg = (
-                    "🛑 반복 실행 작업이 중지되었습니다."
-                    if stopped
-                    else "ℹ️ 중지할 활성 반복 작업이 없습니다."
-                )
-                note = RoomMessage(
-                    seq=len(state.transcript) + 1,
-                    sender_id="system",
-                    content=stop_msg,
-                    kind=RoomMessageKind.UTTERANCE,
-                )
-                state = stack.store.save(
-                    state.model_copy(update={"transcript": (*state.transcript, note)})
-                )
-                return JSONResponse(
-                    status_code=202, content={"room_id": room_id, "seq": state.transcript[-1].seq}
-                )
+                return _notice("loop.stopped" if stopped else "loop.nothing_to_stop")
 
             if clean_content.startswith("/loop "):
                 raw_arg = clean_content[len("/loop ") :].strip()
                 try:
                     interval_seconds, clean_prompt = parse_loop_command_input(raw_arg)
-                except ValueError as err:
-                    err_msg = f"⚠️ `/loop` 형식 오류: {err}"
-                    note = RoomMessage(
-                        seq=len(state.transcript) + 1,
-                        sender_id="system",
-                        content=err_msg,
-                        kind=RoomMessageKind.UTTERANCE,
-                    )
-                    state = stack.store.save(
-                        state.model_copy(update={"transcript": (*state.transcript, note)})
-                    )
-                    return JSONResponse(
-                        status_code=202,
-                        content={"room_id": room_id, "seq": state.transcript[-1].seq},
-                    )
+                except LoopParseError as err:
+                    if err.reason == "interval_too_short":
+                        return _notice(
+                            "loop.interval_too_short", {"interval_seconds": MIN_INTERVAL_SECONDS}
+                        )
+                    if err.reason == "missing_prompt":
+                        return _notice("loop.missing_prompt")
+                    return _notice("loop.no_interval")
 
                 job_id = stack.schedule_room_loop(
                     room_id=room_id,
@@ -974,27 +931,13 @@ def register_room_routes(app: FastAPI, stack: RoomStack) -> None:
                     interval_seconds=interval_seconds,
                     prompt=clean_prompt,
                 )
-                intvl_display = (
-                    f"{int(interval_seconds)}초"
-                    if interval_seconds < 60
-                    else f"{int(interval_seconds // 60)}분"
-                )
-                ack_msg = (
-                    f"🔄 **반복 작업 등록됨** (매 {intvl_display}마다 실행, ID: `{job_id}`):\n"
-                    f'"{clean_prompt}"\n\n'
-                    f"*중지하려면 `/loop stop`을 입력하거나 상단 대화 중단 버튼을 누르세요.*"
-                )
-                note = RoomMessage(
-                    seq=len(state.transcript) + 1,
-                    sender_id="system",
-                    content=ack_msg,
-                    kind=RoomMessageKind.UTTERANCE,
-                )
-                state = stack.store.save(
-                    state.model_copy(update={"transcript": (*state.transcript, note)})
-                )
-                return JSONResponse(
-                    status_code=202, content={"room_id": room_id, "seq": state.transcript[-1].seq}
+                return _notice(
+                    "loop.registered",
+                    {
+                        "job_id": job_id,
+                        "interval_seconds": interval_seconds,
+                        "prompt": clean_prompt,
+                    },
                 )
 
         try:
@@ -1078,7 +1021,7 @@ def register_room_routes(app: FastAPI, stack: RoomStack) -> None:
 
         **`used_tokens` now carries a maximum, and it is a measured one.** It did not, and
         the reason it did not stands: `TokenBudget.max_tokens` is a spend ceiling
-        (1,000,000 by default), so a proportion against it reads near nothing however full
+        (none by default since `llm-token-gateway.md` §4.6), so a proportion against it reads near nothing however full
         the context is, and a ring drawn against a ceiling that does not mean fullness is
         the plausible substituted value P6 forbids. What changed is that the other
         candidate stopped being unavailable. `uclone_x.llm.context_window` reads a locally
@@ -1132,7 +1075,7 @@ def register_room_routes(app: FastAPI, stack: RoomStack) -> None:
             # the orchestrator to copy -- so a figure summed from the rows would be zero on
             # every room.
             # `BaseAgent` books each response against the budget manager instead, keyed by
-            # session, and `_host()` above hands every seat that same manager.
+            # session, and the app scope hands every seat that same manager.
             #
             # **`None` is not zero (P6).** The manager holds this process's bookings, so a
             # seat that has answered only in an earlier run has *no record*, which is a
@@ -1405,7 +1348,7 @@ def _reseat_after_history_change(stack: RoomStack, state: RoomState) -> tuple[st
     So each seat is reset through the Core's single reset semantics, and the room's own
     record replays. `truncate_transcript` and `clear_transcript` have already cut
     `last_seen_seq` back, so `RoomOrchestrator._unseen_span` hands each speaker the surviving
-    conversation again on its next turn, bounded by `RoomPolicy.max_span_messages` and
+    conversation again on its next turn, bounded by `RoomPolicy.max_span_tokens` and
     announcing what that bound dropped. The cost is real and worth stating: a seat loses the
     compaction it had accumulated and re-reads the record. After a rewind that is the
     correct memory to have -- the surviving transcript is what happened.

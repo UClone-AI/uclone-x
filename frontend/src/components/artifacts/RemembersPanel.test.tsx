@@ -94,8 +94,8 @@ describe('RemembersPanel: what the clone remembers (#1357)', () => {
   // A missing store must not read as an empty memory. The declaration pins the first case;
   // the second is the same check for the other status the Core can give.
   it('shows the reason when nothing the seat learned has been saved (not_recorded)', async () => {
-    // Killed by: frontend/src/components/artifacts/RemembersPanel.tsx :: (data.reason ?? `No remembered statements are listed for ${name}.`)
-    // Becomes: (`No remembered statements are listed for ${name}.`)
+    // Killed by: frontend/src/components/artifacts/RemembersPanel.tsx :: (data.reason ?? fmt(t.noneKnown, { name }))
+    // Becomes: (fmt(t.noneKnown, { name }))
     const reason = 'Scout has no knowledge record in this conversation.';
     answers[URL_A] = absent('not_recorded', reason);
     const { container } = render(<RemembersPanel roomId="room-a" seatId="scout" seatName="Scout" />);
@@ -216,8 +216,8 @@ describe('RemembersPanel: the facts the clone saved to memory (#1401)', () => {
   });
 
   it('shows the Core’s sentence when there are no saved facts to list, or they could not be read', async () => {
-    // Killed by: frontend/src/components/artifacts/RemembersPanel.tsx :: data.saved_facts_reason ?? (saved === null ? `${name}'s saved facts are not listed.` : null);
-    // Becomes: (saved === null ? `${name}'s saved facts are not listed.` : null);
+    // Killed by: frontend/src/components/artifacts/RemembersPanel.tsx :: data.saved_facts_reason ?? (saved === null ? fmt(t.savedNotListed, { name }) : null);
+    // Becomes: (saved === null ? fmt(t.savedNotListed, { name }) : null);
     const empty = 'No saved facts are listed for Scout.';
     answers[URL_A] = withSaved(okKnowledge([]), [], empty);
     const { unmount } = render(<RemembersPanel roomId="room-a" seatId="scout" seatName="Scout" />);

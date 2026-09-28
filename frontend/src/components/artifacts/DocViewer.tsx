@@ -12,6 +12,8 @@ import {
 } from 'lucide-react';
 import { MarkdownRenderer } from '../MarkdownRenderer';
 import { roomDockUrls, useRoomRead, type RoomArtifacts } from '../../lib/roomDock';
+import { en } from '../../i18n/en';
+import { fmt, useCopy } from '../../i18n';
 
 interface DocViewerProps {
   /** The conversation on screen; Docs lists only the files it wrote (#1354). */
@@ -25,9 +27,9 @@ interface DocViewerProps {
 }
 
 /** What Docs says when the file list's read fails and the Core gave no plain reason. */
-export const FILES_READ_FAILED = "This conversation's files could not be listed.";
+export const FILES_READ_FAILED = en.dock.docs.filesReadFailed;
 /** What Docs says when a file's content cannot be read; the route's own text is technical. */
-export const FILE_READ_FAILED = 'This file could not be shown.';
+export const FILE_READ_FAILED = en.dock.docs.fileReadFailed;
 
 const IMAGE_FILE = /\.(png|jpg|jpeg|webp|svg|gif)$/i;
 
@@ -38,6 +40,7 @@ export const DocViewer: React.FC<DocViewerProps> = ({
   refreshKey,
 }) => {
   const [reloads, setReloads] = useState(0);
+  const t = useCopy().dock.docs;
   const listRead = useRoomRead<RoomArtifacts>(
     roomId ? roomDockUrls.artifacts(roomId) : null,
     `${String(refreshKey ?? '')}:${reloads}`,
@@ -163,12 +166,12 @@ export const DocViewer: React.FC<DocViewerProps> = ({
   // an empty one never says that nothing was written (#1366); the fallback, for a Core that
   // sent no reason, says only what the list shows and what it covers.
   const emptyReason = !roomId
-    ? 'No conversation is open. Open one from the rail to see the files it wrote.'
+    ? t.noRoom
     : listRead.fault
       ? // The Core's own plain words where it gave them, else ours; never transport text (#1435).
-        (listRead.fault.detail ?? FILES_READ_FAILED)
+        (listRead.fault.detail ?? t.filesReadFailed)
       : listing && artifacts.length === 0
-        ? listing.reason ?? `No files are listed yet. ${listing.scope_note ?? ''}`.trim()
+        ? listing.reason ?? fmt(t.noneListed, { scope: listing.scope_note ?? '' }).trim()
         : null;
   // With files listed, what the list covers and each known reason it may be missing one;
   // the empty list's `reason` already says both.
@@ -192,11 +195,11 @@ export const DocViewer: React.FC<DocViewerProps> = ({
               className="bg-slate-950 border border-slate-700/70 text-slate-200 text-xs rounded-lg px-2.5 py-1.5 focus:outline-none focus:border-cyan-500 flex-1 min-w-0 truncate font-mono"
             >
               {artifacts.length === 0 && !offList && (
-                <option value="">(No files listed)</option>
+                <option value="">{t.noFilesOption}</option>
               )}
               {offList && (
                 <option value={selectedPath}>
-                  {selectedPath.split('/').pop()} (opened from the conversation)
+                  {fmt(t.openedFrom, { name: selectedPath.split('/').pop() ?? selectedPath })}
                 </option>
               )}
               {artifacts.map((a) => (
@@ -211,7 +214,7 @@ export const DocViewer: React.FC<DocViewerProps> = ({
               onClick={() => setReloads((n) => n + 1)}
               disabled={fetchingList || !roomId}
               className="p-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg transition-colors shrink-0 disabled:opacity-50"
-              title="Read this conversation's files again"
+              title={t.refresh}
             >
               <RefreshCw className={`w-3.5 h-3.5 ${fetchingList ? 'animate-spin text-cyan-400' : ''}`} />
             </button>
@@ -228,10 +231,10 @@ export const DocViewer: React.FC<DocViewerProps> = ({
                   ? 'bg-amber-600/30 border-amber-500/80 text-amber-300'
                   : 'bg-slate-800/80 border-slate-700/60 text-slate-300 hover:text-white'
               } disabled:opacity-40`}
-              title={showRaw ? 'Render markdown' : 'Show raw source'}
+              title={showRaw ? t.renderTitle : t.rawTitle}
             >
               {showRaw ? <Eye className="w-3.5 h-3.5" /> : <Code className="w-3.5 h-3.5" />}
-              <span>{showRaw ? 'Rendered' : 'Raw'}</span>
+              <span>{showRaw ? t.rendered : t.raw}</span>
             </button>
 
             <button
@@ -240,7 +243,7 @@ export const DocViewer: React.FC<DocViewerProps> = ({
               onClick={handleCopy}
               disabled={!content}
               className="p-1.5 bg-slate-800/80 hover:bg-slate-700 border border-slate-700/60 text-slate-300 hover:text-white rounded-lg transition-colors disabled:opacity-40"
-              title="Copy markdown text"
+              title={t.copyTitle}
             >
               {copied ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
             </button>
@@ -261,7 +264,9 @@ export const DocViewer: React.FC<DocViewerProps> = ({
                   <User className="w-3 h-3" />
                   <span>
                     {currentArtifact.writers.join(', ')}
-                    {currentArtifact.write_count > 1 ? ` · written ${currentArtifact.write_count} times` : ''}
+                    {currentArtifact.write_count > 1
+                      ? fmt(t.writtenTimes, { count: currentArtifact.write_count })
+                      : ''}
                   </span>
                 </div>
               )}
@@ -291,7 +296,7 @@ export const DocViewer: React.FC<DocViewerProps> = ({
             <div data-testid="doc-record-gaps" className="flex gap-1.5">
               <Info className="w-3 h-3 mt-0.5 shrink-0 text-slate-500" />
               <div>
-                <span>It may also be missing files because:</span>
+                <span>{t.mayBeMissing}</span>
                 <ul className="list-disc pl-4">
                   {gaps.map((gap) => (
                     <li key={gap}>{gap}</li>
@@ -303,7 +308,7 @@ export const DocViewer: React.FC<DocViewerProps> = ({
           {listing.turn_running && (
             <p data-testid="doc-turn-running" className="flex gap-1.5">
               <Info className="w-3 h-3 mt-0.5 shrink-0 text-slate-500" />
-              <span>A turn is still running; the files it saves are listed when it finishes.</span>
+              <span>{t.turnRunning}</span>
             </p>
           )}
         </div>
@@ -323,8 +328,7 @@ export const DocViewer: React.FC<DocViewerProps> = ({
             data-testid="doc-missing-file"
             className="p-4 bg-slate-900/60 border border-slate-800 rounded-xl text-slate-300 text-xs"
           >
-            This file was written in this conversation but is no longer on disk, so there is
-            nothing to show. It may have been moved or deleted after it was written.
+            {t.noLongerOnDisk}
           </div>
         ) : unchecked ? (
           <div
@@ -336,7 +340,7 @@ export const DocViewer: React.FC<DocViewerProps> = ({
         ) : loading ? (
           <div className="flex flex-col items-center justify-center h-48 gap-3 text-slate-400">
             <RefreshCw className="w-6 h-6 animate-spin text-cyan-400" />
-            <span className="text-xs">Loading document content...</span>
+            <span className="text-xs">{t.loadingContent}</span>
           </div>
         ) : error ? (
           <div
@@ -344,13 +348,13 @@ export const DocViewer: React.FC<DocViewerProps> = ({
             className="p-4 bg-rose-950/40 border border-rose-800/60 rounded-xl text-rose-300 text-xs"
           >
             {/* Never the route's text: it is an exception's, and can carry a path (#1435). */}
-            {FILE_READ_FAILED}
+            {t.fileReadFailed}
           </div>
         ) : !selectedPath ? (
           <div className="flex flex-col items-center justify-center h-64 text-center px-4 text-slate-500">
             <FileText className="w-10 h-10 mb-3 text-slate-600 stroke-[1.5]" />
             <p className="text-xs text-slate-400 max-w-sm">
-              {fetchingList ? "Reading this conversation's files…" : 'Pick a file above to read it.'}
+              {fetchingList ? t.readingFiles : t.pickFile}
             </p>
           </div>
         ) : IMAGE_FILE.test(selectedPath) ? (
@@ -367,7 +371,7 @@ export const DocViewer: React.FC<DocViewerProps> = ({
                 rel="noreferrer"
                 className="text-cyan-400 hover:underline"
               >
-                Open original in new tab
+                {t.openOriginal}
               </a>
             </div>
 
@@ -378,7 +382,7 @@ export const DocViewer: React.FC<DocViewerProps> = ({
               >
                 <div className="flex items-center justify-between pb-1.5 border-b border-slate-800/80">
                   <span className="font-semibold text-cyan-300">
-                    Generation Details
+                    {t.generationDetails}
                   </span>
                   <div className="flex items-center gap-2 text-[11px] font-mono text-slate-400">
                     {imageMeta.meta.engine && (
@@ -386,14 +390,14 @@ export const DocViewer: React.FC<DocViewerProps> = ({
                         {imageMeta.meta.engine}
                       </span>
                     )}
-                    {imageMeta.meta.seed != null && <span>Seed: {imageMeta.meta.seed}</span>}
+                    {imageMeta.meta.seed != null && <span>{t.seed}: {imageMeta.meta.seed}</span>}
                   </div>
                 </div>
 
                 {imageMeta.meta.prompt && (
                   <div>
                     <span className="text-slate-400 block text-[10px] font-mono uppercase tracking-wider mb-1">
-                      Prompt
+                      {t.prompt}
                     </span>
                     <p className="bg-slate-950/80 p-2 rounded-lg border border-slate-800/60 font-mono text-[11px] text-slate-200 select-text whitespace-pre-wrap leading-relaxed">
                       {imageMeta.meta.prompt}
@@ -401,18 +405,32 @@ export const DocViewer: React.FC<DocViewerProps> = ({
                   </div>
                 )}
 
+                {imageMeta.meta.negative_prompt && (
+                  <div>
+                    <span className="text-slate-400 block text-[10px] font-mono uppercase tracking-wider mb-1">
+                      {t.negativePrompt}
+                    </span>
+                    <p
+                      data-testid="image-meta-negative-prompt"
+                      className="bg-slate-950/80 p-2 rounded-lg border border-slate-800/60 font-mono text-[11px] text-rose-300/90 select-text whitespace-pre-wrap leading-relaxed"
+                    >
+                      {imageMeta.meta.negative_prompt}
+                    </p>
+                  </div>
+                )}
+
                 <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-slate-400 font-mono">
                   {imageMeta.meta.style && (
-                    <span>Style: <strong className="text-slate-200">{imageMeta.meta.style}</strong></span>
+                    <span>{t.style}: <strong className="text-slate-200">{imageMeta.meta.style}</strong></span>
                   )}
                   {imageMeta.meta.aspect_ratio && (
-                    <span>Aspect: <strong className="text-slate-200">{imageMeta.meta.aspect_ratio}</strong></span>
+                    <span>{t.aspect}: <strong className="text-slate-200">{imageMeta.meta.aspect_ratio}</strong></span>
                   )}
                   {imageMeta.meta.width != null && imageMeta.meta.height != null && (
-                    <span>Size: <strong className="text-slate-200">{imageMeta.meta.width}x{imageMeta.meta.height}</strong></span>
+                    <span>{t.size}: <strong className="text-slate-200">{imageMeta.meta.width}x{imageMeta.meta.height}</strong></span>
                   )}
                   {imageMeta.meta.duration_seconds != null && (
-                    <span>Time: <strong className="text-slate-200">{imageMeta.meta.duration_seconds}s</strong></span>
+                    <span>{t.time}: <strong className="text-slate-200">{imageMeta.meta.duration_seconds}s</strong></span>
                   )}
                 </div>
               </div>

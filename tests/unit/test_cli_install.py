@@ -575,6 +575,8 @@ def test_a_nonzero_installer_exit_is_not_the_verdict(monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(bootstrap.subprocess, "run", _run_ok)
     monkeypatch.setattr(bootstrap, "ollama_binary", lambda: None)
     monkeypatch.setattr(bootstrap, "ollama_version", _version_missing)
+    # A binary that never runs is retried; the backoff is not this test's subject (15 s real).
+    monkeypatch.setattr(bootstrap, "OLLAMA_INSTALL_RETRY_DELAY_S", 0.0)
 
     assert bootstrap.install_ollama_platform() is False
 
@@ -918,16 +920,15 @@ def test_ucx_start_uses_the_same_setup_path_as_ucx_install() -> None:
     serve.assert_called_once()
 
 
-def test_ucx_start_exports_the_endpoint_the_setup_actually_used(
+def test_ucx_start_leaves_the_environment_to_the_person(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """`OLLAMA_BASE_URL` comes from the result, not from a second hard-coded literal.
+    """`start` exports nothing: the choice setup made lives in settings.json only.
 
-    Killed by: src/uclone_x/cli/main.py :: os.environ.setdefault("OLLAMA_BASE_URL", result.llm.endpoint)
-    Becomes: os.environ.setdefault("OLLAMA_BASE_URL", "http://localhost:11434")
-
-    A second hard-coded literal then contradicts the endpoint the prober reached and the
-    summary line reported.
+    An environment variable outranks the settings file. `start` used to export
+    `LLM_PROVIDER=ollama` and the model it prepared, so every later switch in Settings was
+    saved and then ignored for the life of the dashboard: the person picked Gemini and
+    kept talking to Ollama.
     """
     for key in ("LLM_PROVIDER", "OLLAMA_MODEL", "OLLAMA_BASE_URL"):
         monkeypatch.delenv(key, raising=False)
@@ -940,8 +941,8 @@ def test_ucx_start_exports_the_endpoint_the_setup_actually_used(
         with patch("uclone_x.ui.server.start_ui_server"):
             runner.invoke(main.app, ["start", "--no-open", "--port", "5999"])
 
-    assert os.environ["OLLAMA_BASE_URL"] == "http://10.0.0.7:11434"
-    assert os.environ["OLLAMA_MODEL"] == "qwen3:8b"
+    for key in ("LLM_PROVIDER", "OLLAMA_MODEL", "OLLAMA_BASE_URL"):
+        assert key not in os.environ
 
 
 def test_ucx_install_exists_in_an_installed_build_unlike_ucx_setup() -> None:

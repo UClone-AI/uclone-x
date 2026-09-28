@@ -19,6 +19,7 @@ What these pin:
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 from collections.abc import AsyncIterator
@@ -26,7 +27,6 @@ from pathlib import Path
 from typing import Any, cast
 
 import pytest
-from fastapi.testclient import TestClient
 from pydantic import BaseModel, Field
 
 from uclone_x.agent.base import BaseAgent
@@ -176,7 +176,7 @@ class TestTheStoresTheHeadsBuildWriteEvents:
     def test_a_ui_turn_with_a_tool_call_leaves_tool_call_and_tool_result_on_disk(
         self, tmp_path: Path
     ) -> None:
-        """The UI's own store, driven through its own turn route.
+        """The UI's own store, driven through the agent its session manager builds.
 
         Killed by: src/uclone_x/agent/session.py :: if log_writer is None and log_allocator is None:
         Becomes: if False:
@@ -200,16 +200,18 @@ class TestTheStoresTheHeadsBuildWriteEvents:
             responses=["Reading.", "Read it."],
             tool_calls=[ToolCallRequest(id="call_1", name="read_file", arguments={"p": "a"})],
         )
-        from uclone_x.ui.app import create_ui_app
+        from uclone_x.ui.app import AgentSessionManager
 
-        app = create_ui_app(static_dir=tmp_path, llm=llm, tools=registry, storage_dir=tmp_path)
+        manager = AgentSessionManager(llm=llm, tools=registry, storage_dir=tmp_path)
         session_id = "sess_ui_events"
-        res = TestClient(app).post(
-            "/api/turn",
-            json={"message": "read a", "agent_id": "agent-general", "session_id": session_id},
-        )
-        assert res.status_code == 200, res.text
-        assert cast(dict[str, Any], res.json())["status"] == "success", res.text
+
+        async def turn() -> None:
+            agent = await manager.get_or_create_agent("agent-general", session_id=session_id)
+            result = await agent.execute_turn("read a")
+            assert result.error is None, result.error
+            agent.persist_session(session_id=session_id)  # a turn's events land with its save
+
+        asyncio.run(turn())
 
         log_path = tmp_path / CORE_RECORD_SUBDIR / EVENT_LOG_SUBDIR / f"{session_id}.jsonl"
         assert log_path.is_file(), f"no event log at {log_path}"
@@ -466,18 +468,18 @@ class TestTheDefaultEventLog:
     def test_clearing_history_with_a_live_agent_removes_the_log(self, tmp_path: Path) -> None:
         """ "Clear history" leaves the same disk with or without a live agent.
 
-        With no agent the UI deletes the record, and `delete` removes the log. With a live
-        one it resets the agent's session in place, and before this the log survived: the
+        With no agent `clear_session_history` deletes the record, and `delete` removes the
+        log. With a live one it resets the agent's session in place, and before this the log survived: the
         cleared conversation's tool outputs stayed on disk, and the next turn continued
         the same log after them.
 
-        Killed by: src/uclone_x/agent/base.py :: self._store.clear_event_log(sid)
+        Killed by: src/uclone_x/agent/session_lifecycle.py :: self._store.clear_event_log(sid)
         Becomes: pass
         """
         from uclone_x.core.provenance import Provenance as _Prov
         from uclone_x.tools import LocalTool
         from uclone_x.tools.models import ToolResult
-        from uclone_x.ui.app import create_ui_app
+        from uclone_x.ui.app import AgentSessionManager
 
         class ReadFileTool(LocalTool):
             """Answers differently each call, so each conversation's output is its own."""
@@ -497,28 +499,27 @@ class TestTheDefaultEventLog:
             responses=["Reading.", "Read it.", "A new conversation."],
             tool_calls=[ToolCallRequest(id="call_1", name="read_file", arguments={"p": "a"})],
         )
-        app = create_ui_app(static_dir=tmp_path, llm=llm, tools=registry, storage_dir=tmp_path)
-        client = TestClient(app)
+        manager = AgentSessionManager(llm=llm, tools=registry, storage_dir=tmp_path)
         session_id = "sess_clear"
-        turn = {"message": "read a", "agent_id": "agent-general", "session_id": session_id}
-        assert client.post("/api/turn", json=turn).json()["status"] == "success"
         log_path = tmp_path / CORE_RECORD_SUBDIR / EVENT_LOG_SUBDIR / f"{session_id}.jsonl"
-        assert "first conversation body" in log_path.read_text()
-        manager = app.state.session_manager
-        assert manager.get_agent("agent-general", session_id) is not None, (
-            "no live agent, so this would test the delete branch instead"
-        )
 
-        res = client.delete(
-            "/api/session/history",
-            params={"agent_id": "agent-general", "session_id": session_id},
-        )
-        assert res.status_code == 200, res.text
-        assert not log_path.exists(), "the cleared conversation's events are still on disk"
-        assert not log_path.with_suffix(".cursor").exists()
+        async def conversation() -> None:
+            agent = await manager.get_or_create_agent("agent-general", session_id=session_id)
+            assert (await agent.execute_turn("read a")).error is None
+            agent.persist_session(session_id=session_id)
+            assert "first conversation body" in log_path.read_text()
+            assert manager.get_agent("agent-general", session_id) is not None, (
+                "no live agent, so this would test the delete branch instead"
+            )
 
-        turn["message"] = "hello again"
-        assert client.post("/api/turn", json=turn).json()["status"] == "success"
+            manager.clear_session_history("agent-general", session_id)
+            assert not log_path.exists(), "the cleared conversation's events are still on disk"
+            assert not log_path.with_suffix(".cursor").exists()
+
+            assert (await agent.execute_turn("hello again")).error is None
+            agent.persist_session(session_id=session_id)
+
+        asyncio.run(conversation())
         text = log_path.read_text()
         assert "first conversation body" not in text
         events = _events(log_path)
@@ -562,9 +563,9 @@ class TestRequestContextIsADelta:
         The log carries the conversation as a delta; the tools, identity, slow context and
         turn context come from the session's snapshots (#1421).
 
-        Killed by: src/uclone_x/agent/base.py :: return kept, list(current[kept:])
+        Killed by: src/uclone_x/agent/prompt_assembler.py :: return kept, list(current[kept:])
         Becomes: return kept, list(current[kept + 1:])
-        Killed by: src/uclone_x/agent/base.py :: return kept, list(current[kept:])
+        Killed by: src/uclone_x/agent/prompt_assembler.py :: return kept, list(current[kept:])
         Becomes: return kept, list(current)
         """
         from uclone_x.agent.request_record import rebuild_requests
@@ -604,7 +605,7 @@ class TestRequestContextIsADelta:
         one (276,020 vs 40,430 bytes); the delta makes it 3.1x (53,168 vs 16,950). The
         bound of 5 sits between the two. The count assertion below is the sharper check.
 
-        Killed by: src/uclone_x/agent/base.py :: session.last_conversation = conversation
+        Killed by: src/uclone_x/agent/prompt_assembler.py :: session.last_conversation = conversation
         Becomes: session.last_conversation = []
         """
         small_store = SessionStore(tmp_path / "small")

@@ -2,6 +2,7 @@ name: scout
 role: Research & Search Specialist
 description: Neutral, fact-focused research specialist and intelligence gatherer.
 allowed_tools:
+  - set_avatar
   - web_search
   - web_fetch
   - file_read

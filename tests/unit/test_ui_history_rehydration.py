@@ -6,23 +6,20 @@ Pins fidelity of ChatMessage reconstruction across USER, ASSISTANT, and TOOL rol
 - Distinguishes absent/None content from genuinely empty string content ("").
 - Fails loudly with SessionHistoryRehydrationError when a TOOL message lacks identity
   and cannot be repaired, preventing unmappable messages from reaching LLM connectors (P6).
-- Preserves tool identity during Core session history synthesis in AgentSessionManager.get_session_history.
 """
 
 from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 import pytest
-from fastapi import HTTPException
-from fastapi.testclient import TestClient
 
 from tests.support.ui_copy import PRINCIPLE_NUMBER
 from uclone_x.errors import SessionHistoryRehydrationError
 from uclone_x.llm.models import ChatMessage, MessageRole, ToolCallRequest
-from uclone_x.ui.app import AgentSessionManager, _translate_session_error, create_ui_app
+from uclone_x.ui.app import AgentSessionManager
 
 
 @pytest.fixture(autouse=True)
@@ -228,6 +225,11 @@ def test_rehydration_tool_message_missing_identity_fails_loudly(tmp_path: Path) 
     nameless tool message to agent.load_history.
 
     Mutation this catches: falling back to a fabricated name or ChatMessage(role=TOOL, name=None).
+
+    The message is copy a reader may be shown, and it names no principle number (#1027).
+
+    Killed by: src/uclone_x/ui/app.py :: "message to the model."
+    Becomes: "message to the model (P6)."
     """
     mgr = AgentSessionManager(storage_dir=tmp_path)
     raw_msgs = [
@@ -245,7 +247,7 @@ def test_rehydration_tool_message_missing_identity_fails_loudly(tmp_path: Path) 
     assert "tool identity" in err_text
     # The refusal says what it refuses to do, in words. It used to be pinned to the string
     # "P6", which is how the principle number survived into a message the head renders
-    # (#1027): `f"Error: {exc}"` becomes the turn's `response`, and the conversation shows it.
+    # (#1027): the retired chat route rendered `f"Error: {exc}"` into the conversation.
     assert "fabricating a tool name" in err_text
     assert not PRINCIPLE_NUMBER.search(err_text)
 
@@ -434,78 +436,6 @@ async def test_get_or_create_agent_legacy_rehydration_refuses_nameless_tool(
     assert "lacks tool identity" in str(exc_info.value)
 
 
-def test_get_session_history_preserves_tool_identity_from_core_store(tmp_path: Path) -> None:
-    """AgentSessionManager.get_session_history preserves tool identity and content fidelity.
-
-    When synthesizing UI presentation messages from Core store's SessionState,
-    name, tool_call_id, and tool_calls must be preserved on the message dicts,
-    and content=None must not be coerced to empty string.
-    """
-    mgr = AgentSessionManager(storage_dir=tmp_path)
-
-    # Hydrate Core store directly with a conversation containing tool calls
-    from uclone_x.agent.session import SessionState
-
-    core_state = SessionState(
-        session_id="sess_core_tools",
-        agent_id="agent_core",
-        turn_counter=2,
-        messages=(
-            ChatMessage(role=MessageRole.USER, content="Run check"),
-            ChatMessage(
-                role=MessageRole.ASSISTANT,
-                content=None,
-                tool_calls=(
-                    ToolCallRequest(id="call_99", name="disk_check", arguments={"dev": "sda"}),
-                ),
-            ),
-            ChatMessage(
-                role=MessageRole.TOOL,
-                name="disk_check",
-                tool_call_id="call_99",
-                content="disk ok",
-            ),
-            ChatMessage(role=MessageRole.ASSISTANT, content="All clear."),
-        ),
-    )
-    mgr.core_store.save(core_state)
-
-    # Ensure in-memory cache and UI transcript do not exist so get_session_history synthesizes
-    history = mgr.get_session_history(agent_id="agent_core", session_id="sess_core_tools")
-
-    assert len(history) == 4
-    # User message
-    assert history[0]["role"] == "user"
-    assert history[0]["content"] == "Run check"
-
-    # Assistant message with tool_calls and content=None preserved
-    assert history[1]["role"] == "assistant"
-    assert history[1]["content"] is None
-    assert "tool_calls" in history[1]
-    assert history[1]["tool_calls"] == [
-        {"id": "call_99", "name": "disk_check", "arguments": {"dev": "sda"}}
-    ]
-
-    # Tool message with name and tool_call_id preserved
-    assert history[2]["role"] == "tool"
-    assert history[2]["name"] == "disk_check"
-    assert history[2]["tool_call_id"] == "call_99"
-    assert history[2]["content"] == "disk ok"
-
-    # Final assistant message
-    assert history[3]["role"] == "assistant"
-    assert history[3]["content"] == "All clear."
-
-
-def test_translate_session_error_maps_rehydration_error_to_422() -> None:
-    """_translate_session_error maps SessionHistoryRehydrationError to 422 Unprocessable Entity."""
-    exc = SessionHistoryRehydrationError("Corrupt history record")
-    http_exc = _translate_session_error(exc)
-    assert isinstance(http_exc, HTTPException)
-    assert http_exc.status_code == 422
-    assert "Corrupt history record" in http_exc.detail
-
-
 def test_rehydration_does_not_mutate_raw_input_and_marks_inferred_name(tmp_path: Path) -> None:
     """reconstruct_history does not mutate input dicts in place and marks inferred names.
 
@@ -602,155 +532,3 @@ def test_rehydration_unrecognized_role_fails_loudly(tmp_path: Path) -> None:
     with pytest.raises(SessionHistoryRehydrationError) as exc_info:
         mgr.reconstruct_history(raw_msgs_no_role_or_sender, session_id="no_role_sess")
     assert "lacks both 'role' and 'sender'" in str(exc_info.value)
-
-
-def test_chat_session_load_failure_reports_session_load_error_provenance(tmp_path: Path) -> None:
-    """POST /api/turn reports SESSION_LOAD_ERROR provenance when session loading fails.
-
-    When session loading fails (e.g. SessionHistoryRehydrationError due to damaged history),
-    provenance.path must NOT read FAILOVER or OFFLINE_FALLBACK (Issue #390, P6).
-    """
-    storage_dir = tmp_path / "sessions"
-    storage_dir.mkdir(parents=True, exist_ok=True)
-    app = create_ui_app(static_dir=tmp_path, storage_dir=storage_dir)
-    client = TestClient(app)
-
-    # Persist a damaged session transcript containing an unrepairable nameless tool message
-    damaged_transcript = {
-        "session_id": "sess_damaged_load",
-        "agent_id": "test-agent",
-        "turns": 1,
-        "messages": [
-            {"role": "user", "content": "hello"},
-            {"role": "tool", "content": "orphaned output with no name"},
-        ],
-    }
-    transcript_file = storage_dir / "sess_damaged_load.json"
-    transcript_file.write_text(json.dumps(damaged_transcript), encoding="utf-8")
-
-    response = client.post(
-        "/api/turn",
-        json={
-            "message": "Continue work",
-            "agent_id": "test-agent",
-            "session_id": "sess_damaged_load",
-        },
-    )
-    assert response.status_code == 200
-    data = cast(dict[str, Any], response.json())
-
-    # Verify status is error
-    assert data["status"] == "error"
-    assert "Error:" in data["response"]
-
-    # Verify provenance path is SESSION_LOAD_ERROR, NEVER FAILOVER or OFFLINE_FALLBACK
-    prov = data["provenance"]
-    assert prov["path"] == "SESSION_LOAD_ERROR"
-    assert prov["path"] != "FAILOVER"
-    assert prov["path"] != "OFFLINE_FALLBACK"
-    assert prov["component"] == "uclone_x.agent.session"
-    assert prov["degraded"] is True
-
-    # Verify durability diagnostic records the rehydration error type
-    durability = data["durability"]
-    assert durability["persisted"] is False
-    assert durability["error_type"] == "SessionHistoryRehydrationError"
-    assert "lacks tool identity" in durability["error"]
-
-
-def test_get_session_history_damaged_record_returns_422(tmp_path: Path) -> None:
-    """GET /api/session/history refuses damaged transcript records with HTTP 422.
-
-    When reading persisted session history containing damaged records (unrepairable tool,
-    invalid role), GET /api/session/history validates history through reconstruct_history
-    and translates SessionHistoryRehydrationError into 422 Unprocessable Entity (Issue #390).
-
-    The body is copy: it reaches the conversation through the turn's `response` and a client
-    through this 422. It names no principle number (#1027).
-
-    Killed by: src/uclone_x/ui/app.py :: "message to the model."
-    Becomes: "message to the model (P6)."
-    """
-    storage_dir = tmp_path / "sessions"
-    storage_dir.mkdir(parents=True, exist_ok=True)
-    app = create_ui_app(static_dir=tmp_path, storage_dir=storage_dir)
-    client = TestClient(app)
-
-    # 1. Persist a session transcript with an unrepairable nameless tool message
-    damaged_transcript = {
-        "session_id": "sess_damaged_tool",
-        "agent_id": "agent-orchestrator",
-        "messages": [
-            {"role": "user", "content": "check"},
-            {"role": "tool", "content": "damaged output without tool name"},
-        ],
-    }
-    (storage_dir / "sess_damaged_tool.json").write_text(
-        json.dumps(damaged_transcript), encoding="utf-8"
-    )
-
-    resp_tool = client.get(
-        "/api/session/history?agent_id=agent-orchestrator&session_id=sess_damaged_tool"
-    )
-    assert resp_tool.status_code == 422
-    tool_detail = resp_tool.json()["detail"]
-    assert "lacks tool identity" in tool_detail
-    assert "fabricating a tool name" in tool_detail
-    assert not PRINCIPLE_NUMBER.search(tool_detail)
-
-    # 2. Persist a session transcript with an unrecognized role string
-    invalid_role_transcript = {
-        "session_id": "sess_damaged_role",
-        "agent_id": "agent-orchestrator",
-        "messages": [
-            {"role": "rogue_role", "content": "invalid role message"},
-        ],
-    }
-    (storage_dir / "sess_damaged_role.json").write_text(
-        json.dumps(invalid_role_transcript), encoding="utf-8"
-    )
-
-    resp_role = client.get(
-        "/api/session/history?agent_id=agent-orchestrator&session_id=sess_damaged_role"
-    )
-    assert resp_role.status_code == 422
-    role_detail = resp_role.json()["detail"]
-    assert "unrecognized role" in role_detail
-    assert "rogue_role" in role_detail
-
-
-def test_chat_with_an_unusable_agent_name_does_not_blame_the_session_store(
-    tmp_path: Path,
-) -> None:
-    """A name the request supplied is not a fault of `uclone_x.agent.session`.
-
-    `AgentHomeError` is raised while the agent's home directory is resolved, inside the
-    broad handler that wraps `get_or_create_agent` -- so it inherited `session_load_failed`
-    and was recorded as `SESSION_LOAD_ERROR` with `component=uclone_x.agent.session`. That
-    record tells whoever reads it to go and look at the session store, which holds nothing
-    to do with the name and has nothing to fix: the mis-attribution P6 forbids (#539 is
-    the same bug for the LLM provider, one branch above).
-
-    Killed by: src/uclone_x/ui/app.py :: session_load_failed and not is_offline and not isinstance(exc, AgentHomeError)
-    Becomes: session_load_failed and not is_offline
-    """
-    storage_dir = tmp_path / "sessions"
-    storage_dir.mkdir(parents=True, exist_ok=True)
-    app = create_ui_app(static_dir=tmp_path, storage_dir=storage_dir)
-    client = TestClient(app)
-
-    response = client.post(
-        "/api/turn",
-        json={"message": "hello", "agent_id": "Champion", "session_id": "sess_bad_name"},
-    )
-
-    assert response.status_code == 200
-    data = cast(dict[str, Any], response.json())
-    assert data["status"] == "error"
-    assert "Champion" in data["response"], "the caller cannot fix a name the reply withholds"
-
-    prov = data["provenance"]
-    assert prov["component"] != "uclone_x.agent.session", (
-        "the session store did not refuse this name and has nothing to fix"
-    )
-    assert prov["path"] != "SESSION_LOAD_ERROR"

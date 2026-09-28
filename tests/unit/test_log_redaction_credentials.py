@@ -134,7 +134,9 @@ class TestRedactingLogWriter:
     def test_log_writer_write_entry_dict_payload(self) -> None:
         """Structured dictionary entries are recursively redacted on write.
 
-        Killed by: src/uclone_x/core/log_writer.py :: def redact_log_payload(payload: Any, placeholder: str = REDACTED_PLACEHOLDER) -> Any:
+        No one-line mutation fails this test: `write_entry` redacts the mapping and
+        `write_line` then redacts the serialized line, so either alone is enough. The
+        recursive redaction is pinned directly by `test_redact_log_payload_direct`.
         """
         buf = io.StringIO()
         writer = RedactingLogWriter(dest=buf)
@@ -152,7 +154,11 @@ class TestRedactingLogWriter:
         assert "ghp_" not in buf.getvalue()
 
     def test_redact_log_payload_direct(self) -> None:
-        """Direct verification of recursive payload redaction function."""
+        """Direct verification of recursive payload redaction function.
+
+        Killed by: src/uclone_x/core/secrets.py :: return redact_credentials(payload, placeholder=placeholder)
+        Becomes: return payload
+        """
         data = ["secret: sk-proj-123456789012345678901234567890", 42, None]
         cleaned = redact_log_payload(data)
         assert isinstance(cleaned, list)
@@ -224,7 +230,8 @@ class TestSessionStateCredentialRedaction:
     def test_redact_message_masks_content_and_arguments(self) -> None:
         """redact_message sanitizes content and tool call arguments.
 
-        Killed by: src/uclone_x/agent/session.py :: def redact_message(message: ChatMessage) -> ChatMessage:
+        Killed by: src/uclone_x/core/session_state.py :: new_content = redact_credentials(message.content)
+        Becomes: new_content = message.content
         """
         msg = ChatMessage(
             role=MessageRole.USER,
@@ -247,7 +254,8 @@ class TestSessionStateCredentialRedaction:
     def test_session_state_creation_redacts_messages(self) -> None:
         """SessionState validator strips credentials on construction.
 
-        Killed by: src/uclone_x/agent/session.py :: def _redact_messages(cls, messages: tuple[ChatMessage, ...]) -> tuple[ChatMessage, ...]:
+        Killed by: src/uclone_x/core/session_state.py :: return tuple(redact_message(m) for m in messages)
+        Becomes: return messages
         """
         state = SessionState(
             session_id="test_sess",
@@ -302,7 +310,11 @@ class TestCompactorCredentialRedaction:
     def test_compactor_prune_and_offload_redacts_credentials(self, tmp_path: Path) -> None:
         """Compactor offloading and truncation redact credentials before saving to disk.
 
-        Killed by: src/uclone_x/llm/compactor.py :: redacted_content = redact_credentials(msg.content)
+        The blob is redacted inside `store_tool_result` (#1640); the stub's start is
+        redacted here.
+
+        Killed by: src/uclone_x/llm/compactor.py :: redact_credentials(msg.content),
+        Becomes: msg.content,
         """
         compactor = ContextCompactor(
             workspace_root=tmp_path,

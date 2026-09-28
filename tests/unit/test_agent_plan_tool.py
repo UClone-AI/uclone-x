@@ -147,9 +147,3 @@ async def test_compaction_preserves_plan(tmp_path: Path) -> None:
     assert loaded is not None
     assert loaded.plan is not None
     assert loaded.plan.title == "Compaction test plan"
-
-
-def test_agent_turn_consumes_max_turns(tmp_path: Path) -> None:
-    """Tool execution (including plan tool) burns turns."""
-    # This is verified implicitly by the standard agent turn execution.
-    pass

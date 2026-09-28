@@ -1,0 +1,18 @@
+id: raon
+name: 라온
+profile: 은월성의 젊은 검사. 예린의 하나뿐인 제자.
+state:
+  status: alive
+  apprentice_of: yerin
+progressions:
+  - at: ch01.s01
+    set: {possesses: [moon_sword]}
+    note: 예린에게서 월광검을 물려받음
+  - at: ch02.s01
+    set: {possesses: []}
+    note: 안개숲에서 카엘에게 월광검을 빼앗김
+visual:
+  tags: [1girl, silver_hair, long_hair, blue_eyes, scar_on_cheek]
+  prose: 허리까지 오는 은발에 푸른 눈. 왼뺨에 가는 흉터가 있다.
+  gender: female
+  base_seed: 41027

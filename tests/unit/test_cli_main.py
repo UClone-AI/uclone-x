@@ -742,6 +742,7 @@ def test_cli_test_check(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
         fail_fast: bool = True,
         test_scope: str = "unit",
         serial: bool = False,
+        **_: object,
     ) -> int:
         captured["test_scope"] = test_scope
         captured["check_frontend"] = check_frontend
@@ -793,6 +794,7 @@ def test_cli_test_unit(monkeypatch: pytest.MonkeyPatch) -> None:
         fail_fast: bool = True,
         test_scope: str = "unit",
         serial: bool = False,
+        **_: object,
     ) -> int:
         captured["test_scope"] = test_scope
         captured["serial"] = serial
@@ -818,6 +820,7 @@ def test_cli_test_e2e(monkeypatch: pytest.MonkeyPatch) -> None:
         fail_fast: bool = True,
         test_scope: str = "unit",
         serial: bool = False,
+        **_: object,
     ) -> int:
         captured["test_scope"] = test_scope
         return 0
@@ -838,6 +841,7 @@ def test_cli_test_pre_release(monkeypatch: pytest.MonkeyPatch) -> None:
         fail_fast: bool = True,
         test_scope: str = "unit",
         serial: bool = False,
+        **_: object,
     ) -> int:
         captured["test_scope"] = test_scope
         return 0
@@ -858,6 +862,7 @@ def test_cli_test_check_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
         fail_fast: bool = True,
         test_scope: str = "unit",
         serial: bool = False,
+        **_: object,
     ) -> int:
         return 1
 
@@ -905,6 +910,7 @@ def _fake_gate_verdict(
         fail_fast: bool = True,
         test_scope: str = "gate",
         serial: bool = False,
+        **_: object,
     ) -> int:
         scopes.append(test_scope)
         if during is not None:

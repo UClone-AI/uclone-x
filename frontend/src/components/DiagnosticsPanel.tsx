@@ -1,7 +1,8 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { AlertTriangle, ExternalLink, ShieldCheck, Trash2 } from 'lucide-react';
-import { failureOf } from '../lib/coreFailure';
-import { SETTINGS_FAILURE } from '../lib/settingsCopy';
+import { CoreFailure, failureOf } from '../lib/coreFailure';
+import { openConfirmedWindow } from '../lib/person';
+import { plural, useCopy } from '../i18n';
 
 /**
  * Local failure recording, and the one-click way to report what was recorded.
@@ -10,6 +11,10 @@ import { SETTINGS_FAILURE } from '../lib/settingsCopy';
  * it is where the question has to be asked. Nothing here uploads: the report is
  * rendered by the backend from a local journal, shown in full, and the "report"
  * button opens a pre-filled GitHub issue that the person still submits.
+ *
+ * The answer is the person's consent, so the Core takes it only from a window it opened
+ * itself (#1589, `lib/person.ts`). A window opened any other way is refused, says so, and
+ * offers to open a confirmed one, as the story view does.
  */
 
 type ConsentState = 'granted' | 'denied' | 'unasked';
@@ -45,6 +50,15 @@ export const DiagnosticsPanel: React.FC = () => {
   const [fetchError, setFetchError] = useState<string | null>(null);
   const [consentError, setConsentError] = useState<string | null>(null);
   const [showBody, setShowBody] = useState(false);
+  // The Core refused the answer from this window: it was not opened by the Core (#1589).
+  const [unconfirmed, setUnconfirmed] = useState(false);
+  const [windowNote, setWindowNote] = useState<string | null>(null);
+  const { settings, diagnostics } = useCopy();
+  const failure = settings.failure;
+  const copy = diagnostics.panel;
+  // Read through a ref so a language switch does not re-run the mount read and clear its error.
+  const failureRef = useRef(failure);
+  failureRef.current = failure;
 
   const refresh = useCallback(async (clearError = false) => {
     try {
@@ -71,7 +85,7 @@ export const DiagnosticsPanel: React.FC = () => {
       // recorded" state rendered over a backend that was failing — the same
       // substitution the backend was just fixed to stop making, one layer up.
       console.error('Failed to read diagnostics state:', err);
-      setFetchError(SETTINGS_FAILURE.diagnosticsRead);
+      setFetchError(failureRef.current.diagnosticsRead);
       setReport(null);
     }
   }, []);
@@ -86,6 +100,8 @@ export const DiagnosticsPanel: React.FC = () => {
     // previous version cleared it on mount only, so a failed save left its
     // banner on screen beside "Recording on" after the next attempt worked.
     setFetchError(null);
+    setUnconfirmed(false);
+    setWindowNote(null);
     try {
       const res = await fetch('/api/diagnostics/consent', {
         method: 'POST',
@@ -102,14 +118,27 @@ export const DiagnosticsPanel: React.FC = () => {
       await refresh();
     } catch (err) {
       console.error('Failed to record the diagnostics choice:', err);
-      setFetchError(SETTINGS_FAILURE.diagnosticsChoice);
+      const refusedHere = err instanceof CoreFailure && err.status === 403;
+      setUnconfirmed(refusedHere);
+      setFetchError(refusedHere ? copy.unconfirmed : failure.diagnosticsChoice);
     } finally {
       setBusy(false);
     }
   };
 
+  const openWindow = async () => {
+    try {
+      await openConfirmedWindow();
+      setWindowNote(copy.windowOpened);
+    } catch (err) {
+      console.error('Diagnostics: no confirmed window opened', err);
+      const tooSoon = err instanceof CoreFailure && err.status === 429;
+      setWindowNote(tooSoon ? copy.windowTooSoon : copy.windowFailed);
+    }
+  };
+
   const clear = async () => {
-    if (!window.confirm('Delete the recorded failures? This cannot be undone.')) {
+    if (!window.confirm(copy.confirmDelete)) {
       return;
     }
     setBusy(true);
@@ -122,7 +151,7 @@ export const DiagnosticsPanel: React.FC = () => {
       await refresh();
     } catch (err) {
       console.error('Failed to delete the recorded failures:', err);
-      setFetchError(SETTINGS_FAILURE.diagnosticsClear);
+      setFetchError(failure.diagnosticsClear);
     } finally {
       setBusy(false);
     }
@@ -136,23 +165,20 @@ export const DiagnosticsPanel: React.FC = () => {
       <div className="flex items-center gap-2">
         <ShieldCheck className="w-4 h-4 text-cyan-400" />
         <h3 id="diagnostics-heading" className="text-sm font-semibold text-white">
-          Problem reporting
+          {copy.title}
         </h3>
       </div>
 
       <p className="text-xs text-slate-400 leading-relaxed">
-        UClone-X can keep a record of what failed, <strong>on this machine only</strong>. It
-        stores the error type, the code path, your versions, and the error message —
-        never your prompts or the contents of your files. Credentials and home
-        directories are masked by pattern, which catches the shapes that occur rather
-        than everything conceivable. Nothing is uploaded on its own: you read the report
-        and decide.
+        {copy.introBefore}
+        <strong>{copy.introEmphasis}</strong>
+        {copy.introAfter}
       </p>
 
       {state === 'granted' ? (
         <div className="flex flex-wrap items-center gap-2">
           <span className="text-xs px-2 py-1 rounded-lg bg-emerald-950/50 border border-emerald-800/80 text-emerald-200">
-            Recording on
+            {copy.recordingOn}
           </span>
           <button
             type="button"
@@ -160,7 +186,7 @@ export const DiagnosticsPanel: React.FC = () => {
             onClick={() => void decide(false)}
             className="text-xs px-2.5 py-1 rounded-lg border border-slate-700 text-slate-300 hover:bg-slate-800 disabled:opacity-50"
           >
-            Turn off
+            {copy.turnOff}
           </button>
         </div>
       ) : (
@@ -171,10 +197,10 @@ export const DiagnosticsPanel: React.FC = () => {
             onClick={() => void decide(true)}
             className="text-xs px-2.5 py-1 rounded-lg bg-cyan-900/70 border border-cyan-700 text-cyan-100 hover:bg-cyan-800 disabled:opacity-50"
           >
-            Record failures locally
+            {copy.recordLocally}
           </button>
           <span className="text-xs text-slate-500">
-            {state === 'denied' ? 'Currently off, by your choice.' : 'Currently off.'}
+            {state === 'denied' ? copy.offByChoice : copy.off}
           </span>
         </div>
       )}
@@ -183,7 +209,7 @@ export const DiagnosticsPanel: React.FC = () => {
         <div className="p-3 rounded-xl border border-amber-800/80 bg-amber-950/40 space-y-1">
           <div className="flex items-center gap-2 text-xs text-amber-200">
             <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" />
-            <span>Your recording preference could not be read, so collection is off.</span>
+            <span>{copy.preferenceUnreadable}</span>
           </div>
           <p className="text-[11px] text-amber-300/80 font-mono break-all">{consentError}</p>
         </div>
@@ -203,6 +229,17 @@ export const DiagnosticsPanel: React.FC = () => {
             <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0" />
             <span>{fetchError}</span>
           </div>
+          {unconfirmed && (
+            <button
+              type="button"
+              onClick={() => void openWindow()}
+              data-testid="diagnostics-open-confirmed-window"
+              className="text-xs px-2.5 py-1 rounded-lg border border-slate-700 text-slate-300 hover:bg-slate-800"
+            >
+              {copy.openConfirmed}
+            </button>
+          )}
+          {windowNote !== null && <p className="text-[11px] text-slate-300">{windowNote}</p>}
         </div>
       )}
 
@@ -210,7 +247,7 @@ export const DiagnosticsPanel: React.FC = () => {
         <div className="p-3 rounded-xl border border-rose-800/80 bg-rose-950/50 space-y-1">
           <div className="flex items-center gap-2 text-xs text-rose-200">
             <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0" />
-            <span>New failures are not being recorded.</span>
+            <span>{copy.recordingBlocked}</span>
           </div>
           <p className="text-[11px] text-rose-300/80 font-mono break-all">
             {report.recording_blocked}
@@ -222,12 +259,11 @@ export const DiagnosticsPanel: React.FC = () => {
         <div className="p-3 rounded-xl border border-rose-800/80 bg-rose-950/50 space-y-1">
           <div className="flex items-center gap-2 text-xs text-rose-200">
             <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0" />
-            <span>The failure journal could not be read.</span>
+            <span>{copy.journalUnreadable}</span>
           </div>
           <p className="text-[11px] text-rose-300/80 font-mono break-all">{report.error}</p>
           <p className="text-[11px] text-slate-400">
-            This is not the same as having nothing to report — whatever was recorded is
-            still on disk and unreadable to the dashboard.
+            {copy.journalUnreadableNote}
           </p>
         </div>
       )}
@@ -236,13 +272,12 @@ export const DiagnosticsPanel: React.FC = () => {
         <div className="p-3 rounded-xl border border-slate-800 bg-slate-950/60 space-y-2">
           <div className="flex items-center gap-2 text-xs text-amber-200">
             <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" />
-            <span>
-              {recorded} failure{recorded === 1 ? '' : 's'} recorded ({report.distinct} distinct)
-              {report.unreadable_lines > 0
-                ? `, ${report.unreadable_lines} unreadable line(s) omitted`
-                : ''}
-              .
-            </span>
+            <span>{report.unreadable_lines > 0
+                ? plural(copy.recordedWithUnreadable, recorded, {
+                    distinct: report.distinct,
+                    unreadable: report.unreadable_lines,
+                  })
+                : plural(copy.recorded, recorded, { distinct: report.distinct })}</span>
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
@@ -251,7 +286,7 @@ export const DiagnosticsPanel: React.FC = () => {
               onClick={() => setShowBody((shown) => !shown)}
               className="text-xs px-2.5 py-1 rounded-lg border border-slate-700 text-slate-300 hover:bg-slate-800"
             >
-              {showBody ? 'Hide report' : 'Show what would be sent'}
+              {showBody ? copy.hideReport : copy.showReport}
             </button>
 
             {report.issue_url ? (
@@ -261,11 +296,11 @@ export const DiagnosticsPanel: React.FC = () => {
                 rel="noreferrer"
                 className="text-xs px-2.5 py-1 rounded-lg bg-cyan-900/70 border border-cyan-700 text-cyan-100 hover:bg-cyan-800 inline-flex items-center gap-1.5"
               >
-                Report on GitHub <ExternalLink className="w-3 h-3" />
+                {copy.reportOnGithub} <ExternalLink className="w-3 h-3" />
               </a>
             ) : (
               <span className="text-xs text-slate-400">
-                Too long to pre-fill — copy the report below into a new issue.
+                {copy.tooLong}
               </span>
             )}
 
@@ -276,7 +311,7 @@ export const DiagnosticsPanel: React.FC = () => {
                 rel="noreferrer"
                 className="text-xs text-slate-400 underline hover:text-slate-200"
               >
-                Already reported?
+                {copy.alreadyReported}
               </a>
             )}
 
@@ -286,7 +321,7 @@ export const DiagnosticsPanel: React.FC = () => {
               onClick={() => void clear()}
               className="text-xs px-2.5 py-1 rounded-lg border border-slate-700 text-slate-400 hover:bg-slate-800 inline-flex items-center gap-1.5 disabled:opacity-50"
             >
-              <Trash2 className="w-3 h-3" /> Delete
+              <Trash2 className="w-3 h-3" /> {copy.delete}
             </button>
           </div>
 
@@ -294,7 +329,7 @@ export const DiagnosticsPanel: React.FC = () => {
             <textarea
               readOnly
               value={report.body}
-              aria-label="Report contents"
+              aria-label={copy.reportContents}
               className="w-full h-48 text-[11px] font-mono bg-slate-950 border border-slate-800 rounded-lg p-2 text-slate-300"
             />
           )}

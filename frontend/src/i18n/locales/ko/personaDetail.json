@@ -1,0 +1,16 @@
+{
+  "model": "모델",
+  "temperature": "Temperature",
+  "maxTokens": "Max tokens",
+  "tools": "도구",
+  "notSet": "설정 안 됨",
+  "noTools": "도구 목록이 없습니다. 이 클론은 런타임의 모든 도구를 쓸 수 있습니다.",
+  "writeAccess": {
+    "on": "파일을 쓸 수 있습니다",
+    "off": "파일을 쓸 수 없습니다"
+  },
+  "subagentAccess": {
+    "on": "하위 에이전트를 시작할 수 있습니다",
+    "off": "하위 에이전트를 시작할 수 없습니다"
+  }
+}

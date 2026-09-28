@@ -281,3 +281,40 @@ def test_list_session_summaries_and_plan_inspection() -> None:
         assert details.plan_title == "Refactor Session"
         assert details.plan_steps_total == 2
         assert details.plan_steps_completed == 1
+
+
+def test_check_a_stored_tool_result_whose_blob_is_missing(tmp_path: Path) -> None:
+    """A `tr_` handle is checked against the session's artifact directory (#1653).
+
+    Killed by: src/uclone_x/core/session_diagnostics.py :: if not (workspace_root / rel_blob).is_file():
+    Becomes: if False:
+    """
+    store = SessionStore(storage_dir=tmp_path / "sessions")
+    present = "tr_00000000000000aa"
+    missing = "tr_00000000000000bb"
+    blob_dir = tmp_path / ".sandbox" / "tool_artifacts" / "sess_tr"
+    blob_dir.mkdir(parents=True)
+    (blob_dir / f"{present}.txt").write_text("body", encoding="utf-8")
+    calls = (ToolCallRequest(id="c1", name="t"), ToolCallRequest(id="c2", name="t"))
+    state = SessionState.seed("sess_tr", "agent_1").with_messages(
+        (
+            ChatMessage(role=MessageRole.ASSISTANT, content="", tool_calls=calls),
+            ChatMessage(
+                role=MessageRole.TOOL,
+                content=f"[Stored tool result {present}: 9,000 characters]\nx",
+                tool_call_id="c1",
+            ),
+            ChatMessage(
+                role=MessageRole.TOOL,
+                content=f"[Stored tool result {missing}: 9,000 characters]\nx",
+                tool_call_id="c2",
+            ),
+        ),
+        turn_counter=1,
+    )
+    store.save(state)
+
+    report = check_session_health("sess_tr", store=store, workspace_root=tmp_path)
+
+    flagged = [i for i in report.issues if i.code == "MISSING_OFFLOAD_ARTIFACT"]
+    assert [i.details.get("handle") for i in flagged] == [missing]

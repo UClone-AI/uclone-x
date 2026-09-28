@@ -2,12 +2,16 @@ import React from 'react';
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { render, screen, fireEvent, act, waitFor } from '@testing-library/react';
 import { RoomConversation, TYPING_REPORT_INTERVAL_MS } from './RoomConversation';
-import type { AgentInfo, RoomContext, RoomState, RoomTranscriptMessage } from '../../types';
+import type { CloneChoice, RoomContext, RoomState, RoomTranscriptMessage } from '../../types';
 import { EMPTY_LIVE, RoomSendError, RoomsApiError, RoomsNoAnswerError } from '../../lib/rooms';
 import { ABSENCE_CLAIM } from '../../lib/absenceGuard';
-import { makeAgentInfo } from '../../test/fixtures';
+import { makeCloneChoice } from '../../test/fixtures';
 import { expectPlain } from '../../test/plainCopy';
 import failedRows from '../../test/room-failed-rows.json';
+import { LocaleProvider } from '../../i18n';
+import { ko } from '../../i18n/ko';
+import { fmt } from '../../i18n/format';
+import { AvatarChoiceContext } from '../../lib/avatarChoice';
 
 const message = (over: Partial<RoomTranscriptMessage>): RoomTranscriptMessage => ({
   seq: 1,
@@ -38,7 +42,7 @@ const room = (over: Partial<RoomState> = {}): RoomState => ({
   turn_state: { agent_turns_since_human: 0 },
   policy: {
     max_agent_turns_per_human_message: 3,
-    max_span_messages: 40,
+    max_span_tokens: 8000,
     transcript_window: 15,
     hesitation_seconds: 0,
     default_responder_id: '',
@@ -46,15 +50,14 @@ const room = (over: Partial<RoomState> = {}): RoomState => ({
   ...over,
 });
 
-const agents: AgentInfo[] = [makeAgentInfo({ id: 'dba', label: 'DBA', role: 'dba' })];
+const agents: CloneChoice[] = [makeCloneChoice({ id: 'dba', label: 'DBA' })];
 
 /**
  * The composer's text, owned above the component the way `App` owns it (#1290).
  *
- * `draft` is a controlled prop now, because the component does not survive a conversation
- * switch and state kept inside it was destroyed by one. A fixed `draft=""` here would make
- * the box unwritable and every typing case below vacuous, so the harness holds the value
- * for the same reason the real owner does.
+ * The component holds what is in the box and reports every change, and the owner keeps a
+ * copy because the component does not survive a conversation switch. The harness keeps that
+ * copy the way the real owner does, so a case that re-renders the host sees what `App` would.
  */
 const DraftHost: React.FC<{
   initial: string;
@@ -64,7 +67,14 @@ const DraftHost: React.FC<{
   return <RoomConversation {...props} draft={draft} onDraftChange={setDraft} />;
 };
 
-const renderRoom = (over: Partial<React.ComponentProps<typeof RoomConversation>> = {}) => {
+const Korean = ({ children }: { children: React.ReactNode }) => (
+  <LocaleProvider hints={['ko-KR']}>{children}</LocaleProvider>
+);
+
+const renderRoom = (
+  over: Partial<React.ComponentProps<typeof RoomConversation>> = {},
+  { korean = false }: { korean?: boolean } = {},
+) => {
   const { draft = '', onDraftChange: _ignored, ...rest } = over;
   return render(
     <DraftHost
@@ -82,6 +92,7 @@ const renderRoom = (over: Partial<React.ComponentProps<typeof RoomConversation>>
         ...rest,
       }}
     />,
+    korean ? { wrapper: Korean } : undefined,
   );
 };
 
@@ -118,6 +129,24 @@ describe('RoomConversation attribution', () => {
 
     expect(screen.getByTestId('membership-1').textContent).toContain('you');
     expect(screen.getByTestId('membership-1').textContent).not.toContain('Kenny');
+  });
+
+  it('shows a /loop note as the note it is, not as a roster change or as speech', () => {
+    // #1641: the `/loop` help and status lines left the utterance kind so no seat reads
+    // them as conversation. The person who typed the command must still see the answer.
+    // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: ) : message.kind === 'note' ? (
+    // Becomes: ) : message.kind === 'never' ? (
+    renderRoom({
+      room: room({
+        transcript: [
+          message({ seq: 1, sender_id: 'system', kind: 'note', content: 'The loop is off.' }),
+        ],
+      }),
+    });
+
+    expect(screen.getByTestId('note-1')).toHaveTextContent('The loop is off.');
+    expect(screen.queryByTestId('membership-1')).toBeNull();
+    expect(screen.queryByTestId('row-1')).toBeNull();
   });
 
   it('shows an unresolvable sender as its id rather than inventing a name', () => {
@@ -277,7 +306,7 @@ describe('RoomConversation shape', () => {
     expect(screen.getByTestId('row-3')).toHaveTextContent('Critic');
   });
 
-  // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: ? personaAvatarUrl(message.sender_id)
+  // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: ? pictureOf(personaOfSeat(room, message.sender_id), avatarUrls)
   // Becomes: ? undefined
   it('draws each clone`s own picture beside its name in the transcript', () => {
     // A clone wears one picture everywhere it appears -- the rail, its profile, and here --
@@ -405,7 +434,7 @@ describe('RoomConversation shape', () => {
     expect(screen.getByTestId('answering-context-count')).toHaveTextContent('5/20');
   });
 
-  // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: : `${answererContext.active_turns}/${context.saturation_threshold} turns`}
+  // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: : fmt(c.seat.turnsOf, { used: answererContext.active_turns, max: context.saturation_threshold })}
   // Becomes: : `${answererContext.active_turns}/${context.saturation_threshold}`}
   it('names the unit the ring counts in, so its digits cannot be read as tokens', () => {
     // A bare `5/20` an inch above Send is read as tokens -- it was. The ring counts turns,
@@ -418,8 +447,8 @@ describe('RoomConversation shape', () => {
     expect(screen.getByTestId('answering-context-count').textContent).toMatch(/5\/20\s*turns/);
   });
 
-  // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: `${(answererContext.used_tokens ?? 0).toLocaleString()} tokens`}
-  // Becomes: `${(answererContext.used_tokens ?? 0).toLocaleString()}`}
+  // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: fmt(c.seat.tokens, { count: (answererContext.used_tokens ?? 0).toLocaleString() })}
+  // Becomes: (answererContext.used_tokens ?? 0).toLocaleString()}
   it('writes the seat`s token count as tokens, beside the turns the ring draws', () => {
     // The two quantities sit next to each other, so each one says what it is. This seat
     // has no measured window -- `contextFor` reports none unless one is given -- so the
@@ -433,7 +462,7 @@ describe('RoomConversation shape', () => {
     expect(screen.getByTestId('answering-tokens').textContent).toMatch(/12,345\s*tokens/);
   });
 
-  // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: ? 'tokens not counted this run'
+  // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: ? c.seat.tokensNotCounted
   // Becomes: ? '0 tokens'
   it('says a seat`s tokens were not counted this run rather than reporting none spent', () => {
     // P6: the budget manager holds one process's bookings, so a conversation reopened
@@ -472,8 +501,8 @@ describe('RoomConversation shape', () => {
     );
   });
 
-  // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: ? `${participantLabel(soleAnswerer)} has used ${tokenWindow.used.toLocaleString()} of ${tokenWindow.max.toLocaleString()} tokens of context`
-  // Becomes: ? `${participantLabel(soleAnswerer)} has used ${tokenWindow.used.toLocaleString()} of ${tokenWindow.max.toLocaleString()} turns of context`
+  // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: ? fmt(c.seat.ringTokens, { name: participantLabel(soleAnswerer), used: tokenWindow.used.toLocaleString(), max: tokenWindow.max.toLocaleString() })
+  // Becomes: ? fmt(c.seat.ringTurns, { name: participantLabel(soleAnswerer), used: tokenWindow.used.toLocaleString(), max: tokenWindow.max.toLocaleString() })
   it('reads the ring out in the unit it is actually counting', () => {
     // The ring is decoration to a screen reader and its label is the whole of what that
     // reader gets. A label that says turns over a ring drawn to tokens tells one reader
@@ -489,8 +518,8 @@ describe('RoomConversation shape', () => {
     );
   });
 
-  // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: ? `${answererContext.active_turns}/${context.saturation_threshold} turns`
-  // Becomes: ? `${answererContext.active_turns}`
+  // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: ? fmt(c.seat.turnsOf, { used: answererContext.active_turns, max: context.saturation_threshold })
+  // Becomes: ? String(answererContext.active_turns)
   it('keeps the turn count on screen when the ring has taken the tokens', () => {
     // Both ceilings are real and a seat can reach either first: a short conversation can
     // fill a small window, and a long one can hit the turn limit with the window barely
@@ -537,7 +566,7 @@ describe('RoomConversation shape', () => {
     ).not.toBeNull();
   });
 
-  // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: : 'No context window was reported for this model, so the ring counts turns instead of tokens.'
+  // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: : c.seat.noWindow
   // Becomes: : undefined
   it('says why the ring is counting turns when no window was reported', () => {
     // P6: the ring changing unit between two seats is a fact about what could be measured,
@@ -599,8 +628,8 @@ describe('RoomConversation shape', () => {
       expect(screen.getByTestId('answering-model')).toHaveTextContent('hermes3:8b');
     });
 
-    // Killed by: frontend/src/components/rooms/RoomConversation.tsx ::       : (servedModel ?? 'No answer yet');
-    // Becomes:       : servedModel;
+    // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: : (servedModel ?? c.seat.noAnswerYet);
+    // Becomes: : servedModel;
     it('says nothing has served yet, rather than going blank with the header', () => {
       // Both are silent here for the same reason, and one of them has to say why: an
       // absence states its cause (P6). It must not fall back to a model this head merely
@@ -647,7 +676,7 @@ describe('RoomConversation shape', () => {
   // jsdom carries no `SpeechRecognition`, which is the unsupported browser the sibling
   // product renders as a greyed button with a `title` -- unreachable on a touch device and
   // silent everywhere. Pressing it here has to put the cause on the screen.
-  // Killed by: frontend/src/lib/useDictation.ts :: setState({ kind: 'unsupported', reason: DICTATION_UNSUPPORTED });
+  // Killed by: frontend/src/lib/useDictation.ts :: setState({ kind: 'unsupported' });
   // Becomes: setState({ kind: 'idle' });
   it('says why it cannot listen, rather than a mic that does nothing', () => {
     renderRoom({ room: solo({ transcript: exchange }) });
@@ -720,7 +749,7 @@ describe('RoomConversation shape', () => {
     }
   });
 
-  // Killed by: frontend/src/lib/useDictation.ts :: setState({ kind: 'error', message: dictationErrorMessage(event.error) });
+  // Killed by: frontend/src/lib/useDictation.ts :: setState({ kind: 'error', code: event.error });
   // Becomes: setState({ kind: 'idle' });
   it('says on the screen why listening stopped, and what would let it through', () => {
     vi.stubGlobal('SpeechRecognition', FakeRecognition);
@@ -1190,7 +1219,8 @@ describe('RoomConversation composer', () => {
       fireEvent.keyDown(screen.getByTestId('room-composer'), { key: 'Enter' });
 
       await waitFor(() => expect(onSend).toHaveBeenCalledWith('ship it'));
-      expect(screen.getByTestId('room-composer')).toHaveValue('');
+      // The draft clears once the send resolves, a microtask after the call itself.
+      await waitFor(() => expect(screen.getByTestId('room-composer')).toHaveValue(''));
     });
 
     // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: || event.shiftKey
@@ -1290,8 +1320,8 @@ describe('RoomConversation composer', () => {
       expect(screen.getByTestId('room-composer')).toHaveValue('and also');
     });
 
-    // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: aria-label="Send (Enter)"
-    // Becomes: aria-label="Send"
+    // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: aria-label={c.sendLabel}
+    // Becomes: aria-label={c.send}
     it('names the key on the button that does the same thing', () => {
       renderRoom();
 
@@ -1538,8 +1568,8 @@ describe('RoomConversation stops and failures', () => {
   // never of the clone's saved memory, which the set-aside does not touch (#1434).
   // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: {message.knowledge_set_aside ? (
   // Becomes: {false && message.knowledge_set_aside ? (
-  // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: {label}&apos;s knowledge record for this conversation could not be read, so it was
-  // Becomes: {label}&apos;s saved memory could not be read, so it was
+  // Killed by: frontend/src/i18n/locales/en/conversation.json :: "knowledgeSetAside": "{label}'s knowledge record for this conversation could not be read, so it was set aside and kept.",
+  // Becomes: "knowledgeSetAside": "{label}'s saved memory could not be read, so it was set aside and kept.",
   it('says, under a reply, that the knowledge record for this conversation was set aside', () => {
     renderRoom({
       room: room({
@@ -1598,8 +1628,8 @@ describe('RoomConversation stops and failures', () => {
 
   // The reviewer's case on #1400: two different facts, one saved and one not. One success
   // used to silence the row while the reply could claim both.
-  // Killed by: frontend/src/lib/turnOutcome.ts :: if (missed === total) {
-  // Becomes: if (missed > 0) {
+  // Killed by: frontend/src/lib/turnOutcome.ts :: if (missed === total) return plural(copy.memoryNoneSaved, total, { label });
+  // Becomes: if (missed > 0) return plural(copy.memoryNoneSaved, total, { label });
   it('says how many of the facts a reply tried to save were not saved', () => {
     renderRoom({
       room: room({
@@ -1706,8 +1736,8 @@ describe('RoomConversation stops and failures', () => {
   });
 
   it('names the model remedy when the model cannot use tools, and no internals', () => {
-    // Killed by: frontend/src/lib/turnOutcome.ts :: model_without_tools: "its model can't use tools, which clones need",
-    // Becomes: model_without_tools: 'the app refused to run it',
+    // Killed by: frontend/src/i18n/locales/en/conversation.json :: "model_without_tools": "its model can't use tools, which clones need",
+    // Becomes: "model_without_tools": "the app refused to run it",
     renderRoom({
       room: room({
         transcript: [
@@ -1735,6 +1765,128 @@ describe('RoomConversation stops and failures', () => {
     }
   });
 
+  it('says why a retired model stopped the turn, and offers another model instead of Retry (#1630)', () => {
+    // Killed by: frontend/src/lib/turnOutcome.ts :: if (providerFailure) return fmt(copy.providerFailed, { label, message: providerFailure.message });
+    // Becomes: if (false) return fmt(copy.providerFailed, { label, message: providerFailure.message });
+    // Killed by: frontend/src/i18n/locales/en/conversation.json :: "model_unavailable": "Choose another model in Settings, then send your message again.",
+    // Becomes: "model_unavailable": "Try again later.",
+    const plain = 'The model gemini-1.5-pro is not available from Google. It may have been retired, or the name may be misspelled.';
+    renderRoom({
+      room: room({
+        transcript: [
+          message({
+            seq: 1,
+            sender_id: 'scout',
+            content: '',
+            error: plain,
+            refusal: 'model_unavailable',
+            provider_failure: { kind: 'model_unavailable', message: plain, retryable: false },
+          }),
+        ],
+      }),
+    });
+
+    const row = screen.getByTestId('row-error-1');
+    expect(row).toHaveTextContent(`Scout couldn't finish this turn. ${plain}`);
+    expect(screen.queryByTestId('retry-turn')).toBeNull();
+    expect(screen.getByTestId('row-remedy-1')).toHaveTextContent(
+      'Choose another model in Settings, then send your message again.',
+    );
+    expectPlain(row.textContent);
+    expectPlain(screen.getByTestId('row-remedy-1').textContent);
+  });
+
+  it('words a model-unavailable refusal with no provider failure on the row in Korean, not the stored English', () => {
+    // Killed by: frontend/src/i18n/locales/ko/conversation.json :: "model_unavailable": "선택된 모델이 없거나, 선택한 모델을 Provider에서 쓸 수 없습니다",
+    // Becomes: "model_unavailable": "No model is chosen for Google. Pick one in Settings, or pass --model.",
+    const core = 'No model is chosen for Google. Pick one in Settings, or pass --model.';
+    renderRoom(
+      {
+        room: room({
+          transcript: [
+            message({
+              seq: 1,
+              sender_id: 'scout',
+              content: '',
+              error: core,
+              refusal: 'model_unavailable',
+              provider_failure: null,
+            }),
+          ],
+        }),
+      },
+      { korean: true },
+    );
+
+    const row = screen.getByTestId('row-error-1');
+    expect(row).toHaveTextContent(
+      fmt(ko.conversation.outcome.refused, {
+        label: 'Scout',
+        reason: '선택된 모델이 없거나, 선택한 모델을 Provider에서 쓸 수 없습니다',
+      }),
+    );
+    expect(row.textContent).not.toContain('--model');
+    expect(row.textContent).not.toContain('No model is chosen');
+    expect(screen.getByTestId('row-remedy-1')).toHaveTextContent(
+      '설정에서 다른 모델을 고른 뒤 메시지를 다시 보내십시오.',
+    );
+    expect(screen.queryByTestId('retry-turn')).toBeNull();
+    expectPlain(row.textContent);
+  });
+
+  it('says a spent quota is the reason and still offers Retry, since a quota comes back', () => {
+    // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: message.provider_failure,
+    // Becomes: null,
+    const plain =
+      "You've reached Anthropic's usage limit for this API key. Wait a minute and try again, or check your plan with them.";
+    renderRoom({
+      room: room({
+        transcript: [
+          message({
+            seq: 1,
+            sender_id: 'scout',
+            content: '',
+            error: plain,
+            refusal: null,
+            provider_failure: { kind: 'provider_quota', message: plain, retryable: true },
+          }),
+        ],
+      }),
+    });
+
+    const row = screen.getByTestId('row-error-1');
+    expect(row).toHaveTextContent(`Scout couldn't finish this turn. ${plain}`);
+    expect(screen.getByTestId('retry-turn')).toBeInTheDocument();
+    expect(screen.queryByTestId('row-remedy-1')).toBeNull();
+    expectPlain(row.textContent);
+  });
+
+  it('points an unreachable provider at a custom endpoint too, and keeps Retry', () => {
+    // Killed by: frontend/src/i18n/locales/en/conversation.json :: "provider_unreachable": "If you set a custom endpoint in Settings, check that address too."
+    // Becomes: "provider_unreachable_unused": "If you set a custom endpoint in Settings, check that address too."
+    const plain = "Couldn't get an answer from Google. Check your internet connection and try again.";
+    renderRoom({
+      room: room({
+        transcript: [
+          message({
+            seq: 1,
+            sender_id: 'scout',
+            content: '',
+            error: plain,
+            refusal: null,
+            provider_failure: { kind: 'provider_unreachable', message: plain, retryable: true },
+          }),
+        ],
+      }),
+    });
+
+    expect(screen.getByTestId('row-remedy-1')).toHaveTextContent(
+      'If you set a custom endpoint in Settings, check that address too.',
+    );
+    expect(screen.getByTestId('retry-turn')).toBeInTheDocument();
+    expectPlain(screen.getByTestId('row-remedy-1').textContent);
+  });
+
   it('keeps Retry on a failure that carries no refusal (#969)', () => {
     renderRoom({
       room: room({
@@ -1755,8 +1907,8 @@ describe('RoomConversation stops and failures', () => {
     renderRoom({
       onAddAgent,
       availableAgents: [
-        makeAgentInfo({ id: 'scout', label: 'Scout' }),
-        makeAgentInfo({ id: 'dba', label: 'DBA' }),
+        makeCloneChoice({ id: 'scout', label: 'Scout' }),
+        makeCloneChoice({ id: 'dba', label: 'DBA' }),
       ],
     });
 
@@ -1777,7 +1929,7 @@ describe('RoomConversation invite list', () => {
     expect(screen.getByTestId('invite-empty-cause')).toHaveTextContent('No clones are running yet');
     unmount();
 
-    renderRoom({ availableAgents: [makeAgentInfo({ id: 'scout' })] });
+    renderRoom({ availableAgents: [makeCloneChoice({ id: 'scout' })] });
     fireEvent.click(screen.getByTestId('add-someone'));
     expect(screen.getByTestId('invite-empty-cause')).toHaveTextContent(
       'Everyone available is already in this conversation',
@@ -2136,7 +2288,7 @@ describe('RoomConversation at a width the viewport cannot see (#1227)', () => {
         : '';
     });
 
-  // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: aria-label="Clear this conversation"
+  // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: aria-label={t.header.clearLabel}
   // Becomes: aria-label=""
   it('keeps a name on every control whose label the narrow column hides', () => {
     // Both renders, because the five controls never share one: Clear needs a conversation
@@ -2794,8 +2946,8 @@ describe('RoomConversation failure copy (#1408)', () => {
       room: room({ transcript: [message(rows[name])] }),
     });
 
-  // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: <p>{turnFailureSentence(label, message.refusal, message.completed)}</p>
-  // Becomes: <p>{label} couldn&apos;t finish this turn: {message.error}</p>
+  // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: {turnFailureSentence(
+  // Becomes: {((..._args: unknown[]) => message.error)(
   it.each([
     'raised',
     'provider',
@@ -2823,8 +2975,8 @@ describe('RoomConversation failure copy (#1408)', () => {
     expectPlain(line.textContent);
   });
 
-  // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: it could not be saved.
-  // Becomes: it could not be saved: {message.persist_error}
+  // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: {fmt(t.row.unsaved, { label })}
+  // Becomes: {fmt(t.row.unsaved, { label })}: {message.persist_error}
   it('says a reply was not saved without printing why', () => {
     renderRow('unsaved');
     const line = screen.getByTestId(`row-unsaved-${rows.unsaved.seq}`);
@@ -2849,8 +3001,8 @@ describe('RoomConversation failure copy (#1408)', () => {
   });
 
   // A send that got no answer may have been stored, so it is not called "not sent" (#1441).
-  // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: setSendError(sendFailureNotice(err));
-  // Becomes: setSendError(err instanceof Error ? err.message : String(err));
+  // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: {sendFailureNotice(sendError.cause, c.sendFailure)}
+  // Becomes: {sendError.cause instanceof Error ? sendError.cause.message : String(sendError.cause)}
   it('says a send that never got an answer plainly, claims nothing, and keeps the draft', async () => {
     // What `fetch` rejects with when the Core is not there, as `roomsApi` wraps it.
     const noAnswer = new RoomsNoAnswerError(new TypeError('Failed to fetch'));
@@ -2882,7 +3034,7 @@ describe('RoomConversation failure copy (#1408)', () => {
 });
 
 describe('RoomConversation autonomous discussion toggle', () => {
-  // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: <span className="column-icon-only">Auto discuss</span>
+  // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: <span className="column-icon-only">{t.header.autoDiscuss}</span>
   // Becomes: <span className="column-icon-only">자율 토론</span>
   it('renders the autonomous toggle in English with proper accessible labels and invokes callback', () => {
     const onToggleAutonomous = vi.fn();
@@ -2891,7 +3043,7 @@ describe('RoomConversation autonomous discussion toggle', () => {
       room: room({
         policy: {
           max_agent_turns_per_human_message: 3,
-          max_span_messages: 40,
+          max_span_tokens: 8000,
           transcript_window: 15,
           hesitation_seconds: 0,
           default_responder_id: '',
@@ -2919,7 +3071,7 @@ describe('RoomConversation autonomous discussion toggle', () => {
           room: room({
             policy: {
               max_agent_turns_per_human_message: 3,
-              max_span_messages: 40,
+              max_span_tokens: 8000,
               transcript_window: 15,
               hesitation_seconds: 0,
               default_responder_id: '',
@@ -2953,3 +3105,176 @@ describe('RoomConversation autonomous discussion toggle', () => {
   });
 });
 
+
+describe('a clone`s picture in the conversation', () => {
+  // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: imageSrc={pictureOf(personaOfSeat(room, agent.id), avatarUrls)}
+  // Becomes: imageSrc={pictureOf(agent.id, avatarUrls)}
+  it('draws the picture the listing gives, and the clone behind a second seat', () => {
+    // The listed address changes with the picture, so a new one shows here as soon as the
+    // listing is read again; a second seat of the same clone wears the clone's picture.
+    renderRoom({
+      room: room({
+        participants: [
+          { id: 'user', kind: 'human', display_name: 'Kenny' },
+          { id: 'scout-2', kind: 'agent', display_name: 'Scout', persona: 'scout' },
+          { id: 'critic', kind: 'agent', display_name: 'Critic' },
+        ],
+        transcript: [message({ seq: 1, sender_id: 'scout-2', content: 'looked again' })],
+      }),
+      avatarUrls: { scout: '/api/personas/scout/avatar?v=new' },
+    });
+
+    expect(screen.getByTestId('row-1').querySelector('img')).toHaveAttribute(
+      'src',
+      '/api/personas/scout/avatar?v=new',
+    );
+    // The row and the seat strip both: the strip read the seat id before.
+    expect(document.querySelectorAll('img[src="/api/personas/scout/avatar?v=new"]').length).toBeGreaterThanOrEqual(2);
+  });
+
+  // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: value={isAgent ? personaOfSeat(room, message.sender_id) : null}
+  // Becomes: value={null}
+  it('offers a drawn picture to the clone that wrote the message', () => {
+    render(
+      <AvatarChoiceContext.Provider
+        value={{ clones: [{ name: 'scout', label: 'scout' }], onChanged: vi.fn(), askFor: vi.fn() }}
+      >
+        <DraftHost
+          initial=""
+          props={{
+            room: room({
+              transcript: [
+                message({
+                  seq: 1,
+                  sender_id: 'scout',
+                  content: '![me](/api/artifacts/content?path=artifacts/images/a.png)',
+                }),
+              ],
+            }),
+            availableAgents: agents,
+            live: EMPTY_LIVE,
+            onSend: () => {},
+            onStop: () => {},
+            onRetry: () => {},
+            onAddAgent: () => {},
+            onTyping: () => {},
+            onOpenTurn: () => {},
+          }}
+        />
+      </AvatarChoiceContext.Provider>,
+    );
+
+    expect(screen.getByTestId('use-as-avatar-btn')).toHaveAttribute('title', expect.stringContaining('scout'));
+  });
+
+  // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: const next = current.trim() === '' ? insertDraft.text : `${current.trimEnd()}\n\n${insertDraft.text}`;
+  // Becomes: const next = insertDraft.text;
+  // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: if (insertDraft === null || insertedRef.current === insertDraft.id) return;
+  // Becomes: if (insertDraft === null) return;
+  it('puts a prepared request after what is typed, once, and does not send it', () => {
+    const onSend = vi.fn();
+    const request = { id: 1, text: 'Please draw a few pictures.' };
+    const { rerender } = renderRoom({ draft: 'hello', onSend, insertDraft: request });
+
+    expect(screen.getByTestId('room-composer')).toHaveValue('hello\n\nPlease draw a few pictures.');
+    expect(onSend).not.toHaveBeenCalled();
+
+    // The person deletes the request; the same request again -- any later render -- adds nothing back.
+    fireEvent.change(screen.getByTestId('room-composer'), { target: { value: 'hello' } });
+    rerender(
+      <DraftHost
+        initial="hello"
+        props={{
+          room: room(),
+          availableAgents: agents,
+          live: EMPTY_LIVE,
+          onSend,
+          onStop: () => {},
+          onRetry: () => {},
+          onAddAgent: () => {},
+          onTyping: () => {},
+          onOpenTurn: () => {},
+          // A new object for the same request, as a re-render of the owner makes.
+          insertDraft: { ...request },
+        }}
+      />,
+    );
+    expect(screen.getByTestId('room-composer')).toHaveValue('hello');
+  });
+
+  // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: if (!current.includes(insertDraft.text)) {
+  // Becomes: if (true) {
+  it('asked twice, keeps the request in the box once (#1780)', () => {
+    const request = 'Please draw a few pictures.';
+    const props = {
+      room: room(),
+      availableAgents: agents,
+      live: EMPTY_LIVE,
+      onSend: () => {},
+      onStop: () => {},
+      onRetry: () => {},
+      onAddAgent: () => {},
+      onTyping: () => {},
+      onOpenTurn: () => {},
+    };
+    const { rerender } = render(<DraftHost initial="hello" props={{ ...props, insertDraft: { id: 1, text: request } }} />);
+    // A second "Ask … to make one": a new id, the same words.
+    rerender(<DraftHost initial="hello" props={{ ...props, insertDraft: { id: 2, text: request } }} />);
+
+    expect(screen.getByTestId('room-composer')).toHaveValue(`hello\n\n${request}`);
+  });
+
+  // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: <AvatarAuthorContext.Provider value={isAgent ? personaOfSeat(room, message.sender_id) : null}>
+  // Becomes: <AvatarAuthorContext.Provider value={isAgent ? message.sender_id : null}>
+  it('offers a picture from a second seat to the clone, not the seat (#1780)', async () => {
+    // `writer-2` is the second seat of writer; no clone is named `writer-2`, so giving
+    // the picture to the seat id would be refused as a clone that is not here.
+    const calls: string[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string) => {
+        calls.push(url);
+        return new Response(JSON.stringify({ status: 'ok' }), { status: 200 });
+      }),
+    );
+    render(
+      <AvatarChoiceContext.Provider
+        value={{ clones: [{ name: 'writer', label: 'Writer' }], onChanged: vi.fn(), askFor: vi.fn() }}
+      >
+        <DraftHost
+          initial=""
+          props={{
+            room: room({
+              participants: [
+                { id: 'user', kind: 'human', display_name: 'Kenny' },
+                { id: 'writer', kind: 'agent', display_name: 'Writer', persona: 'writer' },
+                { id: 'writer-2', kind: 'agent', display_name: 'Writer', persona: 'writer' },
+              ],
+              transcript: [
+                message({
+                  seq: 1,
+                  sender_id: 'writer-2',
+                  content: '![me](/api/artifacts/content?path=artifacts/images/w.png)',
+                }),
+              ],
+            }),
+            availableAgents: agents,
+            live: EMPTY_LIVE,
+            onSend: () => {},
+            onStop: () => {},
+            onRetry: () => {},
+            onAddAgent: () => {},
+            onTyping: () => {},
+            onOpenTurn: () => {},
+          }}
+        />
+      </AvatarChoiceContext.Provider>,
+    );
+
+    fireEvent.click(screen.getByTestId('use-as-avatar-btn'));
+
+    await waitFor(() => expect(calls).toContain('/api/personas/writer/avatar'));
+    expect(calls).not.toContain('/api/personas/writer-2/avatar');
+    vi.unstubAllGlobals();
+  });
+});

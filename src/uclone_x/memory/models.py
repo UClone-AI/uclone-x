@@ -4,12 +4,17 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from uclone_x.core.provenance import Provenance
 from uclone_x.errors import MissingProvenanceError
+
+#: How a fact came to be known (clone-knowledge-graph design §3.2). `told`: extracted from
+#: what a person wrote. `found`: extracted from a tool result the clone received. `saved`:
+#: the model called `record_memory_fact`. `corrected`: a person edited it.
+FactOrigin = Literal["told", "found", "saved", "corrected"]
 
 
 def utc_now_iso() -> str:
@@ -55,6 +60,22 @@ class MemoryFact(BaseModel):
     source_session_id: str = Field(
         min_length=1,
         description="Session ID where this fact was originally established or observed.",
+    )
+    origin: FactOrigin = Field(
+        default="saved",
+        description="How the fact came to be known. Defaults to `saved` so a row written "
+        "before this field existed, which has no `origin` key, loads as the only kind of "
+        "fact there was then: one the model saved with `record_memory_fact`.",
+    )
+    source_room_id: str | None = Field(
+        default=None,
+        description="The conversation (room) the fact was learned in. `None` outside a "
+        "conversation, and for rows written before this field existed.",
+    )
+    source_turn_id: str | None = Field(
+        default=None,
+        description="The room turn the fact was learned in, the id the room's row carries. "
+        "`None` outside a room turn, and for rows written before this field existed.",
     )
     created_at: str = Field(
         default_factory=utc_now_iso,

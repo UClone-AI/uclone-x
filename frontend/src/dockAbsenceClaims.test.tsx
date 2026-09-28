@@ -221,7 +221,7 @@ describe('the dock makes no categorical absence claim (#1374)', () => {
     expect(offences).toEqual([]);
   });
 
-  // Killed by: frontend/src/components/artifacts/DocViewer.tsx :: ? listing.reason ?? `No files are listed yet. ${listing.scope_note ?? ''}`.trim()
+  // Killed by: frontend/src/components/artifacts/DocViewer.tsx :: ? listing.reason ?? fmt(t.noneListed, { scope: listing.scope_note ?? '' }).trim()
   // Becomes: ? listing.reason ?? 'No file has been written in this conversation yet.'
   it('Docs, empty and with no reason from the Core, says only what is listed', async () => {
     answers['/api/rooms/room-a/artifacts'] = artifacts({});
@@ -231,7 +231,7 @@ describe('the dock makes no categorical absence claim (#1374)', () => {
     expect(text(container)).not.toMatch(ABSENCE_CLAIM);
   });
 
-  // Killed by: frontend/src/components/artifacts/ActivityTimeline.tsx :: return `No tool calls are listed for ${name}'s ${recordedTurns} recorded ${recordedTurns === 1 ? 'turn' : 'turns'} here.`;
+  // Killed by: frontend/src/components/artifacts/ActivityTimeline.tsx :: return plural(t.noCalls, recordedTurns, { name });
   // Becomes: return `${name} took ${recordedTurns} turns here without using a tool.`;
   it('Activity, for turns with no tool calls listed, says none are listed and what the list covers', async () => {
     answers['/api/rooms/room-a/seats/scout/history'] = history({ turns: [answered([])] });
@@ -244,7 +244,7 @@ describe('the dock makes no categorical absence claim (#1374)', () => {
   });
 
   // The header's count is of the calls listed, not a total of what the clone did.
-  // Killed by: frontend/src/components/artifacts/ActivityTimeline.tsx :: {filteredActivities.length} listed
+  // Killed by: frontend/src/components/artifacts/ActivityTimeline.tsx :: {fmt(t.listed, { count: filteredActivities.length })}
   // Becomes: {filteredActivities.length} calls
   it('Activity, for a seat with no turns and no reason from the Core, claims nothing', async () => {
     answers['/api/rooms/room-a/seats/scout/history'] = history({});
@@ -257,7 +257,7 @@ describe('the dock makes no categorical absence claim (#1374)', () => {
     expect(text(container)).not.toMatch(ABSENCE_CLAIM);
   });
 
-  // Killed by: frontend/src/components/artifacts/ActivityTimeline.tsx :: <span>May have written to a file without naming it, so nothing can be opened from here.</span>
+  // Killed by: frontend/src/components/artifacts/ActivityTimeline.tsx :: <span>{t.wroteUnnamed}</span>
   // Becomes: <span>Wrote to a file without naming it, so it can't be opened from here.</span>
   it('Activity says a call *may* have written without naming a path', async () => {
     answers['/api/rooms/room-a/seats/scout/history'] = history({
@@ -307,5 +307,24 @@ describe('the dock makes no categorical absence claim (#1374)', () => {
     );
     expect(text(container)).not.toMatch(/has not remembered anything yet/);
     expect(text(container)).not.toMatch(ABSENCE_CLAIM);
+  });
+});
+
+//: The catalogs the dock's product panels read their sentences from (`multilingual-ui.md`).
+const DOCK_CATALOGS: Record<string, string> = import.meta.glob(
+  ['./i18n/locales/en/dock.json', './i18n/locales/en/toolSteps.json'],
+  { query: '?raw', import: 'default', eager: true },
+);
+
+describe('the dock catalogs (#1366, #1374)', () => {
+  // `DOCK_SOURCES` are `.tsx` files; the sentences they rendered now live in these catalogs,
+  // so the source scan above no longer reads them.
+  // Killed by: frontend/src/i18n/locales/en/dock.json :: "noneKnown": "No remembered statements are listed for {name}.",
+  // Becomes: "noneKnown": "{name} remembers nothing.",
+  it('holds no such claim in the English dock copy', () => {
+    const paths = Object.keys(DOCK_CATALOGS);
+    expect(paths).toHaveLength(2);
+    const offences = paths.flatMap((path) => absenceClaims(path, copyLines(DOCK_CATALOGS[path])));
+    expect(offences).toEqual([]);
   });
 });

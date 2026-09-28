@@ -14,8 +14,10 @@ own.
 
 from __future__ import annotations
 
+from datetime import datetime
+from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 if TYPE_CHECKING:
     # Import-time cycle, annotation-time not: `uclone_x.agent.session` imports this
@@ -49,6 +51,7 @@ __all__ = [
     "LLMConnectorNotConfiguredError",
     "LLMCredentialsNotConfiguredError",
     "LLMError",
+    "LLMModelNotConfiguredError",
     "LLMProviderError",
     "LLMProviderNotConfiguredError",
     "LLMStreamInterruptedError",
@@ -65,6 +68,7 @@ __all__ = [
     "MissingDependencyError",
     "MissingProvenanceError",
     "ModelLacksToolSupportError",
+    "ModelNotAvailableError",
     "NothingToRetryError",
     "OntologyContradictionError",
     "OntologyError",
@@ -78,6 +82,13 @@ __all__ = [
     "PlanGenerationError",
     "PromotionCriteriaNotMetError",
     "ProvenanceError",
+    "ProviderAuthError",
+    "ProviderFailureError",
+    "ProviderFailureKind",
+    "ProviderOutageError",
+    "ProviderQuotaError",
+    "ProviderResponseError",
+    "ProviderUnreachableError",
     "PushNotificationNotSupportedError",
     "RoomAlreadyExistsError",
     "RoomError",
@@ -86,10 +97,10 @@ __all__ = [
     "SandboxViolationError",
     "SeatKnowledgeUnreadableError",
     "SecondHumanInRoomError",
+    "SessionEventLogNotConfiguredError",
     "SessionHistoryRehydrationError",
     "SessionIdCollisionError",
     "SessionMutationDuringTurnError",
-    "SessionEventLogNotConfiguredError",
     "SessionStoreNotConfiguredError",
     "SessionSwitchWhileRunningError",
     "SkillAuditError",
@@ -98,6 +109,7 @@ __all__ = [
     "StaleRoomWriteError",
     "StaleSessionWriteError",
     "StepBudgetExceededError",
+    "StructuredOutputUnsupportedError",
     "TaskNotCancelableError",
     "TaskNotFoundError",
     "TelemetryError",
@@ -128,7 +140,15 @@ class PlainRefusalError(UCloneXError):
     Its message is shown as it is: a tool that raises one fails with exactly this text,
     not with the exception's class name and a prefix around it, so the refusal a
     conversation shows is plain words (#1555).
+
+    `reason_code`, when given, is a short stable name for *why* (`no_image_engine`): the
+    tool's result carries it as `{"reason_code": ...}` in its output, so a caller can
+    branch on the reason without parsing the sentence.
     """
+
+    def __init__(self, message: str, *, reason_code: str | None = None) -> None:
+        super().__init__(message)
+        self.reason_code = reason_code
 
 
 class MemoryStoreUnreadableError(UCloneXError):
@@ -402,6 +422,36 @@ class BudgetExceededError(UCloneXError):
 
     Principle 6 classifies a quota ceiling as never eligible for retry, failover or
     substitution: it must propagate.
+    """
+
+
+class UsageLimitReachedError(BudgetExceededError):
+    """The user's own limit on paid-model tokens is reached (`llm-token-gateway.md` §4.3).
+
+    Raised by the usage gate before a paid call is sent, so no request reaches the
+    provider. The message is written for a person: which window, when it lifts, and the
+    two remedies. It carries no token figure, code or class name.
+
+    Distinct from `ProviderQuotaError`, which is the provider's limit on the user's
+    account. This one is the limit the user set in UClone-X. It is never retried and never
+    answered by switching to another provider or a local model (P6): the choice is the
+    user's.
+    """
+
+    def __init__(self, message: str, *, window: str, available_again_at: datetime) -> None:
+        super().__init__(message)
+        #: The window whose limit is reached: `per_10_minutes`, `per_5_hours` or `per_week`.
+        self.window = window
+        #: When usage in that window falls back under its limit, timezone-aware.
+        self.available_again_at = available_again_at
+
+
+class UsageLimitsUnreadableError(PlainRefusalError):
+    """A usage limit is set to something that is not a number of tokens.
+
+    Refused rather than ignored: an unreadable limit silently treated as "no limit" would
+    spend past a ceiling the user believes is set (P6). The message names where the value
+    came from, so it can be corrected.
     """
 
 
@@ -692,11 +742,174 @@ class ModelLacksToolSupportError(LLMProviderError):
         self.model = model
 
 
+class StructuredOutputUnsupportedError(LLMProviderError):
+    """The connector cannot constrain a reply to a JSON schema (`LLMRequest.response_schema`).
+
+    Raised before any request is sent. A connector that dropped the schema and answered
+    anyway would hand the caller free text it asked to be structured, with nothing on the
+    result saying so (P6), so the ones that have no faithful mapping refuse instead. A
+    caller that can do without structure -- the image-set planner -- catches this and
+    skips the structured call.
+    """
+
+    def __init__(self, provider: str) -> None:
+        super().__init__(f"The {provider} connector cannot constrain a reply to a JSON schema.")
+        self.provider = provider
+
+
+class ProviderFailureKind(StrEnum):
+    """What went wrong on a hosted provider's side of a model call (#1630).
+
+    One member per remedy, because telling them apart is only worth doing when each asks
+    something different of the person using the app: a retired model needs another model,
+    a rejected key a new key, a spent quota time or a plan, an unreachable host a
+    connection, an outage patience. A value is also the `TurnStopReason` of a turn that
+    failed on it, so a consumer branches on a field and not on a provider's wording.
+    """
+
+    MODEL_UNAVAILABLE = "model_unavailable"
+    PROVIDER_AUTH = "provider_auth"
+    PROVIDER_QUOTA = "provider_quota"
+    PROVIDER_UNREACHABLE = "provider_unreachable"
+    PROVIDER_OUTAGE = "provider_outage"
+    PROVIDER_ERROR = "provider_error"
+
+
+class ProviderFailureError(LLMProviderError):
+    """A hosted provider's failure, told as what stopped and whose side it is on (#1630).
+
+    The message is written for someone new to model providers: it names the provider and,
+    where it matters, the model, and carries no status code, response body, URL or class
+    name, so a surface may show `str()` as is. The raw response is logged where the failure
+    is classified (`uclone_x.llm.connectors.failures`). *Where* to act -- Settings, a flag,
+    an environment variable -- is the head's to say (P8), as it is for
+    `ModelLacksToolSupportError`.
+
+    `retryable` is whether the same request can succeed later with nothing changed. A
+    retired model and a rejected key cannot, so a head offers no Retry for them.
+    """
+
+    kind: ClassVar[ProviderFailureKind]
+    retryable: ClassVar[bool] = True
+
+    def __init__(self, message: str, *, provider: str, model: str) -> None:
+        super().__init__(message)
+        self.provider = provider
+        self.model = model
+
+
+class ModelNotAvailableError(ProviderFailureError):
+    """The provider does not serve the requested model: retired, or misspelled."""
+
+    kind = ProviderFailureKind.MODEL_UNAVAILABLE
+    retryable = False
+
+    def __init__(self, *, provider: str, model: str) -> None:
+        super().__init__(
+            f"The model {model} is not available from {provider}. It may have been "
+            "retired, or the name may be misspelled.",
+            provider=provider,
+            model=model,
+        )
+
+
+class ProviderAuthError(ProviderFailureError):
+    """The provider refused the API key: wrong, revoked, or without access."""
+
+    kind = ProviderFailureKind.PROVIDER_AUTH
+    retryable = False
+
+    def __init__(self, *, provider: str, model: str) -> None:
+        super().__init__(f"{provider} did not accept the API key.", provider=provider, model=model)
+
+
+class ProviderQuotaError(ProviderFailureError):
+    """The key has run into the provider's rate limit, quota or credit balance."""
+
+    kind = ProviderFailureKind.PROVIDER_QUOTA
+
+    def __init__(self, *, provider: str, model: str) -> None:
+        super().__init__(
+            f"You've reached {provider}'s usage limit for this API key. Wait a minute and "
+            "try again, or check your plan with them.",
+            provider=provider,
+            model=model,
+        )
+
+
+class ProviderUnreachableError(ProviderFailureError):
+    """The request never got an answer: no connection, DNS, TLS, or a timeout."""
+
+    kind = ProviderFailureKind.PROVIDER_UNREACHABLE
+
+    def __init__(self, *, provider: str, model: str) -> None:
+        super().__init__(
+            f"Couldn't get an answer from {provider}. Check your internet connection and "
+            "try again.",
+            provider=provider,
+            model=model,
+        )
+
+
+class ProviderOutageError(ProviderFailureError):
+    """The provider answered with a server-side failure, or said it was overloaded."""
+
+    kind = ProviderFailureKind.PROVIDER_OUTAGE
+
+    def __init__(self, *, provider: str, model: str) -> None:
+        super().__init__(
+            f"{provider}'s service is having problems right now. This isn't caused by "
+            "your settings. Try again in a few minutes.",
+            provider=provider,
+            model=model,
+        )
+
+
+class ProviderResponseError(ProviderFailureError):
+    """The provider answered with something none of the other kinds recognises.
+
+    Not a guess at one of them: a response this code cannot place is said to be exactly
+    that (P6). The message does not send the user to a log: no head configures one, so there
+    is nowhere to look. It names the two settings a beginner can check instead.
+    """
+
+    kind = ProviderFailureKind.PROVIDER_ERROR
+
+    def __init__(self, *, provider: str, model: str) -> None:
+        super().__init__(
+            f"{provider} returned an error UClone-X didn't recognise. If it happens again, "
+            "check the model name and any custom endpoint.",
+            provider=provider,
+            model=model,
+        )
+
+
+class ImageNotReturnedError(ProviderFailureError):
+    """A provider asked for a picture answered without one.
+
+    Gemini's image models can answer a `generateContent` that asked for `IMAGE` output with
+    text only, or with no parts at all when they decline the description. That is not a
+    picture, and no placeholder stands in for it (P6). Not retryable as it is: the same
+    description is likely to be declined again.
+    """
+
+    kind = ProviderFailureKind.PROVIDER_ERROR
+    retryable = False
+
+    def __init__(self, *, provider: str, model: str) -> None:
+        super().__init__(
+            f"{provider} answered without a picture. It may have declined the description; "
+            "try describing the picture differently.",
+            provider=provider,
+            model=model,
+        )
+
+
 class LLMStreamInterruptedError(LLMError):
     """A streamed model step stopped before it finished, so the turn fails (#938).
 
-    Raised by `BaseAgent._invoke_model` when iterating `llm.stream` raises after the call was
-    made -- before the first chunk or after some. The cause is chained (`__cause__`) and
+    Raised by `TurnExecutor.invoke_model` (`agent/turn_executor.py`) when iterating
+    `llm.stream` raises after the call was made -- before the first chunk or after some. The cause is chained (`__cause__`) and
     named in the message, and is usually the provider's (`LLMProviderError`); a listener that
     raises while a delta is delivered interrupts the stream the same way.
 
@@ -789,6 +1002,29 @@ class LLMProviderNotConfiguredError(LLMError):
     the adjacent case where a provider *was* named and its key was missing. The message names
     the ways to configure one so the repair does not require reading this file.
     """
+
+
+class LLMModelNotConfiguredError(LLMError):
+    """A request reached a connector that names no model, and the connector was given none.
+
+    Raised before any network call. A connector used to fill in a model id written in its
+    source (``gemini-1.5-pro``, ``gpt-4o``, ``claude-3-5-sonnet``) when neither the request
+    nor anything else named one, and those ids went stale: a person who had chosen Gemini
+    Flash in Settings had a retired model called on their behalf, and was told only that
+    the model was unavailable. A model id in source is a substituted value (P6); the model
+    comes from the request, the connector's configured model, or the settings file, and
+    when none of them names one the request is refused here, in plain words.
+
+    It is not an `LLMProviderError`: no provider was reached, and nothing is retryable.
+    ``provider`` is the provider's display name, for a head to say which one needs a model.
+    The sentence says what is missing and leaves where to choose one to the head, which
+    adds its own remedy: a flag on the command line, Settings in the dashboard and for an
+    ACP client.
+    """
+
+    def __init__(self, provider: str) -> None:
+        self.provider = provider
+        super().__init__(f"No model is chosen for {provider}.")
 
 
 class LLMConnectorNotConfiguredError(LLMError):

@@ -14,7 +14,6 @@ import pytest
 from pydantic import BaseModel, Field, ValidationError
 
 from uclone_x.agent import BaseAgent, TurnBudgetExceededError
-from uclone_x.agent.base import TURN_CONTEXT_HEADER
 from uclone_x.agent.hooks import (
     BaseHook,
     HookContext,
@@ -28,6 +27,9 @@ from uclone_x.agent.models import (
     AgentState,
     PersonaDefinition,
     TurnResult,
+)
+from uclone_x.agent.prompt_assembler import (
+    TURN_CONTEXT_HEADER,
 )
 from uclone_x.agent.prompts import (
     HERMES_STEERABILITY_POLICY,
@@ -60,7 +62,6 @@ from uclone_x.telemetry.tracer import TelemetryTracer
 from uclone_x.tools.base import BaseTool
 from uclone_x.tools.models import ToolContext, ToolResultStatus
 from uclone_x.tools.registry import ToolRegistry
-from uclone_x.tools.tool_scoper import LexicalToolScoper
 
 
 def test_turn_result_persona_defaults_to_none() -> None:
@@ -889,7 +890,7 @@ async def test_a_listener_does_not_move_the_ceiling_when_the_stream_reports_usag
     Ignoring the stream's usage chunk makes the listened run book an estimate (at
     `99625f8`, nothing at all), so it is refused elsewhere or never:
 
-    Killed by: src/uclone_x/agent/base.py :: last_usage = chunk.usage
+    Killed by: src/uclone_x/agent/turn_executor.py :: last_usage = chunk.usage
     Becomes: last_usage = None
     """
     unwatched = await _run_until_refused(stream_reports_usage=True, listening=False)
@@ -917,7 +918,7 @@ async def test_a_stream_without_usage_is_charged_as_a_labelled_estimate() -> Non
     Labelling it `PROVIDER` drops the note, and dropping the note leaves a refusal that
     reads as provider-counted.
 
-    Killed by: src/uclone_x/agent/base.py :: count_source=TokenCountSource.ESTIMATE,
+    Killed by: src/uclone_x/agent/turn_executor.py :: count_source=TokenCountSource.ESTIMATE,
     Becomes: count_source=TokenCountSource.PROVIDER,
     Killed by: src/uclone_x/llm/budget.py :: if estimated_steps
     Becomes: if False
@@ -964,7 +965,7 @@ def test_agent_config_step_budget_aliasing() -> None:
 def test_dynamic_persona_definition_and_utilization() -> None:
     """A test defines a persona at runtime and asserts that subsequent agent turns/steps utilize it.
 
-    Killed by: src/uclone_x/agent/base.py :: body = persona.system_prompt if persona is not None else config_prompt
+    Killed by: src/uclone_x/agent/prompt_assembler.py :: body = persona.system_prompt if persona is not None else config_prompt
     Becomes: body = config_prompt
     """
     from uclone_x.agent import BaseAgent
@@ -1076,10 +1077,11 @@ def test_reset_session_empties_every_per_session_accumulator() -> None:
       become non-empty here at all: exercising it needs an error-absorbed leg that is not
       built yet.
 
-    Killed by: src/uclone_x/agent/base.py :: if event.get("session_id") != sid
-    Killed by: src/uclone_x/agent/base.py :: self._session_compactors.pop(sid, None)
+    Killed by: src/uclone_x/agent/session_lifecycle.py :: if event.get("session_id") != sid
+    Becomes: if event.get("session_id") == sid
+    Killed by: src/uclone_x/agent/session_lifecycle.py :: self._session_compactors.pop(sid, None)
     Becomes: pass
-    Killed by: src/uclone_x/agent/base.py :: self._loaded_skills.clear()  # reset active session skills
+    Killed by: src/uclone_x/agent/session_lifecycle.py :: self._loaded_skills.clear()  # reset active session skills
     Becomes: pass  # reset active session skills
     """
     agent = BaseAgent(
@@ -1128,7 +1130,7 @@ def test_reset_session_empties_every_per_session_accumulator() -> None:
 def test_reset_session_clears_loaded_skills() -> None:
     """A skill loaded in one session must not leak into the next across reset_session (#676).
 
-    Killed by: src/uclone_x/agent/base.py :: self._loaded_skills.clear()  # reset active session skills
+    Killed by: src/uclone_x/agent/session_lifecycle.py :: self._loaded_skills.clear()  # reset active session skills
     Becomes: pass  # reset active session skills
     """
     agent = BaseAgent(
@@ -1147,7 +1149,7 @@ def test_reset_session_clears_loaded_skills() -> None:
 def test_delete_session_clears_loaded_skills() -> None:
     """Deleting the active session must clear loaded skills (#676).
 
-    Killed by: src/uclone_x/agent/base.py :: self._loaded_skills.clear()  # delete active session skills
+    Killed by: src/uclone_x/agent/session_lifecycle.py :: self._loaded_skills.clear()  # delete active session skills
     Becomes: pass  # delete active session skills
     """
     agent = BaseAgent(
@@ -1179,11 +1181,12 @@ def test_reset_of_one_session_leaves_another_sessions_pending_events_alone() -> 
     than to guess — every turn stamps `session_id` onto the events it produces — so this
     asserts on the attribution as well as on the survival.
 
-    Killed by: src/uclone_x/agent/base.py :: if event.get("session_id") != sid
+    Killed by: src/uclone_x/agent/session_lifecycle.py :: if event.get("session_id") != sid
     Becomes: if event.get("session_id") == sid
-    Killed by: src/uclone_x/agent/base.py :: reset, anchor_provenance=self._resolved_persona()
+    Killed by: src/uclone_x/agent/session_lifecycle.py :: reset, anchor_provenance=self._resolved_persona()
     Becomes: reset, anchor_provenance=self._resolved_persona()); self._sessions[self._context.session_id] = _LiveSession.from_state(reset, anchor_provenance=self._resolved_persona()
-    Killed by: src/uclone_x/agent/base.py :: event["session_id"] = turn_session_id
+    Killed by: src/uclone_x/agent/turn_executor.py :: event["session_id"] = turn_session_id
+    Becomes: pass
     """
     agent = BaseAgent(
         config=AgentConfig(agent_id="reset_scope", name="Reset Scope"),
@@ -1254,7 +1257,7 @@ class _RecordingSessionStore:
 def test_delete_session_drops_its_queued_durable_events() -> None:
     """A deleted session must drop its pending durable events so they cannot leak into another session's record (#682).
 
-    Killed by: src/uclone_x/agent/base.py :: e.get("session_id") != sid  # delete_session drops queued events
+    Killed by: src/uclone_x/agent/session_lifecycle.py :: e.get("session_id") != sid  # delete_session drops queued events
     Becomes: True  # delete_session drops queued events
     """
     store = _RecordingSessionStore()
@@ -1294,7 +1297,7 @@ def test_delete_session_drops_its_queued_durable_events() -> None:
 def test_persist_session_only_persists_named_session_events() -> None:
     """persist_session must only write durable events belonging to the targeted session (#682).
 
-    Killed by: src/uclone_x/agent/base.py :: d_event.get("session_id") == sid  # persist_session selects session events
+    Killed by: src/uclone_x/agent/session_lifecycle.py :: d_event.get("session_id") == sid  # persist_session selects session events
     Becomes: True  # persist_session selects session events
     """
     store = _RecordingSessionStore()
@@ -1322,7 +1325,7 @@ def test_persist_session_only_persists_named_session_events() -> None:
 def test_persist_session_preserves_other_sessions_queued_events() -> None:
     """persist_session must retain unpersisted events belonging to other sessions (#682).
 
-    Killed by: src/uclone_x/agent/base.py :: d_event.get("session_id") != sid  # persist_session retains other session events
+    Killed by: src/uclone_x/agent/session_lifecycle.py :: d_event.get("session_id") != sid  # persist_session retains other session events
     Becomes: False  # persist_session retains other session events
     """
     store = _RecordingSessionStore()
@@ -1350,7 +1353,7 @@ def test_persist_session_preserves_other_sessions_queued_events() -> None:
 async def test_agent_turn_fails_when_token_budget_exhausted_during_reasoning() -> None:
     """When a model generation finishes with FinishReason.LENGTH and empty content/tools, the turn must fail (#695).
 
-    Killed by: src/uclone_x/agent/base.py :: and resp.finish_reason == FinishReason.LENGTH
+    Killed by: src/uclone_x/agent/turn_executor.py :: and resp.finish_reason == FinishReason.LENGTH
     Becomes: and False
     """
 
@@ -1399,7 +1402,7 @@ async def test_a_tool_call_outside_the_allowlist_does_not_run_mid_turn() -> None
     exists at all. Driven through a real turn rather than the private execution helper,
     because the gap was between what the turn advertises and what the turn runs.
 
-    Killed by: src/uclone_x/agent/base.py :: if allowed_names and effective_tc.name not in allowed_names:
+    Killed by: src/uclone_x/agent/tool_execution.py :: if not self._tool_invoker.in_tool_range(effective_tc.name):
     Becomes: if False:
     """
     executed: list[str] = []
@@ -1538,18 +1541,18 @@ async def test_a_stream_that_fails_mid_reply_fails_the_turn_and_books_the_partia
     Restoring the silent retry — `generate` re-requested and its reply replayed to the
     listener under the connector's `PRIMARY` provenance — completes the turn:
 
-    Killed by: src/uclone_x/agent/base.py :: raise interrupted from stream_err
+    Killed by: src/uclone_x/agent/turn_executor.py :: raise interrupted from stream_err
     Becomes: resp = await llm.generate(req); _r = stream_callback("token", {"content": resp.content}); _ = (await _r) if asyncio.iscoroutine(_r) else None
 
     Dropping the booking of the partial stream leaves the ledger empty:
 
-    Killed by: src/uclone_x/agent/base.py :: self._budget.record_usage(self._context.session_id, partial_usage)
+    Killed by: src/uclone_x/agent/turn_executor.py :: self._budget.record_usage(self._context.session_id, partial_usage)
     Becomes: pass
 
     The estimate is the shared one over UTF-8 bytes, rounded up (#980), not the characters
     rounded down it was: `len // 4` books 4 output tokens for this 17-byte reply, not 5.
 
-    Killed by: src/uclone_x/agent/base.py :: out_tokens = estimate_reply_tokens(content, tool_calls)
+    Killed by: src/uclone_x/agent/turn_executor.py :: out_tokens = estimate_reply_tokens(content, tool_calls)
     Becomes: out_tokens = max(1, len(content) // 4)
     """
     partial = ["The ", "partial ", "reply"]
@@ -1585,7 +1588,7 @@ async def test_a_stream_that_fails_before_its_first_chunk_books_nothing() -> Non
     for a request the provider may have refused at the door (a 429 or 503 is raised before
     the first chunk by every in-tree connector).
 
-    Killed by: src/uclone_x/agent/base.py :: if partial_usage is None and chunks_received:
+    Killed by: src/uclone_x/agent/turn_executor.py :: if partial_usage is None and chunks_received:
     Becomes: if partial_usage is None:
     """
     result, connector, heard, ledger = await _a_turn_whose_stream_fails([])
@@ -1610,12 +1613,12 @@ async def test_a_stream_that_fails_after_a_tool_call_discards_the_call_unexecute
 
     Treating the partial stream as a finished step executes the call:
 
-    Killed by: src/uclone_x/agent/base.py :: raise interrupted from stream_err
+    Killed by: src/uclone_x/agent/turn_executor.py :: raise interrupted from stream_err
     Becomes: resp = ModelResponse(content="".join(content_chunks), tool_calls=tuple(tool_calls_list), usage=partial_usage, finish_reason=FinishReason.TOOL_CALLS, model_name=model_name, provenance=Provenance.primary(provider=llm.provider_name, model=model_name))
 
     Estimating over a count the provider did send books a figure it never reported:
 
-    Killed by: src/uclone_x/agent/base.py :: partial_usage = last_usage
+    Killed by: src/uclone_x/agent/turn_executor.py :: partial_usage = last_usage
     Becomes: partial_usage = None
     """
     executed: list[str] = []
@@ -1735,29 +1738,29 @@ async def test_a_watched_step_is_estimated_exactly_as_a_headless_one(
 
     Leaving the tool definitions out of the input:
 
-    Killed by: src/uclone_x/agent/base.py :: in_tokens = estimate_request_tokens(req)
+    Killed by: src/uclone_x/agent/turn_executor.py :: in_tokens = estimate_request_tokens(req)
     Becomes: in_tokens = estimate_request_tokens(req.model_copy(update={"tools": ()}))
 
     Restoring `len // 4` over the messages' text, with no framing:
 
-    Killed by: src/uclone_x/agent/base.py :: estimate_request_tokens(req)
+    Killed by: src/uclone_x/agent/turn_executor.py :: estimate_request_tokens(req)
     Becomes: max(1, len(str([m.content for m in req.messages])) // 4)
 
     Leaving the reply's tool calls out of the output:
 
-    Killed by: src/uclone_x/agent/base.py :: out_tokens = estimate_reply_tokens(content, tool_calls)
+    Killed by: src/uclone_x/agent/turn_executor.py :: out_tokens = estimate_reply_tokens(content, tool_calls)
     Becomes: out_tokens = estimate_reply_tokens(content)
 
     Counting only the reply's first tool call:
 
-    Killed by: src/uclone_x/agent/base.py :: out_tokens = estimate_reply_tokens(content, tool_calls)
+    Killed by: src/uclone_x/agent/turn_executor.py :: out_tokens = estimate_reply_tokens(content, tool_calls)
     Becomes: out_tokens = estimate_reply_tokens(content, tool_calls[:1])
 
     Not passing the stream's tool calls, from a stream that ended or one that failed:
 
-    Killed by: src/uclone_x/agent/base.py :: full_content, tool_calls_list
+    Killed by: src/uclone_x/agent/turn_executor.py :: full_content, tool_calls_list
     Becomes: full_content, ()
-    Killed by: src/uclone_x/agent/base.py :: known_model, "".join(content_chunks), tool_calls
+    Killed by: src/uclone_x/agent/turn_executor.py :: known_model, "".join(content_chunks), tool_calls
     Becomes: known_model, "".join(content_chunks), ()
     """
     request = LLMRequest(
@@ -1823,7 +1826,7 @@ async def test_a_budget_refusal_is_named_by_its_stop_reason() -> None:
     refusal carried the loop's seed, `not_started`, which is exactly what a provider
     outage carries, so the only difference a head could read was the wording of `error`.
 
-    Killed by: src/uclone_x/agent/base.py :: stop_reason = "budget_exceeded"
+    Killed by: src/uclone_x/agent/turn_executor.py :: stop_reason = "budget_exceeded"
     Becomes: stop_reason = stop_reason
     """
     budget = TokenBudgetManager()
@@ -1883,7 +1886,7 @@ async def test_an_unanswered_prompt_from_another_sender_is_not_a_repeat_of_it() 
     Without the clause, a head that names its users would silently lose one user's message
     whenever it repeated another's unanswered words.
 
-    Killed by: src/uclone_x/agent/base.py :: and last.name == user_prompt.name
+    Killed by: src/uclone_x/agent/turn_executor.py :: and last.name == user_prompt.name
     Becomes: and True
     """
     named = _RecordingConnector(["Answered"])
@@ -2200,7 +2203,7 @@ async def test_an_assignment_that_resolves_to_no_persona_leaves_a_hydrated_ancho
     resolution of the axis makes it stale. The mutation drops exactly that reading.
 
     Killed by: src/uclone_x/agent/base.py ::
-        if isinstance(session.anchor_provenance, _AnchorWriter):
+        if isinstance(session.anchor_provenance, AnchorWriter):
     Becomes: if False:
     """
     for label, value in (("clear", None), ("unresolvable", "no_such_persona")):
@@ -2236,7 +2239,7 @@ async def test_clearing_a_persona_the_anchor_was_written_under_does_move_the_wir
     `effective_system_prompt` reported the configured one: the same P6 divergence #1081
     exists to close, pointing the other way.
 
-    Killed by: src/uclone_x/agent/base.py :: reset, anchor_provenance=self._resolved_persona()
+    Killed by: src/uclone_x/agent/session_lifecycle.py :: reset, anchor_provenance=self._resolved_persona()
     Becomes: reset, anchor_provenance=None
     """
     wire = _RecordingConnector(["One"])
@@ -2307,7 +2310,7 @@ async def test_an_anchor_hydrated_after_a_persona_was_adopted_stays_the_callers(
     The round trip is the second construction because it also lands on `None` and back,
     so a rule keyed on the *last* assignment alone reads it as no movement at all.
 
-    Killed by: src/uclone_x/agent/base.py :: state, anchor_provenance=_AnchorWriter.CALLER
+    Killed by: src/uclone_x/agent/session_lifecycle.py :: state, anchor_provenance=AnchorWriter.CALLER
     Becomes: state, anchor_provenance=None
     """
     for label, names in (
@@ -2352,8 +2355,8 @@ async def test_an_operators_anchor_loaded_before_a_persona_is_adopted_stays_the_
     matches. Only an adoption that resolves separates "the caller wrote it" from "written
     under no persona".
 
-    Killed by: src/uclone_x/agent/base.py ::
-        state, anchor_provenance=_AnchorWriter.CALLER
+    Killed by: src/uclone_x/agent/session_lifecycle.py ::
+        state, anchor_provenance=AnchorWriter.CALLER
     Becomes: state, anchor_provenance=self._resolved_persona()
     """
     wire = _RecordingConnector(["Answered"])
@@ -2389,8 +2392,8 @@ async def test_a_store_restored_agent_seeded_anchor_is_re_resolved_when_a_person
     `history[0]` is unchanged, which is the property #1078 protects: the anchor still
     reports what the first turn really was sent, and only the turn being built is re-framed.
 
-    Killed by: src/uclone_x/agent/base.py ::
-        anchor_provenance=_persisted_anchor_provenance(self.anchor_provenance),
+    Killed by: src/uclone_x/agent/session_lifecycle.py ::
+        anchor_provenance=persisted_anchor_provenance(self.anchor_provenance),
     Becomes: anchor_provenance=None,
     """
     store = SessionStore(storage_dir=tmp_path / "sessions")
@@ -2429,7 +2432,7 @@ async def test_a_store_restored_callers_anchor_is_still_the_callers_after_a_pers
     What holds it is that `CALLER` is a value the record carries, not an assumption made
     about every record.
 
-    Killed by: src/uclone_x/agent/base.py :: return AnchorProvenance(author=AnchorAuthor.CALLER)
+    Killed by: src/uclone_x/agent/prompt_assembler.py :: return AnchorProvenance(author=AnchorAuthor.CALLER)
     Becomes: return AnchorProvenance(author=AnchorAuthor.AGENT, persona=None)
     """
     store = SessionStore(storage_dir=tmp_path / "sessions")
@@ -2466,7 +2469,7 @@ async def test_a_record_with_no_recorded_provenance_is_left_alone_and_reported(
     So it is left alone and said out loud. The record is written through the real store and
     then stripped of the key, which is the shape a legacy record actually has.
 
-    Killed by: src/uclone_x/agent/base.py :: if record is None:
+    Killed by: src/uclone_x/agent/prompt_assembler.py :: if record is None:
     Becomes: if record is None and False:
     """
     store = SessionStore(storage_dir=tmp_path / "sessions")
@@ -2483,7 +2486,7 @@ async def test_a_record_with_no_recorded_provenance_is_left_alone_and_reported(
     wire = _RecordingConnector(["After"])
     restored = BaseAgent(config=config, llm=wire, store=store)
     restored.define_persona(_scouting_persona())
-    with caplog.at_level(logging.WARNING, logger="uclone_x.agent.base"):
+    with caplog.at_level(logging.WARNING, logger="uclone_x.agent.session_lifecycle"):
         assert restored.hydrate_session() is not None
     assert "no recorded provenance" in caplog.text
 
@@ -2506,8 +2509,8 @@ async def test_a_session_restored_with_no_provenance_records_it_on_the_next_anch
     `effective_system_prompt`, so that anchor's provenance is knowable and is stamped on the
     write that creates it.
 
-    Killed by: src/uclone_x/agent/base.py :: if provenance is _AnchorWriter.UNRECORDED:
-    Becomes: if provenance is _AnchorWriter.CALLER:
+    Killed by: src/uclone_x/agent/prompt_assembler.py :: if provenance is AnchorWriter.UNRECORDED:
+    Becomes: if provenance is AnchorWriter.CALLER:
     """
     store = SessionStore(storage_dir=tmp_path / "sessions")
     config = AgentConfig(agent_id="relay", name="Relay", system_prompt="CONFIG PROMPT")
@@ -2537,11 +2540,11 @@ def test_a_caller_composed_anchor_cannot_be_recorded_under_a_persona() -> None:
 
     "The caller wrote this anchor under persona X" is not knowable: the agent did not
     compose the text and has no axis position to attribute it to. A record carrying that
-    pair would be read by `_restored_anchor_provenance` as `CALLER` and the persona
+    pair would be read by `restored_anchor_provenance` as `CALLER` and the persona
     silently dropped -- a field written and never read. Refused at the constructor, so it
     cannot reach the store (P6).
 
-    Killed by: src/uclone_x/agent/session.py ::
+    Killed by: src/uclone_x/core/session_state.py ::
         if self.author is AnchorAuthor.CALLER and self.persona is not None:
     Becomes: if False:
     """
@@ -2565,8 +2568,8 @@ async def test_a_definition_registered_after_the_anchor_moves_the_wire_with_it()
     the stamp is a `PersonaDefinition`, not a name: registering a definition for a name
     that had none changes what the name resolves to, and that is the comparison.
 
-    Killed by: src/uclone_x/agent/base.py :: anchor_provenance=self._resolved_persona(),
-    Becomes: anchor_provenance=_AnchorWriter.CALLER,
+    Killed by: src/uclone_x/agent/session_lifecycle.py :: anchor_provenance=self._resolved_persona(),
+    Becomes: anchor_provenance=AnchorWriter.CALLER,
     """
     wire = _RecordingConnector(["Answered"])
     agent = BaseAgent(
@@ -2636,7 +2639,7 @@ async def test_a_session_with_no_system_anchor_is_sent_the_prompt_it_reports(sha
     caller loaded is left as loaded -- the synthesised turn is built on the way out and not
     written back, so the record still says no system turn was stored (#1078).
 
-    Killed by: src/uclone_x/agent/base.py :: base_sys = self.effective_system_prompt
+    Killed by: src/uclone_x/agent/prompt_assembler.py :: base_sys = self.effective_system_prompt
     Becomes: base_sys = ""
     """
     wire = _RecordingConnector(["Answered"])
@@ -2706,7 +2709,7 @@ async def test_an_anchorless_session_is_sent_the_prompt_framed_for_its_model() -
     `effective_system_prompt` re-frames for Hermes. Synthesising from the unframed base
     would put the canonical framing on the wire while the property reports Hermes's.
 
-    Killed by: src/uclone_x/agent/base.py :: base_sys = self.effective_system_prompt
+    Killed by: src/uclone_x/agent/prompt_assembler.py :: base_sys = self.effective_system_prompt
     Becomes: base_sys = self._system_prompt_base()
     """
     wire = _RecordingConnector(["Answered"])
@@ -2734,7 +2737,7 @@ async def test_an_anchorless_session_with_nothing_to_send_gets_no_system_turn() 
     `SessionState.seed` writes a system turn if and only if the prompt is non-empty; the
     turn builder keeps the same rule, so an agent configured with no prompt sends none.
 
-    Killed by: src/uclone_x/agent/base.py :: system_message=anchored_turn or bool(resolved),
+    Killed by: src/uclone_x/agent/prompt_assembler.py :: system_message=anchored_turn or bool(resolved),
     Becomes: system_message=True,
     """
     wire = _RecordingConnector(["Answered"])
@@ -2859,8 +2862,8 @@ async def test_a_definition_recomputes_the_tool_scope_by_the_setters_rule() -> N
 #
 # Every provider cache (vLLM/Ollama prefix KV reuse, Anthropic and OpenAI prompt caching)
 # keys on the token prefix, so a byte that moves in the system turn invalidates everything
-# after it. The plan, the memory facts and the tool-scoping notice change from turn to
-# turn; they travel in a `[Turn Context]` block on the last user turn instead, which is
+# after it. The plan, the memory facts and the undone-attempt statement change from turn
+# to turn; they travel in a `[Turn Context]` block on the last user turn instead, which is
 # never written to history.
 # --------------------------------------------------------------------------------------
 
@@ -2874,7 +2877,7 @@ async def test_a_plan_step_completed_between_turns_leaves_the_system_turn_byte_i
     re-prefilled. The first turn's prompt is also sent back as the user wrote it: the
     block is attached on the way out and never persisted, so history stays a pure prefix.
 
-    Killed by: src/uclone_x/agent/base.py :: turn_sections.append(plan_section)
+    Killed by: src/uclone_x/agent/prompt_assembler.py :: turn_sections.append(plan_section)
     Becomes: sections.append(plan_section)
     """
     wire = _RecordingConnector(["one", "two"])
@@ -2944,19 +2947,19 @@ class _RecordingToolConnector(CannedToolResponseConnector):
 
 
 @pytest.mark.asyncio
-async def test_the_step_after_a_tool_result_still_says_which_tools_were_withheld() -> None:
-    """The scoping notice travels on every step, as its own user turn after a tool result.
+async def test_the_step_after_a_tool_result_still_carries_the_turn_context_sections() -> None:
+    """A turn's extra section travels on every step, as its own user turn after a result.
 
-    The scoped tool list is sent on every step of a turn, but the step rebuild dropped the
-    notice: from the second step on the model saw fewer tools with no word that any were
-    withheld (P6). After a TOOL message the block cannot be merged, so it follows it.
+    The section here is the undone-attempt statement (#1495), the one extra section left
+    since the scoping notice was removed (design §5.1). The step rebuild used to drop such
+    sections: from the second step on the model lost what the first step was told. After
+    a TOOL message the block cannot be merged, so it follows it.
 
-    Killed by: src/uclone_x/agent/base.py :: step_messages = assemble_request_messages(req_layers)
+    Killed by: src/uclone_x/agent/turn_executor.py :: step_messages = assemble_request_messages(req_layers)
     Becomes: step_messages = assemble_request_messages(self._prepare_turn_layers())
     """
     registry = ToolRegistry()
     registry.register(DummyEchoTool())
-    registry.register(_WithheldTool())
     wire = _RecordingToolConnector(
         (ToolCallRequest(id="call_1", name="dummy_echo", arguments={"text": "hi"}),)
     )
@@ -2968,7 +2971,10 @@ async def test_the_step_after_a_tool_result_still_says_which_tools_were_withheld
         ),
         llm=wire,
         tools=registry,
-        tool_scoper=LexicalToolScoper(top_k=1),
+    )
+    live = agent._live_session(agent.context.session_id)  # pyright: ignore[reportPrivateUsage]
+    live.undone_tool_calls.append(
+        ToolCallRequest(id="old", name="dummy_echo", arguments={"text": "before"})
     )
 
     assert (await agent.execute_turn("use dummy_echo on this")).is_completed is True
@@ -2976,7 +2982,7 @@ async def test_the_step_after_a_tool_result_still_says_which_tools_were_withheld
     assert len(wire.requests) == 2
     for request in wire.requests:
         assert all(TURN_CONTEXT_HEADER not in (m.content or "") for m in request.messages[:-1])
-        assert "withheld" in (request.messages[-1].content or "")
+        assert "[Undone Attempt]" in (request.messages[-1].content or "")
     step_two = wire.requests[1].messages
     assert [m.role for m in step_two[-2:]] == [MessageRole.TOOL, MessageRole.USER]
     assert (step_two[-1].content or "").startswith(TURN_CONTEXT_HEADER)
@@ -3059,7 +3065,7 @@ class TestAToolThatRaisedKeepsItsDeclarations:
 
     @pytest.mark.asyncio
     async def test_a_writer_that_raised_is_recorded_as_a_writer(self, tmp_path: Path) -> None:
-        """Killed by: src/uclone_x/agent/base.py :: writes_files=declared_writes,  # raised partway
+        """Killed by: src/uclone_x/agent/tool_execution.py :: writes_files=declared_writes,  # raised partway
         Becomes: writes_files=False,  # raised partway
         """
         registry = ToolRegistry()
@@ -3090,7 +3096,7 @@ class TestAnErroredTurnKeepsItsTools:
 
     @pytest.mark.asyncio
     async def test_a_provider_error_after_a_tool_step_keeps_the_step(self, tmp_path: Path) -> None:
-        """Killed by: src/uclone_x/agent/base.py :: tool_executions=tuple(tool_executions),  # ran before the failure
+        """Killed by: src/uclone_x/agent/turn_executor.py :: tool_executions=tuple(tool_executions),  # ran before the failure
         Becomes: tool_executions=(),  # ran before the failure
         """
         agent, llm = _writing_agent(tmp_path, RuntimeError("provider went away"))
@@ -3106,7 +3112,7 @@ class TestAnErroredTurnKeepsItsTools:
 
     @pytest.mark.asyncio
     async def test_a_budget_ceiling_after_a_tool_step_keeps_the_step(self, tmp_path: Path) -> None:
-        """Killed by: src/uclone_x/agent/base.py :: tool_executions=tuple(tool_executions),  # ran before the ceiling
+        """Killed by: src/uclone_x/agent/turn_executor.py :: tool_executions=tuple(tool_executions),  # ran before the ceiling
         Becomes: tool_executions=(),  # ran before the ceiling
         """
         agent, llm = _writing_agent(tmp_path, BudgetExceededError("ceiling reached"))
@@ -3123,9 +3129,9 @@ class TestAnErroredTurnKeepsItsTools:
     ) -> None:
         """Tools may have run in the failing step with no record: a lower bound, said so.
 
-        Killed by: src/uclone_x/agent/base.py :: tools_unreported = True
+        Killed by: src/uclone_x/agent/turn_executor.py :: tools_unreported = True
         Becomes: tools_unreported = False
-        Killed by: src/uclone_x/agent/base.py :: tool_executions_complete=not tools_unreported,  # a failure mid-step
+        Killed by: src/uclone_x/agent/turn_executor.py :: tool_executions_complete=not tools_unreported,  # a failure mid-step
         Becomes: tool_executions_complete=True,  # a failure mid-step
         """
         agent, _ = _writing_agent(tmp_path, RuntimeError("unused"))
@@ -3146,7 +3152,7 @@ class TestAnErroredTurnKeepsItsTools:
     ) -> None:
         """The budget handler's own flag: a ceiling met mid-step leaves no record either.
 
-        Killed by: src/uclone_x/agent/base.py :: tool_executions_complete=not tools_unreported,  # a ceiling mid-step
+        Killed by: src/uclone_x/agent/turn_executor.py :: tool_executions_complete=not tools_unreported,  # a ceiling mid-step
         Becomes: tool_executions_complete=True,  # a ceiling mid-step
         """
         agent, _ = _writing_agent(tmp_path, RuntimeError("unused"))

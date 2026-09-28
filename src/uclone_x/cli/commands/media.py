@@ -16,6 +16,8 @@ import typer
 from rich.console import Console
 
 from uclone_x.cli.commands.bootstrap import probe_image_engines
+from uclone_x.errors import PlainRefusalError, UCloneXError
+from uclone_x.llm.connectors.factory import create_llm_connector
 from uclone_x.tools.builtin.image import (
     COMFY_URL_ENV,
     DEFAULT_CHECKPOINTS,
@@ -65,10 +67,34 @@ def local_checkpoints() -> list[tuple[str, int]]:
     return found
 
 
+def chat_provider_in_effect() -> str | None:
+    """The provider `ucx run` would chat with now, or ``None`` when none is configured.
+
+    Built by the connector factory, which sends nothing: `auto` falls back to Gemini
+    only for a Gemini chat, and this is the provider a run would have.
+    """
+    try:
+        return create_llm_connector().provider_name
+    except UCloneXError:
+        return None
+
+
+#: Why Gemini would not draw, by `ImageEngineReport.engine_states` reason code.
+GEMINI_REASONS = {
+    "disabled_by_setting": "off (image_engine is local; no picture request leaves this machine)",
+    "no_key": "no Gemini API key saved or set",
+    "chat_provider_not_gemini": "used under auto only while Gemini is the chat provider",
+}
+
+
 @media_app.command("status")
 def media_status() -> None:
     """Report which image engine would run, and what each one is missing."""
-    report = probe_image_engines()
+    try:
+        report = probe_image_engines(chat_provider=chat_provider_in_effect())
+    except PlainRefusalError as exc:
+        console.print(f"[bold red]✖ {exc}[/bold red]")
+        raise typer.Exit(code=1) from exc
 
     console.print("[bold cyan]🎨 Local image engines[/bold cyan]")
 
@@ -124,6 +150,14 @@ def media_status() -> None:
     if not resolution.usable:
         headline = "checkpoint missing" if resolution.state == "missing" else "no checkpoint found"
         console.print(f"     [bold yellow]{headline}[/bold yellow] — {resolution.describe()}")
+
+    gemini_reason = next(code for name, _, code in report.engine_states() if name == "gemini")
+    if gemini_reason == "ready":
+        gemini_state = f"[bold green]ready[/bold green] ({report.image_model}, over the internet)"
+    else:
+        gemini_state = GEMINI_REASONS.get(gemini_reason, gemini_reason)
+    console.print(f"  4. Google Gemini (cloud): {gemini_state}")
+    console.print(f"     [dim]image_engine: {report.image_engine}[/dim]")
 
     if report.ready:
         console.print(f"[bold green]✔ Ready — '{report.engine}' would run.[/bold green]")

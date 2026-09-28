@@ -3,8 +3,8 @@
 Written before `uclone_x.ui.clones` existed. What they pin, in order of what it would
 cost to get wrong:
 
-* **A fresh install is not an empty screen.** `GET /api/agents` returns live instances,
-  so on an install where nothing has been spawned it is empty -- which is exactly the
+* **A fresh install is not an empty screen.** `GET /api/agents` returned live instances
+  (2026-09-27: `/api/agents` removed, #1775), so on an install where nothing has been spawned it is empty -- which is exactly the
   first screen a new user sees. The clones themselves are directories under the agents
   root, and this route is the only thing that reads them.
 * **Running is reported, never inferred.** A clone that has a home and has never run and
@@ -146,8 +146,8 @@ def test_a_clone_that_has_never_run_is_listed_as_dormant(
 ) -> None:
     """The route this repository already had would answer nothing here.
 
-    `GET /api/agents` lists live instances, and on a fresh install nothing has been
-    spawned -- so a surface built on it renders an empty list over an install that has
+    `GET /api/agents` listed live instances (2026-09-27: `/api/agents` removed, #1775),
+    and on a fresh install nothing has been spawned -- so a surface built on it renders an empty list over an install that has
     clones in it. The decision recorded in design §6.9 is `dormant`, not `present`:
     everything in this list is present by virtue of being listed, so `present` would
     encode nothing and the surface would be back to inferring.

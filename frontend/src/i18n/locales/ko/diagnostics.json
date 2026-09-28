@@ -1,0 +1,46 @@
+{
+  "section": {
+    "title": "진단",
+    "intro": "이 빌드가 Agent Client Protocol에 어떻게 응답하는지와 최근 평가 실행 결과입니다.",
+    "acpFailed": "런타임에서 ACP 상태를 읽지 못했습니다.",
+    "acpLoading": "ACP 상태를 읽는 중입니다…",
+    "evalsFailed": "런타임에서 평가 결과를 읽지 못했습니다.",
+    "evalsLoading": "평가 결과를 읽는 중입니다…"
+  },
+  "panel": {
+    "title": "문제 보고",
+    "introBefore": "UClone-X는 실패한 내용을 ",
+    "introEmphasis": "이 컴퓨터에만",
+    "introAfter": " 기록할 수 있습니다. 오류 종류, 코드 경로, 버전, 오류 메시지를 저장하며, 프롬프트나 파일 내용은 저장하지 않습니다. 자격 증명과 홈 디렉터리는 패턴으로 가립니다. 흔히 나타나는 형태는 가려지지만 모든 경우를 가리지는 못합니다. 저절로 업로드되는 것은 없습니다. 보고서를 읽고 직접 결정하십시오.",
+    "recordingOn": "기록 중",
+    "turnOff": "끄기",
+    "recordLocally": "실패를 이 컴퓨터에 기록",
+    "offByChoice": "사용자의 선택으로 꺼져 있습니다.",
+    "off": "꺼져 있습니다.",
+    "preferenceUnreadable": "기록 설정을 읽지 못해 수집이 꺼져 있습니다.",
+    "recordingBlocked": "새 실패가 기록되지 않고 있습니다.",
+    "journalUnreadable": "실패 기록 파일을 읽지 못했습니다.",
+    "journalUnreadableNote": "보고할 내용이 없다는 뜻이 아닙니다. 기록된 내용은 디스크에 그대로 있지만 대시보드에서 읽을 수 없습니다.",
+    "recorded": {
+      "one": "실패 {count}건이 기록되었습니다(서로 다른 실패 {distinct}건).",
+      "other": "실패 {count}건이 기록되었습니다(서로 다른 실패 {distinct}건)."
+    },
+    "recordedWithUnreadable": {
+      "one": "실패 {count}건이 기록되었습니다(서로 다른 실패 {distinct}건). 읽을 수 없는 줄 {unreadable}개는 제외했습니다.",
+      "other": "실패 {count}건이 기록되었습니다(서로 다른 실패 {distinct}건). 읽을 수 없는 줄 {unreadable}개는 제외했습니다."
+    },
+    "hideReport": "보고서 숨기기",
+    "showReport": "보낼 내용 보기",
+    "reportOnGithub": "GitHub에 보고",
+    "tooLong": "너무 길어 미리 채울 수 없습니다. 아래 보고서를 새 이슈에 복사하십시오.",
+    "alreadyReported": "이미 보고된 문제입니까?",
+    "delete": "삭제",
+    "confirmDelete": "기록된 실패를 삭제하시겠습니까? 되돌릴 수 없습니다.",
+    "reportContents": "보고서 내용",
+    "unconfirmed": "이 선택은 본인만 할 수 있는데, 이 창에서는 본인임을 확인하지 못했습니다. “확인된 창 열기”를 누른 뒤 새로 열린 창에서 선택하십시오. 아무것도 바뀌지 않았습니다.",
+    "openConfirmed": "확인된 창 열기",
+    "windowOpened": "브라우저에 확인된 창이 열렸습니다. 그 창에서 선택하십시오.",
+    "windowTooSoon": "방금 확인된 창을 열었습니다. 브라우저에서 그 창을 찾거나 몇 초 뒤에 다시 시도하십시오.",
+    "windowFailed": "확인된 창을 열지 못했습니다."
+  }
+}

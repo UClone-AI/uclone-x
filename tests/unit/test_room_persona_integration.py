@@ -141,7 +141,7 @@ class TestRoomPersonaResolution:
         Both are the agent's own resolution of the persona the resolver defines on it: the
         seat's registry is the host's, unscoped, since #1448.
 
-        Killed by: src/uclone_x/agent/models.py :: return own + tuple(name for name in BASE_PERSONA_TOOLS if name not in own)
+        Killed by: src/uclone_x/core/models.py :: return own + tuple(name for name in BASE_PERSONA_TOOLS if name not in own)
         Becomes: return ()
         """
         resolver = RoomAgentResolver(host, persona_registry=persona_registry)
@@ -174,7 +174,7 @@ class TestRoomPersonaResolution:
 
         Pinned through `granted_tools`, for the reason given on the test above.
 
-        Killed by: src/uclone_x/agent/models.py :: return own + tuple(name for name in BASE_PERSONA_TOOLS if name not in own)
+        Killed by: src/uclone_x/core/models.py :: return own + tuple(name for name in BASE_PERSONA_TOOLS if name not in own)
         Becomes: return ()
         """
         resolver = RoomAgentResolver(host, persona_registry=persona_registry)
@@ -212,7 +212,7 @@ class TestRoomPersonaResolution:
         empty `allowed_tools` from a same-named shipped persona, and with a shipped name the
         mutated run is refused by that list instead -- passing for the wrong reason.
 
-        Killed by: src/uclone_x/agent/models.py :: return own + tuple(name for name in BASE_PERSONA_TOOLS if name not in own)
+        Killed by: src/uclone_x/core/models.py :: return own + tuple(name for name in BASE_PERSONA_TOOLS if name not in own)
         Becomes: return ()
         """
         persona_name = "room_scoped_scribe"

@@ -1,0 +1,51 @@
+{
+  "placeholder": "메시지 보내기",
+  "dictate": {
+    "stopLabel": "듣기 중지",
+    "startLabel": "메시지를 말로 입력",
+    "listening": "듣는 중",
+    "speak": "말하기"
+  },
+  "dictation": {
+    "unsupported": "이 브라우저는 음성을 들을 수 없습니다. 메시지를 입력하거나, 말로 입력하려면 Chrome, Edge 또는 Safari에서 대화를 여십시오.",
+    "notAllowed": "브라우저가 이 페이지의 마이크 사용을 막고 있습니다. 브라우저에서 이 사이트에 마이크를 허용한 뒤 마이크를 다시 누르십시오.",
+    "noSpeech": "아무 소리도 들리지 않았습니다. 마이크를 누르고 말하거나 메시지를 입력하십시오.",
+    "audioCapture": "마이크를 찾지 못했습니다. 마이크를 연결하고 다시 누르거나 메시지를 입력하십시오.",
+    "network": "브라우저가 음성 인식 서비스에 연결하지 못했습니다. 메시지를 입력하거나, 연결이 돌아오면 마이크를 다시 누르십시오.",
+    "other": "듣기가 멈췄습니다({code}). 마이크를 눌러 다시 시도하거나 메시지를 입력하십시오."
+  },
+  "hint": {
+    "emptyRoom": "아직 이 대화에 아무도 없습니다.",
+    "noSuchName": "여기에 @{token}이라는 참여자가 없어서 이 메시지에는 답이 없습니다.",
+    "unresolved": "누군가 답할 것입니다",
+    "one": "{names}이(가) 답합니다",
+    "inOrder": "{names} 순서로 답합니다",
+    "cutOff": "{names} 순서로 답합니다. 답장 {count}개 뒤에 멈추므로 나머지 지정한 참여자는 답하지 않습니다."
+  },
+  "seat": {
+    "noAnswerYet": "아직 답 없음",
+    "ringTokens": "{name}이(가) 컨텍스트 {max}토큰 중 {used}토큰을 썼습니다",
+    "ringTurns": "{name}이(가) 컨텍스트 {max}턴 중 {used}턴을 썼습니다",
+    "windowLoaded": "이 모델을 서비스하는 서버가 모델을 불러올 때 알려 준 컨텍스트 창입니다.",
+    "windowPublished": "Provider가 적용하는, 이 모델의 공개된 컨텍스트 창입니다.",
+    "activeContext": "현재 컨텍스트: {used} / {max}토큰. 세션 사용량: {spent}토큰.",
+    "notCountedYet": "토큰 수는 현재 실행 동안만 셉니다. 이 참여자는 시작한 뒤 아직 답하지 않아서 여기에 기록된 사용량이 없습니다.",
+    "noWindow": "이 모델의 컨텍스트 창이 알려지지 않아 링이 토큰 대신 턴을 셉니다.",
+    "tokensOf": "{used}/{max}토큰",
+    "turnsOf": "{used}/{max}턴",
+    "tokensNotCounted": "이번 실행에서 토큰을 세지 않음",
+    "tokens": "{count}토큰",
+    "several": "각자 자신의 컨텍스트로 답합니다"
+  },
+  "stop": "중지",
+  "sendLabel": "보내기 (Enter)",
+  "send": "보내기",
+  "sendFailure": {
+    "refused": "보내지 못했습니다: {reason}",
+    "absent": "{reason} 메시지가 이 대화에 없습니다.",
+    "unconfirmed": "이 대화에 메시지가 들어갔는지 확인하지 못했습니다: {reason}",
+    "noAnswer": "앱의 백그라운드 서비스가 응답하지 않았습니다.",
+    "noReason": "앱의 백그라운드 서비스에서 문제가 생겼습니다.",
+    "appFault": "앱에서 문제가 생겼습니다."
+  }
+}

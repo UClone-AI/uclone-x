@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import uuid
 from collections.abc import Mapping
 from enum import StrEnum
 from pathlib import Path
@@ -13,8 +12,19 @@ from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 from uclone_x.agent.hooks.protocols import BaseHook
 from uclone_x.agent.prompts import compose_system_prompt
 from uclone_x.core.immutable import ImmutableJsonMapping, ImmutableStrMapping
+
+# Lowered to `uclone_x.core.models` (#1734) and re-exported here under their old spelling.
+from uclone_x.core.models import BASE_MEMORY_TOOLS as BASE_MEMORY_TOOLS
+from uclone_x.core.models import BASE_PERSONA_TOOLS as BASE_PERSONA_TOOLS
+from uclone_x.core.models import RETIRED_MODEL_TIERS as RETIRED_MODEL_TIERS
+from uclone_x.core.models import AgentLLMConfig as AgentLLMConfig
+from uclone_x.core.models import ModelTier as ModelTier
+from uclone_x.core.models import PersonaDefinition as PersonaDefinition
+from uclone_x.core.models import PlanState as PlanState
+from uclone_x.core.models import PlanStep as PlanStep
 from uclone_x.core.provenance import Provenance
-from uclone_x.llm.models import TokenBudget, TokenUsage, ToolCallRequest
+from uclone_x.errors import ProviderFailureError, ProviderFailureKind
+from uclone_x.llm.models import TokenUsage, ToolCallRequest
 from uclone_x.sandbox.models import (
     IsolationPolicy,
     WorkspaceIsolation,
@@ -35,16 +45,6 @@ class AgentState(StrEnum):
     TERMINATED = "TERMINATED"
 
 
-class ModelTier(StrEnum):
-    """Model specialization tiers for agents and sub-agents."""
-
-    INHERIT = "inherit"
-    FAST = "fast"
-    PRO = "pro"
-    FLASH_LITE = "flash_lite"
-    CUSTOM = "custom"
-
-
 class FsScope(StrEnum):
     """Filesystem scope a sub-agent runs in.
 
@@ -60,113 +60,6 @@ class FsScope(StrEnum):
     INHERIT = "inherit"
     ISOLATED = "isolated"
     SHARED = "shared"
-
-
-class AgentLLMConfig(BaseModel):
-    """Per-agent LLM parameter and token budget configuration."""
-
-    model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
-
-    model_tier: ModelTier = ModelTier.INHERIT
-    model_name: str | None = None
-    temperature: float = 0.7
-    max_tokens: int | None = None
-    top_p: float | None = None
-    token_budget: TokenBudget | None = None
-    auto_compact: bool = True
-    compaction_threshold_tokens: int = 60_000
-    context_limit: int | None = Field(
-        default=None,
-        description="Explicit maximum context window tokens for this agent's model. "
-        "When provided or resolved from model_name, auto-compaction triggers at 70% of this limit.",
-    )
-
-
-#: The tools every persona is given, whatever its own `allowed_tools` lists (#1402). Owner
-#: ruling, 2026-09-23: an agent is given the tools it basically needs by default. Before
-#: this only `clone` -- the one built-in with no list, and so no restriction -- could save
-#: a memory; every other persona's call to `record_memory_fact` was refused.
-#:
-#: The rule for membership: a tool belongs here only if it has no effect outside the
-#: agent's own memory. So the three memory tools (bound to the agent's own store, see
-#: `AGENT_BOUND_TOOL_TYPES`) and the three read-only workspace tools, which
-#: `writes_files = False` declares and the workspace boundary confines, plus
-#: `tool_result_read` (#1422), which reads back this conversation's own shortened tool
-#: results and nothing else -- without it, an excerpt would name a reader the persona
-#: cannot call. Anything that writes a file, runs a command, installs, reaches the
-#: network or makes an image stays in the persona's own list.
-#:
-#: Names, not classes: this module sits below the tool packages. A test holds each name to
-#: the class that registers under it, so a rename cannot leave a dead entry here.
-#:
-#: Naming a tool here grants permission; it does not register anything. An agent composed
-#: with no memory store still has no memory tools, and is not offered one it cannot run.
-#:
-#: The memory part is named on its own, `BASE_MEMORY_TOOLS`, because a sub-agent is not
-#: given it (#1431): `spawn_subagent` removes these names from the list a child inherits.
-BASE_MEMORY_TOOLS: tuple[str, ...] = (
-    "record_memory_fact",
-    "query_memory_facts",
-    "retract_memory_fact",
-)
-
-BASE_PERSONA_TOOLS: tuple[str, ...] = (
-    *BASE_MEMORY_TOOLS,
-    "file_read",
-    "file_search",
-    "directory_list",
-    "tool_result_read",
-    "load_skill",
-)
-
-
-class PersonaDefinition(BaseModel):
-    """Configuration schema for dynamically defined sub-agent personas."""
-
-    model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
-
-    name: str = Field(description="Unique name identifier for the dynamic agent persona")
-    role: str = Field(description="Human-readable role (e.g. 'Security Reviewer')")
-    description: str = Field(default="", description="Description of what this persona does")
-    system_prompt: str = Field(description="System instructions and persona constraints")
-    allowed_tools: tuple[str, ...] = Field(
-        default_factory=tuple, description="Authorized tool names"
-    )
-    llm_config: AgentLLMConfig = Field(
-        default_factory=AgentLLMConfig, description="Dedicated LLM parameters"
-    )
-    enable_write_tools: bool = Field(
-        default=False, description="Whether persona has write permissions"
-    )
-    enable_subagent_tools: bool = Field(
-        default=False, description="Controls recursive sub-agent creation"
-    )
-    a2a_peers: tuple[str, ...] = Field(
-        default_factory=tuple,
-        description=(
-            "Persona names this persona may call through the `a2a_call` tool. Empty means"
-            " it may call no one (#1558)."
-        ),
-    )
-
-    @property
-    def granted_tools(self) -> tuple[str, ...]:
-        """The tools this persona may use: its own `allowed_tools` plus `BASE_PERSONA_TOOLS`.
-
-        This, not `allowed_tools`, is what every site that scopes an agent to a persona
-        reads. `allowed_tools` stays the persona's own list -- what its file says and what
-        its editor shows and saves -- so the base set is never written into a persona.
-
-        An empty `allowed_tools` is no restriction at all (every registered tool), and
-        stays empty here: adding the base set to it would turn "everything" into "only
-        the base set".
-
-        The persona's own order is kept and the base names follow, each once.
-        """
-        if not self.allowed_tools:
-            return ()
-        own = self.allowed_tools
-        return own + tuple(name for name in BASE_PERSONA_TOOLS if name not in own)
 
 
 class SubagentInvocation(BaseModel):
@@ -288,37 +181,6 @@ class AgentConfig(BaseModel):
     approval_timeout_seconds: float = Field(
         default=30.0,
         description="Timeout in seconds when waiting for human approval of a tool call.",
-    )
-
-
-class PlanStep(BaseModel):
-    """A discrete step within an interactive agent execution plan."""
-
-    model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
-
-    index: int = Field(description="Sequential index of the plan step")
-    description: str = Field(description="Description of the action/task for this step")
-    completed: bool = Field(default=False, description="Whether this step has been completed")
-    verification: str | None = Field(
-        default=None, description="Optional verification criteria or outcome"
-    )
-
-
-class PlanState(BaseModel):
-    """Interactive chat plan state tracking step progress."""
-
-    model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
-
-    plan_id: str = Field(
-        default_factory=lambda: f"plan_{uuid.uuid4().hex[:8]}",
-        description="Unique plan identifier",
-    )
-    title: str = Field(description="Title or goal of the plan")
-    steps: tuple[PlanStep, ...] = Field(
-        default_factory=tuple, description="Ordered tuple of plan steps"
-    )
-    status: Literal["proposed", "in_progress", "completed", "rejected"] = Field(
-        default="proposed", description="Overall lifecycle status of the plan"
     )
 
 
@@ -453,8 +315,15 @@ TurnStopReason = Literal[
     "step_budget_exceeded",
     "step_results_over_window",
     "budget_exceeded",
+    "usage_limit",
     "provider_timeout",
     "model_without_tools",
+    "model_unavailable",
+    "provider_auth",
+    "provider_quota",
+    "provider_unreachable",
+    "provider_outage",
+    "provider_error",
     "cancelled",
 ]
 """How a turn's step run ended: the vocabulary of `TURN_END.stop_reason` and `TurnResult`.
@@ -464,6 +333,12 @@ TurnStopReason = Literal[
 `step_results_over_window` refuses a step whose tool results, together, cannot fit the
 context window even as excerpts (#1480). Nothing over the window was sent. It is not a
 refusal a retry meets again: the next attempt may ask for fewer things at once.
+
+`usage_limit` is the user's own limit on paid-model tokens (`llm-token-gateway.md` §4.3),
+refused before the call was sent. Its `error` is a plain sentence naming the window, when
+it lifts and the two remedies, written to be shown as is. It is a refusal until the window
+lifts or the limit is raised -- and unlike `budget_exceeded`, a new conversation does not
+cure it, because the limit is system-wide.
 
 `provider_timeout` is the one failure ending that is named rather than left to `error`.
 Every other provider failure arrives as a string in `error` and is indistinguishable from
@@ -478,7 +353,39 @@ leaves it `None` -- because a retry at a longer ceiling is exactly the right res
 tool definitions, which every clone turn sends. Its `error` is a plain sentence naming the
 model and the remedy, written to be shown as is. It is a refusal: a retry on the same model
 is refused the same way, so `turn_refusal` maps it to `RoomTurnRefusal.MODEL_WITHOUT_TOOLS`.
+
+`model_unavailable`, `provider_auth`, `provider_quota`, `provider_unreachable`,
+`provider_outage` and `provider_error` are a hosted provider's failure, one per
+`ProviderFailureKind` and spelled the same (#1630). The turn's `provider_failure` carries
+the plain sentence for it. The first two are refusals -- a retired model and a rejected key
+fail every retry until the setting changes -- and the rest are not.
 """
+
+
+class ProviderFailure(BaseModel):
+    """A hosted provider's failure, as a head shows it (#1630).
+
+    `message` is the `ProviderFailureError`'s own sentence: it says what stopped and whose
+    side the cause is on, and carries no status, body, URL or class name, so a head shows it
+    as is and adds only where to act. It is carried apart from `TurnResult.error` so no head
+    has to decide whether an `error` string is safe to show.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
+
+    kind: ProviderFailureKind
+    message: str
+    retryable: bool
+    provider: str | None = Field(
+        default=None,
+        description="The provider's display name, e.g. 'Google', so a head can name where "
+        "that provider's key is set. None on a record stored before it was carried.",
+    )
+
+    @classmethod
+    def of(cls, exc: ProviderFailureError) -> ProviderFailure:
+        """The record of a raised provider failure."""
+        return cls(kind=exc.kind, message=str(exc), retryable=exc.retryable, provider=exc.provider)
 
 
 class TurnResult(BaseModel):
@@ -548,7 +455,19 @@ class TurnResult(BaseModel):
         "invocations -- so the field exists to make the failure legible where it is "
         "otherwise indistinguishable from a model that chose not to use tools.",
     )
+    story_id: str | None = Field(
+        default=None,
+        description="The story the turn left open, as its lifecycle hooks moved it between "
+        "steps (#1732) -- the `story_id` it was called with when no hook moved it, or when "
+        "no hook that moves stories is composed in. A room keeps this as its open story "
+        "(#1775), including on a turn that failed after a step had moved it.",
+    )
     error: str | None = None
+    provider_failure: ProviderFailure | None = Field(
+        default=None,
+        description="Set, beside `error`, when the turn failed on a hosted provider's "
+        "failure the connector could classify (#1630). `None` on every other turn.",
+    )
     stop_reason: TurnStopReason | None = Field(
         default=None,
         description="How the step run ended -- the value this turn's `TURN_END` event "
@@ -559,7 +478,9 @@ class TurnResult(BaseModel):
         "can carry `error` too. `blocked_by_hook` is how a consumer tells a `PRE_TURN` hook "
         "refusal from any other failure; before #970 the CLI compared `content` with the "
         "engine's wording instead. `budget_exceeded` is a token ceiling that "
-        "refused the turn, which a retry meets again until the ceiling changes (#969). "
+        "refused the turn, which a retry meets again until the ceiling changes (#969); "
+        "`usage_limit` is the user's system-wide paid-model limit, whose `error` is "
+        "written to be shown as is. "
         "`None` only from a `TurnResult` built outside "
         "`BaseAgent.execute_turn`.",
     )

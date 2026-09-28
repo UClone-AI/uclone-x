@@ -214,6 +214,55 @@ def test_cross_session_memory_bounded_prompt_injection() -> None:
     assert empty_memory.format_prompt_section() == ""
 
 
+def test_memory_section_renders_facts_without_session_or_confidence() -> None:
+    """A fact line is the fact alone; confidence ranks it but is not printed (design §5.3).
+
+    The source session id and the confidence changed the section's text between sessions,
+    which moved the request prefix, without telling the model anything it acts on.
+
+    Killed by: src/uclone_x/memory/store.py :: lines.append(f"- {f.summary()}")
+    Becomes: lines.append(f"- {f.summary()} (session: {f.source_session_id}, confidence: {f.confidence:.2f})")
+    """
+    memory = CrossSessionMemory()
+    prov = _test_provenance()
+    memory.record_fact("db", "engine", "postgres", prov, source_session_id="sess_a", confidence=0.6)
+    memory.record_fact("ui", "theme", "dark", prov, source_session_id="sess_b", confidence=0.9)
+
+    lines = memory.format_prompt_section().splitlines()
+
+    assert lines[2:] == ["- ui: theme -> dark", "- db: engine -> postgres"]
+
+
+def test_memory_section_does_not_depend_on_insertion_order() -> None:
+    """Facts of equal confidence and age come out in the same order however they were stored.
+
+    Killed by: src/uclone_x/memory/store.py :: active_facts.sort(key=lambda f: (f.confidence, f.created_at, f.fact_id), reverse=True)
+    Becomes: active_facts.sort(key=lambda f: (f.confidence, f.created_at), reverse=True)
+    """
+    prov = _test_provenance()
+    facts = [
+        MemoryFact(
+            fact_id=f"mem_{index}",
+            subject=subject,
+            predicate="status",
+            object_value="healthy",
+            provenance=prov,
+            source_session_id="sess_a",
+            confidence=0.8,
+            created_at="2026-09-25T00:00:00+00:00",
+        )
+        for index, subject in enumerate(("alpha", "beta", "gamma"))
+    ]
+
+    def section(order: list[MemoryFact]) -> str:
+        memory = CrossSessionMemory()
+        for fact in order:
+            memory._facts[fact.fact_id] = fact  # pyright: ignore[reportPrivateUsage]
+        return memory.format_prompt_section()
+
+    assert section(facts) == section(list(reversed(facts)))
+
+
 def test_cross_session_memory_persistence(tmp_path: Path) -> None:
     """Memory facts atomically persist to disk and reload across sessions."""
     db_file = tmp_path / "memory_store.json"
@@ -323,7 +372,7 @@ def test_cross_session_memory_p7_ontology_evidence_and_promotion() -> None:
 async def test_cross_session_memory_agent_wiring_and_tools() -> None:
     """BaseAgent wires memory, registers memory tools, and injects facts into prompts.
 
-    Killed by: src/uclone_x/agent/base.py :: memory_section = self._memory.format_prompt_section()
+    Killed by: src/uclone_x/agent/prompt_assembler.py :: memory_section = self._memory.format_prompt_section()
     Becomes: memory_section = ""
     """
     memory = CrossSessionMemory()

@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+from tests.support.person import confirm_window
 from uclone_x.core.failure_journal import (
     consent_path,
     journal_path,
@@ -28,7 +29,13 @@ def isolated_diagnostics(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Non
 
 @pytest.fixture
 def client(tmp_path: Path) -> TestClient:
-    return TestClient(create_ui_app(static_dir=tmp_path))
+    """The dashboard's own window: consent is taken only from a confirmed one (#1589).
+
+    `test_ui_person_gate.py` pins the refusal an unconfirmed caller gets.
+    """
+    confirmed = TestClient(create_ui_app(static_dir=tmp_path))
+    confirm_window(confirmed)
+    return confirmed
 
 
 def _record(client: TestClient, message: str = "boom") -> None:
@@ -121,8 +128,9 @@ def test_cross_origin_requests_cannot_change_anything(client: TestClient) -> Non
 def test_same_origin_and_originless_requests_still_work(client: TestClient) -> None:
     """A browser on this server, and a client that sends no `Origin` at all.
 
-    The second case is the CLI and `curl`; refusing it would break every
-    non-browser caller in the name of a check that does not apply to them.
+    The origin check is not what refuses a program that sends no `Origin`: the person
+    check does, since #1589 (`test_ui_person_gate.py`). A confirmed window that sends
+    none, an older browser, still gets through.
     """
     same = {"Origin": "http://127.0.0.1"}
 

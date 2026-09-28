@@ -685,25 +685,31 @@ class ArtifactLibrary:
         os.replace(located.absolute, target)
         return located.original
 
-    def delete(self, path: str, *, confirm: bool, release_writer: bool = False) -> ArtifactChanged:
-        """Remove a file or story folder for good. Needs `confirm=True`."""
+    def delete(self, path: str, *, confirm: bool) -> ArtifactChanged:
+        """Remove an archived file or story folder for good. Needs `confirm=True`.
+
+        Archive first (owner decision Q1, 2026-09-26): only what is already archived is
+        deleted, so the rule holds for every caller and not only for the Files screen,
+        which offers Delete on archived rows alone (#1692). Archiving settles the story's
+        writer and clears it from the conversations that had it open, so an archived
+        story has neither left to settle.
+        """
         if confirm is not True:
             raise DeleteNotConfirmedError(
                 "Deleting cannot be undone, so it needs your confirmation. Nothing was deleted."
             )
         located = self._locate(path)
         self._refuse_plain_folder(located)
-        leaving = None if located.archived else located.story_id
-        if leaving is not None:
-            self._settle_lease(leaving, release_writer)
+        if not located.archived:  # archive first
+            raise ArtifactError(
+                f"{located.name} is not archived, so it was not deleted. Archive it first; "
+                "only an archived file can be deleted for good."
+            )
         if located.absolute.is_dir():
             shutil.rmtree(located.absolute)
         else:
             located.absolute.unlink()
-        note = None
-        if leaving is not None:
-            note = self._forget_story(leaving, "deleted")
-        return ArtifactChanged(path=located.relative, note=note)
+        return ArtifactChanged(path=located.relative, note=None)
 
     @staticmethod
     def _refuse_plain_folder(located: _Located) -> None:

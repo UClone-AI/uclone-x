@@ -57,6 +57,9 @@ _NOT_TOOL_NAMES = frozenset(
         "relative_url",
         "for_scene",  # a story_context action (#1556)
         "session_summary",  # a story_manuscript argument (#1556)
+        "earlier_changes",  # a story_context 'for_scene' bundle key (#1613)
+        "request_conflicts",  # a story_context 'for_scene' bundle key (#1613)
+        "negative_prompt",  # a generate_image argument
     }
 )
 
@@ -77,8 +80,15 @@ def _builtin(name: str) -> PersonaDefinition:
     return persona
 
 
+#: Tools the agent registers itself rather than the default registry: `load_skill` is bound
+#: when a skill store is (`BaseAgent`, agent/base.py), and every persona holds it
+#: (`BASE_PERSONA_TOOLS`).
+_AGENT_BOUND_TOOLS = frozenset({"load_skill"})
+
+
 def _registered_tool_names() -> set[str]:
-    return {tool.name for tool in create_default_registry(enable_mcp=False).list_tools()}
+    registry = create_default_registry(enable_mcp=False)
+    return {tool.name for tool in registry.list_tools()} | _AGENT_BOUND_TOOLS
 
 
 # --- guidance follows the tools ----------------------------------------------------------
@@ -176,8 +186,8 @@ def test_each_fragment_is_keyed_by_a_registered_tool_it_names() -> None:
 async def test_the_default_registry_advertises_one_shell() -> None:
     """`bash_run` and `run_command` are one tool; a request carries it once, as `bash_run`.
 
-    Killed by: src/uclone_x/agent/base.py :: for t in drop_shadowed_aliases(self._tools.list_tools(filter_names=allowed)):
-    Becomes: for t in self._tools.list_tools(filter_names=allowed):
+    Killed by: src/uclone_x/agent/tool_invoker.py :: for t in drop_shadowed_aliases(self._registry.list_tools(filter_names=allowed)):
+    Becomes: for t in self._registry.list_tools(filter_names=allowed):
     """
     llm = _RecordingConnector()
     registry = create_default_registry(enable_mcp=False)

@@ -29,6 +29,7 @@ from playwright.async_api import Locator, Page
 from uclone_x.engine.event_bus import EventBus
 from uclone_x.llm.budget import TokenBudgetManager
 from uclone_x.llm.connectors.mock import MockLLMConnector
+from uclone_x.skills.auditor import SkillRegistry
 from uclone_x.ui.app import create_ui_app
 
 # The static bundle is resolved from this file rather than the working directory, so the
@@ -95,6 +96,48 @@ async def dock_locator(page: Page) -> Locator:
 #: them; a fixed sleep would be a guess that fails on a loaded machine and passes falsely on
 #: a fast one (R7).
 TWO_FRAMES = "() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)))"
+
+#: Whether the dock's surface has what its own read answered on screen. Topology, Remembers,
+#: Knowledge Graph and Activity render their content only once their `GET` resolves, so a
+#: fixed frame count measures whatever is there at that moment -- under load, the loading line
+#: (#1722). Each answers with the mark it draws once the read settles, answered or failed.
+#: The other surfaces draw from state the page already holds and are settled when mounted.
+SURFACE_READ_SETTLED = """(tab) => {
+    const s = document.querySelector("[data-testid='dock-surface']");
+    if (!s) return false;
+    const one = (id) => s.querySelector(`[data-testid='${id}']`);
+    switch (tab) {
+        case 'topology': {
+            const reason = one('topology-reason');
+            return !!one('topology-history')
+                || (!!reason && !reason.textContent.startsWith('Reading this conversation'));
+        }
+        case 'remembers':
+            return !!one('remembers-saved') || !!one('remembers-reason');
+        case 'knowledge_graph': {
+            const refresh = one('kg-refresh-btn');
+            return !!refresh && !refresh.querySelector('.animate-spin');
+        }
+        case 'activity': {
+            const timeline = one('activity-timeline');
+            return !!timeline && !/Reading .*'s activity/.test(timeline.textContent);
+        }
+        default:
+            return true;
+    }
+}"""
+
+
+async def show_dock_surface(page: Page, tab_testid: str, surface: str) -> None:
+    """Select `surface` by its tab `tab_testid`; return once its read has settled and laid out.
+
+    The settled mark is waited for rather than a frame count or a sleep (R7): the frames are
+    for layout, and say nothing about a response that has not arrived.
+    """
+    await page.click(f"[data-testid='{tab_testid}']")
+    await page.wait_for_function(SURFACE_READ_SETTLED, arg=surface, timeout=10000)
+    await page.evaluate(TWO_FRAMES)
+
 
 #: What a surface holds past its own edges: its scroll overflow, and every control whose box is
 #: not inside the surface's. A control inside a region that scrolls on its own (a wide table in an
@@ -240,6 +283,7 @@ def running_ui(
     budget_tracker: TokenBudgetManager | None = None,
     workspace_dir: Path | None = None,
     eval_reports_dir: Path | None = None,
+    skills_dir: Path | None = None,
     configure: Callable[[Any], None] | None = None,
 ) -> Generator[str]:
     """Run the UI app on an ephemeral port for the duration of the context.
@@ -263,6 +307,12 @@ def running_ui(
     logged in every E2E run (#1415). Delivery survived only because each publish starts a
     fresh dispatcher. Nothing a test asserts about one server should depend on the servers
     before it.
+
+    The skill store is `skills_dir`, and with none the server has no store and registers no
+    skill. Left to default, `create_ui_app` loads the repository's own runtime skill store
+    (`ucx-agent-skills/`) at startup, as a real head does, and every Skills assertion would
+    then depend on what that directory ships -- a directory the published tree does not
+    carry. A test that needs a registered skill passes a store it wrote.
     """
     app = create_ui_app(
         static_dir=STATIC_DIR,
@@ -272,6 +322,7 @@ def running_ui(
         budget_tracker=budget_tracker,
         workspace_dir=workspace_dir,
         eval_reports_dir=eval_reports_dir,
+        skill_registry=SkillRegistry(skills_dir=skills_dir),
     )
     # A hook rather than another keyword per setting: what a test needs to arrange is
     # sometimes a field on a Core object rather than an argument `create_ui_app` takes,

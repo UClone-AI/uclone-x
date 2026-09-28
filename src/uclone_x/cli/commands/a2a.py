@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import Annotated
 
@@ -9,7 +10,6 @@ import typer
 from rich.console import Console
 
 from uclone_x.a2a.models import AgentCard
-from uclone_x.agent.models import AgentConfig
 from uclone_x.engine.event_bus import EventBus
 
 a2a_app = typer.Typer(
@@ -49,13 +49,6 @@ def start_a2a_server(
             endpoints={"http": f"http://{host}:{port}"},
         )
 
-    agent_config = AgentConfig(
-        agent_id=agent_id,
-        name=f"Agent-{agent_id}",
-        role="A2A Federated Agent",
-        description=f"Autonomous A2A agent node ({agent_id})",
-        system_prompt="You are a federated UClone-X A2A agent node.",
-    )
     bus = EventBus()
     # Deferred, with the rest of this function's imports: `uvicorn` and the A2A
     # shell belong to the `http` extra, and `cli/main.py` imports this module at
@@ -79,11 +72,12 @@ def start_a2a_server(
             feature="A2A gateway server (ucx a2a serve)",
         ) from exc
 
-    from uclone_x.agent.composition import HostDependencies, compose_agent
+    from uclone_x.agent.clone_builder import build_clone, local_app_scope, memory_map
     from uclone_x.agent.session import SessionStore
     from uclone_x.cli.agent_memory import memory_for_agent_id
     from uclone_x.llm.connectors.factory import create_llm_connector, saved_choice_notice
     from uclone_x.shells.a2a_server import A2AServer
+    from uclone_x.skills.auditor import load_runtime_skill_registry
     from uclone_x.telemetry import TelemetryTracer
     from uclone_x.tools.registry import create_default_registry
 
@@ -92,17 +86,39 @@ def start_a2a_server(
         # stderr, as ACP does: what the server says to its caller stays on its own channel.
         Console(stderr=True).print(saved_notice, markup=False, highlight=False)
     llm = create_llm_connector(fallback_to_mock=True)
-    memory = memory_for_agent_id(agent_config.agent_id)
+    # One store per clone id, opened now so a bad `--agent-id` exits 2.
+    memory_for = memory_map(memory_for_agent_id)
+    memory_for(agent_id)
 
-    host_deps = HostDependencies(
-        bus=bus,
+    # Built as the desktop app builds the same clone (#1731): an id that names a persona
+    # answers as it. Any other id is a generic federated node.
+    app = local_app_scope(
+        workspace_root=Path.cwd().resolve(),
         llm=llm,
         tools=create_default_registry(),
+        memory_for=memory_for,
+        bus=bus,
         tracer=TelemetryTracer(),
         store=SessionStore(),
-        memory=memory,
+        # P9: the approved skills in the runtime store; without them there is no `load_skill`.
+        skills=asyncio.run(load_runtime_skill_registry()),
     )
-    agent = compose_agent(config=agent_config, host=host_deps)
+    node = (
+        None
+        if app.persona_registry.get_persona(agent_id) is not None
+        else {
+            "name": f"Agent-{agent_id}",
+            "role": "A2A Federated Agent",
+            "description": f"Autonomous A2A agent node ({agent_id})",
+        }
+    )
+    agent = build_clone(
+        app,
+        clone_id=agent_id,
+        session_id=f"sess_{agent_id}",
+        fallback_prompt="You are a federated UClone-X A2A agent node.",
+        config_update=node,
+    ).agent
 
     server = A2AServer(
         agent_card=card,

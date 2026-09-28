@@ -18,21 +18,27 @@ import ast
 import asyncio
 import json
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
 
 import pytest
 from pydantic import BaseModel, ValidationError
 
-from uclone_x.agent.base import BaseAgent, _tool_outcome_of  # pyright: ignore[reportPrivateUsage]
+from uclone_x.agent.base import BaseAgent
 from uclone_x.agent.hooks import BaseHook, HookAction, HookContext, HookDecision
 from uclone_x.agent.models import AgentConfig, AgentLLMConfig, ToolExecutionRecord
+from uclone_x.agent.tool_execution import tool_outcome_of
 from uclone_x.core.provenance import ExecutionPath, Provenance, ServiceRef
 from uclone_x.errors import (
     BudgetExceededError,
     LLMStreamInterruptedError,
     LLMTimeoutError,
     ModelLacksToolSupportError,
+    ModelNotAvailableError,
+    ProviderFailureError,
+    ProviderQuotaError,
+    UsageLimitReachedError,
 )
 from uclone_x.llm.connectors.base import BaseLLMConnector
 from uclone_x.llm.models import (
@@ -145,7 +151,8 @@ async def test_the_log_says_the_model_stopped_on_its_own() -> None:
     A turn that answered and a turn that gave up both reached `outcome: completed`, so a
     step-run post-mortem could not start from the log at all.
 
-    Killed by: src/uclone_x/agent/base.py :: "stop_reason": stop_reason,
+    Killed by: src/uclone_x/agent/turn_executor.py :: "stop_reason": stop_reason,
+    Becomes: "stop_reason": None,
     """
     agent = _agent(_Scripted([_answer("done")]))
     await agent.start()
@@ -166,7 +173,8 @@ async def test_the_log_distinguishes_a_nudged_stop_from_an_ordinary_one() -> Non
     first, and that is the difference between "answered" and "gave up" — which is exactly
     what a reader needs and could not get.
 
-    Killed by: src/uclone_x/agent/base.py :: stop_reason = "model_stopped_after_nudge"
+    Killed by: src/uclone_x/agent/turn_executor.py :: stop_reason = "model_stopped_after_nudge"
+    Becomes: stop_reason = "model_stopped"
     """
     agent = _agent(_Scripted([_answer("no tools")]), require_evidence=True)
     await agent.start()
@@ -187,7 +195,8 @@ async def test_the_log_distinguishes_a_grounding_stop_from_an_unevidenced_one() 
     the distinction #700 needs: an answer refused for resting on nothing and an answer
     refused for outrunning what it read are different failures with different remedies.
 
-    Killed by: src/uclone_x/agent/base.py :: stop_reason = "model_stopped_after_grounding_nudge"
+    Killed by: src/uclone_x/agent/turn_executor.py :: stop_reason = "model_stopped_after_grounding_nudge"
+    Becomes: stop_reason = "model_stopped"
     """
     agent = _agent(
         _Scripted([_call(), _answer("The configured maximum is 100.")]),
@@ -220,7 +229,8 @@ async def test_the_log_keeps_both_reasons_when_a_turn_spent_both_nudges() -> Non
     whole time, so nothing was lost from the log — but a reader aggregating `stop_reason`,
     which is the cheap way to read a run, was undercounting the evidence nudge.
 
-    Killed by: src/uclone_x/agent/base.py :: stop_reason = "model_stopped_after_both_nudges"
+    Killed by: src/uclone_x/agent/turn_executor.py :: stop_reason = "model_stopped_after_both_nudges"
+    Becomes: stop_reason = "model_stopped_after_nudge"
     """
     agent = _agent(
         _Scripted([_answer("no tools"), _call(), _answer("The configured maximum is 100.")]),
@@ -257,7 +267,8 @@ async def test_the_grounding_nudge_event_is_registered_with_the_reader() -> None
 async def test_the_log_says_the_budget_ran_out() -> None:
     """A refusal and a completion must not read alike.
 
-    Killed by: src/uclone_x/agent/base.py :: stop_reason = "step_budget_exceeded"
+    Killed by: src/uclone_x/agent/turn_executor.py :: stop_reason = "step_budget_exceeded"
+    Becomes: stop_reason = "model_stopped"
     """
     agent = _agent(_Scripted([_call()]), max_steps=1)
     await agent.start()
@@ -276,7 +287,7 @@ async def test_the_log_says_a_step_did_not_fit_the_window() -> None:
     A 64-token window cannot hold even the request's fixed part, so no share is left for
     the step's result and the step is refused before a second request is sent.
 
-    Killed by: src/uclone_x/agent/base.py :: stop_reason = "step_results_over_window"
+    Killed by: src/uclone_x/agent/turn_executor.py :: stop_reason = "step_results_over_window"
     Becomes: stop_reason = "step_budget_exceeded"
     """
     registry = ToolRegistry()
@@ -309,7 +320,8 @@ async def test_a_tool_that_found_nothing_is_recorded_as_empty() -> None:
     healthy call and then a turn that ended, and the reader has to open the payload and
     judge it — which is the judgement #698 moved into code.
 
-    Killed by: src/uclone_x/agent/base.py :: "outcome": _tool_outcome_of(tr),
+    Killed by: src/uclone_x/agent/turn_executor.py :: "outcome": tool_outcome_of(tr),
+    Becomes: "outcome": ToolOutcome.PRODUCTIVE.value,
     """
     agent = _agent(_Scripted([_call(), _answer("nothing found")]))
     await agent.start()
@@ -325,7 +337,7 @@ async def test_a_tool_that_found_nothing_is_recorded_as_empty() -> None:
 def test_the_record_mapping_agrees_with_the_classifier() -> None:
     """The log's mapping and `classify_tool_outcome` must not drift.
 
-    `_tool_outcome_of` reads a `ToolExecutionRecord` and the classifier reads a
+    `tool_outcome_of` reads a `ToolExecutionRecord` and the classifier reads a
     `ToolResult`, so they are two code paths over the same question. Pinned here rather
     than trusted, because a divergence would show up as a log that disagrees with the
     report built from the same run.
@@ -420,7 +432,8 @@ async def test_the_log_says_the_agent_had_no_tools_to_call() -> None:
     a post-mortem attributes a toolless run to the model's judgement. #694 established
     that a toolless run is not gradeable; this is the same fact recorded at turn level.
 
-    Killed by: src/uclone_x/agent/base.py :: stop_reason = "no_tools_registered"
+    Killed by: src/uclone_x/agent/turn_executor.py :: stop_reason = "no_tools_registered"
+    Becomes: stop_reason = "model_stopped"
     """
     agent = _toolless_agent(_Scripted([_answer("I cannot check that here")]))
     await agent.start()
@@ -442,7 +455,7 @@ async def test_the_log_says_the_run_never_reached_a_stop_decision() -> None:
     never got far enough to decide why it was over — and it is the value a reader will
     meet most often on a broken run.
 
-    Killed by: src/uclone_x/agent/base.py :: stop_reason: TurnStopReason = "not_started"
+    Killed by: src/uclone_x/agent/turn_executor.py :: stop_reason: TurnStopReason = "not_started"
     Becomes: stop_reason: TurnStopReason = "model_stopped"
     """
 
@@ -474,7 +487,7 @@ async def test_the_log_says_a_provider_ran_past_the_ceiling_the_caller_set() -> 
     not reach a stop decision -- but a deadline the caller chose is a decision the caller
     made, and naming it is what lets a consumer keep it out of a model's grade.
 
-    Killed by: src/uclone_x/agent/base.py :: stop_reason = "provider_timeout"
+    Killed by: src/uclone_x/agent/turn_executor.py :: stop_reason = "provider_timeout"
     Becomes: stop_reason = "not_started"
     """
     agent = _agent(_Raising(LLMTimeoutError("did not answer within 600s", seconds=600.0)))
@@ -498,7 +511,7 @@ async def test_a_stream_cut_off_by_a_ceiling_is_named_through_its_chained_cause(
     and a non-streamed one `provider_timeout`, which is the same conflation #1277 is
     about, reintroduced for half the runs.
 
-    Killed by: src/uclone_x/agent/base.py :: cause = seen.__cause__
+    Killed by: src/uclone_x/agent/turn_executor.py :: cause = seen.__cause__
     Becomes: cause = None
     """
     interrupted = LLMStreamInterruptedError(
@@ -558,7 +571,7 @@ async def test_a_model_without_tools_ends_the_turn_in_plain_words_without_a_trac
     message was the turn's `error`, shown by every head. The refusal is also logged
     without a traceback: it is a choice of model, not a fault.
 
-    Killed by: src/uclone_x/agent/base.py :: return "model_without_tools", str(lacking_tools)
+    Killed by: src/uclone_x/agent/turn_executor.py :: return "model_without_tools", str(lacking_tools)
     Becomes: return "model_without_tools", str(exc)
     """
     agent = _agent_on_ollama_without_tools()
@@ -584,7 +597,7 @@ async def test_a_model_without_tools_ends_the_turn_in_plain_words_without_a_trac
 async def test_a_model_without_tools_is_found_through_the_stream_wrapper() -> None:
     """The stop reason is read through the chained cause, as a ceiling is.
 
-    Killed by: src/uclone_x/agent/base.py :: return "model_without_tools", str(lacking_tools)
+    Killed by: src/uclone_x/agent/turn_executor.py :: return "model_without_tools", str(lacking_tools)
     Becomes: return stop_reason, str(lacking_tools)
     """
     interrupted = LLMStreamInterruptedError(
@@ -606,6 +619,96 @@ async def test_a_model_without_tools_is_found_through_the_stream_wrapper() -> No
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure", "stop_reason", "retryable"),
+    [
+        (
+            ModelNotAvailableError(provider="Google", model="gemini-1.5-pro"),
+            "model_unavailable",
+            False,
+        ),
+        (ProviderQuotaError(provider="Google", model="gemini-2.5-flash"), "provider_quota", True),
+    ],
+)
+async def test_a_provider_failure_ends_the_turn_with_its_kind_and_plain_message(
+    failure: ProviderFailureError,
+    stop_reason: str,
+    retryable: bool,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The turn carries the kind as its stop reason and the message a head may show (#1630).
+
+    Logged without a traceback: the raw response was logged where it was classified, and a
+    provider refusing a key is not a fault in this code.
+
+    Killed by: src/uclone_x/agent/turn_executor.py :: return _PROVIDER_STOP_REASONS[failure.kind], failure.message, failure
+    Becomes: return stop_reason, failure.message, failure
+    Killed by: src/uclone_x/agent/turn_executor.py :: logger.info("Turn for agent %s failed at the provider: %s", agent_id, provider_failure)
+    Becomes: logger.exception("Turn for agent %s failed at the provider: %s", agent_id, provider_failure)
+    """
+    agent = _agent(_Raising(failure))
+    await agent.start()
+
+    result = await agent.execute_turn("hello")
+
+    assert result.stop_reason == stop_reason
+    assert result.error == str(failure)
+    assert result.provider_failure is not None
+    assert result.provider_failure.kind == stop_reason
+    assert result.provider_failure.message == str(failure)
+    assert result.provider_failure.retryable is retryable
+    assert _turn_end(agent)["stop_reason"] == stop_reason
+    assert not [r for r in caplog.records if r.exc_info], "a provider's answer is not a crash"
+
+
+@pytest.mark.asyncio
+async def test_a_provider_failure_is_found_through_the_stream_wrapper() -> None:
+    """Streamed, the failure arrives chained under `LLMStreamInterruptedError`, whose own
+    message names a chunk count and classes; the turn reports the cause, not the wrapper.
+
+    Killed by: src/uclone_x/agent/turn_executor.py :: provider_failure = _in_cause_chain(exc, ProviderFailureError)
+    Becomes: provider_failure = exc if isinstance(exc, ProviderFailureError) else None
+    """
+    interrupted = LLMStreamInterruptedError(
+        "stream stopped after 0 chunks",
+        provider="gemini",
+        model="gemini-1.5-pro",
+        chunks_received=0,
+        discarded_tool_calls=0,
+    )
+    interrupted.__cause__ = ModelNotAvailableError(provider="Google", model="gemini-1.5-pro")
+
+    agent = _agent(_Raising(interrupted))
+    await agent.start()
+
+    result = await agent.execute_turn("hello")
+
+    assert result.stop_reason == "model_unavailable"
+    assert result.error is not None and result.error.startswith("The model gemini-1.5-pro")
+    assert "chunks" not in result.error
+    assert result.provider_failure is not None
+
+
+@pytest.mark.asyncio
+async def test_a_failure_that_is_not_the_providers_carries_no_provider_failure() -> None:
+    """Only a classified provider failure fills the field; anything else stays a crash."""
+    agent = _agent(_Raising(RuntimeError("boom")))
+    await agent.start()
+
+    result = await agent.execute_turn("hello")
+
+    assert result.provider_failure is None
+    assert result.stop_reason not in {
+        "model_unavailable",
+        "provider_auth",
+        "provider_quota",
+        "provider_unreachable",
+        "provider_outage",
+        "provider_error",
+    }
+
+
+@pytest.mark.asyncio
 async def test_a_cause_chain_too_deep_to_walk_is_not_called_a_ceiling_expiring() -> None:
     """The walk is bounded, and past the bound the answer is "no", not a guess.
 
@@ -616,7 +719,7 @@ async def test_a_cause_chain_too_deep_to_walk_is_not_called_a_ceiling_expiring()
     chain it could not finish reading would be the fallback P6 forbids: a claim made where
     there is no knowledge, and here it would pull a real model failure out of the grade.
 
-    Killed by: src/uclone_x/agent/base.py :: _MAX_CAUSE_DEPTH = 10
+    Killed by: src/uclone_x/agent/turn_executor.py :: _MAX_CAUSE_DEPTH = 10
     Becomes: _MAX_CAUSE_DEPTH = 100
     """
     buried: BaseException = LLMTimeoutError("did not answer within 600s", seconds=600.0)
@@ -637,7 +740,7 @@ async def test_a_cause_chain_too_deep_to_walk_is_not_called_a_ceiling_expiring()
 async def test_the_log_says_the_run_was_cancelled() -> None:
     """A turn cancelled by task cancellation or stop signal records cancelled stop reason.
 
-    Killed by: src/uclone_x/agent/base.py :: stop_reason = "cancelled"
+    Killed by: src/uclone_x/agent/turn_executor.py :: stop_reason = "cancelled"
     Becomes: stop_reason = "not_started"
     """
 
@@ -696,7 +799,7 @@ def test_every_stop_reason_the_turn_loop_can_write_is_asserted_in_this_module() 
     and pass. Two exclusions keep the rule honest — this function's own assertions, which
     name reasons in order to check them, and docstrings, which are not assertions.
     """
-    source = Path(__file__).resolve().parents[2] / "src" / "uclone_x" / "agent" / "base.py"
+    source = Path(__file__).resolve().parents[2] / "src" / "uclone_x" / "agent" / "turn_executor.py"
     tree = ast.parse(source.read_text(encoding="utf-8"), filename=str(source))
 
     written: set[str] = set()
@@ -750,14 +853,14 @@ def test_every_stop_reason_the_turn_loop_can_write_is_asserted_in_this_module() 
 def test_the_record_status_the_agent_writes_is_the_one_the_outcome_mapping_reads() -> None:
     """`ToolExecutionRecord.status` is an un-enumerated `str` on both sides of a seam.
 
-    `_tool_outcome_of` branches on `record.status != "success"`; the producers in
+    `tool_outcome_of` branches on `record.status != "success"`; the producers in
     `_execute_single_tool` write the bare literals `"success"` and `"error"`.
     `ToolResultStatus` exists and spells the same two values, but the field is not typed
     to it, so producer and consumer agree by convention. Retyping the field is a wider
     change than this issue (a `strict=True` frozen model consumed across the suite) and is
     its own card, #731; what is cheap here is to stop the convention being unwritten.
 
-    This pins the **consumer** half: if `_tool_outcome_of` drifts to compare against `"ok"`
+    This pins the **consumer** half: if `tool_outcome_of` drifts to compare against `"ok"`
     or `ToolResultStatus.SUCCESS.name`, this fails. It does not pin the producer — mutating
     `_execute_single_tool` to write `"ok"` leaves this green, because the records here are
     built in the test. Producer drift is not uncovered, it is covered elsewhere: that
@@ -765,7 +868,7 @@ def test_the_record_status_the_agent_writes_is_the_one_the_outcome_mapping_reads
     `test_evaluation_answerer` and `test_ui_server`. What was missing, and is what this
     adds, is the assertion that the consumer keeps reading the spelling those produce.
 
-    Killed by: src/uclone_x/agent/base.py :: if record.status != ToolResultStatus.SUCCESS:
+    Killed by: src/uclone_x/agent/tool_execution.py :: if record.status != ToolResultStatus.SUCCESS:
     Becomes: if record.status != ToolResultStatus.ERROR:
     """
     assert ToolResultStatus.SUCCESS.value == "success"
@@ -781,11 +884,11 @@ def test_the_record_status_the_agent_writes_is_the_one_the_outcome_mapping_reads
         tool_name="t", output={"matches": [1]}, status=ToolResultStatus.ERROR
     )
 
-    assert _tool_outcome_of(productive) == ToolOutcome.PRODUCTIVE.value
-    assert _tool_outcome_of(empty) == ToolOutcome.EMPTY.value
+    assert tool_outcome_of(productive) == ToolOutcome.PRODUCTIVE.value
+    assert tool_outcome_of(empty) == ToolOutcome.EMPTY.value
     # The payload is productive; only the status makes this errored. That is the axis the
     # existing agreement test does not cover.
-    assert _tool_outcome_of(failed) == ToolOutcome.ERRORED.value
+    assert tool_outcome_of(failed) == ToolOutcome.ERRORED.value
 
     assert (
         classify_tool_outcome(ToolResult(success=False, output={"matches": [1]}, provenance=_PROV))
@@ -829,7 +932,7 @@ async def test_an_agent_that_does_not_require_evidence_still_records_why_it_stop
     That is the configuration a benchmark does *not* run under and a user does, which
     makes it the one where a post-mortem has least else to go on.
 
-    Killed by: src/uclone_x/agent/base.py :: stop_reason = "model_stopped_after_unproductive_tools"
+    Killed by: src/uclone_x/agent/turn_executor.py :: stop_reason = "model_stopped_after_unproductive_tools"
     Becomes: stop_reason = "model_stopped"
     """
     llm = _Scripted([_call(), _answer("The line does not appear in the file.")])
@@ -868,6 +971,16 @@ def _agent_ending_by(scenario: str) -> BaseAgent:
         return _agent(_Scripted([_call()]), max_steps=1)
     if scenario == "provider_error":
         return _agent(_Raising(RuntimeError("provider down")))
+    if scenario == "usage_limit":
+        return _agent(
+            _Raising(
+                UsageLimitReachedError(
+                    "You've reached your 5-hour limit for paid models.",
+                    window="per_5_hours",
+                    available_again_at=datetime(2026, 9, 26, 15, 40, tzinfo=UTC),
+                )
+            )
+        )
     assert scenario == "budget_ceiling", scenario
     return _agent(_Raising(BudgetExceededError("ceiling 970")))
 
@@ -880,6 +993,7 @@ def _agent_ending_by(scenario: str) -> BaseAgent:
         ("step_budget", "step_budget_exceeded"),
         ("provider_error", "not_started"),
         ("budget_ceiling", "budget_exceeded"),
+        ("usage_limit", "usage_limit"),
     ],
 )
 async def test_the_turn_result_carries_the_stop_reason_its_turn_end_records(
@@ -918,6 +1032,26 @@ async def test_the_log_and_the_result_say_a_budget_ceiling_refused_the_turn() ->
 
 
 @pytest.mark.asyncio
+async def test_the_log_and_the_result_say_the_users_usage_limit_stopped_the_turn() -> None:
+    """The user's paid-model limit is not this session's ceiling, and is named apart from it.
+
+    `UsageLimitReachedError` subclasses `BudgetExceededError`, so without its own branch it
+    would be recorded as `budget_exceeded`, and a head would show the session-ceiling copy
+    for a limit a new conversation meets too.
+
+    Killed by: src/uclone_x/agent/turn_executor.py :: stop_reason = "usage_limit"
+    Becomes: stop_reason = "budget_exceeded"
+    """
+    agent = _agent_ending_by("usage_limit")
+    await agent.start()
+
+    result = await agent.execute_turn("hello")
+
+    assert result.stop_reason == "usage_limit"
+    assert _turn_end(agent)["stop_reason"] == "usage_limit"
+
+
+@pytest.mark.asyncio
 async def test_the_log_and_the_result_say_a_hook_refused_the_turn() -> None:
     """A `PRE_TURN` refusal is named as one, in the result and in `TURN_END`.
 
@@ -925,7 +1059,7 @@ async def test_the_log_and_the_result_say_a_hook_refused_the_turn() -> None:
     log recorded it as `not_started`, which reads as a turn that never got going rather
     than one that was refused.
 
-    Killed by: src/uclone_x/agent/base.py :: stop_reason = "blocked_by_hook"
+    Killed by: src/uclone_x/agent/turn_executor.py :: stop_reason = "blocked_by_hook"
     Becomes: stop_reason = "not_started"
     """
     agent = BaseAgent(

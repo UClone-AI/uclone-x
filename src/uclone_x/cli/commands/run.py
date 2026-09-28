@@ -23,9 +23,6 @@ from uclone_x.agent.loop import (
     parse_loop_command_input,
 )
 from uclone_x.agent.models import (
-    AgentConfig,
-    AgentContext,
-    AgentLLMConfig,
     AgentState,
     TurnResult,
 )
@@ -41,6 +38,7 @@ from uclone_x.errors import (
     SessionIdCollisionError,
 )
 from uclone_x.llm.connectors.factory import (
+    bind_image_engine_settings,
     create_llm_connector,
     model_env_override,
     saved_choice_in_effect,
@@ -48,6 +46,7 @@ from uclone_x.llm.connectors.factory import (
 from uclone_x.llm.connectors.saved_choice import describe_saved_choice
 from uclone_x.llm.models import MessageRole
 from uclone_x.llm.protocols import LLMProviderProtocol
+from uclone_x.llm.providers import PROVIDERS, env_key
 from uclone_x.sandbox.models import NoIsolation, WorkspaceIsolation
 from uclone_x.telemetry import TelemetryTracer, create_telemetry_exporter
 from uclone_x.tools.protocols import ToolRegistryProtocol
@@ -96,12 +95,6 @@ resumes the turn.
 """
 
 
-#: The model `ucx run` falls back to when `--model` names none. One name for what was
-#: three copies of `model or "qwen3:8b"`, which had already drifted out of the `--model`
-#: help text ("default depends on provider").
-DEFAULT_CLI_MODEL = "qwen3:8b"
-
-
 def _report_failed_turn(failure: str) -> None:
     """Report a failed turn on stderr, labelled so it cannot be read as agent output.
 
@@ -134,11 +127,42 @@ def _blocked_by_hook(result: TurnResult) -> bool:
 #: says which model to pick and leaves where to the head (P8); here it is the flag.
 MODEL_WITHOUT_TOOLS_REMEDY = "Choose it with --model."
 
+#: Where to act on a hosted provider's failure, on the command line (#1630). The Core's
+#: sentence says what stopped and whose side it is on; this says where to change it.
+PROVIDER_FAILURE_REMEDIES: dict[str, str] = {
+    "model_without_tools": MODEL_WITHOUT_TOOLS_REMEDY,
+    # Worded for both a model the provider no longer serves and one never chosen.
+    "model_unavailable": "Choose a model with --model.",
+    "provider_auth": "Save a new key with `ucx key set <provider>`.",
+    "provider_unreachable": "If you set a custom endpoint, check that address too.",
+}
+
+
+def provider_key_remedy(provider: str | None) -> str:
+    """Where to put a new key for `provider` (a display name, as failures carry it).
+
+    A rejected key is the case the connector's own "no key" error never reaches -- the key
+    is set, just wrong -- so the remedy names where *this* key came from: the variable,
+    when one is set (it outranks the saved key, so saving another would change nothing),
+    else the command that saves one for this provider. The provider is looked up in the
+    provider table by its display name.
+    """
+    spec = next((s for s in PROVIDERS.values() if s.display_name == provider), None)
+    if spec is None or not spec.key_env_vars:
+        return PROVIDER_FAILURE_REMEDIES["provider_auth"]
+    overriding = env_key(spec.id)
+    if overriding is not None:
+        return f"Set a new key in {overriding[1]}."
+    return f"Save a new key with `ucx key set {spec.id}`."
+
 
 def _turn_failure(result: TurnResult) -> str | None:
     """The turn's error as this head reports it, with the command-line remedy when one fits."""
-    if result.error is not None and result.stop_reason == "model_without_tools":
-        return f"{result.error} {MODEL_WITHOUT_TOOLS_REMEDY}"
+    remedy = PROVIDER_FAILURE_REMEDIES.get(result.stop_reason or "")
+    if result.stop_reason == "provider_auth" and result.provider_failure is not None:
+        remedy = provider_key_remedy(result.provider_failure.provider)
+    if result.error is not None and remedy is not None:
+        return f"{result.error} {remedy}"
     return result.error
 
 
@@ -314,6 +338,20 @@ def apply_saved_model(provider: str | None, model: str | None) -> tuple[str | No
     return chosen, describe_saved_choice(saved, chosen)
 
 
+def own_model_notice(agent_name: str, sent: str | None, saved: str | None) -> str | None:
+    """The line saying a persona runs on its own model rather than `saved`, else `None`.
+
+    The saved-choice notice is printed before the clone is built, so it names the model
+    it chose; a persona that names its own keeps it (that choice fills only empty slots),
+    and without this line the notice would name a model the run never sends (P6). The
+    line names both models rather than calling `saved` "the saved one": it may have come
+    from `OLLAMA_MODEL` / `VLLM_MODEL` instead (`apply_saved_model`).
+    """
+    if saved is None or sent is None or sent == saved:
+        return None
+    return f"{agent_name} runs on its own model, {sent}, not {saved}."
+
+
 async def run_agent_repl_async(
     agent_name: str = "default",
     provider: str | None = None,
@@ -346,12 +384,25 @@ async def run_agent_repl_async(
     notices = err_console if prompt else console
     if saved_notice is not None:
         notices.print(f"[dim]{escape(saved_notice)}[/dim]")
-    llm = create_llm_connector(provider=provider, fallback_to_mock=False)
+    llm = create_llm_connector(provider=provider, model=model, fallback_to_mock=False)
     active_tools = tools if tools is not None else create_default_registry()
+    # The session root's picture settings; under `auto`, Gemini draws only when this
+    # run's chat provider is Gemini and no local engine is ready.
+    # A Gemini chat's address is the pictures' address too (#1769).
+    bind_image_engine_settings(
+        active_tools.get("generate_image"),
+        None,
+        llm.provider_name,
+        llm.base_url if llm.provider_name == "gemini" else None,
+    )
     exporter = create_telemetry_exporter()
     tracer = TelemetryTracer()
 
-    effective_model = saved_model or DEFAULT_CLI_MODEL
+    # `None` when neither `--model` nor the saved choice names one: the connector then
+    # sends its own configured model (the provider's model variable, or the saved model),
+    # and refuses in plain words when it has none -- never a model id written here, which
+    # used to send `qwen3:8b` to Gemini.
+    effective_model = saved_model
 
     # `compose_system_prompt`, not a hand-rolled sentence (#1206): the composed default
     # is the only place `HONEST_REPORTING` / `ARTIFACT_REPORTING` / `IMAGE_GENERATION` /
@@ -366,17 +417,6 @@ async def run_agent_repl_async(
     default_system = system_prompt or compose_system_prompt(model_name=effective_model)
 
     isolation_policy = NoIsolation() if isolation == "none" else WorkspaceIsolation()
-    config = AgentConfig(
-        agent_id=agent_name,
-        name=agent_name,
-        system_prompt=default_system,
-        llm_config=AgentLLMConfig(
-            model_name=effective_model,
-            temperature=0.7,
-            max_tokens=2048,
-        ),
-        isolation=isolation_policy,
-    )
 
     session_store = store if store is not None else SessionStore()
     # `is None`, not `or`: an omitted flag means "the agent's default session", while
@@ -385,25 +425,37 @@ async def run_agent_repl_async(
     effective_workspace = (
         Path(workspace_dir).resolve() if workspace_dir is not None else Path.cwd().resolve()
     )
-    context = AgentContext(
-        session_id=f"sess_{agent_name}" if session_id is None else session_id,
-        agent_id=agent_name,
-        workspace_root=effective_workspace,
-    )
-    from uclone_x.agent.composition import HostDependencies, compose_agent
-    from uclone_x.memory.store import default_cross_session_memory
+    from uclone_x.agent.clone_builder import build_clone, local_app_scope, saved_models
+    from uclone_x.skills.auditor import load_runtime_skill_registry
 
-    host = HostDependencies(
-        bus=bus,
-        llm=llm,
-        tools=active_tools,
-        tracer=tracer,
-        store=session_store,
-        # P7's durable facts are worth nothing to a head that never wires the store:
-        # `BaseAgent` registers the memory tools only when it is given one.
-        memory=default_cross_session_memory(agent_name),
-    )
-    agent = compose_agent(config=config, host=host, context=context)
+    # Built as the desktop app builds the same clone (#1731): an agent name that is a
+    # persona answers as that persona, with its memory, its tools and host binding.
+    agent = build_clone(
+        local_app_scope(
+            workspace_root=effective_workspace,
+            llm=llm,
+            tools=active_tools,
+            global_models=saved_models(effective_model),
+            bus=bus,
+            tracer=tracer,
+            store=session_store,
+            # P9: the approved skills in the runtime store. Without a registry the agent
+            # has no `load_skill`, and the skills the image tools name cannot be read.
+            skills=await load_runtime_skill_registry(),
+        ),
+        clone_id=agent_name,
+        session_id=f"sess_{agent_name}" if session_id is None else session_id,
+        # `--model` wins over a persona's own model, as a model asked for in the app does;
+        # the saved choice only fills what the persona leaves empty (`saved_models`).
+        model_name=model,
+        fallback_prompt=default_system,
+        config_update={"isolation": isolation_policy},
+    ).agent
+    own_model = own_model_notice(agent_name, agent.config.llm_config.model_name, saved_model)
+    if own_model is not None:
+        notices.print(f"[dim]{escape(own_model)}[/dim]")
+    # The model this run sends, for the spans below: a persona's own wins over the saved.
+    effective_model = agent.config.llm_config.model_name or effective_model
 
     # Resume before starting: `switch_session` and the bus subscription are bound at
     # `start()`, and a hydrate that replaced history afterwards would race the loop.
@@ -433,6 +485,8 @@ async def run_agent_repl_async(
 
     # Non-interactive single-shot execution mode
     if prompt:
+        # The session the turn is saved to, which `--session-id` may name: not `sess_<agent>`.
+        turn_session = agent.session_id
         failure: str | None = None
         blocked = False
         reply_text = ""
@@ -442,7 +496,7 @@ async def run_agent_repl_async(
             try:
                 async with tracer.agent_turn_span(
                     agent_id=agent_name,
-                    session_id=f"sess_{agent_name}",
+                    session_id=turn_session,
                     turn_index=1,
                     extra_attributes={
                         "mode": "single-shot",
@@ -767,7 +821,7 @@ async def run_agent_repl_async(
                 try:
                     async with tracer.agent_turn_span(
                         agent_id=agent_name,
-                        session_id=f"sess_{agent_name}",
+                        session_id=agent.session_id,
                         turn_index=turn_count,
                         extra_attributes={
                             "mode": "interactive",

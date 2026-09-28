@@ -12,11 +12,13 @@ for both on every turn.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
-from playwright.async_api import async_playwright
+from playwright.async_api import APIRequestContext, async_playwright
 
 from tests.e2e.conftest import running_ui
 from uclone_x.llm.connectors.mock import MockLLMConnector
@@ -57,6 +59,30 @@ def server(tmp_path: Path, workspace: Path, llm: _RecordingConnector) -> Iterato
         yield url
 
 
+async def _room_turn(request: APIRequestContext, server: str, agent_id: str, message: str) -> None:
+    """Send `message` in a new 1:1 with `agent_id` and wait for what follows it.
+
+    A room answers after the POST returns (202), so the transcript is polled: rows 1 and 2
+    are the two joins and row 3 the message, and row 4 -- the reply, or a note saying why
+    there is none -- is the turn having run.
+    """
+    created = await request.post(
+        f"{server}/api/rooms", data={"title": "e2e", "agent_ids": [agent_id]}
+    )
+    assert created.ok, await created.text()
+    room_id = str((await created.json())["room_id"])
+    sent = await request.post(f"{server}/api/rooms/{room_id}/messages", data={"content": message})
+    assert sent.status == 202, await sent.text()
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 20
+    while True:
+        room: dict[str, Any] = await (await request.get(f"{server}/api/rooms/{room_id}")).json()
+        if len(room.get("transcript", [])) >= 4:
+            return
+        assert loop.time() < deadline, f"the turn never finished: {room.get('transcript')}"
+        await asyncio.sleep(0.1)
+
+
 @pytest.mark.asyncio
 async def test_an_agent_created_in_settings_is_listed_and_answers_with_its_instructions(
     server: str, workspace: Path, llm: _RecordingConnector
@@ -81,17 +107,14 @@ async def test_an_agent_created_in_settings_is_listed_and_answers_with_its_instr
             written = workspace / ".uclone" / "personas" / "surveyor.yaml"
             assert written.is_file(), "the save did not land in the directory the loader reads"
 
-            turn = await page.request.post(
-                f"{server}/api/turn",
-                data={"message": "go", "agent_id": "surveyor", "session_id": "sess_e2e_892"},
-            )
-            assert turn.ok, await turn.text()
+            await _room_turn(page.request, server, "surveyor", "go")
         finally:
             await browser.close()
 
     assert llm.requests, "the turn never reached the model"
     systems = [m.content or "" for m in llm.requests[-1].messages if m.role is MessageRole.SYSTEM]
-    assert systems and systems[0].startswith(_PROMPT), systems
+    # A room seat's prompt opens with its seat framing; the persona's instructions follow.
+    assert systems and _PROMPT in systems[0], systems
 
 
 class _DelegatingConnector(MockLLMConnector):
@@ -148,7 +171,7 @@ async def test_the_shipped_guardian_starts_no_helper_and_writes_no_file_through_
     that guard is ever reached, so neutering it leaves this test green. The refusal branch
     below is the line that actually stands between this persona and both capabilities.
 
-    Killed by: src/uclone_x/agent/base.py :: elif (refusal := self._capability_refusal(tool_inst)) is not None:
+    Killed by: src/uclone_x/agent/tool_execution.py :: elif (refusal := self._capability_refusal(tool_inst)) is not None:
     Becomes: elif False:
     """
     workspace = tmp_path / "workspace"
@@ -162,15 +185,7 @@ async def test_the_shipped_guardian_starts_no_helper_and_writes_no_file_through_
                 page = await browser.new_page(viewport={"width": 1600, "height": 900})
                 await page.goto(server, wait_until="networkidle")
 
-                turn = await page.request.post(
-                    f"{server}/api/turn",
-                    data={
-                        "message": "review this",
-                        "agent_id": "guardian",
-                        "session_id": "sess_e2e_1167",
-                    },
-                )
-                assert turn.ok, await turn.text()
+                await _room_turn(page.request, server, "guardian", "review this")
             finally:
                 await browser.close()
 

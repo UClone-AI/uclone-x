@@ -15,20 +15,22 @@ business logic; `ucx room say` is the shell over it (P8).
 
 from __future__ import annotations
 
-import dataclasses
 import os
 from collections.abc import Callable
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from uclone_x.agent.base import BaseAgent
-from uclone_x.agent.bootstrap import agent_config_for_persona
-from uclone_x.agent.composition import HostDependencies, compose_agent
-from uclone_x.agent.models import (
-    DEFAULT_SYSTEM_PROMPT,
-    AgentConfig,
-    AgentContext,
-    AgentLLMConfig,
+from uclone_x.agent.clone_builder import (
+    APP_ONTOLOGY,
+    AppScope,
+    GlobalModels,
+    OntologyChoice,
+    build_clone,
+    follow_global_models,
 )
+from uclone_x.agent.composition import HostDependencies
+from uclone_x.agent.models import AgentLLMConfig
 from uclone_x.agent.persona_registry import PersonaRegistry, get_default_persona_registry
 from uclone_x.agent.protocols import BaseAgentProtocol
 from uclone_x.errors import ParticipantNotResolvableError, SeatKnowledgeUnreadableError
@@ -38,7 +40,15 @@ from uclone_x.ontology.protocols import OntologyEngineProtocol
 from uclone_x.room.knowledge import KnowledgeLoad, SeatKnowledgeProtocol
 from uclone_x.room.models import Participant, ParticipantKind
 
-__all__ = ["RoomAgentResolver", "room_participant_system_prompt"]
+if TYPE_CHECKING:
+    from uclone_x.a2a.protocols import A2ATransportProtocol
+
+__all__ = [
+    "GlobalModels",
+    "RoomAgentResolver",
+    "follow_global_models",
+    "room_participant_system_prompt",
+]
 
 
 def room_participant_system_prompt(participant: Participant) -> str:
@@ -73,20 +83,18 @@ class RoomAgentResolver:
     `(room, participant)` pair, which is what `RoomService` derives it to be.
     """
 
-    _host: HostDependencies
-    _llm_config: AgentLLMConfig | None
+    _app: AppScope
+    _a2a_transport: A2ATransportProtocol | None
     _ontology_factory: Callable[[str], OntologyEngineProtocol] | None
-    _memory_factory: Callable[[str], CrossSessionMemory] | None
     _knowledge: SeatKnowledgeProtocol | None
-    _workspace_root: Path
-    _persona_registry: PersonaRegistry
     _agents: dict[str, BaseAgentProtocol]
+    _follows: dict[str, tuple[bool, bool]]
     _sessions: dict[str, str]
     _namespaces: dict[str, str]
 
     def __init__(
         self,
-        host: HostDependencies,
+        host: AppScope | HostDependencies,
         *,
         llm_config: AgentLLMConfig | None = None,
         ontology_factory: Callable[[str], OntologyEngineProtocol] | None = None,
@@ -95,39 +103,68 @@ class RoomAgentResolver:
         workspace_root: Path | None = None,
         read_roots: Callable[[], tuple[Path, ...]] | None = None,
         knowledge: SeatKnowledgeProtocol | None = None,
+        global_models: GlobalModels | None = None,
+        a2a_transport: A2ATransportProtocol | None = None,
     ) -> None:
-        self._host = host
+        """Build seats from `host`: the app scope every clone is built from (§5.9).
+
+        A bare `HostDependencies` is accepted too, with the scope's other parts given as
+        keywords. Given an `AppScope`, those keywords are the scope's and are refused here,
+        so a room cannot build its seats differently from the chat that shares the scope.
+        """
+        if isinstance(host, AppScope):
+            given = [
+                name
+                for name, value in (
+                    ("llm_config", llm_config),
+                    ("memory_factory", memory_factory),
+                    ("persona_registry", persona_registry),
+                    ("workspace_root", workspace_root),
+                    ("read_roots", read_roots),
+                    ("global_models", global_models),
+                )
+                if value is not None
+            ]
+            if given:
+                raise TypeError(f"{given} belong to the AppScope, not to the resolver")
+            self._app = host
+        else:
+            root = (
+                workspace_root.resolve()
+                if workspace_root is not None
+                else (
+                    host.workspace.root.resolve()
+                    if host.workspace is not None
+                    else Path(os.getenv("UCLONE_WORKSPACE_DIR", os.getcwd())).resolve()
+                )
+            )
+            self._app = AppScope(
+                host=host,
+                workspace_root=root,
+                persona_registry=(
+                    persona_registry
+                    if persona_registry is not None
+                    else get_default_persona_registry(root)
+                ),
+                #: participant id -> that participant's own cross-session memory store.
+                #: Per participant and not per room, the same shape as `ontology_factory`:
+                #: one store behind two seats makes one agent's recollection readable as
+                #: another's. Given none, room agents are composed with no memory at all --
+                #: which since #1098 means the tools are neither resolved nor advertised.
+                memory_for=memory_factory,
+                global_models=global_models,
+                read_roots=read_roots or (lambda: ()),
+                llm_override=llm_config,
+            )
+        #: The room's transport, handed to every seat so a seat reaches the personas the
+        #: room answers (#1558). Room scope, not app scope: a chat clone has none of it.
+        self._a2a_transport = a2a_transport
         #: Where each seat's knowledge was saved after its turns (#1367). Loaded into the
         #: engine `ontology_factory` builds, before the seat's first turn, so a seat resumed
         #: after a restart continues from what it knew rather than from an empty graph --
         #: the knowledge half of what `hydrate_session` does for the session.
         self._knowledge = knowledge
-        #: Asked on every resolve rather than once, so a folder added in Settings reaches
-        #: a seat that is already built.
-        self._read_roots: Callable[[], tuple[Path, ...]] = read_roots or (lambda: ())
-        self._llm_config = llm_config
         self._ontology_factory = ontology_factory
-        #: participant id -> that participant's own cross-session memory store. Per
-        #: participant and not per room, the same shape as `ontology_factory`: a store is
-        #: what `record_memory_fact` writes into, and one store behind two seats makes one
-        #: agent's recollection readable as another's. Given none, room agents are composed
-        #: with no memory at all -- which since #1098 means the tools are neither resolved
-        #: nor advertised, rather than silently reaching the first store composed anywhere.
-        self._memory_factory = memory_factory
-        self._workspace_root = (
-            workspace_root.resolve()
-            if workspace_root is not None
-            else (
-                self._host.workspace.root.resolve()
-                if self._host.workspace is not None
-                else Path(os.getenv("UCLONE_WORKSPACE_DIR", os.getcwd())).resolve()
-            )
-        )
-        self._persona_registry = (
-            persona_registry
-            if persona_registry is not None
-            else get_default_persona_registry(self._workspace_root)
-        )
         #: session id -> the live agent built against it. Keyed by the *session* and not
         #: by the participant id, because an id is unique within one room and this cache
         #: is not: `scout` in two rooms is two participants with two derived sessions, and
@@ -136,6 +173,9 @@ class RoomAgentResolver:
         #: other's. Nothing downstream could see it: only one session was ever opened, so
         #: neither the claim below nor the session store's revision precondition fires.
         self._agents: dict[str, BaseAgentProtocol] = {}
+        #: session id -> whether that seat's (deep, fast) model follows Settings, because
+        #: its persona named none. Only those move when Settings changes.
+        self._follows: dict[str, tuple[bool, bool]] = {}
         #: session id -> the participant id it was issued to. The check that turns the
         #: protocol's isolation obligation into a refusal.
         self._sessions: dict[str, str] = {}
@@ -148,25 +188,30 @@ class RoomAgentResolver:
     @property
     def host(self) -> HostDependencies:
         """The host every seat is built with, including a connector replaced since (#1446)."""
-        return self._host
+        return self._app.host
+
+    @property
+    def app(self) -> AppScope:
+        """The scope every seat is built from."""
+        return self._app
 
     @property
     def persona_registry(self) -> PersonaRegistry:
         """Where this resolver looks a seat's persona up."""
-        return self._persona_registry
+        return self._app.persona_registry
 
     @property
     def workspace_root(self) -> Path:
-        return self._workspace_root
+        return self._app.workspace_root
 
     @property
     def llm_config(self) -> AgentLLMConfig | None:
         """The installation-wide model override, or `None` for each persona's own."""
-        return self._llm_config
+        return self._app.llm_override
 
     @property
     def read_roots(self) -> Callable[[], tuple[Path, ...]]:
-        return self._read_roots
+        return self._app.read_roots
 
     async def resolve(self, participant: Participant) -> BaseAgentProtocol:
         """Return the live agent for `participant`, constructing it on first use.
@@ -206,10 +251,10 @@ class RoomAgentResolver:
         cached = self._agents.get(cache_key)
         if cached is not None:
             if isinstance(cached, BaseAgent):
-                cached.set_read_roots(self._read_roots())
+                cached.set_read_roots(self._app.read_roots())
             return cached
 
-        host = self._host
+        ontology: OntologyChoice = APP_ONTOLOGY
         if participant.ontology_namespace:
             namespace_owner = self._namespaces.get(participant.ontology_namespace)
             if namespace_owner is not None and namespace_owner != participant.id:
@@ -219,7 +264,7 @@ class RoomAgentResolver:
                     f"for two agents merges what each induced from its own experience, "
                     f"which is the per-agent grounding P7 requires and not a room feature."
                 )
-            if self._ontology_factory is None and host.ontology is not None:
+            if self._ontology_factory is None and self._app.host.ontology is not None:
                 raise ParticipantNotResolvableError(
                     f"Participant {participant.id!r} carries ontology namespace "
                     f"{participant.ontology_namespace!r}, but this resolver was built with "
@@ -250,83 +295,31 @@ class RoomAgentResolver:
                         # hold part of it, and the seat starts over from nothing instead.
                         fresh = self._ontology_factory
                         engine = fresh(participant.ontology_namespace)
-                host = self._replace_ontology(host, engine)
+                ontology = engine
 
-        if self._memory_factory is not None:
-            host = dataclasses.replace(host, memory=self._memory_factory(participant.id))
-
-        # Check for persona definition from registry (matching participant.persona or participant.id)
-        persona_lookup = participant.persona or participant.id
-        persona_def = self._persona_registry.get_persona(persona_lookup)
-
-        # The seat's framing goes to the agent as its own field and the agent composes the
-        # prompt (`compose_identity_prompt`). Composing it here and handing it in after
-        # construction left the stored anchor without the framing the turn then sent.
-        seat_framing = room_participant_system_prompt(participant)
-
-        if persona_def is not None:
-            # Registered on the agent before it seeds the session, so the anchor is
-            # composed with this definition in force; the registry here may not be the
-            # one the agent would read on its own.
-            host = dataclasses.replace(
-                host,
-                persona=persona_def.name,
-                persona_name=persona_def.name,
-                persona_definitions=(persona_def,),
-            )
-
-        if self._llm_config is not None:
-            resolved_llm_config = self._llm_config
-        elif persona_def is not None:
-            resolved_llm_config = persona_def.llm_config
-        else:
-            resolved_llm_config = AgentLLMConfig()
-
-        display_name = participant.display_name or participant.id
-        read_roots = self._read_roots()
-        if persona_def is not None:
-            # Built where the chat head builds it, so a seat is given its tools by the same
-            # rule as a 1:1 chat: the persona's list is resolved by the agent -- from the
-            # definition registered on it through `persona_definitions` above -- and not
-            # copied in as the operator's list, which would win over every later edit
-            # (#1448). No registry proxy either: one fixed here would hide a tool an edit
-            # adds, and the agent's own scope already filters what it offers and refuses
-            # what it withholds.
-            config = agent_config_for_persona(
-                persona_def,
-                agent_id=participant.id,
-                name=display_name,
-                system_prompt=DEFAULT_SYSTEM_PROMPT,
-                seat_framing=seat_framing,
-                llm_config=resolved_llm_config,
-                workspace_dir=self._workspace_root,
-                read_roots=read_roots,
-            )
-        else:
-            config = AgentConfig(
-                agent_id=participant.id,
-                name=display_name,
-                system_prompt=DEFAULT_SYSTEM_PROMPT,
-                seat_framing=seat_framing,
-                llm_config=resolved_llm_config,
-                workspace_dir=self._workspace_root,
-                read_roots=read_roots,
-            )
-        agent = compose_agent(
-            config=config,
-            host=host,
-            context=AgentContext(
-                session_id=participant.session_id,
-                agent_id=participant.id,
-                workspace_root=self._workspace_root,
-            ),
+        # Everything else is built as a 1:1 chat builds it (owner ruling 2026-09-27): the
+        # room adds only what a room has -- the seat's framing, its display name, its own
+        # knowledge engine and the room's transport. The framing goes to the agent as its
+        # own field and the agent composes the prompt (`compose_identity_prompt`).
+        built = build_clone(
+            self._app,
+            clone_id=participant.id,
+            session_id=participant.session_id,
+            persona=participant.persona,
+            display_name=participant.display_name or participant.id,
+            seat_framing=room_participant_system_prompt(participant),
+            ontology=ontology,
+            a2a_transport=self._a2a_transport,
         )
+        agent = built.agent
+        follows = built.follows
         # Resume before the first turn: the room outlives the process that drives it, so an
         # agent that did not hydrate would answer a continuing conversation from a blank
         # history and then persist that over the record.
         agent.hydrate_session()
 
         self._agents[cache_key] = agent
+        self._follows[cache_key] = follows
         self._sessions[participant.session_id] = participant.id
         if participant.ontology_namespace:
             self._namespaces[participant.ontology_namespace] = participant.id
@@ -336,16 +329,25 @@ class RoomAgentResolver:
         """Answer with `llm` from now on: in every seat already built, and in any built later.
 
         The host is held for the resolver's lifetime, so a connector replaced in Settings
-        reached neither half until the room was reopened after a restart (#1446). A seat's
-        model name is its persona's, so only the connector is swapped here.
+        reached neither half until the room was reopened after a restart (#1446). A seat
+        whose persona names its own model keeps it; a seat that follows Settings takes the
+        Settings model with the connector, since a connector alone would leave it asking
+        for the previous provider's model.
         """
-        self._host = dataclasses.replace(self._host, llm=llm)
-        for agent in self._agents.values():
+        self._app = self._app.with_llm(llm)
+        global_models = self._app.global_models
+        deep, fast = global_models() if global_models is not None else (None, None)
+        for cache_key, agent in self._agents.items():
             # Every agent cached here came from `compose_agent`; the protocol it is held as
             # does not declare the reload, and a fake that is not a `BaseAgent` has no
             # connector to swap.
             if isinstance(agent, BaseAgent):
-                agent.hot_reload_llm(llm)
+                deep_follows, fast_follows = self._follows.get(cache_key, (False, False))
+                agent.hot_reload_llm(
+                    llm,
+                    model_name=deep if deep_follows else None,
+                    fast_model=(fast or deep) if fast_follows else None,
+                )
 
     def seated_agent_ids(self) -> frozenset[str]:
         """The ids of the agents this resolver has built and still holds.
@@ -378,10 +380,3 @@ class RoomAgentResolver:
         old messages, which that agent then persisted back over the write.
         """
         return self._agents.get(session_id)
-
-    @staticmethod
-    def _replace_ontology(
-        host: HostDependencies, ontology: OntologyEngineProtocol
-    ) -> HostDependencies:
-        """A copy of `host` carrying this participant's own ontology engine (P7, G4)."""
-        return dataclasses.replace(host, ontology=ontology)

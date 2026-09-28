@@ -39,7 +39,6 @@ def test_model_profile_strict_validation() -> None:
         display_name="Test Model",
         filename="test.safetensors",
         family=PromptFamily.DANBOORU,
-        skill_name="media-prompt-danbooru",
     )
     assert profile.model_id == "test_model"
     assert profile.family == PromptFamily.DANBOORU
@@ -51,7 +50,6 @@ def test_model_profile_strict_validation() -> None:
             model_id="bad",
             display_name="Bad",
             family=PromptFamily.DANBOORU,
-            skill_name="media-prompt-danbooru",
             unknown_attribute=123,  # type: ignore[call-arg]
         )
 
@@ -64,7 +62,7 @@ def test_default_registry_loads_shipped_models() -> None:
     profile_by_id = registry.resolve("anillustrious_v4")
     assert profile_by_id.model_id == "anillustrious_v4"
     assert profile_by_id.family == PromptFamily.DANBOORU
-    assert profile_by_id.skill_name == "media-prompt-danbooru"
+    assert profile_by_id.skill_name is None
 
     # lookup by filename
     profile_by_file = registry.resolve("anillustrious_v4.safetensors")
@@ -73,7 +71,7 @@ def test_default_registry_loads_shipped_models() -> None:
     # flux-2-klein-base-4b lookup
     flux_profile = registry.resolve("flux-2-klein-base-4b")
     assert flux_profile.family == PromptFamily.NATURAL_PROSE
-    assert flux_profile.skill_name == "media-prompt-flux"
+    assert flux_profile.skill_name is None
 
 
 def test_sidecar_metadata_takes_highest_priority(tmp_path: Path) -> None:
@@ -86,7 +84,6 @@ def test_sidecar_metadata_takes_highest_priority(tmp_path: Path) -> None:
         "model_id": "sidecar_custom",
         "display_name": "Sidecar Discovered Model",
         "family": "danbooru",
-        "skill_name": "media-prompt-danbooru",
         "width": 832,
         "height": 1216,
         "default_negative": "low quality, bad hands",
@@ -113,7 +110,6 @@ def test_user_config_overrides_shipped_defaults(tmp_path: Path) -> None:
                 "display_name": "User Overridden Illustrious",
                 "filename": "anillustrious_v4.safetensors",
                 "family": "danbooru",
-                "skill_name": "media-prompt-danbooru",
                 "steps": 28,
                 "cfg": 6.5,
                 "default_negative": "custom negative",
@@ -138,12 +134,12 @@ def test_heuristic_detection_for_unregistered_checkpoints() -> None:
     # Anime heuristic
     anime_prof = registry.resolve("my_special_pony_diffusion_v6.safetensors")
     assert anime_prof.family == PromptFamily.DANBOORU
-    assert anime_prof.skill_name == "media-prompt-danbooru"
+    assert anime_prof.skill_name is None
 
     # Flux heuristic
     flux_prof = registry.resolve("custom_flux_schnell_v1.safetensors")
     assert flux_prof.family == PromptFamily.NATURAL_PROSE
-    assert flux_prof.skill_name == "media-prompt-flux"
+    assert flux_prof.skill_name is None
     assert flux_prof.steps == 4
     assert flux_prof.cfg == 1.0
 
@@ -155,7 +151,7 @@ def test_fallback_profile_for_unknown_model_or_none() -> None:
     none_profile = registry.resolve(None)
     assert none_profile.model_id == "generic_fallback"
     assert none_profile.family == PromptFamily.GENERIC
-    assert none_profile.skill_name == "media-prompt-generic"
+    assert none_profile.skill_name is None
 
     unknown_profile = registry.resolve("totally_unrecognized_checkpoint_xyz.ckpt")
     assert unknown_profile.model_id == "generic_fallback"
@@ -172,24 +168,27 @@ def test_graceful_handling_of_malformed_yaml(tmp_path: Path) -> None:
 
 
 def test_resolve_aspect_dimensions_with_danbooru_profile() -> None:
-    """Aspect ratio resolution adapts to Danbooru anime native resolutions."""
+    """A registered SDXL-class profile renders at SDXL's ~1MP buckets, not below 768².
+
+    Illustrious was trained without images under 768x768; the old DANBOORU branch gave
+    it 576x768 for 3:4, below its own training floor.
+
+    Killed by: src/uclone_x/tools/builtin/image.py :: "3:4": (896, 1152),
+    Becomes: "3:4": (576, 768),
+    """
     danbooru_profile = ModelProfile(
         model_id="anime_test",
         display_name="Anime Test",
         family=PromptFamily.DANBOORU,
-        skill_name="media-prompt-danbooru",
     )
 
-    # 3:4 portrait resolution aligned to 64px
-    assert resolve_aspect_dimensions("3:4", profile=danbooru_profile) == (576, 768)
-    # 9:16 portrait
-    assert resolve_aspect_dimensions("9:16", profile=danbooru_profile) == (512, 896)
-    # 16:9 landscape
-    assert resolve_aspect_dimensions("16:9", profile=danbooru_profile) == (896, 512)
-    # 1:1 square
-    assert resolve_aspect_dimensions("1:1", profile=danbooru_profile) == (768, 768)
+    assert resolve_aspect_dimensions("3:4", profile=danbooru_profile) == (896, 1152)
+    assert resolve_aspect_dimensions("9:16", profile=danbooru_profile) == (768, 1344)
+    assert resolve_aspect_dimensions("16:9", profile=danbooru_profile) == (1344, 768)
+    assert resolve_aspect_dimensions("4:3", profile=danbooru_profile) == (1152, 896)
+    assert resolve_aspect_dimensions("1:1", profile=danbooru_profile) == (1024, 1024)
 
-    # Standard fallback without profile
+    # Standard fallback without profile keeps the legacy table
     assert resolve_aspect_dimensions("3:4") == (576, 768)
 
 
@@ -238,9 +237,9 @@ def test_generate_image_tool_dynamic_description() -> None:
     tool = GenerateImageTool(dispatcher=dispatcher)
 
     profile = dispatcher.get_active_profile()
-    assert f"Active Model: '{profile.model_id}'" in tool.description
+    assert f"Active model: '{profile.model_id}'" in tool.description
     assert f"({profile.family.value} prompt family)" in tool.description
-    assert "Danbooru tags" in tool.description or "media-prompt" in tool.description
+    assert "media-prompt" not in tool.description
 
 
 def test_optimize_prompts_flux_suppresses_negative() -> None:
@@ -249,7 +248,6 @@ def test_optimize_prompts_flux_suppresses_negative() -> None:
         model_id="flux-test",
         display_name="FLUX Test",
         family=PromptFamily.NATURAL_PROSE,
-        skill_name="media-prompt-flux",
         default_negative="",
         suppress_negative=True,
     )
@@ -277,7 +275,6 @@ def test_optimize_prompts_danbooru_merges_negative() -> None:
         model_id="danbooru-test",
         display_name="Danbooru Test",
         family=PromptFamily.DANBOORU,
-        skill_name="media-prompt-danbooru",
         default_negative="worst quality, bad anatomy, deformed, bad hands",
     )
 
@@ -313,7 +310,6 @@ def test_optimize_prompts_generic_fallback() -> None:
         model_id="generic-test",
         display_name="Generic Test",
         family=PromptFamily.GENERIC,
-        skill_name="media-prompt-generic",
         default_negative="worst quality, blurry",
     )
 
@@ -346,7 +342,6 @@ async def test_dispatcher_flux_profile_suppresses_negative() -> None:
         model_id="flux-custom",
         display_name="FLUX Custom",
         family=PromptFamily.NATURAL_PROSE,
-        skill_name="media-prompt-flux",
         default_negative="",
         suppress_negative=True,
     )

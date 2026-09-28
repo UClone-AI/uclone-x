@@ -106,7 +106,7 @@ describe('DocViewer, scoped to the conversation (#1354, #1356)', () => {
     expect(screen.queryByTestId('doc-list-scope')).toBeNull();
   });
 
-  // Killed by: frontend/src/components/artifacts/DocViewer.tsx :: ? listing.reason ?? `No files are listed yet. ${listing.scope_note ?? ''}`.trim()
+  // Killed by: frontend/src/components/artifacts/DocViewer.tsx :: ? listing.reason ?? fmt(t.noneListed, { scope: listing.scope_note ?? '' }).trim()
   // Becomes: ? listing.reason ?? 'No file has been written in this conversation yet.'
   it('says an empty list is only empty, with what it covers, when the Core gives no reason', async () => {
     answers[LIST_A] = listing({});
@@ -231,8 +231,8 @@ describe('DocViewer: a failed read shows no transport text (#1435)', () => {
       headers: { 'content-type': 'text/plain; charset=utf-8' },
     });
 
-  // Killed by: frontend/src/components/artifacts/DocViewer.tsx :: (listRead.fault.detail ?? FILES_READ_FAILED)
-  // Becomes: (listRead.error ?? FILES_READ_FAILED)
+  // Killed by: frontend/src/components/artifacts/DocViewer.tsx :: (listRead.fault.detail ?? t.filesReadFailed)
+  // Becomes: (listRead.error ?? t.filesReadFailed)
   it('an unreachable runtime reads as a plain sentence for the file list', async () => {
     vi.unstubAllGlobals();
     const realFetch = globalThis.fetch;
@@ -258,7 +258,7 @@ describe('DocViewer: a failed read shows no transport text (#1435)', () => {
     expectPlain(reason.textContent);
   });
 
-  // Killed by: frontend/src/components/artifacts/DocViewer.tsx :: {FILE_READ_FAILED}
+  // Killed by: frontend/src/components/artifacts/DocViewer.tsx :: {t.fileReadFailed}
   // Becomes: {error}
   it('an unreachable runtime reads as a plain sentence for a file', async () => {
     vi.unstubAllGlobals();
@@ -278,7 +278,7 @@ describe('DocViewer: a failed read shows no transport text (#1435)', () => {
     expectPlain(failed.textContent);
   });
 
-  // Killed by: frontend/src/components/artifacts/DocViewer.tsx :: {FILE_READ_FAILED}
+  // Killed by: frontend/src/components/artifacts/DocViewer.tsx :: {t.fileReadFailed}
   // Becomes: {error}
   it('a plain-text 500 reads as a plain sentence for a file, not its status line', async () => {
     vi.stubGlobal('fetch', async (url: string) =>
@@ -293,8 +293,8 @@ describe('DocViewer: a failed read shows no transport text (#1435)', () => {
     expectPlain(failed.textContent);
   });
 
-  // Killed by: frontend/src/components/artifacts/DocViewer.tsx :: (listRead.fault.detail ?? FILES_READ_FAILED)
-  // Becomes: (FILES_READ_FAILED)
+  // Killed by: frontend/src/components/artifacts/DocViewer.tsx :: (listRead.fault.detail ?? t.filesReadFailed)
+  // Becomes: (t.filesReadFailed)
   it('a refusal in the Core’s own plain words is shown as it gave them', async () => {
     const detail = 'No conversation with that name is open.';
     vi.stubGlobal(
@@ -336,6 +336,33 @@ describe('DocViewer: a failed read shows no transport text (#1435)', () => {
     expect(screen.getByText('a scenic mountain at sunset')).toBeInTheDocument();
     expect(screen.getByText('Seed: 42')).toBeInTheDocument();
     expect(screen.getByText('diffusers-sdxl')).toBeInTheDocument();
+  });
+
+  // Killed by: frontend/src/components/artifacts/DocViewer.tsx :: {imageMeta.meta.negative_prompt && (
+  // Becomes: {false && (
+  it('renders negative prompt in image metadata card when present', async () => {
+    answers[LIST_A] = listing({
+      artifacts: [
+        art({ path: 'artifacts/images/img_neg123.png', name: 'img_neg123.png' }),
+        art({ path: 'artifacts/images/img_neg123.json', name: 'img_neg123.json' }),
+      ],
+      total: 2,
+    });
+    answers['/api/artifacts/content?path=artifacts%2Fimages%2Fimg_neg123.json'] = {
+      id: 'neg123',
+      prompt: 'a scenic mountain at sunset',
+      negative_prompt: 'blurry, low quality, artifacts',
+      seed: 42,
+      engine: 'diffusers-sdxl',
+      style: 'artistic',
+      width: 1024,
+      height: 768,
+      duration_seconds: 1.5,
+    };
+    render(<DocViewer roomId="room-a" selectedArtifactPath="artifacts/images/img_neg123.png" />);
+    expect(await screen.findByTestId('image-meta-negative-prompt')).toHaveTextContent(
+      'blurry, low quality, artifacts',
+    );
   });
 });
 

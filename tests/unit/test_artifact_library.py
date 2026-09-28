@@ -293,8 +293,9 @@ def test_delete_needs_confirmation(workspace: Path, library: ArtifactLibrary) ->
     )
     assert path.exists()
 
-    library.delete("artifacts/a.md", confirm=True)
-    assert not path.exists()
+    library.archive("artifacts/a.md")
+    library.delete(".archive/artifacts/a.md", confirm=True)
+    assert not (workspace / ".archive" / "artifacts" / "a.md").exists()
 
 
 @pytest.mark.parametrize("almost", ["yes", 1, "true"])
@@ -344,7 +345,7 @@ def test_a_folder_that_is_not_a_story_is_neither_archived_nor_deleted(
 def test_hard_links_are_told_apart_by_the_name_asked_for(
     workspace: Path, library: ArtifactLibrary
 ) -> None:
-    """Two names for one file: the one spelled like the request is the one removed (#1578).
+    """Two names for one file: the one spelled like the request is the one moved (#1578).
 
     Killed by: src/uclone_x/artifacts/library.py :: spelled = [entry for entry in same if _fold(entry) == _fold(part)]
     Becomes: spelled = []
@@ -355,10 +356,11 @@ def test_hard_links_are_told_apart_by_the_name_asked_for(
     if not _case_insensitive(workspace):
         pytest.skip("this disk tells the cases apart, so the other spelling names nothing")
 
-    library.delete("artifacts/B.TXT", confirm=True)
+    library.archive("artifacts/B.TXT")
 
     assert first.read_text(encoding="utf-8") == "shared"
     assert not second.exists()
+    assert (workspace / ".archive" / "artifacts" / "b.txt").is_file()
 
 
 def test_an_archived_file_can_be_deleted(workspace: Path, library: ArtifactLibrary) -> None:
@@ -488,10 +490,6 @@ def test_a_story_being_written_is_not_archived_silently(
     assert refused.value.room_id == room_id
     assert (workspace / "stories" / story_id).is_dir()
 
-    with pytest.raises(StoryInUseError):
-        library.delete(f"stories/{story_id}", confirm=True)
-    assert (workspace / "stories" / story_id).is_dir()
-
 
 def test_going_ahead_releases_the_writer_and_clears_its_story(
     workspace: Path, rooms: RoomService, library: ArtifactLibrary
@@ -524,16 +522,12 @@ def test_going_ahead_is_refused_while_the_writer_is_answering(
     held = rooms.get(room_id)  # what the running turn loaded
     answering.add(room_id)
 
-    for attempt in (
-        lambda: library.archive(f"stories/{story_id}", release_writer=True),
-        lambda: library.delete(f"stories/{story_id}", confirm=True, release_writer=True),
-    ):
-        with pytest.raises(StoryInUseError) as refused:
-            attempt()
-        assert str(refused.value) == (
-            "The conversation “Writing room” is answering right now, so it cannot be stopped "
-            "from writing this story yet. Wait for the answer to finish, then try again."
-        )
+    with pytest.raises(StoryInUseError) as refused:
+        library.archive(f"stories/{story_id}", release_writer=True)
+    assert str(refused.value) == (
+        "The conversation “Writing room” is answering right now, so it cannot be stopped "
+        "from writing this story yet. Wait for the answer to finish, then try again."
+    )
     assert (workspace / "stories" / story_id).is_dir()
     assert _lease_holder(workspace / "stories" / story_id) == room_id
 
@@ -556,8 +550,6 @@ def test_a_story_named_in_another_case_is_still_the_story(
     shouted = f"stories/{story_id.upper()}"
     with pytest.raises(StoryInUseError):
         library.archive(shouted)
-    with pytest.raises(StoryInUseError):
-        library.delete(shouted, confirm=True)
     with pytest.raises(ArtifactError) as member:
         library.delete(f"STORIES/{story_id.upper()}/chapters/01.md", confirm=True)
     assert str(member.value).startswith("01.md is part of the story")
@@ -600,8 +592,6 @@ def test_a_story_spelled_with_a_long_s_is_still_the_story(
     assert long_s != f"stories/{story_id}"
     with pytest.raises(StoryInUseError):
         library.archive(long_s)
-    with pytest.raises(StoryInUseError):
-        library.delete(long_s, confirm=True)
     assert _lease_holder(workspace / "stories" / story_id) == room_id
 
     assert library.archive(long_s, release_writer=True).path == f".archive/stories/{story_id}"
@@ -647,24 +637,6 @@ def test_a_conversation_reading_an_archived_story_no_longer_has_it_open(
     assert rooms.get(other_room).story_id == other_story
 
 
-def test_a_conversation_reading_a_deleted_story_no_longer_has_it_open(
-    workspace: Path, rooms: RoomService, library: ArtifactLibrary
-) -> None:
-    """Killed by: src/uclone_x/artifacts/library.py :: note = self._forget_story(leaving, "deleted")
-    Becomes: note = None
-    """
-    story_id, _ = _story(workspace, rooms, "Writing room")
-    reader = rooms.create("Reading room").room_id
-    library.open_story_in_conversation(story_id, reader)
-    other_story, other_room = _sunset(workspace, rooms, "Other room")
-
-    deleted = library.delete(f"stories/{story_id}", confirm=True, release_writer=True)
-
-    assert deleted.note is None
-    assert rooms.get(reader).story_id is None
-    assert rooms.get(other_room).story_id == other_story
-
-
 @pytest.mark.parametrize(
     "failure", [StaleRoomWriteError("moved on"), OSError("disk full")], ids=["stale", "disk"]
 )
@@ -702,35 +674,6 @@ def test_a_story_that_moved_is_not_reported_as_failing_to(
     assert archived.note == READERS_NOT_CLEARED_NOTE
     assert not (workspace / "stories" / story_id).exists()
     assert f"Story {story_id!r} was archived, but" in caplog.text
-
-
-def test_a_deleted_story_is_not_reported_as_failing_to_go(
-    workspace: Path,
-    rooms: RoomService,
-    library: ArtifactLibrary,
-    monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """The log says the story was deleted, not that it was moved (#1578).
-
-    Killed by: src/uclone_x/artifacts/library.py :: note = self._forget_story(leaving, "deleted")
-    Becomes: note = self._rooms.forget_story(leaving)
-    Killed by: src/uclone_x/artifacts/library.py :: note = self._forget_story(leaving, "deleted")
-    Becomes: note = self._forget_story(leaving, "archived")
-    """
-    story_id, _ = _story(workspace, rooms, "Writing room")
-
-    def stale(story: str) -> tuple[str, ...]:
-        raise StaleRoomWriteError("moved on")
-
-    monkeypatch.setattr(rooms, "forget_story", stale)
-
-    with caplog.at_level(logging.WARNING, logger="uclone_x.artifacts.library"):
-        deleted = library.delete(f"stories/{story_id}", confirm=True, release_writer=True)
-
-    assert deleted.note == READERS_NOT_CLEARED_NOTE
-    assert not (workspace / "stories" / story_id).exists()
-    assert f"Story {story_id!r} was deleted, but" in caplog.text
 
 
 def test_a_defect_while_clearing_the_readers_is_not_hidden_in_the_log(
@@ -820,8 +763,10 @@ def test_a_writer_that_no_longer_exists_holds_nothing(
     assert entry.story is not None and entry.story.writer is not None
     assert (entry.story.writer.exists, entry.story.writer.title) == (False, None)
 
-    library.delete(f"stories/{story_id}", confirm=True)
+    library.archive(f"stories/{story_id}")
+    library.delete(f".archive/stories/{story_id}", confirm=True)
     assert not (workspace / "stories" / story_id).exists()
+    assert not (workspace / ".archive" / "stories" / story_id).exists()
 
 
 def test_an_unreadable_story_is_listed_with_its_reason(

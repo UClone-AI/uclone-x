@@ -10,29 +10,42 @@
  * below, which is a sentence and not an interpretation, is shared by the two.
  */
 
-import type { RoomTurnRefusal } from '../types';
+import type { ProviderFailureKind, RoomProviderFailure, RoomTurnRefusal } from '../types';
+import { en, type Messages } from '../i18n/en';
+import { fmt, plural } from '../i18n/format';
 
 /**
- * What to tell the user about a turn the Core refused, beside the reason it gave.
+ * The sentences below, in the reader's language (`conversation.outcome`).
+ *
+ * Every function takes them last and defaults to English, so the developer-mode Turn surface,
+ * which stays English until step 7 of `multilingual-ui.md`, calls them unchanged.
+ */
+export type OutcomeCopy = Messages['conversation']['outcome'];
+
+const ENGLISH: OutcomeCopy = en.conversation.outcome;
+
+/**
+ * What to tell the user about a turn the Core refused, beside the reason it gave
+ * (`outcome.refusalRemedy`).
  *
  * Such a row offers no Retry: a spent budget refuses every retry, and the button used to
  * append one identical failure per press. A refusal kind this head does not know yet still
  * withholds Retry, since the Core says a retry fails the same way.
  */
-const REFUSAL_REMEDY: Record<RoomTurnRefusal, string> = {
-  budget_exceeded: 'Trying again would be refused too. Start a new conversation to continue.',
-  model_without_tools:
-    'Pick a model that supports tools (for example qwen3:8b) in Settings, then send your message again.',
-};
+export const refusalRemedy = (refusal: RoomTurnRefusal, copy: OutcomeCopy = ENGLISH): string =>
+  (copy.refusalRemedy as Partial<Record<string, string>>)[refusal] ?? copy.refusalRemedyOther;
 
-export const refusalRemedy = (refusal: RoomTurnRefusal): string =>
-  REFUSAL_REMEDY[refusal] ?? 'Trying again would be refused for the same reason.';
-
-/** Why the Core refused a turn, as the end of a sentence about the seat. */
-const REFUSAL_REASON: Record<RoomTurnRefusal, string> = {
-  budget_exceeded: 'it has used all the tokens this conversation allows',
-  model_without_tools: "its model can't use tools, which clones need",
-};
+/**
+ * Where to act on a provider failure a retry can cure, when there is somewhere (#1630).
+ *
+ * The Core's sentence says what stopped and whose side it is on, and leaves *where* to the
+ * head (P8). A failure that is not a refusal still offers Retry; this is said beside it.
+ * The two refusals take their remedy from `outcome.refusalRemedy`, as every refusal does.
+ */
+export const providerFailureRemedy = (
+  kind: ProviderFailureKind,
+  copy: OutcomeCopy = ENGLISH,
+): string | null => (copy.providerRemedy as Partial<Record<string, string>>)[kind] ?? null;
 
 /**
  * What a failed turn's row says happened (#1408).
@@ -40,21 +53,30 @@ const REFUSAL_REASON: Record<RoomTurnRefusal, string> = {
  * Never the row's `error` field: the Core writes it as `"<ExceptionClass>: <message>"`
  * (or the agent's own failure text), which is the cause for the log's reader and can hold
  * class names and file paths. The row says which of three things happened, from the
- * fields the Core states rather than from `error`'s wording (#969): the turn was refused,
- * it was stopped before it finished (`completed: false`), or something went wrong while
- * it answered.
+ * fields the Core states rather than from `error`'s wording (#969): the turn failed at the
+ * model's provider, it was refused, it was stopped before it finished (`completed: false`),
+ * or something went wrong while it answered.
+ *
+ * A provider failure is told in the Core's own sentence (#1630). It is the one failure a
+ * beginner cannot place without it: "something went wrong" over a retired model or a
+ * rejected key reads as a fault in the app, and sends them looking in the wrong place. That
+ * sentence is the Core's and is in English until step 5 of `multilingual-ui.md`.
  */
 export const turnFailureSentence = (
   label: string,
   refusal: RoomTurnRefusal | null | undefined,
   completed: boolean,
+  providerFailure?: RoomProviderFailure | null,
+  copy: OutcomeCopy = ENGLISH,
 ): string => {
+  if (providerFailure) return fmt(copy.providerFailed, { label, message: providerFailure.message });
   if (refusal) {
-    const reason = REFUSAL_REASON[refusal] ?? 'the app refused to run it';
-    return `${label} couldn't finish this turn: ${reason}.`;
+    const reason =
+      (copy.refusalReason as Partial<Record<string, string>>)[refusal] ?? copy.refusalReasonOther;
+    return fmt(copy.refused, { label, reason });
   }
-  if (!completed) return `${label} was stopped before finishing this turn.`;
-  return `${label} couldn't finish this turn because something went wrong while it was answering.`;
+  if (!completed) return fmt(copy.stopped, { label });
+  return fmt(copy.wentWrong, { label });
 };
 
 /**
@@ -66,16 +88,11 @@ export const memoryUnsavedNotice = (
   label: string,
   tried: number | undefined,
   unsaved: number | undefined,
+  copy: OutcomeCopy = ENGLISH,
 ): string | null => {
   const missed = unsaved ?? 0;
   if (missed <= 0) return null;
   const total = Math.max(tried ?? 0, missed);
-  if (missed === total) {
-    return total === 1
-      ? `${label} tried to save something to memory, and nothing was saved.`
-      : `${label} tried to save ${total} things to memory, and none of them were saved.`;
-  }
-  return `${label} tried to save ${total} things to memory, and ${missed} of them ${
-    missed === 1 ? 'was' : 'were'
-  } not saved.`;
+  if (missed === total) return plural(copy.memoryNoneSaved, total, { label });
+  return plural(copy.memorySomeUnsaved, missed, { label, total });
 };

@@ -1,9 +1,9 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Bot, MessageSquarePlus, Pencil, Plus, Save, X, Loader2, Sparkles } from 'lucide-react';
+import { MessageSquarePlus, Pencil, Plus, Save, X, Loader2, Sparkles } from 'lucide-react';
 import { PersonaInfo } from '../../types';
-import { personaAvatarUrl } from '../../lib/personaAvatar';
+import { personaPicture } from '../../lib/avatarChoice';
+import { AvatarMenu } from '../avatar/AvatarMenu';
 import { PersonaDetail } from '../layout/PersonaDetail';
-import { Avatar } from '../../ui-kit';
 import { PersonaEditor } from '../personas/PersonaEditor';
 import {
   draftFromPersona,
@@ -12,7 +12,7 @@ import {
   type PersonaEditMode,
   type PersonaSaveResult,
 } from '../../lib/personaDraft';
-import { PERSONA_EDITOR_COPY } from '../../lib/personaCopy';
+import { fmt, useCopy } from '../../i18n';
 import { synthesizePersonaPrompt } from '../../lib/personasApi';
 import { useEscapeOwner } from '../../lib/escapePrecedence';
 
@@ -31,8 +31,6 @@ export interface CloneProfileProps {
   onEdit?: (cloneId: string) => void;
   /** Available tools from runtime. */
   availableTools?: readonly string[];
-  /** The running clone's tools that it is given only inside a conversation (#1595). */
-  toolsNeedingConversation?: readonly string[];
   /** Available models from runtime. */
   availableModels?: readonly string[];
   /** Existing persona names to prevent duplicate names on create. */
@@ -81,7 +79,6 @@ export const CloneProfile: React.FC<CloneProfileProps> = ({
   onModeChange,
   onEdit,
   availableTools = [],
-  toolsNeedingConversation,
   availableModels = [],
   existingNames = [],
   canWrite = true,
@@ -89,6 +86,8 @@ export const CloneProfile: React.FC<CloneProfileProps> = ({
   studio = false,
   onStudioChange,
 }) => {
+  const copy = useCopy();
+  const t = copy.cloneProfile;
   const isCreate = mode === 'create';
   const isEdit = mode === 'edit';
 
@@ -197,7 +196,7 @@ export const CloneProfile: React.FC<CloneProfileProps> = ({
         isBuiltin={persona?.builtin ?? false}
         saving={saving}
         error={saveError}
-        copy={PERSONA_EDITOR_COPY}
+        copy={copy.personaEditor}
         icons={EDITOR_ICONS}
         isStudio={studio}
         onToggleStudio={onStudioChange ? () => onStudioChange(!studio) : undefined}
@@ -227,11 +226,14 @@ export const CloneProfile: React.FC<CloneProfileProps> = ({
 
   // View mode, but no clone selected
   if (cloneId === '') {
+    // The rail's own word for its Clones section, so the pointer names what the reader sees there.
+    const [noneBefore, noneAfter = ''] = t.none.split('{clones}');
     return (
       <div className="space-y-3">
         <p data-testid="clone-profile-none" className="text-sm text-slate-400 leading-relaxed">
-          No clone is picked yet. Choose one under <span className="text-slate-300">Clones</span> in
-          the left rail to see what it is set up to do and to start a conversation with it.
+          {noneBefore}
+          <span className="text-slate-300">{copy.rail.clones}</span>
+          {noneAfter}
         </p>
         {onModeChange && canWrite && (
           <button
@@ -241,7 +243,7 @@ export const CloneProfile: React.FC<CloneProfileProps> = ({
             className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-slate-700 bg-slate-800 text-xs font-medium text-slate-200 hover:bg-slate-700 hover:text-white transition-colors"
           >
             <Plus className="w-3.5 h-3.5" />
-            {PERSONA_EDITOR_COPY.newPersona}
+            {copy.personaEditor.newPersona}
           </button>
         )}
       </div>
@@ -253,13 +255,11 @@ export const CloneProfile: React.FC<CloneProfileProps> = ({
   return (
     <div data-testid={`clone-profile-${cloneId}`} className="space-y-4">
       <div className="flex flex-col items-center text-center gap-2">
-        <Avatar
-          label={name}
-          kind="agent"
-          agentIcon={Bot}
-          size="lg"
-          imageSrc={personaAvatarUrl(name)}
-          data-testid="clone-profile-avatar"
+        <AvatarMenu
+          name={name}
+          imageSrc={personaPicture(name, persona)}
+          installed={persona !== undefined}
+          hasChosenPicture={persona?.avatar_chosen === true}
         />
         {/* The heading is on one line so that a mutation declaration can name it. A needle
             cannot span lines and must occur once in this file; the bare expression below
@@ -272,7 +272,7 @@ export const CloneProfile: React.FC<CloneProfileProps> = ({
           data-testid="clone-profile-role"
           className="text-[11px] font-mono uppercase tracking-wide text-slate-500"
         >
-          {persona?.role || 'No role set'}
+          {persona?.role || t.noRole}
         </p>
       </div>
 
@@ -280,39 +280,37 @@ export const CloneProfile: React.FC<CloneProfileProps> = ({
         <button
           type="button"
           data-testid="clone-profile-start"
-          aria-label={`Start a conversation with ${name}`}
+          aria-label={fmt(t.startLabel, { name })}
           onClick={() => onStartConversation(cloneId)}
           className="flex-1 flex items-center justify-center gap-2 px-3 py-2 rounded-lg border border-indigo-500/40 bg-indigo-950/40 text-sm font-medium text-indigo-200 hover:bg-indigo-900/50 transition-colors"
         >
           <MessageSquarePlus className="w-4 h-4" />
-          Start a conversation
+          {t.start}
         </button>
         {(onModeChange || onEdit) && persona && (
           <button
             type="button"
             data-testid="clone-profile-edit"
-            aria-label={`Edit ${name}`}
+            aria-label={fmt(t.editLabel, { name })}
             disabled={!canWrite}
             onClick={handleEditClick}
             className="flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg border border-slate-700 bg-slate-800/80 text-sm font-medium text-slate-200 hover:bg-slate-700 hover:text-white transition-colors disabled:opacity-50"
-            title={canWrite ? `Edit ${name}` : PERSONA_EDITOR_COPY.noWorkspace}
+            title={canWrite ? fmt(copy.personaEditor.editTitle, { name }) : copy.personaEditor.noWorkspace}
           >
             <Pencil className="w-4 h-4" />
-            Edit
+            {t.edit}
           </button>
         )}
       </div>
 
       {persona ? (
-        <PersonaDetail persona={persona} toolsNeedingConversation={toolsNeedingConversation} />
+        <PersonaDetail persona={persona} />
       ) : (
         // A clone can be running with no file installed under its name -- the rail builds a
         // row from the live instance in that case. Saying so is the point: "this clone has no
         // settings" and "the settings did not load" are the same blank panel otherwise.
         <p data-testid="clone-profile-no-definition" className="text-sm text-slate-400 leading-relaxed">
-          Nothing is installed under this name, so there is no description, model or tool list
-          to show. A clone gets those from a definition file in the workspace&apos;s personas
-          directory.
+          {t.noDefinition}
         </p>
       )}
     </div>

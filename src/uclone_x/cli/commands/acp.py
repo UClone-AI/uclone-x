@@ -3,16 +3,15 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Annotated
+from pathlib import Path
+from typing import Annotated, Any
 
 import typer
 from rich.console import Console
 from rich.markup import escape
 
 from uclone_x.agent.base import BaseAgent
-from uclone_x.agent.bootstrap import agent_config_for_persona
-from uclone_x.agent.composition import HostDependencies, compose_agent
-from uclone_x.agent.models import AgentConfig, AgentContext
+from uclone_x.agent.clone_builder import AppScope, build_clone, local_app_scope, memory_map
 from uclone_x.agent.persona_registry import get_default_persona_registry
 from uclone_x.agent.persona_store import DEFAULT_PERSONA_NAME
 from uclone_x.agent.session import SessionStore
@@ -34,22 +33,19 @@ console = Console()
 err_console = Console(stderr=True)
 
 
-def session_agent_factory(config: AgentConfig, host: HostDependencies) -> SessionAgentFactory:
-    """Build each ACP session's agent: one `config`, one `host`, a context per session (#1454).
+def session_agent_factory(app: AppScope, **clone: Any) -> SessionAgentFactory:
+    """Build each ACP session's agent: one clone, built per session (#1454, #1731).
 
     Every session gets an agent of its own, so no session's history reaches another's
     request, while everything that is the *agent's* rather than the conversation's -- the
     store, the bus, the connector, the tools and the cross-session memory -- is shared
-    through `host`. Memory in particular must be one store per agent id: two stores over
-    one file would each drop the facts the other recorded (see `HostDependencies.memory`).
+    through `app`. Memory in particular is one store per clone id, from the scope's map:
+    two stores over one file would each drop the facts the other recorded. `clone` is
+    what `build_clone` takes besides the session.
     """
 
     def build(session_id: str) -> BaseAgent:
-        return compose_agent(
-            config=config,
-            host=host,
-            context=AgentContext(session_id=session_id, agent_id=config.agent_id),
-        )
+        return build_clone(app, session_id=session_id, **clone).agent
 
     return build
 
@@ -69,6 +65,9 @@ def start_acp_server(agent_id: str | None = None, persona: str = DEFAULT_PERSONA
     from an editor remembers what the same clone learned in the app and the other way
     round. The old default, `default`, kept the editor's memory apart from the app's.
     """
+    # Deferred for the reason `run` defers its imports: `ucx --help` loads this module.
+    from uclone_x.skills.auditor import load_runtime_skill_registry
+
     tools = create_default_registry()
     # The persona's config is built where the chat head and room seats build theirs
     # (#1452), so the clone an editor talks to is given its tools by the same rule. This
@@ -78,30 +77,37 @@ def start_acp_server(agent_id: str | None = None, persona: str = DEFAULT_PERSONA
     if persona_def is None:
         console.print(f"[bold red]Unknown --persona:[/bold red] {escape(persona)}")
         raise typer.Exit(code=2)
-    # `agent_config_for_persona` names the agent after the persona when no id is given.
-    agent_config = agent_config_for_persona(persona_def, agent_id=agent_id)
-
+    # Named after the persona when no id is given, the id the desktop app uses.
+    clone_id = agent_id or persona_def.name
     bus = EventBus()
     saved_notice = saved_choice_notice()
     if saved_notice is not None:
         err_console.print(saved_notice, markup=False, highlight=False)
     llm = create_llm_connector(fallback_to_mock=True)
     store = SessionStore()
-    tracer = TelemetryTracer()
 
-    memory = memory_for_agent_id(agent_config.agent_id)
+    # One store per clone id, opened now so a bad `--agent-id` exits 2 before the server
+    # starts rather than when the first session is built.
+    memory_for = memory_map(memory_for_agent_id)
+    memory_for(clone_id)
 
-    host_deps = HostDependencies(
-        bus=bus,
+    # Built where the chat head and room seats build theirs (#1452, #1731), so the clone
+    # an editor talks to is the one the desktop app answers as.
+    app = local_app_scope(
+        workspace_root=Path.cwd().resolve(),
         llm=llm,
         tools=tools,
-        tracer=tracer,
+        persona_registry=registry,
+        memory_for=memory_for,
+        bus=bus,
+        tracer=TelemetryTracer(),
         store=store,
-        memory=memory,
+        # P9: the approved skills in the runtime store; without them there is no `load_skill`.
+        skills=asyncio.run(load_runtime_skill_registry()),
     )
 
     server = ACPServer(
-        agent_factory=session_agent_factory(agent_config, host_deps),
+        agent_factory=session_agent_factory(app, clone_id=clone_id, persona=persona_def.name),
         bus=bus,
         store=store,
     )

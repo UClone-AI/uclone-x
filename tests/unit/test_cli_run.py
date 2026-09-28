@@ -17,8 +17,9 @@ import pytest
 from typer.testing import CliRunner
 
 from tests.support import nonblocking_stdout
+from uclone_x.agent import clone_builder
 from uclone_x.agent.hooks import BaseHook, HookAction, HookContext, HookDecision
-from uclone_x.agent.models import AgentConfig, TurnResult
+from uclone_x.agent.models import AgentLLMConfig, TurnResult
 from uclone_x.agent.prompts import HONEST_REPORTING
 from uclone_x.agent.session import SessionState, SessionStore, default_session_storage_dir
 from uclone_x.cli import main
@@ -36,6 +37,7 @@ from uclone_x.llm.connectors.ollama import OllamaConnector
 from uclone_x.llm.models import (
     ChatMessage,
     FinishReason,
+    LLMRequest,
     MessageRole,
     ModelResponse,
     TokenUsage,
@@ -109,16 +111,6 @@ def test_unconfigured_provider_fails_cli_with_clear_error(monkeypatch: pytest.Mo
     assert result.exit_code != 0
     assert "LLM Error:" in result.output
     assert "OPENAI_API_KEY" in result.output
-
-
-@pytest.mark.asyncio
-async def test_run_agent_repl_single_shot_async_with_mock() -> None:
-    """Single-turn run_agent_repl_async executes successfully with mock provider."""
-    await run.run_agent_repl_async(
-        agent_name="test-mock-agent",
-        provider="mock",
-        prompt="Analyze quantum state vectors.",
-    )
 
 
 @pytest.mark.asyncio
@@ -355,6 +347,8 @@ def _drive_repl(
         return next(inputs)
 
     monkeypatch.setattr(run, "create_llm_connector", _connector)
+    # No binder: a local connector's binder would embed against the Ollama on this machine.
+    monkeypatch.setattr(clone_builder, "connector_tool_binder", _no_binder)
     monkeypatch.setattr(run, "TelemetryTracer", _tracer)
     monkeypatch.setattr(run, "create_telemetry_exporter", _exporter)
     monkeypatch.setattr("rich.prompt.Prompt.ask", _ask)
@@ -486,6 +480,8 @@ def _use_connector(monkeypatch: pytest.MonkeyPatch, llm: MagicMock) -> None:
         return llm
 
     monkeypatch.setattr(run, "create_llm_connector", _connector)
+    # No binder: a local connector's binder would embed against the Ollama on this machine.
+    monkeypatch.setattr(clone_builder, "connector_tool_binder", _no_binder)
 
 
 def _feed_prompts(monkeypatch: pytest.MonkeyPatch, *lines: str) -> None:
@@ -577,7 +573,7 @@ def test_a_model_without_tools_is_reported_in_plain_words_on_the_cli(
     body -- after a logged traceback. The model name and the remedy are all a user can act
     on, and a traceback for a choice of model reads as a crash.
 
-    Killed by: src/uclone_x/agent/base.py :: logger.info("Turn for agent %s refused: %s", agent_id, lacking_tools)
+    Killed by: src/uclone_x/agent/turn_executor.py :: logger.info("Turn for agent %s refused: %s", agent_id, lacking_tools)
     Becomes: logger.exception("Error executing turn for agent %s", agent_id)
     """
     _isolated_run_env(monkeypatch, tmp_path)
@@ -599,6 +595,189 @@ def test_a_model_without_tools_is_reported_in_plain_words_on_the_cli(
     # WARNING-or-worse record, traceback and all, on the terminal.
     loud = [r for r in caplog.records if r.levelno >= logging.WARNING or r.exc_info]
     assert not loud, [r.getMessage() for r in loud]
+
+
+def test_a_retired_model_is_reported_with_the_flag_that_changes_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """`ucx run` on a model the provider no longer serves names it and says `--model` (#1630).
+
+    Killed by: src/uclone_x/cli/commands/run.py :: "model_unavailable": "Choose a model with --model.",
+    Becomes: "model_unavailable_unused": "Choose a model with --model.",
+    """
+    from uclone_x.errors import ModelNotAvailableError
+
+    class Retired(MockLLMConnector):
+        async def generate(self, request: LLMRequest) -> ModelResponse:
+            raise ModelNotAvailableError(provider="Google", model="gemini-1.5-pro")
+
+    _isolated_run_env(monkeypatch, tmp_path)
+    _use_connector(monkeypatch, Retired(responses=[]))  # type: ignore[arg-type]
+
+    result = runner.invoke(
+        main.app,
+        ["run", "failing-agent", "--prompt", "hello", "--cwd", str(tmp_path)]
+        + ["--model", "gemini-1.5-pro"],
+    )
+
+    assert result.exit_code == run.FAILED_TURN_EXIT_CODE, result.output
+    stderr = " ".join(result.stderr.split())  # Rich wraps long lines
+    assert "The model gemini-1.5-pro is not available from Google." in stderr
+    assert "Choose a model with --model." in stderr
+    assert "Settings" not in stderr  # the command line has a flag, not a Settings page
+    for internal in ("Traceback", "404", "{", "LLMProviderError", "ModelNotAvailableError"):
+        assert internal not in result.output, internal
+    loud = [r for r in caplog.records if r.levelno >= logging.WARNING or r.exc_info]
+    assert not loud, [r.getMessage() for r in loud]
+
+
+def test_a_revoked_gemini_key_reaches_the_terminal_as_one_plain_line(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Through the real connector: Google's 400 body stays off the terminal, the fix is named.
+
+    Python prints an unconfigured WARNING record to stderr as it is, so the raw body is only
+    kept off the terminal while nothing on this path logs it at WARNING or above.
+    """
+    import httpx
+
+    from uclone_x.llm.connectors.gemini import GeminiConnector
+
+    body = (
+        '{"error": {"code": 400, "message": "API key not valid. Please pass a valid API key.", '
+        '"status": "INVALID_ARGUMENT"}}'
+    )
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(400, text=body))
+    )
+    _isolated_run_env(monkeypatch, tmp_path)
+    for var in ("GEMINI_API_KEY", "GOOGLE_API_KEY"):
+        monkeypatch.delenv(var, raising=False)
+    connector = GeminiConnector(api_key="bad", model="gemini-2.5-flash", http_client=client)
+    _use_connector(monkeypatch, connector)  # type: ignore[arg-type]
+
+    result = runner.invoke(
+        main.app, ["run", "gemini-agent", "--prompt", "hello", "--cwd", str(tmp_path)]
+    )
+
+    assert result.exit_code == run.FAILED_TURN_EXIT_CODE, result.output
+    stderr = " ".join(result.stderr.split())
+    assert "Google did not accept the API key." in stderr
+    assert "Save a new key with `ucx key set gemini`." in stderr
+    for internal in ("{", "400", "INVALID_ARGUMENT", "Traceback", "ProviderAuthError"):
+        assert internal not in result.output, internal
+    loud = [r for r in caplog.records if r.levelno >= logging.WARNING or r.exc_info]
+    assert not loud, [r.getMessage() for r in loud]
+
+
+@pytest.mark.parametrize(
+    ("stop_reason", "remedy"),
+    [
+        ("provider_auth", " Save a new key with `ucx key set <provider>`."),
+        ("provider_unreachable", " If you set a custom endpoint, check that address too."),
+        ("provider_quota", ""),
+        ("provider_outage", ""),
+    ],
+)
+def test_each_provider_failure_gets_the_command_line_remedy_that_fits_it(
+    stop_reason: str, remedy: str
+) -> None:
+    """Where retrying later is the whole remedy, the Core's sentence already says so."""
+    result = TurnResult(
+        turn_index=1,
+        content="",
+        error="Plain sentence.",
+        stop_reason=stop_reason,  # type: ignore[arg-type]
+        provenance=Provenance.primary("fake"),
+    )
+
+    assert run._turn_failure(result) == f"Plain sentence.{remedy}"  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.parametrize(
+    ("provider", "env", "remedy"),
+    [
+        ("Google", {}, "Save a new key with `ucx key set gemini`."),
+        ("Anthropic", {}, "Save a new key with `ucx key set anthropic`."),
+        ("Google", {"GOOGLE_API_KEY": "AQ.env"}, "Set a new key in GOOGLE_API_KEY."),
+        ("Anthropic", {"ANTHROPIC_API_KEY": "sk-ant-env"}, "Set a new key in ANTHROPIC_API_KEY."),
+        (None, {}, "Save a new key with `ucx key set <provider>`."),
+    ],
+)
+def test_a_rejected_key_names_where_that_key_came_from(
+    provider: str | None,
+    env: dict[str, str],
+    remedy: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A beginner does not know where the key is kept; the head does, so it says.
+
+    An environment variable outranks the saved key, so while one is set it is the thing to
+    change; otherwise the key came from the settings file, and `ucx key set` replaces it.
+
+    Killed by: src/uclone_x/cli/commands/run.py :: remedy = provider_key_remedy(result.provider_failure.provider)
+    Becomes: remedy = provider_key_remedy(None)
+
+    Killed by: src/uclone_x/cli/commands/run.py :: return f"Set a new key in {overriding[1]}."
+    Becomes: return f"Save a new key with `ucx key set {spec.id}`."
+    """
+    from uclone_x.agent.models import ProviderFailure
+    from uclone_x.errors import ProviderAuthError
+
+    for var in ("GEMINI_API_KEY", "GOOGLE_API_KEY", "ANTHROPIC_API_KEY"):
+        monkeypatch.delenv(var, raising=False)
+    for var, value in env.items():
+        monkeypatch.setenv(var, value)
+
+    failure = ProviderFailure.of(ProviderAuthError(provider="P", model="m"))
+    result = TurnResult(
+        turn_index=1,
+        content="",
+        error="Plain sentence.",
+        stop_reason="provider_auth",
+        provider_failure=failure.model_copy(update={"provider": provider}),
+        provenance=Provenance.primary("fake"),
+    )
+
+    assert run._turn_failure(result) == f"Plain sentence. {remedy}"  # pyright: ignore[reportPrivateUsage]
+
+
+def test_a_connector_with_no_model_is_refused_in_one_plain_line(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """No `--model`, no saved model, no model variable: the turn is refused before any request.
+
+    The Core's sentence says what is missing; this head adds where, which is its flag.
+
+    Killed by: src/uclone_x/agent/turn_executor.py :: return "model_unavailable", failure.message, failure
+    Becomes: return stop_reason, failure.message, failure
+    """
+    import httpx
+
+    from uclone_x.llm.connectors.gemini import GeminiConnector
+
+    reached: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        reached.append(str(request.url))
+        return httpx.Response(500)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    _isolated_run_env(monkeypatch, tmp_path)
+    _use_connector(monkeypatch, GeminiConnector(api_key="k", http_client=client))  # type: ignore[arg-type]
+
+    result = runner.invoke(
+        main.app, ["run", "gemini-agent", "--prompt", "hello", "--cwd", str(tmp_path)]
+    )
+
+    assert result.exit_code == run.FAILED_TURN_EXIT_CODE, result.output
+    stderr = " ".join(result.stderr.split())
+    assert "No model is chosen for Google. Choose a model with --model." in stderr
+    assert stderr.count("--model") == 1
+    assert "Settings" not in stderr  # the command line has a flag, not a Settings page
+    assert reached == []
+    for internal in ("Traceback", "LLMModelNotConfiguredError", "qwen3", "gemini-1.5"):
+        assert internal not in result.output, internal
 
 
 def test_a_failed_single_shot_turn_is_not_printed_where_the_reply_goes(
@@ -797,13 +976,20 @@ def _answering_llm(content: str, *tool_calls: ToolCallRequest) -> MagicMock:
     return llm
 
 
+def _no_binder(llm: object) -> None:
+    """No host binding: the Ollama binder would try to embed against localhost."""
+    return None
+
+
 def _configure_agent(monkeypatch: pytest.MonkeyPatch, **overrides: Any) -> None:
-    """Build the CLI's `AgentConfig` with `overrides` applied, as a user's config would."""
+    """Build the CLI's clone with `overrides` on its config, as a user's config would."""
+    build = clone_builder.build_clone
 
-    def _config(**kwargs: Any) -> AgentConfig:
-        return AgentConfig(**{**kwargs, **overrides})
+    def _build(app: clone_builder.AppScope, **kwargs: Any) -> clone_builder.BuiltClone:
+        kwargs["config_update"] = {**(kwargs.get("config_update") or {}), **overrides}
+        return build(app, **kwargs)
 
-    monkeypatch.setattr(run, "AgentConfig", _config)
+    monkeypatch.setattr(clone_builder, "build_clone", _build)
 
 
 def _seed_session(session_id: str, *, agent_id: str = "seeded") -> None:
@@ -1235,7 +1421,7 @@ def test_a_hook_blocked_single_shot_turn_exits_1_naming_the_hook_with_nothing_on
     persisted session holds only the system message, because the block happens before the
     prompt is appended; `docs/cli-specification.md` §4 says so.
 
-    Killed by: src/uclone_x/agent/base.py :: stop_reason = "blocked_by_hook"
+    Killed by: src/uclone_x/agent/turn_executor.py :: stop_reason = "blocked_by_hook"
     Becomes: stop_reason = "not_started"
     """
     store = _isolated_run_env(monkeypatch, tmp_path)
@@ -2095,3 +2281,112 @@ def test_measuring_a_pipe_reports_the_room_left_in_it_and_drains_only_its_probe(
     finally:
         os.close(read_fd)
         os.close(write_fd)
+
+
+class _AttributeExporter:
+    """Exporter that keeps each exported span's name and attributes."""
+
+    def __init__(self) -> None:
+        self.spans: list[tuple[str, dict[str, Any]]] = []
+
+    async def export_spans(self, spans: Any) -> None:
+        self.spans.extend((s.name, dict(s.attributes)) for s in spans)
+
+    async def export_metrics(self, metrics: Any) -> None:
+        return None
+
+    async def shutdown(self) -> None:
+        return None
+
+
+def test_a_run_on_a_persona_s_own_model_says_so_and_traces_that_model(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The saved-choice notice names the saved model; the run says which one it sends.
+
+    The saved model fills only what a persona leaves empty (#1731), so a persona with its
+    own model is served by that one. Without the second line the terminal names a model
+    the run never sends, and the turn span records it too (P6).
+
+    Killed by: src/uclone_x/cli/commands/run.py :: effective_model = agent.config.llm_config.model_name or effective_model
+    Becomes: effective_model = effective_model
+    """
+    _isolated_run_env(monkeypatch, tmp_path)
+    _use_connector(monkeypatch, _answering_llm("done"))
+    _configure_agent(monkeypatch, llm_config=AgentLLMConfig(model_name="persona-model"))
+
+    def _saved(provider: str | None, model: str | None) -> tuple[str | None, str | None]:
+        return "saved-model", "Using the saved model saved-model."
+
+    monkeypatch.setattr(run, "apply_saved_model", _saved)
+    exporter = _AttributeExporter()
+
+    def _exporter(*args: Any, **kwargs: Any) -> _AttributeExporter:
+        return exporter
+
+    monkeypatch.setattr(run, "create_telemetry_exporter", _exporter)
+
+    result = runner.invoke(
+        main.app, ["run", "own-model", "--prompt", "hello", "--cwd", str(tmp_path)]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "own-model runs on its own model, persona-model, not saved-model." in result.stderr
+    turn_models = [attrs.get("model") for _, attrs in exporter.spans if "mode" in attrs]
+    assert turn_models == ["persona-model"]
+
+
+def test_a_run_s_turn_span_carries_the_session_it_ran_in(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`--session-id` names the session the turn is saved to; the span said `sess_<agent>`.
+
+    Killed by: src/uclone_x/cli/commands/run.py :: session_id=turn_session,
+    Becomes: session_id=f"sess_{agent_name}",
+    """
+    store = _isolated_run_env(monkeypatch, tmp_path)
+    _use_connector(monkeypatch, _answering_llm("done"))
+    exporter = _AttributeExporter()
+
+    def _exporter(*args: Any, **kwargs: Any) -> _AttributeExporter:
+        return exporter
+
+    monkeypatch.setattr(run, "create_telemetry_exporter", _exporter)
+
+    result = runner.invoke(
+        main.app,
+        ["run", "spanned", "--prompt", "hi", "--session-id", "notes", "--cwd", str(tmp_path)],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert _assistant_texts(store, "notes") == ["done"]
+    turn_sessions = [attrs.get("session_id") for _, attrs in exporter.spans if "mode" in attrs]
+    assert turn_sessions == ["notes"]
+
+
+def test_an_interactive_turn_s_span_carries_the_session_it_ran_in(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The REPL's turn span names the session `--session-id` chose, as `--prompt`'s does (#1775).
+
+    Killed by: src/uclone_x/cli/commands/run.py :: session_id=agent.session_id,
+    Becomes: session_id=f"sess_{agent_name}",
+    """
+    store = _isolated_run_env(monkeypatch, tmp_path)
+    _use_connector(monkeypatch, _answering_llm("done"))
+    exporter = _AttributeExporter()
+
+    def _exporter(*args: Any, **kwargs: Any) -> _AttributeExporter:
+        return exporter
+
+    monkeypatch.setattr(run, "create_telemetry_exporter", _exporter)
+    _feed_prompts(monkeypatch, "hi", "/exit")
+
+    result = runner.invoke(
+        main.app, ["run", "spanned", "--session-id", "notes", "--cwd", str(tmp_path)]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert _assistant_texts(store, "notes") == ["done"]
+    turn_spans = [attrs for _, attrs in exporter.spans if attrs.get("mode") == "interactive"]
+    assert [attrs.get("session_id") for attrs in turn_spans] == ["notes"]

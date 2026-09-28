@@ -3,6 +3,8 @@ import type { PersonaInfo } from '../../types';
 import {
   draftFromPersona,
   emptyPersonaDraft,
+  fmt,
+  plural,
   type PersonaDraft,
   type PersonaEditMode,
   type PersonaEditorCopy,
@@ -70,7 +72,9 @@ export const PersonaManager: React.FC<PersonaManagerProps> = ({
     const result = await onSave(editing.draft, editing.mode);
     setSaving(false);
     if (result.ok) {
-      setNotice(copy.saved(result.persona.name, result.liveAgentsUpdated));
+      setNotice(result.liveAgentsUpdated > 0
+          ? plural(copy.savedWithLive, result.liveAgentsUpdated, { name: result.persona.name })
+          : fmt(copy.saved, { name: result.persona.name }));
       setEditing(null);
     } else {
       setError(result.message);
@@ -108,7 +112,7 @@ export const PersonaManager: React.FC<PersonaManagerProps> = ({
     <div data-testid="persona-manager" className="space-y-3">
       <div className="flex items-center justify-between gap-3">
         <p className="text-[11px] text-slate-500 truncate" title={personasDir ?? undefined}>
-          {personasDir !== null ? copy.savedTo(personasDir) : copy.noWorkspace}
+          {personasDir !== null ? fmt(copy.savedTo, { dir: personasDir }) : copy.noWorkspace}
         </p>
         <button
           type="button"
@@ -129,7 +133,7 @@ export const PersonaManager: React.FC<PersonaManagerProps> = ({
 
       {loadError !== null ? (
         <p role="alert" className="text-xs text-rose-300">
-          {copy.loadFailed(loadError)}
+          {loadError ? fmt(copy.loadFailedBecause, { reason: loadError }) : copy.loadFailed}
         </p>
       ) : personas.length === 0 ? (
         <p className="text-xs text-slate-500">{copy.emptyList}</p>

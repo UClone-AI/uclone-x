@@ -252,7 +252,11 @@ graph TD
 
 ### 6.4 Knowledge Graph / Triples (장기 지식 그래프)
 * **Definition**: Deterministic, structured semantic memory managed by the Ontology Reasoner (`uclone_x.ontology.engine.OntologyEngine`).
-* **Usage**: Stores domain facts, entity relationships, and justification proof trees (`ProofStep`) that persist across turns and sessions.
+* **Usage**: Stores domain facts, entity relationships, and justification proof trees (`ProofStep`). *As shipped (re-read 2026-09-25):* a room seat's engine is saved per conversation (`knowledge/<session_id>.yaml`), not across sessions, and no step writes conversation knowledge into it. design/clone-knowledge-graph.md plans one graph per clone, made of the memory facts in §6.5, with this engine holding rules and computing what follows.
+
+### 6.5 Cross-Session Memory (클론 기억)
+* **Definition**: `uclone_x.memory.store.CrossSessionMemory`, one store per clone (`~/.uclone/agents/<username>/memory.json`) of `MemoryFact` triples (subject, predicate, value, confidence, provenance), with supersession and retraction.
+* **Usage**: The part of what a clone knows that does persist across conversations. Written by the `record_memory_fact` tool; the top facts are injected into the system prompt.
 
 ---
 

@@ -1,0 +1,36 @@
+{
+  "card": {
+    "use": "Use as avatar",
+    "useFor": "Use this picture as {name}'s avatar",
+    "chooseOther": "Choose another clone for this picture",
+    "listLabel": "Give this picture to",
+    "working": "Setting the picture…",
+    "set": "Set as {name}'s avatar.",
+    "undo": "Undo",
+    "undone": "{name}'s previous picture is back."
+  },
+  "menu": {
+    "open": "Change {name}'s picture",
+    "upload": "Upload picture…",
+    "ask": "Ask {name} to make one",
+    "reset": "Reset to default",
+    "uploaded": "{name}'s picture is changed.",
+    "resetDone": "{name} shows its default picture again."
+  },
+  "askText": "Please draw a few profile pictures of yourself and show them to me, so I can choose one.",
+  "upload": {
+    "wrongType": "That file is not a PNG, JPEG or WebP picture, so it was not used.",
+    "tooLarge": "That picture is larger than 10 MB, so it was not used. Choose a smaller one."
+  },
+  "failure": {
+    "unreachable": "UClone-X could not be reached, so {name}'s picture was not changed. Try again once it is running.",
+    "noClone": "{name} is not installed here any more, so its picture was not changed.",
+    "refused": "{name}'s picture could not be changed with that file. Use a PNG, JPEG or WebP picture of 10 MB or less.",
+    "tooLarge": "That picture is larger than 10 MB, so {name}'s picture was not changed. Choose a smaller one.",
+    "notSaved": "{name} has not been saved in this workspace yet, so it cannot keep a picture. Save it from its settings first.",
+    "noWorkspace": "UClone-X has no workspace folder open, so {name}'s picture was not changed. Open a workspace and try again.",
+    "outsideWorkspace": "That picture is outside the workspace, so it was not given to {name}. Upload it from this computer instead.",
+    "noFile": "That picture is no longer in the workspace, so {name}'s picture was not changed.",
+    "failed": "Something went wrong, so {name}'s picture was not changed. Try again."
+  }
+}

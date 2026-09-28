@@ -4,7 +4,7 @@ import type { KitIcon } from '../kit';
  * The shapes the rail reads, and only the fields it reads.
  *
  * The kit may not import the head's `types.ts` (the boundary in `ui-kit.test.ts`), so these are
- * declared here. They are structural: the head's `RoomSummary`, `SessionSummary`, `AgentInfo`
+ * declared here. They are structural: the head's `RoomSummary`, `SessionSummary`
  * and `PersonaInfo` carry more fields and are accepted as they are. The field names are the
  * wire's, so a head passes what its API returned without mapping it.
  */
@@ -16,33 +16,6 @@ export interface RailRoom {
   message_count: number;
   updated_at: string;
 }
-
-export interface RailAgent {
-  id: string;
-  label: string;
-  role: string;
-  /**
-   * The running instance's state, as `/api/agents` sends it.
-   *
-   * It is `AgentState` (`src/uclone_x/agent/models.py`) stringified -- `IDLE`, `INGESTING`,
-   * `REASONING`, `CALLING_TOOL`, `AWAITING_INPUT`, `EMITTING_RESPONSE`, `ERROR`,
-   * `TERMINATED`. Typed `string` rather than that union on purpose: it is a value off the
-   * wire, and a kit that *declares* the set cannot also have a branch for a value outside
-   * it. `livenessOf` in `Rail.tsx` folds the eight it knows and reports anything else as
-   * unknown, which is the branch the type would have made unreachable.
-   */
-  status: string;
-}
-
-/**
- * What a clone's row says about the instance behind it.
- *
- * `offline` is a clone with no running instance at all -- the ordinary state of an installed
- * persona nobody has messaged yet, and not a fault. `unknown` is a `status` this kit has not
- * been taught: it is reported as such rather than folded onto `idle`, because a state the
- * screen cannot read is not evidence that the clone is healthy.
- */
-export type CloneLiveness = 'offline' | 'idle' | 'busy' | 'error' | 'terminated' | 'unknown';
 
 export interface RailPersona {
   name: string;
@@ -78,8 +51,6 @@ export interface PersonaDetailCopy {
   notSet: string;
   /** An empty `allowed_tools`, as a sentence rather than a blank list. */
   noTools: string;
-  /** Leads the names of the tools a clone is given only inside a conversation. */
-  onlyInConversation: string;
   /** `enable_write_tools` as a capability sentence, never a bare boolean. */
   writeAccess: (enabled: boolean | undefined) => string;
   /** `enable_subagent_tools` as a capability sentence, never a bare boolean. */
@@ -164,44 +135,15 @@ export interface CloneConversationsCopy {
   threadLabel?: (clone: string) => string;
 }
 
-/**
- * The words a clone's liveness is said in.
- *
- * Two of them, because a dot cannot carry this alone. `busy` and `idle` are amber and
- * emerald, which is the pairing red-green colour blindness collapses, and the design's #1061
- * row asks that busy stay distinguishable from idle *by colour or a word*. So the row shows
- * the word for every state a glance must not miss, and the dot carries the sentence.
- */
-export interface CloneLivenessCopy {
-  /**
-   * A word beside the clone's name, or `null` to show none.
-   *
-   * `null` is for the two states that need no word: a clone that is running with nothing in
-   * progress, and one that is not running, which is the ordinary state of an installed clone
-   * and is already what the rest of the row is about.
-   */
-  word: (liveness: CloneLiveness) => string | null;
-  /**
-   * The dot's accessible name and its tooltip: the state in a sentence.
-   *
-   * `status` is the raw value off the wire, so the `unknown` sentence can name what arrived
-   * instead of reporting an unreadable state as nothing at all.
-   */
-  title: (liveness: CloneLiveness, status: string) => string;
-}
-
 export interface RailCopy {
   /**
    * The section heading. `Clones` since §3.2.2 R3 -- the product's one word for the thing
-   * `AgentInfo` and `PersonaInfo` both describe. The types keep their names (P8); this is
+   * `PersonaInfo` describes. The types keep their names (P8); this is
    * what a user reads.
    */
   clones: string;
   /** Label/title for creating a new clone. */
   newClone: string;
-  /** How many of the clones the section lists are running. Counted over the same array. */
-  activeClones: (count: number) => string;
-  cloneLiveness: CloneLivenessCopy;
   /**
    * The chevron's words.
    *

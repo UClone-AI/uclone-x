@@ -44,123 +44,16 @@ from uclone_x.errors import LLMProviderError, MissingProvenanceError
 from uclone_x.llm.connectors.ollama import OllamaConnector
 from uclone_x.llm.protocols import LLMProviderProtocol
 from uclone_x.telemetry import SpanStatus, TelemetryTracer
-from uclone_x.ui.app import (
-    AgentSessionManager,
-    create_ui_app,
-)
 
 
 @pytest.mark.asyncio
-async def test_p6_check4_provider_failover_notice_ordered_before_result(tmp_path: Path) -> None:
-    """Check 4: PROVIDER_FAILOVER event exists on bus with lower (priority, sequence) than result."""
-    from unittest.mock import AsyncMock, MagicMock
+async def test_p6_integration_with_unreachable_ollama_connector() -> None:
+    """Integration test: an unreachable Ollama connector triggers P6 Checks 4 & 5.
 
-    from uclone_x.llm.protocols import LLMProviderProtocol
-
-    bus = EventBus()
-    tracer = TelemetryTracer()
-    failing_llm = MagicMock(spec=LLMProviderProtocol)
-    failing_llm.generate = AsyncMock(side_effect=LLMProviderError("Primary provider unavailable"))
-    mgr = AgentSessionManager(bus=bus, tracer=tracer, llm=failing_llm)
-
-    app = create_ui_app(static_dir=tmp_path, bus=bus, tracer=tracer, session_manager=mgr)
-    sub = bus.subscribe("agent.chat.*")
-
-    async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
-    ) as client:
-        resp = await client.post("/api/turn", json={"message": "ping", "agent_id": "test-agent"})
-    assert resp.status_code == 200
-
-    # Collect all events on agent.chat.*
-    events: list[AgentEvent] = []
-    for _ in range(3):
-        events.append(await asyncio.wait_for(sub.get(), timeout=2.0))
-
-    evt_input = next(e for e in events if e.type is EventType.USER_INPUT)
-    evt_failover = next(e for e in events if e.type is EventType.PROVIDER_FAILOVER)
-    evt_reply = next(e for e in events if e.type is EventType.AGENT_REPLY)
-
-    # 1. Event types
-    assert evt_input.type is EventType.USER_INPUT
-    assert evt_failover.type is EventType.PROVIDER_FAILOVER
-    assert evt_reply.type is EventType.AGENT_REPLY
-
-    # 2. Strict total order: notice before result
-    assert evt_failover < evt_reply
-    assert evt_failover.sequence < evt_reply.sequence
-    assert evt_failover.priority <= evt_reply.priority
-    assert evt_input.sequence < evt_failover.sequence
-
-    # 3. Payload and attribution truth
-    assert evt_failover.payload["requested_provider"] == "test-agent"
-    assert evt_failover.payload["served_provider"] == "agent.core"
-    assert evt_failover.payload["error_class"] == "LLMProviderError"
-
-
-@pytest.mark.asyncio
-async def test_p6_check5_failover_event_span_correlation_with_attempt_record(
-    tmp_path: Path,
-) -> None:
-    """Check 5: For every failover result, attempts[*].span_id resolves to an emitted failover.event span."""
-    from unittest.mock import AsyncMock, MagicMock
-
-    from uclone_x.llm.protocols import LLMProviderProtocol
-
-    bus = EventBus()
-    tracer = TelemetryTracer()
-    failing_llm = MagicMock(spec=LLMProviderProtocol)
-    failing_llm.generate = AsyncMock(
-        side_effect=ConnectionRefusedError("Offline connection refused")
-    )
-    mgr = AgentSessionManager(bus=bus, tracer=tracer, llm=failing_llm)
-
-    app = create_ui_app(static_dir=tmp_path, bus=bus, tracer=tracer, session_manager=mgr)
-    sub = bus.subscribe("agent.chat.*")
-
-    async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
-    ) as client:
-        resp = await client.post(
-            "/api/turn", json={"message": "verify span", "agent_id": "span-agent"}
-        )
-    assert resp.status_code == 200
-
-    events: list[AgentEvent] = []
-    for _ in range(3):
-        events.append(await asyncio.wait_for(sub.get(), timeout=2.0))
-
-    evt_failover = next(e for e in events if e.type is EventType.PROVIDER_FAILOVER)
-    evt_reply = next(e for e in events if e.type is EventType.AGENT_REPLY)
-
-    # Query completed telemetry spans
-    spans = tracer.get_completed_spans()
-    failover_spans = [s for s in spans if s.name == "failover.event"]
-    assert len(failover_spans) == 1
-    failover_span = failover_spans[0]
-
-    assert failover_span.status is SpanStatus.ERROR
-    assert failover_span.attributes.get("requested_provider") == "span-agent"
-    assert failover_span.attributes.get("served_provider") == "agent.core"
-    assert failover_span.attributes.get("error_class") == "ConnectionRefusedError"
-
-    # Span ID threaded into in-band provenance
-    assert evt_failover.provenance is not None
-    assert evt_reply.provenance is not None
-    assert evt_reply.provenance.path is ExecutionPath.FAILOVER
-    assert evt_reply.provenance.degraded is True
-    assert len(evt_reply.provenance.attempts) == 1
-
-    attempt = evt_reply.provenance.attempts[0]
-    assert attempt.span_id is not None
-    assert attempt.span_id == failover_span.span_id
-    assert attempt.error_class == "ConnectionRefusedError"
-    assert attempt.provider == "span-agent"
-
-
-@pytest.mark.asyncio
-async def test_p6_integration_with_unreachable_ollama_connector(tmp_path: Path) -> None:
-    """Integration test: Unreachable Ollama connector triggers P6 Checks 4 & 5."""
+    Checks 4 and 5 against a scripted failure are pinned on `BaseAgent` below; this one
+    drives a real connector whose transport refuses the connection, so the error the
+    agent fails over on is the one `OllamaConnector` raises.
+    """
     bus = EventBus()
     tracer = TelemetryTracer()
 
@@ -171,44 +64,23 @@ async def test_p6_integration_with_unreachable_ollama_connector(tmp_path: Path) 
         transport=httpx.MockTransport(_fail_connect),
         base_url="http://127.0.0.1:11434",
     )
-    unreachable_ollama = OllamaConnector(http_client=mock_client)
-    mgr = AgentSessionManager(bus=bus, llm=unreachable_ollama, tracer=tracer)
-    app = create_ui_app(static_dir=tmp_path, bus=bus, tracer=tracer, session_manager=mgr)
+    unreachable_ollama = OllamaConnector(http_client=mock_client, model="qwen3:8b")
+    agent = BaseAgent(
+        config=_sample_agent_config("ollama-agent"), bus=bus, llm=unreachable_ollama, tracer=tracer
+    )
     sub = bus.subscribe("agent.chat.*")
 
-    async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
-    ) as client:
-        resp = await client.post(
-            "/api/turn", json={"message": "ollama test", "agent_id": "ollama-agent"}
-        )
-    assert resp.status_code == 200
-    data = resp.json()
-    assert data["status"] == "warning"
+    result = await agent.execute_turn("ollama test")
 
-    # Verify bus notices (USER_INPUT -> PROVIDER_FAILOVER -> AGENT_REPLY)
-    events: list[AgentEvent] = []
-    for _ in range(3):
-        events.append(await asyncio.wait_for(sub.get(), timeout=2.0))
-
-    evt_input = next(e for e in events if e.type is EventType.USER_INPUT)
-    evt_failover = next(e for e in events if e.type is EventType.PROVIDER_FAILOVER)
-    evt_reply = next(e for e in events if e.type is EventType.AGENT_REPLY)
-
-    assert evt_input.type is EventType.USER_INPUT
+    # Check 4: the notice was published before the result was returned.
+    evt_failover = await asyncio.wait_for(sub.get(), timeout=2.0)
     assert evt_failover.type is EventType.PROVIDER_FAILOVER
-    assert evt_reply.type is EventType.AGENT_REPLY
-    assert evt_failover < evt_reply
-    assert evt_failover.sequence < evt_reply.sequence
 
-    # Verify span correlation
-    spans = tracer.get_completed_spans()
-    failover_spans = [s for s in spans if s.name == "failover.event"]
-    assert len(failover_spans) >= 1
-    span_ids = {s.span_id for s in failover_spans}
-
-    assert evt_reply.provenance is not None
-    assert evt_reply.provenance.attempts[0].span_id in span_ids
+    # Check 5: the result's attempt names the emitted `failover.event` span.
+    assert result.provenance is not None
+    assert result.provenance.path is ExecutionPath.FAILOVER
+    span_ids = {s.span_id for s in tracer.get_completed_spans() if s.name == "failover.event"}
+    assert result.provenance.attempts[0].span_id in span_ids
 
 
 def test_p6_provenance_falsifiable_checks_models() -> None:
@@ -544,8 +416,9 @@ _NON_PRIMARY_PRODUCERS: dict[str, str] = {
     # into the AttemptRecord, and publishes a PROVIDER_FAILOVER before the reply.
     # Unconditional since #184 gave every agent a default tracer; the behavioural proof
     # is the three `test_base_agent_*` cases above, and this registry is what makes a
-    # *new* producer in a new module fail.
-    "uclone_x/agent/base.py": "compliant",
+    # *new* producer in a new module fail. The turn loop that does all three moved out of
+    # `agent/base.py` into `agent/turn_executor.py` in #1736.
+    "uclone_x/agent/turn_executor.py": "compliant",
 }
 
 

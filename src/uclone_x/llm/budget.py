@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-import contextvars
 import threading
-from collections.abc import Generator, Mapping
-from contextlib import contextmanager
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import Any
 
@@ -18,25 +16,22 @@ __all__ = [
     "TokenBudgetTracker",
 ]
 
-#: The turns the running code belongs to: each `collect_turn_usage` it runs inside (#982).
-#: A task copies its context when it is created, so the tasks a turn starts belong to it,
-#: and a turn running in another request's context does not, whatever session it shares.
-_CURRENT_TURNS: contextvars.ContextVar[tuple[list[TokenUsage], ...]] = contextvars.ContextVar(
-    "uclone_x_current_turns", default=()
-)
-
 
 class TokenBudgetManager(TokenBudgetManagerProtocol):
-    """Session-level and provider-level token budget manager.
+    """Session-level and provider-level token ledger, with optional ceilings.
 
-    Enforces a session token ceiling and decoupled per-provider token quotas. Under
-    Principle 6, budget violations fail fast and propagate as `BudgetExceededError`.
-    Cost is not calculated: UClone-X counts tokens only (#1392).
+    Attributes each session's tokens, per provider and per turn. A session has **no token
+    ceiling by default** (`llm-token-gateway.md` §4.6): the budget is the user's
+    system-wide paid-model limit, enforced by the usage gate in the connector factory. An
+    explicit ceiling (`configure_session(max_tokens=...)`, `default_max_tokens=...`) and
+    per-provider quotas are still enforced for embedders and tests: under Principle 6, a
+    breach fails fast and propagates as `BudgetExceededError`. Cost is not calculated:
+    UClone-X counts tokens only (#1392).
     """
 
     def __init__(
         self,
-        default_max_tokens: int = 1_000_000,
+        default_max_tokens: int | None = None,
         default_provider_limits: Mapping[str, int] | None = None,
     ) -> None:
         self._default_max_tokens = default_max_tokens
@@ -46,8 +41,6 @@ class TokenBudgetManager(TokenBudgetManagerProtocol):
         self._budgets: dict[str, TokenBudget] = {}
         self._session_provider_limits: dict[str, dict[str, int]] = {}
         self._turn_history: dict[str, list[TokenUsage]] = {}
-        # The turns open on each session, each the list `collect_turn_usage` yields (#982).
-        self._open_turns: dict[str, list[list[TokenUsage]]] = {}
         self._compaction_history: list[dict[str, Any]] = []
         self._lock = threading.Lock()
 
@@ -66,10 +59,13 @@ class TokenBudgetManager(TokenBudgetManagerProtocol):
     def configure_session(
         self,
         session_id: str,
-        max_tokens: int = 1_000_000,
+        max_tokens: int | None = None,
         provider_limits: Mapping[str, int] | None = None,
     ) -> TokenBudget:
-        """Create or configure a session budget with custom limits. Counters carry over."""
+        """Create or configure a session budget with custom limits. Counters carry over.
+
+        `max_tokens=None` (the default) sets no session ceiling.
+        """
         with self._lock:
             existing = self._budgets.get(session_id)
             budget = TokenBudget(
@@ -122,52 +118,19 @@ class TokenBudgetManager(TokenBudgetManagerProtocol):
                 self._turn_history[session_id] = []
             self._turn_history[session_id].append(usage)
 
-            ours = _CURRENT_TURNS.get()
-            for turn in self._open_turns.get(session_id, ()):
-                if any(turn is mine for mine in ours):
-                    turn.append(usage)
-
-    @contextmanager
-    def collect_turn_usage(self, session_id: str) -> Generator[list[TokenUsage], None, None]:
-        """Collect the usages this turn books on `session_id`, as they are booked (#982).
-
-        The ledger is keyed by session id, so a slice of `get_turn_history` taken across a
-        turn holds every step booked on the session meanwhile, including another turn's when
-        two overlap: a second client on the same agent, or two agents given one session id.
-        A booking made inside this block, or in a task started from it, lands in the
-        yielded list; one made by code running in another context does not. The list stays
-        readable after the block closes, and nothing is added to it afterwards.
-        """
-        # A task started inside this block keeps the turn in its context for as long as it
-        # runs, but it collects nothing once the block closes, because the turn has left
-        # `_open_turns`. So a long-lived task first started mid-turn (the event bus
-        # dispatcher, an agent started from a tool) books later steps to the session only.
-        booked: list[TokenUsage] = []
-        with self._lock:
-            self._open_turns.setdefault(session_id, []).append(booked)
-        token = _CURRENT_TURNS.set((*_CURRENT_TURNS.get(), booked))
-        try:
-            yield booked
-        finally:
-            _CURRENT_TURNS.reset(token)
-            with self._lock:
-                still_open = [turn for turn in self._open_turns[session_id] if turn is not booked]
-                if still_open:
-                    self._open_turns[session_id] = still_open
-                else:
-                    del self._open_turns[session_id]
-
     def check_budget(self, session_id: str, provider: str | None = None) -> BudgetDecision:
         """Report whether a session — optionally for one provider — may proceed.
 
-        The session token ceiling is checked first, then `provider`'s token limit if the
-        session has one.
+        The session token ceiling is checked first, when the session has one, then
+        `provider`'s token limit if the session has one. With no ceiling,
+        `remaining_tokens` is `None`.
         """
         with self._lock:
             budget = self._get_or_create_budget(session_id)
             history = self._turn_history.get(session_id, ())
             total_used_tokens = budget.used_input_tokens + budget.used_output_tokens
-            rem_tokens = max(0, budget.max_tokens - total_used_tokens)
+            ceiling = budget.max_tokens
+            rem_tokens = None if ceiling is None else max(0, ceiling - total_used_tokens)
             # A refusal is where an estimated figure acts rather than merely misreports,
             # so a refusal that estimates contributed to says so (P6, #916).
             estimated_steps = sum(
@@ -179,10 +142,10 @@ class TokenBudgetManager(TokenBudgetManagerProtocol):
                 else ""
             )
 
-            if total_used_tokens >= budget.max_tokens:
+            if ceiling is not None and total_used_tokens >= ceiling:
                 return BudgetDecision(
                     allowed=False,
-                    reason=f"Session token limit exceeded: {total_used_tokens}/{budget.max_tokens}"
+                    reason=f"Session token limit exceeded: {total_used_tokens}/{ceiling}"
                     f"{estimate_note}",
                     remaining_tokens=0,
                 )
@@ -253,7 +216,11 @@ class TokenBudgetManager(TokenBudgetManagerProtocol):
             return entry
 
     def get_summary(self, session_id: str | None = None) -> dict[str, Any]:
-        """Return token budget metrics, per-provider attribution, and compaction history."""
+        """Return token budget metrics, per-provider attribution, and compaction history.
+
+        `session_budget.max_tokens`, `remaining_tokens` and `budget_used_pct` are `None`
+        when there is no session ceiling, which is the default.
+        """
         with self._lock:
             if session_id is not None:
                 if session_id in self._budgets:
@@ -275,16 +242,26 @@ class TokenBudgetManager(TokenBudgetManagerProtocol):
                 used_in = sum(b.used_input_tokens for b in self._budgets.values())
                 used_out = sum(b.used_output_tokens for b in self._budgets.values())
                 total_used = used_in + used_out
-                max_tok = (
-                    sum(b.max_tokens for b in self._budgets.values())
-                    if self._budgets
-                    else self._default_max_tokens
-                )
+                # The sum of ceilings, which exists only when every session has one.
+                ceilings = [b.max_tokens for b in self._budgets.values()]
+                if not ceilings:
+                    max_tok = self._default_max_tokens
+                elif all(c is not None for c in ceilings):
+                    max_tok = sum(c for c in ceilings if c is not None)
+                else:
+                    max_tok = None
                 usages = [u for turn_list in self._turn_history.values() for u in turn_list]
                 compactions = list(self._compaction_history)
 
-            rem_tokens = max(0, max_tok - total_used)
-            pct_used = round((total_used / max_tok * 100.0), 2) if max_tok > 0 else 0.0
+            # With no ceiling there is nothing to be a remainder or a percentage of.
+            rem_tokens = None if max_tok is None else max(0, max_tok - total_used)
+            pct_used = (
+                None
+                if max_tok is None
+                else round((total_used / max_tok * 100.0), 2)
+                if max_tok > 0
+                else 0.0
+            )
 
             # Provider breakdown
             providers: dict[str, dict[str, Any]] = {}

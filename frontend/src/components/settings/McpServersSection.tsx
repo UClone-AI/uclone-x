@@ -11,6 +11,7 @@ import {
   setMcpServerEnabled,
 } from '../../lib/mcpServersApi';
 import { coreReason } from '../../lib/coreFailure';
+import { fmt, plural, useCopy, type Messages } from '../../i18n';
 import { Badge } from '../ui/Badge';
 import { Button } from '../ui/Button';
 
@@ -25,8 +26,6 @@ import { Button } from '../ui/Button';
  * never come back: the server reports only their names, and the form forgets them on success.
  */
 
-const NAME_RULE = 'Use 1 to 32 letters, digits, - or _ (no spaces).';
-
 const inputClass =
   'bg-slate-950/90 border border-slate-800 rounded-xl px-3 py-2 text-xs text-white placeholder-slate-600 focus:outline-none focus:border-cyan-500/80 transition-colors';
 
@@ -35,8 +34,6 @@ const commandLine = (server: McpServer): string =>
   [server.command ?? '', ...server.args.map((a) => (/\s/.test(a) || a === '' ? JSON.stringify(a) : a))]
     .join(' ')
     .trim();
-
-const toolCount = (n: number) => (n === 1 ? '1 tool' : `${n} tools`);
 
 // ---------------------------------------------------------------------------------------------
 // Key/value rows (headers, environment variables). Values are secret: password inputs.
@@ -48,19 +45,20 @@ interface Pair {
 }
 
 const KeyValueRows: React.FC<{
+  copy: Messages['mcp']['pairs'];
   label: string;
   keyPlaceholder: string;
   addLabel: string;
   pairs: Pair[];
   onChange: (pairs: Pair[]) => void;
-}> = ({ label, keyPlaceholder, addLabel, pairs, onChange }) => (
+}> = ({ copy, label, keyPlaceholder, addLabel, pairs, onChange }) => (
   <fieldset className="space-y-1.5">
     <legend className="text-xs font-medium text-slate-300 mb-1">{label}</legend>
     {pairs.map((pair, i) => (
       <div key={i} className="flex flex-wrap items-center gap-2">
         <input
           type="text"
-          aria-label={`${label} name ${i + 1}`}
+          aria-label={fmt(copy.name, { label, row: i + 1 })}
           value={pair.key}
           placeholder={keyPlaceholder}
           onChange={(e) => onChange(pairs.map((p, j) => (j === i ? { ...p, key: e.target.value } : p)))}
@@ -69,16 +67,16 @@ const KeyValueRows: React.FC<{
         <input
           type="password"
           autoComplete="off"
-          aria-label={`${label} value ${i + 1}`}
+          aria-label={fmt(copy.value, { label, row: i + 1 })}
           value={pair.value}
-          placeholder="Value (kept secret)"
+          placeholder={copy.valuePlaceholder}
           onChange={(e) => onChange(pairs.map((p, j) => (j === i ? { ...p, value: e.target.value } : p)))}
           className={`${inputClass} flex-1 min-w-[8rem] font-mono`}
         />
         <button
           type="button"
-          aria-label={`Remove ${label.toLowerCase()} row ${i + 1}`}
-          title="Remove this row"
+          aria-label={fmt(copy.remove, { label: label.toLowerCase(), row: i + 1 })}
+          title={copy.removeTitle}
           onClick={() => onChange(pairs.filter((_, j) => j !== i))}
           className="text-slate-500 hover:text-rose-400"
         >
@@ -94,13 +92,17 @@ const KeyValueRows: React.FC<{
 );
 
 /** The rows as a record, or the reason they cannot be one. Blank rows are dropped. */
-const pairsToRecord = (pairs: Pair[], what: string): Record<string, string> | string => {
+const pairsToRecord = (
+  pairs: Pair[],
+  what: string,
+  copy: Messages['mcp']['pairs'],
+): Record<string, string> | string => {
   const out: Record<string, string> = {};
   for (const { key, value } of pairs) {
     const k = key.trim();
     if (!k && !value) continue;
-    if (!k) return `Each ${what} value needs a name.`;
-    if (k in out) return `The ${what} "${k}" is listed twice.`;
+    if (!k) return fmt(copy.unnamed, { what });
+    if (k in out) return fmt(copy.duplicate, { what, key: k });
     out[k] = value;
   }
   return out;
@@ -123,6 +125,7 @@ const AddServerForm: React.FC<{ onAdded: (server: McpServer) => void; onCancel: 
   const [env, setEnv] = useState<Pair[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const copy = useCopy().mcp;
 
   const nameInvalid = name.trim() !== '' && !MCP_NAME_PATTERN.test(name.trim());
 
@@ -130,16 +133,16 @@ const AddServerForm: React.FC<{ onAdded: (server: McpServer) => void; onCancel: 
     setError(null);
     const trimmedName = name.trim();
     if (!MCP_NAME_PATTERN.test(trimmedName)) {
-      setError(`The name is not usable. ${NAME_RULE}`);
+      setError(fmt(copy.add.nameUnusable, { rule: copy.nameRule }));
       return;
     }
     const draft: McpServerDraft = { name: trimmedName, transport };
     if (transport === 'http') {
       if (!url.trim()) {
-        setError('Enter the server address, starting with http:// or https://.');
+        setError(copy.add.urlMissing);
         return;
       }
-      const record = pairsToRecord(headers, 'header');
+      const record = pairsToRecord(headers, copy.pairs.header, copy.pairs);
       if (typeof record === 'string') {
         setError(record);
         return;
@@ -148,10 +151,10 @@ const AddServerForm: React.FC<{ onAdded: (server: McpServer) => void; onCancel: 
       if (Object.keys(record).length) draft.headers = record;
     } else {
       if (!command.trim()) {
-        setError('Enter the command that starts the server, for example npx.');
+        setError(copy.add.commandMissing);
         return;
       }
-      const record = pairsToRecord(env, 'environment variable');
+      const record = pairsToRecord(env, copy.pairs.envVar, copy.pairs);
       if (typeof record === 'string') {
         setError(record);
         return;
@@ -187,7 +190,7 @@ const AddServerForm: React.FC<{ onAdded: (server: McpServer) => void; onCancel: 
       data-testid="mcp-add-form"
     >
       <fieldset className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-slate-300">
-        <legend className="sr-only">Kind of server</legend>
+        <legend className="sr-only">{copy.add.kind}</legend>
         <label className="flex items-center gap-1.5">
           <input
             type="radio"
@@ -195,7 +198,7 @@ const AddServerForm: React.FC<{ onAdded: (server: McpServer) => void; onCancel: 
             checked={transport === 'http'}
             onChange={() => setTransport('http')}
           />
-          Remote (URL)
+          {copy.add.remote}
         </label>
         <label className="flex items-center gap-1.5">
           <input
@@ -204,30 +207,30 @@ const AddServerForm: React.FC<{ onAdded: (server: McpServer) => void; onCancel: 
             checked={transport === 'stdio'}
             onChange={() => setTransport('stdio')}
           />
-          On this computer (command)
+          {copy.add.local}
         </label>
       </fieldset>
 
       <div className="space-y-1">
         <label className="block text-xs font-medium text-slate-300" htmlFor="mcp-name">
-          Name
+          {copy.add.name}
         </label>
         <input
           id="mcp-name"
           type="text"
           value={name}
           onChange={(e) => setName(e.target.value)}
-          placeholder="e.g. github"
+          placeholder={copy.add.namePlaceholder}
           className={`${inputClass} w-full font-mono`}
         />
-        <p className={`text-[11px] ${nameInvalid ? 'text-amber-400' : 'text-slate-500'}`}>{NAME_RULE}</p>
+        <p className={`text-[11px] ${nameInvalid ? 'text-amber-400' : 'text-slate-500'}`}>{copy.nameRule}</p>
       </div>
 
       {transport === 'http' ? (
         <>
           <div className="space-y-1">
             <label className="block text-xs font-medium text-slate-300" htmlFor="mcp-url">
-              Server address (URL)
+              {copy.add.url}
             </label>
             <input
               id="mcp-url"
@@ -239,9 +242,10 @@ const AddServerForm: React.FC<{ onAdded: (server: McpServer) => void; onCancel: 
             />
           </div>
           <KeyValueRows
-            label="Headers"
-            keyPlaceholder="e.g. Authorization"
-            addLabel="Add header"
+            copy={copy.pairs}
+            label={copy.add.headers}
+            keyPlaceholder={copy.add.headerPlaceholder}
+            addLabel={copy.add.addHeader}
             pairs={headers}
             onChange={setHeaders}
           />
@@ -253,24 +257,24 @@ const AddServerForm: React.FC<{ onAdded: (server: McpServer) => void; onCancel: 
             data-testid="mcp-command-warning"
           >
             <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-0.5" />
-            This runs a program on this computer with your permissions. Only add servers you trust.
+            {copy.add.commandWarning}
           </p>
           <div className="space-y-1">
             <label className="block text-xs font-medium text-slate-300" htmlFor="mcp-command">
-              Command
+              {copy.add.command}
             </label>
             <input
               id="mcp-command"
               type="text"
               value={command}
               onChange={(e) => setCommand(e.target.value)}
-              placeholder="e.g. npx"
+              placeholder={copy.add.commandPlaceholder}
               className={`${inputClass} w-full font-mono`}
             />
           </div>
           <div className="space-y-1">
             <label className="block text-xs font-medium text-slate-300" htmlFor="mcp-args">
-              Arguments, one per line
+              {copy.add.args}
             </label>
             <textarea
               id="mcp-args"
@@ -282,9 +286,10 @@ const AddServerForm: React.FC<{ onAdded: (server: McpServer) => void; onCancel: 
             />
           </div>
           <KeyValueRows
-            label="Environment variables"
-            keyPlaceholder="e.g. API_KEY"
-            addLabel="Add variable"
+            copy={copy.pairs}
+            label={copy.add.env}
+            keyPlaceholder={copy.add.envPlaceholder}
+            addLabel={copy.add.addVariable}
             pairs={env}
             onChange={setEnv}
           />
@@ -299,10 +304,10 @@ const AddServerForm: React.FC<{ onAdded: (server: McpServer) => void; onCancel: 
 
       <div className="flex flex-wrap items-center gap-2">
         <Button variant="solid" onClick={() => void submit()} disabled={busy}>
-          {busy ? 'Adding…' : 'Add server'}
+          {busy ? copy.add.adding : copy.add.submit}
         </Button>
         <Button onClick={onCancel} disabled={busy}>
-          Cancel
+          {copy.add.cancel}
         </Button>
       </div>
     </div>
@@ -318,6 +323,7 @@ const ImportServers: React.FC<{ onAdded: (servers: McpServer[]) => void; onCance
   onCancel,
 }) => {
   const [json, setJson] = useState('');
+  const copy = useCopy().mcp.import;
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [outcome, setOutcome] = useState<{ added: string[]; skipped: { name: string; reason: string }[] } | null>(
@@ -349,12 +355,10 @@ const ImportServers: React.FC<{ onAdded: (servers: McpServer[]) => void; onCance
     >
       <div className="space-y-1">
         <label className="block text-xs font-medium text-slate-300" htmlFor="mcp-import-json">
-          Paste a server list in JSON
+          {copy.label}
         </label>
         <p className="text-[11px] text-slate-500">
-          Many tools publish a setup snippet that starts with {'{"mcpServers": …}'}. Paste it here as it is.
-          Servers in it that run a command run on this computer with your permissions, so only import
-          from sources you trust.
+          {fmt(copy.hint, { snippet: '{"mcpServers": …}' })}
         </p>
         <textarea
           id="mcp-import-json"
@@ -376,14 +380,14 @@ const ImportServers: React.FC<{ onAdded: (servers: McpServer[]) => void; onCance
         <div className="space-y-1 text-[11px]" data-testid="mcp-import-outcome">
           <p className="text-slate-300">
             {outcome.added.length > 0
-              ? `Added: ${outcome.added.join(', ')}`
-              : 'No servers were added.'}
+              ? fmt(copy.added, { names: outcome.added.join(', ') })
+              : copy.noneAdded}
           </p>
           {outcome.skipped.length > 0 && (
-            <ul className="space-y-0.5" aria-label="Skipped servers">
+            <ul className="space-y-0.5" aria-label={copy.skippedLabel}>
               {outcome.skipped.map((s) => (
                 <li key={s.name} className="text-amber-300">
-                  Skipped {s.name}: {s.reason}
+                  {fmt(copy.skipped, { name: s.name, reason: s.reason })}
                 </li>
               ))}
             </ul>
@@ -393,10 +397,10 @@ const ImportServers: React.FC<{ onAdded: (servers: McpServer[]) => void; onCance
 
       <div className="flex flex-wrap items-center gap-2">
         <Button variant="solid" onClick={() => void submit()} disabled={busy || !json.trim()}>
-          {busy ? 'Importing…' : 'Import'}
+          {busy ? copy.importing : copy.submit}
         </Button>
         <Button onClick={onCancel} disabled={busy}>
-          Close
+          {copy.close}
         </Button>
       </div>
     </div>
@@ -415,6 +419,7 @@ const ServerRow: React.FC<{
   const [busy, setBusy] = useState(false);
   const [confirming, setConfirming] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const copy = useCopy().mcp.row;
 
   const run = async (action: () => Promise<{ ok: true; value: McpServer } | { ok: false; message: string }>) => {
     setBusy(true);
@@ -437,13 +442,13 @@ const ServerRow: React.FC<{
 
   const status =
     server.status === 'connected' ? (
-      <Badge tone="success">Connected · {toolCount(server.tools.length)}</Badge>
+      <Badge tone="success">{plural(copy.connected, server.tools.length)}</Badge>
     ) : server.status === 'disabled' ? (
-      <Badge tone="neutral">Disabled</Badge>
+      <Badge tone="neutral">{copy.disabled}</Badge>
     ) : server.status === 'connecting' ? (
-      <Badge tone="neutral">Connecting…</Badge>
+      <Badge tone="neutral">{copy.connecting}</Badge>
     ) : (
-      <Badge tone="danger">Error</Badge>
+      <Badge tone="danger">{copy.error}</Badge>
     );
 
   const secretKeys = server.transport === 'http' ? server.header_keys : server.env_keys;
@@ -456,7 +461,7 @@ const ServerRow: React.FC<{
       <div className="flex flex-wrap items-center gap-2">
         <span className="text-xs font-medium text-slate-200 font-mono">{server.name}</span>
         <span className="text-[11px] text-slate-500">
-          {server.transport === 'http' ? 'Remote' : 'On this computer'}
+          {server.transport === 'http' ? copy.remote : copy.local}
         </span>
         {status}
         <span className="ml-auto flex items-center gap-2">
@@ -464,8 +469,8 @@ const ServerRow: React.FC<{
             type="button"
             role="switch"
             aria-checked={server.enabled}
-            aria-label={`Use ${server.name}`}
-            title={server.enabled ? 'Turn off' : 'Turn on'}
+            aria-label={fmt(copy.use, { name: server.name })}
+            title={server.enabled ? copy.turnOff : copy.turnOn}
             disabled={busy}
             onClick={() => void run(() => setMcpServerEnabled(server.name, !server.enabled))}
             className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full border transition-colors disabled:opacity-50 ${
@@ -481,8 +486,8 @@ const ServerRow: React.FC<{
           <Button
             variant="ghost"
             size="icon"
-            aria-label={`Reconnect ${server.name}`}
-            title="Reconnect"
+            aria-label={fmt(copy.reconnect, { name: server.name })}
+            title={copy.reconnectTitle}
             disabled={busy}
             onClick={() => void run(() => reconnectMcpServer(server.name))}
           >
@@ -491,8 +496,8 @@ const ServerRow: React.FC<{
           <Button
             variant="ghost"
             size="icon"
-            aria-label={`Remove ${server.name}`}
-            title="Remove"
+            aria-label={fmt(copy.remove, { name: server.name })}
+            title={copy.removeTitle}
             disabled={busy}
             onClick={() => setConfirming(true)}
           >
@@ -506,35 +511,34 @@ const ServerRow: React.FC<{
       </p>
       {secretKeys.length > 0 && (
         <p className="text-[11px] text-slate-500">
-          {server.transport === 'http' ? 'Sends headers' : 'Sets environment variables'}:{' '}
-          <span className="font-mono">{secretKeys.join(', ')}</span> (values hidden)
+          {server.transport === 'http' ? copy.sendsHeaders : copy.setsEnv}:{' '}
+          <span className="font-mono">{secretKeys.join(', ')}</span> {copy.valuesHidden}
         </p>
       )}
 
       {server.status === 'error' && (
         <div className="text-[11px] space-y-0.5" data-testid="mcp-server-error">
-          <p className="text-rose-300">Not connected. The server reported:</p>
-          <p className="font-mono text-rose-200 break-all">{server.error || 'No reason was given.'}</p>
+          <p className="text-rose-300">{copy.notConnected}</p>
+          <p className="font-mono text-rose-200 break-all">{server.error || copy.noReason}</p>
           <p className="text-slate-500">
-            It is still saved. Check the {server.transport === 'http' ? 'address and headers' : 'command'}, then
-            press Reconnect, or remove it and add it again.
+            {fmt(copy.stillSaved, { what: server.transport === 'http' ? copy.checkHttp : copy.checkCommand })}
           </p>
         </div>
       )}
       {server.status === 'connecting' && (
-        <p className="text-[11px] text-slate-500">Starting the connection. Its tools are listed once it connects.</p>
+        <p className="text-[11px] text-slate-500">{copy.connectingNote}</p>
       )}
       {server.status === 'disabled' && (
-        <p className="text-[11px] text-slate-500">Turned off. Clones cannot use its tools until you turn it on.</p>
+        <p className="text-[11px] text-slate-500">{copy.disabledNote}</p>
       )}
 
       {server.status === 'connected' && (
         <details className="text-[11px]">
           <summary className="cursor-pointer text-slate-400 hover:text-slate-200">
-            Show tools ({server.tools.length})
+            {fmt(copy.showTools, { count: server.tools.length })}
           </summary>
           {server.tools.length > 0 ? (
-            <ul className="mt-1 space-y-1" aria-label={`Tools from ${server.name}`}>
+            <ul className="mt-1 space-y-1" aria-label={fmt(copy.toolsFrom, { name: server.name })}>
               {server.tools.map((tool) => (
                 <li key={tool.name}>
                   <span className="font-mono text-slate-200">{tool.name}</span>
@@ -543,19 +547,19 @@ const ServerRow: React.FC<{
               ))}
             </ul>
           ) : (
-            <p className="mt-1 text-slate-500">This server is connected but offers no tools.</p>
+            <p className="mt-1 text-slate-500">{copy.noTools}</p>
           )}
         </details>
       )}
 
       {confirming && (
         <div className="flex flex-wrap items-center gap-2 text-[11px] text-slate-300" data-testid="mcp-remove-confirm">
-          <span>Remove {server.name}? Clones will no longer be able to use its tools.</span>
+          <span>{fmt(copy.confirmRemove, { name: server.name })}</span>
           <Button onClick={() => void remove()} disabled={busy}>
-            Remove
+            {copy.removeTitle}
           </Button>
           <Button onClick={() => setConfirming(false)} disabled={busy}>
-            Keep
+            {copy.keep}
           </Button>
         </div>
       )}
@@ -581,6 +585,7 @@ export const McpServersSection: React.FC<{ pollMs?: number }> = ({ pollMs = CONN
   /** Why the last read failed, or `null` when it did not; `reason` is the Core's own words, if any. */
   const [loadError, setLoadError] = useState<{ reason: string | null } | null>(null);
   const [panel, setPanel] = useState<'none' | 'add' | 'import'>('none');
+  const copy = useCopy().mcp;
 
   const load = useCallback(async () => {
     try {
@@ -627,10 +632,10 @@ export const McpServersSection: React.FC<{ pollMs?: number }> = ({ pollMs = CONN
     <div className="space-y-3" data-testid="settings-mcp">
       <label className="text-xs font-semibold uppercase tracking-wider text-slate-400 flex items-center gap-1.5">
         <Plug className="w-3.5 h-3.5 text-cyan-400" />
-        External tools (MCP)
+        {copy.title}
       </label>
       <p className="text-[11px] text-slate-500">
-        Connect a tool server so clones can use its tools.
+        {copy.intro}
       </p>
 
       {loadError !== null && (
@@ -641,22 +646,21 @@ export const McpServersSection: React.FC<{ pollMs?: number }> = ({ pollMs = CONN
         >
           <div className="flex items-center gap-2 text-xs text-rose-200">
             <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0" />
-            <span>The list of tool servers could not be read.</span>
+            <span>{copy.loadFailed}</span>
           </div>
           {loadError.reason !== null && <p className="text-[11px] text-rose-300/80">{loadError.reason}</p>}
-          <Button onClick={() => void load()}>Try again</Button>
+          <Button onClick={() => void load()}>{copy.tryAgain}</Button>
         </div>
       )}
 
       {loadError === null && list !== null && servers.length === 0 && (
         <p className="text-[11px] text-slate-400" data-testid="settings-mcp-empty">
-          No tool servers are connected yet. Choose Add a server to connect one by its web address or by a
-          command, or Import from JSON to paste the setup snippet a tool publishes.
+          {copy.empty}
         </p>
       )}
 
       {servers.length > 0 && (
-        <ul className="space-y-1.5" aria-label="Tool servers">
+        <ul className="space-y-1.5" aria-label={copy.listLabel}>
           {servers.map((server) => (
             <ServerRow
               key={server.name}
@@ -670,7 +674,7 @@ export const McpServersSection: React.FC<{ pollMs?: number }> = ({ pollMs = CONN
 
       {list?.config_path ? (
         <p className="text-[11px] text-slate-600 font-mono break-all" data-testid="settings-mcp-config-path">
-          Saved in {list.config_path}
+          {fmt(copy.savedIn, { path: list.config_path })}
         </p>
       ) : null}
 
@@ -689,11 +693,11 @@ export const McpServersSection: React.FC<{ pollMs?: number }> = ({ pollMs = CONN
         <div className="flex flex-wrap items-center gap-2">
           <Button variant="bordered" onClick={() => setPanel('add')} className="px-3 py-1.5 rounded-xl">
             <Plus className="w-3.5 h-3.5 text-cyan-400" />
-            Add a server
+            {copy.addServer}
           </Button>
           <Button variant="bordered" onClick={() => setPanel('import')} className="px-3 py-1.5 rounded-xl">
             <Upload className="w-3.5 h-3.5 text-cyan-400" />
-            Import from JSON
+            {copy.importJson}
           </Button>
         </div>
       )}

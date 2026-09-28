@@ -15,6 +15,8 @@ rule about rooms appears below, it is in the wrong file.
 from __future__ import annotations
 
 import asyncio
+import os
+from pathlib import Path
 from typing import Annotated
 
 import typer
@@ -73,13 +75,12 @@ def build_orchestrator(
     has landed, and a CLI that prints the result afterwards has nothing to stream to. The
     bus being optional is what lets this stay a four-line assembly.
     """
-    from uclone_x.agent.composition import HostDependencies
+    from uclone_x.agent.clone_builder import local_app_scope
     from uclone_x.agent.models import AgentLLMConfig
-    from uclone_x.agent.persona_registry import get_default_persona_registry
     from uclone_x.agent.session import SessionStore
     from uclone_x.cli.commands.run import apply_saved_model, get_default_llm
     from uclone_x.engine.event_bus import EventBus
-    from uclone_x.memory.store import default_cross_session_memory
+    from uclone_x.skills.auditor import load_runtime_skill_registry
     from uclone_x.telemetry import TelemetryTracer
     from uclone_x.tools.registry import create_default_registry
 
@@ -89,22 +90,23 @@ def build_orchestrator(
     if saved_notice is not None:
         console.print(f"[dim]{escape(saved_notice)}[/dim]")
     llm = get_default_llm(provider)
-    host = HostDependencies(
-        bus=EventBus(),
+    tools = create_default_registry()
+    # The scope `ucx run` builds its clone from, so a seat here is that clone (#1731). Its
+    # memory is one store per participant id: `record_memory_fact` reaches the seated
+    # agent's own file, never one store read back by every seat as its own recollection.
+    app = local_app_scope(
+        workspace_root=Path(os.getenv("UCLONE_WORKSPACE_DIR", os.getcwd())).resolve(),
         llm=llm,
-        tools=create_default_registry(),
+        tools=tools,
+        llm_override=None if model is None else AgentLLMConfig(model_name=model),
+        bus=EventBus(),
         tracer=TelemetryTracer(),
         store=SessionStore(),
+        # P9: the approved skills in the runtime store, shared by every seat as the web
+        # app's rooms share theirs; without them no seat has `load_skill`.
+        skills=asyncio.run(load_runtime_skill_registry()),
     )
-    resolver = RoomAgentResolver(
-        host,
-        llm_config=None if model is None else AgentLLMConfig(model_name=model),
-        # One store per participant, so `record_memory_fact` reaches the seated agent's
-        # own file. The host deliberately carries no `memory=`: a single store there is
-        # read back by every agent in the room as its own recollection.
-        memory_factory=default_cross_session_memory,
-        persona_registry=get_default_persona_registry(),
-    )
+    resolver = RoomAgentResolver(app)
     return RoomOrchestrator(
         store=store,
         selectors=build_selector_chain(policy, provider=llm),
@@ -652,17 +654,33 @@ def _offer_retry(state: RoomState) -> None:
     """Name the remedy when the room's last utterance is a failed turn.
 
     A plain retry is not offered for a refusal: it is refused the same way. A model without
-    tools is the one refusal a retry can cure, with another model, so that retry is named
-    with `--model`. A spent usage budget is not cured by retrying at all, so nothing is.
+    tools and a model the provider does not serve are the refusals a retry can cure, with
+    another model, so that retry is named with `--model`. A spent usage budget is not cured
+    by retrying at all, so nothing is. A rejected API key is not cured by retrying either,
+    but a new key is, so that is named, with the variable it is read from (#1630).
     """
+    # Deferred like `_compose`'s: `ucx --help` does not import `run` (test_distribution_install).
+    from uclone_x.cli.commands.run import PROVIDER_FAILURE_REMEDIES, provider_key_remedy
+
     last = state.last_utterance
     if last is None or last.error is None:
         return
     room_id = escape(state.room_id)
+    failure = last.provider_failure
     if last.refusal is None:
+        if failure is not None and failure.kind == "provider_unreachable":
+            console.print(f"[dim]— {PROVIDER_FAILURE_REMEDIES['provider_unreachable']}[/dim]")
         console.print(f"[dim]— retry that turn with:[/dim] ucx room retry {room_id}")
+    elif last.refusal == RoomTurnRefusal.PROVIDER_AUTH:
+        provider = failure.provider if failure is not None else None
+        console.print(f"[dim]— {provider_key_remedy(provider)}[/dim]")
     elif last.refusal == RoomTurnRefusal.MODEL_WITHOUT_TOOLS:
         console.print(
             "[dim]— retry that turn on a model that supports tools with:[/dim] "
+            f"ucx room retry {room_id} --model <model>"
+        )
+    elif last.refusal == RoomTurnRefusal.MODEL_UNAVAILABLE:
+        console.print(
+            "[dim]— retry that turn on another model with:[/dim] "
             f"ucx room retry {room_id} --model <model>"
         )

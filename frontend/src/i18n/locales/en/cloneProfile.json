@@ -1,0 +1,9 @@
+{
+  "none": "No clone is picked yet. Choose one under {clones} in the left rail to see what it is set up to do and to start a conversation with it.",
+  "noRole": "No role set",
+  "start": "Start a conversation",
+  "startLabel": "Start a conversation with {name}",
+  "edit": "Edit",
+  "editLabel": "Edit {name}",
+  "noDefinition": "Nothing is installed under this name, so there is no description, model or tool list to show. A clone gets those from a definition file in the workspace's personas directory."
+}

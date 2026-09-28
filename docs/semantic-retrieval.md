@@ -5,18 +5,16 @@ composition does, and — as much as anything — what it deliberately refuses t
 
 ## Why it was added
 
-The subsystem previously had three components with "semantic" in their names and no
-embeddings anywhere: `SemanticToolScoper` scored lowercase substrings, `SemanticModelRouter`
-matched keywords, and `query_memory_facts` took exact `subject` / `predicate` / `tag`
-filters. None of them was wrong as code; the names were wrong, and a name that overstates a
+The subsystem previously had two components with "semantic" in their names and no
+embeddings anywhere: `SemanticModelRouter` matched keywords, and `query_memory_facts` took
+exact `subject` / `predicate` / `tag` filters. Neither was wrong as code; the names were wrong, and a name that overstates a
 mechanism is how a lexical miss gets read as "nothing relevant exists".
 
-Two of the three are addressed here: `SemanticToolScoper` is now `LexicalToolScoper`, and
-`query_memory_facts` now ranks — by embeddings when one is wired, and by lexical overlap
+One of the two is addressed here: `query_memory_facts` now ranks — by embeddings when one is wired, and by lexical overlap
 otherwise, saying which. **`SemanticModelRouter` is untouched and still keyword-matching
 under its original name.** It routes between model tiers rather than retrieving anything, so
 it is out of this seam's scope; naming it here is the point, because a document that listed
-three problems and silently fixed two would leave the third looking solved.
+two problems and silently fixed one would leave the other looking solved.
 
 Alongside that, `CrossSessionMemory` was a real store that no composed agent ever received:
 `compose_agent` had no `memory` field, so `BaseAgent` — which registers the three memory

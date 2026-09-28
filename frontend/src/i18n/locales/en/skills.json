@@ -1,0 +1,89 @@
+{
+  "title": "Skills",
+  "intro": "Skills are add-ons that give your clones new abilities. Each one is listed here with the result of its safety check.",
+  "loadFailed": "Your skills could not be loaded.",
+  "loading": "Loading your skills…",
+  "empty": "No skills are registered with this installation.",
+  "noStore": "No skills are loaded, because there is no ucx-agent-skills folder in the project UClone-X was started from. To see how to add a skill, run this in a terminal window: ucx skill --help",
+  "plainCause": {
+    "unreachable": "UClone-X could not be reached. If it has stopped, start it again, then try again.",
+    "status": "UClone-X answered with an error but gave no reason.",
+    "unreadable": "UClone-X's answer could not be read."
+  },
+  "readState": {
+    "reason": "Reason:",
+    "retry": "Try again",
+    "retrying": "Trying again…"
+  },
+  "notLoaded": {
+    "label": "Why it is not used:",
+    "codes": {
+      "changed_after_approval": "This skill was changed after it was approved, so it is not used. To use it, check what changed, then approve it again in a terminal window: ucx skill approve {name}",
+      "approved_before_pins": "This skill was approved before UClone-X began keeping a record of approvals on this computer, so it is not used until you approve it again. In a terminal window, run: ucx skill approve {name}",
+      "never_approved": "This skill is marked ready to use, but it was never approved on this computer, so it is not used. To use it, approve it in a terminal window: ucx skill approve {name}",
+      "failed_safety_check": "The safety check did not pass this skill, so it is not used.",
+      "check_not_finished": "The safety check could not read all of this skill's files, so it is not used. Check that its files can be opened, then start UClone-X again.",
+      "unreadable": "This skill's instructions could not be read, so it is not used. They may be incomplete or edited by hand. Fix them, or install the skill again."
+    }
+  },
+  "reapprove": {
+    "one": "{names} was approved before UClone-X kept a record of approvals, so it needs approving again. In a terminal window, run: ucx skill approve {names}",
+    "other": "{count} skills were approved before UClone-X kept a record of approvals, so they need approving again. In a terminal window, run ucx skill approve for each: {names}"
+  },
+  "tab": {
+    "status": {
+      "active": "Ready to use",
+      "pending": "Waiting for review",
+      "quarantined": "Blocked",
+      "rejected": "Turned down"
+    },
+    "origin": {
+      "human": "Written by a person",
+      "synthesized": "Written by the assistant"
+    },
+    "isolation": {
+      "none": "Runs without a sandbox",
+      "workspace": "Runs in your workspace folder",
+      "container": "Runs in a container",
+      "wasm": "Runs in a sandbox"
+    },
+    "recommendation": {
+      "approve": "Safe to use",
+      "require_human_review": "Needs your review",
+      "reject": "Not safe to use"
+    },
+    "cards": {
+      "total": {
+        "label": "Skills",
+        "hint": "Installed"
+      },
+      "active": {
+        "label": "Ready to use",
+        "hint": "Passed the safety check"
+      },
+      "pending": {
+        "label": "Waiting for review",
+        "hint": "Needs a person to approve it"
+      },
+      "blocked": {
+        "label": "Blocked",
+        "hint": "Failed the safety check"
+      }
+    },
+    "search": "Search skills by name, description, or tags...",
+    "anyStatus": "Any status",
+    "anyone": "Anyone",
+    "refresh": "Refresh",
+    "refreshing": "Refreshing…",
+    "listHeading": "Skills ({count})",
+    "checkHeading": "Safety check",
+    "author": "Author:",
+    "fingerprint": "Fingerprint",
+    "result": "Result",
+    "risk": "Risk found in its code",
+    "findings": "What the check found",
+    "noFindings": "Nothing unsafe was found in this skill's code.",
+    "turnedDown": "Why it was turned down:",
+    "choose": "Choose a skill to see its safety check."
+  }
+}

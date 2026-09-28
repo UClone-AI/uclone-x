@@ -1,66 +1,17 @@
 import React from 'react';
 import { Avatar } from '../primitives/Avatar';
-import { StatusDot } from '../primitives/StatusDot';
-import type { KitTone } from '../primitives/StatusDot';
 import { ConversationList, LastActive } from './ConversationList';
 import { CloneRowMenu } from './CloneRowMenu';
 import type { CloneRowMenuItem } from './CloneRowMenu';
 import { ConversationTitleEditor } from './ConversationTitleEditor';
 import { DeleteConversationDialog } from './DeleteConversationDialog';
 import type {
-  CloneLiveness,
-  RailAgent,
   RailCopy,
   RailIcons,
   RailPersona,
   RailRoom,
   UseKitEscape,
 } from './types';
-
-/**
- * `AgentState` (`src/uclone_x/agent/models.py`) folded onto what a 240px row can draw.
- *
- * `/api/agents` sends that enum's value verbatim as `status`. The row used to compare it
- * against `'busy'`, a value the endpoint has never sent, so the comparison was never true and
- * a clone mid-tool-call, in `ERROR` or `TERMINATED` drew the same emerald dot as an idle one.
- * The eight states the runtime has are named here, once, against the file that defines them.
- */
-const LIVENESS_BY_STATE: Record<string, CloneLiveness> = {
-  IDLE: 'idle',
-  AWAITING_INPUT: 'idle',
-  INGESTING: 'busy',
-  REASONING: 'busy',
-  CALLING_TOOL: 'busy',
-  EMITTING_RESPONSE: 'busy',
-  ERROR: 'error',
-  TERMINATED: 'terminated',
-};
-
-/**
- * What the row may say about the instance behind a clone.
- *
- * A `status` this table does not hold is `unknown`, never `idle`: the runtime is free to grow
- * a state, and a screen that folds one it cannot read onto "running, nothing in progress"
- * reports health it has no evidence for.
- */
-export const livenessOf = (status: string | undefined): CloneLiveness =>
-  status === undefined ? 'offline' : (LIVENESS_BY_STATE[status] ?? 'unknown');
-
-/**
- * The dot's colour per liveness.
- *
- * Amber and emerald are the pairing red-green colour blindness collapses, so the colour is
- * never the only carrier: `copy.cloneLiveness.word` puts busy, error, stopped and unknown
- * beside the name in words, and the dot's own `title` says all six in a sentence.
- */
-const TONE_BY_LIVENESS: Record<CloneLiveness, KitTone> = {
-  offline: 'neutral',
-  idle: 'success',
-  busy: 'warning',
-  error: 'danger',
-  terminated: 'neutral',
-  unknown: 'neutral',
-};
 
 /**
  * The rail's rendered width in pixels -- the `w-60` on its `<aside>` below, as a number.
@@ -77,7 +28,6 @@ export const RAIL_WIDTH_PX = 240;
 export const RAIL_WIDTH_CLASS = 'w-60';
 
 export interface RailProps {
-  agents: RailAgent[];
   personas?: RailPersona[];
   selectedAgent: string;
   onSelectAgent: (id: string) => void;
@@ -180,7 +130,6 @@ export interface RailProps {
  * imports from outside it, other than `react`.
  */
 export const Rail: React.FC<RailProps> = ({
-  agents,
   personas,
   selectedAgent,
   onSelectAgent,
@@ -265,7 +214,8 @@ export const Rail: React.FC<RailProps> = ({
   const [renamingId, setRenamingId] = React.useState<string | null>(null);
 
   /**
-   * The clones the section lists, from whichever source the head has.
+   * The clones the section lists: the installed personas, and nothing else. Live-instance
+   * state used to be overlaid from `/api/agents` (2026-09-27: `/api/agents` removed, #1775).
    *
    * Ordered by hybrid Pin + MRU:
    * 1. Pinned clones first.
@@ -273,11 +223,7 @@ export const Rail: React.FC<RailProps> = ({
    * 3. Clones without conversations fall to the bottom of their tier, sorted alphabetically.
    */
   const clones = React.useMemo(() => {
-    const liveOf = (id: string) => agents.find((a) => a.id === id);
-    const base =
-      personas && personas.length > 0
-        ? personas.map((p) => ({ id: p.name, label: p.name, role: p.role, live: liveOf(p.name) }))
-        : agents.map((a) => ({ id: a.id, label: a.label || a.id, role: a.role, live: a }));
+    const base = (personas ?? []).map((p) => ({ id: p.name, label: p.name, role: p.role }));
 
     const latestActive = new Map<string, number>();
     for (const room of rooms) {
@@ -307,7 +253,23 @@ export const Rail: React.FC<RailProps> = ({
       const cmp = a.label.localeCompare(b.label);
       return cmp !== 0 ? cmp : a.id.localeCompare(b.id);
     });
-  }, [agents, personas, rooms, pinnedCloneIds]);
+  }, [personas, rooms, pinnedCloneIds]);
+
+  /**
+   * The clone currently active in the rail.
+   *
+   * If currentRoomId matches one of the clone's 1:1 sessions, that clone is the sole active one.
+   * Otherwise, falls back to selectedAgent (e.g. when in group chats or when no room is open).
+   * This guarantees that multiple clones are never selected at the same time.
+   */
+  const activeCloneId = React.useMemo(() => {
+    for (const [agentId, sessions] of sessionsByClone.entries()) {
+      if (sessions.some((s) => s.room_id === currentRoomId)) {
+        return agentId;
+      }
+    }
+    return selectedAgent;
+  }, [sessionsByClone, currentRoomId, selectedAgent]);
 
   return (
     <aside
@@ -344,16 +306,15 @@ export const Rail: React.FC<RailProps> = ({
             onNewConversation={() => onNewRoom(undefined, true)}
             onRenameRoom={onRenameRoom}
             onDeleteRoom={onDeleteRoom}
-            // `clones`, not `agents`: the empty list's cause says whether any clone is set up,
-            // and `clones` is what the section below actually lists. Counted from `agents`, an
-            // install with personas but no running instance read "No clones are set up yet"
-            // directly above the clones it had (#1088).
+            // `clones`: the empty list's cause says whether any clone is set up, and `clones`
+            // is what the section below actually lists (#1088).
             agentCount={clones.length}
             modelConfigured={modelConfigured}
             listTestId="sessions-list"
             onCollapse={onClose}
             copy={copy.conversations}
             icons={icons}
+            avatarSrc={avatarSrc}
             useEscape={useEscape}
           />
         </div>
@@ -366,17 +327,6 @@ export const Rail: React.FC<RailProps> = ({
               <span>{copy.clones}</span>
             </div>
             <div className="flex items-center gap-1.5">
-              {/* The number and the list come from one expression. The badge counted `agents`
-                  while the rows came from `clones`, so an install with three personas and one
-                  running instance read "1 active" over three rows -- and one with a live agent
-                  that has no persona read "2 active" over rows that did not include it. It
-                  counts the rows it sits above, and only the ones with an instance behind
-                  them, which is what "active" claims. */}
-              {clones.length > 1 && (
-                <span className="text-[10px] text-slate-500 font-normal">
-                  {copy.activeClones(clones.filter((clone) => clone.live).length)}
-                </span>
-              )}
               {onNewClone && (
                 <button
                   type="button"
@@ -403,7 +353,7 @@ export const Rail: React.FC<RailProps> = ({
                 const cloneSessions = sessionsByClone.get(clone.id) || [];
                 const hasSessions = cloneSessions.length > 0;
                 const isExpanded = expandedClones[clone.id] ?? true;
-                const isSelected = clone.id === selectedAgent || cloneSessions.some((s) => s.room_id === currentRoomId);
+                const isSelected = clone.id === activeCloneId;
                 const isPinned = (pinnedCloneIds ?? []).includes(clone.id);
                 // The list sorts pinned clones first, so the tier is marked once, at its
                 // boundaries, rather than on every row: a heading over the first pinned row,
@@ -439,9 +389,6 @@ export const Rail: React.FC<RailProps> = ({
                     onSelect: () => onInspectAgent(clone.id),
                   });
                 }
-                const liveness = livenessOf(clone.live?.status);
-                const livenessWord = copy.cloneLiveness.word(liveness);
-
                 const handleCloneClick = () => {
                   onSelectAgent(clone.id);
                   if (hasSessions) {
@@ -503,15 +450,6 @@ export const Rail: React.FC<RailProps> = ({
                           }}
                           interactiveLabel={copy.inspectLabel(clone.label)}
                         />
-                        {/* A dark outline, so the dot stays a dot against whatever the
-                            picture happens to be behind it. */}
-                        <span className="absolute bottom-1 right-0 flex items-center justify-center leading-none rounded-full ring-2 ring-slate-950 bg-slate-950 pointer-events-none">
-                          <StatusDot
-                            tone={TONE_BY_LIVENESS[liveness]}
-                            data-testid={`clone-liveness-${clone.id}`}
-                            title={copy.cloneLiveness.title(liveness, clone.live?.status ?? '')}
-                          />
-                        </span>
                       </span>
 
                       {/* Main card body: clicking opens recent conversation. The name owns
@@ -529,14 +467,6 @@ export const Rail: React.FC<RailProps> = ({
                         >
                           <div className="flex items-center gap-1.5 truncate">
                             <span className="truncate text-sm font-medium text-slate-200">{clone.label}</span>
-                            {livenessWord !== null && (
-                              <span
-                                data-testid={`clone-liveness-word-${clone.id}`}
-                                className="shrink-0 text-[11px] text-slate-500 font-normal"
-                              >
-                                {livenessWord}
-                              </span>
-                            )}
                           </div>
                           {clone.role && (
                             <span

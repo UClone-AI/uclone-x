@@ -6,7 +6,7 @@ import logging
 import re
 from collections.abc import Callable
 from pathlib import Path
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from uclone_x.agent.hooks.models import HookAction, HookContext, HookDecision
 from uclone_x.agent.hooks.protocols import BaseHook
@@ -21,6 +21,24 @@ MD_LINK_RE = re.compile(r"(?<!!)\[(.*?)\]\((.*?)\)")
 
 # Matches artifact content endpoint: /api/artifacts/content
 ARTIFACT_ENDPOINT = "/api/artifacts/content"
+
+# The two directives a missing artifact is replaced with. The head's `RichText` finds them
+# and words them in the reader's language (`notices.missingImage`); anything else that shows
+# the text (an export, the CLI) shows the directive, which names the file in English words.
+# The syntax is remark-directive's text directive, so the head could adopt that plugin later
+# without a stored reply changing shape.
+MISSING_IMAGE_DIRECTIVE = "missing-image"
+MISSING_IMAGE_LINK_DIRECTIVE = "missing-image-link"
+
+
+def missing_image_directive(name: str, filename: str) -> str:
+    """`:<name>{file="<filename>"}`, with the filename percent-encoded.
+
+    The filename comes from model output, so it is encoded down to letters, digits and
+    `._-~` plus `%` escapes: a quote, a brace, a bracket or a newline in it cannot end the
+    directive early or start Markdown of its own. The head decodes it to show it.
+    """
+    return f':{name}{{file="{quote(filename, safe="._-~")}"}}'
 
 
 def rooted_artifact_url(raw_url: str) -> str | None:
@@ -75,7 +93,7 @@ def is_artifact_missing(rel_path: str, workspace_root: Path | None) -> bool:
 
 
 def sanitize_hallucinated_artifacts(content: str, workspace_root: Path | None) -> tuple[str, int]:
-    """Replace nonexistent artifact image references with a reader-facing notice banner.
+    """Replace nonexistent artifact image references with a directive the head words.
 
     A link to an artifact that does exist but was written with a host or directory before
     the endpoint is re-rooted to the served path (#1618), and counts as a replacement.
@@ -105,7 +123,7 @@ def sanitize_hallucinated_artifacts(content: str, workspace_root: Path | None) -
             if is_artifact_missing(rel_path, workspace_root):
                 replacements += 1
                 filename = Path(rel_path).name or rel_path
-                return f"> ⚠️ *[이미지 생성 도구가 실행되지 않아 이미지가 표시되지 않습니다: {filename}]*"
+                return missing_image_directive(MISSING_IMAGE_DIRECTIVE, filename)
         return _rooted(match, "!")
 
     def _replace_link(match: re.Match[str]) -> str:
@@ -118,7 +136,7 @@ def sanitize_hallucinated_artifacts(content: str, workspace_root: Path | None) -
             if is_artifact_missing(rel_path, workspace_root):
                 replacements += 1
                 filename = Path(rel_path).name or rel_path
-                return f"*[생성되지 않은 이미지 링크: {filename}]*"
+                return missing_image_directive(MISSING_IMAGE_LINK_DIRECTIVE, filename)
         return _rooted(match, "")
 
     # First replace markdown images

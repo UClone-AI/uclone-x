@@ -4,13 +4,17 @@
  *
  * Pure: no request is made from this module. The components in `components/personas/`
  * import only from here, and take data, callbacks, copy and icons as props; the requests
- * are in `personasApi.ts` and the words in `personaCopy.ts`, and `SettingsModal` is the one
- * place that wires the three together.
+ * are in `personasApi.ts` and the words in `i18n/locales/<language>/personaEditor.json`, and
+ * `SettingsModal` is the one place that wires the three together.
  *
  * The server is the authority on every rule here. The name rule is repeated so the editor
  * can say what is wrong before a round trip, but a save the server refuses is shown with the
  * server's own sentence, which names the file, the tool or the field it refused.
  */
+import { fmt, type Plural } from '../i18n/format';
+
+/** Re-exported so the editor components fill their sentences without importing `i18n`. */
+export { fmt, plural } from '../i18n/format';
 import type { PersonaInfo, PersonaModelTier } from '../types';
 
 /** What `POST /api/personas` and `PUT /api/personas/{name}` accept, field for field. */
@@ -37,13 +41,12 @@ export type PersonaSaveResult =
   | { ok: true; persona: PersonaInfo; liveAgentsUpdated: number }
   | { ok: false; message: string };
 
-export const MODEL_TIERS: readonly PersonaModelTier[] = [
-  'inherit',
-  'fast',
-  'pro',
-  'flash_lite',
-  'custom',
-];
+export const MODEL_TIERS: readonly PersonaModelTier[] = ['inherit', 'fast'];
+
+/** A tier the Core still sends, else `inherit`: the retired values (pro, flash_lite, custom)
+ * were read by nothing, and the Core loads a file naming one as `inherit` too. */
+const knownTier = (tier: string | null | undefined): PersonaModelTier =>
+  (MODEL_TIERS as readonly string[]).includes(tier ?? '') ? (tier as PersonaModelTier) : 'inherit';
 
 export const emptyPersonaDraft = (): PersonaDraft => ({
   name: '',
@@ -70,7 +73,7 @@ export const draftFromPersona = (persona: PersonaInfo): PersonaDraft => ({
   append_default_prompt: persona.append_default_prompt ?? false,
   allowed_tools: [...(persona.allowed_tools ?? [])],
   model_name: persona.model_name ?? null,
-  model_tier: persona.model_tier ?? 'inherit',
+  model_tier: knownTier(persona.model_tier),
   temperature: persona.temperature ?? 0.7,
   max_tokens: persona.max_tokens ?? null,
   enable_write_tools: persona.enable_write_tools ?? false,
@@ -97,7 +100,7 @@ export const draftProblem = (
   copy: PersonaEditorCopy,
 ): string | null => {
   if (!NAME_RULE.test(draft.name)) return copy.nameRule;
-  if (mode === 'create' && existingNames.includes(draft.name)) return copy.nameTaken(draft.name);
+  if (mode === 'create' && existingNames.includes(draft.name)) return fmt(copy.nameTaken, { name: draft.name });
   if (!draft.role.trim()) return copy.roleRequired;
   if (!draft.system_prompt.trim()) return copy.promptRequired;
   return null;
@@ -116,25 +119,27 @@ export const describeRefusal = (detail: unknown, status: number, copy: PersonaEd
       const field = issue.loc && issue.loc.length > 0 ? String(issue.loc[issue.loc.length - 1]) : '';
       return field ? `${field}: ${issue.msg ?? 'invalid'}` : (issue.msg ?? 'invalid');
     });
-    return copy.fieldsRefused(fields.join('; '));
+    return fmt(copy.fieldsRefused, { fields: fields.join('; ') });
   }
-  return copy.saveFailed(status);
+  return fmt(copy.saveFailed, { status });
 };
 
 /** Every word the persona editor shows. Passed in, so the components carry none of their own. */
 export interface PersonaEditorCopy {
   sectionTitle: string;
-  savedTo: (dir: string) => string;
+  savedTo: string;
   noWorkspace: string;
-  /** `reason` is the Core's own words for the failure, or `''` when it gave none (#1436). */
-  loadFailed: (reason: string) => string;
+  /** For a failure the Core gave no words for. */
+  loadFailed: string;
+  /** The same, with the Core's own words for the failure as `{reason}` (#1436). */
+  loadFailedBecause: string;
   emptyList: string;
   newPersona: string;
   edit: string;
   builtinBadge: string;
   overrideBadge: string;
   createTitle: string;
-  editTitle: (name: string) => string;
+  editTitle: string;
   builtinEditNote: string;
   fields: {
     name: string;
@@ -146,9 +151,9 @@ export interface PersonaEditorCopy {
     tools: string;
     toolsHint?: string;
     toolsAllAllowedBadge?: string;
-    toolsRestrictedBadge?: (count: number, total: number) => string;
+    toolsRestrictedBadge?: string;
     toolsResetToAll?: string;
-    toolsRestrictedNotice?: (count: number) => string;
+    toolsRestrictedNotice?: Plural;
     model: string;
     modelDefault: string;
     modelOther: string;
@@ -164,9 +169,9 @@ export interface PersonaEditorCopy {
     generateWithAi: string;
     generatingPrompt: string;
     generateHint: string;
-    draftedByModel: (model: string) => string;
-    draftedFromTemplate: (reason: string) => string;
-    draftFailed: (reason: string) => string;
+    draftedByModel: string;
+    draftedFromTemplate: string;
+    draftFailed: string;
     undoDraft: string;
     maxTokens: string;
     maxTokensHint: string;
@@ -183,13 +188,14 @@ export interface PersonaEditorCopy {
   saving: string;
   cancel: string;
   nameRule: string;
-  nameTaken: (name: string) => string;
+  nameTaken: string;
   roleRequired: string;
   promptRequired: string;
-  fieldsRefused: (fields: string) => string;
-  saveFailed: (status: number) => string;
-  unreachable: (reason: string) => string;
-  saved: (name: string, liveAgents: number) => string;
+  fieldsRefused: string;
+  saveFailed: string;
+  unreachable: string;
+  saved: string;
+  savedWithLive: Plural;
 }
 
 

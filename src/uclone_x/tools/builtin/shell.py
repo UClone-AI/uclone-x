@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import shutil
 import signal
 import tempfile
 import time
@@ -19,7 +18,9 @@ from uclone_x.sandbox.path_validator import PathValidator
 from uclone_x.sandbox.protocols import PathValidatorProtocol
 from uclone_x.sandbox.story_jail import (
     JAIL_SETUP_REFUSAL,
+    has_started,
     jailed_shell,
+    remove_started_folder,
     story_library_jail,
 )
 from uclone_x.tools.models import ToolContext, ToolResult
@@ -39,6 +40,28 @@ STORY_LIBRARY_SHELL_NOTE = (
     "(The shell cannot change files in the story library, 'stories/'. Stories are changed "
     "with the story tools: story_manuscript, story_outline and story_codex.)"
 )
+
+#: How long a daemon's jail has to start it before it is taken as not started (#1611).
+#: The jailed shell's first act is to create the marker, so only a `sandbox-exec` that
+#: hangs ever reaches it.
+_JAIL_START_SECONDS = 10.0
+
+
+async def _jail_started(proc: asyncio.subprocess.Process, started: Path) -> bool:
+    """Wait until the jailed shell has created `started`, or the process has ended."""
+    deadline = time.monotonic() + _JAIL_START_SECONDS
+    while not has_started(started):
+        if proc.returncode is not None:
+            # Created before the command runs, so once the process has ended it is final.
+            return has_started(started)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=min(remaining, 0.02))
+        except TimeoutError:
+            pass
+    return True  # the jailed shell created the marker
 
 
 class BashRunTool:
@@ -147,6 +170,20 @@ class BashRunTool:
                 child_env[str(key)] = str(value)
 
         return child_env
+
+    @staticmethod
+    def _kill_group(proc: asyncio.subprocess.Process) -> None:
+        """Kill `proc` and every process in its group, or `proc` alone if that fails."""
+        try:
+            if hasattr(os, "killpg") and hasattr(os, "getpgid"):
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    proc.kill()
+            else:
+                proc.kill()
+        except Exception:
+            pass
 
     def _truncate_output(self, raw_bytes: bytes, max_bytes: int) -> tuple[str, bool]:
         """Truncate raw bytes to max_bytes, keeping both head and tail context.
@@ -345,13 +382,16 @@ class BashRunTool:
         try:
             stdout_target = asyncio.subprocess.PIPE if not is_daemon else asyncio.subprocess.DEVNULL
             stderr_target = asyncio.subprocess.PIPE if not is_daemon else asyncio.subprocess.DEVNULL
+            # The command never reads the UI server's own stdin, which is the terminal
+            # the person started it from (#1589): it reads end-of-file at once.
+            stdin_target = asyncio.subprocess.DEVNULL
             if jail:
-                if not is_daemon:
-                    started_dir = Path(tempfile.mkdtemp(prefix="ucx-jail-"))
+                started_dir = Path(tempfile.mkdtemp(prefix="ucx-jail-"))
                 proc = await asyncio.create_subprocess_exec(
-                    *jailed_shell(jail, command, started_dir / "started" if started_dir else None),
+                    *jailed_shell(jail, command, started_dir / "started"),
                     cwd=str(safe_cwd),
                     env=child_env,
+                    stdin=stdin_target,
                     stdout=stdout_target,
                     stderr=stderr_target,
                     preexec_fn=preexec,
@@ -361,12 +401,29 @@ class BashRunTool:
                     command,
                     cwd=str(safe_cwd),
                     env=child_env,
+                    stdin=stdin_target,
                     stdout=stdout_target,
                     stderr=stderr_target,
                     preexec_fn=preexec,
                 )
 
             if is_daemon:
+                # A daemon is not waited for, but its jail is: a jail that never started
+                # it must not be reported as a daemon that did (#1611).
+                if started_dir is not None and not await _jail_started(
+                    proc, started_dir / "started"
+                ):
+                    if proc.returncode is None:
+                        self._kill_group(proc)
+                        await proc.wait()
+                    return ToolResult(
+                        success=False,
+                        output={"stdout": "", "stderr": "", "exit_code": -1},
+                        error=JAIL_SETUP_REFUSAL,
+                        execution_time_ms=round((time.monotonic() - start_time) * 1000, 3),
+                        isolation_level=context.isolation.level,
+                        provenance=prov,
+                    )
                 self._daemons[proc.pid] = proc
                 duration_ms = (time.monotonic() - start_time) * 1000.0
                 return ToolResult(
@@ -385,18 +442,7 @@ class BashRunTool:
                 exit_code = proc.returncode
             except TimeoutError:
                 timed_out = True
-                # Terminate entire process tree / process group
-                try:
-                    if hasattr(os, "killpg") and hasattr(os, "getpgid"):
-                        try:
-                            pgid = os.getpgid(proc.pid)
-                            os.killpg(pgid, signal.SIGKILL)
-                        except (ProcessLookupError, PermissionError):
-                            proc.kill()
-                    else:
-                        proc.kill()
-                except Exception:
-                    pass
+                self._kill_group(proc)
 
                 try:
                     stdout_bytes, stderr_bytes = await asyncio.wait_for(
@@ -409,7 +455,7 @@ class BashRunTool:
                 exit_code = proc.returncode
 
             if started_dir is not None:
-                started = (started_dir / "started").exists()
+                started = has_started(started_dir / "started")
 
             # 6. Output buffer truncation
             stdout_text, out_trunc = self._truncate_output(stdout_bytes, max_output_bytes)
@@ -441,7 +487,7 @@ class BashRunTool:
         finally:
             if started_dir is not None:
                 # Only the marker the shell may have created is in it.
-                shutil.rmtree(started_dir, ignore_errors=True)
+                remove_started_folder(started_dir)
 
         duration_ms = (time.monotonic() - start_time) * 1000.0
 
@@ -466,6 +512,8 @@ class BashRunTool:
             )
 
         if jail and not started:
+            # What `sandbox-exec` printed is about the jail, not the command (#1611).
+            output_data = {"stdout": "", "stderr": "", "exit_code": -1}
             return ToolResult(
                 success=False,
                 output=output_data,

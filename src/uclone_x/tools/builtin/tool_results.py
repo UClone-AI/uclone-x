@@ -17,7 +17,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from uclone_x.core.tool_results import (
     TOOL_RESULT_READ_TOOL,
-    artifacts_dir_for,
+    contained_artifacts_dir,
     read_tool_result_page,
 )
 from uclone_x.tools.base import BaseTool
@@ -66,7 +66,7 @@ class ToolResultReadTool(BaseTool[ToolResultReadParams]):
     def run(self, params: ToolResultReadParams, context: ToolContext) -> str:
         """Return one page of the stored result as plain text."""
         return read_tool_result_page(
-            artifacts_dir_for(context.require_workspace()),
+            contained_artifacts_dir(context.require_workspace()),
             context.session_id,
             params.handle,
             params.offset,

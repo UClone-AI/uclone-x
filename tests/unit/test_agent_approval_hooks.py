@@ -225,7 +225,7 @@ async def test_the_agent_hands_the_approval_hook_what_the_tool_declares(tmp_path
     put it there, from the tool it resolved (#1463). The read-only twin runs, so the refusal
     is the declaration's doing and not the name's.
 
-    Killed by: src/uclone_x/agent/base.py :: pre_payload["writes_files"] = tool_writes_files(pre_tool)
+    Killed by: src/uclone_x/agent/tool_execution.py :: pre_payload["writes_files"] = tool_writes_files(pre_tool)
     Becomes: pre_payload["writes_files"] = False
     """
     writer = _CountingNotesTool(writes_files=True)
@@ -247,7 +247,7 @@ async def test_the_agent_hands_the_approval_hook_that_the_tool_spawns_subagents(
     the agent from the tool it resolved, can make plan mode refuse it. The twin that spawns
     nothing runs, and the agent allows sub-agents by default, so the refusal is the hook's.
 
-    Killed by: src/uclone_x/agent/base.py :: pre_payload["spawns_subagents"] = tool_spawns_subagents(pre_tool)
+    Killed by: src/uclone_x/agent/tool_execution.py :: pre_payload["spawns_subagents"] = tool_spawns_subagents(pre_tool)
     Becomes: pre_payload["spawns_subagents"] = False
     """
     spawner = _CountingNotesTool(writes_files=False, spawns_subagents=True)

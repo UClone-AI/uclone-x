@@ -73,8 +73,8 @@ describe('user-facing copy (#1018)', () => {
     ]);
   });
 
-  // Killed by: frontend/src/components/artifacts/ActivityTimeline.tsx :: <span>Input Parameters</span>
-  // Becomes: <span>P6 Input Parameters</span>
+  // Killed by: frontend/src/components/layout/ModelCalls.tsx :: <span>Model calls</span>
+  // Becomes: <span>P6 Model calls</span>
   it('names no principle number anywhere a user can read one', () => {
     const scanned = Object.keys(SOURCES).filter(isScanned);
     expect(scanned.length).toBeGreaterThan(20);
@@ -120,5 +120,23 @@ describe('user-facing copy (#1018)', () => {
     expect(staleExemptions({ './components/Fixture.tsx': '<div>nothing here</div>' }, exempt)).toEqual([
       './components/Fixture.tsx: <option value="P9">P9</option>',
     ]);
+  });
+});
+
+//: The English catalogs (`multilingual-ui.md`), whose values are what most screens now show.
+const CATALOGS: Record<string, string> = import.meta.glob('./i18n/locales/en/*.json', {
+  query: '?raw',
+  import: 'default',
+  eager: true,
+});
+
+describe('user-facing copy in the catalogs', () => {
+  // The glob above reads `.ts`/`.tsx` only, so a sentence moved into a catalog left the scan
+  // with it. This reads the catalogs the same way.
+  // Killed by: frontend/src/i18n/locales/en/dock.json :: "inputParameters": "Input Parameters",
+  // Becomes: "inputParameters": "P6 Input Parameters",
+  it('names no principle number in any English catalog', () => {
+    expect(Object.keys(CATALOGS)).toContain('./i18n/locales/en/dock.json');
+    expect(principleNumberOffences(CATALOGS, EXEMPT_LINES)).toEqual([]);
   });
 });

@@ -4,8 +4,8 @@ Owner ruling, 2026-09-22: the dock describes the room on screen and the seat sel
 it. The workspace-wide and chat-scoped routes it read before (`/api/artifacts`,
 `/api/agents`, `/api/knowledge-graph`) answer for the single-agent surface the centre
 column retired in #1208, and a seat is invisible to all three: its agent is built and
-cached by the room's resolver and never enters the chat manager's map. They stay for
-compatibility; these are the room's own.
+cached by the room's resolver and never enters the chat manager's map. The other two stay
+for compatibility (2026-09-27: `/api/agents` removed, #1775); these are the room's own.
 
 **Every read answers from the Core's record, and says when it cannot.** An empty list here
 always means *recorded as empty* -- never that nothing happened: the room's file list in

@@ -2,14 +2,21 @@
 
 from __future__ import annotations
 
+import ipaddress
 import json
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Mapping, Sequence
 from typing import Any, cast
+from urllib.parse import urlsplit
 
 import httpx
 
-from uclone_x.errors import LLMCredentialsNotConfiguredError, MalformedToolCallArgumentsError
+from uclone_x.errors import (
+    LLMCredentialsNotConfiguredError,
+    LLMModelNotConfiguredError,
+    MalformedToolCallArgumentsError,
+    StructuredOutputUnsupportedError,
+)
 from uclone_x.llm.compactor import estimate_reply_tokens, estimate_request_tokens
 from uclone_x.llm.models import (
     LLMRequest,
@@ -19,6 +26,16 @@ from uclone_x.llm.models import (
     ToolCallRequest,
 )
 from uclone_x.llm.protocols import LLMProviderProtocol
+
+
+def refuse_response_schema(request: LLMRequest, provider: str) -> None:
+    """Raise when `request` asks for structured output this connector cannot send.
+
+    For connectors with no mapping for `LLMRequest.response_schema`: dropping it would
+    answer a structured request with free text and nothing saying so (P6).
+    """
+    if request.response_schema is not None:
+        raise StructuredOutputUnsupportedError(provider)
 
 
 def reported_count(block: Mapping[str, Any] | None, key: str) -> int | None:
@@ -72,6 +89,31 @@ def resolve_token_counts(
     return input_tokens, output_tokens, source
 
 
+#: Host names that stay on this machine or its local network.
+_LOCAL_HOST_SUFFIXES: tuple[str, ...] = (".local", ".lan", ".internal", ".home.arpa", ".localhost")
+
+
+def is_local_endpoint(url: str | None) -> bool:
+    """Whether `url` points at this machine or a private network, not a hosted service.
+
+    Loopback, private-range and link-local addresses, `localhost`, single-label host names
+    (`gpu-box`) and the local-network suffixes count as local. Anything else, including an
+    address that cannot be parsed, counts as hosted: an unknown endpoint is treated as one
+    that may charge (P6, fail closed).
+    """
+    if not url:
+        return False
+    host = urlsplit(url if "//" in url else f"//{url}").hostname
+    if not host:
+        return False
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        name = host.lower().rstrip(".")
+        return name == "localhost" or "." not in name or name.endswith(_LOCAL_HOST_SUFFIXES)
+    return address.is_loopback or address.is_private or address.is_link_local
+
+
 def parse_dict_payload(data: object) -> dict[str, Any]:
     """Safely parse a JSON string or mapping into a dict[str, Any], raising on malformed strings (P6)."""
     if data is None or data == "":
@@ -101,6 +143,34 @@ def parse_dict_payload(data: object) -> dict[str, Any]:
     )
 
 
+def named_model(model: str | None) -> str | None:
+    """``model`` stripped, or ``None`` when it names no model (absent, blank or ``default``)."""
+    if model is None:
+        return None
+    stripped = model.strip()
+    if not stripped or stripped == "default":
+        return None
+    return stripped
+
+
+def resolve_model(requested: str | None, configured: str | None, provider: str) -> str:
+    """The model a request is sent to: the one it names, else the connector's own.
+
+    ``configured`` is the model the connector was built with -- the model a person chose,
+    handed down by the connector factory. With neither, the request is refused before the
+    network with :class:`LLMModelNotConfiguredError`, naming ``provider`` (a display name).
+    A connector never fills in a model id from its source: those ids go stale, and the
+    person who chose a model is owed a refusal rather than a call to one they did not pick.
+
+    One function for the request builder, the streaming path and the ``Provenance.requested``
+    each connector reports, so no copy of the rule can drift from another.
+    """
+    chosen = named_model(requested) or named_model(configured)
+    if chosen is None:
+        raise LLMModelNotConfiguredError(provider)
+    return chosen
+
+
 class BaseLLMConnector(ABC, LLMProviderProtocol):
     """Abstract base connector for foundation model providers."""
 
@@ -121,6 +191,17 @@ class BaseLLMConnector(ABC, LLMProviderProtocol):
     def provider_name(self) -> str:
         """Name of the provider service."""
         ...
+
+    @property
+    def paid(self) -> bool:
+        """Whether calls through this connector may cost the user money.
+
+        A paid connector's calls count against the user's usage limits
+        (the token-gateway design). The default is `True`, so a connector that
+        does not say otherwise is counted rather than left unlimited (P6). A local model
+        overrides it.
+        """
+        return True
 
     def _require_api_key(self) -> str:
         """Return `api_key` as a `str`, raising if it is absent or blank.

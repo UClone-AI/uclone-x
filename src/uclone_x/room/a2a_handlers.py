@@ -41,6 +41,7 @@ from uclone_x.a2a.in_memory import A2AInMemoryTransport
 from uclone_x.a2a.models import TaskMessage, TaskResult, TaskStatus
 from uclone_x.agent.base import BaseAgent
 from uclone_x.agent.bootstrap import agent_config_for_persona
+from uclone_x.agent.clone_builder import follow_global_models, with_app_lifecycle_hooks
 from uclone_x.agent.composition import HostDependencies, compose_agent
 from uclone_x.agent.hooks import HookAction, HookContext, HookDecision, HookEvent, HookRunner
 from uclone_x.agent.models import (
@@ -187,6 +188,7 @@ class PersonaTaskHandler:
         workspace_root: Path,
         llm_config: AgentLLMConfig | None = None,
         read_roots: Callable[[], tuple[Path, ...]] | None = None,
+        global_models: Callable[[], tuple[str | None, str | None]] | None = None,
     ) -> None:
         self._persona_name = persona_name
         self._host_factory = host_factory
@@ -194,6 +196,7 @@ class PersonaTaskHandler:
         self._workspace_root = workspace_root
         self._llm_config = llm_config
         self._read_roots: Callable[[], tuple[Path, ...]] = read_roots or (lambda: ())
+        self._global_models = global_models
 
     def _refuse(self, message: TaskMessage, error: str) -> TaskResult:
         return TaskResult(
@@ -233,7 +236,8 @@ class PersonaTaskHandler:
         scratch: Path,
     ) -> BaseAgent:
         """Build the one-off agent for this task, under the caller's step budget."""
-        base = self._host_factory()
+        # A callee works in its caller's story, and moves it as a seat would (#1732).
+        base = with_app_lifecycle_hooks(self._host_factory())
         inherited = tuple(base.hooks or ()) + (
             base.hook_runner.hooks if base.hook_runner is not None else ()
         )
@@ -249,12 +253,18 @@ class PersonaTaskHandler:
             persona_name=persona.name,
             persona_definitions=(persona,),
         )
+        # The seat rule: the model the request names, else the persona's, else the Settings
+        # deep and fast ones, read per call -- never a connector's built-in default.
+        llm_config = self._llm_config or persona.llm_config
+        if self._global_models is not None:
+            deep, fast = self._global_models()
+            llm_config = follow_global_models(llm_config, deep, fast)
         config = agent_config_for_persona(
             persona,
             agent_id=persona.name,
             name=persona.name,
             system_prompt=DEFAULT_SYSTEM_PROMPT,
-            llm_config=self._llm_config or persona.llm_config,
+            llm_config=llm_config,
             workspace_dir=self._workspace_root,
             read_roots=self._read_roots(),
         )
@@ -375,6 +385,7 @@ def register_persona_handlers(
     llm_config: AgentLLMConfig | None = None,
     read_roots: Callable[[], tuple[Path, ...]] | None = None,
     personas: Sequence[str] | None = None,
+    global_models: Callable[[], tuple[str | None, str | None]] | None = None,
 ) -> tuple[str, ...]:
     """Register a handler for every persona some persona may call; return their names.
 
@@ -401,6 +412,7 @@ def register_persona_handlers(
                 workspace_root=workspace_root,
                 llm_config=llm_config,
                 read_roots=read_roots,
+                global_models=global_models,
             ),
         )
     return names

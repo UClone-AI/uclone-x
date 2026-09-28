@@ -11,6 +11,7 @@ from uclone_x.agent.hooks import BaseHook, HookRunner
 from uclone_x.agent.models import AgentConfig, AgentContext, PersonaDefinition
 from uclone_x.agent.persona_store import PersonaStoreProtocol
 from uclone_x.agent.planner import PlanGenerator
+from uclone_x.agent.protocols import TurnLifecycleHookProtocol
 from uclone_x.core.capability import Capability
 from uclone_x.core.host import HostProtocol
 from uclone_x.core.session_store import SessionStoreProtocol
@@ -29,7 +30,7 @@ from uclone_x.sandbox.protocols import SandboxRunnerProtocol
 from uclone_x.skills.protocols import SkillRegistryProtocol
 from uclone_x.telemetry.protocols import TracerProtocol
 from uclone_x.tools.protocols import ToolRegistryProtocol
-from uclone_x.tools.tool_scoper import ToolScoperProtocol
+from uclone_x.tools.tool_binder import ToolBinder
 
 if TYPE_CHECKING:
     from uclone_x.a2a.protocols import A2ATransportProtocol
@@ -77,7 +78,8 @@ class HostDependencies:
     hooks: Sequence[BaseHook] | None = None
     hook_runner: HookRunner | None = None
     semantic_router: SemanticModelRouter | None = None
-    tool_scoper: ToolScoperProtocol | None = None
+    #: Host binding for a local model (design §5.1); `None` pins every held tool.
+    tool_binder: ToolBinder | None = None
     plan_generator: PlanGenerator | None = None
     persona: str | None = None
     persona_name: str | None = None
@@ -95,6 +97,14 @@ class HostDependencies:
     #: call no one. An agent built to answer a peer call is given `None`, which is what
     #: holds such calls to one level deep; a sub-agent is not given it either.
     a2a_transport: A2ATransportProtocol | None = None
+    #: Whether a person answers an approval request during a turn in this app. The desktop
+    #: app has no approval prompt in a conversation and says `False`, so a call that needs
+    #: a person is refused at once, naming where to decide instead, rather than after
+    #: `approval_timeout_seconds`. A sub-agent inherits it.
+    approvals_answered: bool = True
+    #: Domain behaviour added to every turn (#1732): the app's story hook, for one. The
+    #: agent imports no domain; a head composes the hooks it wants in here.
+    lifecycle_hooks: tuple[TurnLifecycleHookProtocol, ...] = ()
 
     @property
     def capabilities(self) -> frozenset[Capability]:
@@ -178,11 +188,13 @@ def build_agent(
         hooks=host.hooks,
         hook_runner=host.hook_runner,
         semantic_router=host.semantic_router,
-        tool_scoper=host.tool_scoper,
+        tool_binder=host.tool_binder,
         plan_generator=host.plan_generator,
         persona=host.persona,
         persona_name=host.persona_name,
         personas=host.persona_definitions,
         host=cast("HostProtocol", host),
         a2a_transport=host.a2a_transport,
+        approvals_answered=host.approvals_answered,
+        lifecycle_hooks=host.lifecycle_hooks,
     )

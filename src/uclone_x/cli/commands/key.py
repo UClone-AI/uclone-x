@@ -1,68 +1,59 @@
-"""CLI commands for public LLM API key onboarding and setup."""
+"""``ucx key``: save, list and remove the API keys for hosted LLM providers.
+
+A key is saved in the settings file, under the provider it is for, through the settings
+module's one writer -- the same file and the same writer the dashboard's Settings panel
+uses, so a key saved here is the key Settings shows, and the reverse. Nothing here writes
+``.env`` or exports a variable: ``ucx key setup`` used to write ``GEMINI_API_KEY`` into a
+``.env`` file while Settings wrote the settings file, and which of the two a request used
+depended on which was loaded first.
+
+A key variable in the environment (``GEMINI_API_KEY`` and the rest) still outranks the
+saved key -- a CI job has to be able to override the file -- and ``ucx key list`` says
+when one does.
+
+What each provider is called, which variables carry its key, and where a key is created
+all come from the provider table, ``uclone_x.llm.providers``.
+"""
 
 from __future__ import annotations
 
 import contextlib
-import os
 import webbrowser
-from dataclasses import dataclass
-from pathlib import Path
 from typing import Annotated
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
+
+from uclone_x.llm.connectors.saved_choice import (
+    api_keys,
+    delete_api_key,
+    save_api_key,
+    settings_data,
+    settings_file,
+)
+from uclone_x.llm.providers import PROVIDERS, ProviderSpec, env_key, spec_for
 
 console = Console()
 
 key_app = typer.Typer(
     name="key",
-    help="Setup and manage API keys for public LLM providers (Gemini, Claude, OpenAI)",
+    help="Save and manage API keys for hosted LLM providers (Google, Anthropic, OpenAI)",
     no_args_is_help=True,
 )
 
+#: The providers ``ucx key`` manages: every provider in the table that reads a key.
+KEYED_PROVIDERS: tuple[ProviderSpec, ...] = tuple(
+    spec for spec in PROVIDERS.values() if spec.key_env_vars
+)
 
-@dataclass(frozen=True)
-class ProviderKeyInfo:
-    name: str
-    env_var: str
-    url: str
-    prefix: str
-    pattern: str
-    tip: str
-    alt_env_var: str | None = None
-
-
-PROVIDER_INFO: dict[str, ProviderKeyInfo] = {
-    "gemini": ProviderKeyInfo(
-        name="Google Gemini",
-        env_var="GEMINI_API_KEY",
-        alt_env_var="GOOGLE_API_KEY",
-        url="https://aistudio.google.com/app/apikey",
-        prefix="AIzaSy",
-        pattern=r"^AIzaSy[A-Za-z0-9_-]{33}$",
-        tip="Google AI Studio: 신용카드 없이 분당 15회 무료(Free Tier) 사용 가능",
-    ),
-    "anthropic": ProviderKeyInfo(
-        name="Anthropic Claude",
-        env_var="ANTHROPIC_API_KEY",
-        url="https://console.anthropic.com/settings/keys",
-        prefix="sk-ant-",
-        pattern=r"^sk-ant-[A-Za-z0-9_-]{20,}$",
-        tip="Anthropic Console: 종량제 Credit 충전 필요",
-    ),
-    "openai": ProviderKeyInfo(
-        name="OpenAI",
-        env_var="OPENAI_API_KEY",
-        url="https://platform.openai.com/api-keys",
-        prefix="sk-",
-        pattern=r"^sk-(?:proj-)?[A-Za-z0-9_-]{20,}$",
-        tip="OpenAI Platform: 프로젝트 또는 사용자 비밀 키 생성",
-    ),
-}
+#: The hosted providers the interactive ``setup`` offers, in the order it lists them.
+_SETUP_CHOICES: tuple[str, ...] = ("gemini", "anthropic", "openai")
 
 
 def sanitize_key(key: str) -> str:
+    """``key`` without surrounding whitespace or one pair of surrounding quotes."""
     cleaned = key.strip()
     if (cleaned.startswith('"') and cleaned.endswith('"')) or (
         cleaned.startswith("'") and cleaned.endswith("'")
@@ -72,61 +63,115 @@ def sanitize_key(key: str) -> str:
 
 
 def mask_key(key: str) -> str:
+    """Enough of ``key`` to recognise it, never enough to use it."""
     if len(key) <= 8:
         return "****"
     return f"{key[:6]}...{key[-4:]}"
 
 
-def find_env_path(start_dir: Path | None = None) -> Path:
-    current = start_dir or Path.cwd()
-    for directory in [current, *current.parents]:
-        env_file = directory / ".env"
-        if env_file.exists():
-            return env_file
-        if (directory / ".git").exists():
-            return env_file
-    return current / ".env"
+def _keyed_spec(provider: str) -> ProviderSpec:
+    """The provider ``provider`` names, or a plain refusal listing the ones that take a key."""
+    spec = spec_for(provider)
+    if spec is None or not spec.key_env_vars:
+        known = ", ".join(s.id for s in KEYED_PROVIDERS)
+        console.print(
+            f"[red]There is no provider called {escape(provider.strip())!r} that takes a key.[/red] "
+            f"Choose one of: {known}."
+        )
+        raise typer.Exit(code=2)
+    return spec
 
 
-def update_env_file(env_path: Path, key_name: str, key_val: str) -> None:
-    lines: list[str] = []
-    if env_path.exists():
-        lines = env_path.read_text(encoding="utf-8").splitlines()
+def _save(spec: ProviderSpec, raw_key: str) -> None:
+    """Save ``raw_key`` for ``spec``, and say where it went and what outranks it."""
+    clean_key = sanitize_key(raw_key)
+    if not clean_key:
+        console.print("[red]The key is empty, so nothing was saved.[/red]")
+        raise typer.Exit(code=1)
+    if spec.key_hint is not None and not clean_key.startswith(spec.key_hint):
+        # A warning, not a refusal: providers change their key formats (a current Google
+        # key starts `AQ.`), and a refused real key is worse than a saved typo.
+        console.print(
+            f"[yellow]Note: {spec.display_name} keys usually start with "
+            f"'{spec.key_hint}'. It was saved anyway; check it if requests are refused.[/yellow]"
+        )
+    try:
+        save_api_key(spec.id, clean_key)
+    except (OSError, ValueError) as exc:
+        console.print(f"[red]The key was not saved:[/red] {escape(str(exc))}")
+        raise typer.Exit(code=1) from exc
+    console.print(
+        f"[bold green]Saved[/bold green] the {spec.display_name} key "
+        f"([green]{mask_key(clean_key)}[/green]) in {escape(str(settings_file()))}."
+    )
+    overriding = env_key(spec.id)
+    if overriding is not None:
+        console.print(
+            f"[yellow]{overriding[1]} is set in this environment and is used instead of the "
+            f"saved key until it is unset.[/yellow]"
+        )
 
-    updated = False
-    new_lines: list[str] = []
-    for line in lines:
-        stripped = line.strip()
-        if stripped.startswith(f"{key_name}=") or stripped.startswith(f"export {key_name}="):
-            prefix = "export " if stripped.startswith("export ") else ""
-            new_lines.append(f'{prefix}{key_name}="{key_val}"')
-            updated = True
-        else:
-            new_lines.append(line)
-    if not updated:
-        new_lines.append(f'{key_name}="{key_val}"')
 
-    env_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+@key_app.command("set")
+def set_key(
+    provider: Annotated[
+        str, typer.Argument(help="Provider the key is for: gemini | anthropic | openai | vllm")
+    ],
+    api_key: Annotated[
+        str | None,
+        typer.Option("--key", "-k", help="The key (prompted for, hidden, when omitted)"),
+    ] = None,
+) -> None:
+    """Save a provider's API key in the settings file, keeping every other provider's key."""
+    spec = _keyed_spec(provider)
+    raw = (
+        api_key
+        if api_key is not None
+        else typer.prompt(f"{spec.display_name} API key", hide_input=True)
+    )
+    _save(spec, raw)
+
+
+@key_app.command("remove")
+def remove_key(
+    provider: Annotated[str, typer.Argument(help="Provider whose saved key to remove")],
+) -> None:
+    """Remove a provider's saved API key. Other providers' keys and the environment are kept."""
+    spec = _keyed_spec(provider)
+    try:
+        delete_api_key(spec.id)
+    except (OSError, ValueError) as exc:
+        console.print(f"[red]The key was not removed:[/red] {escape(str(exc))}")
+        raise typer.Exit(code=1) from exc
+    console.print(f"Removed the saved {spec.display_name} key, if there was one.")
+    overriding = env_key(spec.id)
+    if overriding is not None:
+        console.print(
+            f"[yellow]{overriding[1]} is still set in this environment, so requests keep "
+            f"using it.[/yellow]"
+        )
 
 
 @key_app.command("list")
 def list_keys() -> None:
-    """List status of all configured public LLM API keys."""
-    table = Table(title="Public LLM API Key Status", border_style="cyan")
+    """Show each provider's saved key (masked) and any environment variable overriding it."""
+    saved = api_keys(settings_data())
+    table = Table(title=f"API keys ({settings_file()})", border_style="cyan")
     table.add_column("Provider", style="bold white")
-    table.add_column("Environment Variable", style="yellow")
-    table.add_column("Status", style="green")
-    table.add_column("Console Link", style="blue")
+    table.add_column("Saved key", style="green")
+    table.add_column("Environment", style="yellow")
+    table.add_column("Get a key", style="blue")
 
-    for info in PROVIDER_INFO.values():
-        key_val = os.getenv(info.env_var)
-        if not key_val and info.alt_env_var:
-            key_val = os.getenv(info.alt_env_var)
-
-        status = (
-            f"[green]Configured ({mask_key(key_val)})[/green]" if key_val else "[red]Not Set[/red]"
+    for spec in KEYED_PROVIDERS:
+        stored = saved.get(spec.id)
+        overriding = env_key(spec.id)
+        saved_cell = mask_key(stored) if stored else "[dim]not saved[/dim]"
+        env_cell = (
+            f"{overriding[1]} ({mask_key(overriding[0])}) overrides the saved key"
+            if overriding is not None
+            else f"[dim]{spec.key_env_vars[0]} not set[/dim]"
         )
-        table.add_row(info.name, info.env_var, status, info.url)
+        table.add_row(spec.display_name, saved_cell, env_cell, spec.console_url or "")
 
     console.print(table)
 
@@ -139,69 +184,34 @@ def setup_key(
     ] = None,
     api_key: Annotated[
         str | None,
-        typer.Option("--key", "-k", help="API key value (skips interactive prompt)"),
+        typer.Option("--key", "-k", help="API key value (skips the prompt)"),
     ] = None,
     open_browser: Annotated[
         bool,
         typer.Option(
             "--open-browser/--no-open-browser",
-            help="Open browser console to generate key automatically",
+            help="Open the provider's page for creating a key",
         ),
     ] = True,
-    env_file: Annotated[
-        Path | None,
-        typer.Option("--env-file", "-e", help="Path to .env file to update"),
-    ] = None,
 ) -> None:
-    """Interactively setup and validate a public LLM API key."""
-    console.print("\n[bold cyan]🔑 Public LLM API Key Setup Wizard[/bold cyan]\n")
+    """Walk through choosing a provider and saving its API key in the settings file."""
+    chosen = spec_for(provider) if provider else None
+    if chosen is None or chosen.id not in _SETUP_CHOICES:
+        console.print("Which provider is the key for?")
+        for number, provider_id in enumerate(_SETUP_CHOICES, start=1):
+            console.print(f"  [{number}] {PROVIDERS[provider_id].display_name}")
+        answer = typer.prompt(f"Choose (1-{len(_SETUP_CHOICES)})", default="1").strip()
+        index = int(answer) - 1 if answer.isdigit() else 0
+        chosen = PROVIDERS[_SETUP_CHOICES[index if 0 <= index < len(_SETUP_CHOICES) else 0]]
 
-    chosen_provider = provider.lower().strip() if provider else None
-    if not chosen_provider or chosen_provider not in PROVIDER_INFO:
-        console.print("설정할 LLM 공급자를 선택하세요:")
-        console.print("  [1] [bold]Google Gemini[/bold] (Free Tier 제공, 분당 15회 무료)")
-        console.print("  [2] [bold]Anthropic Claude[/bold] (Claude 3.5 Sonnet)")
-        console.print("  [3] [bold]OpenAI[/bold] (GPT-4o)")
-
-        choice = typer.prompt("선택 (1-3)", default="1").strip()
-        mapping = {"1": "gemini", "2": "anthropic", "3": "openai"}
-        chosen_provider = mapping.get(choice, "gemini")
-
-    info = PROVIDER_INFO[chosen_provider]
-    console.print(f"\n[cyan]▶ {info.name}[/cyan] 설정을 진행합니다.")
-    console.print(f"  [dim]💡 {info.tip}[/dim]\n")
-
-    if open_browser and not api_key:
-        console.print(
-            f"🌐 기본 브라우저에서 키 발급 페이지를 엽니다: [underline]{info.url}[/underline]"
-        )
+    if open_browser and not api_key and chosen.console_url:
+        console.print(f"Opening {chosen.console_url} to create a key.")
         with contextlib.suppress(Exception):
-            webbrowser.open(info.url)
+            webbrowser.open(chosen.console_url)
 
-    key_input = api_key
-    if not key_input:
-        key_input = typer.prompt(
-            f"발급받은 {info.name} API Key를 입력하세요 ({info.prefix}...)",
-            hide_input=True,
-        )
-
-    clean_key = sanitize_key(key_input)
-    if not clean_key:
-        console.print("[red]❌ 빈 키가 입력되어 취소되었습니다.[/red]")
-        raise typer.Exit(code=1)
-
-    # Validate pattern
-    if not clean_key.startswith(info.prefix):
-        console.print(
-            f"[yellow]⚠️ 경고: {info.name} 키는 일반적으로 '{info.prefix}'로 시작합니다.[/yellow]"
-        )
-
-    target_env = env_file or find_env_path()
-    update_env_file(target_env, info.env_var, clean_key)
-    os.environ[info.env_var] = clean_key
-
-    console.print(
-        f"\n[bold green]✔ 성공:[/bold green] {info.name} API Key가 안전하게 저장되었습니다!"
+    raw = (
+        api_key
+        if api_key is not None
+        else typer.prompt(f"{chosen.display_name} API key", hide_input=True)
     )
-    console.print(f"  - 파일: [white]{target_env}[/white]")
-    console.print(f"  - 키: [green]{mask_key(clean_key)}[/green]\n")
+    _save(chosen, raw)

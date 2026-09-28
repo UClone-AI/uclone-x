@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import os
 import sys
 import time
+from collections.abc import Iterator
 from pathlib import Path
 from typing import cast
 
 import pytest
 
+import uclone_x.tools.builtin.shell as shell_module
 from uclone_x.core.provenance import ExecutionPath
 from uclone_x.errors import PathTraversalError
 from uclone_x.sandbox.models import IsolationLevel
@@ -510,3 +514,100 @@ async def test_bash_run_workspace_isolation_bounds_cwd_not_subshell_writes(
     assert res.success is True
     assert target_outside_file.exists()
     target_outside_file.unlink()
+
+
+# ======================================================================================
+# Stdin: the model's shell must not read the person's terminal (#1589)
+# ======================================================================================
+
+
+@pytest.fixture
+def terminal_input() -> Iterator[None]:
+    """Put a line on this process's fd 0, as a person typing in the UI server's terminal.
+
+    The write end is closed, so a child that inherits fd 0 reads the line and then EOF,
+    and one given `/dev/null` reads EOF alone.
+    """
+    saved = os.dup(0)
+    read_end, write_end = os.pipe()
+    os.write(write_end, b"TERMINAL-INPUT\n")
+    os.close(write_end)
+    os.dup2(read_end, 0)
+    os.close(read_end)
+    try:
+        yield
+    finally:
+        os.dup2(saved, 0)
+        os.close(saved)
+
+
+def _no_jail(_root: Path | None) -> list[str]:
+    return []
+
+
+#: `read` exits 1 on EOF; on the planted line it exits 0 and echoes it.
+_READ_STDIN = 'read -r line; echo "rc=$?:$line"'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("jailed", [True, False], ids=["jailed", "unjailed"])
+async def test_bash_run_command_reads_eof_not_the_parents_stdin(
+    workspace_ctx: ToolContext,
+    terminal_input: None,
+    jailed: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A foreground command reads EOF at once, on both spawn paths (#1589).
+
+    `run_command` is the same class under another name, so this covers it too. Unjailed
+    is forced, as on a system with no story-library jail.
+
+    Killed by: src/uclone_x/tools/builtin/shell.py :: stdin_target = asyncio.subprocess.DEVNULL
+    Becomes: stdin_target = None
+    """
+    if not jailed:
+        monkeypatch.setattr(shell_module, "story_library_jail", _no_jail)
+    elif not shell_module.story_library_jail(workspace_ctx.workspace_root):
+        pytest.skip("this system has no story-library jail")
+
+    res = await BashRunTool().execute(
+        {"command": _READ_STDIN, "timeout_seconds": 10}, workspace_ctx
+    )
+
+    assert res.success is True, res.error
+    assert isinstance(res.output, dict)
+    assert res.output.get("stdout") == "rc=1:\n"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("jailed", [True, False], ids=["jailed", "unjailed"])
+async def test_bash_run_daemon_reads_eof_not_the_parents_stdin(
+    workspace_ctx: ToolContext,
+    terminal_input: None,
+    jailed: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A daemon reads EOF too; its stdout is discarded, so it reports through a file.
+
+    Killed by: src/uclone_x/tools/builtin/shell.py :: stdin_target = asyncio.subprocess.DEVNULL
+    Becomes: stdin_target = None
+    """
+    if not jailed:
+        monkeypatch.setattr(shell_module, "story_library_jail", _no_jail)
+    elif not shell_module.story_library_jail(workspace_ctx.workspace_root):
+        pytest.skip("this system has no story-library jail")
+    root = workspace_ctx.workspace_root
+    assert root is not None
+    report = root / "daemon-stdin.txt"
+    partial = root / "daemon-stdin.tmp"
+
+    res = await BashRunTool().execute(
+        {"command": f"{_READ_STDIN} > {partial} && mv {partial} {report}", "is_daemon": True},
+        workspace_ctx,
+    )
+    assert res.success is True, res.error
+
+    deadline = time.monotonic() + 10.0
+    while not report.exists() and time.monotonic() < deadline:
+        await asyncio.sleep(0.05)
+    assert report.read_text() == "rc=1:\n"

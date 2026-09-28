@@ -49,6 +49,11 @@ export interface ConversationListProps {
   onCollapse?: () => void;
   copy: ConversationListCopy;
   icons: ConversationListIcons;
+  /**
+   * Where a participant's picture is, asked of the head by agent id -- the rail's clone rows
+   * ask the same question. Left off, every participant draws `Avatar`'s default.
+   */
+  avatarSrc?: (agentId: string) => string | undefined;
   /** Escape's registry, injected: the kit may not import the head's (#1036, #1158). */
   useEscape: UseKitEscape;
 }
@@ -84,6 +89,7 @@ export const ConversationList: React.FC<ConversationListProps> = ({
   onCollapse,
   copy,
   icons,
+  avatarSrc,
   useEscape,
 }) => {
   const cause = copy.emptyCause(modelConfigured, agentCount);
@@ -202,6 +208,7 @@ export const ConversationList: React.FC<ConversationListProps> = ({
                           label={agentId}
                           kind="agent"
                           agentIcon={icons.agent}
+                          imageSrc={avatarSrc?.(agentId)}
                           size="2xs"
                           className="ring-2 ring-slate-950"
                         />

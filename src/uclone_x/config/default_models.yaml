@@ -1,4 +1,9 @@
 # Default image model profiles and prompt family bindings for UClone-X (P0/P9)
+#
+# Prompt rules are routed by (family, domain): the `media-<domain>` skills carry one
+# section per family, so a profile names no skill. `skill_name` is an override for a model
+# no domain skill fits; `prompt_notes` appends a few model-specific lines. `default_negative`
+# holds domain-neutral quality terms only: a building or a chart has no hands to get wrong.
 version: "1.0"
 
 models:
@@ -6,7 +11,6 @@ models:
     display_name: "Illustrious-XL v4 (Anime SDXL)"
     filename: "anillustrious_v4.safetensors"
     family: "danbooru"
-    skill_name: "media-prompt-danbooru"
     engine_type: "auto"
     width: 832
     height: 1216
@@ -14,13 +18,12 @@ models:
     cfg: 5.5
     sampler: "dpmpp_2m"
     scheduler: "karras"
-    default_negative: "worst quality, bad anatomy, deformed, bad hands, animal, blurry, text, watermark"
+    default_negative: "worst quality, low quality, blurry, watermark, text"
 
   - model_id: "Illustrious-XL-v0.1"
     display_name: "Illustrious-XL v0.1 (SDXL Checkpoint)"
     filename: "Illustrious-XL-v0.1.safetensors"
     family: "danbooru"
-    skill_name: "media-prompt-danbooru"
     engine_type: "auto"
     width: 832
     height: 1216
@@ -28,13 +31,12 @@ models:
     cfg: 5.5
     sampler: "dpmpp_2m"
     scheduler: "karras"
-    default_negative: "worst quality, bad anatomy, deformed, bad hands, animal, blurry, text, watermark"
+    default_negative: "worst quality, low quality, blurry, watermark, text"
 
   - model_id: "flux-2-klein-base-4b"
     display_name: "FLUX.2 Klein Base 4B (Apache 2.0)"
     filename: "flux-2-klein-base-4b.safetensors"
     family: "prose"
-    skill_name: "media-prompt-flux"
     engine_type: "mlx"
     width: 1024
     height: 1024
@@ -50,7 +52,6 @@ default_fallback:
   display_name: "Universal Image Generation Model"
   filename: ""
   family: "generic"
-  skill_name: "media-prompt-generic"
   engine_type: "auto"
   width: 768
   height: 768
@@ -58,4 +59,4 @@ default_fallback:
   cfg: 7.0
   sampler: "euler"
   scheduler: "normal"
-  default_negative: "worst quality, blurry, deformed, bad anatomy, bad hands, text"
+  default_negative: "worst quality, low quality, blurry, watermark, text"

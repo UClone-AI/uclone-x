@@ -18,14 +18,23 @@
  * `animate-pulse` and the ping halo the sibling draws around its mic.
  */
 
+import { en, type Messages } from '../i18n/en';
+import { fmt } from '../i18n/format';
+
 /** What the mic control is currently able to do, and what to say when it cannot. */
 export type DictationState =
-  /** This browser has no speech recognition at all. `reason` is shown, not hovered. */
-  | { kind: 'unsupported'; reason: string }
+  /**
+   * This browser has no speech recognition at all. The surface shows the reason
+   * (`composer.dictation.unsupported`) in words, not in a hover.
+   */
+  | { kind: 'unsupported' }
   | { kind: 'idle' }
   | { kind: 'listening' }
-  /** The last attempt stopped. `message` names the cause and the remedy. */
-  | { kind: 'error'; message: string };
+  /**
+   * The last attempt stopped, with the browser's code for why. The surface says it with
+   * `dictationSentence`, in the reader's language, which names the cause and the remedy.
+   */
+  | { kind: 'error'; code: string };
 
 /**
  * A recognition session, narrowed to what this module uses.
@@ -66,9 +75,11 @@ export function speechRecognitionConstructor(scope: unknown = globalThis): Recog
   return typeof ctor === 'function' ? (ctor as RecognitionConstructor) : null;
 }
 
+/** The dictation sentences, in the reader's language (`composer.dictation`). */
+export type DictationCopy = Messages['composer']['dictation'];
+
 /** The sentence shown where the mic would be, when the browser has no recognition. */
-export const DICTATION_UNSUPPORTED =
-  'This browser cannot listen. Type the message, or open the conversation in Chrome, Edge or Safari to speak it.';
+export const DICTATION_UNSUPPORTED = en.composer.dictation.unsupported;
 
 /**
  * What to say about a recognition error, by the code the browser reports.
@@ -78,20 +89,40 @@ export const DICTATION_UNSUPPORTED =
  * it is what the browser reports when the reader themselves pressed stop, which is not a
  * failure and is handled before this is called.
  */
-export function dictationErrorMessage(code: string): string {
+export function dictationSentence(code: string, copy: DictationCopy): string {
   switch (code) {
     case 'not-allowed':
     case 'service-not-allowed':
-      return 'The browser is not letting this page use the microphone. Allow it for this site in the browser, then press the mic again.';
+      return copy.notAllowed;
     case 'no-speech':
-      return 'Nothing was heard. Press the mic and speak, or type the message instead.';
+      return copy.noSpeech;
     case 'audio-capture':
-      return 'No microphone was found. Connect one and press the mic again, or type the message instead.';
+      return copy.audioCapture;
     case 'network':
-      return 'The browser could not reach its speech service. Type the message instead, or press the mic again once the connection is back.';
+      return copy.network;
     default:
-      return `Listening stopped (${code}). Press the mic to try again, or type the message instead.`;
+      return fmt(copy.other, { code });
   }
+}
+
+/**
+ * `dictationSentence` in English. One argument only, so it can be handed to `map` without the
+ * index arriving as a catalog.
+ */
+export function dictationErrorMessage(code: string): string {
+  return dictationSentence(code, en.composer.dictation);
+}
+
+/**
+ * The language to listen in: the head's own, so a reader who chose Korean is heard in
+ * Korean whatever the browser is set to (`multilingual-ui.md` §3.6).
+ *
+ * The browser's own tag is kept when it is the same language, because it carries the region
+ * (`en-GB`, `ko-KR`) the recogniser is tuned by; otherwise the language's usual region.
+ */
+export function dictationLang(language: string, browser: string | undefined): string {
+  if (browser && browser.split('-')[0].toLowerCase() === language) return browser;
+  return language === 'ko' ? 'ko-KR' : 'en-US';
 }
 
 /**

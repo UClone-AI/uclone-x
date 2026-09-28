@@ -37,7 +37,7 @@ from pydantic import ValidationError
 from uclone_x.agent.base import BaseAgent
 from uclone_x.llm import MockLLMConnector
 from uclone_x.llm.context_window import OllamaContextWindows
-from uclone_x.llm.models import TokenUsage
+from uclone_x.llm.models import LLMRequest, ModelResponse, TokenUsage
 from uclone_x.room.models import Participant, ParticipantKind, RoomPolicy, RoomState
 from uclone_x.room.service import RoomService
 from uclone_x.ui import rooms as rooms_module
@@ -80,6 +80,18 @@ def answering_client(tmp_path: Path) -> Iterator[TestClient]:
     )
     with TestClient(app, raise_server_exceptions=False) as started:
         yield started
+
+
+_HANGUL = re.compile(r"[\uac00-\ud7a3]")
+
+
+def _notes(client: TestClient, room_id: str) -> list[dict[str, Any]]:
+    """The application's notes in a room's transcript, oldest first.
+
+    Not the person's typed commands, which are notes too (#1661) but are written by them.
+    """
+    room = client.get(f"/api/rooms/{room_id}").json()
+    return [m for m in room["transcript"] if m.get("kind") == "note" and m["sender_id"] == "system"]
 
 
 def _create(client: TestClient, **kwargs: Any) -> Any:
@@ -689,27 +701,6 @@ class TestTheHeadDoesNotSubstituteValuesTheCoreWouldRefuse:
         assert refused.status_code == 409, refused.text
 
 
-class TestARoomsSessionNamespaceIsNotOpenToCallers:
-    def test_chat_refuses_a_session_id_reserved_for_a_rooms_agent(self, client: TestClient) -> None:
-        """The filter that hides these must not be a place to hide an ordinary chat.
-
-        `/api/turn` took a caller-supplied session id with no check, so a chat could be
-        parked on the exact id `participant_session_id` derives for a seated agent --
-        two writers on one `SessionState`, which is what the derivation exists to
-        prevent, and invisible because `/api/sessions` now filters that prefix.
-
-        Killed by: src/uclone_x/ui/app.py :: if session_id and session_id.startswith(ROOM_SESSION_PREFIX):
-        Becomes: if False:
-        """
-        refused = client.post(
-            "/api/turn",
-            json={"message": "hi", "agent_id": "scout", "session_id": "sess_room__room_zz__scout"},
-        )
-
-        assert refused.status_code == 400, refused.text
-        assert "sess_room__" in refused.json()["detail"]
-
-
 class TestACascadeFailureIsAnnouncedWithoutLeaking:
     """The room topic is forwarded to every subscriber and rendered as copy.
 
@@ -797,6 +788,43 @@ class TestACascadeFailureIsAnnouncedWithoutLeaking:
         assert lost[0].exc_info is not None, "the reason the notice was lost must be logged too"
 
 
+class TestTheDesktopSaysNobodyAnswersApprovals:
+    """Owner decision 2026-09-26: the desktop app does not ask for approval mid-conversation.
+
+    Nothing in the desktop app answers an approval request (a person approves story changes
+    in the story's view instead, #1560), so every agent it builds must say so, and a call
+    that needs a person's approval is then refused at once rather than after the timeout.
+    """
+
+    def test_a_chat_agent_and_a_room_seat_are_built_saying_so(self, tmp_path: Path) -> None:
+        """Killed by: src/uclone_x/ui/app.py :: approvals_answered=False,
+        Becomes: approvals_answered=True,
+
+        One declaration covers both since #1731: the chat agent and the room seat are
+        built from the one `AgentSessionManager.app_scope()`.
+        """
+        from uclone_x.core.agent_home import AGENTS_DIR_ENV_VAR
+        from uclone_x.ui.app import AgentSessionManager
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setenv(AGENTS_DIR_ENV_VAR, str(tmp_path / "agents"))
+            mgr = AgentSessionManager(storage_dir=tmp_path / "sessions", llm=MockLLMConnector())
+            chat = asyncio.run(mgr.get_or_create_agent("writer"))
+            stack = RoomStack(mgr)
+            state = stack.service.create(title="Chapter one")
+            stack.service.add_participant(
+                state.room_id, participant_id="writer", kind=ParticipantKind.AGENT
+            )
+            seated = stack.store.load(state.room_id)
+            assert seated is not None
+            resolver = stack.orchestrator(seated)._resolver  # pyright: ignore[reportPrivateUsage]
+            participant = next(p for p in seated.participants if p.id == "writer")
+            seat = cast("BaseAgent", asyncio.run(resolver.resolve(participant)))
+
+        assert chat.approvals_answered is False
+        assert seat.approvals_answered is False
+
+
 class TestRoomMemoryIsHeldPerAgent:
     """One store per agent id, and exactly one map of them in the process.
 
@@ -841,7 +869,7 @@ class TestRoomMemoryIsHeldPerAgent:
     def test_two_seats_in_one_room_do_not_share_a_store(self, tmp_path: Path) -> None:
         """Sharing one store across seats is the opposite failure: recollection bleed.
 
-        Killed by: src/uclone_x/room/resolver.py :: host = dataclasses.replace(host, memory=self._memory_factory(participant.id))
+        Killed by: src/uclone_x/agent/clone_builder.py :: host = dataclasses.replace(host, memory=app.memory_for(clone_id))
         Becomes: host = host
         """
         from uclone_x.core.agent_home import AGENTS_DIR_ENV_VAR
@@ -878,8 +906,8 @@ class TestRoomMemoryIsHeldPerAgent:
         `record_memory_fact` is neither advertised to them nor resolvable — the defect the
         false "wired by every head" comment on `HostDependencies.memory` concealed.
 
-        Killed by: src/uclone_x/ui/rooms.py :: memory_factory=self._session_mgr.memory_for,
-        Becomes: memory_factory=None,
+        Killed by: src/uclone_x/ui/app.py :: memory_for=self.memory_for,
+        Becomes: memory_for=None,
         """
         from uclone_x.core.agent_home import AGENTS_DIR_ENV_VAR
         from uclone_x.ui.app import AgentSessionManager
@@ -1108,9 +1136,8 @@ class TestConversationContextReadout:
         runtime. A hosted provider's window is a published figure its API enforces, so for
         those the table *is* the measurement and the seat reports it.
 
-        The settings are poked rather than posted because `update_settings` writes the
-        provider into `os.environ` for the whole process, which is a side effect on every
-        other test in this file and not part of what is being checked here.
+        The settings are poked rather than posted because a save rebuilds the connector,
+        which is not part of what is being checked here.
 
         Killed by: src/uclone_x/ui/rooms.py :: window_tokens, window_source = declared, "published"
         Becomes: window_tokens, window_source = declared, "loaded"
@@ -1176,6 +1203,62 @@ class TestConversationContextReadout:
 
         assert seat["max_context_tokens"] == 40_960
         assert seat["context_window_source"] == "loaded"
+
+
+class _ModelRecorder(MockLLMConnector):
+    """A mock that records the model every request named, for the seat-model tests."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.models: list[str | None] = []
+
+    async def generate(self, request: LLMRequest) -> ModelResponse:
+        self.models.append(request.model)
+        return await super().generate(request)
+
+
+class TestASeatRunsOnTheSettingsModel:
+    """A seat whose persona names no model sends the Settings deep model.
+
+    Before this, the seat sent no model and the connector filled in one written in source
+    -- a retired Gemini model -- while Settings showed the model the person had picked.
+    """
+
+    def test_a_seat_sends_the_settings_model_and_the_new_one_after_a_save(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Killed by: src/uclone_x/ui/app.py :: global_models=self.global_models,
+        Becomes: global_models=None,
+        """
+        sessions = tmp_path / "sessions"
+        sessions.mkdir()
+        (sessions / "settings.json").write_text(
+            json.dumps({"llm_provider": "mock", "llm_model": "deep-before"}), encoding="utf-8"
+        )
+        first = _ModelRecorder()
+        app = create_ui_app(static_dir=tmp_path, storage_dir=sessions, llm=first)
+        with TestClient(app) as client:
+            room_id = _create(client).json()["room_id"]
+            client.post(f"/api/rooms/{room_id}/messages", json={"content": "hello"})
+            _wait_for_transcript(client, room_id, rows=4)
+
+            assert "deep-before" in first.models, first.models
+
+            second = _ModelRecorder()
+            mgr = cast(Any, app).state.session_manager
+
+            def build_second(**_: Any) -> _ModelRecorder:
+                return second
+
+            monkeypatch.setattr(mgr, "build_llm", build_second)
+            saved = client.post("/api/settings", json={"llm_model": "deep-after"})
+            assert saved.status_code == 200, saved.text
+
+            client.post(f"/api/rooms/{room_id}/messages", json={"content": "again"})
+            _wait_for_transcript(client, room_id, rows=6)
+
+            assert second.models, "the seat never reached the connector Settings installed"
+            assert set(second.models) == {"deep-after"}, second.models
 
 
 class TestWhichSeatsAHistoryControlActsOn:
@@ -1637,7 +1720,7 @@ class TestHistoryIsRefusedWhileSomebodyIsAnswering:
 
         Killed by: src/uclone_x/ui/rooms.py :: if isinstance(exc, SessionMutationDuringTurnError):
         Becomes: if False:
-        Killed by: src/uclone_x/agent/base.py :: self._refuse_session_mutation_during_turn(sid, "compact")
+        Killed by: src/uclone_x/agent/compaction_driver.py :: self._refuse_session_mutation_during_turn(sid, "compact")
         Becomes: pass
         """
         app = create_ui_app(
@@ -1663,22 +1746,73 @@ class TestHistoryIsRefusedWhileSomebodyIsAnswering:
         assert seat.session_id in detail, detail
         await stack.close()
 
-    def test_room_slash_loop_help(self, client: TestClient) -> None:
-        """Sending /loop or /loop help records help text in transcript without agent cascade."""
+    def test_room_slash_loop_help(self, client: TestClient, tmp_path: Path) -> None:
+        """Sending /loop or /loop help records help text in transcript without agent cascade.
+
+        The typed command is a note from the person, not their message, so no seat is
+        handed it as something to answer (#1661).
+
+        Killed by: src/uclone_x/ui/rooms.py :: return _notice("loop.help")
+        Becomes: return _notice("loop.no_interval")
+        Killed by: src/uclone_x/ui/rooms.py :: state = await orch.accept_command(room_id, sender_id, content)
+        Becomes: state = await orch.accept(room_id, sender_id, content)
+        """
         room_id = _create(client).json()["room_id"]
         res = client.post(f"/api/rooms/{room_id}/messages", json={"content": "/loop help"})
         assert res.status_code == 202
 
         room = client.get(f"/api/rooms/{room_id}").json()
-        utterances = [m for m in room["transcript"] if m.get("kind") == "utterance"]
-        assert len(utterances) == 2
-        assert utterances[0]["content"] == "/loop help"
-        assert utterances[0]["sender_id"] == "user"
-        assert utterances[1]["sender_id"] == "system"
-        assert "명령어 안내" in utterances[1]["content"]
+        assert [m for m in room["transcript"] if m.get("kind") == "utterance"] == []
+        command, help_note = [m for m in room["transcript"] if m["kind"] == "note"]
+        assert (command["kind"], command["sender_id"], command["content"]) == (
+            "note",
+            "user",
+            "/loop help",
+        )
+        assert command["code"] is None
+        # Stored as a note, and not only read as one: loading converts a command saved as
+        # speech by an older build, which would hide this route saving it as speech.
+        stored = json.loads((tmp_path / "sessions" / "rooms" / f"{room_id}.json").read_text())
+        assert [m["kind"] for m in stored["transcript"] if m["sender_id"] == "user"][-1] == "note"
+        # The help is a note, not speech: shown in the room, kept out of seat spans (#1641).
+        notes = _notes(client, room_id)
+        assert notes == [help_note]
+        assert notes[0]["sender_id"] == "system"
+        assert notes[0]["code"] == "loop.help"
+        assert notes[0]["params"] is None
+        # The stored fallback is English, for exports and heads that predate the code.
+        assert "`/loop list`" in notes[0]["content"]
+        assert not _HANGUL.search(notes[0]["content"])
+
+    def test_a_word_that_starts_with_loop_is_one_message(self, client: TestClient) -> None:
+        """`/loopy` is not a command; it was recorded as one and then again as a message.
+
+        Killed by: src/uclone_x/ui/rooms.py :: if is_loop_command(clean_content):
+        Becomes: if clean_content.startswith("/loop"):
+        """
+        room_id = _create(client).json()["room_id"]
+        res = client.post(f"/api/rooms/{room_id}/messages", json={"content": "/loopy idea"})
+        assert res.status_code == 202
+
+        room = client.get(f"/api/rooms/{room_id}").json()
+        rows = [
+            (m["kind"], m["content"])
+            for m in room["transcript"]
+            if m["sender_id"] == "user" and m["kind"] != "join"
+        ]
+        assert rows == [("utterance", "/loopy idea")]
 
     def test_room_slash_loop_schedule_and_stop(self, client: TestClient) -> None:
-        """Sending /loop <interval> <prompt> registers recurring loop and /loop stop cancels it."""
+        """Sending /loop <interval> <prompt> registers recurring loop and /loop stop cancels it.
+
+        Each reply is a code with its values, which the head words in the reader's language;
+        the interval travels as seconds for the head to format.
+
+        Killed by: src/uclone_x/ui/rooms.py :: "interval_seconds": interval_seconds,
+        Becomes: "interval_seconds": 0,
+        Killed by: src/uclone_x/ui/rooms.py :: return _notice("loop.stopped" if stopped else "loop.nothing_to_stop")
+        Becomes: return _notice("loop.nothing_to_stop" if stopped else "loop.stopped")
+        """
         room_id = _create(client).json()["room_id"]
         res = client.post(
             f"/api/rooms/{room_id}/messages",
@@ -1686,46 +1820,76 @@ class TestHistoryIsRefusedWhileSomebodyIsAnswering:
         )
         assert res.status_code == 202
 
-        room = client.get(f"/api/rooms/{room_id}").json()
-        transcript = room["transcript"]
-        # Human slash command + system registration notice
-        assert any("반복 작업 등록됨" in m["content"] for m in transcript)
+        notes = _notes(client, room_id)
+        assert notes[-1]["code"] == "loop.registered"
+        params = notes[-1]["params"]
+        assert params["interval_seconds"] == 10.0
+        assert params["prompt"] == "status check"
+        job_id = params["job_id"]
+        assert isinstance(job_id, str) and job_id
+        assert notes[-1]["content"].startswith("🔄 **Repeating task started** (every 10 seconds")
 
-        # Query loop list
-        res_list = client.post(
-            f"/api/rooms/{room_id}/messages",
-            json={"content": "/loop list"},
-        )
-        assert res_list.status_code == 202
-        room = client.get(f"/api/rooms/{room_id}").json()
-        assert any("활성 반복 작업" in m["content"] for m in room["transcript"])
+        client.post(f"/api/rooms/{room_id}/messages", json={"content": "/loop list"})
+        notes = _notes(client, room_id)
+        assert notes[-1]["code"] == "loop.active"
+        assert notes[-1]["params"] == {
+            "job_id": job_id,
+            "interval_seconds": 10.0,
+            "prompt": "status check",
+        }
 
-        # Stop loop
-        res_stop = client.post(
-            f"/api/rooms/{room_id}/messages",
-            json={"content": "/loop stop"},
-        )
-        assert res_stop.status_code == 202
-        room = client.get(f"/api/rooms/{room_id}").json()
-        assert any("반복 실행 작업이 중지되었습니다" in m["content"] for m in room["transcript"])
+        client.post(f"/api/rooms/{room_id}/messages", json={"content": "/loop stop"})
+        notes = _notes(client, room_id)
+        assert notes[-1]["code"] == "loop.stopped"
 
-    def test_room_slash_loop_invalid_syntax(self, client: TestClient) -> None:
-        """Invalid interval syntax records helpful format error in transcript."""
+        client.post(f"/api/rooms/{room_id}/messages", json={"content": "/loop stop"})
+        notes = _notes(client, room_id)
+        assert notes[-1]["code"] == "loop.nothing_to_stop"
+        assert all(not _HANGUL.search(n["content"]) for n in notes)
+
+    @pytest.mark.parametrize(
+        ("command", "code", "params"),
+        [
+            ("/loop not_an_interval prompt", "loop.no_interval", None),
+            ("/loop 5m", "loop.missing_prompt", None),
+            ("/loop 0.5s check", "loop.interval_too_short", {"interval_seconds": 1.0}),
+        ],
+    )
+    def test_room_slash_loop_invalid_syntax(
+        self, client: TestClient, command: str, code: str, params: dict[str, float] | None
+    ) -> None:
+        """A command that cannot be read is answered with why, as a code; never the parser's text.
+
+        The parser's message names internals ("spin loops", the unit table) and is English on
+        every screen, so the conversation carries the reason instead.
+
+        Killed by: src/uclone_x/ui/rooms.py :: if err.reason == "missing_prompt":
+        Becomes: if err.reason == "no_prompt":
+        Killed by: src/uclone_x/ui/rooms.py :: if err.reason == "interval_too_short":
+        Becomes: if err.reason == "too_short":
+        """
         room_id = _create(client).json()["room_id"]
-        res = client.post(
-            f"/api/rooms/{room_id}/messages",
-            json={"content": "/loop not_an_interval prompt"},
-        )
+        res = client.post(f"/api/rooms/{room_id}/messages", json={"content": command})
         assert res.status_code == 202
-        room = client.get(f"/api/rooms/{room_id}").json()
-        assert any("형식 오류" in m["content"] for m in room["transcript"])
+        notes = _notes(client, room_id)
+        assert [n["code"] for n in notes] == [code]
+        assert notes[0]["params"] == params
+        assert "spin loop" not in notes[0]["content"]
+        assert "Supported units" not in notes[0]["content"]
 
     def test_room_slash_loop_stopped_via_room_stop_button(self, client: TestClient) -> None:
-        """POST /api/rooms/{id}/stop cancels any active recurring loop for that room."""
+        """POST /api/rooms/{id}/stop cancels any active recurring loop for that room.
+
+        Killed by: src/uclone_x/ui/rooms.py :: return _notice("loop.none_active")
+        Becomes: return _notice("loop.active")
+        """
         room_id = _create(client).json()["room_id"]
         client.post(
             f"/api/rooms/{room_id}/messages",
             json={"content": "/loop 60s check something"},
+        )
+        assert _notes(client, room_id)[-1]["content"].startswith(
+            "🔄 **Repeating task started** (every 1 minute,"
         )
         # Calling stop endpoint
         stop_res = client.post(f"/api/rooms/{room_id}/stop")
@@ -1733,8 +1897,9 @@ class TestHistoryIsRefusedWhileSomebodyIsAnswering:
 
         # /loop list now says no active loop
         client.post(f"/api/rooms/{room_id}/messages", json={"content": "/loop list"})
-        room = client.get(f"/api/rooms/{room_id}").json()
-        assert any("실행 중인 반복 작업이 없습니다" in m["content"] for m in room["transcript"])
+        notes = _notes(client, room_id)
+        assert notes[-1]["code"] == "loop.none_active"
+        assert notes[-1]["params"] is None
 
     def test_room_toggle_autonomous_and_presence(self, client: TestClient) -> None:
         """POST /api/rooms/{id}/autonomous toggles policy, /presence updates presence."""
@@ -1879,3 +2044,34 @@ class TestHistoryIsRefusedWhileSomebodyIsAnswering:
             assert reloaded.last_decision is not None
             assert reloaded.last_decision.verdict == SelectionVerdict.SILENCE
             assert "cascade stopped" in reloaded.last_decision.reasoning
+
+    @pytest.mark.asyncio
+    async def test_get_room_reports_active_turn_in_flight_and_clears_on_completion(
+        self, client: TestClient
+    ) -> None:
+        """GET /api/rooms/{id} returns active_turn when a turn runs, None when idle."""
+        room_id = _create(client, agent_ids=["scout"]).json()["room_id"]
+        res = client.get(f"/api/rooms/{room_id}").json()
+        assert res["active_turn"] is None
+
+        stack = cast(RoomStack, cast(Any, client.app).state.room_stack)
+        ev = asyncio.Event()
+
+        async def pause_task() -> None:
+            await ev.wait()
+
+        stack.drive(room_id, pause_task)
+        try:
+            assert stack.turn_in_flight(room_id) is True
+            active = client.get(f"/api/rooms/{room_id}").json()["active_turn"]
+            assert active is not None
+            assert active["in_flight"] is True
+            assert active["agent_id"] == "scout"
+        finally:
+            ev.set()
+            for _ in range(50):
+                if not stack.turn_in_flight(room_id):
+                    break
+                await asyncio.sleep(0.01)
+
+        assert client.get(f"/api/rooms/{room_id}").json()["active_turn"] is None

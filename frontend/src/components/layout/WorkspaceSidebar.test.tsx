@@ -1,16 +1,16 @@
 import { describe, it, expect, vi } from 'vitest';
 import { render, screen, fireEvent, within } from '@testing-library/react';
 import { RAIL_WIDTH_CLASS, RAIL_WIDTH_PX, WorkspaceSidebar } from './WorkspaceSidebar';
-import { makeAgentInfo, makePersonaInfo } from '../../test/fixtures';
+import { makePersonaInfo } from '../../test/fixtures';
 import { ResourceSummary, RESOURCE_ROOM_COPY } from '../artifacts/ResourceSummary';
 import type { RoomContext, RoomState, RoomSummary } from '../../types';
 
-const agents = [makeAgentInfo({ id: 'agent-1' })];
+const personas = [makePersonaInfo({ name: 'agent-1' })];
 
 const renderSidebar = (over: Partial<React.ComponentProps<typeof WorkspaceSidebar>> = {}) =>
   render(
     <WorkspaceSidebar
-      agents={agents}
+      personas={personas}
       selectedAgent="agent-1"
       onSelectAgent={() => {}}
       rooms={[]}
@@ -82,7 +82,7 @@ describe('WorkspaceSidebar readouts moved to the dock (#1059)', () => {
       turn_state: { agent_turns_since_human: 3 },
       policy: {
         max_agent_turns_per_human_message: 50,
-        max_span_messages: 40,
+        max_span_tokens: 8000,
         transcript_window: 30,
         hesitation_seconds: 2,
         default_responder_id: 'agent-1',
@@ -119,7 +119,7 @@ describe('WorkspaceSidebar readouts moved to the dock (#1059)', () => {
 
 describe('WorkspaceSidebar clones section', () => {
   it('labels the section as Clones, never Agents or Active Swarm (#869, R3)', () => {
-    renderSidebar({ agents: [makeAgentInfo({ id: 'champion', label: 'Champion', role: 'Coach' })] });
+    renderSidebar({ personas: [makePersonaInfo({ name: 'champion', role: 'Coach' })] });
     expect(screen.getByText('Clones')).toBeInTheDocument();
     // `Agents` and `Personas` were two words this head used for one thing a user sees; the
     // product's word is `Clones` (§3.2.2 R3). The types keep their names -- this pins what
@@ -129,58 +129,31 @@ describe('WorkspaceSidebar clones section', () => {
     expect(screen.queryByText(/nodes/i)).not.toBeInTheDocument();
   });
 
-  it('omits robotic count when only 1 agent is present and shows untruncated role', () => {
-    renderSidebar({ agents: [makeAgentInfo({ id: 'champion', label: 'Champion', role: 'Coach' })] });
-    expect(screen.getByText('Champion')).toBeInTheDocument();
-    expect(screen.getByText('Coach')).toBeInTheDocument();
-    expect(screen.queryByText(/\d+\s+active/i)).not.toBeInTheDocument();
-  });
-
-  it('shows active count when multiple agents are collaborating', () => {
+  it('shows each clone with its untruncated role', () => {
     renderSidebar({
-      agents: [
-        makeAgentInfo({ id: 'champion', label: 'Champion', role: 'Coach' }),
-        makeAgentInfo({ id: 'researcher', label: 'Researcher', role: 'Specialist' }),
+      personas: [
+        makePersonaInfo({ name: 'champion', role: 'Coach' }),
+        makePersonaInfo({ name: 'researcher', role: 'Specialist' }),
       ],
     });
-    expect(screen.getByText('2 active')).toBeInTheDocument();
-    expect(screen.getByText('Champion')).toBeInTheDocument();
-    expect(screen.getByText('Researcher')).toBeInTheDocument();
+    expect(screen.getByText('champion')).toBeInTheDocument();
+    expect(screen.getByText('Coach')).toBeInTheDocument();
+    expect(screen.getByText('researcher')).toBeInTheDocument();
     expect(screen.getByText('Specialist')).toBeInTheDocument();
   });
 
-  // Killed by: frontend/src/ui-kit/rail/Rail.tsx :: {copy.activeClones(clones.filter((clone) => clone.live).length)}
-  // Becomes: {copy.activeClones(clones.length)}
-  it('counts the clones it lists, and only the ones with an instance running', () => {
-    // The badge read `agents` while the rows came from `clones`. Three installed personas
-    // with one running instance is the ordinary case, and it printed "1 active" over three
-    // rows -- or, below two live agents, nothing at all. The number and the list now come
-    // from one expression.
-    renderSidebar({
-      personas: [
-        makePersonaInfo({ name: 'scout' }),
-        makePersonaInfo({ name: 'critic' }),
-        makePersonaInfo({ name: 'scribe' }),
-      ],
-      agents: [makeAgentInfo({ id: 'scout' })],
-    });
-
-    expect(screen.getAllByTestId(/^persona-item-/)).toHaveLength(3);
-    expect(screen.getByText('1 active')).toBeInTheDocument();
-    expect(screen.queryByText('3 active')).not.toBeInTheDocument();
-  });
-
-  // Killed by: frontend/src/ui-kit/rail/Rail.tsx :: clones.length > 1 && (
-  // Becomes: agents.length > 1 && (
-  it('shows the count beside the clones it lists, not beside the live instances', () => {
+  it('claims nothing about which clones are running (#1775)', () => {
+    // The row's dot, its state word and the section's "N active" count were read from
+    // `/api/agents`, which reported no instance on any install after #1731 and was removed
+    // on 2026-09-27. A reading with no source is not drawn as "offline" or "0 active".
     renderSidebar({
       personas: [makePersonaInfo({ name: 'scout' }), makePersonaInfo({ name: 'critic' })],
-      agents: [],
     });
 
-    // Two rows, so the count is worth printing; zero of them are running, and "0 active"
-    // over two rows is a true and useful thing to read.
-    expect(screen.getByText('0 active')).toBeInTheDocument();
+    expect(screen.getAllByTestId(/^persona-item-/)).toHaveLength(2);
+    expect(screen.queryByText(/\d+\s+active/i)).not.toBeInTheDocument();
+    expect(screen.queryByTestId('clone-liveness-scout')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('clone-liveness-word-scout')).not.toBeInTheDocument();
   });
 
   it('renders dynamic personas and triggers onSelectAgent when clicked', () => {
@@ -276,113 +249,11 @@ describe('WorkspaceSidebar clone row interactions', () => {
   });
 });
 
-/**
- * What a clone's row says about the instance behind it.
- *
- * The row compared `status` against `'busy'`, a value `/api/agents` has never sent: it sends
- * `AgentState` (`src/uclone_x/agent/models.py`), whose eight values are `IDLE`, `INGESTING`,
- * `REASONING`, `CALLING_TOOL`, `AWAITING_INPUT`, `EMITTING_RESPONSE`, `ERROR` and
- * `TERMINATED`. So the amber branch was unreachable and a clone mid-tool-call, in `ERROR` or
- * stopped drew the same emerald dot as an idle one. These pin the states the rail must tell
- * apart, and that it tells them apart in a word, not only in a hue.
- */
-describe('WorkspaceSidebar clone liveness (#1061)', () => {
-  const withStatus = (status: string) =>
-    renderSidebar({
-      personas: [],
-      agents: [makeAgentInfo({ id: 'scout', label: 'Scout', status })],
-    });
-
-  // Killed by: frontend/src/ui-kit/rail/Rail.tsx :: CALLING_TOOL: 'busy',
-  // Becomes: CALLING_TOOL: 'idle',
-  it('says a clone is working, in a word beside its name', () => {
-    withStatus('CALLING_TOOL');
-
-    expect(screen.getByTestId('clone-liveness-word-scout')).toHaveTextContent('working');
-    expect(screen.getByTestId('clone-liveness-scout')).toHaveAttribute(
-      'title',
-      'Working on something right now.',
-    );
-  });
-
-  // Killed by: frontend/src/ui-kit/rail/Rail.tsx :: ERROR: 'error',
-  // Becomes: ERROR: 'idle',
-  it('does not draw a clone whose last run failed as a healthy one', () => {
-    withStatus('ERROR');
-
-    expect(screen.getByTestId('clone-liveness-word-scout')).toHaveTextContent('error');
-    expect(screen.getByTestId('clone-liveness-scout')).toHaveAttribute(
-      'title',
-      'Its last run ended in an error.',
-    );
-  });
-
-  // Killed by: frontend/src/ui-kit/rail/Rail.tsx :: TERMINATED: 'terminated',
-  // Becomes: TERMINATED: 'idle',
-  it('says a stopped clone is stopped', () => {
-    withStatus('TERMINATED');
-
-    expect(screen.getByTestId('clone-liveness-word-scout')).toHaveTextContent('stopped');
-  });
-
-  // Killed by: frontend/src/ui-kit/rail/Rail.tsx :: (LIVENESS_BY_STATE[status] ?? 'unknown')
-  // Becomes: (LIVENESS_BY_STATE[status] ?? 'idle')
-  it('reports a state it has not been taught as unknown, never as healthy', () => {
-    // A state the runtime grows later. Folding it onto idle would put "running, nothing in
-    // progress" on screen as a claim the rail cannot support (P6), so it is named instead --
-    // and the raw value goes in the tooltip, because "unknown" alone is not actionable.
-    withStatus('COMPACTING_CONTEXT');
-
-    expect(screen.getByTestId('clone-liveness-word-scout')).toHaveTextContent('unknown');
-    expect(screen.getByTestId('clone-liveness-scout').getAttribute('title')).toContain(
-      'COMPACTING_CONTEXT',
-    );
-  });
-
-  // Killed by: frontend/src/ui-kit/rail/Rail.tsx :: livenessOf(clone.live?.status)
-  // Becomes: livenessOf('IDLE')
-  it('says nothing extra about the two ordinary states, running and not', () => {
-    // A rail that labels every row says nothing by labelling any. Idle and offline carry the
-    // dot and the tooltip and no word; the four above carry all three.
-    withStatus('IDLE');
-    expect(screen.queryByTestId('clone-liveness-word-scout')).not.toBeInTheDocument();
-    expect(screen.getByTestId('clone-liveness-scout')).toHaveAttribute(
-      'title',
-      'Running, with nothing in progress.',
-    );
-
-    // A persona with no instance behind it at all: the ordinary state of one nobody has
-    // messaged yet, and not a fault.
-    renderSidebar({ personas: [makePersonaInfo({ name: 'idler' })], agents: [] });
-    expect(screen.queryByTestId('clone-liveness-word-idler')).not.toBeInTheDocument();
-    expect(screen.getByTestId('clone-liveness-idler')).toHaveAttribute(
-      'title',
-      'Not running. It starts when you message it.',
-    );
-  });
-
-  // Killed by: frontend/src/ui-kit/rail/Rail.tsx :: tone={TONE_BY_LIVENESS[liveness]}
-  // Becomes: tone="success"
-  it('draws busy and idle in different colours as well as different words', () => {
-    // Belt and braces, in both directions: the colour is not the only carrier (the words
-    // above), and the words are not the only carrier either.
-    withStatus('REASONING');
-    expect(screen.getByTestId('clone-liveness-scout').className).toContain('bg-amber-400');
-
-    renderSidebar({
-      personas: [],
-      agents: [makeAgentInfo({ id: 'calm', label: 'Calm', status: 'IDLE' })],
-    });
-    expect(screen.getByTestId('clone-liveness-calm').className).toContain('bg-emerald-400');
-  });
-});
-
-
 describe('WorkspaceSidebar with no agents and no personas (#1060)', () => {
   // Killed by: frontend/src/ui-kit/rail/Rail.tsx :: {copy.conversations.emptyCause(modelConfigured, clones.length)}
   // Becomes: <span>General Assistant</span>
   it('names no clone, because the runtime has offered none', () => {
-    renderSidebar({ agents: [], personas: [], rooms: [] });
+    renderSidebar({ personas: [], rooms: [] });
 
     expect(screen.queryByText('General Assistant')).not.toBeInTheDocument();
     expect(screen.getByTestId('agents-empty-cause')).toHaveTextContent(
@@ -397,7 +268,7 @@ describe('WorkspaceSidebar with no agents and no personas (#1060)', () => {
     ['the runtime has not said whether one is', null as boolean | null],
     ['no model is configured', false as boolean | null],
   ])('states the same cause and remedy as the list above it when %s', (_case, modelConfigured) => {
-    renderSidebar({ agents: [], personas: [], rooms: [], modelConfigured });
+    renderSidebar({ personas: [], rooms: [], modelConfigured });
 
     // The property, not the wording: whatever the two regions say about this one fact,
     // they say the same thing. Both read `emptyCause` in `lib/emptyStates.ts`, so a
@@ -439,7 +310,7 @@ describe('WorkspaceSidebar conversation list', () => {
   });
 
   // Killed by: frontend/src/ui-kit/rail/Rail.tsx :: agentCount={clones.length}
-  // Becomes: agentCount={agents.length}
+  // Becomes: agentCount={0}
   it('does not say no clones are set up directly above the clones it lists (#1088)', () => {
     // The list's empty cause was counted from `agents` -- the *running* instances -- while
     // the section below it lists `clones`. An install with personas nobody has messaged yet
@@ -447,7 +318,6 @@ describe('WorkspaceSidebar conversation list', () => {
     // yet" an inch above three clones.
     renderSidebar({
       personas: [makePersonaInfo({ name: 'scout' }), makePersonaInfo({ name: 'critic' })],
-      agents: [],
       rooms: [],
     });
 
@@ -775,6 +645,25 @@ describe('WorkspaceSidebar uclone2-style group chats and clone smart accordion s
     // Excluded from clone 1:1 session expansion
     expect(screen.queryByTestId('clone-expansion-scout')).toBeNull();
   });
+
+  it("draws each group chat participant's picture, as the clone rows do", () => {
+    const rooms: RoomSummary[] = [
+      {
+        room_id: 'r-pair',
+        title: 'Pair',
+        agent_ids: ['scout', 'critic'],
+        human_ids: ['user'],
+        message_count: 1,
+        updated_at: '2026-09-22T10:00:00Z',
+      },
+    ];
+
+    renderSidebar({ personas: [scout], rooms });
+
+    const row = within(screen.getByTestId('conversation-list')).getByTestId('conversation-r-pair');
+    const sources = Array.from(row.querySelectorAll('img')).map((img) => img.getAttribute('src'));
+    expect(sources).toEqual(['/api/personas/scout/avatar', '/api/personas/critic/avatar']);
+  });
 });
 
 
@@ -908,3 +797,61 @@ describe('WorkspaceSidebar clone row actions menu', () => {
     expect(screen.queryByTestId('clones-pinned-separator')).toBeNull();
   });
 });
+
+describe('WorkspaceSidebar clone selection exclusivity', () => {
+  const scout = makePersonaInfo({ name: 'scout', role: 'Research' });
+  const critic = makePersonaInfo({ name: 'critic', role: 'Review' });
+
+  // Killed by: frontend/src/ui-kit/rail/Rail.tsx :: const isSelected = clone.id === activeCloneId;
+  // Becomes: const isSelected = clone.id === selectedAgent || cloneSessions.some((s) => s.room_id === currentRoomId);
+  it('marks only the clone that owns the active 1:1 conversation, even if selectedAgent differs', () => {
+    const criticRoom: RoomSummary = {
+      room_id: 'room-critic',
+      title: 'Critic conversation',
+      agent_ids: ['critic'],
+      human_ids: ['user'],
+      message_count: 5,
+      updated_at: '2026-09-25T10:00:00Z',
+    };
+    renderSidebar({
+      personas: [scout, critic],
+      rooms: [criticRoom],
+      currentRoomId: 'room-critic',
+      selectedAgent: 'scout',
+    });
+
+    const activeRows = screen
+      .getAllByTestId(/^persona-item-/)
+      .filter((el) => el.getAttribute('aria-current') === 'true');
+
+    expect(activeRows).toHaveLength(1);
+    expect(screen.getByTestId('persona-item-critic')).toHaveAttribute('aria-current', 'true');
+    expect(screen.getByTestId('persona-item-scout')).not.toHaveAttribute('aria-current');
+  });
+
+  it('falls back to selectedAgent when current room is not a 1:1 clone session', () => {
+    const groupRoom: RoomSummary = {
+      room_id: 'room-group',
+      title: 'Team group chat',
+      agent_ids: ['scout', 'critic'],
+      human_ids: ['user'],
+      message_count: 5,
+      updated_at: '2026-09-25T10:00:00Z',
+    };
+    renderSidebar({
+      personas: [scout, critic],
+      rooms: [groupRoom],
+      currentRoomId: 'room-group',
+      selectedAgent: 'scout',
+    });
+
+    const activeRows = screen
+      .getAllByTestId(/^persona-item-/)
+      .filter((el) => el.getAttribute('aria-current') === 'true');
+
+    expect(activeRows).toHaveLength(1);
+    expect(screen.getByTestId('persona-item-scout')).toHaveAttribute('aria-current', 'true');
+    expect(screen.getByTestId('persona-item-critic')).not.toHaveAttribute('aria-current');
+  });
+});
+

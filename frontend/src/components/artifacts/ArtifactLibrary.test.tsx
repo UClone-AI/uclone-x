@@ -172,14 +172,35 @@ describe('ArtifactLibrary, the Files screen (#1554)', () => {
     expect(await screen.findByTestId('files-preview-text')).toHaveTextContent('the whole note');
   });
 
-  // Killed by: frontend/src/components/artifacts/ArtifactLibrary.tsx :: onClick={onAskDelete}
-  // Becomes: onClick={() => onDelete(false)}
-  it('asks before deleting, and sends nothing until the deletion is confirmed', async () => {
-    answers[LIST] = [ok(survey([entry({})])), ok(survey([]))];
-    answers['POST /api/artifacts/library/delete'] = ok({ deleted: 'artifacts/report.md' });
+  const ARCHIVED = entry({ path: '.archive/artifacts/report.md', archived: true });
+
+  const showArchived = async () => {
+    await screen.findByTestId('files-empty');
+    fireEvent.click(screen.getByTestId('files-show-archived'));
+    return rowFor('.archive/artifacts/report.md');
+  };
+
+  // Killed by: frontend/src/components/artifacts/ArtifactLibrary.tsx :: {entry.managed && entry.archived && (
+  // Becomes: {entry.managed && (
+  it('offers archive, not permanent delete, for a file outside the archive (owner decision 2026-09-26)', async () => {
+    answers[LIST] = ok(survey([entry({}), STORY]));
     renderLibrary();
 
-    fireEvent.click(within(await rowFor('artifacts/report.md')).getByTestId('files-delete'));
+    for (const path of ['artifacts/report.md', 'stories/night-train']) {
+      const row = await rowFor(path);
+      expect(within(row).getByTestId('files-archive')).toBeInTheDocument();
+      expect(within(row).queryByTestId('files-delete')).toBeNull();
+    }
+  });
+
+  // Killed by: frontend/src/components/artifacts/ArtifactLibrary.tsx :: onClick={onAskDelete}
+  // Becomes: onClick={onDelete}
+  it('in the archive, asks before deleting, and sends nothing until the deletion is confirmed', async () => {
+    answers[LIST] = [ok(survey([ARCHIVED])), ok(survey([]))];
+    answers['POST /api/artifacts/library/delete'] = ok({ deleted: '.archive/artifacts/report.md' });
+    renderLibrary();
+
+    fireEvent.click(within(await showArchived()).getByTestId('files-delete'));
 
     expect(screen.getByRole('alertdialog')).toHaveTextContent(FILES_COPY.confirmDelete('report.md'));
     expect(posts('/delete')).toEqual([]);
@@ -188,15 +209,15 @@ describe('ArtifactLibrary, the Files screen (#1554)', () => {
 
     expect(await screen.findByTestId('files-notice')).toHaveTextContent('report.md was deleted.');
     expect(posts('/delete').map((c) => c.body)).toEqual([
-      { path: 'artifacts/report.md', confirm: true, release_writer: false },
+      { path: '.archive/artifacts/report.md', confirm: true, release_writer: false },
     ]);
   });
 
   it('keeping the file sends nothing', async () => {
-    answers[LIST] = ok(survey([entry({})]));
+    answers[LIST] = ok(survey([ARCHIVED]));
     renderLibrary();
 
-    fireEvent.click(within(await rowFor('artifacts/report.md')).getByTestId('files-delete'));
+    fireEvent.click(within(await showArchived()).getByTestId('files-delete'));
     fireEvent.click(screen.getByText('Keep it'));
 
     expect(screen.queryByRole('alertdialog')).toBeNull();
@@ -205,23 +226,16 @@ describe('ArtifactLibrary, the Files screen (#1554)', () => {
 
   // Killed by: frontend/src/components/artifacts/ArtifactLibrary.tsx :: setNotice(note ? `${done} ${note}` : done);
   // Becomes: setNotice(done);
-  it.each([
-    ['archive', 'files-archive', { path: '.archive/stories/night-train' }, FILES_COPY.archived('night-train')],
-    ['delete', 'files-delete', { deleted: 'stories/night-train' }, FILES_COPY.deleted('night-train')],
-  ])(
-    'a story %sd while some of its conversations could not be updated says so beside the result (#1578)',
-    async (action, button, body, done) => {
-      const note = 'Some conversations that had this story open could not be updated, so they may still show it as open.';
-      answers[LIST] = [ok(survey([STORY])), ok(survey([]))];
-      answers[`POST /api/artifacts/library/${action}`] = ok({ ...body, note });
-      renderLibrary();
+  it('a story archived while some of its conversations could not be updated says so beside the result (#1578)', async () => {
+    const note = 'Some conversations that had this story open could not be updated, so they may still show it as open.';
+    answers[LIST] = [ok(survey([STORY])), ok(survey([]))];
+    answers['POST /api/artifacts/library/archive'] = ok({ path: '.archive/stories/night-train', note });
+    renderLibrary();
 
-      fireEvent.click(within(await rowFor('stories/night-train')).getByTestId(button));
-      if (action === 'delete') fireEvent.click(screen.getByTestId('files-confirm-delete'));
+    fireEvent.click(within(await rowFor('stories/night-train')).getByTestId('files-archive'));
 
-      expect(await screen.findByTestId('files-notice')).toHaveTextContent(`${done} ${note}`);
-    },
-  );
+    expect(await screen.findByTestId('files-notice')).toHaveTextContent(`${FILES_COPY.archived('night-train')} ${note}`);
+  });
 
   // Killed by: frontend/src/components/artifacts/ArtifactLibrary.tsx :: if (inUse && inUse.kind === 'in-use' && isStoryInUse(err)) {
   // Becomes: if (false) {
@@ -276,34 +290,6 @@ describe('ArtifactLibrary, the Files screen (#1554)', () => {
       { path: 'stories/night-train', release_writer: false },
       { path: 'stories/night-train', release_writer: true },
       { path: 'stories/night-train', release_writer: true },
-    ]);
-  });
-
-  // Checked by hand (#1578): with `retry: releaseWriter` in `remove` replaced by
-  // `retry: false`, this case fails.
-  it('a delete refused again after going ahead also says it is trying again', async () => {
-    const writing =
-      'The conversation “Writing room” is writing this story. Delete that conversation first, or go ahead anyway to stop it writing to this story.';
-    const answering =
-      'The conversation “Writing room” is answering right now, so it cannot be stopped from writing this story yet. Wait for the answer to finish, then try again.';
-    answers[LIST] = ok(survey([STORY]));
-    answers['POST /api/artifacts/library/delete'] = [
-      { status: 409, body: { detail: writing } },
-      { status: 409, body: { detail: answering } },
-    ];
-    renderLibrary();
-
-    fireEvent.click(within(await rowFor('stories/night-train')).getByTestId('files-delete'));
-    fireEvent.click(screen.getByTestId('files-confirm-delete'));
-    expect(await screen.findByText(writing)).toBeInTheDocument();
-    expect(screen.getByTestId('files-go-ahead')).toHaveTextContent(FILES_COPY.goAhead);
-
-    fireEvent.click(screen.getByTestId('files-go-ahead'));
-    expect(await screen.findByText(answering)).toBeInTheDocument();
-    expect(screen.getByTestId('files-go-ahead')).toHaveTextContent('Try going ahead again');
-    expect(posts('/delete').map((c) => c.body)).toEqual([
-      { path: 'stories/night-train', confirm: true, release_writer: false },
-      { path: 'stories/night-train', confirm: true, release_writer: true },
     ]);
   });
 

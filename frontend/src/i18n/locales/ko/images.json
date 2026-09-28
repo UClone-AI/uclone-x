@@ -1,0 +1,49 @@
+{
+  "title": "이미지",
+  "intro": "클론에게 그림을 부탁했을 때 무엇으로 그릴지 정합니다.",
+  "loading": "그림을 그릴 수 있는 것을 확인하는 중…",
+  "loadFailed": "그림을 그릴 수 있는 것을 확인하지 못했습니다.",
+  "choice": {
+    "label": "그림을 그릴 방법",
+    "auto": "준비된 것으로",
+    "autoHint": "이 컴퓨터나 원격 GPU의 모델을 먼저 씁니다. Google Gemini는 대화가 이미 Gemini로 실행될 때만 씁니다.",
+    "local": "이 컴퓨터나 내 원격 GPU만",
+    "localHint": "그림 요청이 내 기기 밖으로 나가지 않습니다.",
+    "gemini": "Google Gemini",
+    "geminiHint": "저장된 Gemini API 키를 사용합니다. 그림마다 Google이 요금을 청구할 수 있는 요청입니다."
+  },
+  "model": {
+    "label": "Gemini 그림 모델",
+    "default": "{model} (권장)",
+    "listFailed": "Google의 모델 목록을 읽지 못해 저장된 모델과 권장 모델만 표시합니다."
+  },
+  "now": {
+    "drawing": "지금은 {engine}(으)로 그림을 그립니다.",
+    "none": "지금은 그림을 그릴 수 있는 것이 없습니다.",
+    "noneHint": "Google Gemini를 선택하고 LLM 및 모델에서 Gemini API 키를 저장하거나, 아래에서 원격 GPU나 ComfyUI를 시작하십시오. 클론의 프로필에서 그림을 직접 올릴 수도 있습니다.",
+    "badSetting": "저장된 선택을 읽을 수 없어 그림을 그릴 수 없습니다. 다시 선택하고 저장하십시오."
+  },
+  "enginesLabel": "그릴 수 있는 것",
+  "engines": {
+    "remote-cuda": "원격 GPU",
+    "comfyui-local": "이 컴퓨터의 ComfyUI",
+    "diffusers-sdxl": "이 컴퓨터의 내장 모델",
+    "gemini": "Google Gemini"
+  },
+  "reasons": {
+    "ready": "준비됨",
+    "not_configured": "설정되지 않음",
+    "unreachable": "설정되었지만 응답하지 않음",
+    "not_running": "실행 중이 아님",
+    "missing_dependencies": "이 컴퓨터에 설치되지 않음",
+    "no_checkpoint": "설치되었지만 모델 파일을 받지 않음",
+    "disabled_by_setting": "위의 선택에 따라 꺼짐",
+    "no_key": "저장된 Gemini API 키가 없음",
+    "chat_provider_not_gemini": "대화가 Gemini로 실행될 때만 사용",
+    "unknown": "사용할 수 없음"
+  },
+  "save": "저장",
+  "saving": "저장하는 중…",
+  "saved": "저장했습니다.",
+  "saveFailed": "선택을 저장하는 중 문제가 생겼습니다. 다시 시도하십시오."
+}

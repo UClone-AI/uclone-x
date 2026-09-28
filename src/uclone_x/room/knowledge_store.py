@@ -49,7 +49,7 @@ from typing import Any, Protocol, runtime_checkable
 
 import yaml
 
-from uclone_x.agent.session import validate_session_id
+from uclone_x.core.session import validate_session_id
 from uclone_x.errors import SeatKnowledgeUnreadableError
 from uclone_x.ontology.protocols import OntologyEngineProtocol
 from uclone_x.room.knowledge import KnowledgeLoad

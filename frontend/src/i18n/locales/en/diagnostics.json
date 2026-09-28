@@ -1,0 +1,46 @@
+{
+  "section": {
+    "title": "Diagnostics",
+    "intro": "What this build answers of the Agent Client Protocol, and its latest evaluation run.",
+    "acpFailed": "ACP status could not be read from the runtime.",
+    "acpLoading": "Reading ACP status…",
+    "evalsFailed": "Evaluation results could not be read from the runtime.",
+    "evalsLoading": "Reading evaluation results…"
+  },
+  "panel": {
+    "title": "Problem reporting",
+    "introBefore": "UClone-X can keep a record of what failed, ",
+    "introEmphasis": "on this machine only",
+    "introAfter": ". It stores the error type, the code path, your versions, and the error message — never your prompts or the contents of your files. Credentials and home directories are masked by pattern, which catches the shapes that occur rather than everything conceivable. Nothing is uploaded on its own: you read the report and decide.",
+    "recordingOn": "Recording on",
+    "turnOff": "Turn off",
+    "recordLocally": "Record failures locally",
+    "offByChoice": "Currently off, by your choice.",
+    "off": "Currently off.",
+    "preferenceUnreadable": "Your recording preference could not be read, so collection is off.",
+    "recordingBlocked": "New failures are not being recorded.",
+    "journalUnreadable": "The failure journal could not be read.",
+    "journalUnreadableNote": "This is not the same as having nothing to report — whatever was recorded is still on disk and unreadable to the dashboard.",
+    "recorded": {
+      "one": "{count} failure recorded ({distinct} distinct).",
+      "other": "{count} failures recorded ({distinct} distinct)."
+    },
+    "recordedWithUnreadable": {
+      "one": "{count} failure recorded ({distinct} distinct), {unreadable} unreadable line(s) omitted.",
+      "other": "{count} failures recorded ({distinct} distinct), {unreadable} unreadable line(s) omitted."
+    },
+    "hideReport": "Hide report",
+    "showReport": "Show what would be sent",
+    "reportOnGithub": "Report on GitHub",
+    "tooLong": "Too long to pre-fill — copy the report below into a new issue.",
+    "alreadyReported": "Already reported?",
+    "delete": "Delete",
+    "confirmDelete": "Delete the recorded failures? This cannot be undone.",
+    "reportContents": "Report contents",
+    "unconfirmed": "Only you can make this choice, and this window could not show that it is you. Choose “Open a confirmed window”, then choose in the window that opens. Nothing was changed.",
+    "openConfirmed": "Open a confirmed window",
+    "windowOpened": "A confirmed window opened in your browser. Choose there.",
+    "windowTooSoon": "A confirmed window was opened a moment ago. Look for it in your browser, or try again in a few seconds.",
+    "windowFailed": "No confirmed window could be opened."
+  }
+}

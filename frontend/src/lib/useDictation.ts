@@ -1,8 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
-  DICTATION_UNSUPPORTED,
   appendPhrase,
-  dictationErrorMessage,
   speechRecognitionConstructor,
   type DictationState,
   type SpeechRecognitionEventLike,
@@ -20,8 +18,13 @@ import {
  * constructing one is what some browsers treat as the moment to ask for the microphone --
  * and a conversation that asks for the microphone merely by being opened is asking for
  * something the reader has not reached for.
+ *
+ * `lang` is the recognition language tag (`dictationLang`), read when listening starts.
  */
-export function useDictation(onPhrase: (phrase: string) => void): {
+export function useDictation(
+  onPhrase: (phrase: string) => void,
+  lang: string = navigator.language || 'en-US',
+): {
   state: DictationState;
   /** Start, or stop if already listening. Safe to call in any state. */
   toggle: () => void;
@@ -33,6 +36,8 @@ export function useDictation(onPhrase: (phrase: string) => void): {
   // Read inside the browser's callbacks, which close over the render that made them.
   const phraseRef = useRef(onPhrase);
   phraseRef.current = onPhrase;
+  const langRef = useRef(lang);
+  langRef.current = lang;
   const stoppedByReader = useRef(false);
 
   // Leaving the conversation while it is listening must release the microphone. Without
@@ -54,14 +59,14 @@ export function useDictation(onPhrase: (phrase: string) => void): {
 
     const Recognition = speechRecognitionConstructor();
     if (Recognition === null) {
-      setState({ kind: 'unsupported', reason: DICTATION_UNSUPPORTED });
+      setState({ kind: 'unsupported' });
       return;
     }
 
     const session = new Recognition();
     // Set on the instance rather than passed to the constructor: the prefixed
     // implementations read `lang` at `start()`, so a language set any earlier is ignored.
-    session.lang = navigator.language || 'en-US';
+    session.lang = langRef.current;
     session.continuous = true;
     session.interimResults = false;
     session.onresult = (event: SpeechRecognitionEventLike) => {
@@ -72,7 +77,7 @@ export function useDictation(onPhrase: (phrase: string) => void): {
     };
     session.onerror = (event: { error: string }) => {
       if (event.error === 'aborted') return;
-      setState({ kind: 'error', message: dictationErrorMessage(event.error) });
+      setState({ kind: 'error', code: event.error });
     };
     session.onend = () => {
       recognition.current = null;
@@ -86,7 +91,7 @@ export function useDictation(onPhrase: (phrase: string) => void): {
     try {
       session.start();
     } catch (err) {
-      setState({ kind: 'error', message: dictationErrorMessage(String(err)) });
+      setState({ kind: 'error', code: String(err) });
       return;
     }
     recognition.current = session;

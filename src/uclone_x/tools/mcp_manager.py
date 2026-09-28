@@ -1,6 +1,7 @@
 """External MCP servers a user connects from Settings: stored, connected, and registered.
 
-A server added here lives in `<storage_dir>/mcp_servers.json`, in the same `mcpServers`
+A server added here is kept by an `MCPServerStoreProtocol` store. The app's store,
+`FileMCPServerStore`, is `<storage_dir>/mcp_servers.json`, in the same `mcpServers`
 shape Claude Desktop and Claude Code write, so a snippet copied from a server's own README
 can be pasted in as it is. Each connected server's tools are registered as
 `<server>__<tool>`, so two servers that both offer `search` cannot shadow each other or a
@@ -15,10 +16,10 @@ import os
 import re
 import tempfile
 import urllib.parse
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Any, Literal, Protocol, cast
 
 import httpx
 from pydantic import (
@@ -196,19 +197,113 @@ class UnknownServerError(KeyError):
     """No server has this name."""
 
 
+class MCPServerStoreProtocol(Protocol):
+    """Where a manager's configured servers are kept between runs (#1735).
+
+    The manager owns the servers, their connections and the lock that serialises every
+    change; a store only reads the whole configuration once and writes it back whole
+    after each change, under that lock.
+    """
+
+    def load(self) -> tuple[dict[str, MCPServerSpec], str | None]:
+        """Every valid stored server by name, and why something stored could not be used.
+
+        The second value is shown to the user (`MCPServerManager.load_error`); a store that
+        cannot be read at all returns no servers and says why, it does not raise.
+        """
+        ...
+
+    def save(self, servers: Mapping[str, MCPServerSpec]) -> None:
+        """Replace the stored configuration with `servers`."""
+        ...
+
+
+class FileMCPServerStore:
+    """The servers in one `mcpServers` JSON file, written owner-only and atomically."""
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+
+    @property
+    def path(self) -> Path:
+        return self._path
+
+    def load(self) -> tuple[dict[str, MCPServerSpec], str | None]:
+        servers: dict[str, MCPServerSpec] = {}
+        load_error: str | None = None
+        if not self._path.exists():
+            return servers, load_error
+        try:
+            data = cast(object, json.loads(self._path.read_text(encoding="utf-8")))
+        except (OSError, ValueError) as err:
+            return servers, f"{self._path} could not be read: {err}"
+        raw_servers = (
+            cast(dict[str, object], data).get("mcpServers") if isinstance(data, dict) else None
+        )
+        if not isinstance(raw_servers, dict):
+            return servers, load_error
+        for name, raw in cast(dict[str, object], raw_servers).items():
+            try:
+                servers[name] = spec_from_entry(name, raw)
+            except ValueError as err:
+                # Kept visible, not dropped: the user wrote it and should see why it is idle.
+                load_error = f"Server '{name}' in {self._path} is invalid: {err}"
+        return servers, load_error
+
+    def save(self, servers: Mapping[str, MCPServerSpec]) -> None:
+        payload = {"mcpServers": {name: spec.to_file_entry() for name, spec in servers.items()}}
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        # Header and env values are credentials: owner-only, written atomically so a crash
+        # mid-write cannot leave a half file that loses every server.
+        fd, tmp = tempfile.mkstemp(dir=self._path.parent, prefix=".mcp_servers.")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, indent=2)
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, self._path)
+        except BaseException:
+            Path(tmp).unlink(missing_ok=True)
+            raise
+
+
+class InMemoryMCPServerStore:
+    """Servers kept in this process only: for a host with its own storage, and for tests."""
+
+    def __init__(self, servers: Mapping[str, MCPServerSpec] | None = None) -> None:
+        self._servers: dict[str, MCPServerSpec] = dict(servers or {})
+
+    @property
+    def servers(self) -> dict[str, MCPServerSpec]:
+        """A copy of what is stored now."""
+        return dict(self._servers)
+
+    def load(self) -> tuple[dict[str, MCPServerSpec], str | None]:
+        return dict(self._servers), None
+
+    def save(self, servers: Mapping[str, MCPServerSpec]) -> None:
+        self._servers = dict(servers)
+
+
 class MCPServerManager:
     """Owns the user's external MCP servers for one running app (one event loop)."""
 
     def __init__(
         self,
         registry: ToolRegistryProtocol,
-        config_path: Path,
+        config_path: Path | None,
         workspace_root: Path,
         client_factory: ClientFactory | None = None,
         connect_timeout: float = 20.0,
+        *,
+        store: MCPServerStoreProtocol | None = None,
     ) -> None:
+        # `config_path` keeps every existing caller on the file store; `store` is any other.
+        if (config_path is None) == (store is None):
+            raise ValueError("Give an MCPServerManager a config_path or a store, exactly one")
+        if store is None:
+            store = FileMCPServerStore(cast(Path, config_path))
         self._registry = registry
-        self._config_path = config_path
+        self._store: MCPServerStoreProtocol = store
         self._workspace_root = workspace_root
         self._connect_timeout = connect_timeout
         self._client_factory: ClientFactory = client_factory or (
@@ -222,8 +317,9 @@ class MCPServerManager:
         self._load()
 
     @property
-    def config_path(self) -> Path:
-        return self._config_path
+    def config_path(self) -> Path | None:
+        """The file the servers are stored in, or None when the store is not a file."""
+        return self._store.path if isinstance(self._store, FileMCPServerStore) else None
 
     @property
     def load_error(self) -> str | None:
@@ -233,45 +329,14 @@ class MCPServerManager:
     # ── storage ──────────────────────────────────────────────────────────
 
     def _load(self) -> None:
-        if not self._config_path.exists():
-            return
-        try:
-            data = cast(object, json.loads(self._config_path.read_text(encoding="utf-8")))
-        except (OSError, ValueError) as err:
-            self._load_error = f"{self._config_path} could not be read: {err}"
-            return
-        raw_servers = (
-            cast(dict[str, object], data).get("mcpServers") if isinstance(data, dict) else None
-        )
-        if not isinstance(raw_servers, dict):
-            return
-        for name, raw in cast(dict[str, object], raw_servers).items():
-            try:
-                spec = spec_from_entry(name, raw)
-            except ValueError as err:
-                # Kept visible, not dropped: the user wrote it and should see why it is idle.
-                self._load_error = f"Server '{name}' in {self._config_path} is invalid: {err}"
-                continue
+        specs, self._load_error = self._store.load()
+        for name, spec in specs.items():
             self._servers[name] = _Server(
                 spec=spec, status="connecting" if spec.enabled else "disabled"
             )
 
     def _save(self) -> None:
-        payload = {
-            "mcpServers": {name: s.spec.to_file_entry() for name, s in self._servers.items()}
-        }
-        self._config_path.parent.mkdir(parents=True, exist_ok=True)
-        # Header and env values are credentials: owner-only, written atomically so a crash
-        # mid-write cannot leave a half file that loses every server.
-        fd, tmp = tempfile.mkstemp(dir=self._config_path.parent, prefix=".mcp_servers.")
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                json.dump(payload, fh, indent=2)
-            os.chmod(tmp, 0o600)
-            os.replace(tmp, self._config_path)
-        except BaseException:
-            Path(tmp).unlink(missing_ok=True)
-            raise
+        self._store.save({name: s.spec for name, s in self._servers.items()})
 
     # ── connection ───────────────────────────────────────────────────────
 

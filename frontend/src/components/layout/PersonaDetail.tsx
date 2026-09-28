@@ -1,7 +1,9 @@
-import React from 'react';
+import React, { useMemo } from 'react';
 import { PersonaInfo } from '../../types';
 import { PersonaDetail as KitPersonaDetail } from '../../ui-kit';
 import type { PersonaDetailCopy } from '../../ui-kit';
+import { useCopy, type Messages } from '../../i18n';
+import { en } from '../../i18n/en';
 
 /**
  * Read-only detail for one persona — issue #1056, scope (a).
@@ -32,13 +34,12 @@ import type { PersonaDetailCopy } from '../../ui-kit';
  * returns, using only what this file itself defines.
  *
  * The markup now lives in the kit (`ui-kit/rail/PersonaDetail.tsx`, #1158), which holds no
- * words. This file is the head's side of it: the sentences below, bound to the kit component.
+ * words. This file is the head's side of it: the `personaDetail` catalog's sentences, in the
+ * screen's language, bound to the kit component.
  */
 
 interface PersonaDetailProps {
   persona: PersonaInfo;
-  /** The running clone's tools that it is given only inside a conversation (#1595). */
-  toolsNeedingConversation?: readonly string[];
 }
 
 /**
@@ -52,39 +53,37 @@ interface PersonaDetailProps {
  * runtime: an empty `allowed_tools` is no restriction (`ScopedToolRegistry` and
  * `BaseAgent._apply_persona_tool_scope` both treat it so), not a restriction to nothing.
  */
-export const NO_TOOLS_CAUSE = 'No tool list — this clone can use every tool the runtime has.';
+export const NO_TOOLS_CAUSE = en.personaDetail.noTools;
 
 /** `enable_write_tools` as a plain-language capability statement, never a bare boolean. */
-export const describeWriteAccess = (enabled: boolean | undefined): string =>
-  enabled ? 'Can write files' : 'Cannot write files';
+export const describeWriteAccess = (
+  enabled: boolean | undefined,
+  copy: Messages['personaDetail'] = en.personaDetail,
+): string => (enabled ? copy.writeAccess.on : copy.writeAccess.off);
 
 /** `enable_subagent_tools` as a plain-language capability statement, never a bare boolean. */
-export const describeSubagentAccess = (enabled: boolean | undefined): string =>
-  enabled ? 'Can spawn sub-agents' : 'Cannot spawn sub-agents';
+export const describeSubagentAccess = (
+  enabled: boolean | undefined,
+  copy: Messages['personaDetail'] = en.personaDetail,
+): string => (enabled ? copy.subagentAccess.on : copy.subagentAccess.off);
 
-/**
- * Leads the tools the clone is not given outside a conversation. The story tools are the
- * ones today: a clone run on its own, with no conversation, is not offered them (#1595).
- */
-export const ONLY_IN_CONVERSATION = 'Only available inside a conversation:';
+/** Every word the persona card shows, as this head words it, from the `personaDetail` catalog. */
+export const personaDetailCopy = (copy: Messages['personaDetail']): PersonaDetailCopy => ({
+  model: copy.model,
+  temperature: copy.temperature,
+  maxTokens: copy.maxTokens,
+  tools: copy.tools,
+  notSet: copy.notSet,
+  noTools: copy.noTools,
+  writeAccess: (enabled) => describeWriteAccess(enabled, copy),
+  subagentAccess: (enabled) => describeSubagentAccess(enabled, copy),
+});
 
-/** Every word the persona card shows, as this head words it. */
-export const PERSONA_DETAIL_COPY: PersonaDetailCopy = {
-  model: 'Model',
-  temperature: 'Temperature',
-  maxTokens: 'Max tokens',
-  tools: 'Tools',
-  notSet: 'not set',
-  noTools: NO_TOOLS_CAUSE,
-  onlyInConversation: ONLY_IN_CONVERSATION,
-  writeAccess: describeWriteAccess,
-  subagentAccess: describeSubagentAccess,
+/** The persona card's words in English, for callers outside a `LocaleProvider`. */
+export const PERSONA_DETAIL_COPY: PersonaDetailCopy = personaDetailCopy(en.personaDetail);
+
+export const PersonaDetail: React.FC<PersonaDetailProps> = ({ persona }) => {
+  const t = useCopy();
+  const copy = useMemo(() => personaDetailCopy(t.personaDetail), [t]);
+  return <KitPersonaDetail persona={persona} copy={copy} />;
 };
-
-export const PersonaDetail: React.FC<PersonaDetailProps> = ({ persona, toolsNeedingConversation }) => (
-  <KitPersonaDetail
-    persona={persona}
-    copy={PERSONA_DETAIL_COPY}
-    toolsNeedingConversation={toolsNeedingConversation}
-  />
-);

@@ -21,8 +21,10 @@ from uclone_x.errors import (
 )
 from uclone_x.llm.connectors.base import (
     BaseLLMConnector,
+    named_model,
     parse_dict_payload,
     reported_count,
+    resolve_model,
     resolve_token_counts,
 )
 from uclone_x.llm.context_window import (
@@ -211,15 +213,18 @@ def resolve_ollama_base_url(base_url: str | None = None) -> str:
     return "http://localhost:11434"
 
 
-def resolve_ollama_model(model: str | None = None) -> str:
-    """Resolve model name from arguments or environment fallback hierarchy.
+def resolve_ollama_model(model: str | None = None) -> str | None:
+    """The model named by the argument or the environment, else ``None``.
 
-    Fallback hierarchy:
+    In order:
     1. Explicit model argument (if not None, empty string, or 'default')
     2. OLLAMA_MODEL
     3. OLLAMA_INDEPTH_MODEL
     4. OLLAMA_FAST_MODEL
-    5. Default: qwen3:8b
+
+    ``None`` when none names one. No model id is filled in from source: an id written
+    here goes stale, and the person is owed a plain refusal instead of a call to a model
+    they never chose (the connector raises ``LLMModelNotConfiguredError``).
     """
     if model is not None:
         stripped = model.strip()
@@ -231,10 +236,7 @@ def resolve_ollama_model(model: str | None = None) -> str:
         os.getenv("OLLAMA_INDEPTH_MODEL"),
         os.getenv("OLLAMA_FAST_MODEL"),
     )
-    for candidate in candidates:
-        if candidate and candidate.strip():
-            return candidate.strip()
-    return "qwen3:8b"
+    return next((found.strip() for found in candidates if found and found.strip()), None)
 
 
 #: How long the daemon keeps a model and its KV cache loaded after a request, when neither
@@ -313,7 +315,14 @@ class OllamaConnector(BaseLLMConnector):
         http_client: httpx.AsyncClient | None = None,
         keep_alive: str | int | float | None = None,
         context_windows: OllamaContextWindows | None = None,
+        model: str | None = None,
     ) -> None:
+        """``model`` is what a request naming no model is sent to, ahead of the variables.
+
+        The connector factory passes the model it resolved (its argument, then the model
+        variables, then the saved choice), so a variable still outranks the saved model.
+        """
+        self._model: str | None = named_model(model)
         resolved_base = resolve_ollama_base_url(base_url)
         resolved_timeout = resolve_ollama_timeout(timeout)
         super().__init__(
@@ -344,8 +353,11 @@ class OllamaConnector(BaseLLMConnector):
         figure is returned without a request. `None` when the daemon has not loaded the
         model -- never a guess (P6).
         """
+        chosen = resolve_ollama_model(named_model(model) or self._model)
+        if chosen is None:
+            return None  # no model is chosen, so there is no window to read
         # Keyed as the daemon names the model, so `llama3.2` and `llama3.2:latest` are one.
-        name = ollama_model_key(resolve_ollama_model(model))
+        name = ollama_model_key(chosen)
         base = self._endpoint
         if self._windows.get(base, name) is None or name in self._unconfirmed:
             await self._windows.refresh(
@@ -372,20 +384,34 @@ class OllamaConnector(BaseLLMConnector):
         return self._windows
 
     @property
+    def paid(self) -> bool:
+        """A model this machine or its network serves; not counted against usage limits."""
+        return False
+
+    @property
     def provider_name(self) -> str:
         return "ollama"
 
     @property
-    def _default_model(self) -> str:
+    def _default_model(self) -> str | None:
         """The model a request naming none is sent to, resolved when read (#1447).
 
         `BaseAgent` reads this to name what a streamed step *asked for* when the request
         named no model. Without it the agent had nothing to read and recorded the literal
         `"default"` -- a model nobody asked Ollama for -- while `OLLAMA_MODEL` answered.
         A property, not a stored value, because the resolution reads the environment on
-        every request and this must agree with what `_build_payload` sends.
+        every request and this must agree with what `_build_payload` sends. ``None`` when
+        no model is chosen: the agent records that rather than a guess.
         """
-        return resolve_ollama_model(None)
+        return resolve_ollama_model(self._model)
+
+    def _resolve_model(self, requested: str | None) -> str:
+        """The request's model, else the one this connector was built with, else the variables'.
+
+        With none of them, the request is refused before the network, in plain words
+        (``LLMModelNotConfiguredError``), as every hosted connector refuses.
+        """
+        return resolve_model(requested, resolve_ollama_model(self._model), "Ollama")
 
     def _map_finish_reason(self, done_reason: str | None) -> FinishReason:
         """Map Ollama's `done_reason` onto `FinishReason`, or report it as unknown.
@@ -455,7 +481,7 @@ class OllamaConnector(BaseLLMConnector):
             UnmappableChatMessageError: a message has no faithful Ollama
                 representation. The offending value is named in the message.
         """
-        model = resolve_ollama_model(request.model)
+        model = self._resolve_model(request.model)
         messages_payload: list[dict[str, Any]] = []
 
         for msg in request.messages:
@@ -512,6 +538,9 @@ class OllamaConnector(BaseLLMConnector):
         }
         if request.thinking is not None:
             payload["think"] = request.thinking
+        if request.response_schema is not None:
+            # Ollama's structured output: the reply's content is constrained to the schema.
+            payload["format"] = cast(dict[str, Any], unwrap_immutable(request.response_schema))
 
         if request.tools:
             payload["tools"] = [
@@ -594,7 +623,7 @@ class OllamaConnector(BaseLLMConnector):
 
         usage = TokenUsage(
             provider="ollama",
-            model=resolve_ollama_model(request.model),
+            model=self._resolve_model(request.model),
             input_tokens=in_tokens,
             output_tokens=out_tokens,
             total_tokens=in_tokens + out_tokens,
@@ -610,7 +639,7 @@ class OllamaConnector(BaseLLMConnector):
             )
         )
 
-        requested_model = resolve_ollama_model(request.model)
+        requested_model = self._resolve_model(request.model)
         model_name = str(data.get("model", requested_model))
         # P6: `requested` is the model actually sent to the server — the resolved
         # name, since nobody asks Ollama for a model called "default" — and
@@ -737,7 +766,7 @@ class OllamaConnector(BaseLLMConnector):
                         )
                         usage = TokenUsage(
                             provider="ollama",
-                            model=resolve_ollama_model(request.model),
+                            model=self._resolve_model(request.model),
                             input_tokens=in_tok,
                             output_tokens=out_tok,
                             total_tokens=in_tok + out_tok,

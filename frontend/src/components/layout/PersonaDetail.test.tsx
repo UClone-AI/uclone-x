@@ -3,7 +3,6 @@ import { render, screen } from '@testing-library/react';
 import {
   PersonaDetail,
   NO_TOOLS_CAUSE,
-  ONLY_IN_CONVERSATION,
   describeWriteAccess,
   describeSubagentAccess,
 } from './PersonaDetail';
@@ -57,29 +56,9 @@ describe('PersonaDetail', () => {
     expect(screen.queryByTestId('persona-tools-reader')).not.toBeInTheDocument();
   });
 
-  it('says in words which tools the clone is given only inside a conversation (#1595)', () => {
-    // Killed by: frontend/src/ui-kit/rail/PersonaDetail.tsx :: toolsNeedingConversation.length > 0 ?
-    // Becomes: false ?
-    render(
-      <PersonaDetail
-        persona={makePersonaInfo({ allowed_tools: [] })}
-        toolsNeedingConversation={['story_outline', 'story_codex']}
-      />,
-    );
-
-    const note = screen.getByTestId('persona-tools-conversation-only-reader');
-    expect(note).toHaveTextContent(`${ONLY_IN_CONVERSATION} story_outline, story_codex`);
-    expect(note).not.toHaveTextContent(/room|needs_room|capabilities/);
-  });
-
-  it('adds no conversation-only note when the clone has no such tool', () => {
-    render(<PersonaDetail persona={makePersonaInfo({ allowed_tools: ['read_file'] })} toolsNeedingConversation={[]} />);
-    expect(screen.queryByTestId('persona-tools-conversation-only-reader')).not.toBeInTheDocument();
-  });
-
   it('reads the write-tools flag as a capability sentence, never a bare boolean', () => {
-    // Killed by: frontend/src/components/layout/PersonaDetail.tsx :: enabled ? 'Can write files' : 'Cannot write files'
-    // Becomes: 'Can write files'
+    // Killed by: frontend/src/components/layout/PersonaDetail.tsx :: ): string => (enabled ? copy.writeAccess.on : copy.writeAccess.off);
+    // Becomes: ): string => copy.writeAccess.on;
     expect(describeWriteAccess(true)).toBe('Can write files');
     expect(describeWriteAccess(false)).toBe('Cannot write files');
 
@@ -90,8 +69,8 @@ describe('PersonaDetail', () => {
   });
 
   it('reads the subagent-tools flag as a capability sentence, never a bare boolean', () => {
-    // Killed by: frontend/src/components/layout/PersonaDetail.tsx :: enabled ? 'Can spawn sub-agents' : 'Cannot spawn sub-agents'
-    // Becomes: 'Can spawn sub-agents'
+    // Killed by: frontend/src/components/layout/PersonaDetail.tsx :: ): string => (enabled ? copy.subagentAccess.on : copy.subagentAccess.off);
+    // Becomes: ): string => copy.subagentAccess.on;
     expect(describeSubagentAccess(false)).toBe('Cannot spawn sub-agents');
     expect(describeSubagentAccess(true)).toBe('Can spawn sub-agents');
 

@@ -55,7 +55,7 @@ const roomWith = (over: {
   turn_state: { agent_turns_since_human: 0, ...over.turn_state },
   policy: {
     max_agent_turns_per_human_message: 6,
-    max_span_messages: 40,
+    max_span_tokens: 8000,
     transcript_window: 30,
     hesitation_seconds: 2,
     default_responder_id: 'architect',
@@ -138,6 +138,34 @@ describe('ResourceSummary', () => {
     expect(container.textContent).not.toContain('$');
   });
 
+  it('says there is no session ceiling when the Core reports none, instead of inventing one', () => {
+    render(
+      <ResourceSummary
+        budgetData={{
+          ...mockBudgetData,
+          session_budget: {
+            ...mockBudgetData.session_budget,
+            max_tokens: null,
+            remaining_tokens: null,
+            budget_used_pct: null,
+          },
+        }}
+        onRefresh={vi.fn()}
+        isRefreshing={false}
+      />
+    );
+
+    expect(screen.getByTestId('resource-token-no-ceiling')).toHaveTextContent('Settings → Usage');
+    expect(screen.queryByText(/\/ 1,000,000/)).toBeNull();
+  });
+
+  it('meters the session against its ceiling when one is set', () => {
+    render(<ResourceSummary budgetData={mockBudgetData} onRefresh={vi.fn()} isRefreshing={false} />);
+
+    expect(screen.getByText('/ 1,000,000 (2%)')).toBeDefined();
+    expect(screen.queryByTestId('resource-token-no-ceiling')).toBeNull();
+  });
+
   it('displays dynamic context pruning and token savings', () => {
     render(
       <ResourceSummary
@@ -218,8 +246,8 @@ describe('ResourceSummary', () => {
  * and U3's: one deliberate action away, never in the default state. So they are here, on the
  * dock's Resource surface.
  *
- * #1272 is about *what they count*. They were derived from `chatMessages`, which is
- * `GET /api/session/history` for whichever clone the rail has selected -- and since #1208
+ * #1272 is about *what they count*. They were derived from `chatMessages`, which was
+ * `GET /api/session/history` (removed in #1731) for whichever clone the rail has selected -- and since #1208
  * retired the single-agent surface the centre column is unconditionally a room, so those
  * figures named a transcript the user could not see. Picking a clone moved them; opening a
  * room did not. Two of the four have no room-level equivalent at all, and the surface says so

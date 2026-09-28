@@ -72,7 +72,7 @@ As agents collaborate and execute multiple tools, message context grows. When co
 ## 4. Token Governance
 
 * **Decoupled Billing**: Token consumption is measured and attributed per-agent, per-session, per-user, **and per-provider** at the LLM layer. Agnosticism at the call boundary (agent code never names a provider) does not mean the accounting is provider-blind: every `TokenUsage` record is tagged with the provider that produced it (see §5), so a quota controller can answer "how many tokens did each provider consume for this session" without any caller having imported that provider's SDK.
-* **Token Limits**: Developers set a session token ceiling (`TokenBudget.max_tokens`), and a per-provider token limit can be checked against `per_provider`.
+* **Token Limits**: The budget is **one system-wide limit on paid-model tokens**, which the user sets in Settings → Usage (or `UCLONE_USAGE_LIMIT_*`): the last 10 minutes, the last 5 hours and the last 7 days, across every session, clone, room and process. The connector factory's usage gate enforces it before each paid call and refuses with `UsageLimitReachedError`; local models are never counted (`design/llm-token-gateway.md`). The per-session ledger (`TokenBudgetManager`) is **attribution only** by default: it records what each session and turn spent, per provider, and has no session ceiling (`TokenBudget.max_tokens` is `None`). An embedder or test may still set an explicit session ceiling (`configure_session(max_tokens=...)`) or a per-provider limit against `per_provider`, and those are enforced.
 * **No cost**: The layer does not price tokens, estimate monetary cost, or enforce a monetary ceiling. Cost calculation is out of scope for UClone-X (P5, #1392).
 * **Observable Failover**: If a primary provider (e.g. Gemini) returns HTTP 429/503, the router falls back to secondary (e.g. Claude), emitting an explicit OpenTelemetry `failover.event` span with zero silent masking of infrastructure state.
 
@@ -138,7 +138,7 @@ class TokenUsage(BaseModel):
 
 
 class TokenBudget(BaseModel):
-    max_tokens: int = 1_000_000
+    max_tokens: int | None = None  # no session ceiling unless one is set
     used_input_tokens: int = 0
     used_output_tokens: int = 0
     per_provider: Mapping[str, int] = {}  # tokens (input + output) broken out by provider name
@@ -339,7 +339,7 @@ message and per tool call. The connectors use the same estimator
 report (§5.2). The estimator counts bytes and not characters because byte-level BPE
 tokenizers merge bytes. Latin text is one byte a character, so its figure is the one the old
 `(len + 3) // 4` gave, and a Hangul syllable, three bytes, is no longer undercounted
-threefold (#939). It is a point estimate, not a bound. `BaseAgent._estimate_stream_usage`,
+threefold (#939). It is a point estimate, not a bound. `TurnExecutor._estimate_stream_usage`,
 which the agent uses when a stream sent no count, calls the same `estimate_request_tokens`
 and `estimate_reply_tokens` over the request and over the reply text and tool calls the
 stream carried, so a watched step and a headless step are estimated alike (#980).

@@ -319,3 +319,35 @@ describe('opening a generated image in Docs (#1354)', () => {
     expect(screen.queryByTestId('artifact-open-docs-btn')).toBeNull();
   });
 });
+
+/**
+ * A re-render keeps the elements it already drew.
+ *
+ * The `table`, `img` and `a` overrides were written inline in the JSX, so every render gave
+ * react-markdown new functions -- new component types, to React -- and it replaced every link,
+ * table and image in every message. The conversation re-renders on each keystroke, so typing
+ * rebuilt all of them each time. The className changes between the two renders because the
+ * memo would otherwise skip the second one, and the test could not tell the two apart.
+ */
+describe('RichText re-render', () => {
+  const REPLY = [
+    'See [the docs](https://example.com/docs).',
+    '',
+    '| a | b |',
+    '| - | - |',
+    '| 1 | 2 |',
+  ].join('\n');
+
+  it('keeps its links and tables when drawn again with the same text', () => {
+    const { container, rerender } = render(<RichText content={REPLY} className="one" />);
+    const link = screen.getByRole('link', { name: 'the docs' });
+    const table = container.querySelector('table');
+    expect(table).not.toBeNull();
+
+    rerender(<RichText content={REPLY} className="two" />);
+
+    expect(container.firstElementChild).toHaveClass('two');
+    expect(link.isConnected).toBe(true);
+    expect(table?.isConnected).toBe(true);
+  });
+});

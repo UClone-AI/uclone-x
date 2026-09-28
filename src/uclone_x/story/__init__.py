@@ -13,9 +13,12 @@ from typing import TYPE_CHECKING, cast
 from uclone_x.tools.models import ToolResultStatus
 
 if TYPE_CHECKING:
-    from uclone_x.agent.models import ToolExecutionRecord
+    from collections.abc import Sequence
 
-__all__ = ["OPEN_STORY_KEY", "story_after"]
+    from uclone_x.agent.models import ToolExecutionRecord
+    from uclone_x.tools.models import ToolContext
+
+__all__ = ["OPEN_STORY_KEY", "StoryLifecycleHook", "story_after"]
 
 #: The output key under which a tool declaring `opens_story` names the story its
 #: conversation has open after the call; `None` under it means the story was closed.
@@ -39,3 +42,21 @@ def story_after(records: Iterable[ToolExecutionRecord], current: str | None) -> 
             if value is None or isinstance(value, str):
                 story = value
     return story
+
+
+class StoryLifecycleHook:
+    """The turn lifecycle hook that moves a turn's open story between its steps (#1732).
+
+    A `TurnLifecycleHookProtocol`: the agent carries `story_id` but imports nothing from
+    here, so a host composing an agent without this hook gets one whose story never
+    moves mid-turn. Every UClone-X head composes it in (`agent/clone_builder.py`).
+    """
+
+    def after_tool_step(
+        self, records: Sequence[ToolExecutionRecord], context: ToolContext
+    ) -> ToolContext:
+        """`context` with the story `records` left open (`story_after`)."""
+        story = story_after(records, context.story_id)
+        if story == context.story_id:
+            return context
+        return context.model_copy(update={"story_id": story})

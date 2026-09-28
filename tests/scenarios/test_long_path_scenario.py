@@ -537,15 +537,14 @@ async def test_long_path_stage_1_plan_tool_persist_compact(tmp_path: Path) -> No
                 m for m in messages if m.role == MessageRole.TOOL and m.name == "big_query"
             )
             assert tool_msg.content is not None
-            assert "[Tool Output Offloaded" in tool_msg.content
-            assert "path=offload" in tool_msg.content
+            # Offloaded to the session's `tr_` result store (#1640)
+            from uclone_x.core.tool_results import handle_in
 
-            # Read back using FileReadTool
-            import re
+            handle = handle_in(tool_msg.content)
+            assert handle is not None
 
-            m = re.search(r"Full output saved to '([^']+)'", tool_msg.content)
-            assert m is not None
-            artifact_rel_path = m.group(1)
+            # Read the stored blob back using FileReadTool
+            artifact_rel_path = f".sandbox/tool_artifacts/{stage5_agent.session_id}/{handle}.txt"
 
             tool_ctx = ToolContext(
                 agent_id=stage5_agent.agent_id,

@@ -3,7 +3,6 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent.parent.parent / "src"))
 
-from typing import Any
 
 import pytest
 
@@ -70,8 +69,8 @@ async def test_topology_integration(
 ) -> None:
     """An agent the user asked for directly is nobody's child.
 
-    Killed by: src/uclone_x/ui/app.py :: parent_agent_id=None,
-    Becomes: parent_agent_id="champion" if agent_id != "champion" else None,
+    Killed by: src/uclone_x/agent/clone_builder.py :: context=AgentContext(
+    Becomes: context=AgentContext(parent_agent_id="champion" if clone_id != "champion" else None,
     """
     # This test builds an agent but is not about provider resolution, so it says which
     # connector it wants. `conftest` clears LLM configuration rather than pinning a
@@ -84,8 +83,8 @@ async def test_topology_integration(
 
     # Two agents the UI can build. Neither is anybody's parent: `get_or_create_agent`
     # used to set `parent_agent_id="champion" if agent_id != "champion"`, so every agent
-    # but one was recorded as having been spawned by `champion` -- an edge `/api/agents/
-    # graph` then drew between two agents that had never spoken to each other.
+    # but one was recorded as having been spawned by `champion` -- an edge the dashboard's
+    # agent graph then drew between two agents that had never spoken to each other.
     clone_agent = await session_mgr.get_or_create_agent("clone")
     assert clone_agent.agent_id == "clone"
     assert clone_agent.context.parent_agent_id is None
@@ -93,29 +92,3 @@ async def test_topology_integration(
     guardian_agent = await session_mgr.get_or_create_agent("guardian")
     assert guardian_agent.agent_id == "guardian"
     assert guardian_agent.context.parent_agent_id is None
-
-    # Test topology output
-    from fastapi.testclient import TestClient
-
-    from uclone_x.ui.app import create_ui_app
-
-    app = create_ui_app(session_manager=session_mgr)
-    client = TestClient(app)
-
-    import typing
-
-    resp: Any = typing.cast(Any, client).get("/api/agents")
-    assert resp.status_code == 200  # type: ignore
-    data: Any = resp.json()  # type: ignore
-
-    agents_list: Any = data.get("agents", [])  # type: ignore
-    assert isinstance(agents_list, list)
-    agents: list[dict[str, Any]] = [dict(a) for a in agents_list]  # type: ignore
-    assert len(agents) >= 2
-
-    clone_data: dict[str, Any] = next(ag for ag in agents if ag["id"] == "clone")
-    assert clone_data["role"] == "Personal AI Clone & Collaborator"
-
-    guardian_data: dict[str, Any] = next(ag for ag in agents if ag["id"] == "guardian")
-    assert guardian_data["role"] == "Risk Analyst & Strategic Guardian"
-    assert guardian_data["parent_agent_id"] is None

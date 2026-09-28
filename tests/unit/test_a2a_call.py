@@ -864,6 +864,59 @@ def _sketching_artist(tmp_path: Path, sketch: _Sketch, llm: MockLLMConnector) ->
     return transport
 
 
+class _ModelRecorder(MockLLMConnector):
+    """A mock model that keeps the model id each request asked for."""
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.models: list[str | None] = []
+
+    async def generate(self, request: LLMRequest) -> ModelResponse:
+        self.models.append(request.model)
+        return await super().generate(request)
+
+
+class TestTheCalledAgentsModel:
+    """Request, then persona, then the Settings deep and fast models -- the seat rule."""
+
+    @staticmethod
+    def _run(
+        tmp_path: Path, persona: PersonaDefinition, llm_config: AgentLLMConfig | None
+    ) -> tuple[PersonaTaskHandler, _ModelRecorder]:
+        llm = _ModelRecorder(default_response="Done.")
+        handler = PersonaTaskHandler(
+            "artist",
+            host_factory=_host(tmp_path, llm, ToolRegistry()),
+            persona_registry=_registry(persona),
+            workspace_root=tmp_path,
+            llm_config=llm_config,
+            global_models=lambda: ("settings-deep", "settings-fast"),
+        )
+        return handler, llm
+
+    @pytest.mark.asyncio
+    async def test_a_persona_naming_no_model_runs_on_the_settings_one(self, tmp_path: Path) -> None:
+        handler, llm = self._run(tmp_path, _artist(), None)
+
+        result = await handler(_message())
+
+        assert result.status is TaskStatus.COMPLETED, result.error
+        assert llm.models and set(llm.models) == {"settings-deep"}
+
+    @pytest.mark.asyncio
+    async def test_the_personas_model_and_then_the_requests_come_first(
+        self, tmp_path: Path
+    ) -> None:
+        own = _artist(llm_config=AgentLLMConfig(model_name="artist-own"))
+        handler, llm = self._run(tmp_path, own, None)
+        await handler(_message())
+        assert set(llm.models) == {"artist-own"}
+
+        handler, llm = self._run(tmp_path, own, AgentLLMConfig(model_name="asked-for"))
+        await handler(_message())
+        assert set(llm.models) == {"asked-for"}
+
+
 def _sketch_llm() -> _Listening:
     return _Listening(
         default_response="I sketched the hero.",

@@ -106,9 +106,10 @@ async def test_approval_path_carries_nested_tool_arguments():
     The assertions are on the outcome the fail-closed design promises: a refusal that
     names the timeout, carrying the arguments it refused.
 
-    Killed by: src/uclone_x/agent/base.py :: else cast(dict[str, Any], unwrap_immutable(tc.arguments))
+    Killed by: src/uclone_x/agent/tool_execution.py :: else cast(dict[str, Any], unwrap_immutable(tc.arguments))
     Becomes: else cast(dict[str, Any], tc.arguments)
-    Killed by: src/uclone_x/agent/base.py :: arguments=cast(dict[str, Any], unwrap_immutable(tc.arguments)),
+    Killed by: src/uclone_x/agent/tool_execution.py :: arguments=cast(dict[str, Any], unwrap_immutable(tc.arguments)),
+    Becomes: arguments=cast(dict[str, Any], tc.arguments),
     """
     nested_arguments: dict[str, Any] = {
         "path": "/tmp/a.txt",
@@ -174,7 +175,8 @@ async def test_approval_response_carries_nested_modified_arguments():
     fails — so a half-fix that stopped the raise but left the proxy in place would
     silently discard the modification, and this test would still fail.
 
-    Killed by: src/uclone_x/agent/base.py :: modified_arguments=cast(dict[str, Any], unwrap_immutable(modified_arguments))
+    Killed by: src/uclone_x/agent/tool_execution.py :: modified_arguments=cast(dict[str, Any], unwrap_immutable(modified_arguments))
+    Becomes: modified_arguments=cast(dict[str, Any], modified_arguments)
     """
     modified: dict[str, Any] = {
         "path": "/tmp/safe.txt",

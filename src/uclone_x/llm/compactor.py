@@ -5,15 +5,19 @@ from __future__ import annotations
 import json
 import logging
 import re
-import uuid
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from uclone_x.core.immutable import unwrap_immutable
 from uclone_x.core.provenance import ExecutionPath, Provenance, ServiceRef
 from uclone_x.core.secrets import redact_credentials
-from uclone_x.core.tool_results import stub_tool_result
-from uclone_x.errors import UnmappableChatMessageError
+from uclone_x.core.tool_results import (
+    handle_in,
+    store_tool_result,
+    stored_result_stub,
+    stub_tool_result,
+)
+from uclone_x.errors import PathTraversalError, UnmappableChatMessageError
 from uclone_x.llm.models import (
     ChatMessage,
     CompactionOutcome,
@@ -77,7 +81,7 @@ def estimate_text_tokens(text: str) -> int:
     The shared token estimator (#939). The compaction trigger uses it, and so does every
     connector that has to stand in for a count the provider did not report; such a figure
     is labelled `TokenCountSource.ESTIMATE`, `MockLLMConnector`'s included (#983). So does
-    `BaseAgent._estimate_stream_usage`, the agent's estimate for a stream that sent no count,
+    `TurnExecutor._estimate_stream_usage`, the agent's estimate for a stream that sent no count,
     through the same `estimate_request_tokens` and `estimate_reply_tokens`, so a watched step
     and a headless step are estimated alike (#980).
 
@@ -101,7 +105,9 @@ def _tool_call_tokens(tool_call: ToolCallRequest) -> int:
     """A tool call's framing, its id and name, and its JSON arguments."""
     total = 4 + estimate_text_tokens(tool_call.id + tool_call.name)
     if tool_call.arguments:
-        total += estimate_text_tokens(json.dumps(unwrap_immutable(tool_call.arguments)))
+        total += estimate_text_tokens(
+            json.dumps(unwrap_immutable(tool_call.arguments), ensure_ascii=False)
+        )
     return total
 
 
@@ -173,7 +179,7 @@ def estimate_request_tokens(request: LLMRequest) -> int:
     """
     total = estimate_message_tokens(request.messages)
     for tool in request.tools:
-        schema = json.dumps(unwrap_immutable(tool.parameters))
+        schema = json.dumps(unwrap_immutable(tool.parameters), ensure_ascii=False)
         total += 4 + estimate_text_tokens(f"{tool.name} {tool.description} {schema}")
     return total
 
@@ -429,21 +435,20 @@ class ContextCompactor(ContextCompactorProtocol):
 
         An excerpt or page of a stored result (#1422) is not offloaded a second time: its
         full text is already stored, so it drops to a stub -- its handle and the start of
-        the stored text. Only when the handle resolves in this session and the agent can
-        call the reader; otherwise it is pruned like any output.
+        the stored text. Only when the handle resolves in this session; otherwise it is
+        pruned like any output. The stub names `tool_result_read` only when the agent can
+        call it.
         """
         if msg.role != MessageRole.TOOL or not msg.content:
             return msg
-        if (
-            self.tool_result_reader
-            and self.workspace_root is not None
-            and self.session_id is not None
-        ):
+        artifacts_dir = self._contained_artifacts_dir()
+        if artifacts_dir is not None and self.session_id is not None:
             stub = stub_tool_result(
                 msg.content,
-                self.workspace_root / self.artifact_subdir,
+                artifacts_dir,
                 self.session_id,
                 keep_chars=self.max_tool_output_chars // 2,
+                readable=self.tool_result_reader,
             )
             if stub is not None:
                 if len(stub) >= len(msg.content):
@@ -464,7 +469,11 @@ class ContextCompactor(ContextCompactorProtocol):
 
         head_len = self.max_tool_output_chars // 2
 
-        if self.workspace_root is not None:
+        # Offloading needs a session: the reader looks only in the session's own
+        # directory, so a blob stored for no session could never be read back, and its
+        # stub would name a handle nothing resolves -- and, not recognised as stored, be
+        # offloaded again under a small cap (#1653). Without one it is truncated.
+        if self.workspace_root is not None and self.session_id is not None:
             return self._offload_tool_message(msg, head_len)
 
         redacted_full = redact_credentials(msg.content)
@@ -486,51 +495,54 @@ class ContextCompactor(ContextCompactorProtocol):
     def _prune_tool_message(self, msg: ChatMessage) -> ChatMessage:
         return self.prune_tool_message(msg)
 
+    def _contained_artifacts_dir(self) -> Path | None:
+        """The artifact directory, resolved inside the workspace; `None` when it is not (P3)."""
+        if self.workspace_root is None:
+            return None
+        try:
+            return PathValidator().resolve_safe_path(
+                Path(self.artifact_subdir), self.workspace_root
+            )
+        except PathTraversalError:
+            return None
+
     def _offload_tool_message(self, msg: ChatMessage, head_len: int) -> ChatMessage:
-        """Offload oversized tool output to sandbox filesystem and reference it."""
+        """Store oversized tool output in the session's result store and stub it.
+
+        The store is the one ingest uses (#1422): the blob is named by its content's
+        handle, so a reused `tool_call_id` cannot overwrite another result, and the stub
+        is the form compaction gives a stored excerpt, naming `tool_result_read` only when
+        the agent can call it (#1640).
+        """
         assert self.workspace_root is not None
+        assert self.session_id is not None
         assert msg.content is not None
 
-        session_subdir = self.session_id if self.session_id is not None else "default"
+        session_subdir = self.session_id
         if any(bad in session_subdir for bad in ("..", "/", "\\", "\x00")):
-            from uclone_x.errors import PathTraversalError
-
             raise PathTraversalError(
                 f"Session ID '{session_subdir}' contains forbidden path traversal sequence"
             )
 
-        tool_name = re.sub(r"[^a-zA-Z0-9_\-]", "_", msg.name or "tool")
-        call_id = msg.tool_call_id or ""
-        if any(bad in call_id for bad in ("..", "/", "\\", "\x00")):
-            from uclone_x.errors import PathTraversalError
-
-            raise PathTraversalError(
-                f"Tool call ID '{call_id}' contains forbidden path traversal sequence"
-            )
-
-        filename = (
-            f"{tool_name}_{call_id}.txt" if call_id else f"{tool_name}_{uuid.uuid4().hex[:8]}.txt"
+        # The sandbox boundary (P3) is checked in two parts. Here, the artifact directory
+        # must resolve inside the workspace. `store_tool_result` then refuses a session
+        # directory or blob that resolves outside that directory, as through a symlink.
+        artifacts_dir = PathValidator().resolve_safe_path(
+            Path(self.artifact_subdir), self.workspace_root
         )
-        target_path = Path(self.artifact_subdir) / session_subdir / filename
-
-        # Must strictly enforce sandbox boundary (P3)
-        safe_path = PathValidator().resolve_safe_path(target_path, self.workspace_root)
-
-        safe_path.parent.mkdir(parents=True, exist_ok=True)
-        # Redact credentials on write so offloaded tool outputs do not retain credentials permanently (#569)
-        redacted_content = redact_credentials(msg.content)
-        safe_path.write_text(redacted_content, encoding="utf-8")
-        rel_path = safe_path.relative_to(self.workspace_root.resolve()).as_posix()
-
-        redacted_head = redacted_content[:head_len]
-        offloaded_content = (
-            f"[Tool Output Offloaded (path=offload, {len(msg.content)} chars total):\n"
-            f"{redacted_head}\n"
-            f"... Full output saved to '{rel_path}'. Use file_read to inspect.]"
+        # Redacted before it is hashed or written (#569), inside `store_tool_result`; the
+        # stub's start is taken from the same redacted text.
+        handle = store_tool_result(artifacts_dir, session_subdir, msg.content)
+        reader_offered = self.tool_result_reader
+        stub = stored_result_stub(
+            handle,
+            redact_credentials(msg.content),
+            keep_chars=head_len,
+            readable=reader_offered,
         )
         return ChatMessage(
             role=msg.role,
-            content=offloaded_content,
+            content=stub,
             name=msg.name,
             tool_call_id=msg.tool_call_id,
             tool_calls=msg.tool_calls,
@@ -605,8 +617,14 @@ class ContextCompactor(ContextCompactorProtocol):
                         "tool that never ran, under a name indistinguishable from a real "
                         "one (P6, #385)."
                     )
+                handle = handle_in(msg.content)
+                # A record written before #1640 names the file it offloaded to.
                 match = re.search(r"Full output saved to '([^']+)'", msg.content or "")
-                if match:
+                if handle is not None:
+                    bullets.append(
+                        f"• Tool Result (turn {i}, {msg.name}): completed execution (stored result: {handle})"
+                    )
+                elif match:
                     artifact_path = match.group(1)
                     bullets.append(
                         f"• Tool Result (turn {i}, {msg.name}): completed execution (artifact: '{artifact_path}')"

@@ -30,7 +30,7 @@ from uclone_x.room.models import (
 from uclone_x.room.orchestrator import RoomOrchestrator
 from uclone_x.room.service import RoomService
 from uclone_x.room.store import RoomStore
-from uclone_x.story import OPEN_STORY_KEY
+from uclone_x.story import OPEN_STORY_KEY, story_after
 from uclone_x.story.library import StoryLibrary
 from uclone_x.tools.models import ToolResultStatus
 from uclone_x.ui.app import create_ui_app
@@ -49,7 +49,11 @@ def _seat(agent_id: str) -> Participant:
 
 
 class _Seat:
-    """Records the conversation and story each turn was given."""
+    """Records the conversation and story each turn was given.
+
+    Its result's `story_id` is the one its tool records leave open, as a real agent's is with
+    the story hook composed in (`test_turn_lifecycle_hooks.py` holds the agent to that).
+    """
 
     def __init__(self, agent_id: str) -> None:
         self.agent_id = agent_id
@@ -71,6 +75,7 @@ class _Seat:
             content=f"{self.agent_id} wrote",
             provenance=None,
             tool_executions=self.tool_executions,
+            story_id=story_after(self.tool_executions, story_id),
         )
 
     def checkpoint_turn(self, session_id: str | None = None) -> SessionState:
@@ -158,8 +163,8 @@ class TestEverySeatWorksOnTheRoomsStory:
     async def test_a_story_opened_by_one_seat_is_the_rooms_for_the_next(
         self, tmp_path: Path
     ) -> None:
-        """Killed by: src/uclone_x/room/orchestrator.py :: "story_id": story_after(executions, state.story_id),
-        Becomes: "story_id": state.story_id,
+        """Killed by: src/uclone_x/room/orchestrator.py :: story_id = result.story_id
+        Becomes: story_id = state.story_id
         """
         store, seats, orch = _room(tmp_path, None)
         seats["scout"].tool_executions = (

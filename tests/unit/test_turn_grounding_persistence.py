@@ -40,11 +40,13 @@ import pytest
 from pydantic import BaseModel, Field
 
 from uclone_x.agent.base import (
-    EVIDENCE_REQUIRED_NUDGE,
-    GROUNDING_REQUIRED_NUDGE_PREFIX,
     BaseAgent,
 )
 from uclone_x.agent.models import AgentConfig, AgentLLMConfig
+from uclone_x.agent.nudges import (
+    EVIDENCE_REQUIRED_NUDGE,
+    GROUNDING_REQUIRED_NUDGE_PREFIX,
+)
 from uclone_x.core.provenance import ExecutionPath, Provenance, ServiceRef
 from uclone_x.llm.connectors.base import BaseLLMConnector
 from uclone_x.llm.models import (
@@ -154,7 +156,7 @@ async def test_an_answer_whose_figure_was_never_read_is_sent_back_once() -> None
     tool output and in no prompt, so the turn did not read it. The existing evidence rule
     is silent here -- a tool executed -- which is why this needed its own condition.
 
-    Killed by: src/uclone_x/agent/base.py :: grounding_nudge,
+    Killed by: src/uclone_x/agent/turn_executor.py :: grounding_nudge,
     Becomes: "",
     """
     llm = ScriptedLLM(
@@ -182,7 +184,7 @@ async def test_an_answer_that_quotes_what_the_tool_returned_is_not_sent_back() -
     Without this the check taxes exactly the turns that did the work, and a nudge on every
     answer carrying a figure is a nudge that distinguishes nothing.
 
-    Killed by: src/uclone_x/agent/base.py :: unsupported = unsupported_specifics(
+    Killed by: src/uclone_x/agent/turn_executor.py :: unsupported = unsupported_specifics(
     Becomes: unsupported = ("42",) or unsupported_specifics(
     """
     llm = ScriptedLLM([_call("tc_1", value=41), _answer("The tool returned 42.")])
@@ -204,7 +206,8 @@ async def test_the_grounding_nudge_is_sent_once_and_then_the_answer_stands() -> 
     `max_steps` -- turning a cheap wrong answer into fifty round-trips of the same wrong
     answer.
 
-    Killed by: src/uclone_x/agent/base.py :: grounding_nudged = True
+    Killed by: src/uclone_x/agent/turn_executor.py :: grounding_nudged = True
+    Becomes: grounding_nudged = False
     """
     llm = ScriptedLLM([_call("tc_1"), _answer("The default is 100.")])
     agent = _agent(llm)
@@ -228,7 +231,8 @@ async def test_the_two_nudges_together_add_at_most_two_steps() -> None:
     same unread figure, is nudged again, and repeats it. `max_steps` is 50 and is not what
     stops this.
 
-    Killed by: src/uclone_x/agent/base.py :: and not grounding_nudged
+    Killed by: src/uclone_x/agent/turn_executor.py :: and not grounding_nudged
+    Becomes: and True
     """
     llm = ScriptedLLM(
         [
@@ -264,7 +268,8 @@ async def test_the_unsupported_specifics_are_reported_even_when_nothing_is_requi
     to miss a trap string. Gating the *field* on the setting would make that unavailable to
     every agent that has not opted into the behaviour.
 
-    Killed by: src/uclone_x/agent/base.py :: unsupported_claims=tuple(unsupported),
+    Killed by: src/uclone_x/agent/turn_executor.py :: unsupported_claims=tuple(unsupported),
+    Becomes: unsupported_claims=(),
     """
     llm = ScriptedLLM([_call("tc_1"), _answer("The default is 100.")])
     agent = _agent(llm, require_evidence=False)
@@ -294,7 +299,7 @@ async def test_the_models_own_earlier_answer_does_not_support_its_later_one() ->
     longer puts it in front of the check. An earlier two-step version had the same flaw: in each, the declaration named
     a line the script did not exercise.
 
-    Killed by: src/uclone_x/agent/base.py :: if m.role is MessageRole.ASSISTANT or not m.content:
+    Killed by: src/uclone_x/agent/nudges.py :: if m.role is MessageRole.ASSISTANT or not m.content:
     Becomes: if not m.content:
     """
     llm = ScriptedLLM(
@@ -324,7 +329,7 @@ async def test_the_nudge_quoting_a_specific_does_not_then_ground_it() -> None:
     on the turn that most needs it, and any later rule built on that field reads a
     fabrication as evidenced.
 
-    Killed by: src/uclone_x/agent/base.py :: text = text.replace(nudge, "")
+    Killed by: src/uclone_x/agent/nudges.py :: text = text.replace(nudge, "")
     Becomes: pass
     """
     llm = ScriptedLLM([_call("tc_1"), _answer("The default is 100.")])

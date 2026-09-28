@@ -1,0 +1,14 @@
+id: kael
+name: 카엘
+profile: 그림자 도적단의 두목. 예린을 벤 자.
+state:
+  status: alive
+progressions:
+  - at: ch02.s01
+    set: {possesses: [moon_sword]}
+    note: 라온에게서 월광검을 빼앗음
+visual:
+  tags: [1boy, black_hair, yellow_eyes, eyepatch]
+  prose: 검은 머리, 노란 눈, 오른눈에 안대.
+  gender: male
+  base_seed: 66013

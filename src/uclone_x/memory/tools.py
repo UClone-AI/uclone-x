@@ -76,6 +76,9 @@ class RecordMemoryFactTool(BaseTool[RecordMemoryFactParams]):
                 source_session_id=session_id,
                 confidence=params.confidence,
                 tags=params.tags,
+                origin="saved",
+                source_room_id=context.room_id,
+                source_turn_id=context.turn_id,
             )
         except ValueError as exc:
             # The store refuses an empty field before it touches anything, so this one

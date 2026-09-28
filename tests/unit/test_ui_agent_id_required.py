@@ -17,68 +17,22 @@ def client(tmp_path: Path) -> TestClient:
     return TestClient(create_ui_app(static_dir=tmp_path, llm=MockLLMConnector()))
 
 
-def test_a_chat_request_that_names_no_agent_is_refused(client: TestClient) -> None:
-    """Answering it meant inventing the answerer.
-
-    These routes read a built-in persona's name when the body carried no `agent_id`. On
-    an install that has no agent by that name -- which is any install whose agents are
-    its own -- the turn still ran: it was executed under a config assembled for a name
-    the caller never wrote, answered 200, and was written into the session record as
-    that agent's. Nothing reported the substitution, which is what P6 forbids; the user
-    saw a reply from somebody they had not addressed.
-
-    Killed by: src/uclone_x/ui/app.py :: if not isinstance(raw, str) or not raw.strip():
-    Becomes: if False:
-    """
-    refused = client.post("/api/turn", json={"message": "hello"})
-
-    assert refused.status_code == 400, refused.text
-    assert "agent_id" in refused.json()["detail"]
-
-
 def test_the_refusal_says_where_to_find_the_names(client: TestClient) -> None:
     """P0: the reader is not assumed to know the API.
 
     A bare "field required" leaves a non-expert with no next step, so the refusal names
-    the endpoint that lists this install's agents rather than only the missing field.
+    the endpoint that lists this install's agents rather than only the missing field. A
+    blank name is no name: answering it would mean inventing the answerer (P6).
+
+    Killed by: src/uclone_x/ui/app.py :: if not isinstance(raw, str) or not raw.strip():
+    Becomes: if False:
     """
-    detail = client.post("/api/turn", json={"message": "hello"}).json()["detail"]
-
-    assert "/api/agents" in detail
-    assert "no default agent" in detail
-
-
-def test_truncating_a_conversation_names_the_agent_whose_it_is(client: TestClient) -> None:
-    """Truncation reached for a default through a chain of `or`s.
-
-    `str(body.get("agent_id") or agent_id or "champion")` let a truncate request with no
-    name cut a *different* agent's transcript back to an index the caller chose for
-    theirs -- a destructive edit, attributed to the wrong agent and not reported.
-
-    Killed by: src/uclone_x/ui/app.py :: eff_agent_id = _required_agent_id(body.get("agent_id") or agent_id)
-    Becomes: eff_agent_id = str(body.get("agent_id") or agent_id or "champion")
-    """
-    refused = client.post("/api/session/history/truncate", json={"index": 0})
-
+    refused = client.post("/api/dispatch", json={"task": "summarize", "agent_id": "  "})
     assert refused.status_code == 400, refused.text
-    assert "agent_id" in refused.json()["detail"]
+    detail = refused.json()["detail"]
 
-
-@pytest.mark.parametrize("method", ["GET", "DELETE"])
-def test_reading_or_clearing_history_without_a_name_is_refused(
-    client: TestClient, method: str
-) -> None:
-    """The two query-parameter routes refuse with FastAPI's own 422.
-
-    No `Killed by:` declaration: requiredness here is the *absence* of a default in the
-    signature (`agent_id: str`), and that line is not unique in the file, so no
-    single-line mutation names it. The test still pins the observable behaviour --
-    without it, re-adding `= "champion"` to either signature would make both routes read
-    and *delete* a named agent's transcript for a request that named nobody.
-    """
-    refused = client.request(method, "/api/session/history")
-
-    assert refused.status_code == 422, refused.text
+    assert "/api/personas" in detail
+    assert "no default agent" in detail
 
 
 def test_a_dispatch_without_a_recipient_is_refused(client: TestClient) -> None:

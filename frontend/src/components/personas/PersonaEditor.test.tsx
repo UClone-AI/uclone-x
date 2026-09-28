@@ -3,9 +3,12 @@ import { fireEvent, render, screen } from '@testing-library/react';
 import React from 'react';
 import { PersonaEditor, type PersonaEditorProps } from './PersonaEditor';
 import { emptyPersonaDraft, type PersonaDraft } from '../../lib/personaDraft';
-import { PERSONA_EDITOR_COPY } from '../../lib/personaCopy';
+import { en } from '../../i18n/en';
+import { fmt, plural } from '../../i18n/format';
 import editorSource from './PersonaEditor.tsx?raw';
 import managerSource from './PersonaManager.tsx?raw';
+
+const PERSONA_EDITOR_COPY = en.personaEditor;
 
 /**
  * The persona editor (#892) is a controlled, props-only form: what it shows is the draft it
@@ -80,10 +83,10 @@ describe('PersonaEditor', () => {
     const props = renderEditor({ draft: valid({ allowed_tools: ['map_area'] }) });
 
     expect(screen.getByTestId('persona-tools-mode-badge')).toHaveTextContent(
-      PERSONA_EDITOR_COPY.fields.toolsRestrictedBadge!(1, 2),
+      fmt(PERSONA_EDITOR_COPY.fields.toolsRestrictedBadge, { count: 1, total: 2 }),
     );
     expect(screen.getByTestId('persona-restricted-tools-cause')).toHaveTextContent(
-      PERSONA_EDITOR_COPY.fields.toolsRestrictedNotice!(1),
+      plural(PERSONA_EDITOR_COPY.fields.toolsRestrictedNotice, 1),
     );
     expect(screen.queryByTestId('persona-no-tools-cause')).not.toBeInTheDocument();
 
@@ -169,7 +172,7 @@ describe('PersonaEditor', () => {
       target: { value: 'Changed' },
     });
 
-    expect(screen.getByRole('alert')).toHaveTextContent(PERSONA_EDITOR_COPY.nameTaken('surveyor'));
+    expect(screen.getByRole('alert')).toHaveTextContent(fmt(PERSONA_EDITOR_COPY.nameTaken, { name: 'surveyor' }));
   });
 
   it('locks the name on an edit and says a built-in is saved as the user\'s own copy', () => {

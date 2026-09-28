@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from uclone_x.core.provenance import ExecutionPath, Provenance
+from uclone_x.core.tool_results import handle_in, load_tool_result, result_handle
 from uclone_x.errors import BudgetExceededError, UnmappableChatMessageError
 from uclone_x.llm import (
     ChatMessage,
@@ -408,6 +409,40 @@ def test_a_replys_estimate_counts_the_tool_calls_it_made() -> None:
     )
 
 
+def test_korean_tool_call_arguments_are_counted_as_utf8_not_as_escapes() -> None:
+    """A Hangul syllable is three UTF-8 bytes, not the six of a `\\uXXXX` escape (#1640).
+
+    Killed by: src/uclone_x/llm/compactor.py :: json.dumps(unwrap_immutable(tool_call.arguments), ensure_ascii=False)
+    Becomes: json.dumps(unwrap_immutable(tool_call.arguments))
+    """
+    text = "서울의 오늘 날씨를 알려 주세요" * 10
+    call = ToolCallRequest(id="call_1", name="search", arguments={"q": text})
+    arguments = '{"q": "' + text + '"}'
+
+    assert estimate_reply_tokens(None, (call,)) == (
+        4 + estimate_text_tokens("call_1search") + estimate_text_tokens(arguments)
+    )
+
+
+def test_a_korean_tool_schema_is_counted_as_utf8_not_as_escapes() -> None:
+    """Killed by: src/uclone_x/llm/compactor.py :: schema = json.dumps(unwrap_immutable(tool.parameters), ensure_ascii=False)
+    Becomes: schema = json.dumps(unwrap_immutable(tool.parameters))
+    """
+    messages = (ChatMessage(role=MessageRole.USER, content="날씨"),)
+    description = "날씨를 알고 싶은 도시의 이름" * 10
+    tool = ToolDefinition(
+        name="weather",
+        description="도시의 현재 날씨",
+        parameters={"type": "object", "properties": {"city": {"description": description}}},
+    )
+    schema = '{"type": "object", "properties": {"city": {"description": "' + description + '"}}}'
+
+    bare = estimate_request_tokens(LLMRequest(messages=messages))
+    with_tool = estimate_request_tokens(LLMRequest(messages=messages, tools=(tool,)))
+
+    assert with_tool - bare == 4 + estimate_text_tokens(f"weather 도시의 현재 날씨 {schema}")
+
+
 def test_context_compactor_should_compact_at() -> None:
     compactor = ContextCompactor()
 
@@ -514,6 +549,7 @@ async def test_context_compactor_prunes_long_tool_outputs() -> None:
 
 @pytest.mark.asyncio
 async def test_context_compactor_offloads_oversized_tool_output(tmp_path: Path) -> None:
+    """Oversized output goes to the session's `tr_` result store and is stubbed (#1640)."""
     workspace_root = tmp_path / "sandbox_ws"
     workspace_root.mkdir()
     compactor = ContextCompactor(
@@ -539,16 +575,67 @@ async def test_context_compactor_offloads_oversized_tool_output(tmp_path: Path) 
     assert len(compacted) == 3
     tool_msg = compacted[2]
     assert tool_msg.role == MessageRole.TOOL
-    assert "[Tool Output Offloaded" in (tool_msg.content or "")
-    assert "path=offload" in (tool_msg.content or "")
-    assert "query_db_call_db_1.txt" in (tool_msg.content or "")
+    handle = handle_in(tool_msg.content)
+    assert handle is not None
+    assert f'tool_result_read(handle="{handle}", offset=0)' in (tool_msg.content or "")
+    assert "file_read" not in (tool_msg.content or "")
 
-    # Assert artifact written to disk and content matches
-    artifact_path = (
-        workspace_root / ".sandbox" / "tool_artifacts" / "sess_alpha" / "query_db_call_db_1.txt"
+    artifacts = workspace_root / ".sandbox" / "tool_artifacts"
+    assert load_tool_result(artifacts, "sess_alpha", handle) == long_tool_content
+
+
+@pytest.mark.asyncio
+async def test_a_reused_call_id_does_not_overwrite_an_earlier_offload(tmp_path: Path) -> None:
+    """Two results under one `tool_call_id` are both kept (#1640).
+
+    Ollama and Gemini number calls `call_0`, `call_1` per response, so the same id recurs
+    across steps. The store names a blob by its content, not by the call.
+
+    Killed by: src/uclone_x/llm/compactor.py :: handle = store_tool_result(artifacts_dir, session_subdir, msg.content)
+    Becomes: handle = store_tool_result(artifacts_dir, session_subdir, str(msg.tool_call_id))
+    """
+    compactor = ContextCompactor(
+        max_tool_output_chars=100, workspace_root=tmp_path, session_id="sess_reuse"
     )
-    assert artifact_path.is_file()
-    assert artifact_path.read_text(encoding="utf-8") == long_tool_content
+    first, second = "first " * 100, "second " * 100
+    stubs = [
+        compactor.prune_tool_message(
+            ChatMessage(role=MessageRole.TOOL, name="fetch", content=body, tool_call_id="call_0")
+        )
+        for body in (first, second)
+    ]
+
+    handles = [handle_in(stub.content) for stub in stubs]
+    assert None not in handles
+    artifacts = tmp_path / ".sandbox" / "tool_artifacts"
+    assert [load_tool_result(artifacts, "sess_reuse", str(h)) for h in handles] == [first, second]
+
+
+@pytest.mark.asyncio
+async def test_an_offload_does_not_name_a_reader_the_agent_lacks(tmp_path: Path) -> None:
+    """Without `tool_result_read` the stub says the output was kept, and names no tool.
+
+    It named `file_read` whether or not the agent had it (#1640).
+
+    Killed by: src/uclone_x/llm/compactor.py :: readable=reader_offered,
+    Becomes: readable=True,
+    """
+    compactor = ContextCompactor(
+        max_tool_output_chars=100,
+        workspace_root=tmp_path,
+        session_id="sess_blind",
+        tool_result_reader=False,
+    )
+    msg = ChatMessage(role=MessageRole.TOOL, name="fetch", content="Q" * 500, tool_call_id="c1")
+
+    stub = compactor.prune_tool_message(msg)
+
+    assert handle_in(stub.content) is not None
+    assert "tool_result_read" not in (stub.content or "")
+    assert "file_read" not in (stub.content or "")
+    assert "no tool to read it" in (stub.content or "")
+    # A second pass leaves the stub as it is rather than storing the stub itself.
+    assert compactor.prune_tool_message(stub) == stub
 
 
 @pytest.mark.asyncio
@@ -568,8 +655,8 @@ async def test_context_compactor_refuses_path_traversal(tmp_path: Path) -> None:
     with pytest.raises(PathTraversalError):
         compactor_bad_session.prune_tool_message(msg)
 
-    # 2. Traversal via tool_call_id
-    compactor_bad_call = ContextCompactor(
+    # 2. A tool_call_id no longer names a file, so a hostile one lands inside the store.
+    compactor = ContextCompactor(
         max_tool_output_chars=100,
         workspace_root=workspace_root,
         session_id="valid_session",
@@ -580,8 +667,37 @@ async def test_context_compactor_refuses_path_traversal(tmp_path: Path) -> None:
         content="Z" * 500,
         tool_call_id="../../escaped_call",
     )
+    handle = handle_in(compactor.prune_tool_message(bad_msg).content)
+    assert handle is not None
+    stored = workspace_root / ".sandbox" / "tool_artifacts" / "valid_session" / f"{handle}.txt"
+    assert stored.is_file()
+    assert not (tmp_path / "escaped_call").exists()
+
+
+def test_an_offload_refuses_a_session_directory_symlinked_outside(tmp_path: Path) -> None:
+    """A session directory that is a symlink out of the workspace is refused, not written (P3).
+
+    The session id is lexically clean, so only resolving the path catches a planted link.
+
+    Killed by: src/uclone_x/core/tool_results.py :: _blob_path(artifacts_dir, session_id, handle), artifacts_dir
+    Becomes: _blob_path(artifacts_dir, session_id, handle), Path("/")
+    """
+    from uclone_x.errors import PathTraversalError
+
+    workspace_root = tmp_path / "ws"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    artifacts = workspace_root / ".sandbox" / "tool_artifacts"
+    artifacts.mkdir(parents=True)
+    (artifacts / "sess").symlink_to(outside, target_is_directory=True)
+    compactor = ContextCompactor(
+        max_tool_output_chars=100, workspace_root=workspace_root, session_id="sess"
+    )
+    msg = ChatMessage(role=MessageRole.TOOL, name="fetch", content="W" * 600, tool_call_id="c1")
+
     with pytest.raises(PathTraversalError):
-        compactor_bad_call.prune_tool_message(bad_msg)
+        compactor.prune_tool_message(msg)
+    assert list(outside.iterdir()) == []
 
 
 @pytest.mark.asyncio
@@ -610,10 +726,7 @@ async def test_heuristic_ledger_includes_offloaded_artifact(tmp_path: Path) -> N
     ledger_msg = next(m for m in outcome.messages if m.compaction_ledger)
     assert ledger_msg.content is not None
     assert "search_logs" in ledger_msg.content
-    assert (
-        "artifact: '.sandbox/tool_artifacts/sess_ledger/search_logs_call_s1.txt'"
-        in ledger_msg.content
-    )
+    assert f"(stored result: {result_handle('A' * 600)})" in ledger_msg.content
 
 
 class _MockSummarizer(LLMProviderProtocol):

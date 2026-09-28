@@ -169,7 +169,7 @@ async def test_write_flag_off_refuses_a_writing_tool_by_raising_and_never_runs_i
 async def test_write_flag_off_does_not_offer_a_writing_tool_to_the_model() -> None:
     """The advertisement drops what the flags refuse, and keeps what they do not.
 
-    Killed by: src/uclone_x/agent/base.py :: if self._capability_refusal(t) is not None:
+    Killed by: src/uclone_x/agent/tool_invoker.py :: if self._scope.capability_refusal(t) is not None:
     Becomes: if False:
     """
     llm = _RecordingConnector()
@@ -337,6 +337,8 @@ def test_the_ruling_s_classification_of_every_shipped_tool() -> None:
         "web_fetch": False,
         "web_search": False,
         "generate_image": True,
+        # Only the calling clone's own picture, in a folder no general tool can write.
+        "set_avatar": False,
         "character_sheet": True,
         "story_library": True,
         "muse_spark": False,
@@ -453,7 +455,7 @@ _EDITABLE_KEYS = (
 def test_the_shipped_guardian_neither_writes_nor_delegates_until_its_settings_allow_it(
     tmp_path: Path,
 ) -> None:
-    """Through `/api/turn`, with the default tools and the shipped `guardian` persona.
+    """Through the session manager, with the default tools and the shipped `guardian` persona.
 
     The model asks for `file_write` and `delegate_subagent` whether or not it was offered
     them, which is what a small model does. Under guardian's shipped flags (`false`, `false`)
@@ -461,7 +463,7 @@ def test_the_shipped_guardian_neither_writes_nor_delegates_until_its_settings_al
     sub-agent's prompt. Turning on "Allow file-writing tools" from the editor
     (`PUT /api/personas/guardian`) reaches the running agent, and the next turn writes.
 
-    Killed by: src/uclone_x/agent/base.py :: elif (refusal := self._capability_refusal(tool_inst)) is not None:
+    Killed by: src/uclone_x/agent/tool_execution.py :: elif (refusal := self._capability_refusal(tool_inst)) is not None:
     Becomes: elif False:
     """
     workspace = tmp_path / "ws"
@@ -496,9 +498,14 @@ def test_the_shipped_guardian_neither_writes_nor_delegates_until_its_settings_al
             if m.role is MessageRole.SYSTEM
         )
 
+    async def take_turn(session_id: str, message: str) -> None:
+        agent = await manager.get_or_create_agent("guardian", session_id=session_id)
+        await agent.execute_turn(message)
+
     with TestClient(app) as client:
-        turn = {"message": "review this", "agent_id": "guardian", "session_id": "s1"}
-        assert client.post("/api/turn", json=turn).status_code == 200
+        portal = client.portal
+        assert portal is not None
+        portal.call(take_turn, "s1", "review this")
         guardian = manager.get_agent("guardian", "s1")
         assert guardian is not None
         assert (guardian.write_tools_enabled, guardian.subagent_tools_enabled) == (False, False)
@@ -512,8 +519,7 @@ def test_the_shipped_guardian_neither_writes_nor_delegates_until_its_settings_al
         res = client.put("/api/personas/guardian", json=edit)
         assert res.status_code == 200, res.text
 
-        turn = {"message": "now fix it", "agent_id": "guardian", "session_id": "s2"}
-        assert client.post("/api/turn", json=turn).status_code == 200
+        portal.call(take_turn, "s2", "now fix it")
 
         assert target.read_text(encoding="utf-8") == "rewritten"
         assert not a_helper_was_started()
@@ -530,7 +536,7 @@ async def test_an_executed_tools_declarations_are_carried_on_its_record() -> Non
     without it, the room would have to guess from an output's shape, and `file_read`
     returns a `path` too.
 
-    Killed by: src/uclone_x/agent/base.py :: declared_writes = tool_call_writes_files(tool_inst, unwrapped_args)
+    Killed by: src/uclone_x/agent/tool_execution.py :: declared_writes = tool_call_writes_files(tool_inst, unwrapped_args)
     Becomes: declared_writes = False
     """
     agent = _agent(_Writer(), _Reader(), enable_write_tools=True)
@@ -557,7 +563,7 @@ class _Spawner(BaseTool[_TextParams]):
 async def test_a_spawning_tools_declaration_is_carried_on_its_record() -> None:
     """P4: the room's topology draws a sub-agent only from a tool that declares it spawns.
 
-    Killed by: src/uclone_x/agent/base.py :: spawns_subagents=tool_spawns_subagents(tool_inst),
+    Killed by: src/uclone_x/agent/tool_execution.py :: spawns_subagents=tool_spawns_subagents(tool_inst),
     Becomes: spawns_subagents=False,
     """
     agent = _agent(_Spawner(), enable_subagent_tools=True)

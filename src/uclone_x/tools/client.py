@@ -9,6 +9,7 @@ import os
 import re
 import shutil
 import signal
+import tempfile
 import time
 import types
 import urllib.parse
@@ -21,7 +22,7 @@ from pydantic import JsonValue
 
 import uclone_x
 from uclone_x.core.provenance import Provenance
-from uclone_x.errors import SandboxViolationError
+from uclone_x.errors import PlainRefusalError, SandboxViolationError
 from uclone_x.sandbox.models import (
     IsolationLevel,
     effective_isolation_level,
@@ -29,7 +30,13 @@ from uclone_x.sandbox.models import (
 )
 from uclone_x.sandbox.path_validator import PathValidator
 from uclone_x.sandbox.protocols import PathValidatorProtocol
-from uclone_x.sandbox.story_jail import story_library_jail
+from uclone_x.sandbox.story_jail import (
+    JAIL_SERVER_REFUSAL,
+    has_started,
+    jailed_exec,
+    remove_started_folder,
+    story_library_jail,
+)
 from uclone_x.tools.models import (
     MCPConnectionConfig,
     MCPTransport,
@@ -502,45 +509,70 @@ class MCPClient:
                 assert self._config.command is not None
                 # A local server is a process the model drives, so it runs where the
                 # system allows in the jail that keeps it from writing the story library,
-                # as `bash_run` does (#1589). `sandbox-exec` starts the command itself,
+                # as `bash_run` does (#1589). The jail's shell starts the command itself,
                 # so a missing command is looked for first: otherwise it would surface as
-                # `sandbox-exec` failing, not as a missing server.
-                jail = story_library_jail(self._config.workspace_root)
-                if jail and not _command_exists(self._config.command, child_env, cwd_str):
-                    raise FileNotFoundError(
-                        f"MCP server executable not found: '{self._config.command}'"
-                    )
+                # the shell failing, not as a missing server.
                 try:
-                    self._process = await asyncio.create_subprocess_exec(
-                        *jail,
-                        self._config.command,
-                        *self._config.args,
-                        stdin=asyncio.subprocess.PIPE,
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE,
-                        cwd=cwd_str,
-                        env=child_env,
-                        # A server's stdout line can be a whole tool listing; asyncio's
-                        # 64 KiB default makes `readline` fail on a large one.
-                        limit=_STDIO_LINE_LIMIT,
-                        # Its own process group, so stopping it also stops what a launcher
-                        # (`npx`, `uvx`) started beneath it.
-                        start_new_session=os.name == "posix",
-                    )
-                except FileNotFoundError as err:
-                    raise FileNotFoundError(
-                        f"MCP server executable not found: '{self._config.command}'"
-                    ) from err
-                self._stderr_tail.clear()
-                self._stderr_task = asyncio.create_task(self._drain_stderr(self._process))
-
+                    jail = story_library_jail(self._config.workspace_root)
+                except PlainRefusalError:
+                    raise PlainRefusalError(JAIL_SERVER_REFUSAL) from None
+                argv = [self._config.command, *self._config.args]
+                # Created by the jailed shell before it becomes the server, so a missing
+                # file after a failed start means the jail never started it (#1611).
+                started_dir: Path | None = None
+                if jail:
+                    if not _command_exists(self._config.command, child_env, cwd_str):
+                        raise FileNotFoundError(
+                            f"MCP server executable not found: '{self._config.command}'"
+                        )
+                    started_dir = Path(tempfile.mkdtemp(prefix="ucx-jail-"))
+                    argv = jailed_exec(jail, argv, started_dir / "started")
                 try:
-                    await self._initialize(_STDIO_PROTOCOL_VERSION)
-                except Exception:
-                    await self._terminate_process()
-                    raise
+                    await self._start_stdio(argv, child_env, cwd_str, started_dir)
+                finally:
+                    if started_dir is not None:
+                        remove_started_folder(started_dir)
 
                 self._connected = True
+
+    async def _start_stdio(
+        self,
+        argv: list[str],
+        child_env: dict[str, str],
+        cwd_str: str | None,
+        started_dir: Path | None,
+    ) -> None:
+        try:
+            self._process = await asyncio.create_subprocess_exec(
+                *argv,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=cwd_str,
+                env=child_env,
+                # A server's stdout line can be a whole tool listing; asyncio's
+                # 64 KiB default makes `readline` fail on a large one.
+                limit=_STDIO_LINE_LIMIT,
+                # Its own process group, so stopping it also stops what a launcher
+                # (`npx`, `uvx`) started beneath it.
+                start_new_session=os.name == "posix",
+            )
+        except FileNotFoundError as err:
+            raise FileNotFoundError(
+                f"MCP server executable not found: '{self._config.command}'"
+            ) from err
+        self._stderr_tail.clear()
+        self._stderr_task = asyncio.create_task(self._drain_stderr(self._process))
+
+        try:
+            await self._initialize(_STDIO_PROTOCOL_VERSION)
+        except Exception:
+            await self._terminate_process()
+            # Stopped first, so the marker can no longer appear. Without it, what the
+            # server "said" is `sandbox-exec`'s own complaint, not the server's (#1611).
+            if started_dir is not None and not has_started(started_dir / "started"):
+                raise PlainRefusalError(JAIL_SERVER_REFUSAL) from None
+            raise
 
     async def _close_http(self) -> None:
         http, self._http = self._http, None

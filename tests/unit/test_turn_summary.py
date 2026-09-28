@@ -369,3 +369,24 @@ def test_turn_summary_turn_not_found() -> None:
     state = RoomState(room_id="room_empty")
     with pytest.raises(TurnNotFoundError):
         summarize_turn(state, 999)
+
+
+@pytest.mark.parametrize("tools_recorded", [False, True])
+def test_turn_summary_carries_the_provider_failure(tools_recorded: bool) -> None:
+    """The turn panel names the remedy from this, so both agent-turn branches must carry it (#1630)."""
+    from uclone_x.agent.models import ProviderFailure
+    from uclone_x.errors import ProviderUnreachableError
+
+    failure = ProviderFailure.of(ProviderUnreachableError(provider="OpenAI", model="gpt-5-mini"))
+    msg = RoomMessage(
+        seq=1,
+        sender_id="scout",
+        content="",
+        error=failure.message,
+        turn_id="turn_1",
+        tools_recorded=tools_recorded,
+        provider_failure=failure,
+    )
+    state = RoomState(room_id="room_1", participants=(_make_agent("scout"),), transcript=(msg,))
+
+    assert summarize_turn(state, 1).provider_failure == failure

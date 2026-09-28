@@ -235,7 +235,8 @@ async def test_execute_turn_loop_synchronizes_with_deducted_steps() -> None:
     When tools consume child steps during a step, the next loop iteration
     accounts for those consumed steps so the session ceiling cannot be breached.
 
-    Killed by: src/uclone_x/agent/base.py :: step = self._run_steps + 1
+    Killed by: src/uclone_x/agent/turn_executor.py :: step = self._run_steps + 1
+    Becomes: step = locals().get("step", 0) + 1
     """
     from pydantic import BaseModel
 

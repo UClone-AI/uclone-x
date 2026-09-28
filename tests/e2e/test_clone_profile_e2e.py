@@ -19,12 +19,14 @@ in passes every selector written about it.
 from __future__ import annotations
 
 import base64
+import contextlib
 from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 import yaml
 from playwright.async_api import FloatRect, Page, async_playwright
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from tests.e2e.conftest import TWO_FRAMES, dock_locator, mock_llm, running_ui
 
@@ -165,7 +167,11 @@ async def test_a_clone_with_no_picture_installed_shows_the_default_and_no_broken
             await _pick(page, "courier")
 
             avatar = page.get_by_test_id("clone-profile-avatar")
-            await page.evaluate(TWO_FRAMES)
+            # The element goes only once the browser's request for the picture has answered 404
+            # and fired `error`; two frames after the pick can be before that on a loaded
+            # machine (#1722), so the drop itself is waited for.
+            with contextlib.suppress(PlaywrightTimeoutError):
+                await avatar.locator("img").wait_for(state="detached", timeout=10_000)
             assert await avatar.locator("img").count() == 0, (
                 "a clone with no picture installed is still holding an image element"
             )

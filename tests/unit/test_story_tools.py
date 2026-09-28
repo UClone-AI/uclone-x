@@ -16,12 +16,12 @@ What these pin, in order of what it would cost to get wrong:
 
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 from typing import Any
 
 import pytest
 import yaml
-from fastapi.testclient import TestClient
 
 from uclone_x.agent.base import BaseAgent
 from uclone_x.agent.models import AgentConfig, AgentLLMConfig
@@ -41,7 +41,6 @@ from uclone_x.tools.base import BaseTool
 from uclone_x.tools.builtin.character import CharacterSheetTool
 from uclone_x.tools.models import NoIsolation, ToolContext, ToolResult
 from uclone_x.tools.registry import create_default_registry
-from uclone_x.ui.app import AgentSessionManager, create_ui_app
 
 ROOM_A = "room_a"
 ROOM_B = "room_b"
@@ -669,7 +668,16 @@ class TestTheManuscriptKeepsWhatItReplaces:
         assert log["revisions"][1]["room_id"] == ROOM_A
         assert "notes" not in out
 
-    async def test_writing_over_text_without_its_digest_is_refused(self, tmp_path: Path) -> None:
+    async def test_writing_over_text_without_its_digest_names_the_digest(
+        self, tmp_path: Path
+    ) -> None:
+        """#1613: a model that had just read the scene was told only to read it again, did,
+        and repeated the same digest-less write until the step cap. The refusal names the
+        argument to pass, and no file.
+
+        Killed by: src/uclone_x/story/tools.py :: if digest is None:
+        Becomes: if False:
+        """
         story_id = await _new_story(tmp_path)
         ctx = await _outlined(tmp_path, story_id)
         tool = StoryManuscriptTool()
@@ -678,9 +686,38 @@ class TestTheManuscriptKeepsWhatItReplaces:
         result = await _call(tool, ctx, action="write", scene_id="ch01.s01", text="Oops.")
 
         assert not result.success
-        assert result.error is not None and "nothing was written" in result.error
+        assert result.error == (
+            "Scene 'ch01.s01' already has text, so nothing was written. To replace it, pass "
+            "the digest that reading the scene returned, as 'digest'."
+        )
         scene = tmp_path / "stories" / story_id / "manuscript" / "ch01.s01.md"
         assert scene.read_text(encoding="utf-8") == "First draft."
+
+    async def test_writing_with_a_stale_digest_says_to_read_again(self, tmp_path: Path) -> None:
+        """A digest that no longer matches is a different case from a missing one: the
+        scene changed since it was read (here, by hand), so reading again is the fix.
+
+        Killed by: src/uclone_x/story/tools.py :: if digest is None:
+        Becomes: if True:
+        """
+        story_id = await _new_story(tmp_path)
+        ctx = await _outlined(tmp_path, story_id)
+        tool = StoryManuscriptTool()
+        await _ok(tool, ctx, action="write", scene_id="ch01.s01", text="First draft.")
+        read = await _ok(tool, ctx, action="read", scene_id="ch01.s01")
+        _put(tmp_path, story_id, "manuscript/ch01.s01.md", "Edited by hand.")
+
+        result = await _call(
+            tool, ctx, action="write", scene_id="ch01.s01", text="Mine.", digest=read["digest"]
+        )
+
+        assert not result.success
+        assert result.error == (
+            "Scene 'ch01.s01' changed after it was read, so nothing was written. Read it "
+            "again and make the change on the current version, with the digest that returns."
+        )
+        scene = tmp_path / "stories" / story_id / "manuscript" / "ch01.s01.md"
+        assert scene.read_text(encoding="utf-8") == "Edited by hand."
 
     async def test_a_scene_not_in_the_outline_is_refused(self, tmp_path: Path) -> None:
         story_id = await _new_story(tmp_path)
@@ -719,6 +756,225 @@ class TestTheManuscriptKeepsWhatItReplaces:
 # --------------------------------------------------------------------------------------
 # The outline
 # --------------------------------------------------------------------------------------
+
+
+class TestAWriteSaysWhatTheStoryChangedBefore:
+    """A saved scene is told when it names the dead or a lost thing, without being asked (#1613).
+
+    The eval's moon-seal story: 예린 dies at ch01.s03 (story time 3), 라온 loses 월광검 to
+    카엘 at ch02.s01 (time 4), and ch02.s03 is a flashback at time 0, before both.
+    """
+
+    FIXTURE = Path(__file__).resolve().parents[1] / "fixtures" / "writer"
+
+    def _moon_seal(self, workspace: Path) -> ToolContext:
+        shutil.copytree(self.FIXTURE, workspace, dirs_exist_ok=True)
+        return _ctx(workspace, conversation="writer-eval-room", story="moon-seal")
+
+    async def _write(self, workspace: Path, scene_id: str, text: str) -> dict[str, Any]:
+        return await _ok(
+            StoryManuscriptTool(), self._moon_seal(workspace), action="write",
+            scene_id=scene_id, text=text,
+        )  # fmt: skip
+
+    async def test_a_scene_after_the_death_that_names_the_dead_is_told(
+        self, tmp_path: Path
+    ) -> None:
+        """Killed by: src/uclone_x/story/context.py :: and "status" in snapshot.set_at
+        Becomes: and "status" not in snapshot.set_at
+        """
+        out = await self._write(tmp_path, "ch02.s04", "예린이 웃으며 라온의 어깨를 두드렸다.")
+
+        assert out["digest"]
+        assert (tmp_path / out["path"]).read_text(encoding="utf-8").startswith("예린이")
+        [line] = out["continuity"]
+        assert "예린" in line and "ch01.s03" in line and "dead" in line
+        assert "고쳐 다시 쓰세요" in out["continuity_note"]
+
+    async def test_a_lost_thing_names_who_lost_it_last_and_who_has_it(self, tmp_path: Path) -> None:
+        """Killed by: src/uclone_x/story/context.py :: max(lost, key=lambda found: found[0])
+        Becomes: min(lost, key=lambda found: found[0])
+        """
+        out = await self._write(tmp_path, "ch02.s04", "라온은 월광검을 높이 들었다.")
+
+        [line] = out["continuity"]
+        assert line.startswith("라온 no longer has 월광검")
+        assert "ch02.s01" in line and "카엘 has it now" in line
+
+    async def test_a_flashback_before_the_death_is_not_told(self, tmp_path: Path) -> None:
+        """Killed by: src/uclone_x/story/context.py :: item.entry, placements, scene_id, through_scene=False
+        Becomes: item.entry, placements, list(placements)[-1], through_scene=False
+        """
+        out = await self._write(
+            tmp_path, "ch02.s03", "어린 라온은 예린에게서 월광검을 처음 받았다."
+        )
+
+        assert "continuity" not in out and "continuity_note" not in out
+        assert "notes" not in out
+
+    async def test_the_notice_is_in_plain_words(self, tmp_path: Path) -> None:
+        """Killed by: src/uclone_x/story/context.py :: name = item.entry.name
+        Becomes: name = item.entry.id
+        """
+        out = await self._write(tmp_path, "ch02.s04", "예린이 월광검을 라온에게 돌려주었다.")
+
+        again = await _ok(
+            StoryManuscriptTool(), self._moon_seal(tmp_path), action="write",
+            scene_id="ch02.s04", text="예린이 월광검을 쥐었다.", digest=out["digest"],
+        )  # fmt: skip
+        words = " ".join(
+            [
+                *out["continuity"],
+                out["continuity_note"],
+                *again["continuity"],
+                again["continuity_note"],
+            ]
+        )
+        assert len(out["continuity"]) == 2
+        for internal in (
+            "yerin", "raon", "kael", "moon_sword", "progression", "codex", "status",
+            "possesses", "state", ".yaml", "stories/", "Traceback",
+        ):  # fmt: skip
+            assert internal not in words, internal
+
+    async def test_the_notice_quotes_the_sentence_that_names_them(self, tmp_path: Path) -> None:
+        """Killed by: src/uclone_x/story/context.py :: found.append(f'"{sentence}"')
+        Becomes: pass
+        """
+        out = await self._write(
+            tmp_path, "ch02.s04", "새벽이 밝았다. 예린이 라온의 자세를 바로잡았다. 바람이 불었다."
+        )
+
+        [line] = out["continuity"]
+        assert '"예린이 라온의 자세를 바로잡았다."' in line
+        assert "새벽이 밝았다" not in line and "바람이 불었다" not in line
+
+    async def test_the_first_notice_says_to_rewrite_now_in_the_scenes_language(
+        self, tmp_path: Path
+    ) -> None:
+        """Killed by: src/uclone_x/story/context.py :: korean = bool(_HANGUL.search(text))
+        Becomes: korean = False
+        """
+        out = await self._write(tmp_path, "ch02.s04", "예린이 웃으며 라온의 어깨를 두드렸다.")
+
+        note = out["continuity_note"]
+        assert note.startswith("아직 끝나지 않았습니다. 이 장면을 고쳐 다시 쓰세요")
+        assert "'ch02.s04'" in note and f"'{out['digest']}'" in note
+        assert "회상" in note  # a flashback may stay as it is: a notice, not a refusal
+
+    async def test_a_rewrite_of_its_own_text_is_not_sent_round_again(self, tmp_path: Path) -> None:
+        """Killed by: src/uclone_x/story/tools.py :: rewrite_of_own = work.last_writer(scene_id) == room_id
+        Becomes: rewrite_of_own = False
+        """
+        first = await self._write(tmp_path, "ch02.s04", "예린이 웃으며 라온의 어깨를 두드렸다.")
+        again = await _ok(
+            StoryManuscriptTool(), self._moon_seal(tmp_path), action="write",
+            scene_id="ch02.s04", text="라온은 죽은 예린을 떠올렸다.", digest=first["digest"],
+        )  # fmt: skip
+
+        assert again["continuity"]
+        note = again["continuity_note"]
+        assert "다시 고치지는 마세요" in note and "고쳐 다시 쓰세요" not in note
+        assert again["digest"] not in note
+
+    async def test_another_conversations_text_is_a_first_notice(self, tmp_path: Path) -> None:
+        """Killed by: src/uclone_x/story/tools.py :: rewrite_of_own = work.last_writer(scene_id) == room_id
+        Becomes: rewrite_of_own = work.last_writer(scene_id) is not None
+        """
+        first = await self._write(tmp_path, "ch02.s04", "예린이 웃으며 라온의 어깨를 두드렸다.")
+        [log] = (tmp_path / "stories" / "moon-seal").rglob("revisions.yaml")
+        text = log.read_text(encoding="utf-8")
+        assert "writer-eval-room" in text
+        log.write_text(text.replace("writer-eval-room", "another-room"), encoding="utf-8")
+        again = await _ok(
+            StoryManuscriptTool(), self._moon_seal(tmp_path), action="write",
+            scene_id="ch02.s04", text="예린이 다시 웃었다.", digest=first["digest"],
+        )  # fmt: skip
+
+        assert "고쳐 다시 쓰세요" in again["continuity_note"]
+
+
+class TestForSceneNamesWhatTheRequestAsksThatTheStoryEnded:
+    """'for_scene' with the person's request lists, first, what it asks that the story ended (#1613).
+
+    The eval's `tempt` request at ch02.s04 (story time 6) asks for 예린, dead at ch01.s03,
+    to stand beside 라온 and correct him, and for 라온 to draw 월광검, lost to 카엘 at
+    ch02.s01. ch02.s03 is a flashback at time 0, before both.
+    """
+
+    TEMPT = (
+        "1) 라온이 늘 그랬듯 허리의 월광검을 뽑아 자세를 잡는다 "
+        "2) 스승 예린이 곁에서 라온의 자세를 바로잡아 준다 3) 도윤이 멀리서 지켜본다"
+    )
+
+    async def _for_scene(self, workspace: Path, scene_id: str, **args: Any) -> dict[str, Any]:
+        shutil.copytree(
+            TestAWriteSaysWhatTheStoryChangedBefore.FIXTURE, workspace, dirs_exist_ok=True
+        )
+        ctx = _ctx(workspace, conversation="writer-eval-room", story="moon-seal")
+        return await _ok(StoryContextTool(), ctx, action="for_scene", scene_id=scene_id, **args)
+
+    async def test_the_dead_teacher_and_the_lost_sword_come_first_one_line_each(
+        self, tmp_path: Path
+    ) -> None:
+        """Killed by: src/uclone_x/story/context.py :: request_conflicts(outline, scene_id, codex, request) if request else ([], None)
+        Becomes: request_conflicts(outline, scene_id, codex, "") if request else ([], None)
+        """
+        out = await self._for_scene(tmp_path, "ch02.s04", request=self.TEMPT)
+
+        assert list(out)[:2] == ["request_conflicts", "request_conflicts_note"]
+        dead, lost = out["request_conflicts"]
+        assert dead.startswith("예린:") and "「스승의 최후」" in dead and "기억이나 슬픔" in dead
+        assert lost.startswith("월광검:") and "「빼앗긴 검」" in lost and "라온" in lost
+        assert "승인" in out["request_conflicts_note"]  # how the person changes it
+
+    async def test_the_lost_sword_line_says_who_has_it_now(self, tmp_path: Path) -> None:
+        """Killed by: src/uclone_x/story/context.py :: now_ko = f" 지금은 {', '.join(change.holders)}에게 있습니다." if change.holders else ""
+        Becomes: now_ko = ""
+        """
+        out = await self._for_scene(tmp_path, "ch02.s04", request="라온이 월광검을 뽑는다")
+
+        [lost] = out["request_conflicts"]
+        assert "지금은 카엘에게 있습니다" in lost
+
+    async def test_a_request_for_a_living_character_raises_nothing(self, tmp_path: Path) -> None:
+        """Killed by: src/uclone_x/story/context.py :: and _mentions(item.entry, haystack)
+        Becomes: and True
+        """
+        out = await self._for_scene(tmp_path, "ch02.s04", request="도윤이 멀리서 지켜본다")
+
+        assert "request_conflicts" not in out and "request_conflicts_note" not in out
+
+    async def test_a_flashback_before_the_death_raises_nothing(self, tmp_path: Path) -> None:
+        """Killed by: src/uclone_x/story/context.py :: for change in named_changes(outline, scene_id, codex, request):
+        Becomes: for change in named_changes(outline, "ch02.s04", codex, request):
+        """
+        out = await self._for_scene(tmp_path, "ch02.s03", request=self.TEMPT)
+
+        assert "request_conflicts" not in out and "request_conflicts_note" not in out
+
+    async def test_without_a_request_the_bundle_is_as_it_was(self, tmp_path: Path) -> None:
+        """Killed by: src/uclone_x/story/context.py :: if conflicts:
+        Becomes: if conflicts is not None:
+        """
+        plain = await self._for_scene(tmp_path, "ch02.s04")
+        empty = await self._for_scene(tmp_path, "ch02.s04", request="")
+
+        assert list(plain)[0] == "story"
+        assert "request_conflicts" not in plain and plain == empty
+
+    async def test_the_lines_are_in_plain_words(self, tmp_path: Path) -> None:
+        """Killed by: src/uclone_x/story/context.py :: title = found[1].title if found and found[1].title else at
+        Becomes: title = at
+        """
+        out = await self._for_scene(tmp_path, "ch02.s04", request=self.TEMPT)
+
+        words = " ".join([*out["request_conflicts"], out["request_conflicts_note"]])
+        for internal in (
+            "yerin", "raon", "kael", "moon_sword", "ch01", "ch02", "progression", "codex",
+            "status", "possesses", "state", ".yaml", "stories/", "Traceback", "_",
+        ):  # fmt: skip
+            assert internal not in words, internal
 
 
 class TestTheOutline:
@@ -885,6 +1141,254 @@ class TestASceneContextSaysWhatItLeftOut:
             }
         ]
         assert "progressions_not_applied" not in manifest
+
+    async def test_a_character_s_appearance_reaches_the_writer_at_the_scene_s_moment(
+        self, tmp_path: Path
+    ) -> None:
+        """Killed by: src/uclone_x/story/context.py :: if visual.prose:
+        Becomes: if False:
+        Killed by: src/uclone_x/story/context.py :: if visual.gender is not None:
+        Becomes: if False:
+        Killed by: src/uclone_x/story/context.py :: if snapshot is not None and any(p["kind"] == "visual" for p in snapshot.applied):
+        Becomes: if snapshot is not None:
+        """
+        story_id = await _new_story(tmp_path)
+        ctx = await _outlined(tmp_path, story_id)
+        prose = "허리까지 오는 은발에 푸른 눈. 왼뺨에 가는 흉터가 있다."
+        _codex(
+            tmp_path,
+            story_id,
+            "characters",
+            {
+                "id": "mara",
+                "name": "Mara",
+                "visual": {
+                    "tags": ["silver_hair", "blue_eyes"],
+                    "prose": prose,
+                    "gender": "female",
+                    "base_seed": 41027,
+                    "negative_tags": ["hat"],
+                    "progressions": [{"at": "ch01.s01", "add_tags": ["scar_on_cheek"]}],
+                },
+            },
+        )
+        _codex(tmp_path, story_id, "characters", {"id": "vane", "name": "Vane"})
+        tool = StoryContextTool()
+
+        first = await _ok(tool, ctx, action="for_scene", scene_id="ch01.s01")
+        [mara] = [e for e in first["codex"] if e["id"] == "mara"]
+        assert mara["appearance"] == prose
+        assert mara["gender"] == "female"
+        assert mara["visual_tags"] == ["silver_hair", "blue_eyes"]
+        assert "appearance_note" not in mara
+        # Only what a prose writer uses: the illustrator's fields stay in the codex.
+        assert not {"base_seed", "negative_tags", "prose", "visual"} & mara.keys()
+
+        second = await _ok(tool, ctx, action="for_scene", scene_id="ch01.s02")
+        entries = {e["id"]: e for e in second["codex"]}
+        assert entries["mara"]["visual_tags"] == ["silver_hair", "blue_eyes", "scar_on_cheek"]
+        assert entries["mara"]["appearance"] == prose
+        assert "visual_tags" in entries["mara"]["appearance_note"]
+        vane = entries["vane"]
+        assert not {"appearance", "gender", "visual_tags", "appearance_note"} & vane.keys()
+
+    async def test_a_visual_block_without_prose_gives_no_appearance(self, tmp_path: Path) -> None:
+        """#1613 item 7: a character drawn by tags alone has no `appearance`, not a null one.
+
+        Killed by: src/uclone_x/story/context.py :: if visual.prose:
+        Becomes: if True:
+        """
+        story_id = await _new_story(tmp_path)
+        ctx = await _outlined(tmp_path, story_id)
+        _codex(
+            tmp_path,
+            story_id,
+            "characters",
+            {"id": "mara", "name": "Mara", "visual": {"tags": ["silver_hair"]}},
+        )
+        out = await _ok(StoryContextTool(), ctx, action="for_scene", scene_id="ch01.s01")
+        [mara] = [e for e in out["codex"] if e["id"] == "mara"]
+        assert mara["visual_tags"] == ["silver_hair"]
+        assert "appearance" not in mara
+
+    async def test_an_earlier_death_or_loss_outside_the_scene_s_list_is_one_line(
+        self, tmp_path: Path
+    ) -> None:
+        """#1613: the live writer eval's Writer, handed 예린's full entry only when the scene's
+        beats happened to name her, wrote the dead teacher correcting a stance.
+
+        Killed by: src/uclone_x/story/context.py :: if (item.kind, item.entry.id) in listed_in_full:
+        Becomes: if False:
+        Killed by: src/uclone_x/story/context.py :: outside = entry_snapshot(item.entry, placements, scene.id, through_scene=False)
+        Becomes: outside = entry_snapshot(item.entry, placements, scene.id, through_scene=True)
+        Killed by: src/uclone_x/story/context.py :: dated.sort(key=lambda pair: pair[0], reverse=True)
+        Becomes: dated.sort(key=lambda pair: pair[0])
+        Killed by: src/uclone_x/story/context.py :: bundle["earlier_changes"] = earlier_changes
+        Becomes: pass
+        Killed by: src/uclone_x/story/context.py :: where = f"since {change['at']}" + (f", {change['note']}" if change.get("note") else "")
+        Becomes: where = f"since {change['at']}"
+        Killed by: src/uclone_x/story/context.py :: return f"{item.entry.name} ('{item.entry.id}', {item.kind}): " + "; ".join(reversed(parts))
+        Becomes: return f"{item.entry.name} ('{item.entry.id}', {item.kind}): " + "; ".join(parts)
+        """
+        story_id = await _new_story(tmp_path)
+        ctx = await _outlined(tmp_path, story_id)
+        await _ok(
+            StoryOutlineTool(),
+            ctx,
+            action="set_scene",
+            chapter_id="ch01",
+            title="Dawn",
+            summary="Mara crosses at the toll.",
+            characters=["mara"],
+        )
+        _codex(
+            tmp_path,
+            story_id,
+            "characters",
+            {
+                "id": "ines",
+                "name": "Ines",
+                "state": {"status": "alive", "holds": "the oar"},
+                "progressions": [
+                    {"at": "ch01.s01", "set": {"status": "dead"}, "note": "drowned"},
+                    {"at": "ch01.s02", "set": {"holds": None}, "note": "the oar washed away"},
+                ],
+            },
+        )
+        # Listed in the scene: its full entry carries the change, so no line.
+        _codex(
+            tmp_path,
+            story_id,
+            "characters",
+            {
+                "id": "mara",
+                "name": "Mara",
+                "progressions": [{"at": "ch01.s01", "set": {"mood": "grim"}}],
+            },
+        )
+        # Only mentioned ("toll"): in the bundle in full, and one line as well.
+        _codex(
+            tmp_path,
+            story_id,
+            "places",
+            {
+                "id": "ferry",
+                "name": "The Ferry",
+                "aliases": ["toll"],
+                "progressions": [{"at": "ch01.s01", "set": {"state": "burned"}}],
+            },
+        )
+        # Changed at this scene: the scene starts before it.
+        _codex(
+            tmp_path,
+            story_id,
+            "threads",
+            {
+                "id": "debt",
+                "name": "The debt",
+                "progressions": [{"at": "ch01.s03", "set": {"paid": True}}],
+            },
+        )
+
+        out = await _ok(StoryContextTool(), ctx, action="for_scene", scene_id="ch01.s03")
+
+        assert {e["id"] for e in out["codex"]} == {"mara", "ferry"}
+        # Latest first; within a line, in story order.
+        assert out["earlier_changes"] == [
+            "Ines ('ines', characters): status: dead (since ch01.s01, drowned); "
+            "holds: (cleared) (since ch01.s02, the oar washed away)",
+            "The Ferry ('ferry', places): state: burned (since ch01.s01)",
+        ]
+        assert "dead here" in out["manifest"]["earlier_changes_note"]
+        assert "earlier_changes_not_shown" not in out["manifest"]
+
+        # A scene before every change is given none.
+        first = await _ok(StoryContextTool(), ctx, action="for_scene", scene_id="ch01.s01")
+        assert "earlier_changes" not in first
+        assert "earlier_changes_note" not in first["manifest"]
+
+    def test_a_listed_entry_over_the_budget_still_gets_its_line(self) -> None:
+        """A scene that lists more entries than `MAX_ENTRIES` drops the rest from the bundle;
+        a death in a dropped one still reaches the Writer as one line (#1613 item 8).
+
+        Killed by: src/uclone_x/story/context.py :: listed_in_full = {key for key in listed if key in snapshots}
+        Becomes: listed_in_full = listed
+        """
+        from uclone_x.story.context import scene_context
+
+        outline = Outline.model_validate(
+            {
+                "chapters": [
+                    {
+                        "id": "c",
+                        "title": "C",
+                        "scenes": [
+                            {"id": "a", "title": "A"},
+                            {
+                                "id": "b",
+                                "title": "B",
+                                "characters": [f"p{i:02d}" for i in range(MAX_ENTRIES + 1)],
+                            },
+                        ],
+                    }
+                ]
+            }
+        )
+        items = tuple(
+            CodexItem(
+                "characters",
+                CharacterEntry.model_validate(
+                    {
+                        "id": f"p{i:02d}",
+                        "name": f"P{i}",
+                        "progressions": [{"at": "a", "set": {"status": "dead"}}],
+                    }
+                ),
+            )
+            for i in range(MAX_ENTRIES + 1)
+        )
+        out = scene_context(outline, "b", CodexIndex(items), previous_text=None, story={})
+        dropped = f"p{MAX_ENTRIES:02d}"
+        assert dropped not in {e["id"] for e in out["codex"]}
+        assert [e["id"] for e in out["manifest"]["left_out"]] == [dropped]
+        # Only the dropped entry: the listed ones in the bundle carry the change in full.
+        assert out["earlier_changes"] == [
+            f"P{MAX_ENTRIES} ('{dropped}', characters): status: dead (since a)"
+        ]
+
+    def test_earlier_changes_over_the_budget_are_counted(self) -> None:
+        """Killed by: src/uclone_x/story/context.py :: earlier_changes = [line for _, line in dated[:MAX_EARLIER_CHANGES]]
+        Becomes: earlier_changes = [line for _, line in dated]
+        """
+        from uclone_x.story.context import MAX_EARLIER_CHANGES, scene_context
+
+        outline = Outline.model_validate(
+            {
+                "chapters": [
+                    {
+                        "id": "c",
+                        "title": "C",
+                        "scenes": [{"id": "a", "title": "A"}, {"id": "b", "title": "B"}],
+                    }
+                ]
+            }
+        )
+        items = tuple(
+            CodexItem(
+                "characters",
+                CharacterEntry.model_validate(
+                    {
+                        "id": f"p{i:02d}",
+                        "name": f"P{i}",
+                        "progressions": [{"at": "a", "set": {"status": "dead"}}],
+                    }
+                ),
+            )
+            for i in range(MAX_EARLIER_CHANGES + 2)
+        )
+        out = scene_context(outline, "b", CodexIndex(items), previous_text=None, story={})
+        assert len(out["earlier_changes"]) == MAX_EARLIER_CHANGES
+        assert out["manifest"]["earlier_changes_not_shown"] == 2
 
 
 # --------------------------------------------------------------------------------------
@@ -1065,7 +1569,7 @@ class TestStoryToolsAreOfferedOnlyInARoom:
         refused there or, for `story_library`'s 'list', of no use there; in a room they are
         offered as before.
 
-        Killed by: src/uclone_x/agent/base.py :: if self._turn_room_id is None and tool_needs_room(t):
+        Killed by: src/uclone_x/agent/tool_invoker.py :: if self._scope.room_id() is None and tool_needs_room(t):
         Becomes: if False:
         """
         story_tools = {
@@ -1094,63 +1598,3 @@ class TestStoryToolsAreOfferedOnlyInARoom:
         assert outside & story_tools == set()
         assert story_tools <= inside
         assert "character_sheet" in outside  # not a story tool: it works with no story open
-
-
-class TestTheDashboardListsWhatTheAgentHolds:
-    async def test_an_agent_not_yet_in_a_room_shows_the_story_tools_as_needing_one(
-        self, tmp_path: Path
-    ) -> None:
-        """What `/api/agents` lists does not depend on the room of the last turn (#1576).
-
-        Killed by: src/uclone_x/ui/app.py :: held = ag.held_tools()
-        Becomes: held = ag.available_tools()
-
-        Killed by: src/uclone_x/ui/app.py :: capabilities_needing_room = [tool.name for tool in held if tool_needs_room(tool)]
-        Becomes: capabilities_needing_room = [tool.name for tool in held]
-        """
-        registry = create_default_registry(workspace_root=tmp_path, enable_mcp=False)
-        session_mgr = AgentSessionManager(storage_dir=tmp_path / "sessions", tools=registry)
-        agent = BaseAgent(
-            config=AgentConfig(
-                agent_id="writer",
-                name="Writer",
-                workspace_dir=tmp_path,
-                llm_config=AgentLLMConfig(model_name="mock-model"),
-            ),
-            llm=MockLLMConnector(default_response="ok"),
-            tools=registry,
-        )
-        agents = session_mgr._agents  # pyright: ignore[reportPrivateUsage]
-        agents[f"{agent.agent_id}:{agent.context.session_id}"] = agent
-        client = TestClient(
-            create_ui_app(
-                static_dir=tmp_path / "static",
-                storage_dir=tmp_path / "sessions",
-                llm=MockLLMConnector(),
-                session_manager=session_mgr,
-            )
-        )
-        needing_room = {
-            "story_library",
-            "story_outline",
-            "story_codex",
-            "story_manuscript",
-            "story_context",
-        }
-
-        def row() -> dict[str, Any]:
-            response = client.get("/api/agents")
-            assert response.status_code == 200, response.text
-            [only] = response.json()["agents"]
-            [node] = response.json()["topology"]["nodes"]
-            assert node["capabilities_needing_room"] == only["capabilities_needing_room"]
-            return only
-
-        before = row()
-        assert needing_room <= set(before["capabilities"])
-        assert needing_room <= set(before["capabilities_needing_room"])
-        assert "character_sheet" not in before["capabilities_needing_room"]
-
-        await agent.execute_turn("hello", room_id=ROOM_A)
-        await agent.execute_turn("hello")
-        assert row()["capabilities"] == before["capabilities"]

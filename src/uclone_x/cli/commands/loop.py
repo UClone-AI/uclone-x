@@ -12,7 +12,6 @@ from rich.console import Console
 from rich.markup import escape
 from rich.panel import Panel
 
-from uclone_x.agent.composition import HostDependencies, compose_agent
 from uclone_x.agent.loop import (
     LoopJob,
     LoopScheduler,
@@ -21,12 +20,10 @@ from uclone_x.agent.loop import (
     parse_interval_string,
     parse_loop_command_input,
 )
-from uclone_x.agent.models import AgentConfig, AgentContext, AgentLLMConfig
 from uclone_x.agent.prompts import compose_system_prompt
 from uclone_x.agent.session import SessionStore
 from uclone_x.engine.event_bus import EventBus
 from uclone_x.llm.connectors.factory import create_llm_connector
-from uclone_x.memory.store import default_cross_session_memory
 from uclone_x.sandbox.models import WorkspaceIsolation
 from uclone_x.telemetry import TelemetryTracer
 from uclone_x.tools.registry import create_default_registry
@@ -62,44 +59,49 @@ async def _run_loop_agent(
     tools = create_default_registry()
     # Imported here, as `room` does: `ucx --help` imports this module, and `run` is kept
     # out of that path on purpose, by a fitness check on what `--help` reaches.
-    from uclone_x.cli.commands.run import apply_saved_model
+    from uclone_x.cli.commands.run import apply_saved_model, own_model_notice
 
     saved_model, saved_notice = apply_saved_model(provider, model)
     if saved_notice is not None:
         console.print(f"[dim]{escape(saved_notice)}[/dim]")
-    llm = create_llm_connector(provider=provider, fallback_to_mock=False)
-    effective_model = saved_model or getattr(llm, "default_model", "qwen3:8b")
+    llm = create_llm_connector(provider=provider, model=model, fallback_to_mock=False)
+    # `None` leaves the model to the connector, which refuses in plain words when it has
+    # none configured, rather than sending a literal id to a provider that never served it.
+    effective_model = saved_model
 
     store = SessionStore()
     effective_session_id = session_id or f"loop_{agent_name}"
     tracer = TelemetryTracer()
 
     default_system = compose_system_prompt(model_name=effective_model)
-    config = AgentConfig(
-        agent_id=agent_name,
-        name=agent_name,
-        system_prompt=default_system,
-        llm_config=AgentLLMConfig(
-            model_name=effective_model,
-            temperature=0.7,
-            max_tokens=2048,
+    # Deferred for the reason `run` is: `ucx --help` imports this module.
+    from uclone_x.agent.clone_builder import build_clone, local_app_scope, saved_models
+    from uclone_x.skills.auditor import load_runtime_skill_registry
+
+    # Built as the desktop app builds the same clone (#1731).
+    agent = build_clone(
+        local_app_scope(
+            workspace_root=effective_cwd,
+            llm=llm,
+            tools=tools,
+            global_models=saved_models(effective_model),
+            bus=bus,
+            tracer=tracer,
+            store=store,
+            # P9: the approved skills in the runtime store; without them no `load_skill`.
+            skills=await load_runtime_skill_registry(),
         ),
-        isolation=WorkspaceIsolation(),
-    )
-    context = AgentContext(
+        clone_id=agent_name,
         session_id=effective_session_id,
-        agent_id=agent_name,
-        workspace_root=effective_cwd,
-    )
-    host = HostDependencies(
-        bus=bus,
-        llm=llm,
-        tools=tools,
-        tracer=tracer,
-        store=store,
-        memory=default_cross_session_memory(agent_name),
-    )
-    agent = compose_agent(config=config, host=host, context=context)
+        # `--model` wins over a persona's own model, as a model asked for in the app does;
+        # the saved choice only fills what the persona leaves empty (`saved_models`).
+        model_name=model,
+        fallback_prompt=default_system,
+        config_update={"isolation": WorkspaceIsolation()},
+    ).agent
+    own_model = own_model_notice(agent_name, agent.config.llm_config.model_name, saved_model)
+    if own_model is not None:
+        console.print(f"[dim]{escape(own_model)}[/dim]")
 
     agent.hydrate_session()
     await agent.start()

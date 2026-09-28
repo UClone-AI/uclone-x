@@ -79,9 +79,10 @@ export interface ResourceSummaryProps {
    * The conversation on screen, as `GET /api/rooms/{id}` answers it (#1272).
    *
    * This surface reads the room and never `chatMessages`. The latter is the retired
-   * single-agent store (`GET /api/session/history`), which since #1208 describes no
-   * conversation the user can see: it followed the rail's clone selection while the centre
-   * column showed a room, so every figure derived from it named a different transcript.
+   * single-agent store (once `GET /api/session/history`, removed in #1731), which since
+   * #1208 describes no conversation the user can see: it followed the rail's clone selection
+   * while the centre column showed a room, so every figure derived from it named a different
+   * transcript.
    */
   room?: RoomState | null;
   /** Per-seat context fill, as `GET /api/rooms/{id}/context` answers it. */
@@ -116,14 +117,16 @@ export const ResourceSummary: React.FC<ResourceSummaryProps> = ({
     };
   }, []);
 
+  // No answer yet reads as no ceiling: a figure made up here would be read as the real one.
   const sessionBudget = budgetData?.session_budget || {
-    max_tokens: 1_000_000,
+    max_tokens: null,
     used_input_tokens: 0,
     used_output_tokens: 0,
     total_used_tokens: 0,
-    remaining_tokens: 1_000_000,
-    budget_used_pct: 0.0,
+    remaining_tokens: null,
+    budget_used_pct: null,
   };
+  const sessionCeiling = sessionBudget.max_tokens;
 
   const providers = budgetData?.providers || {};
   const compactionHistory = budgetData?.compaction_history || [];
@@ -156,8 +159,8 @@ export const ResourceSummary: React.FC<ResourceSummaryProps> = ({
   // Token percentage
   const tokenPercentage = Math.min(
     100,
-    sessionBudget.max_tokens > 0
-      ? Math.round((sessionBudget.total_used_tokens / sessionBudget.max_tokens) * 100)
+    sessionCeiling !== null && sessionCeiling > 0
+      ? Math.round((sessionBudget.total_used_tokens / sessionCeiling) * 100)
       : 0
   );
 
@@ -334,15 +337,23 @@ export const ResourceSummary: React.FC<ResourceSummaryProps> = ({
             <p className="text-lg font-bold text-white font-mono">
               {sessionBudget.total_used_tokens.toLocaleString()}
             </p>
-            <div className="w-full h-1.5 bg-slate-950 rounded-full overflow-hidden mt-1">
-              <div
-                className="h-full bg-cyan-500 rounded-full"
-                style={{ width: `${Math.max(2, tokenPercentage)}%` }}
-              />
-            </div>
-            <p className="text-[10px] text-cyan-400 font-mono mt-1">
-              / {sessionBudget.max_tokens.toLocaleString()} ({tokenPercentage}%)
-            </p>
+            {sessionCeiling !== null ? (
+              <>
+                <div className="w-full h-1.5 bg-slate-950 rounded-full overflow-hidden mt-1">
+                  <div
+                    className="h-full bg-cyan-500 rounded-full"
+                    style={{ width: `${Math.max(2, tokenPercentage)}%` }}
+                  />
+                </div>
+                <p className="text-[10px] text-cyan-400 font-mono mt-1">
+                  / {sessionCeiling.toLocaleString()} ({tokenPercentage}%)
+                </p>
+              </>
+            ) : (
+              <p className="text-[10px] text-slate-500 mt-1" data-testid="resource-token-no-ceiling">
+                No session ceiling. Paid-model limits are in Settings → Usage.
+              </p>
+            )}
           </div>
 
           {/* Prompt vs Completion */}

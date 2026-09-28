@@ -28,8 +28,8 @@ from datetime import UTC, datetime
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from uclone_x.agent.session import validate_session_id
 from uclone_x.core.agent_home import AgentHomeError, refuse_an_unusable_username
+from uclone_x.core.session import validate_session_id
 from uclone_x.errors import (
     PathTraversalError,
     RoomAlreadyExistsError,

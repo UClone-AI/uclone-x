@@ -2,9 +2,11 @@
 
 What these pin, in order of what it would cost to get wrong:
 
-* **The model cannot apply its own proposal.** `story_codex 'apply'` runs only once a person
-  answers the runtime's approval request with yes: no hook, no argument and no chat message
-  stands in for that, and without a way to ask, the call is refused.
+* **The model cannot apply its own proposal through `story_codex`.** `story_codex 'apply'`
+  runs only once a person answers the runtime's approval request with yes: no hook, no
+  argument and no chat message stands in for that, and without a way to ask, the call is
+  refused. The story view's approve route is the other way a proposal is applied; that it
+  accepts only a window the server opened is pinned in `test_ui_person_gate.py` (#1589).
 * **A flashback is not a contradiction.** A scene is checked against the codex as it stands
   at that point of *story* time, so a character who dies later is alive in a flashback and
   dead in a later scene.
@@ -17,6 +19,7 @@ What these pin, in order of what it would cost to get wrong:
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 from typing import Any
 
@@ -35,10 +38,11 @@ from uclone_x.room.a2a_handlers import (
     _DeferredApprovalRunner,  # pyright: ignore[reportPrivateUsage]
 )
 from uclone_x.story.quotes import quote_found
-from uclone_x.story.schemas import Outline
+from uclone_x.story.schemas import Outline, StoryFileError, parse_file
 from uclone_x.story.timeline import assumptions, place_scenes, time_key
 from uclone_x.story.tool import StoryLibraryTool
 from uclone_x.story.tools import (
+    AUDIT_FACT_EXAMPLE,
     StoryAuditTool,
     StoryCodexTool,
     StoryContextTool,
@@ -49,6 +53,7 @@ from uclone_x.tools.base import BaseTool, tool_writes_files
 from uclone_x.tools.builtin.character import CharacterSheetTool
 from uclone_x.tools.models import NoIsolation, ToolContext, ToolResult
 from uclone_x.tools.registry import ToolRegistry
+from uclone_x.tools.schema import advertised_tool_parameters
 
 ROOM = "room_a"
 
@@ -211,6 +216,36 @@ class TestStoryTime:
         assert [int(t) for t in sorted(numbers, key=time_key)] == sorted(int(t) for t in numbers)
         assert time_key("-0") == time_key("0") and time_key("01") == time_key("1")
         assert time_key("１２") == time_key("12")
+
+    def test_an_int_of_any_length_is_ordered_as_its_digits_are(self) -> None:
+        """#1613: `str` refuses an `int` of more than 4300 digits; a string time has no limit.
+
+        Killed by: src/uclone_x/story/timeline.py :: return ((0, _number(_decimal(abs(value)), value < 0)),)
+        Becomes: return ((0, _number(str(abs(value)), value < 0)),)
+        Killed by: src/uclone_x/story/timeline.py :: chunks.append(f"{low:0{_CHUNK_DIGITS}d}")
+        Becomes: chunks.append(str(low))
+        """
+        huge = 10**5000 + 7
+        assert time_key(huge) == time_key("1" + "0" * 4999 + "7")
+        assert time_key(-huge) == time_key("-1" + "0" * 4999 + "7")
+        assert time_key(-huge) < time_key(-1) < time_key("9" * 5000) < time_key(huge)
+
+    def test_a_story_file_value_python_cannot_read_is_refused_in_plain_words(self) -> None:
+        """#1613: YAML reads a 5000-digit number or `2024-13-01` before any field sees it.
+
+        Python refuses both with its own `ValueError`; the author is told what to do.
+
+        Killed by: src/uclone_x/story/schemas.py :: except ValueError as exc:
+        Becomes: except KeyError as exc:
+        """
+        for value in ("1" * 5000, "2024-13-01"):
+            text = f"chapters:\n- id: ch01\n  title: One\n  story_time: {value}\n"
+            with pytest.raises(StoryFileError) as refused:
+                parse_file(Outline, text, "outline.yaml")
+            message = str(refused.value)
+            assert message.startswith("outline.yaml has a value that could not be read")
+            assert "Put it in quotes" in message
+            assert "sys.set_int_max_str_digits" not in message and "month" not in message
 
     def test_times_compare_as_numbers_and_an_untimed_scene_continues_the_one_before(
         self,
@@ -518,6 +553,38 @@ class TestTheAuditChecksAgainstStoryTime:
         assert contradiction["kind"] == "disjoint"
         assert not out.get("rules_not_applied")
 
+    async def test_a_class_no_rule_names_keeps_its_words_when_one_is_in_capitals(
+        self, tmp_path: Path
+    ) -> None:
+        """#1613: the codex's `HALF-dead`, named by no rule, is shown `HalfDead`, not `HALFDead`.
+
+        Killed by: src/uclone_x/story/audit.py :: words = [word.capitalize() if word.isupper() else word for word in words]
+        Becomes: words = words
+        Killed by: src/uclone_x/story/audit.py :: if len(words) > 1:
+        Becomes: if False:
+        """
+        story_id, ctx = await _timed_story(tmp_path)
+        _codex(
+            tmp_path,
+            story_id,
+            "characters",
+            {
+                "id": "vane",
+                "name": "Lord Vane",
+                "aliases": ["Vane"],
+                "state": {"status": "HALF-dead"},
+            },
+        )
+        # A rule on the property, so the class itself is named by no rule.
+        _set_story_yaml(tmp_path, story_id, axioms=[{"kind": "functional", "subject": "type"}])
+        out = await _ok(
+            StoryAuditTool(), ctx, action="check", scene_id="ch01.s03", facts=[_alive()]
+        )
+        [contradiction] = out["contradictions"]
+        assert contradiction["kind"] == "functional"
+        assert "vane type HalfDead" in [part.get("fact") for part in contradiction["facts"]]
+        assert "HALFDead" not in repr(contradiction)
+
     async def test_a_class_a_rule_names_is_shown_as_the_rule_spells_it(
         self, tmp_path: Path
     ) -> None:
@@ -630,6 +697,62 @@ class TestTheAuditChecksAgainstStoryTime:
         )
         assert error == "Scene 'ch01.s05' has no text yet, so there is nothing to check."
         assert story_id
+
+    async def test_a_call_with_no_facts_is_told_what_to_send_with_an_example(
+        self, tmp_path: Path
+    ) -> None:
+        """#1613: qwen3:8b left 'facts' out of 8 of 9 first calls.
+
+        Killed by: src/uclone_x/story/tools.py :: if _without_facts(data):
+        Becomes: if False:
+        """
+        _, ctx = await _timed_story(tmp_path)
+        example = (
+            '{"subject": "Vane", "predicate": "status", "object": "dead", '
+            '"quote": "Vane did not rise again"}'
+        )
+        expected = (
+            "The call to 'story_audit' was refused because its arguments did not fit: No facts "
+            "were given in 'facts', and the check compares only the facts it is given. Read "
+            "the scene (story_manuscript 'read'), then call story_audit 'check' again with the "
+            "same scene_id and 'facts': a list with one object per fact the scene states -- "
+            "who is alive or dead, who has what, where someone is -- each with the exact words "
+            f"of the scene it comes from, for example facts=[{example}]. Nothing was checked. "
+            "Call it again with the arguments corrected."
+        )
+        tool = StoryAuditTool()
+        no_facts_calls: tuple[dict[str, Any], ...] = ({}, {"facts": []}, {"facts": None})
+        for no_facts in no_facts_calls:
+            error = await _refused(tool, ctx, action="check", scene_id="ch01.s02", **no_facts)
+            assert error == expected
+        # The example is a call the tool takes: resent as it is, over a scene with its words,
+        # it is checked and not rejected.
+        manuscript = StoryManuscriptTool()
+        digest = (await _ok(manuscript, ctx, action="read", scene_id="ch01.s02"))["digest"]
+        await _ok(
+            manuscript,
+            ctx,
+            action="write",
+            scene_id="ch01.s02",
+            text="The arrow struck, and Vane did not rise again.",
+            digest=digest,
+        )
+        out = await _ok(tool, ctx, action="check", scene_id="ch01.s02", facts=[json.loads(example)])
+        assert out["summary"] == (
+            "1 submitted fact(s) were checked against 2 rule(s): 0 contradiction(s) found."
+        )
+
+    def test_the_schema_the_model_sees_requires_facts_and_shows_one(self) -> None:
+        """Killed by: src/uclone_x/story/tools.py :: min_length=1,
+        Becomes: default_factory=list[AuditFact],
+        Killed by: src/uclone_x/story/tools.py :: f"[{json.dumps(AUDIT_FACT_EXAMPLE)}].",
+        Becomes: ".",
+        """
+        schema = advertised_tool_parameters(StoryAuditTool())
+        assert "facts" in schema["required"]
+        facts = schema["properties"]["facts"]
+        assert facts["minItems"] == 1
+        assert json.dumps(AUDIT_FACT_EXAMPLE) in facts["description"]
 
 
 # --------------------------------------------------------------------------------------
@@ -890,7 +1013,7 @@ async def _run_with_answer(
 
 class TestOnlyAPersonApproves:
     async def test_a_person_s_yes_applies_it(self, tmp_path: Path) -> None:
-        """Killed by: src/uclone_x/agent/base.py :: approved_by_person = decision.action in (HookAction.ALLOW, HookAction.MODIFY)
+        """Killed by: src/uclone_x/agent/tool_execution.py :: approved_by_person = decision.action in (HookAction.ALLOW, HookAction.MODIFY)
         Becomes: approved_by_person = False
         """
         story_id, status, asked = await _run_with_answer(tmp_path, "allow")
@@ -914,9 +1037,9 @@ class TestOnlyAPersonApproves:
 
         Killed by: src/uclone_x/agent/hooks/runner.py :: decision.modified_payload if decision.action == HookAction.MODIFY else None
         Becomes: None
-        Killed by: src/uclone_x/agent/base.py :: if decision.action in (HookAction.ALLOW, HookAction.MODIFY)
+        Killed by: src/uclone_x/agent/tool_execution.py :: if decision.action in (HookAction.ALLOW, HookAction.MODIFY)
         Becomes: if False
-        Killed by: src/uclone_x/agent/base.py :: if hook_arguments is not None
+        Killed by: src/uclone_x/agent/tool_execution.py :: if hook_arguments is not None
         Becomes: if False
         """
 
@@ -986,7 +1109,7 @@ class TestOnlyAPersonApproves:
         An empty rewrite read for its truth was dropped after the person said yes, and the
         model's original call ran, approved, although the person had been shown `{}`.
 
-        Killed by: src/uclone_x/agent/base.py :: if approved_arguments is not None and decision.action == HookAction.ALLOW
+        Killed by: src/uclone_x/agent/tool_execution.py :: if approved_arguments is not None and decision.action == HookAction.ALLOW
         Becomes: if approved_arguments and decision.action == HookAction.ALLOW
         """
 
@@ -1048,14 +1171,14 @@ class TestOnlyAPersonApproves:
 
         Killed by: src/uclone_x/agent/hooks/runner.py :: if needs_approval and decision.action not in (HookAction.BLOCK, HookAction.ASK):
         Becomes: if False:
-        Killed by: src/uclone_x/agent/base.py :: pre_payload["needs_approval"] = tool_call_needs_approval(
+        Killed by: src/uclone_x/agent/tool_execution.py :: pre_payload["needs_approval"] = tool_call_needs_approval(
         Becomes: pre_payload["needs_approval"] = False and tool_call_needs_approval(
 
         The refusal is the person's answer in the desktop app, which does not ask during a
         conversation: it says so in plain words, not that a request "timed out", and names
         where the person decides instead (the story view, #1560).
 
-        Killed by: src/uclone_x/agent/base.py :: timeout_note or "Approval request timed out (denied fail-closed)",
+        Killed by: src/uclone_x/agent/tool_execution.py :: timeout_note or "Approval request timed out (denied fail-closed)",
         Becomes: "Approval request timed out (denied fail-closed)",
         Killed by: src/uclone_x/story/tools.py :: approval_timeout_note: ClassVar[str | None] = APPLY_NOT_APPROVED_NOTE
         Becomes: approval_timeout_note: ClassVar[str | None] = None
@@ -1073,6 +1196,78 @@ class TestOnlyAPersonApproves:
             "not ask during a conversation, as the desktop app does not, a person approves or "
             "rejects proposals in the story's view, under Files."
         )
+        assert _vane_progressions(tmp_path, story_id) == [
+            {"at": "ch01.s02", "set": {"status": "dead"}}
+        ]
+
+    async def test_where_nobody_answers_apply_is_refused_before_anything_is_asked(
+        self, tmp_path: Path
+    ) -> None:
+        """Owner decision 2026-09-26: the desktop app refuses at once and names the story view.
+
+        The desktop app has nobody to answer an approval request during a conversation, so
+        waiting out the timeout only delayed the same refusal. Here a listener stands ready
+        to say yes; it is never asked, because the host said nobody answers, and the model's
+        call does not approve itself. The refusal is plain words, with no internals.
+
+        Killed by: src/uclone_x/agent/tool_execution.py :: if pre_decision.action == HookAction.ASK and not self._approvals_answered:
+        Becomes: if pre_decision.action == HookAction.ASK and False:
+        Killed by: src/uclone_x/story/tools.py :: approval_unavailable_note: ClassVar[str | None] = APPLY_NOT_ASKED_NOTE
+        Becomes: approval_unavailable_note: ClassVar[str | None] = None
+        """
+        story_id, ctx = await _timed_story(tmp_path)
+        proposal_id = await _proposed(ctx)
+        bus = EventBus()
+        await bus.start()
+        agent = _agent(bus, approvals_answered=False)
+        topic = f"session.{agent._context.session_id}"  # pyright: ignore[reportPrivateUsage]
+        sub = bus.subscribe({topic})
+        asked: list[dict[str, Any]] = []
+
+        async def person() -> None:
+            while True:
+                event = await sub.get()
+                if event.type == EventType.TOOL_APPROVAL_REQUEST:
+                    asked.append(dict(event.payload))
+                    await bus.publish(
+                        AgentEvent(
+                            type=EventType.TOOL_APPROVAL_RESPONSE,
+                            topic=topic,
+                            sender_id="ui",
+                            payload={"request_id": event.payload["request_id"], "action": "allow"},
+                        )
+                    )
+
+        await agent.start()
+        answering = asyncio.create_task(person())
+        try:
+            _, record = await agent._execute_single_tool(  # pyright: ignore[reportPrivateUsage]
+                _apply_call(proposal_id), ctx
+            )
+        finally:
+            answering.cancel()
+            await agent.stop()
+            await bus.stop()
+        assert asked == []
+        assert record.status == "error"
+        assert record.error == (
+            "The change was not applied, and nothing in the story changed: this app does not "
+            "ask for approval during a conversation, so a proposal cannot be applied from "
+            "here. A person approves or rejects proposals in the story's view, under Files."
+        )
+        for internal in (
+            "approval_",
+            "timed out",
+            "fail-closed",
+            "HookAction",
+            "story_codex",
+            "proposal_id",
+            proposal_id,
+            "'apply'",
+        ):
+            assert internal not in record.error
+        # Refused at once, not after the 2 s the agent would otherwise wait.
+        assert record.duration_ms < 1000.0
         assert _vane_progressions(tmp_path, story_id) == [
             {"at": "ch01.s02", "set": {"status": "dead"}}
         ]
@@ -1142,7 +1337,7 @@ class TestAReadIsNotRecordedAsAWrite:
     call that writes. The tool is still a write tool (`enable_write_tools` refuses it)."""
 
     async def test_the_story_tools_reads_are_recorded_as_reads(self, tmp_path: Path) -> None:
-        """Killed by: src/uclone_x/agent/base.py :: declared_writes = tool_call_writes_files(tool_inst, unwrapped_args)
+        """Killed by: src/uclone_x/agent/tool_execution.py :: declared_writes = tool_call_writes_files(tool_inst, unwrapped_args)
         Becomes: declared_writes = tool_writes_files(tool_inst)
         Killed by: src/uclone_x/tools/base.py :: return not (isinstance(action, str) and action in cast(frozenset[object], declared))
         Becomes: return True

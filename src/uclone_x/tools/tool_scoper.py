@@ -1,24 +1,19 @@
-"""Per-turn tool scoping: advertise a subset of the registry, and say so.
+"""Per-turn tool scoping: kept for the `tool_strategy` eval only, not on any request path.
 
-Two things are fixed here relative to the `SemanticToolScoper` this module replaces.
+**No production path uses this module.** The agent's tools layer is a pinned base set that
+host binding may only append to (`uclone_x.tools.tool_binder`, design §5.1): re-choosing
+the advertised tools on every turn changed the tools layer on 11 of 19 request pairs in
+#1670, and every empty reply it caused was a call to a tool it had withheld, which Ollama
+drops without an error. The embedding-backed `SemanticToolScoper` was removed with it.
 
-**The name.** That class scored a tool by lowercase substring overlap between the query
-and the tool's name and description, and called the result semantic. It is lexical, and
-the class is now called what it does. No embedding-backed scoper exists yet; when one is
-written it is the one entitled to the other word, and `ToolScoperProtocol` is the seam it
-plugs into. Until then the word is simply not claimed by anything here.
+`LexicalToolScoper` stays because the eval's arm B measures it as the baseline host
+binding replaced. Its notice promised that a withheld tool still runs when called by
+name; the agent now refuses a call to a name its request did not declare (F12), so the
+notice describes the eval's harness, not the agent.
 
-**The silence.** Withholding a tool withholds a *capability*, and the previous
-implementation withheld without telling the model — indistinguishable, from inside the
-turn, from a registry that never held the tool. A model that does not know a capability
-was withheld reports the task impossible instead of asking for it. So scoping returns a
-`ToolScopingResult` carrying what was withheld and by which method, and the turn carries
-that notice into the context.
-
-A third correction is in `LexicalToolScoper` itself: a query no tool scores above zero on
-used to return the first `top_k` tools in registry order, which is a selection with no
-signal behind it presented as a selection. It now withholds nothing and says the method
-found no signal.
+What the scoper still fixes relative to its predecessor: it is called lexical because it
+scores literal token overlap, and a query no tool scores above zero on withholds nothing
+rather than returning the first `top_k` tools in registry order.
 """
 
 from __future__ import annotations
@@ -29,9 +24,7 @@ from typing import TYPE_CHECKING, Protocol
 from uclone_x.llm.models import ToolDefinition
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Sequence
-
-    from uclone_x.llm.protocols import EmbedderProtocol
+    from collections.abc import Sequence
 
 # How many withheld tool names the notice lists before it stops naming them. The count is
 # always exact; the names are a courtesy that must not itself become the context problem
@@ -39,17 +32,14 @@ if TYPE_CHECKING:
 MAX_NAMED_WITHHELD = 20
 
 
-def _cosine_similarity(vec_a: Sequence[float], vec_b: Sequence[float]) -> float:
-    dot = 0.0
-    norm_a = 0.0
-    norm_b = 0.0
-    for a, b in zip(vec_a, vec_b, strict=False):
-        dot += a * b
-        norm_a += a * a
-        norm_b += b * b
-    if norm_a <= 0.0 or norm_b <= 0.0:
-        return 0.0
-    return dot / ((norm_a**0.5) * (norm_b**0.5))
+def _by_name(tools: Sequence[ToolDefinition]) -> tuple[ToolDefinition, ...]:
+    """`tools` in name order: the tools layer of the request (design §5.1).
+
+    A scorer decides *which* tools are advertised, never their order. Score order would
+    move a schema within the request prefix whenever a query ranked it differently, so the
+    rank is kept on `ToolScopingResult.scores` and out of `selected`.
+    """
+    return tuple(sorted(tools, key=lambda tool: tool.name))
 
 
 @dataclass(frozen=True)
@@ -114,9 +104,7 @@ class ToolScoperProtocol(Protocol):
 class LexicalToolScoper:
     """Scores tools by literal token overlap with the query. Not semantic.
 
-    Kept because it needs no embedder and therefore always runs — P0's default
-    composition has to work before anything optional is configured. It is the only scoper
-    in the tree: an embedding-backed one would implement `ToolScoperProtocol` beside it.
+    The eval's per-turn baseline (arm B); no agent is built with it.
     """
 
     def __init__(self, top_k: int = 5) -> None:
@@ -150,145 +138,22 @@ class LexicalToolScoper:
                 selected=tools, method="lexical overlap", reason="no tool scored above zero"
             )
 
-        # `index` breaks ties, so equal scores keep registry order rather than whatever
-        # order the sort happened to produce.
-        scored.sort(key=lambda entry: (-entry[0], entry[1]))
+        # The name breaks ties, so which tools an equal score keeps does not depend on the
+        # order they were passed in.
+        scored.sort(key=lambda entry: (-entry[0], entry[2].name))
         selected = tuple(tool for _, _, tool in scored[: self.top_k])
         withheld = tuple(tool.name for _, _, tool in scored[self.top_k :])
         return ToolScopingResult(
-            selected=selected,
+            selected=_by_name(selected),
             withheld=withheld,
             method="lexical overlap",
             scores=tuple((tool.name, float(score)) for score, _, tool in scored),
         )
 
 
-class SemanticToolScoper:
-    """Scores and scopes tools and skills using text embeddings (Principle 5 & 6).
-
-    Embeds tools once, caching vectors in memory. On each turn, embeds the query
-    and ranks tools by cosine similarity. Tools above `threshold` are selected up
-    to `top_k`. If no tool reaches `threshold`, advertises only `always_include`
-    (or nothing), saving prompt context on pure chat.
-
-    If the embedder fails or is unavailable, falls back gracefully to LexicalToolScoper.
-    """
-
-    def __init__(
-        self,
-        embedder: EmbedderProtocol,
-        *,
-        top_k: int = 5,
-        threshold: float = 0.30,
-        always_include: Sequence[str] = (),
-        skills_provider: Callable[[], Sequence[tuple[str, str]]] | None = None,
-    ) -> None:
-        self.embedder = embedder
-        self.top_k = top_k
-        self.threshold = threshold
-        self.always_include = frozenset(always_include)
-        self.skills_provider = skills_provider
-        self._tool_cache: dict[tuple[str, str], tuple[float, ...]] = {}
-        self._skill_cache: dict[tuple[str, str], tuple[float, ...]] = {}
-        self._fallback_scoper = LexicalToolScoper(top_k=top_k)
-
-    async def scope_tools(self, query: str, tools: tuple[ToolDefinition, ...]) -> ToolScopingResult:
-        """Select relevant tools using semantic embedding similarity."""
-        if not query or not query.strip():
-            return ToolScopingResult(selected=tools, reason="no query to score against")
-
-        try:
-            # 1. Ensure tools are embedded and cached
-            needed_tools: list[str] = []
-            needed_keys: list[tuple[str, str]] = []
-            for t in tools:
-                k = (t.name, t.description or "")
-                if k not in self._tool_cache:
-                    needed_keys.append(k)
-                    needed_tools.append(f"{t.name}: {t.description or ''}")
-
-            if needed_tools:
-                tool_vectors = await self.embedder.embed(needed_tools)
-                for k, vec in zip(needed_keys, tool_vectors, strict=True):
-                    self._tool_cache[k] = vec
-
-            # 2. Embed query
-            query_vectors = await self.embedder.embed([query])
-            if not query_vectors:
-                return await self._fallback_scoper.scope_tools(query, tools)
-            query_vec = query_vectors[0]
-
-            # 3. Score tools
-            scored_tools: list[tuple[float, int, ToolDefinition]] = []
-            for index, t in enumerate(tools):
-                k = (t.name, t.description or "")
-                t_vec = self._tool_cache.get(k)
-                sim = _cosine_similarity(query_vec, t_vec) if t_vec else 0.0
-                scored_tools.append((sim, index, t))
-
-            # 4. Sort and filter
-            scored_tools.sort(key=lambda entry: (-entry[0], entry[1]))
-
-            selected_tools: list[ToolDefinition] = []
-            withheld_names: list[str] = []
-
-            for sim, _, tool in scored_tools:
-                is_always = tool.name in self.always_include
-                if (sim >= self.threshold or is_always) and len(selected_tools) < self.top_k:
-                    selected_tools.append(tool)
-                else:
-                    withheld_names.append(tool.name)
-
-            # 5. Check skills if provider is given
-            matched_skills: list[str] = []
-            if self.skills_provider is not None:
-                try:
-                    skills = self.skills_provider()
-                    needed_skills: list[str] = []
-                    needed_skill_keys: list[tuple[str, str]] = []
-                    for s_name, s_desc in skills:
-                        sk = (s_name, s_desc)
-                        if sk not in self._skill_cache:
-                            needed_skill_keys.append(sk)
-                            needed_skills.append(f"{s_name}: {s_desc}")
-                    if needed_skills:
-                        s_vecs = await self.embedder.embed(needed_skills)
-                        for sk, s_vec in zip(needed_skill_keys, s_vecs, strict=True):
-                            self._skill_cache[sk] = s_vec
-
-                    skill_scored: list[tuple[float, str]] = []
-                    for s_name, s_desc in skills:
-                        sk = (s_name, s_desc)
-                        s_vec = self._skill_cache.get(sk)
-                        if s_vec:
-                            s_sim = _cosine_similarity(query_vec, s_vec)
-                            if s_sim >= self.threshold:
-                                skill_scored.append((s_sim, s_name))
-                    skill_scored.sort(key=lambda entry: -entry[0])
-                    matched_skills = [name for _, name in skill_scored[:3]]
-                except Exception:
-                    pass
-
-            return ToolScopingResult(
-                selected=tuple(selected_tools),
-                withheld=tuple(withheld_names),
-                method="semantic similarity",
-                scores=tuple((tool.name, round(sim, 4)) for sim, _, tool in scored_tools),
-                matched_skills=tuple(matched_skills),
-                reason=(
-                    "no tool met similarity threshold"
-                    if not selected_tools
-                    else f"selected {len(selected_tools)} tools above {self.threshold} threshold"
-                ),
-            )
-        except Exception:
-            return await self._fallback_scoper.scope_tools(query, tools)
-
-
 __all__ = [
     "MAX_NAMED_WITHHELD",
     "LexicalToolScoper",
-    "SemanticToolScoper",
     "ToolScoperProtocol",
     "ToolScopingResult",
 ]

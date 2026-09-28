@@ -2,13 +2,10 @@
 
 from __future__ import annotations
 
-import asyncio
-
 import pytest
 
 from uclone_x.errors import BudgetExceededError
 from uclone_x.llm import TokenBudgetManager, TokenUsage
-from uclone_x.llm.budget import _CURRENT_TURNS  # pyright: ignore[reportPrivateUsage]
 from uclone_x.llm.models import TokenBudget, TokenCountSource
 
 
@@ -306,101 +303,3 @@ def test_the_summary_breaks_usage_out_by_provider_in_tokens() -> None:
         "budget_used_pct": 14.2,
     }
     assert set(manager.get_summary()["providers"]) == {"openai", "ollama", "anthropic"}
-
-
-def test_a_turn_collects_the_steps_booked_on_its_session_while_it_is_open_and_nothing_else() -> (
-    None
-):
-    """`collect_turn_usage` holds a turn's own bookings, which the chat figures are (#982).
-
-    A booking on another session is not the turn's, nor is one made after the turn closed,
-    and a closed turn leaves nothing on the ledger for later bookings to walk. That two
-    turns overlapping on one session keep apart is pinned through `/api/turn` in
-    `test_ui_server.py`, where turns overlap.
-
-    Killed by: src/uclone_x/llm/budget.py :: for turn in self._open_turns.get(session_id, ()):
-    Becomes: for turn in (t for ts in self._open_turns.values() for t in ts):
-    Killed by: src/uclone_x/llm/budget.py :: del self._open_turns[session_id]
-    Becomes: pass
-    """
-    manager = TokenBudgetManager()
-
-    def usage(input_tokens: int) -> TokenUsage:
-        return TokenUsage(provider="openai", model="gpt-4o", input_tokens=input_tokens)
-
-    with manager.collect_turn_usage("session_a") as booked:
-        manager.record_usage("session_a", usage(10))
-        manager.record_usage("session_b", usage(20))
-    manager.record_usage("session_a", usage(40))
-
-    assert [u.input_tokens for u in booked] == [10]
-    assert manager._open_turns == {}  # pyright: ignore[reportPrivateUsage]
-
-
-def _usage(input_tokens: int) -> TokenUsage:
-    return TokenUsage(provider="openai", model="gpt-4o", input_tokens=input_tokens)
-
-
-@pytest.mark.parametrize("ending", ["raises", "is_cancelled"])
-async def test_a_turn_that_raises_or_is_cancelled_leaves_no_open_turn_and_no_turn_in_context(
-    ending: str,
-) -> None:
-    """A turn that ends abnormally unregisters exactly as one that returns does (#987).
-
-    A chat turn ends this way whenever a step raises or the client disconnects, so a
-    collector that cleaned up only on success would leave every such turn on the session's
-    ledger for good, walked by each later booking. The context is read inside the turn's
-    own task, since a task's context is its own copy.
-
-    Killed by: src/uclone_x/llm/budget.py :: if turn is not booked
-    Becomes: if turn is not booked or __import__("sys").exc_info()[0]
-    Killed by: src/uclone_x/llm/budget.py :: _CURRENT_TURNS.reset(token)
-    Becomes: pass
-    """
-    manager = TokenBudgetManager()
-    entered = asyncio.Event()
-    context_after_turn: list[tuple[list[TokenUsage], ...]] = []
-
-    async def turn() -> None:
-        try:
-            with manager.collect_turn_usage("session_a"):
-                manager.record_usage("session_a", _usage(10))
-                entered.set()
-                if ending == "raises":
-                    raise RuntimeError("the step failed")
-                await asyncio.Event().wait()
-        finally:
-            context_after_turn.append(_CURRENT_TURNS.get())
-
-    task = asyncio.create_task(turn())
-    await entered.wait()
-    if ending == "is_cancelled":
-        task.cancel()
-    with pytest.raises(RuntimeError if ending == "raises" else asyncio.CancelledError):
-        await task
-
-    assert manager._open_turns == {}  # pyright: ignore[reportPrivateUsage]
-    assert context_after_turn == [()]
-    assert [u.input_tokens for u in manager.get_turn_history("session_a")] == [10]
-
-
-def test_a_turn_opened_inside_another_on_the_same_session_collects_into_both() -> None:
-    """A nested turn's bookings are the enclosing turn's too (#987).
-
-    Nothing nests a collector today; a sub-agent turn run inside a chat turn would, and its
-    steps belong to the chat turn that caused them.
-
-    Killed by: src/uclone_x/llm/budget.py :: token = _CURRENT_TURNS.set((*_CURRENT_TURNS.get(), booked))
-    Becomes: token = _CURRENT_TURNS.set((booked,))
-    """
-    manager = TokenBudgetManager()
-
-    with manager.collect_turn_usage("session_a") as outer:
-        manager.record_usage("session_a", _usage(3))
-        with manager.collect_turn_usage("session_a") as inner:
-            manager.record_usage("session_a", _usage(4))
-        manager.record_usage("session_a", _usage(5))
-
-    assert [u.input_tokens for u in outer] == [3, 4, 5]
-    assert [u.input_tokens for u in inner] == [4]
-    assert manager._open_turns == {}  # pyright: ignore[reportPrivateUsage]

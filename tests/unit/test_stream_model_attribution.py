@@ -115,11 +115,11 @@ async def test_a_streamed_ollama_turn_records_what_it_asked_for_and_what_answere
     only from the stream. Copying one onto the other would hide a substitution P6 wants
     visible, the way `generate` keeps them apart (#149).
 
-    Killed by: src/uclone_x/agent/base.py :: served_model = chunk.model
+    Killed by: src/uclone_x/agent/turn_executor.py :: served_model = chunk.model
     Becomes: pass
     Killed by: src/uclone_x/llm/connectors/ollama.py :: model=served_model,
     Becomes:
-    Killed by: src/uclone_x/llm/connectors/ollama.py :: return resolve_ollama_model(None)
+    Killed by: src/uclone_x/llm/connectors/ollama.py :: return resolve_ollama_model(self._model)
     Becomes: return "default"
     """
     result, sent = await _ollama_turn(served="qwen3:8b-q4_K_M")
@@ -159,9 +159,9 @@ async def test_a_turn_whose_model_cannot_be_known_records_none_rather_than_defau
     """No model is knowable, so none is recorded -- `None`, which the room renders as the
     provider alone -- and the placeholder `default` is not presented as one.
 
-    Killed by: src/uclone_x/agent/base.py :: return stripped if stripped and stripped != "default" else None
+    Killed by: src/uclone_x/agent/turn_executor.py :: return stripped if stripped and stripped != "default" else None
     Becomes: return stripped or None
-    Killed by: src/uclone_x/agent/base.py :: model=requested_model or served_model,
+    Killed by: src/uclone_x/agent/turn_executor.py :: model=requested_model or served_model,
     Becomes: model=requested_model or served_model or "default",
     """
     result = await _streamed_turn(_NamelessStreamConnector(), model_name=configured)
@@ -177,7 +177,7 @@ async def test_a_turn_whose_model_cannot_be_known_records_none_rather_than_defau
 async def test_an_openai_compatible_stream_carries_the_model_its_chunks_name() -> None:
     """OpenAI and vLLM name the model on every SSE chunk, and the chunk passes it on.
 
-    vLLM declares an empty `_default_model`, so a streamed vLLM turn whose request named no
+    vLLM may be built with no model, so a streamed vLLM turn whose request named no
     model had nothing but the stream to be attributed from, and recorded `default` too.
 
     Killed by: src/uclone_x/llm/connectors/openai.py :: model=served_model,
@@ -193,7 +193,9 @@ async def test_an_openai_compatible_stream_carries_the_model_its_chunks_name() -
         return httpx.Response(200, text=body, headers={"Content-Type": "text/event-stream"})
 
     connector = OpenAIConnector(
-        api_key="test_key", http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        model="gpt-4o",
+        api_key="test_key",
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
     )
     chunks = [
         chunk

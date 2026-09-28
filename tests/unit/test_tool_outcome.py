@@ -140,7 +140,8 @@ async def test_the_empty_note_reaches_the_model_in_the_tool_message() -> None:
     that ended the measured turn. A classification recorded in a field the model does not
     read would be the #584 failure in another costume.
 
-    Killed by: src/uclone_x/agent/base.py :: if classify_tool_outcome(res) is ToolOutcome.EMPTY:
+    Killed by: src/uclone_x/agent/tool_execution.py :: if classify_tool_outcome(res) is ToolOutcome.EMPTY:
+    Becomes: if False:
     """
     from collections.abc import AsyncIterator
 

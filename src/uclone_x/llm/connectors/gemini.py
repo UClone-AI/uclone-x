@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
+import logging
 import os
 from collections.abc import AsyncIterator
 from typing import Any, cast
@@ -12,14 +15,26 @@ import httpx
 from uclone_x.core.immutable import unwrap_immutable
 from uclone_x.core.provenance import Provenance
 from uclone_x.errors import (
+    ImageNotReturnedError,
     LLMCredentialsNotConfiguredError,
-    LLMProviderError,
     UnmappableChatMessageError,
 )
+from uclone_x.llm.catalog import CatalogEntry
 from uclone_x.llm.connectors.base import (
     BaseLLMConnector,
+    named_model,
     parse_dict_payload,
+    refuse_response_schema,
+    resolve_model,
     resolve_token_counts,
+)
+from uclone_x.llm.connectors.failures import failed_request, failed_status, unusable_response
+from uclone_x.llm.connectors.listing import (
+    MAX_LISTING_PAGES,
+    get_listing_page,
+    listed_items,
+    optional_int,
+    optional_str,
 )
 from uclone_x.llm.models import (
     FinishReason,
@@ -32,23 +47,74 @@ from uclone_x.llm.models import (
     ToolCallRequest,
 )
 
-_DEFAULT_MODEL = "gemini-1.5-pro"
+_logger = logging.getLogger(__name__)
+
+#: Who the person using the app holds the key with, as a failure names it (#1630).
+_PROVIDER = "Google"
 
 
-def _requested_model(request: LLMRequest) -> str:
-    """The model this connector asks Gemini for, defaulted when the caller named none.
+def _usage_counts(usage_meta: dict[str, Any]) -> tuple[int, int, int]:
+    """Input, output and total tokens from a Gemini `usageMetadata`.
 
-    One expression, used by the request builder, the streaming path and the
-    `Provenance.requested` it reports. It was written out three times with the same
-    literal; if one copy were ever changed and not the others, provenance would name
-    a `requested` model that was never sent and `degraded` would flip — in the exact
-    field #149 exists to make trustworthy.
+    `totalTokenCount` is `promptTokenCount + candidatesTokenCount` plus two counts that
+    sit beside them: `thoughtsTokenCount` (a thinking model's reasoning, billed as
+    output) and `toolUsePromptTokenCount` (tool-use context Gemini adds to the prompt).
+    Reading only the first two made every `gemini-2.5-*` reply fail `TokenUsage`'s sum
+    check -- thinking is on by default there -- so the call errored after it had been
+    billed. Each count is folded into the side it is charged on, which is also where
+    OpenAI's `completion_tokens` already puts reasoning tokens.
+
+    Inside a `usageMetadata` Gemini did send, an absent field is a zero: its JSON omits
+    zero-valued fields, e.g. `candidatesTokenCount` for a blocked prompt.
     """
-    if request.model is not None:
-        stripped = request.model.strip()
-        if stripped and stripped != "default":
-            return stripped
-    return _DEFAULT_MODEL
+    in_tokens = int(usage_meta.get("promptTokenCount", 0)) + int(
+        usage_meta.get("toolUsePromptTokenCount", 0)
+    )
+    out_tokens = int(usage_meta.get("candidatesTokenCount", 0)) + int(
+        usage_meta.get("thoughtsTokenCount", 0)
+    )
+    return in_tokens, out_tokens, int(usage_meta.get("totalTokenCount", in_tokens + out_tokens))
+
+
+def _first_inline_image(data: object, *, model: str) -> tuple[bytes, str]:
+    """The first candidate's first ``inlineData`` part, decoded, or `ImageNotReturnedError`.
+
+    The reason a reply held no picture (its ``finishReason``, any text the model wrote
+    instead) is logged below WARNING, as `failures` logs a raw response; the error itself
+    carries none of it.
+    """
+    candidates: list[object] = []
+    if isinstance(data, dict):
+        found = cast(dict[str, object], data).get("candidates")
+        if isinstance(found, list):
+            candidates = cast(list[object], found)
+    finish: object = None
+    for candidate in candidates[:1]:
+        if not isinstance(candidate, dict):
+            break
+        cand = cast(dict[str, object], candidate)
+        finish = cand.get("finishReason")
+        content = cand.get("content")
+        parts = cast(dict[str, object], content).get("parts") if isinstance(content, dict) else None
+        for part in cast(list[object], parts) if isinstance(parts, list) else []:
+            inline = (
+                cast(dict[str, object], part).get("inlineData") if isinstance(part, dict) else None
+            )
+            if not isinstance(inline, dict):
+                continue
+            blob = cast(dict[str, object], inline)
+            encoded, mime = blob.get("data"), blob.get("mimeType")
+            if not isinstance(encoded, str) or not encoded:
+                continue
+            try:
+                raw = base64.b64decode(encoded, validate=True)
+            except (binascii.Error, ValueError):
+                continue
+            return raw, mime if isinstance(mime, str) and mime else "application/octet-stream"
+    _logger.info(
+        "%s answered image model %s with no image part (finishReason=%r)", _PROVIDER, model, finish
+    )
+    raise ImageNotReturnedError(provider=_PROVIDER, model=model)
 
 
 class GeminiConnector(BaseLLMConnector):
@@ -60,7 +126,12 @@ class GeminiConnector(BaseLLMConnector):
         base_url: str | None = None,
         timeout: float = 60.0,
         http_client: httpx.AsyncClient | None = None,
+        model: str | None = None,
     ) -> None:
+        """``model`` is what a request naming no model is sent to; see ``resolve_model``."""
+        #: The model a request naming none asks for, or ``None``: then such a request is
+        #: refused before the network rather than sent to a model id written here.
+        self._default_model: str | None = named_model(model)
         resolved_key = (
             api_key
             if api_key is not None
@@ -91,6 +162,92 @@ class GeminiConnector(BaseLLMConnector):
     @property
     def provider_name(self) -> str:
         return "gemini"
+
+    def _requested_model(self, request: LLMRequest) -> str:
+        """The model this connector asks Gemini for: the request's, else its own, else refused.
+
+        One expression, used by the request builder, the streaming path and the
+        `Provenance.requested` it reports, so provenance cannot name a `requested` model
+        that was never sent (#149).
+        """
+        return resolve_model(request.model, self._default_model, _PROVIDER)
+
+    async def list_models(self) -> list[CatalogEntry]:
+        """The models this key can use, from Gemini's `models.list` (#1631).
+
+        Gemini reports each model's input and output token limits and the methods it
+        supports; a model without `generateContent` (an embedding model) cannot chat.
+        """
+        entries: list[CatalogEntry] = []
+        params: dict[str, str] = {"pageSize": "1000"}
+        for _ in range(MAX_LISTING_PAGES):
+            page = await get_listing_page(
+                self,
+                provider=_PROVIDER,
+                url=f"{self.base_url}/models",
+                headers={"x-goog-api-key": self._require_api_key()},
+                params=params,
+            )
+            for item in listed_items(page, "models"):
+                name = optional_str(item.get("name"))
+                if name is None:
+                    continue
+                methods = item.get("supportedGenerationMethods")
+                entries.append(
+                    CatalogEntry(
+                        id=name.removeprefix("models/"),
+                        display_name=optional_str(item.get("displayName")),
+                        context_window=optional_int(item.get("inputTokenLimit")),
+                        max_output_tokens=optional_int(item.get("outputTokenLimit")),
+                        chat_capable=isinstance(methods, list)
+                        and "generateContent" in cast(list[object], methods),
+                    )
+                )
+            token = optional_str(page.get("nextPageToken"))
+            if token is None:
+                break
+            params = {"pageSize": "1000", "pageToken": token}
+        return entries
+
+    async def generate_image(self, prompt: str, aspect_ratio: str, model: str) -> tuple[bytes, str]:
+        """One picture from a Gemini image model: ``(image bytes, MIME type)``.
+
+        ``generateContent`` with ``responseModalities: ["IMAGE"]`` and the aspect ratio in
+        ``imageConfig``; the first ``inlineData`` part of the first candidate is the picture.
+        A reply with no such part -- text only, or no candidates, which is how the model
+        declines a description -- raises `ImageNotReturnedError`; nothing stands in for the
+        picture (P6). Every other failure is mapped by `failures`, like a chat call's.
+        """
+        chosen = resolve_model(model, self._default_model, _PROVIDER)
+        payload: dict[str, Any] = {
+            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "responseModalities": ["IMAGE"],
+                "imageConfig": {"aspectRatio": aspect_ratio},
+            },
+        }
+        url = f"{self.base_url}/models/{chosen}:generateContent"
+        headers: dict[str, str] = {
+            "x-goog-api-key": self._require_api_key(),
+            "Content-Type": "application/json",
+        }
+        client = self._get_client()
+        should_close = self._http_client is None
+        try:
+            resp = await client.post(url, json=payload, headers=headers, timeout=self.timeout)
+            if resp.status_code != 200:
+                raise failed_status(
+                    provider=_PROVIDER, model=chosen, status_code=resp.status_code, body=resp.text
+                )
+            data: object = resp.json()
+        except httpx.RequestError as exc:
+            raise failed_request(provider=_PROVIDER, model=chosen, exc=exc) from exc
+        except json.JSONDecodeError as exc:
+            raise unusable_response(provider=_PROVIDER, model=chosen, detail=str(exc)) from exc
+        finally:
+            if should_close:
+                await client.aclose()
+        return _first_inline_image(data, model=chosen)
 
     def _map_finish_reason(self, reason: str | None) -> FinishReason:
         """Map Gemini's `finishReason` onto `FinishReason`, or report it as unknown.
@@ -155,6 +312,7 @@ class GeminiConnector(BaseLLMConnector):
             UnmappableChatMessageError: a message has no faithful Gemini
                 representation. The offending value is named in the message.
         """
+        refuse_response_schema(request, self.provider_name)
         system_texts: list[str] = []
         contents: list[dict[str, Any]] = []
 
@@ -243,13 +401,23 @@ class GeminiConnector(BaseLLMConnector):
             payload["systemInstruction"] = {"parts": [{"text": "\n\n".join(system_texts)}]}
 
         if request.tools:
+            # `parametersJsonSchema`, not `parameters`. `parameters` is Gemini's OpenAPI
+            # `Schema` subset, which rejects keywords our tools really emit —
+            # `additionalProperties` (every `extra="forbid"` params model) and `$defs`/`$ref`
+            # (nested params models) — with a 400 for the whole request. The JSON Schema
+            # field takes the advertised schema as it is, so nothing is flattened or
+            # dropped here: the schema Gemini sees is the one the other three connectors
+            # send (#1542's shared pass), in keeping with emitting the caller's value
+            # faithfully rather than a lossy rewrite of it.
             payload["tools"] = [
                 {
                     "functionDeclarations": [
                         {
                             "name": t.name,
                             "description": t.description,
-                            "parameters": cast(dict[str, Any], unwrap_immutable(t.parameters)),
+                            "parametersJsonSchema": cast(
+                                dict[str, Any], unwrap_immutable(t.parameters)
+                            ),
                         }
                         for t in request.tools
                     ]
@@ -260,7 +428,7 @@ class GeminiConnector(BaseLLMConnector):
 
     async def generate(self, request: LLMRequest) -> ModelResponse:
         """Generate response from Gemini REST endpoint."""
-        model = _requested_model(request)
+        model = self._requested_model(request)
         payload = self._build_payload(request)
         url = f"{self.base_url}/models/{model}:generateContent"
         headers: dict[str, str] = {
@@ -273,19 +441,21 @@ class GeminiConnector(BaseLLMConnector):
         try:
             resp = await client.post(url, json=payload, headers=headers, timeout=self.timeout)
             if resp.status_code != 200:
-                raise LLMProviderError(f"Gemini error {resp.status_code}: {resp.text}")
+                raise failed_status(
+                    provider=_PROVIDER, model=model, status_code=resp.status_code, body=resp.text
+                )
             data: dict[str, Any] = resp.json()
         except httpx.RequestError as exc:
-            raise LLMProviderError(f"Gemini connection error: {exc}") from exc
+            raise failed_request(provider=_PROVIDER, model=model, exc=exc) from exc
         except json.JSONDecodeError as exc:
-            raise LLMProviderError(f"Invalid JSON from Gemini: {exc}") from exc
+            raise unusable_response(provider=_PROVIDER, model=model, detail=str(exc)) from exc
         finally:
             if should_close:
                 await client.aclose()
 
         candidates = data.get("candidates", [])
         if not candidates:
-            raise LLMProviderError("Gemini returned empty candidates in response")
+            raise unusable_response(provider=_PROVIDER, model=model, detail="no candidates")
 
         candidate = candidates[0]
         content_obj = candidate.get("content", {})
@@ -316,11 +486,7 @@ class GeminiConnector(BaseLLMConnector):
             )
             total_tokens = in_tokens + out_tokens
         else:
-            # Inside a `usageMetadata` Gemini did send, an absent field is a zero: its JSON
-            # omits zero-valued fields, e.g. `candidatesTokenCount` for a blocked prompt.
-            in_tokens = int(usage_meta.get("promptTokenCount", 0))
-            out_tokens = int(usage_meta.get("candidatesTokenCount", 0))
-            total_tokens = int(usage_meta.get("totalTokenCount", in_tokens + out_tokens))
+            in_tokens, out_tokens, total_tokens = _usage_counts(usage_meta)
             count_source = TokenCountSource.PROVIDER
         model_name = data.get("modelVersion", model)
 
@@ -354,7 +520,7 @@ class GeminiConnector(BaseLLMConnector):
 
     async def stream(self, request: LLMRequest) -> AsyncIterator[StreamChunk]:
         """Stream response chunks from Gemini SSE endpoint."""
-        model = _requested_model(request)
+        model = self._requested_model(request)
         payload = self._build_payload(request)
         url = f"{self.base_url}/models/{model}:streamGenerateContent?alt=sse"
         headers: dict[str, str] = {
@@ -370,8 +536,11 @@ class GeminiConnector(BaseLLMConnector):
             ) as resp:
                 if resp.status_code != 200:
                     err_body = await resp.aread()
-                    raise LLMProviderError(
-                        f"Gemini stream error {resp.status_code}: {err_body.decode('utf-8', errors='replace')}"
+                    raise failed_status(
+                        provider=_PROVIDER,
+                        model=model,
+                        status_code=resp.status_code,
+                        body=err_body.decode("utf-8", errors="replace"),
                     )
 
                 async for raw_line in resp.aiter_lines():
@@ -418,15 +587,14 @@ class GeminiConnector(BaseLLMConnector):
                     usage_meta = chunk_json.get("usageMetadata")
                     usage: TokenUsage | None = None
                     if usage_meta:
-                        in_tok = int(usage_meta.get("promptTokenCount", 0))
-                        out_tok = int(usage_meta.get("candidatesTokenCount", 0))
+                        in_tok, out_tok, total_tok = _usage_counts(usage_meta)
                         model_name = chunk_json.get("modelVersion", model)
                         usage = TokenUsage(
                             provider="gemini",
                             model=model_name,
                             input_tokens=in_tok,
                             output_tokens=out_tok,
-                            total_tokens=in_tok + out_tok,
+                            total_tokens=total_tok,
                         )
 
                     if delta_content or tool_calls or usage or finish_reason:
@@ -437,7 +605,7 @@ class GeminiConnector(BaseLLMConnector):
                             finish_reason=finish_reason,
                         )
         except httpx.RequestError as exc:
-            raise LLMProviderError(f"Gemini stream connection error: {exc}") from exc
+            raise failed_request(provider=_PROVIDER, model=model, exc=exc) from exc
         finally:
             if should_close:
                 await client.aclose()

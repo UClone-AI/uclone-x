@@ -1,0 +1,51 @@
+{
+  "placeholder": "Send a message",
+  "dictate": {
+    "stopLabel": "Stop listening",
+    "startLabel": "Speak the message",
+    "listening": "Listening",
+    "speak": "Speak"
+  },
+  "dictation": {
+    "unsupported": "This browser cannot listen. Type the message, or open the conversation in Chrome, Edge or Safari to speak it.",
+    "notAllowed": "The browser is not letting this page use the microphone. Allow it for this site in the browser, then press the mic again.",
+    "noSpeech": "Nothing was heard. Press the mic and speak, or type the message instead.",
+    "audioCapture": "No microphone was found. Connect one and press the mic again, or type the message instead.",
+    "network": "The browser could not reach its speech service. Type the message instead, or press the mic again once the connection is back.",
+    "other": "Listening stopped ({code}). Press the mic to try again, or type the message instead."
+  },
+  "hint": {
+    "emptyRoom": "No one is in this conversation yet.",
+    "noSuchName": "No one here is called @{token}, so this message will not be answered.",
+    "unresolved": "Someone will pick this up",
+    "one": "{names} will answer",
+    "inOrder": "{names} will answer, in that order",
+    "cutOff": "{names} will answer, in that order. Paused after {count} replies, so the rest of those you named will not."
+  },
+  "seat": {
+    "noAnswerYet": "No answer yet",
+    "ringTokens": "{name} has used {used} of {max} tokens of context",
+    "ringTurns": "{name} has used {used} of {max} turns of context",
+    "windowLoaded": "The server serving this model reported this context window when it loaded it.",
+    "windowPublished": "The published context window for this model, which its provider enforces.",
+    "activeContext": "Active context: {used} / {max} tokens. Session spend: {spent} tokens.",
+    "notCountedYet": "Token counts are kept for the current run. This seat has not answered since it started, so nothing has been booked against it here.",
+    "noWindow": "No context window was reported for this model, so the ring counts turns instead of tokens.",
+    "tokensOf": "{used}/{max} tokens",
+    "turnsOf": "{used}/{max} turns",
+    "tokensNotCounted": "tokens not counted this run",
+    "tokens": "{count} tokens",
+    "several": "Each answers from its own context"
+  },
+  "stop": "Stop",
+  "sendLabel": "Send (Enter)",
+  "send": "Send",
+  "sendFailure": {
+    "refused": "Not sent: {reason}",
+    "absent": "{reason} Your message is not in this conversation.",
+    "unconfirmed": "Could not confirm whether this conversation has your message: {reason}",
+    "noAnswer": "The app's background service didn't answer.",
+    "noReason": "Something went wrong in the app's background service.",
+    "appFault": "Something went wrong in the app."
+  }
+}

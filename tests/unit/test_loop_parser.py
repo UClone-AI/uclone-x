@@ -4,6 +4,8 @@ import pytest
 
 from uclone_x.agent.loop.parser import (
     MIN_INTERVAL_SECONDS,
+    LoopParseError,
+    LoopParseReason,
     parse_interval_string,
     parse_loop_command_input,
 )
@@ -86,3 +88,28 @@ def test_parse_loop_command_input_missing_prompt_or_interval() -> None:
 
     with pytest.raises(ValueError, match="Could not recognize interval"):
         parse_loop_command_input("just run this without any interval")
+
+
+@pytest.mark.parametrize(
+    ("text", "reason"),
+    [
+        ("", "usage"),
+        ("5m", "missing_prompt"),
+        ("5m   ", "missing_prompt"),
+        ("5분마다", "missing_prompt"),
+        ("0.5s check", "interval_too_short"),
+        ("every 0.5 seconds check", "interval_too_short"),
+        ("just run this without any interval", "no_interval"),
+    ],
+)
+def test_a_command_that_cannot_be_read_says_why_as_a_value(
+    text: str, reason: LoopParseReason
+) -> None:
+    """A conversation words the reason itself, so the reason is a value, not the message.
+
+    Killed by: src/uclone_x/agent/loop/parser.py :: "Prompt is empty after extracting interval.", reason="missing_prompt"
+    Becomes: "Prompt is empty after extracting interval.", reason="no_interval"
+    """
+    with pytest.raises(LoopParseError) as raised:
+        parse_loop_command_input(text)
+    assert raised.value.reason == reason

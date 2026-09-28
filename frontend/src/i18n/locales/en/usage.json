@@ -1,0 +1,59 @@
+{
+  "title": "Paid model usage",
+  "intro": "Counts tokens sent to and received from paid cloud models. Local models are never counted.",
+  "loading": "Loading your usage…",
+  "loadFailed": "Your usage could not be loaded.",
+  "windows": {
+    "per_10_minutes": "Last 10 minutes",
+    "per_5_hours": "Last 5 hours",
+    "per_week": "Last 7 days"
+  },
+  "fields": {
+    "per_10_minutes": "Per 10 minutes",
+    "per_5_hours": "Per 5 hours",
+    "per_week": "Per week"
+  },
+  "phrases": {
+    "per_10_minutes": "10-minute",
+    "per_5_hours": "5-hour",
+    "per_week": "weekly"
+  },
+  "ofLimit": "{used} of {limit} ({pct}%)",
+  "noLimit": "{used} used, no limit",
+  "pausedUntil": "Paid models are paused until {time}.",
+  "envOverride": "Set by {variable}",
+  "limitLabel": "Limit",
+  "presets": {
+    "light": "Light",
+    "standard": "Standard",
+    "heavy": "Heavy",
+    "none": "No limit",
+    "custom": "Custom"
+  },
+  "presetHelp": {
+    "light": "Light — enough for short chats with one clone.",
+    "standard": "Standard — enough for a few hours of steady chatting with one or two clones.",
+    "heavy": "Heavy — for long sessions with several clones working at once.",
+    "none": "No limit — paid models are never paused by UClone-X.",
+    "custom": "Custom — set each window yourself."
+  },
+  "customHelp": "Leave a box empty for no limit in that window.",
+  "save": "Save limits",
+  "saving": "Saving…",
+  "saved": "Limits saved.",
+  "saveFailed": "The limits were not saved.",
+  "providers": "By provider (last 7 days):",
+  "noProviders": "No paid model has been used in the last 7 days.",
+  "moneyCap": "This counts tokens, not money. For a hard spending cap, set a limit in your provider's console:",
+  "offer": {
+    "text": "Paid models have no usage limit yet.",
+    "set": "Set a limit",
+    "dismiss": "Not now"
+  },
+  "banner": {
+    "text": "You've used 80% of your {window} limit for paid models.",
+    "open": "Usage settings",
+    "close": "Close",
+    "reached": "Paid models are paused until {time} because your {window} limit was reached."
+  }
+}

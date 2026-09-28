@@ -23,6 +23,9 @@ from uclone_x.errors import (
     LLMTimeoutError,
     MalformedToolCallArgumentsError,
     ModelLacksToolSupportError,
+    ProviderAuthError,
+    ProviderQuotaError,
+    ProviderResponseError,
     UnmappableChatMessageError,
 )
 from uclone_x.llm import (
@@ -131,13 +134,14 @@ def test_resolve_ollama_model_hierarchy(monkeypatch: pytest.MonkeyPatch) -> None
     for var in ("OLLAMA_MODEL", "OLLAMA_INDEPTH_MODEL", "OLLAMA_FAST_MODEL"):
         monkeypatch.delenv(var, raising=False)
 
-    # 1. Default fallback when all envs are unset and model is None / "" / "default" / whitespace
-    assert resolve_ollama_model() == "qwen3:8b"
-    assert resolve_ollama_model(None) == "qwen3:8b"
-    assert resolve_ollama_model("") == "qwen3:8b"
-    assert resolve_ollama_model("default") == "qwen3:8b"
-    assert resolve_ollama_model("   ") == "qwen3:8b"
-    assert resolve_ollama_model("  default  ") == "qwen3:8b"
+    # 1. No model at all when all envs are unset and model is None / "" / "default" /
+    # whitespace: no model id is filled in from source.
+    assert resolve_ollama_model() is None
+    assert resolve_ollama_model(None) is None
+    assert resolve_ollama_model("") is None
+    assert resolve_ollama_model("default") is None
+    assert resolve_ollama_model("   ") is None
+    assert resolve_ollama_model("  default  ") is None
 
     # 2. Resolves OLLAMA_FAST_MODEL when higher envs are absent
     monkeypatch.setenv("OLLAMA_FAST_MODEL", "qwen2.5-coder:7b")
@@ -188,7 +192,9 @@ async def test_ollama_connector_strips_v1_in_request_url() -> None:
 
     client = _make_mock_client(handler)
     # Instantiate connector with a /v1 suffix
-    connector = OllamaConnector(base_url="http://192.0.2.10:11434/v1/", http_client=client)
+    connector = OllamaConnector(
+        model=_OLLAMA_MODEL, base_url="http://192.0.2.10:11434/v1/", http_client=client
+    )
     assert connector.base_url == "http://192.0.2.10:11434"
 
     llm_req = LLMRequest(
@@ -220,7 +226,7 @@ async def test_ollama_connector_env_fast_base_url_fallback(monkeypatch: pytest.M
     monkeypatch.setenv("OLLAMA_FAST_BASE_URL", "http://192.0.2.10:11434/v1")
 
     client = _make_mock_client(handler)
-    connector = OllamaConnector(http_client=client)
+    connector = OllamaConnector(model=_OLLAMA_MODEL, http_client=client)
     assert connector.base_url == "http://192.0.2.10:11434"
 
     llm_req = LLMRequest(
@@ -251,7 +257,7 @@ async def test_ollama_connector_generate_text() -> None:
         return httpx.Response(200, json=response_data)
 
     client = _make_mock_client(handler)
-    connector = OllamaConnector(http_client=client)
+    connector = OllamaConnector(model=_OLLAMA_MODEL, http_client=client)
 
     llm_req = LLMRequest(
         model="qwen2.5-coder:7b",
@@ -296,7 +302,7 @@ async def test_ollama_connector_generate_tool_calls() -> None:
         return httpx.Response(200, json=response_data)
 
     client = _make_mock_client(handler)
-    connector = OllamaConnector(http_client=client)
+    connector = OllamaConnector(model=_OLLAMA_MODEL, http_client=client)
 
     tool_def = ToolDefinition(
         name="lookup_user",
@@ -334,7 +340,7 @@ async def test_ollama_connector_streaming() -> None:
         return httpx.Response(200, text="\n".join(lines) + "\n")
 
     client = _make_mock_client(handler)
-    connector = OllamaConnector(http_client=client)
+    connector = OllamaConnector(model=_OLLAMA_MODEL, http_client=client)
 
     chunks: list[StreamChunk] = []
     async for chunk in connector.stream(
@@ -356,7 +362,7 @@ async def test_ollama_connector_errors() -> None:
         return httpx.Response(500, text="Internal Ollama Error")
 
     client = _make_mock_client(handler)
-    connector = OllamaConnector(http_client=client)
+    connector = OllamaConnector(model=_OLLAMA_MODEL, http_client=client)
 
     with pytest.raises(LLMProviderError, match="Ollama provider returned status 500"):
         await connector.generate(LLMRequest(messages=()))
@@ -390,7 +396,7 @@ async def test_ollama_generate_turns_a_model_without_tools_into_a_plain_sentence
     Killed by: src/uclone_x/llm/connectors/ollama.py :: if status_code == 400 and _NO_TOOL_SUPPORT_PHRASE in body:
     Becomes: if False:
     """
-    connector = OllamaConnector(http_client=_make_mock_client(_refuse_tools))
+    connector = OllamaConnector(model=_OLLAMA_MODEL, http_client=_make_mock_client(_refuse_tools))
 
     with pytest.raises(ModelLacksToolSupportError) as caught:
         await connector.generate(LLMRequest(messages=(), model="deepseek-r1:14b"))
@@ -406,7 +412,7 @@ async def test_ollama_stream_turns_a_model_without_tools_into_a_plain_sentence()
     Killed by: src/uclone_x/llm/connectors/ollama.py :: return ModelLacksToolSupportError(model)
     Becomes: return LLMProviderError(f"{prefix} {status_code}: {body}")
     """
-    connector = OllamaConnector(http_client=_make_mock_client(_refuse_tools))
+    connector = OllamaConnector(model=_OLLAMA_MODEL, http_client=_make_mock_client(_refuse_tools))
 
     with pytest.raises(ModelLacksToolSupportError) as caught:
         async for _ in connector.stream(  # pragma: no branch
@@ -424,7 +430,7 @@ async def test_ollama_other_400s_keep_the_diagnostic_wording() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(400, text='{"error":"invalid options"}')
 
-    connector = OllamaConnector(http_client=_make_mock_client(handler))
+    connector = OllamaConnector(model=_OLLAMA_MODEL, http_client=_make_mock_client(handler))
 
     with pytest.raises(LLMProviderError, match="returned status 400") as caught:
         await connector.generate(LLMRequest(messages=()))
@@ -453,7 +459,7 @@ async def test_ollama_transport_error_message_names_a_cause_when_exc_is_blank() 
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("", request=request)
 
-    connector = OllamaConnector(http_client=_make_mock_client(handler))
+    connector = OllamaConnector(model=_OLLAMA_MODEL, http_client=_make_mock_client(handler))
 
     with pytest.raises(LLMProviderError) as excinfo:
         await connector.generate(LLMRequest(messages=()))
@@ -486,7 +492,9 @@ async def test_ollama_generate_says_a_ceiling_expired_rather_than_a_daemon_was_a
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ReadTimeout("", request=request)
 
-    connector = OllamaConnector(http_client=_make_mock_client(handler), timeout=42.0)
+    connector = OllamaConnector(
+        model=_OLLAMA_MODEL, http_client=_make_mock_client(handler), timeout=42.0
+    )
 
     with pytest.raises(LLMTimeoutError) as excinfo:
         await connector.generate(LLMRequest(messages=()))
@@ -516,7 +524,9 @@ async def test_ollama_generate_keeps_a_connect_timeout_on_the_unreachable_side()
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectTimeout("timed out reaching host", request=request)
 
-    connector = OllamaConnector(http_client=_make_mock_client(handler), timeout=42.0)
+    connector = OllamaConnector(
+        model=_OLLAMA_MODEL, http_client=_make_mock_client(handler), timeout=42.0
+    )
 
     with pytest.raises(LLMProviderError) as excinfo:
         await connector.generate(LLMRequest(messages=()))
@@ -540,7 +550,9 @@ async def test_ollama_stream_draws_the_same_line_generate_does() -> None:
     def timed_out(request: httpx.Request) -> httpx.Response:
         raise httpx.ReadTimeout("", request=request)
 
-    connector = OllamaConnector(http_client=_make_mock_client(timed_out), timeout=7.5)
+    connector = OllamaConnector(
+        model=_OLLAMA_MODEL, http_client=_make_mock_client(timed_out), timeout=7.5
+    )
 
     with pytest.raises(LLMTimeoutError) as excinfo:
         async for _ in connector.stream(LLMRequest(messages=())):  # pragma: no branch
@@ -552,7 +564,9 @@ async def test_ollama_stream_draws_the_same_line_generate_does() -> None:
     def unreachable(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectTimeout("timed out reaching host", request=request)
 
-    connector = OllamaConnector(http_client=_make_mock_client(unreachable), timeout=7.5)
+    connector = OllamaConnector(
+        model=_OLLAMA_MODEL, http_client=_make_mock_client(unreachable), timeout=7.5
+    )
 
     with pytest.raises(LLMProviderError) as connect_info:
         async for _ in connector.stream(LLMRequest(messages=())):  # pragma: no branch
@@ -606,15 +620,15 @@ def test_ollama_connector_uses_resolved_timeout(monkeypatch: pytest.MonkeyPatch)
     monkeypatch.delenv("OLLAMA_TIMEOUT", raising=False)
     monkeypatch.delenv("LLM_TIMEOUT", raising=False)
 
-    conn_default = OllamaConnector()
+    conn_default = OllamaConnector(model=_OLLAMA_MODEL)
     assert conn_default.timeout == DEFAULT_OLLAMA_TIMEOUT_SECONDS
     assert conn_default.timeout == 180.0
 
     monkeypatch.setenv("OLLAMA_TIMEOUT", "300")
-    conn_env = OllamaConnector()
+    conn_env = OllamaConnector(model=_OLLAMA_MODEL)
     assert conn_env.timeout == 300.0
 
-    conn_explicit = OllamaConnector(timeout=45.0)
+    conn_explicit = OllamaConnector(model=_OLLAMA_MODEL, timeout=45.0)
     assert conn_explicit.timeout == 45.0
 
 
@@ -1091,7 +1105,7 @@ async def test_openai_connector_generate() -> None:
         return httpx.Response(200, json=response_data)
 
     client = _make_mock_client(handler)
-    connector = OpenAIConnector(api_key="test_key", http_client=client)
+    connector = OpenAIConnector(model="gpt-4o", api_key="test_key", http_client=client)
 
     resp = await connector.generate(
         LLMRequest(
@@ -1133,7 +1147,7 @@ async def test_openai_connector_streaming() -> None:
         return httpx.Response(200, text="\n\n".join(sse_lines) + "\n\n")
 
     client = _make_mock_client(handler)
-    connector = OpenAIConnector(api_key="key", http_client=client)
+    connector = OpenAIConnector(model="gpt-4o", api_key="key", http_client=client)
 
     chunks: list[StreamChunk] = []
     async for chunk in connector.stream(
@@ -1155,9 +1169,9 @@ async def test_openai_connector_error() -> None:
         return httpx.Response(401, text="Unauthorized API key")
 
     client = _make_mock_client(handler)
-    connector = OpenAIConnector(api_key="bad_key", http_client=client)
+    connector = OpenAIConnector(model="gpt-4o", api_key="bad_key", http_client=client)
 
-    with pytest.raises(LLMProviderError, match="OpenAI error 401"):
+    with pytest.raises(ProviderAuthError, match="OpenAI did not accept the API key"):
         await connector.generate(LLMRequest(messages=()))
 
 
@@ -1195,7 +1209,7 @@ async def test_anthropic_connector_generate() -> None:
         return httpx.Response(200, json=response_data)
 
     client = _make_mock_client(handler)
-    connector = AnthropicConnector(api_key="ant_key", http_client=client)
+    connector = AnthropicConnector(model="claude-3-5-sonnet", api_key="ant_key", http_client=client)
 
     llm_req = LLMRequest(
         model="claude-3-5-sonnet",
@@ -1249,7 +1263,7 @@ async def test_anthropic_connector_streaming() -> None:
         return httpx.Response(200, text="\n\n".join(sse_lines) + "\n\n")
 
     client = _make_mock_client(handler)
-    connector = AnthropicConnector(api_key="key", http_client=client)
+    connector = AnthropicConnector(model="claude-3-5-sonnet", api_key="key", http_client=client)
 
     chunks: list[StreamChunk] = []
     async for chunk in connector.stream(
@@ -1272,9 +1286,9 @@ async def test_anthropic_connector_error() -> None:
         return httpx.Response(429, text="Rate limit exceeded")
 
     client = _make_mock_client(handler)
-    connector = AnthropicConnector(api_key="key", http_client=client)
+    connector = AnthropicConnector(model="claude-3-5-sonnet", api_key="key", http_client=client)
 
-    with pytest.raises(LLMProviderError, match="Anthropic error 429"):
+    with pytest.raises(ProviderQuotaError, match="Anthropic's usage limit"):
         await connector.generate(LLMRequest(messages=()))
 
 
@@ -1318,7 +1332,7 @@ async def test_gemini_connector_generate() -> None:
         return httpx.Response(200, json=response_data)
 
     client = _make_mock_client(handler)
-    connector = GeminiConnector(api_key="gem_key", http_client=client)
+    connector = GeminiConnector(model="gemini-1.5-pro", api_key="gem_key", http_client=client)
 
     resp = await connector.generate(
         LLMRequest(
@@ -1373,7 +1387,9 @@ async def test_gemini_connector_keeps_a_resolved_model_alias_visible() -> None:
             },
         )
 
-    connector = GeminiConnector(api_key="gem_key", http_client=_make_mock_client(handler))
+    connector = GeminiConnector(
+        model="gemini-1.5-pro", api_key="gem_key", http_client=_make_mock_client(handler)
+    )
     resp = await connector.generate(
         LLMRequest(
             model="gemini-1.5-pro",
@@ -1462,7 +1478,7 @@ async def test_requested_provenance_names_the_model_actually_sent() -> None:
             },
         )
 
-    connector = OpenAIConnector(api_key="k", http_client=_make_mock_client(handler))
+    connector = OpenAIConnector(model="gpt-4o", api_key="k", http_client=_make_mock_client(handler))
     # No model named: the connector's own default is what reaches the provider.
     resp = await connector.generate(
         LLMRequest(messages=(ChatMessage(role=MessageRole.USER, content="hi"),))
@@ -1474,6 +1490,9 @@ async def test_requested_provenance_names_the_model_actually_sent() -> None:
 
 
 _LOCAL_MODEL = "qwen2.5-coder-32b-instruct"
+#: What an Ollama connector is built with in these tests; the factory hands the saved
+#: model to the connector, which fills in none of its own.
+_OLLAMA_MODEL = "qwen3:8b"
 """A model name OpenAI does not serve, served by a local OpenAI-compatible endpoint."""
 
 
@@ -1517,11 +1536,11 @@ async def test_an_openai_compatible_connector_is_attributed_to_itself() -> None:
     budget row and UI label downstream repeats it. The literal is unreachable by any
     override, which is what makes this the connector's defect rather than the operator's.
 
-    Killed by: src/uclone_x/llm/connectors/openai.py :: provider=self.provider_name, model=requested_model, served_model=model_name
-    Becomes: provider="openai", model=requested_model, served_model=model_name
+    Killed by: src/uclone_x/llm/connectors/openai.py :: provider=self.provider_name, model=model, served_model=model_name
+    Becomes: provider="openai", model=model, served_model=model_name
     """
     connector = _OpenAICompatibleConnector(
-        api_key="k", http_client=_make_mock_client(_local_endpoint_handler)
+        api_key="k", model=_LOCAL_MODEL, http_client=_make_mock_client(_local_endpoint_handler)
     )
 
     resp = await connector.generate(
@@ -1553,7 +1572,9 @@ async def test_a_streamed_openai_compatible_turn_is_attributed_to_itself() -> No
         )
         return httpx.Response(200, text=body)
 
-    connector = _OpenAICompatibleConnector(api_key="k", http_client=_make_mock_client(handler))
+    connector = _OpenAICompatibleConnector(
+        api_key="k", model=_LOCAL_MODEL, http_client=_make_mock_client(handler)
+    )
 
     usages: list[TokenUsage] = []
     async for chunk in connector.stream(
@@ -1567,15 +1588,15 @@ async def test_a_streamed_openai_compatible_turn_is_attributed_to_itself() -> No
 
 
 def _openai_connector(client: httpx.AsyncClient) -> BaseLLMConnector:
-    return OpenAIConnector(api_key="k", http_client=client)
+    return OpenAIConnector(model="gpt-4o", api_key="k", http_client=client)
 
 
 def _anthropic_connector(client: httpx.AsyncClient) -> BaseLLMConnector:
-    return AnthropicConnector(api_key="k", http_client=client)
+    return AnthropicConnector(model="claude-3-5-sonnet", api_key="k", http_client=client)
 
 
 def _ollama_connector(client: httpx.AsyncClient) -> BaseLLMConnector:
-    return OllamaConnector(http_client=client)
+    return OllamaConnector(model=_OLLAMA_MODEL, http_client=client)
 
 
 _ALIAS_CASES: list[
@@ -1694,15 +1715,21 @@ async def test_connectors_report_an_unaliased_model_as_undegraded() -> None:
 
     cases = (
         (
-            OpenAIConnector(api_key="k", http_client=_make_mock_client(openai_handler)),
+            OpenAIConnector(
+                model="gpt-4o", api_key="k", http_client=_make_mock_client(openai_handler)
+            ),
             "gpt-4o",
         ),
         (
-            AnthropicConnector(api_key="k", http_client=_make_mock_client(anthropic_handler)),
+            AnthropicConnector(
+                model="claude-3-5-sonnet",
+                api_key="k",
+                http_client=_make_mock_client(anthropic_handler),
+            ),
             "claude-3-5-sonnet",
         ),
         (
-            OllamaConnector(http_client=_make_mock_client(ollama_handler)),
+            OllamaConnector(model=_OLLAMA_MODEL, http_client=_make_mock_client(ollama_handler)),
             "qwen2.5-coder:14b",
         ),
     )
@@ -1744,7 +1771,7 @@ async def test_gemini_connector_streaming() -> None:
         return httpx.Response(200, text="\n\n".join(sse_lines) + "\n\n")
 
     client = _make_mock_client(handler)
-    connector = GeminiConnector(api_key="key", http_client=client)
+    connector = GeminiConnector(model="gemini-1.5-pro", api_key="key", http_client=client)
 
     chunks: list[StreamChunk] = []
     async for chunk in connector.stream(
@@ -1760,15 +1787,104 @@ async def test_gemini_connector_streaming() -> None:
     assert chunks[1].usage.total_tokens == 23
 
 
+# The shape `gemini-2.5-flash` returned live (2026-09-25): thinking is on by default, so
+# `totalTokenCount` exceeds prompt + candidates by `thoughtsTokenCount`.
+_GEMINI_THINKING_USAGE = {
+    "promptTokenCount": 6400,
+    "candidatesTokenCount": 54,
+    "thoughtsTokenCount": 65,
+    "toolUsePromptTokenCount": 11,
+    "totalTokenCount": 6530,
+}
+
+
+@pytest.mark.asyncio
+async def test_gemini_counts_thinking_and_tool_use_tokens_where_they_are_billed() -> None:
+    """A thinking model's reply is accepted, with reasoning counted as output.
+
+    Reading only `promptTokenCount` and `candidatesTokenCount` made `TokenUsage` reject the
+    provider's own total, so every `gemini-2.5-*` call raised after it had been billed.
+
+    Killed by: src/uclone_x/llm/connectors/gemini.py :: usage_meta.get("thoughtsTokenCount", 0)
+    Becomes: usage_meta.get("thoughtsTokenCount", 0) * 0
+    Killed by: src/uclone_x/llm/connectors/gemini.py :: usage_meta.get("toolUsePromptTokenCount", 0)
+    Becomes: usage_meta.get("toolUsePromptTokenCount", 0) * 0
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "candidates": [
+                    {
+                        "content": {"parts": [{"text": "ok"}], "role": "model"},
+                        "finishReason": "STOP",
+                    }
+                ],
+                "usageMetadata": _GEMINI_THINKING_USAGE,
+                "modelVersion": "gemini-2.5-flash",
+            },
+        )
+
+    connector = GeminiConnector(
+        model="gemini-1.5-pro", api_key="key", http_client=_make_mock_client(handler)
+    )
+    resp = await connector.generate(
+        LLMRequest(
+            model="gemini-2.5-flash", messages=(ChatMessage(role=MessageRole.USER, content="Hi"),)
+        )
+    )
+
+    assert (resp.usage.input_tokens, resp.usage.output_tokens, resp.usage.total_tokens) == (
+        6411,
+        119,
+        6530,
+    )
+    assert resp.usage.count_source == TokenCountSource.PROVIDER
+
+
+@pytest.mark.asyncio
+async def test_gemini_stream_counts_thinking_tokens_like_generate() -> None:
+    """The stream's final usage agrees with `generate` on the same `usageMetadata`.
+
+    The stream summed prompt + candidates itself, so it never raised -- it under-reported a
+    thinking model's output instead, and disagreed with `generate` about the same reply.
+
+    Killed by: src/uclone_x/llm/connectors/gemini.py :: usage_meta.get("thoughtsTokenCount", 0)
+    Becomes: usage_meta.get("thoughtsTokenCount", 0) * 0
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        line = "data: " + json.dumps(
+            {
+                "candidates": [{"content": {"parts": [{"text": "ok"}]}, "finishReason": "STOP"}],
+                "usageMetadata": _GEMINI_THINKING_USAGE,
+            }
+        )
+        return httpx.Response(200, text=line + "\n\n")
+
+    connector = GeminiConnector(
+        model="gemini-1.5-pro", api_key="key", http_client=_make_mock_client(handler)
+    )
+    chunks = [
+        c
+        async for c in connector.stream(
+            LLMRequest(messages=(ChatMessage(role=MessageRole.USER, content="Hi"),))
+        )
+    ]
+    (usage,) = [c.usage for c in chunks if c.usage is not None]
+    assert (usage.input_tokens, usage.output_tokens, usage.total_tokens) == (6411, 119, 6530)
+
+
 @pytest.mark.asyncio
 async def test_gemini_connector_error() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(400, text="Bad Request")
 
     client = _make_mock_client(handler)
-    connector = GeminiConnector(api_key="key", http_client=client)
+    connector = GeminiConnector(model="gemini-1.5-pro", api_key="key", http_client=client)
 
-    with pytest.raises(LLMProviderError, match="Gemini error 400"):
+    with pytest.raises(ProviderResponseError, match="Google returned an error"):
         await connector.generate(LLMRequest(messages=()))
 
 
@@ -1822,7 +1938,7 @@ async def test_openai_connector_malformed_tool_args_raises() -> None:
         )
 
     client = _make_mock_client(handler)
-    connector = OpenAIConnector(api_key="key", http_client=client)
+    connector = OpenAIConnector(model="gpt-4o", api_key="key", http_client=client)
 
     with pytest.raises(MalformedToolCallArgumentsError):
         await connector.generate(LLMRequest(messages=()))
@@ -1851,7 +1967,9 @@ async def test_ollama_connector_malformed_tool_args_raises() -> None:
         )
 
     client = _make_mock_client(handler)
-    connector = OllamaConnector(base_url="http://localhost:11434", http_client=client)
+    connector = OllamaConnector(
+        model=_OLLAMA_MODEL, base_url="http://localhost:11434", http_client=client
+    )
 
     with pytest.raises(MalformedToolCallArgumentsError):
         await connector.generate(LLMRequest(messages=()))
@@ -1878,7 +1996,7 @@ async def test_anthropic_connector_malformed_tool_args_raises() -> None:
         )
 
     client = _make_mock_client(handler)
-    connector = AnthropicConnector(api_key="key", http_client=client)
+    connector = AnthropicConnector(model="claude-3-5-sonnet", api_key="key", http_client=client)
 
     with pytest.raises(MalformedToolCallArgumentsError):
         await connector.generate(LLMRequest(messages=()))
@@ -1909,7 +2027,7 @@ async def test_gemini_connector_malformed_tool_args_raises() -> None:
         )
 
     client = _make_mock_client(handler)
-    connector = GeminiConnector(api_key="key", http_client=client)
+    connector = GeminiConnector(model="gemini-1.5-pro", api_key="key", http_client=client)
 
     with pytest.raises(MalformedToolCallArgumentsError):
         await connector.generate(LLMRequest(messages=()))
@@ -1942,7 +2060,7 @@ async def test_gemini_connector_streaming_malformed_tool_args_raises() -> None:
         return httpx.Response(200, text="\n\n".join(sse_lines) + "\n\n")
 
     client = _make_mock_client(handler)
-    connector = GeminiConnector(api_key="key", http_client=client)
+    connector = GeminiConnector(model="gemini-1.5-pro", api_key="key", http_client=client)
 
     with pytest.raises(MalformedToolCallArgumentsError):
         async for _ in connector.stream(LLMRequest(messages=())):
@@ -1977,7 +2095,7 @@ async def test_openai_connector_streaming_malformed_tool_args_raises() -> None:
         return httpx.Response(200, text="\n\n".join(sse_lines) + "\n\n")
 
     client = _make_mock_client(handler)
-    connector = OpenAIConnector(api_key="key", http_client=client)
+    connector = OpenAIConnector(model="gpt-4o", api_key="key", http_client=client)
 
     with pytest.raises(MalformedToolCallArgumentsError):
         async for _ in connector.stream(LLMRequest(messages=())):
@@ -2004,7 +2122,9 @@ async def test_ollama_connector_streaming_malformed_tool_args_raises() -> None:
         return httpx.Response(200, text=ndjson + "\n")
 
     client = _make_mock_client(handler)
-    connector = OllamaConnector(base_url="http://localhost:11434", http_client=client)
+    connector = OllamaConnector(
+        model=_OLLAMA_MODEL, base_url="http://localhost:11434", http_client=client
+    )
 
     with pytest.raises(MalformedToolCallArgumentsError):
         async for _ in connector.stream(LLMRequest(messages=())):
@@ -2261,7 +2381,7 @@ async def test_openai_connector_resolves_default_model(model_input: str | None) 
         )
 
     client = _make_mock_client(handler)
-    connector = OpenAIConnector(api_key="test_key", http_client=client)
+    connector = OpenAIConnector(model="gpt-4o", api_key="test_key", http_client=client)
     resp = await connector.generate(
         LLMRequest(
             model=model_input,
@@ -2299,7 +2419,7 @@ async def test_anthropic_connector_resolves_default_model(model_input: str | Non
         )
 
     client = _make_mock_client(handler)
-    connector = AnthropicConnector(api_key="ant_key", http_client=client)
+    connector = AnthropicConnector(model="claude-3-5-sonnet", api_key="ant_key", http_client=client)
     resp = await connector.generate(
         LLMRequest(
             model=model_input,
@@ -2343,7 +2463,7 @@ async def test_gemini_connector_resolves_default_model(model_input: str | None) 
         )
 
     client = _make_mock_client(handler)
-    connector = GeminiConnector(api_key="gem_key", http_client=client)
+    connector = GeminiConnector(model="gemini-1.5-pro", api_key="gem_key", http_client=client)
     resp = await connector.generate(
         LLMRequest(
             model=model_input,
@@ -2387,7 +2507,7 @@ async def test_ollama_connector_resolves_default_model(
         )
 
     client = _make_mock_client(handler)
-    connector = OllamaConnector(http_client=client)
+    connector = OllamaConnector(model=_OLLAMA_MODEL, http_client=client)
     resp = await connector.generate(
         LLMRequest(
             model=model_input,
@@ -2519,22 +2639,32 @@ async def test_connectors_streaming_resolves_default_model(
     )
 
     # 1. OpenAI
-    c_oa = OpenAIConnector(api_key="k", http_client=_make_mock_client(openai_stream_handler))
+    c_oa = OpenAIConnector(
+        model="gpt-4o", api_key="k", http_client=_make_mock_client(openai_stream_handler)
+    )
     chunks_oa = [c async for c in c_oa.stream(req)]
     assert any(c.delta_content == "chunk" for c in chunks_oa)
 
     # 2. Anthropic
-    c_ant = AnthropicConnector(api_key="k", http_client=_make_mock_client(anthropic_stream_handler))
+    c_ant = AnthropicConnector(
+        model="claude-3-5-sonnet",
+        api_key="k",
+        http_client=_make_mock_client(anthropic_stream_handler),
+    )
     chunks_ant = [c async for c in c_ant.stream(req)]
     assert any(c.delta_content == "chunk" for c in chunks_ant)
 
     # 3. Gemini
-    c_gem = GeminiConnector(api_key="k", http_client=_make_mock_client(gemini_stream_handler))
+    c_gem = GeminiConnector(
+        model="gemini-1.5-pro", api_key="k", http_client=_make_mock_client(gemini_stream_handler)
+    )
     chunks_gem = [c async for c in c_gem.stream(req)]
     assert any(c.delta_content == "chunk" for c in chunks_gem)
 
     # 4. Ollama
-    c_oll = OllamaConnector(http_client=_make_mock_client(ollama_stream_handler))
+    c_oll = OllamaConnector(
+        model=_OLLAMA_MODEL, http_client=_make_mock_client(ollama_stream_handler)
+    )
     chunks_oll = [c async for c in c_oll.stream(req)]
     assert any(c.delta_content == "chunk" for c in chunks_oll)
 
@@ -2673,7 +2803,9 @@ async def _gemini_sent_body(*messages: ChatMessage) -> dict[str, Any]:
             },
         )
 
-    connector = GeminiConnector(api_key="k", http_client=_make_mock_client(handler))
+    connector = GeminiConnector(
+        model="gemini-1.5-pro", api_key="k", http_client=_make_mock_client(handler)
+    )
     await connector.generate(LLMRequest(model="gemini-1.5-pro", messages=tuple(messages)))
     return cast("dict[str, Any]", captured["body"])
 
@@ -2740,6 +2872,39 @@ async def test_gemini_sends_a_real_tool_name_verbatim() -> None:
             "parts": [{"functionResponse": {"name": "read_file", "response": {"result": "42"}}}],
         }
     ]
+
+
+def test_gemini_declares_tool_parameters_as_json_schema_unaltered() -> None:
+    """Tool parameters go out as `parametersJsonSchema`, byte-for-byte what the tool advertised.
+
+    Gemini's `parameters` field is an OpenAPI subset that 400s the whole request on
+    `additionalProperties` and `$defs`/`$ref`, which `extra="forbid"` and nested params
+    models emit. The schema here carries all three, so a connector that went back to
+    `parameters` — or that "normalised" the schema on the way out — fails this test.
+
+    Killed by: src/uclone_x/llm/connectors/gemini.py :: "parametersJsonSchema": cast(
+    Becomes: "parameters": cast(
+    """
+    schema: dict[str, Any] = {
+        "type": "object",
+        "properties": {"entry": {"$ref": "#/$defs/Entry"}},
+        "required": ["entry"],
+        "additionalProperties": False,
+        "$defs": {
+            "Entry": {
+                "type": "object",
+                "properties": {"kind": {"anyOf": [{"const": "a"}, {"const": "b"}]}},
+                "additionalProperties": False,
+            }
+        },
+    }
+    request = LLMRequest(
+        messages=(ChatMessage(role=MessageRole.USER, content="hi"),),
+        tools=(ToolDefinition(name="codex", description="d", parameters=schema),),
+    )
+    payload = GeminiConnector(model="gemini-1.5-pro", api_key="k")._build_payload(request)  # pyright: ignore[reportPrivateUsage]
+    (declaration,) = payload["tools"][0]["functionDeclarations"]
+    assert declaration == {"name": "codex", "description": "d", "parametersJsonSchema": schema}
 
 
 @pytest.mark.asyncio
@@ -2987,7 +3152,9 @@ async def _anthropic_sent_body(
             },
         )
 
-    connector = AnthropicConnector(api_key="k", http_client=_make_mock_client(handler))
+    connector = AnthropicConnector(
+        model="claude-3-5-sonnet", api_key="k", http_client=_make_mock_client(handler)
+    )
     await connector.generate(
         LLMRequest(
             model="claude-3-5-sonnet",
@@ -3013,7 +3180,7 @@ async def _openai_sent_messages(*messages: ChatMessage) -> list[dict[str, Any]]:
             },
         )
 
-    connector = OpenAIConnector(api_key="k", http_client=_make_mock_client(handler))
+    connector = OpenAIConnector(model="gpt-4o", api_key="k", http_client=_make_mock_client(handler))
     await connector.generate(LLMRequest(model="gpt-4o", messages=tuple(messages)))
     body = cast("dict[str, Any]", captured["body"])
     return cast("list[dict[str, Any]]", body["messages"])
@@ -3037,7 +3204,7 @@ async def _ollama_sent_messages(*messages: ChatMessage) -> list[dict[str, Any]]:
             },
         )
 
-    connector = OllamaConnector(http_client=_make_mock_client(handler))
+    connector = OllamaConnector(model=_OLLAMA_MODEL, http_client=_make_mock_client(handler))
     await connector.generate(LLMRequest(messages=tuple(messages)))
     body = cast("dict[str, Any]", captured["body"])
     return cast("list[dict[str, Any]]", body["messages"])
@@ -3438,7 +3605,7 @@ async def test_ollama_generate_reports_an_unrecognised_done_reason_as_unknown(
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json=payload)
 
-    connector = OllamaConnector(http_client=_make_mock_client(handler))
+    connector = OllamaConnector(model=_OLLAMA_MODEL, http_client=_make_mock_client(handler))
     resp = await connector.generate(
         LLMRequest(messages=(ChatMessage(role=MessageRole.USER, content="hi"),))
     )
@@ -3474,7 +3641,7 @@ async def test_ollama_stream_reads_done_reason_rather_than_always_reporting_stop
         ]
         return httpx.Response(200, text="\n".join(lines) + "\n")
 
-    connector = OllamaConnector(http_client=_make_mock_client(handler))
+    connector = OllamaConnector(model=_OLLAMA_MODEL, http_client=_make_mock_client(handler))
     chunks: list[StreamChunk] = []
     async for chunk in connector.stream(
         LLMRequest(messages=(ChatMessage(role=MessageRole.USER, content="hi"),))
@@ -3521,7 +3688,9 @@ async def test_anthropic_reports_an_unrecognised_stop_reason_as_unknown(
             },
         )
 
-    connector = AnthropicConnector(api_key="k", http_client=_make_mock_client(handler))
+    connector = AnthropicConnector(
+        model="claude-3-5-sonnet", api_key="k", http_client=_make_mock_client(handler)
+    )
     resp = await connector.generate(
         LLMRequest(messages=(ChatMessage(role=MessageRole.USER, content="hi"),))
     )
@@ -3560,7 +3729,7 @@ async def test_openai_reports_an_unrecognised_finish_reason_as_unknown(
             },
         )
 
-    connector = OpenAIConnector(api_key="k", http_client=_make_mock_client(handler))
+    connector = OpenAIConnector(model="gpt-4o", api_key="k", http_client=_make_mock_client(handler))
     resp = await connector.generate(
         LLMRequest(messages=(ChatMessage(role=MessageRole.USER, content="hi"),))
     )
@@ -3610,7 +3779,9 @@ async def test_gemini_reports_an_unrecognised_finish_reason_as_unknown(
             },
         )
 
-    connector = GeminiConnector(api_key="k", http_client=_make_mock_client(handler))
+    connector = GeminiConnector(
+        model="gemini-1.5-pro", api_key="k", http_client=_make_mock_client(handler)
+    )
     resp = await connector.generate(
         LLMRequest(messages=(ChatMessage(role=MessageRole.USER, content="hi"),))
     )
@@ -3732,7 +3903,7 @@ async def test_an_api_key_blanked_after_construction_is_refused_at_request_time(
             },
         )
 
-    connector = OpenAIConnector(api_key="k", http_client=_make_mock_client(handler))
+    connector = OpenAIConnector(model="gpt-4o", api_key="k", http_client=_make_mock_client(handler))
     connector.api_key = ""
 
     with pytest.raises(LLMCredentialsNotConfiguredError) as excinfo:
@@ -3871,6 +4042,29 @@ async def _drive_stream(connector: BaseLLMConnector) -> None:
         pass
 
 
+async def _drive_list_models(connector: BaseLLMConnector) -> None:
+    # Only the Anthropic and Gemini connectors list models with an inline header; OpenAI's
+    # listing goes through `_auth_headers`, which the two doors above already pin (#1631).
+    await cast(Any, connector).list_models()
+
+
+def _anthropic_listing(request: httpx.Request) -> httpx.Response:
+    return httpx.Response(200, json={"data": [], "has_more": False})
+
+
+def _gemini_listing(request: httpx.Request) -> httpx.Response:
+    return httpx.Response(200, json={"models": []})
+
+
+async def _drive_generate_image(connector: BaseLLMConnector) -> None:
+    await cast(Any, connector).generate_image("a kite", "1:1", "m")
+
+
+def _gemini_image(request: httpx.Request) -> httpx.Response:
+    part = {"inlineData": {"mimeType": "image/png", "data": "iVBORw0KGgo="}}
+    return httpx.Response(200, json={"candidates": [{"content": {"parts": [part]}}]})
+
+
 _CREDENTIAL_PIN_SITES: tuple[
     tuple[
         str,
@@ -3910,6 +4104,19 @@ _CREDENTIAL_PIN_SITES: tuple[
     ),
     ("gemini.GeminiConnector.generate", GeminiConnector, _gemini_success, _drive_generate),
     ("gemini.GeminiConnector.stream", GeminiConnector, _gemini_stream_success, _drive_stream),
+    (
+        "anthropic.AnthropicConnector.list_models",
+        AnthropicConnector,
+        _anthropic_listing,
+        _drive_list_models,
+    ),
+    ("gemini.GeminiConnector.list_models", GeminiConnector, _gemini_listing, _drive_list_models),
+    (
+        "gemini.GeminiConnector.generate_image",
+        GeminiConnector,
+        _gemini_image,
+        _drive_generate_image,
+    ),
 )
 
 
@@ -3954,7 +4161,9 @@ async def test_a_credential_blanked_after_construction_is_refused_at_every_reque
         seen.append(request.url.path)
         return handler(request)
 
-    refusing = connector_cls(api_key="k", http_client=_make_mock_client(recording_handler))
+    # Every connector here takes a model; the base class's signature does not name one.
+    built: dict[str, Any] = {"api_key": "k", "model": "m"}
+    refusing = connector_cls(**built, http_client=_make_mock_client(recording_handler))
     refusing.api_key = ""
 
     with pytest.raises(LLMCredentialsNotConfiguredError) as excinfo:
@@ -3967,7 +4176,7 @@ async def test_a_credential_blanked_after_construction_is_refused_at_every_reque
     # caller would read a configuration defect as a transport fault.
     assert seen == [], (site, seen)
 
-    accepting = connector_cls(api_key="k", http_client=_make_mock_client(recording_handler))
+    accepting = connector_cls(**built, http_client=_make_mock_client(recording_handler))
     await drive(accepting)
     assert len(seen) == 1, (site, seen)
 
@@ -3991,7 +4200,9 @@ async def test_every_shape_of_absent_credential_is_refused_not_only_the_empty_st
         -   if key is None or not key.strip():
         +   if key is None:
     """
-    connector = OpenAIConnector(api_key="k", http_client=_make_mock_client(_openai_success))
+    connector = OpenAIConnector(
+        model="gpt-4o", api_key="k", http_client=_make_mock_client(_openai_success)
+    )
     connector.api_key = blank
     with pytest.raises(LLMCredentialsNotConfiguredError):
         await _drive_generate(connector)
@@ -4059,7 +4270,8 @@ def test_every_require_api_key_call_site_is_named_by_a_pin() -> None:
         f"unpinned call sites: {sorted(discovered - pinned)}; "
         f"pins naming no call site: {sorted(pinned - discovered)}"
     )
-    assert len(discovered) == 5, sorted(discovered)
+    # five turn sites + two listings (#1631) + Gemini image generation
+    assert len(discovered) == 8, sorted(discovered)
 
 
 # --------------------------------------------------------------------------------------
@@ -4106,13 +4318,13 @@ async def test_openai_generate_and_stream_agree_that_an_empty_finish_reason_is_u
         return httpx.Response(200, text=body)
 
     resp = await OpenAIConnector(
-        api_key="k", http_client=_make_mock_client(generate_handler)
+        model="gpt-4o", api_key="k", http_client=_make_mock_client(generate_handler)
     ).generate(LLMRequest(messages=(ChatMessage(role=MessageRole.USER, content="hi"),)))
     assert resp.finish_reason is FinishReason.UNKNOWN
 
     chunks: list[StreamChunk] = []
     async for chunk in OpenAIConnector(
-        api_key="k", http_client=_make_mock_client(stream_handler)
+        model="gpt-4o", api_key="k", http_client=_make_mock_client(stream_handler)
     ).stream(LLMRequest(messages=(ChatMessage(role=MessageRole.USER, content="hi"),))):
         chunks.append(chunk)
 
@@ -4161,13 +4373,13 @@ async def test_anthropic_generate_and_stream_agree_that_an_empty_stop_reason_is_
         return httpx.Response(200, text=body)
 
     resp = await AnthropicConnector(
-        api_key="k", http_client=_make_mock_client(generate_handler)
+        model="claude-3-5-sonnet", api_key="k", http_client=_make_mock_client(generate_handler)
     ).generate(LLMRequest(messages=(ChatMessage(role=MessageRole.USER, content="hi"),)))
     assert resp.finish_reason is FinishReason.UNKNOWN
 
     reported: list[FinishReason] = []
     async for chunk in AnthropicConnector(
-        api_key="k", http_client=_make_mock_client(stream_handler)
+        model="claude-3-5-sonnet", api_key="k", http_client=_make_mock_client(stream_handler)
     ).stream(LLMRequest(messages=(ChatMessage(role=MessageRole.USER, content="hi"),))):
         if chunk.finish_reason is not None:
             reported.append(chunk.finish_reason)
@@ -4209,13 +4421,13 @@ async def test_gemini_generate_and_stream_agree_that_an_empty_finish_reason_is_u
         return httpx.Response(200, text=body)
 
     resp = await GeminiConnector(
-        api_key="k", http_client=_make_mock_client(generate_handler)
+        model="gemini-1.5-pro", api_key="k", http_client=_make_mock_client(generate_handler)
     ).generate(LLMRequest(messages=(ChatMessage(role=MessageRole.USER, content="hi"),)))
     assert resp.finish_reason is FinishReason.UNKNOWN
 
     reported: list[FinishReason] = []
     async for chunk in GeminiConnector(
-        api_key="k", http_client=_make_mock_client(stream_handler)
+        model="gemini-1.5-pro", api_key="k", http_client=_make_mock_client(stream_handler)
     ).stream(LLMRequest(messages=(ChatMessage(role=MessageRole.USER, content="hi"),))):
         if chunk.finish_reason is not None:
             reported.append(chunk.finish_reason)
@@ -4259,15 +4471,15 @@ async def test_ollama_generate_and_stream_agree_that_an_empty_done_reason_is_unk
         )
         return httpx.Response(200, text=body)
 
-    resp = await OllamaConnector(http_client=_make_mock_client(generate_handler)).generate(
-        LLMRequest(messages=(ChatMessage(role=MessageRole.USER, content="hi"),))
-    )
+    resp = await OllamaConnector(
+        model=_OLLAMA_MODEL, http_client=_make_mock_client(generate_handler)
+    ).generate(LLMRequest(messages=(ChatMessage(role=MessageRole.USER, content="hi"),)))
     assert resp.finish_reason is FinishReason.UNKNOWN
 
     reported: list[FinishReason] = []
-    async for chunk in OllamaConnector(http_client=_make_mock_client(stream_handler)).stream(
-        LLMRequest(messages=(ChatMessage(role=MessageRole.USER, content="hi"),))
-    ):
+    async for chunk in OllamaConnector(
+        model=_OLLAMA_MODEL, http_client=_make_mock_client(stream_handler)
+    ).stream(LLMRequest(messages=(ChatMessage(role=MessageRole.USER, content="hi"),))):
         if chunk.finish_reason is not None:
             reported.append(chunk.finish_reason)
     assert reported == [FinishReason.UNKNOWN], reported
@@ -4770,7 +4982,7 @@ async def _ollama_sent_body(*messages: ChatMessage) -> dict[str, Any]:
             },
         )
 
-    connector = OllamaConnector(http_client=_make_mock_client(handler))
+    connector = OllamaConnector(model=_OLLAMA_MODEL, http_client=_make_mock_client(handler))
     await connector.generate(LLMRequest(model="qwen2.5-coder:14b", messages=messages))
     return cast(dict[str, Any], captured["body"])
 
@@ -4947,7 +5159,7 @@ def test_ollama_serializes_nested_tool_call_arguments() -> None:
 
     Killed by: src/uclone_x/llm/connectors/ollama.py :: "arguments": cast(dict[str, Any], unwrap_immutable(tc.arguments)),
     """
-    connector = OllamaConnector()
+    connector = OllamaConnector(model=_OLLAMA_MODEL)
     payload = connector._build_payload(  # pyright: ignore[reportPrivateUsage]
         LLMRequest(messages=(_nested_tool_call_turn(),))
     )
@@ -4962,7 +5174,7 @@ def test_anthropic_serializes_nested_tool_call_arguments() -> None:
 
     Killed by: src/uclone_x/llm/connectors/anthropic.py :: "input": cast(dict[str, Any], unwrap_immutable(tc.arguments)),
     """
-    connector = AnthropicConnector(api_key="k")
+    connector = AnthropicConnector(model="claude-3-5-sonnet", api_key="k")
     payload = connector._build_payload(  # pyright: ignore[reportPrivateUsage]
         LLMRequest(model="claude-3-5-sonnet", messages=(_nested_tool_call_turn(),))
     )
@@ -4976,7 +5188,7 @@ def test_gemini_serializes_nested_tool_call_arguments() -> None:
 
     Killed by: src/uclone_x/llm/connectors/gemini.py :: "args": cast(dict[str, Any], unwrap_immutable(tc.arguments)),
     """
-    connector = GeminiConnector(api_key="k")
+    connector = GeminiConnector(model="gemini-1.5-pro", api_key="k")
     payload = connector._build_payload(  # pyright: ignore[reportPrivateUsage]
         LLMRequest(model="gemini-1.5-pro", messages=(_nested_tool_call_turn(),))
     )
@@ -4993,7 +5205,7 @@ def test_openai_serializes_nested_tool_call_arguments() -> None:
 
     Killed by: src/uclone_x/llm/connectors/openai.py :: "arguments": json.dumps(unwrap_immutable(tc.arguments)),
     """
-    connector = OpenAIConnector(api_key="k")
+    connector = OpenAIConnector(model="gpt-4o", api_key="k")
     payload = connector._build_payload(  # pyright: ignore[reportPrivateUsage]
         LLMRequest(model="gpt-4o", messages=(_nested_tool_call_turn(),))
     )
@@ -5027,7 +5239,7 @@ async def test_ollama_connector_captures_thinking_channel_in_generate() -> None:
         return httpx.Response(200, json=response_data)
 
     client = _make_mock_client(handler)
-    connector = OllamaConnector(http_client=client)
+    connector = OllamaConnector(model=_OLLAMA_MODEL, http_client=client)
 
     llm_req = LLMRequest(
         model="qwen3:8b",
@@ -5066,7 +5278,7 @@ async def test_ollama_connector_captures_delta_thinking_channel_in_stream() -> N
         return httpx.Response(200, text="\n".join(lines) + "\n")
 
     client = _make_mock_client(handler)
-    connector = OllamaConnector(http_client=client)
+    connector = OllamaConnector(model=_OLLAMA_MODEL, http_client=client)
 
     chunks: list[StreamChunk] = []
     async for chunk in connector.stream(
@@ -5190,12 +5402,12 @@ def _generate_body(provider: str, input_tokens: int | None, output_tokens: int |
 
 def _connector_for(provider: str, client: httpx.AsyncClient) -> BaseLLMConnector:
     if provider == "openai":
-        return OpenAIConnector(api_key="k", http_client=client)
+        return OpenAIConnector(model="gpt-4o", api_key="k", http_client=client)
     if provider == "anthropic":
-        return AnthropicConnector(api_key="k", http_client=client)
+        return AnthropicConnector(model="claude-3-5-sonnet", api_key="k", http_client=client)
     if provider == "gemini":
-        return GeminiConnector(api_key="k", http_client=client)
-    return OllamaConnector(http_client=client)
+        return GeminiConnector(model="gemini-1.5-pro", api_key="k", http_client=client)
+    return OllamaConnector(model=_OLLAMA_MODEL, http_client=client)
 
 
 @pytest.mark.parametrize("provider", ["openai", "anthropic", "gemini", "ollama"])
@@ -5396,7 +5608,7 @@ def _vllm_endpoint(
 async def test_a_vllm_turn_is_attributed_to_vllm_and_not_to_openai() -> None:
     """Provenance and usage name the service that answered, not the wire format it speaks.
 
-    Reaching vLLM as `OpenAIConnector(base_url=...)` — the arrangement this connector
+    Reaching vLLM as `OpenAIConnector(model="gpt-4o", base_url=...)` — the arrangement this connector
     replaces — recorded `provider="openai"` in `Provenance.requested`, in
     `Provenance.served_by` and on the ledger. Every one of those is a statement about a
     service that was never involved, in the fields #149 added to make attribution
@@ -5498,24 +5710,33 @@ async def test_no_failure_from_this_connector_names_openai_to_a_vllm_operator() 
     information. Found by review, not by the gate, because no test read that string.
 
     Swept rather than pinned at the fixed site: the defect was a family covered at four of
-    its five members, so the assertion is over every `raise LLMProviderError` in the module.
+    its five members, so the assertion is over every failure the module raises. Since #1630
+    each of them is built by `uclone_x.llm.connectors.failures`, and the provider it names is
+    the `provider=` keyword, so the sweep requires that keyword to be `self._display_name`.
 
-    Killed by: src/uclone_x/llm/connectors/openai.py :: f"Invalid JSON from {self._display_name}: {exc}"
-    Becomes: f"Invalid JSON from OpenAI: {exc}"
+    Killed by: src/uclone_x/llm/connectors/openai.py :: provider=self._display_name, model=model, detail="no choices"
+    Becomes: provider="OpenAI", model=model, detail="no choices"
     """
     source = Path(openai_module.__file__ or "").read_text(encoding="utf-8")
+    builders = {"failed_status", "failed_request", "unusable_response"}
     raises = [
         node
         for node in ast.walk(ast.parse(source))
         if isinstance(node, ast.Raise)
         and isinstance(node.exc, ast.Call)
         and isinstance(node.exc.func, ast.Name)
-        and node.exc.func.id == "LLMProviderError"
+        and node.exc.func.id in builders
     ]
     # The control: a parse that found nothing would satisfy every assertion below.
-    assert len(raises) >= 5, f"only {len(raises)} LLMProviderError raises found in openai.py"
+    assert len(raises) >= 5, f"only {len(raises)} provider failures found in openai.py"
     for node in raises:
+        assert isinstance(node.exc, ast.Call)
         rendered = ast.get_source_segment(source, node) or ""
+        provider = [kw.value for kw in node.exc.keywords if kw.arg == "provider"]
+        assert len(provider) == 1, f"line {node.lineno} names no provider: {rendered}"
+        assert ast.unparse(provider[0]) == "self._display_name", (
+            f"line {node.lineno} does not name the server that answered: {rendered}"
+        )
         assert "OpenAI" not in rendered, f"line {node.lineno} hardcodes the vendor: {rendered}"
 
     # And on the wire, where the operator reads it: a body that is not JSON at all.
@@ -5725,7 +5946,7 @@ def test_ollama_sends_keep_alive_with_the_stated_default(monkeypatch: pytest.Mon
     """
     monkeypatch.delenv("OLLAMA_KEEP_ALIVE", raising=False)
 
-    body = _ollama_body(OllamaConnector(base_url="http://localhost:11434"))
+    body = _ollama_body(OllamaConnector(model=_OLLAMA_MODEL, base_url="http://localhost:11434"))
 
     assert DEFAULT_OLLAMA_KEEP_ALIVE == "30m"
     assert body["keep_alive"] == "30m"
@@ -5742,8 +5963,10 @@ def test_ollama_keep_alive_follows_the_daemons_variable_and_then_the_caller(
     Becomes: return str(text)
     """
     monkeypatch.setenv("OLLAMA_KEEP_ALIVE", "-1")
-    from_env = _ollama_body(OllamaConnector(base_url="http://localhost:11434"))
-    explicit = _ollama_body(OllamaConnector(base_url="http://localhost:11434", keep_alive="1h"))
+    from_env = _ollama_body(OllamaConnector(model=_OLLAMA_MODEL, base_url="http://localhost:11434"))
+    explicit = _ollama_body(
+        OllamaConnector(model=_OLLAMA_MODEL, base_url="http://localhost:11434", keep_alive="1h")
+    )
 
     assert from_env["keep_alive"] == -1
     assert isinstance(from_env["keep_alive"], int)
@@ -5760,7 +5983,7 @@ def test_ollama_sends_the_configured_window_as_num_ctx_and_keeps_sending_it() ->
     Killed by: src/uclone_x/llm/connectors/ollama.py :: num_ctx = self._num_ctx.get(window_key, default_ollama_num_ctx())
     Becomes: num_ctx = default_ollama_num_ctx()
     """
-    connector = OllamaConnector(base_url="http://localhost:11434")
+    connector = OllamaConnector(model=_OLLAMA_MODEL, base_url="http://localhost:11434")
 
     first = _ollama_body(connector, model="llama3.2:1b", context_window=32_768)
     later = _ollama_body(connector, model="llama3.2:1b")
@@ -5776,7 +5999,7 @@ def test_ollama_sends_the_default_window_when_nothing_configures_one() -> None:
     Killed by: src/uclone_x/llm/context_window.py :: DEFAULT_OLLAMA_NUM_CTX = 16_384
     Becomes: DEFAULT_OLLAMA_NUM_CTX = 4_096
     """
-    connector = OllamaConnector(base_url="http://localhost:11434")
+    connector = OllamaConnector(model=_OLLAMA_MODEL, base_url="http://localhost:11434")
 
     body = _ollama_body(connector, model="qwen3:8b")
 
@@ -5805,7 +6028,7 @@ def test_a_configured_window_wins_over_the_daemons_context_length(
     monkeypatch.setenv("OLLAMA_CONTEXT_LENGTH", "32768")
 
     body = _ollama_body(
-        OllamaConnector(base_url="http://localhost:11434"),
+        OllamaConnector(model=_OLLAMA_MODEL, base_url="http://localhost:11434"),
         model="qwen3:8b",
         context_window=8_192,
     )
@@ -5837,7 +6060,9 @@ async def test_ollama_rereads_the_served_window_after_sending_the_default() -> N
     """
     store = OllamaContextWindows()
     store.remember("http://localhost:11434", "gemma:2b", 4_096)  # a load from before
-    connector = OllamaConnector(base_url="http://localhost:11434", context_windows=store)
+    connector = OllamaConnector(
+        model=_OLLAMA_MODEL, base_url="http://localhost:11434", context_windows=store
+    )
     refresh = AsyncMock()
     store.refresh = refresh  # type: ignore[method-assign]
 
@@ -5848,7 +6073,7 @@ async def test_ollama_rereads_the_served_window_after_sending_the_default() -> N
 
 
 def test_ollama_sends_think_parameter_when_thinking_is_specified() -> None:
-    connector = OllamaConnector(base_url="http://localhost:11434")
+    connector = OllamaConnector(model=_OLLAMA_MODEL, base_url="http://localhost:11434")
 
     default_body = _ollama_body(connector, model="qwen3:8b")
     assert "think" not in default_body

@@ -13,8 +13,10 @@ from pydantic import BaseModel, Field
 
 import uclone_x
 from uclone_x.agent.base import BaseAgent
+from uclone_x.agent.clone_builder import AppScope
 from uclone_x.agent.composition import HostDependencies
-from uclone_x.agent.models import AgentConfig, AgentLLMConfig, TurnResult
+from uclone_x.agent.models import AgentLLMConfig, TurnResult
+from uclone_x.agent.persona_registry import PersonaRegistry
 from uclone_x.agent.persona_store import DEFAULT_PERSONA_NAME
 from uclone_x.agent.session import SessionState, SessionStore
 from uclone_x.cli.commands.acp import session_agent_factory
@@ -198,15 +200,21 @@ def _real_server(store: SessionStore, llm: _RecordingLLM, **kwargs: Any) -> ACPS
     tools = ToolRegistry()
     tools.register(_EchoTool())
     bus = EventBus()
-    host = HostDependencies(bus=bus, llm=llm, tools=tools, tracer=TelemetryTracer(), store=store)
-    config = AgentConfig(
-        agent_id="acp_agent",
-        name="ACP Agent",
-        llm_config=AgentLLMConfig(model_name="scripted"),
-        max_steps=5,
+    app = AppScope(
+        host=HostDependencies(bus=bus, llm=llm, tools=tools, tracer=TelemetryTracer(), store=store),
+        workspace_root=Path.cwd(),
+        persona_registry=PersonaRegistry(include_defaults=False),
     )
     return ACPServer(
-        agent_factory=session_agent_factory(config, host), bus=bus, store=store, **kwargs
+        agent_factory=session_agent_factory(
+            app,
+            clone_id="acp_agent",
+            fallback_llm=AgentLLMConfig(model_name="scripted"),
+            config_update={"name": "ACP Agent", "max_steps": 5},
+        ),
+        bus=bus,
+        store=store,
+        **kwargs,
     )
 
 
@@ -936,8 +944,8 @@ async def test_acp_model_without_tools_is_answered_with_its_remedy() -> None:
     """The turn's error for a model without tools names the model and the remedy, and is
     written for the user, so the client gets it rather than "the turn failed".
 
-    Killed by: src/uclone_x/shells/acp/server.py :: {"step_results_over_window", "model_without_tools"}
-    Becomes: {"step_results_over_window"}
+    Killed by: src/uclone_x/shells/acp/server.py :: "model_without_tools",
+    Becomes: "model_without_tools_unused",
     Killed by: src/uclone_x/shells/acp/server.py :: "model_without_tools": "Choose it in Settings, then send your message again.",
     Becomes: "model_without_tools_unused": "Choose it in Settings, then send your message again.",
     """
@@ -967,6 +975,96 @@ async def test_acp_model_without_tools_is_answered_with_its_remedy() -> None:
     assert "qwen3:8b" in message
     assert "--model" not in message  # an ACP client has no command line to pass it on
     for internal in ("Traceback", "status 400", "{", "LLMProviderError"):
+        assert internal not in message, internal
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stop_reason", "remedy"),
+    [
+        ("model_unavailable", " Choose a model in Settings, then send your message again."),
+        ("provider_auth", " Paste a new API key in Settings, then send your message again."),
+        ("provider_quota", ""),
+        # The user's own paid-model limit: its sentence already names the window, when it
+        # lifts and the remedies (llm-token-gateway.md §4.3).
+        ("usage_limit", ""),
+    ],
+)
+async def test_acp_provider_failure_is_answered_with_its_cause_and_remedy(
+    stop_reason: str, remedy: str
+) -> None:
+    """A provider failure's error is written for the user, so the client gets the cause --
+    and, where the user has something to change, the Settings remedy -- rather than "the
+    turn failed" (#1630).
+
+    Killed by: src/uclone_x/shells/acp/server.py :: *(kind.value for kind in ProviderFailureKind),
+    Becomes: *(),
+    Killed by: src/uclone_x/shells/acp/server.py :: "provider_auth": "Paste a new API key in Settings, then send your message again.",
+    Becomes: "provider_auth_unused": "Paste a new API key in Settings, then send your message again.",
+    Killed by: src/uclone_x/shells/acp/server.py :: "usage_limit",
+    Becomes: "usage_limit_unused",
+    """
+    plain = "Google did not accept the API key."
+
+    async def fail(prompt: str) -> TurnResult:
+        return TurnResult(
+            turn_index=1,
+            content="",
+            error=plain,
+            stop_reason=stop_reason,  # type: ignore[arg-type]
+            provenance=Provenance.primary("fake"),
+        )
+
+    agents: list[_FakeSessionAgent] = []
+    server = ACPServer(agent_factory=_fake_factory(agents, fail))
+    sent = _capture(server)
+
+    await server.dispatch_method("new_session", {"sessionId": "pf"}, req_id=1)
+    await _prompt(server, "pf", "hello", req_id=2)
+
+    final, _ = _final_and_texts(sent, 2)
+    message = final[0]["error"]["message"]
+    assert message == f"{plain}{remedy}"
+    assert "--model" not in message  # an ACP client has no command line to pass it on
+
+
+@pytest.mark.asyncio
+async def test_acp_says_plainly_that_no_model_is_chosen_and_where_to_choose_one() -> None:
+    """A connector given no model refuses before the network; the Core ends the turn as
+    `model_unavailable` with its own sentence, and the client is told what is missing and
+    where to choose one -- no class name, no code, no command-line flag.
+
+    Killed by: src/uclone_x/shells/acp/server.py :: "model_unavailable": "Choose a model in Settings, then send your message again.",
+    Becomes: "model_unavailable_unused": "Choose a model in Settings, then send your message again.",
+    """
+    from uclone_x.agent.turn_executor import _turn_failure  # pyright: ignore[reportPrivateUsage]
+    from uclone_x.errors import LLMModelNotConfiguredError
+
+    stop, error, failure = _turn_failure(LLMModelNotConfiguredError("Google"), "not_started", "a")
+
+    async def fail(prompt: str) -> TurnResult:
+        return TurnResult(
+            turn_index=1,
+            content="",
+            error=error,
+            stop_reason=stop,
+            provider_failure=failure,
+            provenance=Provenance.primary("fake"),
+        )
+
+    agents: list[_FakeSessionAgent] = []
+    server = ACPServer(agent_factory=_fake_factory(agents, fail))
+    sent = _capture(server)
+
+    await server.dispatch_method("new_session", {"sessionId": "nm"}, req_id=1)
+    await _prompt(server, "nm", "hello", req_id=2)
+
+    final, _ = _final_and_texts(sent, 2)
+    message = final[0]["error"]["message"]
+    assert message == (
+        "No model is chosen for Google. Choose a model in Settings, then send your message again."
+    )
+    for internal in ("LLMModelNotConfiguredError", "model_unavailable", "--model", "Error", "{"):
         assert internal not in message, internal
 
 

@@ -272,7 +272,7 @@ class TestOntologyIsolation:
         merge G4 forbids, produced by an omission at construction rather than by any
         roster edit.
 
-        Killed by: src/uclone_x/room/resolver.py :: if self._ontology_factory is None and host.ontology is not None:
+        Killed by: src/uclone_x/room/resolver.py :: if self._ontology_factory is None and self._app.host.ontology is not None:
         Becomes: if False:
         """
         shared = OntologyEngine(namespace_iri="https://n/host")
@@ -360,7 +360,7 @@ class TestPerParticipantMemory:
     ) -> None:
         """Two seats, two stores, and a fact recorded in one is absent from the other.
 
-        Killed by: src/uclone_x/room/resolver.py :: host = dataclasses.replace(host, memory=self._memory_factory(participant.id))
+        Killed by: src/uclone_x/agent/clone_builder.py :: host = dataclasses.replace(host, memory=app.memory_for(clone_id))
         Becomes: host = host
         """
         stores: dict[str, CrossSessionMemory] = {}
@@ -442,8 +442,8 @@ class TestPersonaModelSelection:
     ) -> None:
         """What `PersonaEditor` saved is what the seated agent is configured to call.
 
-        Killed by: src/uclone_x/room/resolver.py :: resolved_llm_config = persona_def.llm_config
-        Becomes: resolved_llm_config = None
+        Killed by: src/uclone_x/agent/clone_builder.py :: llm_config = persona_def.llm_config
+        Becomes: llm_config = AgentLLMConfig()
         """
         registry = PersonaRegistry(workspace_root=tmp_path, include_defaults=False)
         registry.register_persona(
@@ -510,6 +510,73 @@ class TestPersonaModelSelection:
         agent = await resolver.resolve(participant)
 
         assert agent.config.llm_config.model_name == "an-installation-wide-default"
+
+    @pytest.mark.asyncio
+    async def test_a_seat_follows_the_settings_models_only_where_its_persona_names_none(
+        self, host: HostDependencies, tmp_path: Path
+    ) -> None:
+        """Deep and fast each follow Settings in the slot the persona left empty.
+
+        The seat that follows is the one that sent no model before, so its connector filled
+        in a model id written in source. The seat whose persona names a model keeps it,
+        and keeps it through a Settings change.
+
+        Killed by: src/uclone_x/agent/clone_builder.py :: llm_config = follow_global_models(llm_config, deep, fast)
+        Becomes: pass
+        """
+        registry = PersonaRegistry(workspace_root=tmp_path, include_defaults=False)
+        registry.register_persona(
+            PersonaDefinition(
+                name="plain",
+                role="Generalist",
+                description="Names no model.",
+                system_prompt="You help.",
+            )
+        )
+        registry.register_persona(
+            PersonaDefinition(
+                name="novelist",
+                role="Creative Fiction Writer",
+                description="Specialist in narrative prose.",
+                system_prompt="You are a novelist.",
+                llm_config=AgentLLMConfig(model_name="own-deep", fast_model="own-fast"),
+            )
+        )
+        models: dict[str, str | None] = {"deep": "settings-deep", "fast": None}
+        resolver = RoomAgentResolver(
+            host,
+            persona_registry=registry,
+            global_models=lambda: (models["deep"], models["fast"]),
+        )
+
+        def seat(pid: str, persona: str) -> Participant:
+            return Participant(
+                id=pid,
+                kind=ParticipantKind.AGENT,
+                display_name=pid,
+                persona=persona,
+                session_id=f"sess_room__r1__{pid}",
+            )
+
+        follower = cast(BaseAgent, await resolver.resolve(seat("helper", "plain")))
+        owner = cast(BaseAgent, await resolver.resolve(seat("author", "novelist")))
+
+        # Fast left empty in Settings means deep.
+        assert follower.config.llm_config.model_name == "settings-deep"
+        assert follower.config.llm_config.fast_model == "settings-deep"
+        assert owner.config.llm_config.model_name == "own-deep"
+        assert owner.config.llm_config.fast_model == "own-fast"
+
+        models.update(deep="settings-deep-2", fast="settings-fast-2")
+        replacement = MockLLMConnector()
+        resolver.replace_llm(replacement)
+
+        assert follower.llm is replacement
+        assert follower.config.llm_config.model_name == "settings-deep-2"
+        assert follower.config.llm_config.fast_model == "settings-fast-2"
+        assert owner.llm is replacement
+        assert owner.config.llm_config.model_name == "own-deep"
+        assert owner.config.llm_config.fast_model == "own-fast"
 
     @pytest.mark.asyncio
     async def test_room_agent_receives_workspace_root(

@@ -1,5 +1,6 @@
 """Unit tests for the diff-scoped check (uclone_x.cli.changed_scope)."""
 
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -14,6 +15,9 @@ from uclone_x.cli.changed_scope import (
     select_for_diff,
     split_browser_tests,
 )
+from uclone_x.cli.scope_rules import RULES_PATH, load_scope_rules
+
+_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _tree(root: Path, files: dict[str, str]) -> Path:
@@ -42,16 +46,37 @@ _REPO = {
     "tests/unit/test_script.py": "SCRIPT = 'scripts/run.sh'\n",
     "tests/fitness/test_docs.py": "",
     "tests/e2e/test_browser.py": "from pkg.app import VALUE\n",
+    "tests/e2e/test_other_browser.py": "from pkg.app import VALUE\n",
+    "tests/unit/test_paid.py": "import pytest\n\n@pytest.mark.live\ndef test(): ...\n",
     "tests/unit/test_oss_export.py": "",
     "tests/unit/test_swarm_manifest.py": "",
+    "tests/fitness/test_oss_manifest.py": "",
+    "tests/fitness/test_mutation_kill_declarations.py": "",
+    "tests/fitness/test_frontend_kill_declarations.py": "",
+    "tests/fitness/test_kill_declaration_uniqueness.py": "",
+    "tests/fitness/test_kill_declaration_placement.py": "",
+    "tests/fitness/test_kill_declaration_becomes.py": "",
 }
 
-_TREE_WIDE = ["tests/unit/test_oss_export.py", "tests/unit/test_swarm_manifest.py"]
+_TREE_WIDE = sorted(
+    [
+        "tests/unit/test_oss_export.py",
+        "tests/unit/test_swarm_manifest.py",
+        "tests/fitness/test_oss_manifest.py",
+        "tests/fitness/test_mutation_kill_declarations.py",
+        "tests/fitness/test_frontend_kill_declarations.py",
+        "tests/fitness/test_kill_declaration_uniqueness.py",
+        "tests/fitness/test_kill_declaration_placement.py",
+        "tests/fitness/test_kill_declaration_becomes.py",
+    ]
+)
 
 
 @pytest.fixture
 def repo(tmp_path: Path) -> Path:
-    return _tree(tmp_path, _REPO)
+    root = _tree(tmp_path, _REPO)
+    shutil.copy(_ROOT / RULES_PATH, root / RULES_PATH)
+    return root
 
 
 def test_module_name_strips_src_and_init() -> None:
@@ -105,6 +130,20 @@ def test_the_tree_wide_checks_run_on_any_diff(repo: Path) -> None:
     assert selection.test_files == _TREE_WIDE
 
 
+def test_a_source_change_runs_the_declaration_and_manifest_checks(repo: Path) -> None:
+    """The full gate failed on these after a clean diff-scoped run: a new file missing from
+    the export manifest, a kill declaration whose line moved. Nothing imports a changed
+    module into them, so only `[always]` brings them into `./ucx test changed`.
+
+    Killed by: tests/scope-rules.toml :: "tests/fitness/test_mutation_kill_declarations.py",
+    Becomes:
+    """
+    selection = select_for_diff(["src/pkg/other.py"], repo)
+    assert "tests/fitness/test_oss_manifest.py" in selection.test_files
+    assert "tests/fitness/test_mutation_kill_declarations.py" in selection.test_files
+    assert "tests/fitness/test_frontend_kill_declarations.py" in selection.test_files
+
+
 def test_a_non_python_file_selects_the_tests_that_name_its_path(repo: Path) -> None:
     selection = select_for_diff(["scripts/run.sh"], repo)
     assert selection.test_files == sorted(["tests/unit/test_script.py", *_TREE_WIDE])
@@ -153,7 +192,9 @@ def test_the_frontend_flag_follows_the_frontend_paths(
 
 
 def test_browser_tests_are_split_from_the_worker_tests() -> None:
-    workers, browser = split_browser_tests(["tests/unit/test_a.py", "tests/e2e/test_b.py"])
+    workers, browser = split_browser_tests(
+        ["tests/unit/test_a.py", "tests/e2e/test_b.py"], load_scope_rules(_ROOT)
+    )
     assert workers == ["tests/unit/test_a.py"]
     assert browser == ["tests/e2e/test_b.py"]
 
@@ -216,7 +257,7 @@ def _run(repo: Path, monkeypatch: pytest.MonkeyPatch, changed: list[str]) -> int
     return run_changed_gate(repo=repo, junit_path=repo / ".pytest_cache" / "j.xml")
 
 
-def test_the_run_checks_the_selection_and_skips_the_browser_suite(
+def test_the_run_checks_the_selection_and_skips_the_unchanged_browser_tests(
     repo: Path, monkeypatch: pytest.MonkeyPatch, stages: list[list[str]]
 ) -> None:
     assert _run(repo, monkeypatch, ["src/pkg/core.py"]) == 0
@@ -298,3 +339,100 @@ def test_the_cli_passes_base_and_fail_fast_and_exits_with_the_code(
     result = CliRunner().invoke(main.app, ["test", "changed", "--base", "main", "--no-fail-fast"])
     assert result.exit_code == 3
     assert calls == [("main", False)]
+
+
+def test_a_changed_browser_test_runs_in_one_process_and_the_rest_stay_deferred(
+    repo: Path, monkeypatch: pytest.MonkeyPatch, stages: list[list[str]]
+) -> None:
+    """A test the PR edits is run by the PR's own check, browser test or not.
+
+    Killed by: src/uclone_x/cli/changed_scope.py :: if failed(run_changed_browser_tests()):
+    Becomes: if False:
+    """
+    assert _run(repo, monkeypatch, ["src/pkg/core.py", "tests/e2e/test_browser.py"]) == 0
+    browser_runs = [a for a in stages if a[0] == "pytest" and "tests/e2e/test_browser.py" in a]
+    assert len(browser_runs) == 1
+    assert "-n" not in browser_runs[0]
+    assert "--no-cov" in browser_runs[0]
+    # Reached through the import graph but not changed: left to the merge gate.
+    assert not any("tests/e2e/test_other_browser.py" in argv for argv in stages)
+
+
+def test_a_failing_changed_browser_test_fails_the_run(
+    repo: Path, monkeypatch: pytest.MonkeyPatch, stages: list[list[str]]
+) -> None:
+    def run_stage(argv: list[str]) -> _Done:
+        stages.append(argv)
+        return _Done(1 if "tests/e2e/test_browser.py" in argv else 0)
+
+    monkeypatch.setattr(quality_gate, "run_stage", run_stage)
+    assert _run(repo, monkeypatch, ["tests/e2e/test_browser.py"]) == 1
+
+
+def test_a_whole_suite_change_still_runs_the_changed_browser_tests(
+    repo: Path, monkeypatch: pytest.MonkeyPatch, stages: list[list[str]]
+) -> None:
+    """`check --fast` has no browser suite, so the changed browser tests run after it.
+
+    Killed by: src/uclone_x/cli/changed_scope.py :: browser_code = run_changed_browser_tests()
+    Becomes: browser_code = 0
+    """
+
+    def _fake_gate(**_: object) -> int:
+        return 0
+
+    monkeypatch.setattr(quality_gate, "run_quality_gate", _fake_gate)
+    assert _run(repo, monkeypatch, ["pyproject.toml", "tests/e2e/test_browser.py"]) == 0
+    assert [a for a in stages if a[0] == "pytest" and "tests/e2e/test_browser.py" in a]
+
+
+def test_a_changed_test_holding_an_opt_in_tier_is_named_as_not_run(
+    repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stages: list[list[str]],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A diff's own `live` test is skipped by the gate's marker; the run says so.
+
+    Killed by: src/uclone_x/cli/changed_scope.py :: set(_OPT_IN_MARKER.findall(text))
+    Becomes: set[str]()
+    """
+    selection = select_for_diff(["tests/unit/test_paid.py"], repo)
+    assert selection.opt_in_tests == {"tests/unit/test_paid.py": ["live"]}
+    assert _run(repo, monkeypatch, ["tests/unit/test_paid.py"]) == 0
+    out = " ".join(capsys.readouterr().out.split())
+    assert "tests/unit/test_paid.py holds live test(s)" in out
+    assert "./ucx test live" in out
+
+
+def test_an_unreadable_rules_file_is_a_scope_resolution_failure(
+    repo: Path, monkeypatch: pytest.MonkeyPatch, stages: list[list[str]]
+) -> None:
+    """Selecting by rules nobody wrote would be a silent narrowing; the run refuses instead."""
+    (repo / RULES_PATH).write_text(
+        "version = 1\n[whole_suite]\nprefixs = ['x/']\n", encoding="utf-8"
+    )
+    assert _run(repo, monkeypatch, ["src/pkg/core.py"]) == quality_gate.SCOPE_RESOLUTION_EXIT_CODE
+    assert stages == []
+
+
+@pytest.mark.parametrize(
+    ("source", "tiers"),
+    [
+        ("pytestmark = pytest.mark.pre_release\n", ["pre_release"]),
+        ("pytestmark = [pytest.mark.recorded, pytest.mark.slow]\n", ["recorded"]),
+        ("    @pytest.mark.live\n    def test(self): ...\n", ["live"]),
+        # A test that writes a fixture naming the marker marks nothing itself.
+        ('FIXTURE = "import pytest\\n\\n@pytest.mark.live\\ndef test(): ..."\n', []),
+        ("# pytest.mark.live is opt-in\n", []),
+    ],
+)
+def test_only_a_marker_that_applies_names_an_opt_in_tier(
+    tmp_path: Path, source: str, tiers: list[str]
+) -> None:
+    """Killed by: src/uclone_x/cli/changed_scope.py :: r"^[
+    Becomes: r"[
+    """
+    path = tmp_path / "test_x.py"
+    path.write_text(source, encoding="utf-8")
+    assert changed_scope._opt_in_tiers(path) == tiers  # pyright: ignore[reportPrivateUsage]

@@ -1293,7 +1293,7 @@ def test_default_tool_registry_registration() -> None:
 
     # Convenience classmethod
     reg2 = ToolRegistry.with_builtins()
-    assert len(reg2.list_tools()) == 23
+    assert len(reg2.list_tools()) == 24
 
 
 # ======================================================================================
@@ -1436,8 +1436,8 @@ async def test_file_edit_keeps_crlf_line_endings(
 ) -> None:
     """A file with CRLF endings used to come back with `\\n` on every line (#1589 c).
 
-    Killed by: src/uclone_x/tools/builtin/filesystem.py :: if crlf:
-    Becomes: if False:
+    Killed by: src/uclone_x/tools/builtin/filesystem.py :: pieces.append(replacement.replace("\n", endings.ending_at(start)))
+    Becomes: pieces.append(replacement)
     """
     target = workspace / "notes.txt"
     target.write_bytes(b"first\r\nold\r\nlast\r\n")
@@ -1453,11 +1453,83 @@ async def test_file_edit_keeps_crlf_line_endings(
 async def test_file_edit_leaves_lf_endings_as_they_are(
     workspace: Path, tool_context: ToolContext
 ) -> None:
+    """A replacement written with CRLF takes the file's LF, like the rest of the file (#1611).
+
+    Killed by: src/uclone_x/tools/builtin/filesystem.py :: replacement = _LINE_END.sub("\n", params.replacement_content)
+    Becomes: replacement = params.replacement_content
+    """
     target = workspace / "notes.txt"
     target.write_bytes(b"first\nold\nlast\n")
     result = await FileEditTool().execute(
-        {"path": "notes.txt", "target_content": "old", "replacement_content": "new"},
+        {"path": "notes.txt", "target_content": "old", "replacement_content": "new\r\nextra"},
         tool_context,
     )
     assert result.status == ToolResultStatus.SUCCESS, result.error
-    assert target.read_bytes() == b"first\nnew\nlast\n"
+    assert target.read_bytes() == b"first\nnew\nextra\nlast\n"
+
+
+@pytest.mark.asyncio
+async def test_file_edit_keeps_each_line_ending_of_a_mixed_file(
+    workspace: Path, tool_context: ToolContext
+) -> None:
+    """Mixed endings used to come back as all CRLF (#1611).
+
+    Every byte outside the replaced text is the file's own, and each replacement's line
+    breaks take the ending of the line it starts on.
+
+    Killed by: src/uclone_x/tools/builtin/filesystem.py :: pieces.append(endings.raw(kept_from, start))
+    Becomes: pieces.append(content[kept_from:start])
+    Killed by: src/uclone_x/tools/builtin/filesystem.py :: following = bisect.bisect_left(self._positions, index)
+    Becomes: following = 0
+    """
+    target = workspace / "notes.txt"
+    target.write_bytes(b"k=1\r\nk=1\nx\rk=1\r")
+    result = await FileEditTool().execute(
+        {
+            "path": "notes.txt",
+            "target_content": "k=1",
+            "replacement_content": "k=2\nz",
+            "allow_multiple": True,
+        },
+        tool_context,
+    )
+    assert result.status == ToolResultStatus.SUCCESS, result.error
+    assert target.read_bytes() == b"k=2\r\nz\r\nk=2\nz\nx\rk=2\rz\r"
+
+
+@pytest.mark.asyncio
+async def test_file_edit_keeps_cr_only_line_endings(
+    workspace: Path, tool_context: ToolContext
+) -> None:
+    """CR-only endings used to come back as LF (#1611).
+
+    Killed by: src/uclone_x/tools/builtin/filesystem.py :: pieces.append(endings.raw(kept_from, len(content)))
+    Becomes: pieces.append(content[kept_from:])
+    """
+    target = workspace / "notes.txt"
+    target.write_bytes(b"first\rold\rlast\r")
+    result = await FileEditTool().execute(
+        {"path": "notes.txt", "target_content": "old", "replacement_content": "new\nextra"},
+        tool_context,
+    )
+    assert result.status == ToolResultStatus.SUCCESS, result.error
+    assert target.read_bytes() == b"first\rnew\rextra\rlast\r"
+
+
+@pytest.mark.asyncio
+async def test_file_edit_on_a_last_line_without_an_ending(
+    workspace: Path, tool_context: ToolContext
+) -> None:
+    """The last line has no ending of its own, so a break added there takes the one above.
+
+    Killed by: src/uclone_x/tools/builtin/filesystem.py :: return self._endings[min(following, len(self._endings) - 1)]
+    Becomes: return self._endings[following]
+    """
+    target = workspace / "notes.txt"
+    target.write_bytes(b"first\r\nold")
+    result = await FileEditTool().execute(
+        {"path": "notes.txt", "target_content": "old", "replacement_content": "new\nextra"},
+        tool_context,
+    )
+    assert result.status == ToolResultStatus.SUCCESS, result.error
+    assert target.read_bytes() == b"first\r\nnew\r\nextra"

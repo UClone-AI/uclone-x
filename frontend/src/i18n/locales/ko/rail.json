@@ -1,0 +1,32 @@
+{
+  "clones": "클론",
+  "newClone": "새 클론",
+  "expandLabel": "{name}의 대화 보기",
+  "collapseLabel": "{name}의 대화 숨기기",
+  "expandTitle": "대화 보기",
+  "collapseTitle": "대화 숨기기",
+  "inspectLabel": "{name}의 프로필 보기",
+  "inspectTitle": "작업 패널에서 프로필 보기",
+  "editLabel": "{name}의 설정 편집",
+  "editTitle": "작업 패널에서 설정 편집",
+  "pinLabel": "{name}을(를) 맨 위에 고정",
+  "unpinLabel": "{name} 고정 해제",
+  "pinTitle": "클론을 맨 위에 고정",
+  "unpinTitle": "클론 고정 해제",
+  "moreLabel": "{name}에 대한 추가 작업",
+  "moreTitle": "추가 작업",
+  "pinnedHeading": "고정됨",
+  "cloneConversations": {
+    "heading": "대화",
+    "none": "아직 참여한 대화가 없습니다.",
+    "start": "대화 시작",
+    "openLabel": "{clone}이(가) 참여한 대화 {title} 열기",
+    "startLabel": "{clone}와(과) 대화 시작",
+    "thread": "스레드 시작",
+    "threadLabel": "{clone}와(과) 스레드 시작"
+  },
+  "groupChats": {
+    "heading": "그룹 대화",
+    "newTitle": "새 그룹 대화 시작"
+  }
+}

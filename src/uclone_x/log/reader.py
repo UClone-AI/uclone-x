@@ -74,7 +74,8 @@ CURRENT_LOG_FORMAT_VERSION: str = "0.1.0-dev"
 CURRENT_LOG_SCHEMA: str = "uclone_x.log.v0"
 SUPPORTED_LOG_FORMAT_VERSIONS: tuple[str, ...] = (CURRENT_LOG_FORMAT_VERSION,)
 
-# Turn loop durable event types (emitted by BaseAgent.execute_turn)
+# Turn loop durable event types (emitted by `TurnExecutor.execute_turn` in
+# `agent/turn_executor.py`)
 TURN_LOOP_EVENT_TYPES: frozenset[str] = frozenset(
     {
         "TURN_START",

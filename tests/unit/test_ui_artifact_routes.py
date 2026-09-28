@@ -14,6 +14,7 @@ from typing import Any, cast
 import pytest
 from fastapi.testclient import TestClient
 
+from tests.support.person import confirm_window
 from uclone_x.artifacts.library import READERS_NOT_CLEARED_NOTE, ArtifactLibrary
 from uclone_x.errors import StaleRoomWriteError
 from uclone_x.llm import MockLLMConnector
@@ -37,6 +38,9 @@ def client(tmp_path: Path, workspace: Path) -> Iterator[TestClient]:
         llm=MockLLMConnector(),
     )
     with TestClient(app) as started:
+        # As the story view is used: from a window the server confirmed (#1589 item 6).
+        # The refusal of a window it did not confirm is pinned in `test_ui_person_gate.py`.
+        confirm_window(started)
         yield started
 
 
@@ -101,11 +105,66 @@ def test_delete_without_confirmation_is_a_400_with_the_plain_sentence(
     )
     assert (workspace / "artifacts" / "a.md").exists()
 
-    deleted = client.post(
-        "/api/artifacts/library/delete", json={"path": "artifacts/a.md", "confirm": True}
+
+def test_a_file_that_is_not_archived_is_not_deleted(client: TestClient, workspace: Path) -> None:
+    """Archive first (owner decision Q1, 2026-09-26) holds on the server, not only in the list.
+
+    The Files screen offers Delete on archived rows alone; a request made without it -- an
+    older screen, a script -- is refused and the file stays where it was (#1692).
+
+    Killed by: src/uclone_x/artifacts/library.py :: if not located.archived:  # archive first
+    Becomes: if False:  # archive first
+    """
+    _write(workspace, "artifacts/a.md")
+
+    refused = client.post(
+        "/api/artifacts/library/delete",
+        json={"path": "artifacts/a.md", "confirm": True, "release_writer": True},
     )
-    assert deleted.status_code == 200
+
+    assert refused.status_code == 400, refused.text
+    assert (workspace / "artifacts" / "a.md").read_text(encoding="utf-8") == "hello"
+    assert not (workspace / ".archive").exists()
+
+
+def test_an_archived_file_is_deleted_for_good(client: TestClient, workspace: Path) -> None:
+    """Killed by: src/uclone_x/artifacts/library.py :: if not located.archived:  # archive first
+    Becomes: if True:  # archive first
+    """
+    _write(workspace, "artifacts/a.md")
+    archived = client.post("/api/artifacts/library/archive", json={"path": "artifacts/a.md"})
+    assert archived.status_code == 200, archived.text
+
+    deleted = client.post(
+        "/api/artifacts/library/delete",
+        json={"path": ".archive/artifacts/a.md", "confirm": True},
+    )
+
+    assert deleted.status_code == 200, deleted.text
+    assert deleted.json() == {"deleted": ".archive/artifacts/a.md", "note": None}
+    assert not (workspace / ".archive" / "artifacts" / "a.md").exists()
     assert not (workspace / "artifacts" / "a.md").exists()
+
+
+def test_the_not_archived_refusal_is_plain_words(client: TestClient, workspace: Path) -> None:
+    """The person hears what to do, with no path, folder name or exception text in it.
+
+    Killed by: src/uclone_x/artifacts/library.py :: f"{located.name} is not archived, so it was not deleted. Archive it first; "
+    Becomes: f"{located.relative} is not archived, so it was not deleted. Archive it first; "
+    """
+    _write(workspace, "artifacts/notes/a.md")
+
+    refused = client.post(
+        "/api/artifacts/library/delete", json={"path": "artifacts/notes/a.md", "confirm": True}
+    )
+
+    detail = refused.json()["detail"]
+    assert detail == (
+        "a.md is not archived, so it was not deleted. Archive it first; only an archived "
+        "file can be deleted for good."
+    )
+    for internal in ("/", "\\", ".archive", "notes", "Error", "Traceback", str(workspace)):
+        assert internal not in detail
 
 
 @pytest.mark.parametrize(
@@ -163,20 +222,18 @@ def test_only_a_json_true_goes_ahead_over_a_writer(
     assert not (workspace / ".archive").exists()
 
 
-@pytest.mark.parametrize(("route", "extra"), [("archive", {}), ("delete", {"confirm": True})])
 def test_a_story_whose_readers_were_not_all_cleared_says_so(
     client: TestClient,
     workspace: Path,
     monkeypatch: pytest.MonkeyPatch,
-    route: str,
-    extra: dict[str, object],
 ) -> None:
-    """The change stands and the answer carries the plain note, not only the log (#1578).
+    """The archive stands and the answer carries the plain note, not only the log (#1578).
+
+    Only archiving clears a story's readers: a delete takes an archived story, which has
+    none left (#1692).
 
     Killed by: src/uclone_x/ui/artifacts.py :: return {"path": moved.path, "note": moved.note}
     Becomes: return {"path": moved.path, "note": None}
-    Killed by: src/uclone_x/ui/artifacts.py :: return {"deleted": body.path, "note": removed.note}
-    Becomes: return {"deleted": body.path, "note": None}
     """
     room_id = _room(client, "Writing room")
     story_id = StoryLibrary(workspace).create("Night Train", room_id).story_id
@@ -187,8 +244,8 @@ def test_a_story_whose_readers_were_not_all_cleared_says_so(
     monkeypatch.setattr(RoomService, "forget_story", stale)
 
     done = client.post(
-        f"/api/artifacts/library/{route}",
-        json={"path": f"stories/{story_id}", "release_writer": True, **extra},
+        "/api/artifacts/library/archive",
+        json={"path": f"stories/{story_id}", "release_writer": True},
     )
 
     assert done.status_code == 200, done.text
@@ -254,13 +311,12 @@ def _refused_while(
 
     monkeypatch.setattr(stack, predicate, running)
 
-    for route, extra in (("archive", {}), ("delete", {"confirm": True})):
-        refused = client.post(
-            f"/api/artifacts/library/{route}",
-            json={"path": f"stories/{story_id}", "release_writer": True, **extra},
-        )
-        assert refused.status_code == 409, refused.text
-        assert refused.json()["detail"] == _ANSWERING
+    refused = client.post(
+        "/api/artifacts/library/archive",
+        json={"path": f"stories/{story_id}", "release_writer": True},
+    )
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["detail"] == _ANSWERING
     assert (workspace / "stories" / story_id).is_dir()
     assert StoryLibrary(workspace).load(story_id).lease is not None
 

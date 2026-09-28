@@ -11,15 +11,15 @@ from uclone_x.agent.base import BaseAgent
 from uclone_x.agent.models import AgentConfig, AgentLLMConfig
 from uclone_x.llm.connectors.mock import MockLLMConnector
 from uclone_x.llm.models import LLMRequest, MessageRole, ModelResponse, ToolCallRequest
+from uclone_x.skills.approvals import SkillApprovalLedger, SkillPin
 from uclone_x.skills.auditor import (
     Skill,
-    SkillAuditor,
     SkillRegistry,
+    compute_skill_sha256,
     save_skill,
 )
 from uclone_x.skills.models import (
     AuditVerdict,
-    AutoApprovalPolicy,
     SkillAuditReport,
     SkillManifest,
     SkillOrigin,
@@ -239,17 +239,14 @@ async def test_agent_reload_skills_from_disk(tmp_path: Path) -> None:
     reloaded_before = await agent.reload_skills()
     assert len(reloaded_before) == 0
 
-    # Simulate approval: audit and update status to ACTIVE
-    auditor = SkillAuditor(policy=AutoApprovalPolicy.SAFE_ONLY)
-    audit_report = await auditor.audit_skill(skills_dir / "dynamic_refactor")
+    # Simulate approval the way `ucx skill approve` does it: mark the skill active, then pin
+    # the digest of what is now on disk in the approvals ledger (#1720).
     approved_manifest = manifest.model_copy(
-        update={
-            "status": SkillStatus.ACTIVE,
-            "approved_by": "developer:human",
-            "content_sha256": audit_report.content_sha256,
-        }
+        update={"status": SkillStatus.ACTIVE, "approved_by": "developer:human"}
     )
     save_skill(skills_dir / "dynamic_refactor", approved_manifest, "# Refactoring guide")
+    digest = compute_skill_sha256(skills_dir / "dynamic_refactor")
+    SkillApprovalLedger().pin("dynamic_refactor", SkillPin(digest, "developer:human", "t0"))
 
     # Reload skills
     reloaded_after = await agent.reload_skills()
@@ -276,8 +273,8 @@ class TestLoadSkillIsBoundToItsOwnAgent:
     def test_a_second_agent_loads_from_its_own_approval_list(self) -> None:
         """...and the load is recorded against the agent that made it.
 
-        Killed by: src/uclone_x/agent/base.py :: self._agent_local_tools[skill_tool.name] = skill_tool
-        Becomes: self._agent_local_tools.pop(skill_tool.name, None)
+        Killed by: src/uclone_x/agent/base.py :: agent_local_tools[skill_tool.name] = skill_tool
+        Becomes: agent_local_tools.pop(skill_tool.name, None)
         """
         shared_tools = ToolRegistry()
         first_skills, second_skills = SkillRegistry(), SkillRegistry()

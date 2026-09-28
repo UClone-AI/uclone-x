@@ -1,9 +1,7 @@
-"""Tool scoping: what is advertised, what is withheld, and whether the turn says so."""
+"""The eval-only lexical scoper, and the canonical order of the agent's tools layer."""
 
 from __future__ import annotations
 
-import asyncio
-from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
@@ -12,7 +10,7 @@ from uclone_x.agent import BaseAgent
 from uclone_x.agent.models import AgentConfig, AgentContext
 from uclone_x.llm.connectors.mock import MockLLMConnector
 from uclone_x.llm.models import ToolDefinition
-from uclone_x.tools.registry import create_default_registry
+from uclone_x.tools.registry import ToolRegistry, create_default_registry
 from uclone_x.tools.tool_scoper import LexicalToolScoper, ToolScopingResult
 
 
@@ -24,7 +22,7 @@ def _tools(*names: str) -> tuple[ToolDefinition, ...]:
 
 
 @pytest.mark.asyncio
-async def test_lexical_scoper_ranks_the_matching_tool_first() -> None:
+async def test_lexical_scoper_keeps_the_matching_tool() -> None:
     scoper = LexicalToolScoper(top_k=2)
     tools = (
         ToolDefinition(name="math_add", description="add numbers", parameters={}),
@@ -34,8 +32,8 @@ async def test_lexical_scoper_ranks_the_matching_tool_first() -> None:
 
     result = await scoper.scope_tools("Can you analyze the logs?", tools)
 
-    assert len(result.selected) == 2
-    assert result.selected[0].name == "system_analyze"
+    assert [tool.name for tool in result.selected] == ["math_add", "system_analyze"]
+    assert result.scores[0] == ("system_analyze", 1.0)
     assert result.method == "lexical overlap"
 
 
@@ -113,179 +111,78 @@ def test_the_notice_bounds_how_many_names_it_lists() -> None:
 
 
 @pytest.mark.asyncio
-async def test_equal_scores_keep_registry_order() -> None:
-    """Ties break on the registry index, so scoping is deterministic across runs.
+async def test_equal_scores_break_on_the_name_not_the_input_order() -> None:
+    """Which of two equal scores is kept does not depend on the order tools arrive in.
 
-    Killed by: src/uclone_x/tools/tool_scoper.py :: scored.sort(key=lambda entry: (-entry[0], entry[1]))
-    Becomes: scored.sort(key=lambda entry: (-entry[0], entry[2].name), reverse=True)
+    Killed by: src/uclone_x/tools/tool_scoper.py :: scored.sort(key=lambda entry: (-entry[0], entry[2].name))
+    Becomes: scored.sort(key=lambda entry: (-entry[0], entry[1]))
     """
     scoper = LexicalToolScoper(top_k=2)
     tools = (
         ToolDefinition(name="zeta", description="analyze logs", parameters={}),
+        ToolDefinition(name="beta", description="analyze logs", parameters={}),
         ToolDefinition(name="alpha", description="analyze logs", parameters={}),
         ToolDefinition(name="omega", description="unrelated", parameters={}),
     )
 
-    result = await scoper.scope_tools("analyze the logs", tools)
+    results = [
+        await scoper.scope_tools("analyze the logs", order)
+        for order in (tools, tuple(reversed(tools)))
+    ]
 
-    assert [tool.name for tool in result.selected] == ["zeta", "alpha"]
+    for result in results:
+        assert [tool.name for tool in result.selected] == ["alpha", "beta"]
+        assert set(result.withheld) == {"zeta", "omega"}
 
 
-def test_a_withheld_tool_still_executes_when_the_model_calls_it(tmp_path: Path) -> None:
-    """The notice makes a promise about withheld tools, and the promise has to hold.
+@pytest.mark.asyncio
+async def test_the_selected_tools_come_back_in_name_order_not_score_order() -> None:
+    """The score picks which tools; the tools layer is in name order (design §5.1).
 
-    An earlier wording promised that naming a withheld tool would get it "advertised on the
-    next turn". Nothing implements that: scoping runs against the *user's* next input, so a
-    model that asks for a tool is answered by whatever the user types next. The notice now
-    says the true thing instead — a withheld tool is withheld from the *advertisement*, not
-    from the registry, and a call for it runs — which is only worth saying if it is so.
-
-    Killed by: src/uclone_x/tools/tool_scoper.py :: "A withheld tool is registered and still executes: emit a call for it by name "
-    Becomes: "A withheld tool is gone for this turn. "
+    Killed by: src/uclone_x/tools/tool_scoper.py :: selected=_by_name(selected),
+    Becomes: selected=selected,
     """
-    scoper = LexicalToolScoper(top_k=1)
-    agent = BaseAgent(
-        config=AgentConfig(agent_id="a", name="A", system_prompt="s", workspace_dir=tmp_path),
-        llm=MockLLMConnector(default_response="stubbed"),
-        tools=create_default_registry(enable_mcp=False),
-        context=AgentContext(session_id="sess_a", agent_id="a"),
-        tool_scoper=scoper,
-    )
-    definitions = tuple(
-        ToolDefinition(name=tool.name, description=tool.description, parameters={})
-        for tool in agent.tools.list_tools()  # pyright: ignore[reportOptionalMemberAccess]
-    )
-
-    result = asyncio.run(scoper.scope_tools("use file_read on the notes", definitions))
-    assert "file_write" in result.withheld, result.withheld
-    assert "still executes" in result.notice()
-
-    record = asyncio.run(
-        agent.execute_tool_call("file_write", {"path": "note.md", "content": "seven\n"})
-    )
-
-    assert record.status == "success", record.error
-    assert (tmp_path / "note.md").read_text() == "seven\n"
-
-
-class _MockScoperEmbedder:
-    @property
-    def model_name(self) -> str:
-        return "mock-scoper-embed"
-
-    @property
-    def dimensions(self) -> int:
-        return 4
-
-    def __init__(self, mapping: dict[str, tuple[float, ...]] | None = None) -> None:
-        self.mapping = mapping or {}
-        self.should_fail = False
-
-    async def embed(self, texts: Sequence[str]) -> tuple[tuple[float, ...], ...]:
-        if self.should_fail:
-            raise RuntimeError("Embedder connection lost")
-        result: list[tuple[float, ...]] = []
-        for t in texts:
-            if t in self.mapping:
-                result.append(self.mapping[t])
-            else:
-                result.append((0.01, 0.01, 0.01, 0.01))
-        return tuple(result)
-
-
-@pytest.mark.asyncio
-async def test_semantic_tool_scoper_matches_by_similarity() -> None:
-    from uclone_x.tools.tool_scoper import SemanticToolScoper
-
-    embedder = _MockScoperEmbedder(
-        mapping={
-            "generate_image: generate an image": (1.0, 0.0, 0.0, 0.0),
-            "file_write: write files": (0.0, 1.0, 0.0, 0.0),
-            "draw a photo of a beach": (0.95, 0.05, 0.0, 0.0),
-        }
-    )
-    scoper = SemanticToolScoper(embedder, threshold=0.5, top_k=1)
+    scoper = LexicalToolScoper(top_k=2)
     tools = (
-        ToolDefinition(name="generate_image", description="generate an image", parameters={}),
-        ToolDefinition(name="file_write", description="write files", parameters={}),
+        ToolDefinition(name="alpha", description="unrelated", parameters={}),
+        ToolDefinition(name="zeta_fetch", description="unrelated", parameters={}),
+        ToolDefinition(name="beta", description="analyze logs", parameters={}),
     )
 
-    result = await scoper.scope_tools("draw a photo of a beach", tools)
-    assert len(result.selected) == 1
-    assert result.selected[0].name == "generate_image"
-    assert result.withheld == ("file_write",)
-    assert result.method == "semantic similarity"
+    # `zeta_fetch` is named in the query and outranks `beta`, which only matches a word.
+    result = await scoper.scope_tools("zeta_fetch and analyze", tools)
+
+    assert result.scores[0][0] == "zeta_fetch"
+    assert [tool.name for tool in result.selected] == ["beta", "zeta_fetch"]
 
 
-@pytest.mark.asyncio
-async def test_semantic_tool_scoper_withholds_all_tools_for_unrelated_chat() -> None:
-    from uclone_x.tools.tool_scoper import SemanticToolScoper
+def test_the_advertised_tools_do_not_depend_on_registration_order(tmp_path: Path) -> None:
+    """The tools layer is the same bytes however the registry was filled (design §5.1).
 
-    embedder = _MockScoperEmbedder(
-        mapping={
-            "generate_image: generate an image": (1.0, 0.0, 0.0, 0.0),
-            "file_write: write files": (0.0, 1.0, 0.0, 0.0),
-            "hello how are you": (0.0, 0.0, 0.0, 1.0),
-        }
-    )
-    scoper = SemanticToolScoper(embedder, threshold=0.5, top_k=2)
-    tools = (
-        ToolDefinition(name="generate_image", description="generate an image", parameters={}),
-        ToolDefinition(name="file_write", description="write files", parameters={}),
-    )
+    A registry keeps insertion order, so an agent built from the same tools registered in a
+    different order advertised them in a different order, which moves every schema in the
+    request prefix and misses the provider's prefix cache.
 
-    result = await scoper.scope_tools("hello how are you", tools)
-    assert len(result.selected) == 0
-    assert set(result.withheld) == {"generate_image", "file_write"}
-    assert "0 of 2 registered tools are advertised" in result.notice()
+    Killed by: src/uclone_x/agent/tool_invoker.py :: for t in sorted(self.available_tools(), key=lambda tool: tool.name)
+    Becomes: for t in self.available_tools()
+    """
+    builtins = create_default_registry(enable_mcp=False).list_tools()
 
+    def advertised(order: list[object]) -> list[ToolDefinition]:
+        registry = ToolRegistry()
+        for tool in order:
+            registry.register(tool)  # type: ignore[arg-type]
+        agent = BaseAgent(
+            config=AgentConfig(agent_id="a", name="A", system_prompt="s", workspace_dir=tmp_path),
+            llm=MockLLMConnector(default_response="stubbed"),
+            tools=registry,
+            context=AgentContext(session_id="sess_a", agent_id="a"),
+        )
+        return agent.advertised_tool_definitions()
 
-@pytest.mark.asyncio
-async def test_semantic_tool_scoper_always_include_and_skill_matching() -> None:
-    from uclone_x.tools.tool_scoper import SemanticToolScoper
+    forward = advertised(list(builtins))
+    backward = advertised(list(reversed(builtins)))
 
-    embedder = _MockScoperEmbedder(
-        mapping={
-            "generate_image: generate an image": (1.0, 0.0, 0.0, 0.0),
-            "record_memory_fact: record memory": (0.0, 1.0, 0.0, 0.0),
-            "photo_skill: advanced photo editing": (0.9, 0.1, 0.0, 0.0),
-            "draw something": (0.95, 0.05, 0.0, 0.0),
-        }
-    )
-    scoper = SemanticToolScoper(
-        embedder,
-        threshold=0.5,
-        always_include=("record_memory_fact",),
-        skills_provider=lambda: [("photo_skill", "advanced photo editing")],
-    )
-    tools = (
-        ToolDefinition(name="generate_image", description="generate an image", parameters={}),
-        ToolDefinition(name="record_memory_fact", description="record memory", parameters={}),
-    )
-
-    result = await scoper.scope_tools("draw something", tools)
-    selected_names = {t.name for t in result.selected}
-    assert "generate_image" in selected_names
-    assert "record_memory_fact" in selected_names
-    assert "photo_skill" in result.matched_skills
-    assert "photo_skill" in result.notice()
-
-
-@pytest.mark.asyncio
-async def test_semantic_tool_scoper_fallback_on_embedder_failure() -> None:
-    from uclone_x.tools.tool_scoper import SemanticToolScoper
-
-    embedder = _MockScoperEmbedder()
-    embedder.should_fail = True
-
-    scoper = SemanticToolScoper(embedder, top_k=1)
-    tools = (
-        ToolDefinition(name="generate_image", description="generate an image", parameters={}),
-        ToolDefinition(name="file_write", description="write files", parameters={}),
-    )
-
-    result = await scoper.scope_tools("generate_image now", tools)
-    # Falls back to lexical overlap, which matches 'generate_image'
-    assert len(result.selected) == 1
-    assert result.selected[0].name == "generate_image"
-    assert result.method == "lexical overlap"
+    assert len(forward) > 1
+    assert forward == backward
+    assert [d.name for d in forward] == sorted(d.name for d in forward)

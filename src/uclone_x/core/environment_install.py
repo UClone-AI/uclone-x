@@ -345,7 +345,9 @@ def install_into_running_environment(*packages: str) -> tuple[bool, str]:
         )
 
     try:
-        result = subprocess.run(command, check=False)
+        # No stdin: the tool's caller is a model, and the installer must not read the
+        # terminal the UI server was started from (#1589).
+        result = subprocess.run(command, check=False, stdin=subprocess.DEVNULL)
     except Exception as exc:  # noqa: BLE001 - any OS-level failure is reported, not raised
         return False, f"Running `{' '.join(command)}` failed: {exc}"
     if result.returncode != 0:

@@ -266,27 +266,62 @@ def llm_rm(
 
 @llm_app.command("use")
 def llm_use(
-    model: str = typer.Argument(..., help="Model to make the default, e.g. 'qwen3:1.7b'"),
+    model: str | None = typer.Argument(
+        None, help="Model to make the default (the deep model), e.g. 'qwen3:1.7b'"
+    ),
     provider: str = typer.Option(
         "ollama", "--provider", help="Provider that serves it: ollama, vllm, openai, ..."
     ),
     base_url: str | None = typer.Option(
         None, "--base-url", help="Address of the server, when it is not the usual one"
     ),
+    fast: str | None = typer.Option(
+        None,
+        "--fast",
+        help="Model for quick auxiliary calls (routing, summaries); '' follows the default",
+    ),
 ) -> None:
     """Make MODEL the default for `ucx run`, rooms and the dashboard.
 
     Saved where the dashboard's Settings keep the choice, so both change the same thing.
-    Without `--base-url`, an address already saved for the same provider is kept. A saved
-    API key is kept too, for the provider it was saved for.
+    Without `--base-url`, an address already saved for the same provider is kept. Every
+    saved API key is kept too, under the provider it was saved for.
+
+    `--fast MODEL` saves the fast model, used for auxiliary calls; alone, it changes only
+    that. An empty `--fast ''` makes the fast model follow the default again.
     """
     from uclone_x.llm.connectors.factory import model_env_override, what_outranks_saved_choice
     from uclone_x.llm.connectors.saved_choice import (
+        LLM_MODEL_FAST_KEY,
         SAVED_PROVIDERS,
         read_saved_choice,
         save_choice,
         settings_file,
+        update_settings_file,
     )
+
+    if fast is not None:
+        fast_model = fast.strip() or None
+        try:
+            update_settings_file({LLM_MODEL_FAST_KEY: fast_model})
+        except (OSError, ValueError):
+            console.print(
+                f"[red]Could not save the fast model: {escape(str(settings_file()))} could "
+                "not be read or written. Choose it in the dashboard's Settings instead.[/red]"
+            )
+            raise typer.Exit(code=1) from None
+        if fast_model is None:
+            console.print("[green]✔ The fast model now follows the default model.[/green]")
+        else:
+            console.print(
+                f"[green]✔ {escape(fast_model)} is now the fast model, for routing and "
+                "summaries.[/green]"
+            )
+        if model is None:
+            return
+    if model is None:
+        console.print("[red]Name a model to use, or pass --fast MODEL.[/red]")
+        raise typer.Exit(code=2)
 
     chosen = provider.strip().lower()
     if chosen not in SAVED_PROVIDERS:

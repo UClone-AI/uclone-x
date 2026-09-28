@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { TurnDetail } from './TurnDetail';
 import type { EventEnvelope, RoomState, RoomTranscriptMessage } from '../../types';
@@ -26,7 +26,7 @@ const room = (transcript: RoomTranscriptMessage[]): RoomState => ({
   turn_state: { agent_turns_since_human: 0 },
   policy: {
     max_agent_turns_per_human_message: 4,
-    max_span_messages: 40,
+    max_span_tokens: 8000,
     transcript_window: 40,
     hesitation_seconds: 0,
     default_responder_id: '',
@@ -177,6 +177,53 @@ describe('TurnDetail', () => {
     expect(attempts).toHaveTextContent('ollama:hermes3:8b');
     expect(attempts).toHaveTextContent('ConnectionError');
     expect(attempts).toHaveTextContent('503');
+  });
+
+  // Killed by: frontend/src/components/layout/TurnDetail.tsx :: (devMode || summary.decision?.selector !== 'sole_agent')
+  // Becomes: true
+  it('omits the Chosen by field for sole_agent in normal mode, but displays it in developer mode', () => {
+    // Normal mode: Chosen by omitted for sole_agent
+    const { unmount } = render(
+      <TurnDetail
+        seq={1}
+        room={room([message()])}
+        summary={defaultSummary({
+          decision: {
+            verdict: 'speak',
+            speaker_id: 'scout',
+            confidence: 1.0,
+            selector: 'sole_agent',
+            reasoning: "the room's only agent",
+          },
+        })}
+        developerMode={false}
+      />,
+    );
+
+    expect(screen.queryByTestId('turn-detail-decision')).toBeNull();
+    expect(screen.queryByText('Chosen by')).toBeNull();
+    unmount();
+
+    // Developer mode: Chosen by displayed with raw selector sole_agent
+    render(
+      <TurnDetail
+        seq={1}
+        room={room([message()])}
+        summary={defaultSummary({
+          decision: {
+            verdict: 'speak',
+            speaker_id: 'scout',
+            confidence: 1.0,
+            selector: 'sole_agent',
+            reasoning: "the room's only agent",
+          },
+        })}
+        developerMode={true}
+      />,
+    );
+
+    expect(screen.getByTestId('turn-detail-decision')).toHaveTextContent('sole_agent');
+    expect(screen.getByText('Chosen by')).toBeDefined();
   });
 
   // Killed by: frontend/src/components/layout/TurnDetail.tsx :: Nobody chose this speaker: the turn records no selection.
@@ -457,6 +504,56 @@ describe('TurnDetail', () => {
     expect(containerText).not.toMatch(/bash_run/);
   });
 
+  // Killed by: frontend/src/components/layout/TurnDetail.tsx :: ) : summary.provider_failure && providerFailureRemedy(summary.provider_failure.kind) ? (
+  // Becomes: ) : false ? (
+  it('says where to act on a provider failure a retry can cure, as the room row does (#1630)', () => {
+    const plain = "Couldn't reach Google. Check your internet connection.";
+    render(
+      <TurnDetail
+        seq={1}
+        room={room([message()])}
+        summary={defaultSummary({
+          error: plain,
+          provider_failure: { kind: 'provider_unreachable', message: plain, retryable: true },
+        })}
+      />,
+    );
+
+    const box = screen.getByTestId('turn-detail-error');
+    expect(box).toHaveTextContent(plain);
+    expect(screen.getByTestId('turn-detail-remedy')).toHaveTextContent(
+      'If you set a custom endpoint in Settings, check that address too.',
+    );
+    expect(box.textContent ?? '').not.toMatch(/\{|http|Error\b/);
+  });
+
+  // Killed by: frontend/src/components/layout/TurnDetail.tsx :: provider_failure: message.provider_failure ?? null,
+  // Becomes: provider_failure: null,
+  it("tells a retired model's cause while the turn's record is still loading (#1630)", () => {
+    vi.stubGlobal('fetch', vi.fn(() => new Promise<Response>(() => {})));
+    const plain =
+      'The model gemini-1.5-pro is not available from Google. It may have been retired or renamed.';
+    try {
+      render(
+        <TurnDetail
+          seq={1}
+          room={room([
+            message({
+              content: '',
+              error: plain,
+              refusal: 'model_unavailable',
+              provider_failure: { kind: 'model_unavailable', message: plain, retryable: false },
+            }),
+          ])}
+        />,
+      );
+
+      expect(screen.getByTestId('turn-detail-error')).toHaveTextContent(plain);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   // Acceptance: raw error hidden with developer mode off
   it('hides raw error when developer mode is off and displays it when on', () => {
     const summary = defaultSummary({
@@ -492,6 +589,43 @@ describe('TurnDetail', () => {
     expect(screen.getByTestId('turn-detail-raw-error')).toHaveTextContent(
       'CRITICAL_INTERNAL_RPC_TIMEOUT: 504 Gateway Timeout at server.py:142',
     );
+  });
+
+  it('shows a step\'s arguments one per line and wrapped, not as one sideways-scrolling line', () => {
+    const step = (arguments_preview: string, seq: number) => ({
+      turn_id: 'turn_101',
+      participant_id: 'scout',
+      tool_name: 'generate_image',
+      tool_call_id: `call_${seq}`,
+      status: 'success',
+      error: null,
+      duration_ms: 38200,
+      arguments_preview,
+      output_preview: '',
+      truncated: false,
+      written_path: null,
+      wrote_unnamed: false,
+      subagent_id: null,
+      recorded_at: '2026-01-01T00:00:01Z',
+      seq,
+    });
+    const summary = defaultSummary({
+      steps: [
+        step(JSON.stringify({ aspect_ratio: '16:9', count: 10 }), 1),
+        // A preview cut to fit is not whole JSON; it shows as sent.
+        step('{"aspect_ratio": "16:9", "negative_prompt": "bad_anat', 2),
+      ],
+    });
+
+    render(<TurnDetail seq={1} room={room([message()])} summary={summary} developerMode={true} />);
+
+    const [whole, cut] = screen.getAllByTestId('turn-step-args');
+    expect(whole.textContent).toBe('{\n  "aspect_ratio": "16:9",\n  "count": 10\n}');
+    expect(cut.textContent).toBe('{"aspect_ratio": "16:9", "negative_prompt": "bad_anat');
+    for (const pre of [whole, cut]) {
+      expect(pre.className).toContain('whitespace-pre-wrap');
+      expect(pre.className).not.toContain('overflow-x-auto');
+    }
   });
 
   // Acceptance: refetch on matching room.{id}.tool event; assert fetch mock count; do not use timers.
@@ -611,5 +745,60 @@ describe('TurnDetail', () => {
       ]),
     );
     vi.unstubAllGlobals();
+  });
+
+  describe('turn_id display and copy', () => {
+    beforeEach(() => {
+      Object.assign(navigator, {
+        clipboard: {
+          writeText: vi.fn().mockResolvedValue(undefined),
+        },
+      });
+    });
+
+    it('in developer mode, allows copying turn_id from raw identifiers and header chip', async () => {
+      const summary = defaultSummary({ turn_id: 'turn_abc123' });
+      render(
+        <TurnDetail
+          seq={1}
+          room={room([message({ turn_id: 'turn_abc123' })])}
+          summary={summary}
+          developerMode={true}
+        />,
+      );
+
+      // 1. Raw identifiers copy button
+      const copyBtn = screen.getByTestId('turn-copy-id');
+      expect(copyBtn).toHaveTextContent('Copy');
+      fireEvent.click(copyBtn);
+
+      await waitFor(() => {
+        expect(navigator.clipboard.writeText).toHaveBeenCalledWith('turn_abc123');
+      });
+      expect(screen.getByTestId('turn-copy-id')).toHaveTextContent('Copied');
+
+      // 2. Header chip copy button
+      const chipBtn = screen.getByTestId('turn-chip-copy-id');
+      expect(chipBtn).toBeInTheDocument();
+      fireEvent.click(chipBtn);
+      await waitFor(() => {
+        expect(navigator.clipboard.writeText).toHaveBeenCalledWith('turn_abc123');
+      });
+    });
+
+    it('with developer mode off, renders neither turn_id copy button nor chip', () => {
+      const summary = defaultSummary({ turn_id: 'turn_abc123' });
+      render(
+        <TurnDetail
+          seq={1}
+          room={room([message({ turn_id: 'turn_abc123' })])}
+          summary={summary}
+          developerMode={false}
+        />,
+      );
+
+      expect(screen.queryByTestId('turn-copy-id')).toBeNull();
+      expect(screen.queryByTestId('turn-chip-copy-id')).toBeNull();
+    });
   });
 });

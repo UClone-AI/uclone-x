@@ -13,7 +13,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, StrictBool
 
 from uclone_x.artifacts.library import (
@@ -26,6 +26,7 @@ from uclone_x.errors import PlainRefusalError, StaleRoomWriteError
 from uclone_x.story.view import StoryNotFoundError, StoryView, WriterBusyError
 
 if TYPE_CHECKING:
+    from uclone_x.ui.person import PersonGate
     from uclone_x.ui.rooms import RoomStack
 
 logger = logging.getLogger(__name__)
@@ -84,8 +85,13 @@ def _http_error(exc: Exception, *, failed: str = FILES_FAILURE_DETAIL) -> HTTPEx
     return HTTPException(status_code=500, detail=failed)
 
 
-def register_artifact_routes(app: FastAPI, stack: RoomStack) -> None:
-    """Mount the Files screen's routes under `/api/artifacts/library`."""
+def register_artifact_routes(app: FastAPI, stack: RoomStack, person: PersonGate) -> None:
+    """Mount the Files screen's routes under `/api/artifacts/library`.
+
+    Approve and reject record that a person decided (`decided_in: story_view`), so both
+    first ask `person` whether the request came from a window this server confirmed, and
+    refuse before anything is read or written when it did not (#1589 item 6).
+    """
 
     def _turn_busy(room_id: str) -> bool:
         # A retry runs its turn inside the request, not as a cascade, so
@@ -135,11 +141,13 @@ def register_artifact_routes(app: FastAPI, stack: RoomStack) -> None:
 
     @app.post("/api/artifacts/library/delete")
     async def delete_artifact(body: _DeleteRequest) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
-        """Remove a file or story for good; refused unless `confirm` is true."""
+        """Remove an archived file or story for good; refused unless `confirm` is true.
+
+        A file that is not archived is refused with a 400 (archive first, #1692). The
+        request's `release_writer` is accepted and has nothing to do: archiving settled it.
+        """
         try:
-            removed = _library().delete(
-                body.path, confirm=body.confirm, release_writer=body.release_writer
-            )
+            removed = _library().delete(body.path, confirm=body.confirm)
         except Exception as exc:
             raise _http_error(exc) from exc
         return {"deleted": body.path, "note": removed.note}
@@ -170,9 +178,10 @@ def register_artifact_routes(app: FastAPI, stack: RoomStack) -> None:
 
     @app.post("/api/artifacts/library/stories/{story_id}/proposals/{proposal_id}/approve")
     async def approve_proposal(  # pyright: ignore[reportUnusedFunction]
-        story_id: str, proposal_id: str, body: _DecideRequest
+        request: Request, story_id: str, proposal_id: str, body: _DecideRequest
     ) -> dict[str, Any]:
         """Apply a proposed change a person approved in the story view."""
+        person.require(request)
         try:
             decided = _story_view().approve(story_id, proposal_id, seen_digest=body.seen_digest)
         except Exception as exc:
@@ -181,9 +190,10 @@ def register_artifact_routes(app: FastAPI, stack: RoomStack) -> None:
 
     @app.post("/api/artifacts/library/stories/{story_id}/proposals/{proposal_id}/reject")
     async def reject_proposal(  # pyright: ignore[reportUnusedFunction]
-        story_id: str, proposal_id: str, body: _RejectRequest
+        request: Request, story_id: str, proposal_id: str, body: _RejectRequest
     ) -> dict[str, Any]:
         """Mark a proposed change rejected by a person in the story view."""
+        person.require(request)
         try:
             decided = _story_view().reject(
                 story_id, proposal_id, seen_digest=body.seen_digest, reason=body.reason

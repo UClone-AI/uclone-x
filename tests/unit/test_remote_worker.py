@@ -22,6 +22,7 @@ from uclone_x.core.remote_worker import (
     find_free_port,
     is_port_in_use,
     is_valid_host,
+    launch_remote_comfyui,
     probe_remote_host,
 )
 from uclone_x.ui.app import create_ui_app
@@ -188,7 +189,7 @@ async def test_ui_remote_gpu_endpoints(tmp_path: Path) -> None:
         with patch.object(tunnel_mgr, "connect", return_value=mock_tunnel_status):
             resp = await client.post(
                 "/api/settings/remote-gpu/connect",
-                json={"host": "dell", "apply_settings": True},
+                json={"host": "dell", "apply_settings": True, "sync_llm": True},
             )
             assert resp.status_code == 200
             data = resp.json()
@@ -316,3 +317,267 @@ async def test_ssh_tunnel_manager_connect_failure_cases() -> None:
             status = await mgr.connect("dell")
             assert status.connected is False
             assert "Address already in use" in (status.error or "")
+
+
+@pytest.mark.asyncio
+async def test_launch_remote_comfyui_success() -> None:
+    """Test remote ComfyUI launch and polling success."""
+    mock_spawn = MagicMock()
+    mock_spawn.returncode = 0
+    mock_spawn.communicate = AsyncMock(return_value=(b"", b""))
+
+    mock_poll = MagicMock()
+    mock_poll.returncode = 0
+    mock_poll.wait = AsyncMock(return_value=0)
+
+    with patch("asyncio.create_subprocess_exec", side_effect=[mock_spawn, mock_poll]):
+        ok, err = await launch_remote_comfyui("dell", "/home/kennylim/ComfyUI", timeout=3.0)
+    assert ok is True
+    assert err is None
+
+
+@pytest.mark.asyncio
+async def test_launch_remote_comfyui_failure_with_tail() -> None:
+    """Test remote ComfyUI launch failure reading tail of comfy.log."""
+    mock_spawn = MagicMock()
+    mock_spawn.returncode = 0
+    mock_spawn.communicate = AsyncMock(return_value=(b"", b""))
+
+    mock_poll = MagicMock()
+    mock_poll.returncode = 1
+    mock_poll.wait = AsyncMock(return_value=1)
+
+    mock_tail = MagicMock()
+    mock_tail.returncode = 0
+    mock_tail.communicate = AsyncMock(
+        return_value=(b"ModuleNotFoundError: No module named 'onnxruntime'", b"")
+    )
+
+    with patch("asyncio.create_subprocess_exec", side_effect=[mock_spawn, mock_poll, mock_tail]):
+        ok, err = await launch_remote_comfyui("dell", "/home/kennylim/ComfyUI", timeout=0.2)
+    assert ok is False
+    assert err is not None
+    assert "onnxruntime" in err
+
+
+@pytest.mark.asyncio
+async def test_ssh_tunnel_manager_auto_start_comfyui() -> None:
+    """Test that connect() automatically launches ComfyUI when not listening."""
+    mgr = SSHTunnelManager()
+
+    mock_inspection = RemoteHostInspection(
+        host="dell",
+        reachable=True,
+        ports={
+            "ollama": RemoteServiceStatus("ollama", 11434, True),
+            "comfyui": RemoteServiceStatus("comfyui", 8188, False),
+        },
+        comfyui_dir="/home/kennylim/ComfyUI",
+        ollama_models=["qwen3:8b"],
+    )
+
+    mock_proc = MagicMock()
+    mock_proc.pid = 9999
+    mock_proc.returncode = None
+    mock_proc.stderr = AsyncMock()
+    mock_proc.stderr.readline = AsyncMock(return_value=b"")
+
+    with patch("uclone_x.core.remote_worker.probe_remote_host", return_value=mock_inspection):
+        with patch(
+            "uclone_x.core.remote_worker.launch_remote_comfyui", return_value=(True, None)
+        ) as mock_launch:
+            with patch("uclone_x.core.remote_worker.is_port_in_use", return_value=True):
+                with patch("asyncio.create_subprocess_exec", return_value=mock_proc):
+                    status = await mgr.connect("dell", auto_start_comfyui=True)
+                    assert status.connected is True
+                    assert status.comfyui_autostarted is True
+                    assert any(m.service_name == "comfyui" for m in status.mappings)
+                    mock_launch.assert_called_once_with(
+                        "dell", "/home/kennylim/ComfyUI", timeout=10.0
+                    )
+
+
+@pytest.mark.asyncio
+async def test_ui_connect_preserves_llm_when_model_missing_on_remote(tmp_path: Path) -> None:
+    """Test that /api/settings/remote-gpu/connect preserves local llm_base_url if model is missing on remote."""
+    app = create_ui_app(storage_dir=tmp_path / "uclone_storage")
+
+    mock_tunnel_status = TunnelSessionStatus(
+        host="dell",
+        connected=True,
+        pid=12345,
+        mappings=[
+            PortMapping("ollama", DEFAULT_REMOTE_OLLAMA_PORT, 11435),
+            PortMapping("comfyui", DEFAULT_REMOTE_COMFYUI_PORT, 8189),
+        ],
+        ollama_models=["qwen3:8b", "deepseek-r1:14b"],  # does NOT have qwen2.5:32b
+    )
+
+    tunnel_mgr = app.state.tunnel_manager
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://127.0.0.1") as client:
+        # Pre-configure with local model that remote does NOT have
+        await client.post(
+            "/api/settings",
+            json={
+                "llm_provider": "ollama",
+                "llm_base_url": "http://127.0.0.1:11434",
+                "llm_model": "qwen2.5:32b",
+            },
+        )
+        with patch.object(tunnel_mgr, "connect", return_value=mock_tunnel_status):
+            resp = await client.post(
+                "/api/settings/remote-gpu/connect",
+                json={"host": "dell", "apply_settings": True, "sync_llm": True},
+            )
+            assert resp.status_code == 200
+            data = resp.json()
+            assert data["status"] == "ok"
+            assert data["llm_skipped"] == "model_not_on_remote"
+            # ComfyUI was updated
+            assert data["applied_changes"].get("comfyui_base_url") == "http://127.0.0.1:8189"
+            # LLM was NOT overwritten because qwen2.5:32b is not on remote Ollama!
+            assert "llm_base_url" not in data["applied_changes"]
+            # Active settings still has original local Ollama base URL
+            get_resp = await client.get("/api/settings")
+            assert get_resp.status_code == 200
+            cur = get_resp.json()
+            assert cur.get("llm_base_url") == "http://127.0.0.1:11434"
+
+
+def _dell_tunnel() -> TunnelSessionStatus:
+    return TunnelSessionStatus(
+        host="dell",
+        connected=True,
+        pid=12345,
+        mappings=[
+            PortMapping("ollama", DEFAULT_REMOTE_OLLAMA_PORT, 11435),
+            PortMapping("comfyui", DEFAULT_REMOTE_COMFYUI_PORT, 8189),
+        ],
+        ollama_models=["qwen3:8b"],
+    )
+
+
+async def _save_local_ollama(client: AsyncClient) -> None:
+    await client.post(
+        "/api/settings",
+        json={
+            "llm_provider": "ollama",
+            "llm_base_url": "http://127.0.0.1:11434",
+            "llm_model": "qwen3:8b",
+            "comfyui_base_url": "http://127.0.0.1:8188",
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_ui_connect_leaves_llm_local_unless_asked(tmp_path: Path) -> None:
+    """A worker connected for images does not take the LLM, even with the same model on it."""
+    app = create_ui_app(storage_dir=tmp_path / "uclone_storage")
+    tunnel_mgr = app.state.tunnel_manager
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://127.0.0.1") as client:
+        await _save_local_ollama(client)
+        with patch.object(tunnel_mgr, "connect", return_value=_dell_tunnel()):
+            resp = await client.post(
+                "/api/settings/remote-gpu/connect", json={"host": "dell", "apply_settings": True}
+            )
+        data = resp.json()
+        assert data["applied_changes"] == {"comfyui_base_url": "http://127.0.0.1:8189"}
+        assert data["llm_skipped"] is None
+        cur = (await client.get("/api/settings")).json()
+        assert cur["llm_base_url"] == "http://127.0.0.1:11434"
+        assert cur["comfyui_base_url"] == "http://127.0.0.1:8189"
+
+
+@pytest.mark.asyncio
+async def test_ui_dead_tunnel_restores_saved_addresses_from_disk(tmp_path: Path) -> None:
+    """A tunnel that died -- or a restart -- puts back what connect replaced, from disk."""
+    storage = tmp_path / "uclone_storage"
+    app = create_ui_app(storage_dir=storage)
+    tunnel_mgr = app.state.tunnel_manager
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://127.0.0.1") as client:
+        await _save_local_ollama(client)
+        with patch.object(tunnel_mgr, "connect", return_value=_dell_tunnel()):
+            await client.post(
+                "/api/settings/remote-gpu/connect",
+                json={"host": "dell", "apply_settings": True, "sync_llm": True},
+            )
+            # A second connect must not record the tunnel's own addresses as "previous".
+            await client.post(
+                "/api/settings/remote-gpu/connect",
+                json={"host": "dell", "apply_settings": True, "sync_llm": True},
+            )
+        record = json.loads((storage / "remote_gpu_restore.json").read_text())
+        assert record == {
+            "original": {
+                "llm_provider": "ollama",
+                "llm_base_url": "http://127.0.0.1:11434",
+                "comfyui_base_url": "http://127.0.0.1:8188",
+            },
+            "applied": {
+                "llm_provider": "ollama",
+                "llm_base_url": "http://127.0.0.1:11435",
+                "comfyui_base_url": "http://127.0.0.1:8189",
+            },
+        }
+        # The ssh process is gone; nobody pressed Disconnect.
+        resp = await client.get("/api/settings/remote-gpu/status")
+        data = resp.json()
+        assert data["connected"] is False
+        assert data["restored_settings"]["llm_base_url"] == "http://127.0.0.1:11434"
+        cur = (await client.get("/api/settings")).json()
+        assert cur["llm_base_url"] == "http://127.0.0.1:11434"
+        assert cur["comfyui_base_url"] == "http://127.0.0.1:8188"
+        assert not (storage / "remote_gpu_restore.json").exists()
+        # Nothing left to restore: a later status read changes nothing.
+        assert (
+            "restored_settings" not in (await client.get("/api/settings/remote-gpu/status")).json()
+        )
+
+
+@pytest.mark.asyncio
+async def test_ui_restore_leaves_an_address_changed_by_hand(tmp_path: Path) -> None:
+    """Only a field still holding the tunnel's address is put back."""
+    app = create_ui_app(storage_dir=tmp_path / "uclone_storage")
+    tunnel_mgr = app.state.tunnel_manager
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://127.0.0.1") as client:
+        await _save_local_ollama(client)
+        with patch.object(tunnel_mgr, "connect", return_value=_dell_tunnel()):
+            await client.post(
+                "/api/settings/remote-gpu/connect",
+                json={"host": "dell", "apply_settings": True, "sync_llm": True},
+            )
+        # While connected, the user points the LLM at another server by hand.
+        await client.post(
+            "/api/settings",
+            json={"llm_provider": "vllm", "llm_base_url": "http://10.0.0.7:8000/v1"},
+        )
+        data = (await client.get("/api/settings/remote-gpu/status")).json()
+        assert data["restored_settings"] == {"comfyui_base_url": "http://127.0.0.1:8188"}
+        cur = (await client.get("/api/settings")).json()
+        assert cur["llm_provider"] == "vllm"
+        assert cur["llm_base_url"] == "http://10.0.0.7:8000/v1"
+        assert cur["comfyui_base_url"] == "http://127.0.0.1:8188"
+
+
+@pytest.mark.asyncio
+async def test_ui_startup_restores_a_record_the_last_run_left(tmp_path: Path) -> None:
+    """A run stopped while connected: the next start puts the local addresses back."""
+    storage = tmp_path / "uclone_storage"
+    app = create_ui_app(storage_dir=storage)
+    tunnel_mgr = app.state.tunnel_manager
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://127.0.0.1") as client:
+        await _save_local_ollama(client)
+        with patch.object(tunnel_mgr, "connect", return_value=_dell_tunnel()):
+            await client.post(
+                "/api/settings/remote-gpu/connect",
+                json={"host": "dell", "apply_settings": True, "sync_llm": True},
+            )
+    restarted = create_ui_app(storage_dir=storage)
+    async with restarted.router.lifespan_context(restarted):
+        async with AsyncClient(
+            transport=ASGITransport(app=restarted), base_url="http://127.0.0.1"
+        ) as client:
+            cur = (await client.get("/api/settings")).json()
+    assert cur["llm_base_url"] == "http://127.0.0.1:11434"
+    assert cur["comfyui_base_url"] == "http://127.0.0.1:8188"
+    assert not (storage / "remote_gpu_restore.json").exists()

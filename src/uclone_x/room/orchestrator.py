@@ -21,7 +21,7 @@ import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from typing import Any, Final, cast
 
-from uclone_x.agent.models import ToolExecutionRecord
+from uclone_x.agent.models import ProviderFailure, ToolExecutionRecord
 from uclone_x.agent.protocols import BaseAgentProtocol
 from uclone_x.agent.session import SessionState
 from uclone_x.core.immutable import unwrap_immutable
@@ -36,11 +36,14 @@ from uclone_x.errors import (
     TurnNotStartedError,
     UnknownRoomParticipantError,
 )
+from uclone_x.llm.compactor import estimate_text_tokens
 from uclone_x.room.knowledge import SeatKnowledgeProtocol
 from uclone_x.room.models import (
+    SPAN_WINDOW_SHARE,
     Participant,
     ParticipantKind,
     RoomMessage,
+    RoomMessageKind,
     RoomState,
     RoomToolUse,
     RoomTurnRefusal,
@@ -55,7 +58,6 @@ from uclone_x.room.protocols import (
     RoomStoreProtocol,
     SpeakerSelectorProtocol,
 )
-from uclone_x.story import story_after
 from uclone_x.tools.models import ToolResultStatus
 
 __all__ = ["RoomOrchestrator"]
@@ -271,6 +273,8 @@ class RoomOrchestrator:
         self._activity_events: dict[str, list[asyncio.Event]] = {}
         #: room id -> monotonic timestamp of last reported user presence
         self._presence: dict[str, float] = {}
+        #: room id -> active turn metadata in flight
+        self._live_turn_info: dict[str, dict[str, Any]] = {}
 
     # -- public surface ----------------------------------------------------------------
 
@@ -337,6 +341,13 @@ class RoomOrchestrator:
         """
         return room_id in self._unlanded
 
+    def active_turn(self, room_id: str) -> dict[str, Any] | None:
+        """Return in-flight turn metadata for `room_id`, if a turn is running."""
+        info = self._live_turn_info.get(room_id)
+        if info is not None:
+            return dict(info)
+        return None
+
     async def post(self, room_id: str, sender_id: str, content: str) -> RoomState:
         """Append an utterance and drive the resulting agent turns to a stop."""
         state = await self.accept(room_id, sender_id, content)
@@ -355,6 +366,37 @@ class RoomOrchestrator:
         synchronously -- an unknown sender and an agent trying to post are answers to the
         request, not events that arrive later on a topic nobody may be reading.
         """
+        state = self._require_human_sender(room_id, sender_id)
+        state = self._store.save(self.append_human(state, sender_id, content))
+        # Clear any prior interrupt flag when a fresh post arrives.
+        self._interrupted_rooms.discard(room_id)
+        self._generation[room_id] = self._generation.get(room_id, 0) + 1
+        self._signal_activity(room_id)
+        return state
+
+    async def accept_command(self, room_id: str, sender_id: str, content: str) -> RoomState:
+        """Record a command the person typed, such as `/loop 30s ...`, as a note (#1661).
+
+        Shown in the conversation where it was typed, and nobody's speech: a note is kept
+        out of every seat's span, the interjection check and the selector window, so no
+        seat is handed `[user]: /loop 30s ...` as something to answer. For the same reason
+        it does not reset the turn budget and does not stop a running exchange, which is
+        what a message does. `accept`'s refusals apply: only the room's human may type a
+        command. The row carries no `code`, so a head shows the command as it was typed.
+        """
+        state = self._require_human_sender(room_id, sender_id)
+        note = RoomMessage(
+            seq=len(state.transcript) + 1,
+            sender_id=sender_id,
+            content=content,
+            kind=RoomMessageKind.NOTE,
+        )
+        state = self._store.save(state.model_copy(update={"transcript": (*state.transcript, note)}))
+        self._signal_activity(room_id)
+        return state
+
+    def _require_human_sender(self, room_id: str, sender_id: str) -> RoomState:
+        """The room, when `sender_id` is its human; refused otherwise."""
         state = self._require_room(room_id)
         sender = self._participant(state, sender_id)
         if sender is None:
@@ -372,12 +414,6 @@ class RoomOrchestrator:
                 f"{sender_id!r} is an agent of room {room_id!r}, and only a human may post; "
                 f"an agent speaks when the orchestrator gives it the floor"
             )
-
-        state = self._store.save(self.append_human(state, sender_id, content))
-        # Clear any prior interrupt flag when a fresh post arrives.
-        self._interrupted_rooms.discard(room_id)
-        self._generation[room_id] = self._generation.get(room_id, 0) + 1
-        self._signal_activity(room_id)
         return state
 
     async def resume(self, room_id: str, baseline_seq: int) -> RoomState:
@@ -702,7 +738,7 @@ class RoomOrchestrator:
         """
         agent = await self._resolver.resolve(speaker)
         state = self._require_room(room_id)
-        prompt = self._render_span(state, speaker)
+        prompt = self._render_span(state, speaker, span_token_budget(state, agent))
         # The span this turn actually showed. The high-water mark advances to *this*, not to
         # the speaker's own new message: anything appended while the turn ran — an
         # interjection, by the very seam `append_human` exists to provide — was never
@@ -803,11 +839,15 @@ class RoomOrchestrator:
         usage = None
         completed = True
         refusal: RoomTurnRefusal | None = None
+        provider_failure: ProviderFailure | None = None
         # What the turn says its tools were. Stays empty *and unrecorded* when the turn
         # raised or was cancelled: there is no `TurnResult` to read them from, and an
         # empty list stored as recorded would claim the seat used none (P6).
         executions: Sequence[ToolExecutionRecord] = ()
         tools_recorded = False
+        # A turn that raised or was cancelled has no `TurnResult`, and keeps the story
+        # the room had.
+        story_id = state.story_id
         turn_task = asyncio.create_task(
             agent.execute_turn(
                 prompt,
@@ -836,6 +876,7 @@ class RoomOrchestrator:
             provenance = result.provenance
             usage = result.usage
             executions = result.tool_executions
+            story_id = result.story_id
             # Not simply True: a turn that failed while a step's tools were running may
             # have run calls whose records never reached the list, and storing that list
             # as the turn's account would claim they did not happen (#1366).
@@ -852,6 +893,7 @@ class RoomOrchestrator:
                 error = result.error
                 # From the turn's stated stop reason, never from `error`'s wording (#969).
                 refusal = turn_refusal(result.stop_reason)
+                provider_failure = result.provider_failure
         finally:
             # Only if it is still ours. Evicting somebody else's live turn made
             # `interrupt` cancel nothing while answering as though it had -- a Stop that
@@ -864,6 +906,9 @@ class RoomOrchestrator:
             current = self._active_turns.get(room_id)
             if current is not None and current[0] == turn_id:
                 del self._active_turns[room_id]
+            current_info = self._live_turn_info.get(room_id)
+            if current_info is not None and current_info.get("turn_id") == turn_id:
+                del self._live_turn_info[room_id]
 
         # One predicate for the whole commit (#1423): the session below, the row's answer,
         # and `last_seen_seq` all read it, so they cannot disagree about whether the
@@ -913,6 +958,7 @@ class RoomOrchestrator:
             provenance=provenance,
             error=error,
             refusal=refusal,
+            provider_failure=provider_failure,
             completed=completed,
             rendered_through=rendered_through,
             persist_error=persist_error,
@@ -948,11 +994,11 @@ class RoomOrchestrator:
                 "tool_uses": (*state.tool_uses, *uses),
                 "written_files": (*state.written_files, *written),
                 # The story a `story_library` call in this turn opened, created or closed
-                # (#1555). Read from the records whether or not the turn then failed: the
-                # lease moved when the call succeeded, and a room that forgot it would
-                # hold a lease it does not know it has. A turn that raised has no records,
-                # and keeps the story it had.
-                "story_id": story_after(executions, state.story_id),
+                # (#1555), as the seat's lifecycle hooks moved it (#1775) -- the room does
+                # not re-derive it from the records. Kept whether or not the turn then
+                # failed: the lease moved when the call succeeded, and a room that forgot
+                # it would hold a lease it does not know it has.
+                "story_id": story_id,
                 # What `written_files` cannot see, counted where it happens and kept
                 # past any clear or rewind that removes the rows above (#1366).
                 "file_record": state.file_record.model_copy(
@@ -1113,6 +1159,8 @@ class RoomOrchestrator:
             payload["error"] = message.error
         if message.refusal is not None:
             payload["refusal"] = message.refusal.value
+        if message.provider_failure is not None:
+            payload["provider_failure"] = message.provider_failure.model_dump(mode="json")
         try:
             publisher = self._publishers.get(message.sender_id)
             if publisher is None:
@@ -1192,6 +1240,10 @@ class RoomOrchestrator:
                 detail = data.get("detail")
                 if not detail:
                     return
+                info = self._live_turn_info.get(room_id)
+                if info is not None and info.get("turn_id") == turn_id:
+                    info["status"] = "status_update"
+                    info["detail"] = str(detail)
                 try:
                     publisher = self._publishers.get(agent_id)
                     if publisher is None:
@@ -1229,6 +1281,10 @@ class RoomOrchestrator:
             delta = data.get("content")
             if not delta:
                 return
+            info = self._live_turn_info.get(room_id)
+            if info is not None and info.get("turn_id") == turn_id:
+                info["status"] = "streaming"
+                info["accumulated_text"] = info.get("accumulated_text", "") + delta
             try:
                 publisher = self._publishers.get(agent_id)
                 if publisher is None:
@@ -1274,14 +1330,22 @@ class RoomOrchestrator:
         Carries `turn_id` and no `seq`. The row this turn lands on is not known yet --
         see `_take_turn` -- and a number that is wrong is worse than one that is absent.
         """
-        if self._bus is None:
-            return
         payload: dict[str, Any] = {
             "room_id": state.room_id,
             "agent_id": speaker.id,
             "turn_id": turn_id,
             "status": "generating",
         }
+        self._live_turn_info[state.room_id] = {
+            "in_flight": True,
+            "agent_id": speaker.id,
+            "turn_id": turn_id,
+            "status": payload["status"],
+            "detail": None,
+            "accumulated_text": "",
+        }
+        if self._bus is None:
+            return
         try:
             publisher = self._publishers.get(speaker.id)
             if publisher is None:
@@ -1560,7 +1624,7 @@ class RoomOrchestrator:
         return speaker
 
     @staticmethod
-    def _render_span(state: RoomState, speaker: Participant) -> str:
+    def _render_span(state: RoomState, speaker: Participant, budget: int) -> str:
         """Render the transcript span `speaker` has not been shown, speakers named.
 
         Everything earlier already sits in that agent's own session, so re-sending it
@@ -1568,42 +1632,115 @@ class RoomOrchestrator:
         kinds of message are skipped: the speaker's own, which are already in its session
         as its own assistant turns and would be a duplicate and a misattribution at once;
         and those recording a failed turn, which carry no content, since an empty
-        utterance attributed to an agent is not something another agent can read. A third
-        is skipped for a different reason: a membership row is the *room's* prose about who
-        joined or left, and rendering it as `[critic]: critic joined the room` would hand
-        the speaker a sentence critic never said. An agent learns the roster from the
-        roster, not from a line it would read as a remark.
+        utterance attributed to an agent is not something another agent can read. Rows
+        that are not utterances are skipped for a different reason: a membership row is
+        the *room's* prose about who joined or left, and rendering it as
+        `[critic]: critic joined the room` would hand the speaker a sentence critic never
+        said; a note (`RoomMessageKind.NOTE`, the `/loop` help and status) is written for
+        the people reading the room and is not seat context (design doc
+        `llm-request-layering.md` §8 Q4). An agent learns the roster from the roster, not
+        from a line it would read as a remark.
 
-        **Bounded by `RoomPolicy.max_span_messages`, and the bound is announced.** Nothing
-        bounded this before, so an agent addressed for the first time in a long room was
-        handed the entire backlog — the per-turn cost grew with the room's length and could
-        outrun the model's context. When the span is longer than the ceiling the most
-        recent are kept, and the prompt says how many were dropped: the agent has never
-        seen them, so a silent trim would leave it answering from a gap it cannot know is
-        there.
+        **Bounded by `budget` estimated tokens, and the bound is announced** (#1641). See
+        `span_token_budget` for where the figure comes from. The newest lines are kept,
+        as a contiguous run back from the latest, so the span has no hole in its middle.
+        When lines are dropped the prompt says how many: the agent has never seen them, so
+        a silent trim would leave it answering from a gap it cannot know is there. That
+        notice is paid for out of the same budget (#1661).
+
+        The latest line is always present, because it is the message the turn answers,
+        but not always whole: a line over the budget on its own is cut to fit, with its
+        sender kept and the cut announced at its end (#1661). Kept whole, one pasted log
+        could still fill the seat's window. The one exception is a budget smaller than
+        the sender and the announcement themselves, which `span_token_budget` can give a
+        seat with a window under `SPAN_WINDOW_SHARE` tokens: those two are still sent.
         """
         last_seen = int(state.last_seen_seq.get(speaker.id, "0"))
-        # Membership rows and the speaker's own turns are not conversation *for this
-        # speaker*: the first is the room narrating itself, the second is already in its
-        # session as its own assistant turn. Both are excluded from the span and from the
-        # count of what was withheld — the notice speaks about the conversation it dropped.
+        # Rows that are not utterances and the speaker's own turns are not conversation
+        # *for this speaker*: the first is the room narrating itself, the second is already
+        # in its session as its own assistant turn. Both are excluded from the span and from
+        # the count of what was withheld -- the notice speaks about the conversation it
+        # dropped.
         owed = [
             m
             for m in state.transcript
             if m.seq > last_seen and m.is_utterance and m.sender_id != speaker.id
         ]
-        lines = [f"[{m.sender_id}]: {m.content}" for m in owed if m.content]
-        ceiling = state.policy.max_span_messages
-        shown = lines[-ceiling:] if len(lines) > ceiling else lines
+        said = [(f"[{m.sender_id}]: ", m.content) for m in owed if m.content]
+        lines = [prefix + content for prefix, content in said]
+
+        def run_back(allowance: int) -> int:
+            """How many lines, back from the latest, fit in `allowance`; at least one."""
+            kept = 0
+            spent = 0
+            for line in reversed(lines):
+                # One token for the newline that joins it to the next line.
+                cost = estimate_text_tokens(line) + 1
+                if kept and spent + cost > allowance:
+                    break
+                spent += cost
+                kept += 1
+            return kept
+
+        allowance = budget
+        kept = run_back(allowance)
+        if kept < len(owed):
+            # Lines are withheld, so the notice is sent, and it is paid for first. Costed
+            # at the count of every owed line, which is as many digits as it can need.
+            allowance = budget - (estimate_text_tokens(_withheld_notice(len(owed))) + 1)
+            kept = run_back(allowance)
+        shown = lines[len(lines) - kept :]
+        if shown and estimate_text_tokens(shown[-1]) + 1 > allowance:
+            # Only the latest line can be over the allowance: `run_back` stops before any
+            # other that would be.
+            shown[-1] = _cut_to_fit(*said[-1], allowance)
         # Counted against every owed utterance, not against what happened to render: a
         # failed turn carries no content, is filtered out of `lines`, and is still
         # something this speaker never saw. Counting only rendered lines understated the
         # gap, in a notice whose whole purpose is to state its size.
         withheld = len(owed) - len(shown)
         if withheld > 0:
-            plural = "s" if withheld != 1 else ""
-            shown = [
-                f"[...{withheld} earlier message{plural} in this room are not shown]",
-                *shown,
-            ]
+            shown = [_withheld_notice(withheld), *shown]
         return "\n".join(shown)
+
+
+def _withheld_notice(withheld: int) -> str:
+    """The line that opens a span when `withheld` earlier messages are not in it."""
+    plural = "s" if withheld != 1 else ""
+    return f"[...{withheld} earlier message{plural} in this room are not shown]"
+
+
+#: Ends a line `_cut_to_fit` shortened, so the seat knows the message goes on.
+_CUT_MARKER = "[...the rest of this message is not shown]"
+
+
+def _cut_to_fit(prefix: str, content: str, allowance: int) -> str:
+    """`prefix + content`, with `content` shortened so the line costs at most `allowance`.
+
+    The sender prefix and the marker are kept whatever the allowance, so the line still
+    says who wrote it and that it was cut. Cut on the UTF-8 bytes `estimate_text_tokens`
+    counts, and never inside a character.
+    """
+    frame = estimate_text_tokens(f"{prefix} {_CUT_MARKER}")
+    # One token for the newline, as `run_back` costs it; four bytes to a token.
+    room = max(0, (allowance - 1 - frame) * 4)
+    head = content.encode("utf-8")[:room].decode("utf-8", errors="ignore").rstrip()
+    return f"{prefix}{head} {_CUT_MARKER}" if head else f"{prefix}{_CUT_MARKER}"
+
+
+def span_token_budget(state: RoomState, agent: object) -> int:
+    """The estimated tokens a turn's span may take (#1641).
+
+    The smaller of the room's `RoomPolicy.max_span_tokens` and one `SPAN_WINDOW_SHARE`-th
+    of the seat's context window. The window is the one the seat's own compaction counts
+    against (`BaseAgent.context_window`), so a seat on a small local window is handed a
+    span it can hold beside its prefix and history. A seat that reports no window -- one
+    whose provider does not say, or an agent that is not a `BaseAgent` -- gets the
+    policy's ceiling alone.
+    """
+    ceiling = state.policy.max_span_tokens
+    read_window = getattr(agent, "context_window", None)
+    window = read_window() if callable(read_window) else None
+    if isinstance(window, int) and not isinstance(window, bool) and window > 0:
+        return max(1, min(ceiling, window // SPAN_WINDOW_SHARE))
+    return ceiling

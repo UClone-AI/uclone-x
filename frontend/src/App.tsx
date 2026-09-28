@@ -18,6 +18,7 @@ import {
   lastSeq,
   messageArrived,
   sendWasRefused,
+  restoreLiveFromActiveTurn,
   type RoomListing,
   type RoomLiveState,
   type RoomReadTicket,
@@ -34,17 +35,24 @@ import {
   useWindowWidth,
 } from './lib/rail';
 import { readDeveloperMode, storeDeveloperMode } from './lib/developerMode';
-import { SettingsModal } from './components/SettingsModal';
+import { SettingsModal, type SettingsTabId } from './components/SettingsModal';
 import { ArtifactLibrary } from './components/artifacts/ArtifactLibrary';
 import { artifactLibraryApi } from './lib/artifactLibrary';
 import { CoreFailure } from './lib/coreFailure';
 import { OpenInDocsContext, defaultSeat } from './lib/roomDock';
+import {
+  AvatarChoiceContext,
+  avatarUrlsOf,
+  personaOfSeat,
+  type AvatarChoice,
+  type AvatarUrls,
+} from './lib/avatarChoice';
 import { savePersona } from './lib/personasApi';
-import { PERSONA_EDITOR_COPY } from './lib/personaCopy';
+import { useCopy } from './i18n';
 import type { PersonaDraft, PersonaEditMode, PersonaSaveResult } from './lib/personaDraft';
 import {
   DockSurface,
-  AgentInfo,
+  CloneChoice,
   EventEnvelope,
   OntologyData,
   BudgetData,
@@ -57,36 +65,17 @@ import {
 } from './types';
 
 export function App() {
-  const [agents, setAgents] = useState<AgentInfo[]>([]);
+  const copy = useCopy();
   const [personas, setPersonas] = useState<PersonaInfo[]>([]);
   /**
-   * Clones available for room invites: prioritizes installed personas and falls back to
-   * runtime agents, matching the Rail's population logic (#1088).
+   * Clones available for room invites: the installed personas, the same list the rail shows
+   * (#1088). Live-instance state was overlaid from `/api/agents` until it was removed
+   * (2026-09-27, #1775).
    */
-  const availableClones = useMemo<AgentInfo[]>(() => {
-    if (personas.length > 0) {
-      const personaClones: AgentInfo[] = personas.map((p) => {
-        const live = agents.find((a) => a.id === p.name);
-        return {
-          id: p.name,
-          label: p.name,
-          role: p.role || 'Clone',
-          status: live?.status || 'idle',
-          tier: live?.tier || 'standard',
-          isolation_level: live?.isolation_level || 'shared',
-          capabilities: p.allowed_tools || [],
-          uptime_s: live?.uptime_s || 0,
-          current_task: live?.current_task || '',
-          parent_id: live?.parent_id || null,
-          subagents: live?.subagents || [],
-        };
-      });
-      const personaIds = new Set(personas.map((p) => p.name));
-      const extraAgents = agents.filter((a) => !personaIds.has(a.id));
-      return [...personaClones, ...extraAgents];
-    }
-    return agents;
-  }, [personas, agents]);
+  const availableClones = useMemo<CloneChoice[]>(
+    () => personas.map((p) => ({ id: p.name, label: p.name })),
+    [personas],
+  );
   const [cloneDockMode, setCloneDockMode] = useState<'view' | 'edit' | 'create'>('view');
   const [availableTools, setAvailableTools] = useState<string[]>([]);
   const [personasDir, setPersonasDir] = useState<string | null>(null);
@@ -161,6 +150,12 @@ export function App() {
   };
   const [isDockOpen, setIsDockOpen] = useState<boolean>(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState<boolean>(false);
+  // The tab a link opened Settings on; `undefined` keeps the tab the user last left it on.
+  const [settingsTab, setSettingsTab] = useState<SettingsTabId | undefined>(undefined);
+  const openSettings = (tab?: SettingsTabId): void => {
+    setSettingsTab(tab);
+    setIsSettingsOpen(true);
+  };
   // The Files screen (#1554): a user feature, so not behind developer mode.
   const [isFilesOpen, setIsFilesOpen] = useState<boolean>(false);
   const [activeDockSurface, setActiveDockSurface] = useState<DockSurface>('artifacts');
@@ -292,18 +287,17 @@ export function App() {
    *
    * Only non-empty drafts are kept: the composer reports a cleared box as `''`, and
    * storing that would grow the map by one dead key per conversation ever opened.
+   *
+   * A ref, not state. The composer holds what is on screen and writes every change here as it
+   * happens, so the map is always current for the switch it exists to survive -- but nothing
+   * here draws it, and as state each keystroke re-rendered this whole component: the rail,
+   * the header and every message in the transcript, which is what made typing slow down as a
+   * conversation grew. It is read once, when a conversation is opened.
    */
-  const [drafts, setDrafts] = useState<Readonly<Record<string, string>>>({});
+  const draftsRef = useRef<Record<string, string>>({});
   const rememberDraft = useCallback((roomId: string, next: string) => {
-    setDrafts((prev) => {
-      if ((prev[roomId] ?? '') === next) return prev;
-      if (next === '') {
-        if (!(roomId in prev)) return prev;
-        const { [roomId]: _gone, ...rest } = prev;
-        return rest;
-      }
-      return { ...prev, [roomId]: next };
-    });
+    if (next === '') delete draftsRef.current[roomId];
+    else draftsRef.current[roomId] = next;
   }, []);
   /**
    * `readRoomContext`, reachable from the event stream without being a dependency of it.
@@ -392,6 +386,9 @@ export function App() {
     (ticket: RoomReadTicket, next: RoomState) => {
       if (roomReadIsStale(ticket)) return;
       setRoom(next);
+      if (next.active_turn?.in_flight) {
+        setRoomLive((prev) => restoreLiveFromActiveTurn(prev, next.active_turn));
+      }
     },
     [roomReadIsStale],
   );
@@ -484,6 +481,9 @@ export function App() {
       if (roomGenerationRef.current !== generation) return;
       // Overtaken only by a read of this same room issued since, which lands in its place.
       if (!roomReadsRef.current.overtaken(ticket)) setRoom(next);
+      if (!roomReadsRef.current.overtaken(ticket) && next.active_turn?.in_flight) {
+        setRoomLive((prev) => restoreLiveFromActiveTurn(prev, next.active_turn));
+      }
       void readRoomContextRef.current(roomId);
     } catch (err) {
       if (roomGenerationRef.current !== generation) return;
@@ -647,7 +647,7 @@ export function App() {
    * looked.
    */
   const handleNewRoom = useCallback(
-    async (cloneId?: string, isGroup?: boolean) => {
+    async (cloneId?: string, isGroup?: boolean, openingDraft?: string) => {
       // No prompt (F1). The Core refuses a blank title, so the conversation opens under
       // `NEW_CONVERSATION_TITLE` and its first message names it -- see `seededTitle`. A
       // native `window.prompt` used to stand here, gating the first thing a new user does
@@ -667,6 +667,8 @@ export function App() {
           });
         }
         if (cloneId) setSelectedAgent(cloneId);
+        // Waiting in the box when it opens, unsent -- the profile's "Ask … to make one".
+        if (openingDraft) rememberDraft(created.room_id, openingDraft);
         await fetchRooms();
         await openRoom(created.room_id);
       } catch (err) {
@@ -681,7 +683,7 @@ export function App() {
         createInFlightRef.current = false;
       }
     },
-    [fetchRooms, openRoom, selectedAgent],
+    [fetchRooms, openRoom, rememberDraft, selectedAgent],
   );
 
   /**
@@ -858,10 +860,9 @@ export function App() {
     try {
       // Skills, ACP status and evaluations are not read here any more: their sections in
       // Settings read their own routes when shown (#1358).
-      const [healthRes, agentsRes, personasRes, ontologyRes, budgetRes, modelsRes] =
+      const [healthRes, personasRes, ontologyRes, budgetRes, modelsRes] =
         await Promise.all([
           fetch('/api/health'),
-          fetch('/api/agents'),
           fetch('/api/personas'),
           fetch('/api/ontology'),
           fetch('/api/budget'),
@@ -875,16 +876,8 @@ export function App() {
           setGitCommit(hData.git_commit);
         }
       }
-      // The first name the server offers, if we are not already on one. The composer
-      // lists personas first and falls back to agents, so the name adopted here is the
-      // one its dropdown will show as selected.
+      // The first persona the server offers, if we are not already on one.
       let firstNamed: string | null = null;
-      if (agentsRes.ok) {
-        const aData = await agentsRes.json();
-        const loaded: AgentInfo[] = aData.agents || [];
-        setAgents(loaded);
-        if (loaded.length > 0) firstNamed = loaded[0].id;
-      }
       if (personasRes.ok) {
         const pData = await personasRes.json();
         const loaded: PersonaInfo[] = pData.personas || [];
@@ -958,6 +951,50 @@ export function App() {
     return () => clearInterval(interval);
   }, [fetchAllMetadata]);
 
+  /**
+   * Each clone's picture address, as the listing last gave it. Keyed by its contents, so a
+   * poll that changes nothing hands the transcript the same object and its rows' memo holds.
+   */
+  const avatarUrlsKey = JSON.stringify(avatarUrlsOf(personas));
+  const avatarUrls = useMemo<AvatarUrls>(() => JSON.parse(avatarUrlsKey) as AvatarUrls, [avatarUrlsKey]);
+  /**
+   * A request for pictures put in the open conversation's box, from the profile's menu. It
+   * names its conversation and reaches the composer only there, so opening another one does
+   * not carry the request into it.
+   */
+  const [insertDraft, setInsertDraft] = useState<{ id: number; text: string; roomId: string } | null>(null);
+  // Spent once another conversation is opened: the composer remounts on return, and would
+  // otherwise add the same request to a box that already holds it.
+  useEffect(() => setInsertDraft(null), [currentRoomId]);
+  const currentIsGroup = currentRoomId !== null && groupRoomIds.includes(currentRoomId);
+  const openCloneName = room && seatedCloneId && !currentIsGroup ? personaOfSeat(room, seatedCloneId) : null;
+  const askText = copy.avatar.askText;
+  /**
+   * What every place that changes a clone's picture is handed.
+   *
+   * After a change, the listing is read again at once rather than on the next poll, so the
+   * rail, the transcript and the profile show the new picture together. Asking a clone for
+   * pictures puts the request in the box of the conversation with it -- the open one when
+   * that is the clone's own, a new one otherwise -- and never sends it.
+   */
+  const avatarChoice = useMemo<AvatarChoice>(
+    () => ({
+      clones: personas.map((p) => ({ name: p.name, label: p.name })),
+      onChanged: () => void fetchAllMetadata(),
+      askFor: (name: string) => {
+        setCloneStudioRequested(false);
+        if (openCloneName === name && currentRoomId !== null) {
+          setInsertDraft({ id: Date.now(), text: askText, roomId: currentRoomId });
+          return;
+        }
+        closeOverlaidRail();
+        void handleNewRoom(name, false, askText);
+      },
+    }),
+    // `closeOverlaidRail` is re-made every render and reads only `railIsOverlaid`.
+    [personas, fetchAllMetadata, openCloneName, currentRoomId, askText, handleNewRoom, railIsOverlaid],
+  );
+
   useEffect(() => {
     void fetchRooms();
   }, [fetchRooms]);
@@ -974,7 +1011,7 @@ export function App() {
    * its first message renames (F1, the same path the rail's New takes).
    *
    * Both lists are waited for. Firing before `/api/rooms` answers would start a second
-   * conversation beside the one the server already has; firing before `/api/agents`
+   * conversation beside the one the server already has; firing before `/api/personas`
    * does would seat it with nobody, since `handleNewRoom` reads `selectedAgent`.
    *
    * The latch is a ref, not a "done once" flag: deleting the open conversation calls
@@ -1087,34 +1124,18 @@ export function App() {
   }, [refreshRoom]);
 
   /**
-   * Picking a clone in the rail opens or starts a conversation with that clone.
+   * Picking a clone in the rail selects it; the rail decides which conversation that opens.
    *
-   * UClone2 parity (Option 2): clicking a clone row opens its most recently updated
-   * conversation if it has one, or creates a new conversation seating that clone if
-   * none exists yet.
+   * Every rail call site pairs `onSelectAgent` with the room it means -- the clone's latest
+   * 1:1 session, a new one, or the session row clicked -- so this only records the choice.
+   * It used to also open the most recent room *containing* the clone, group chats included,
+   * which raced the rail's own `onSelectRoom`: clicking a clone landed in a group chat it sat
+   * in, and a clone with no session started two conversations.
    */
-  const handleSelectAgent = useCallback(
-    async (agentId: string) => {
-      setSelectedAgent(agentId);
-      setPreferredClone(agentId);
-
-      const cloneRooms = rooms
-        .filter((r) => r.agent_ids.includes(agentId))
-        .sort((a, b) => (a.updated_at < b.updated_at ? 1 : a.updated_at > b.updated_at ? -1 : 0));
-
-      if (cloneRooms.length > 0) {
-        if (currentRoomId !== cloneRooms[0].room_id) {
-          await openRoom(cloneRooms[0].room_id);
-        }
-      } else {
-        await handleNewRoom(agentId);
-      }
-      if (railIsOverlaid) {
-        closeOverlaidRail();
-      }
-    },
-    [closeOverlaidRail, currentRoomId, handleNewRoom, openRoom, railIsOverlaid, rooms],
-  );
+  const handleSelectAgent = useCallback((agentId: string) => {
+    setSelectedAgent(agentId);
+    setPreferredClone(agentId);
+  }, []);
 
   /**
    * Inspecting a clone from the rail's inspect button opens the dock on that clone.
@@ -1148,7 +1169,7 @@ export function App() {
 
   const handleSavePersona = useCallback(
     async (draft: PersonaDraft, mode: PersonaEditMode): Promise<PersonaSaveResult> => {
-      const result = await savePersona(draft, mode, PERSONA_EDITOR_COPY);
+      const result = await savePersona(draft, mode, copy.personaEditor);
       if (result.ok) {
         await fetchAllMetadata();
         setSelectedAgent(result.persona.name);
@@ -1156,7 +1177,7 @@ export function App() {
       }
       return result;
     },
-    [fetchAllMetadata],
+    [fetchAllMetadata, copy],
   );
 
   // The step, turn and token readings the dock's Resource surface shows are not derived
@@ -1177,6 +1198,7 @@ export function App() {
 
   return (
     <OpenInDocsContext.Provider value={openInDocs}>
+    <AvatarChoiceContext.Provider value={avatarChoice}>
     <div className="h-screen overflow-hidden bg-slate-950 text-slate-100 flex flex-col font-sans selection:bg-cyan-500 selection:text-black">
       {/* Top Application Header */}
       <Header
@@ -1189,7 +1211,7 @@ export function App() {
         onToggleSidebar={() => chooseSidebarOpen(!isSidebarOpen)}
         isDockOpen={isDockOpen}
         onToggleDock={() => setIsDockOpen(!isDockOpen)}
-        onOpenSettings={() => setIsSettingsOpen(true)}
+        onOpenSettings={() => openSettings()}
         onOpenFiles={() => setIsFilesOpen(true)}
       />
 
@@ -1198,12 +1220,9 @@ export function App() {
       <div className="flex-1 flex min-h-0 h-full overflow-hidden relative">
         {isSidebarOpen && (
           <WorkspaceSidebar
-            agents={agents}
             personas={personas}
             selectedAgent={selectedAgent}
-            onSelectAgent={(agentId) => {
-              void handleSelectAgent(agentId);
-            }}
+            onSelectAgent={handleSelectAgent}
             onInspectAgent={handleInspectAgent}
             onEditAgent={handleEditAgent}
             onNewClone={handleNewClone}
@@ -1278,11 +1297,14 @@ export function App() {
           {room && currentRoomId ? (
             <RoomConversation
               room={room}
+              onOpenSettings={() => openSettings('usage')}
               availableAgents={availableClones}
               live={roomLive}
               // Owned here so it outlives the composer, which `openRoom` unmounts (#1290).
-              draft={drafts[currentRoomId] ?? ''}
+              draft={draftsRef.current[currentRoomId] ?? ''}
               onDraftChange={(next) => rememberDraft(currentRoomId, next)}
+              insertDraft={insertDraft?.roomId === currentRoomId ? insertDraft : null}
+              avatarUrls={avatarUrls}
               onSend={async (content) => {
                 // Rethrown on purpose: the composer keeps the draft when this rejects.
                 const generation = roomGenerationRef.current;
@@ -1458,9 +1480,6 @@ export function App() {
             cloneMode={cloneDockMode}
             onCloneModeChange={setCloneDockMode}
             availableTools={availableTools}
-            cloneToolsNeedingConversation={
-              agents.find((a) => a.id === selectedAgent)?.capabilities_needing_room
-            }
             availableModels={availableModels}
             canWritePersonas={personasDir !== null}
             onSavePersona={handleSavePersona}
@@ -1485,8 +1504,10 @@ export function App() {
         onSettingsSaved={() => fetchAllMetadata()}
         developerMode={developerMode}
         onDeveloperModeChange={changeDeveloperMode}
+        initialTab={settingsTab}
       />
     </div>
+    </AvatarChoiceContext.Provider>
     </OpenInDocsContext.Provider>
   );
 }

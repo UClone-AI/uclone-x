@@ -107,7 +107,7 @@ class TestTheBaseSet:
     def test_each_name_is_the_name_a_tool_class_registers_under(self) -> None:
         """The set is spelled as names, so a renamed tool would leave a dead entry.
 
-        Killed by: src/uclone_x/agent/models.py :: "query_memory_facts",
+        Killed by: src/uclone_x/core/models.py :: "query_memory_facts",
         Becomes: "query_memory_fact",
         """
         assert set(BASE_PERSONA_TOOLS) == {cls.name for cls in _BASE_CLASSES}
@@ -138,7 +138,7 @@ class TestTheBaseSet:
 
 class TestGrantedTools:
     def test_a_personas_own_list_is_kept_and_the_base_follows_once(self) -> None:
-        """Killed by: src/uclone_x/agent/models.py :: return own + tuple(name for name in BASE_PERSONA_TOOLS if name not in own)
+        """Killed by: src/uclone_x/core/models.py :: return own + tuple(name for name in BASE_PERSONA_TOOLS if name not in own)
         Becomes: return own
         """
         persona = PersonaDefinition(
@@ -157,7 +157,7 @@ class TestGrantedTools:
     def test_a_persona_with_no_list_stays_unrestricted(self) -> None:
         """An empty list is every tool; the base set added to it would be a restriction.
 
-        Killed by: src/uclone_x/agent/models.py :: if not self.allowed_tools:
+        Killed by: src/uclone_x/core/models.py :: if not self.allowed_tools:
         Becomes: if False:
         """
         persona = PersonaDefinition(name="p", role="r", system_prompt="s")
@@ -215,7 +215,7 @@ class TestEveryWayToTakeOnAPersona:
     async def test_a_room_seat_is_offered_the_memory_tools(self, name: str, tmp_path: Path) -> None:
         """A seat's scope carries the base, and its request offers the memory tools.
 
-        Killed by: src/uclone_x/agent/models.py :: return own + tuple(name for name in BASE_PERSONA_TOOLS if name not in own)
+        Killed by: src/uclone_x/core/models.py :: return own + tuple(name for name in BASE_PERSONA_TOOLS if name not in own)
         Becomes: return own
         """
         llm = _RecordingConnector()
@@ -335,8 +335,8 @@ class TestTheWorkspaceSectionFollowsARegisteredFileTool:
         return agent
 
     def test_no_section_when_no_file_tool_is_registered(self, tmp_path: Path) -> None:
-        """Killed by: src/uclone_x/agent/base.py :: name in _FILE_TOOL_NAMES and self._tools is not None and self._tools.get(name)
-        Becomes: name in _FILE_TOOL_NAMES
+        """Killed by: src/uclone_x/agent/prompt_assembler.py :: name in FILE_TOOL_NAMES and self._tools is not None and self._tools.get(name)
+        Becomes: name in FILE_TOOL_NAMES
         """
         agent = self._agent(tmp_path, ToolRegistry())
         assert "file_read" in agent.config.allowed_tools

@@ -1,0 +1,117 @@
+{
+  "tabs": {
+    "clone": "Clone",
+    "turn": "Turn",
+    "artifacts": "Docs & Artifacts",
+    "remembers": "Remembers",
+    "activity": "Activity & Tools",
+    "resource": "Resource"
+  },
+  "chrome": {
+    "resize": "Drag to resize workspace dock",
+    "close": "Close workspace dock",
+    "showing": "Showing"
+  },
+  "remembers": {
+    "title": "What {name} remembers",
+    "theClone": "the clone",
+    "thisClone": "This clone",
+    "loading": "Reading what {name} remembers…",
+    "noRoom": "No conversation is open. Open one from the rail to see what its clones remember.",
+    "noSeat": "No clone is seated in this conversation yet, so there is nobody to ask.",
+    "readFailed": "What {name} remembers could not be read.",
+    "savedNotListed": "{name}'s saved facts are not listed.",
+    "noneKnown": "No remembered statements are listed for {name}.",
+    "savedHeading": "Saved to memory",
+    "savedHere": "saved in this conversation",
+    "knownHeading": "Known in this conversation",
+    "workedOutTitle": "Worked out from other things it knew, rather than told",
+    "workedOut": "worked out"
+  },
+  "activity": {
+    "readFailed": "{name}'s activity could not be read.",
+    "thisClone": "This clone",
+    "theClone": "the clone",
+    "noRoom": "No conversation is open. Open one from the rail to see what its clones did.",
+    "noSeat": "No clone is seated in this conversation, so there is no clone to show activity for.",
+    "loading": "Reading {name}'s activity…",
+    "noTurns": "No turns by {name} are listed in this conversation.",
+    "noneRecorded": "None of {name}'s turns here recorded which tools they used.",
+    "noCalls": {
+      "one": "No tool calls are listed for {name}'s {count} recorded turn here.",
+      "other": "No tool calls are listed for {name}'s {count} recorded turns here."
+    },
+    "heading": "Tool calls by {name}",
+    "listed": "{count} listed",
+    "subtitle": "The tool calls recorded in this conversation, with what went in, what came out, and how long each took",
+    "search": "Search actions, files, args...",
+    "category": {
+      "all": "All",
+      "mutation": "Mutations",
+      "command": "Commands",
+      "web": "Web",
+      "inspection": "Inspection"
+    },
+    "status": {
+      "all": "All Status",
+      "success": "Passed",
+      "error": "Errors"
+    },
+    "notRecorded": {
+      "one": "{count} turn did not record which tools it used in full, so its calls may not all be listed here.",
+      "other": "{count} turns did not record which tools they used in full, so their calls may not all be listed here."
+    },
+    "hiddenByFilters": {
+      "one": "Nothing matches these filters; {count} call is hidden by them.",
+      "other": "Nothing matches these filters; {count} calls are hidden by them."
+    },
+    "pass": "Pass",
+    "running": "Running",
+    "stopped": "Stopped",
+    "error": "Error",
+    "wrote": "Wrote {path}",
+    "openInDocs": "Open in Docs",
+    "wroteUnnamed": "May have written to a file without naming it, so nothing can be opened from here.",
+    "helper": "Started a helper agent ({id})",
+    "executionTime": "Execution Time",
+    "stillRunning": "still running",
+    "notTimed": "not timed",
+    "copyTraceTitle": "Copy the whole record of this call as JSON",
+    "copyTrace": "Copy trace",
+    "inputParameters": "Input Parameters",
+    "copyJson": "Copy JSON",
+    "outputPayload": "Output Payload",
+    "truncated": "This output was cut to fit; the clone received all of it.",
+    "errorTrace": "Execution Error Trace"
+  },
+  "docs": {
+    "filesReadFailed": "This conversation's files could not be listed.",
+    "fileReadFailed": "This file could not be shown.",
+    "noRoom": "No conversation is open. Open one from the rail to see the files it wrote.",
+    "noneListed": "No files are listed yet. {scope}",
+    "noFilesOption": "(No files listed)",
+    "openedFrom": "{name} (opened from the conversation)",
+    "refresh": "Read this conversation's files again",
+    "renderTitle": "Render markdown",
+    "rawTitle": "Show raw source",
+    "rendered": "Rendered",
+    "raw": "Raw",
+    "copyTitle": "Copy markdown text",
+    "writtenTimes": " · written {count} times",
+    "mayBeMissing": "It may also be missing files because:",
+    "turnRunning": "A turn is still running; the files it saves are listed when it finishes.",
+    "noLongerOnDisk": "This file was written in this conversation but is no longer on disk, so there is nothing to show. It may have been moved or deleted after it was written.",
+    "loadingContent": "Loading document content...",
+    "readingFiles": "Reading this conversation's files…",
+    "pickFile": "Pick a file above to read it.",
+    "openOriginal": "Open original in new tab",
+    "generationDetails": "Generation Details",
+    "seed": "Seed",
+    "prompt": "Prompt",
+    "negativePrompt": "Negative Prompt",
+    "style": "Style",
+    "aspect": "Aspect",
+    "size": "Size",
+    "time": "Time"
+  }
+}

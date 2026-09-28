@@ -1,3 +1,6 @@
+import { en, type Messages } from '../i18n/en';
+import { fmt } from '../i18n/format';
+
 export type ActivityCategory = 'mutation' | 'command' | 'web' | 'inspection' | 'tool';
 
 export interface ToolClassification {
@@ -8,7 +11,9 @@ export interface ToolClassification {
 
 export const classifyTool = (
   toolName: string,
-  args?: Record<string, unknown>
+  args?: Record<string, unknown>,
+  /** The step names, in the reader's language. English unless a surface passes its own. */
+  copy: Messages['toolSteps'] = en.toolSteps,
 ): ToolClassification => {
   const name = (toolName || '').toLowerCase();
 
@@ -33,8 +38,10 @@ export const classifyTool = (
     const basename = target ? target.split('/').pop() : '';
     return {
       category: 'mutation',
-      label: 'File Mutation',
-      summaryTitle: target ? `File Mutation: ${basename || target}` : `File Mutation (${toolName})`,
+      label: copy.mutation.label,
+      summaryTitle: target
+        ? fmt(copy.mutation.on, { target: basename || target })
+        : fmt(copy.mutation.bare, { tool: toolName }),
     };
   }
 
@@ -55,8 +62,10 @@ export const classifyTool = (
     const shortCmd = cmd.length > 50 ? `${cmd.substring(0, 47)}...` : cmd;
     return {
       category: 'command',
-      label: 'Command',
-      summaryTitle: cmd ? `Command: ${shortCmd}` : `Command Execution (${toolName})`,
+      label: copy.command.label,
+      summaryTitle: cmd
+        ? fmt(copy.command.on, { target: shortCmd })
+        : fmt(copy.command.bare, { tool: toolName }),
     };
   }
 
@@ -77,8 +86,10 @@ export const classifyTool = (
     const shortQuery = query.length > 50 ? `${query.substring(0, 47)}...` : query;
     return {
       category: 'web',
-      label: 'Web Retrieval',
-      summaryTitle: query ? `Web Retrieval: ${shortQuery}` : `Web Retrieval (${toolName})`,
+      label: copy.web.label,
+      summaryTitle: query
+        ? fmt(copy.web.on, { target: shortQuery })
+        : fmt(copy.web.bare, { tool: toolName }),
     };
   }
 
@@ -104,15 +115,17 @@ export const classifyTool = (
     const basename = target ? target.split('/').pop() : '';
     return {
       category: 'inspection',
-      label: 'Inspection',
-      summaryTitle: target ? `Inspection: ${basename || target}` : `Inspection (${toolName})`,
+      label: copy.inspection.label,
+      summaryTitle: target
+        ? fmt(copy.inspection.on, { target: basename || target })
+        : fmt(copy.inspection.bare, { tool: toolName }),
     };
   }
 
   return {
     category: 'tool',
-    label: 'Tool Call',
-    summaryTitle: `Tool Call: ${toolName || 'Unknown Tool'}`,
+    label: copy.tool.label,
+    summaryTitle: fmt(copy.tool.on, { tool: toolName || copy.tool.unknown }),
   };
 };
 

@@ -33,6 +33,7 @@ from uclone_x.llm.connectors.vllm import (
     VLLM_MODEL_ENV_VAR,
 )
 from uclone_x.shells.ui_process import DASHBOARD_STATE_DIR_ENV_VAR, UI_BIND_HOST_ENV_VAR
+from uclone_x.skills.approvals import APPROVALS_DIR_ENV_VAR
 from uclone_x.tools.builtin import mcp_loader
 
 # Collection-time isolation: ensure UCLONE_SESSION_DIR is established immediately
@@ -133,7 +134,9 @@ else:
 # Both variables are carried, not just the session one: an agent home is created by the
 # same kind of incidental composition a session is, and a child handed a sanitized env
 # would write into the invoking developer's `~/.uclone/agents`.
-_ISOLATED_CHILD_ENV_VARS = (SESSION_STORAGE_DIR_ENV_VAR, AGENTS_DIR_ENV_VAR)
+# The skill approvals ledger (#1720) is carried for the same reason: `ucx skill approve` in a
+# child writes a pin, and left at the default that pin lands in the developer's own ledger.
+_ISOLATED_CHILD_ENV_VARS = (SESSION_STORAGE_DIR_ENV_VAR, AGENTS_DIR_ENV_VAR, APPROVALS_DIR_ENV_VAR)
 
 
 def _carry_isolated_dirs_into_child_env(kwargs: dict[str, Any]) -> None:
@@ -379,6 +382,21 @@ def _isolate_agent_homes(  # pyright: ignore[reportUnusedFunction]
         yield root
 
     homes.assert_no_leaks()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_skill_approvals(  # pyright: ignore[reportUnusedFunction]
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> Path:
+    """Point every test's skill approvals ledger at a temporary folder (#1720).
+
+    `ucx skill approve` writes a pin, and loading a skill reads them. Left at the default,
+    a test would pin skills in the developer's own `~/.uclone/skills/approvals.json`, and
+    a skill the developer approved would load in a test that expects it refused.
+    """
+    folder = tmp_path_factory.mktemp("skill-approvals")
+    monkeypatch.setenv(APPROVALS_DIR_ENV_VAR, str(folder))
+    return folder
 
 
 @pytest.fixture(autouse=True)

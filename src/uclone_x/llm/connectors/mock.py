@@ -7,7 +7,7 @@ from collections.abc import AsyncIterator, Sequence
 
 from uclone_x.core.provenance import ExecutionPath, Provenance, ServiceRef
 from uclone_x.llm.compactor import estimate_reply_tokens, estimate_request_tokens
-from uclone_x.llm.connectors.base import BaseLLMConnector
+from uclone_x.llm.connectors.base import BaseLLMConnector, refuse_response_schema
 from uclone_x.llm.models import (
     FinishReason,
     LLMRequest,
@@ -34,6 +34,7 @@ class MockLLMConnector(BaseLLMConnector):
         latency_seconds: float = 0.0,
         streaming_chunk_delay: float = 0.0,
         timeout: float = 60.0,
+        model: str | None = None,
     ) -> None:
         # Accepted and recorded although nothing here waits on a socket, so that
         # `create_llm_connector(provider=..., timeout=...)` means the same thing for every
@@ -46,9 +47,15 @@ class MockLLMConnector(BaseLLMConnector):
         self._default_response = default_response
         self._tool_calls: list[ToolCallRequest] = list(tool_calls) if tool_calls is not None else []
         self._call_count: int = 0
-        self._default_model = default_model
+        # `model` is the name every connector takes for its configured model, so the factory
+        # can hand one to the mock as to any other; `default_model` is the older spelling.
+        self._default_model = model.strip() if model and model.strip() else default_model
         self.latency_seconds: float = max(0.0, latency_seconds)
         self.streaming_chunk_delay: float = max(0.0, streaming_chunk_delay)
+
+    @property
+    def paid(self) -> bool:
+        return False
 
     @property
     def provider_name(self) -> str:
@@ -59,6 +66,9 @@ class MockLLMConnector(BaseLLMConnector):
         return self._call_count
 
     async def generate(self, request: LLMRequest) -> ModelResponse:
+        # Canned replies are not constrained to anything, so a structured request is
+        # refused rather than answered with text that ignores its schema (P6).
+        refuse_response_schema(request, self.provider_name)
         if self.latency_seconds > 0:
             await asyncio.sleep(self.latency_seconds)
         self._call_count += 1

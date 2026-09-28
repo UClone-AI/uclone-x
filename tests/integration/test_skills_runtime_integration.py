@@ -20,13 +20,13 @@ from uclone_x.llm.models import (
     TokenUsage,
     ToolCallRequest,
 )
+from uclone_x.skills.approvals import SkillApprovalLedger, SkillPin
 from uclone_x.skills.auditor import (
-    SkillAuditor,
     SkillRegistry,
+    compute_skill_sha256,
     save_skill,
 )
 from uclone_x.skills.models import (
-    AutoApprovalPolicy,
     SkillManifest,
     SkillOrigin,
     SkillStatus,
@@ -160,21 +160,18 @@ async def test_skills_runtime_integration_approval_changes_agent_prompt(
         assert "[Available Approved Skills]" not in turn1_prompt
         assert res1.active_skills == ()
 
-        # Step 3: Approve 'code_refactor' via auditor
-        auditor = SkillAuditor(policy=AutoApprovalPolicy.SAFE_ONLY)
-        report = await auditor.audit_skill(skills_dir / "code_refactor")
+        # Step 3: Approve 'code_refactor' as `ucx skill approve` does: mark it active, then
+        # pin the digest of what is on disk in the approvals ledger (#1720).
         approved_manifest = pending_manifest.model_copy(
-            update={
-                "status": SkillStatus.ACTIVE,
-                "approved_by": "sec_auditor:l2_test",
-                "content_sha256": report.content_sha256,
-            }
+            update={"status": SkillStatus.ACTIVE, "approved_by": "sec_auditor:l2_test"}
         )
         save_skill(
             skills_dir / "code_refactor",
             approved_manifest,
             "# Refactoring Instructions\nExtract small pure functions.",
         )
+        digest = compute_skill_sha256(skills_dir / "code_refactor")
+        SkillApprovalLedger().pin("code_refactor", SkillPin(digest, "sec_auditor:l2_test", "t0"))
 
         # Hot-reload into agent
         reloaded = await agent.reload_skills()

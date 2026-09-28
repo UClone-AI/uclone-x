@@ -6,7 +6,6 @@ import httpx
 import pytest
 
 import uclone_x
-from uclone_x.cli.commands.run import run_agent_repl_async
 from uclone_x.errors import TelemetryExportError
 from uclone_x.telemetry import (
     CompositeTelemetryExporter,
@@ -518,17 +517,6 @@ def test_create_telemetry_exporter_factory(monkeypatch: pytest.MonkeyPatch) -> N
 # ======================================================================================
 # 4. CLI REPL Integration Tests (run.py)
 # ======================================================================================
-
-
-@pytest.mark.asyncio
-async def test_run_agent_repl_single_shot_emits_telemetry_trace() -> None:
-    """Verify ./ucx run single-shot prompt execution records agent.run trace span."""
-    # Run single-shot turn
-    await run_agent_repl_async(
-        agent_name="test_agent",
-        provider="mock",
-        prompt="Hello UClone-X!",
-    )
 
 
 def test_otlp_span_export_reports_package_version(monkeypatch: pytest.MonkeyPatch) -> None:

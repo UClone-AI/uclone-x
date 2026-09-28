@@ -2,28 +2,15 @@
  * Shared test fixtures.
  *
  * These build *complete* objects and take a `Partial` override, rather than casting a
- * two-field literal with `as AgentInfo`. The cast compiles until the interface grows a
+ * two-field literal with `as PersonaInfo`. The cast compiles until the interface grows a
  * required field, at which point every test that used it is silently exercising a shape
  * the app never sees — `tsc` rejected exactly that when these tests were first written.
  */
-import type { AgentInfo, ChatMessage, PersonaInfo, SessionSummary } from '../types';
+import type { ChatMessage, CloneChoice, PersonaInfo, SessionSummary } from '../types';
 
-export const makeAgentInfo = (over: Partial<AgentInfo> = {}): AgentInfo => ({
+export const makeCloneChoice = (over: Partial<CloneChoice> = {}): CloneChoice => ({
   id: 'agent-1',
   label: 'agent-1',
-  role: 'orchestrator',
-  // `AgentState.IDLE`, as `/api/agents` sends it -- `list_agents` puts `ag.state.value` in
-  // this field, and that enum (`src/uclone_x/agent/models.py`) has no `healthy`. The default
-  // used to be exactly that: a value the endpoint has never sent, which is the shape this
-  // file's own docstring exists to prevent.
-  status: 'IDLE',
-  tier: 'champion',
-  isolation_level: 'workspace',
-  capabilities: [],
-  uptime_s: 0,
-  current_task: '',
-  parent_id: null,
-  subagents: [],
   ...over,
 });
 

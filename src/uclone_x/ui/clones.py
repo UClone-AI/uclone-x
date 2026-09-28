@@ -1,16 +1,16 @@
 """The head's clone surface: `GET /api/clones`.
 
 **Why this exists.** Nothing enumerated the clones that are *installed*. `GET /api/agents`
-returns `session_mgr.list_agents(...)`, which is live instances: on an install where
+returned `session_mgr.list_agents(...)`, which is live instances: on an install where
 nothing has been spawned it is empty, and that is exactly the first screen a new user
-sees. The clones themselves are directories under the agents root, and by P8 a second
+sees. (2026-09-27: `/api/agents` removed, #1775.) The clones themselves are directories under the agents root, and by P8 a second
 head attached to the same Core would need the same enumeration -- so the Core owns it
 (`uclone_x.core.agent_home.list_agent_homes`) and no head walks that directory itself.
 
 **Why `clone` here and `AgentHome` there.** Design §3.1.1 puts the boundary between the
 two vocabularies at the wire: what crosses `/api/` is the product's word, what lives
-inside the Core keeps the Core's. So `AgentInfo`, `AgentHome` and `agent_id` are unchanged
-and this module says `clone`. It renames what is read, not what is typed.
+inside the Core keeps the Core's. So `AgentHome` and `agent_id` are unchanged
+and this module says `clone` (`AgentInfo` went with `/api/agents`, 2026-09-27, #1775). It renames what is read, not what is typed.
 
 **The open question this module decides (design §6.9).**
 

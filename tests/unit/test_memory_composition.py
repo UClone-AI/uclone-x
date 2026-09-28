@@ -171,7 +171,7 @@ def test_two_agents_sharing_one_registry_keep_their_own_memories(tmp_path: Path)
     duplicate and both agents execute the first agent's instance — the critic records into
     the champion's file, and nothing in either agent reports an error.
 
-    Killed by: src/uclone_x/agent/base.py :: local = self._agent_local_tools.get(name)
+    Killed by: src/uclone_x/agent/tool_invoker.py :: local = self._agent_local_tools.get(name)
     Becomes: local = None
     """
     registry = ToolRegistry()
@@ -215,7 +215,7 @@ def test_an_agent_without_memory_cannot_reach_another_agents_store(tmp_path: Pat
     `success`. An agent given no memory has no memory: the call has to fail, and the tool
     must not be advertised to it either.
 
-    Killed by: src/uclone_x/agent/base.py :: if isinstance(candidate, AGENT_BOUND_TOOL_TYPES):
+    Killed by: src/uclone_x/agent/tool_invoker.py :: if isinstance(candidate, self._agent_bound_types):
     Becomes: if False:
     """
     registry = ToolRegistry()
@@ -259,7 +259,7 @@ def test_a_memory_tool_is_advertised_only_to_the_agent_it_belongs_to(tmp_path: P
     in the list, a memoryless agent is told it can record facts and is refused when it
     tries — the model's next move is to report the task impossible for the wrong reason.
 
-    Killed by: src/uclone_x/agent/base.py :: if isinstance(t, AGENT_BOUND_TOOL_TYPES) and t.name not in self._agent_local_tools:
+    Killed by: src/uclone_x/agent/tool_invoker.py :: if isinstance(t, self._agent_bound_types) and t.name not in self._agent_local_tools:
     Becomes: if False and t.name not in self._agent_local_tools:
     """
     registry = ToolRegistry()
@@ -317,7 +317,7 @@ def test_a_shared_tool_that_merely_shares_the_name_still_resolves() -> None:
     registered, working tool is not registered, which is the same false report the guard
     exists to prevent, pointed the other way (P6).
 
-    Killed by: src/uclone_x/agent/base.py :: if isinstance(candidate, AGENT_BOUND_TOOL_TYPES):
+    Killed by: src/uclone_x/agent/tool_invoker.py :: if isinstance(candidate, self._agent_bound_types):
     Becomes: if candidate is not None and candidate.name.endswith("memory_facts"):
     """
     registry = ToolRegistry()

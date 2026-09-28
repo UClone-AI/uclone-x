@@ -90,7 +90,7 @@ Ordered by what an attacker gains, not by how the code is laid out.
 | A1 | **The developer's machine** | Arbitrary code execution as the developer. Persistence via shell profiles, git hooks (`./ucx setup` already writes `.git/hooks/pre-commit`), launch agents. | Host OS |
 | A2 | **Source code and the working tree** | The product being built; also destructive edits and history rewrites. | `cwd`, git worktrees |
 | A3 | **Credentials** | Direct monetary and lateral value. `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `OPENAI_API_KEY`, `LANGFUSE_SECRET_KEY` (see `.env.example`); and, by inheritance, everything else in the developer's environment and home directory — SSH keys, `~/.aws`, `~/.config/gh`, git credential helpers, cloud CLI tokens. | Process environment, `~` |
-| A4 | **The skill store** | Executable code that the framework loads and runs, by design, in every future session. The highest-value persistence target in the system. | `ucx-agent-skills/` (empty today, and held that way by `tests/fitness/test_runtime_skill_store_membership.py`, which fails on any package nobody declared — the premise is checked rather than observed) |
+| A4 | **The skill store** | Executable code that the framework loads and runs, by design, in every future session. The highest-value persistence target in the system. | `ucx-agent-skills/`, loaded into the agents' skill registry when the web app or a CLI head starts. It holds six approved prose skills with no scripts (`avatar`, `character-consistency`, `media-architecture`, `media-character`, `media-engineering`, `remote_gpu_recovery`) and nothing else, held that way by `tests/fitness/test_runtime_skill_store_membership.py`, which fails on any package nobody declared — the premise is checked rather than observed. Each is pinned to its digest in `src/uclone_x/skills/shipped_pins.py` and is not loaded once its bytes differ (T2's update). The open-source release ships the store empty, so there it holds only what its user approves |
 | A5 | **The ontology store** | The assertions the agent validates its own actions against. Poisoning it changes what the system believes is correct. | `ontology/` (empty today) |
 | A6 | **The event bus** | Every prompt, tool argument, tool result and A2A payload passes through it in cleartext, and any in-process subscriber may read all of it. Also the integrity of control events — cancellation, interrupt, and any future human-approval event. | `uclone_x.engine.event_bus` |
 | A7 | **Agent identity and A2A credentials** | The ability to act as this agent toward remote peers, and to consume its quota. | Agent Card, out-of-band credentials |
@@ -242,6 +242,53 @@ and no quarantine directory. `./ucx skill approve` is referenced by both P9 and
 `version`, `setup`, `run`, `ui`, `test check` and `dev`
 ([`cli-specification.md`](cli-specification.md) confirms `ui` and `setup` are stubs).
 The human-in-the-loop box in the architecture diagram has no command behind it.
+
+**Update, 2026-09-27 — approval is pinned outside the skill (#1720, #1751).** The
+paragraph above is out of date on one point: `ucx skill approve` exists, and since #1589 it
+asks for a typed "yes" at the terminal it was run from. What changed now is what an approval
+binds to.
+
+* *The digest rule.* `compute_skill_sha256` (`src/uclone_x/skills/auditor.py`) is the one
+  statement of it. It hashes every file in the package except that in `SKILL.md` it leaves
+  out the frontmatter line `content_sha256: <64 hex digits>`, so a package can record its
+  own digest. A line in any other form, and the same line in the body, is hashed.
+* *The pin.* `ucx skill approve` writes the approved digest to the person's approvals
+  ledger, `~/.uclone/skills/approvals.json` (`UCLONE_SKILL_APPROVALS_DIR` overrides the
+  folder), outside every package. `ucx skill reject` removes the pin. The skills that ship in
+  `ucx-agent-skills/` are pinned in `src/uclone_x/skills/shipped_pins.py`, which is reviewed
+  code, and a unit test recomputes each shipped digest against it.
+* *The check.* The file-system store loads an active package only when the auditor approves
+  it and its current digest is its pin. The digest the package records is not consulted, so
+  editing a skill and rewriting its recorded digest in the same edit does not carry the
+  approval along. A refused skill is listed in the Settings Skills panel as blocked, with the
+  reason in plain words.
+
+What remains: anyone who can write the ledger can still approve a skill, because the ledger
+is a file in the person's home and a clone's `bash_run` runs as the same user. The pin is
+checked when skills load, not when an agent reads a skill's files later in the session.
+
+**Update, 2026-09-27 — what a same-user writer can do, and why nothing more is added
+(#1777).** Any process running as the person can write `approvals.json`: add a pin for an
+edited skill, or put back a pin `ucx skill reject` removed. That is an approval without the
+typed "yes", so the pin stops an edit that happens *without* ledger access — an edit through
+a file tool confined to a workspace, a package copied in from elsewhere, a synced folder —
+and does not stop one made by a same-user shell. Other local accounts cannot write the
+ledger: it is written through `mkstemp` and `os.replace`, so the file is created `0600`.
+
+No further protection is added, on purpose. Every candidate is held by the same user it is
+meant to stop: a key or an HMAC over the ledger has to be stored where the user can read it,
+and so can the process that forges the entry; a keychain entry is readable by any program
+the user runs, unless it prompts, and a prompt is what the terminal "yes" already is. The
+same writer can also edit what checks the ledger: `shipped_pins.py`, the installed package,
+a shell profile or a launch agent (A1). A signature over the ledger would stop none of it
+and would add a key to manage. The control that does close this is keeping the clone's
+shell off the person's home — T2's isolation row, D1 — not a harder ledger.
+
+What `ucx skill approve` itself guarantees (#1777): it copies the package once, audits the
+copy, asks about it, and pins the digest of the copy. If the package on disk no longer
+matches what was audited when the person answers, it approves nothing and says so. So a
+change made while the question waits is never pinned: either approval refuses, or the pin is
+of the checked bytes and the changed package does not load.
 
 ### T3 — Credential exfiltration via a tool or a skill
 
@@ -494,6 +541,10 @@ address was exposed on purpose and is not guarded. `_refuse_unless_local` stays 
 `/api/mcp/servers` routes: on such an exposed server, it still lets only this computer start
 programs.
 
+**Update, 2026-09-27 — `/api/turn` is gone (#1731).** The two notes above name `/api/turn`.
+That route was removed with the single-agent chat path; a chat turn now goes through a
+room. The notes are left as written, because they record what was exposed at the time.
+
 ### T10 — Self-granted sub-agent privilege
 
 **Entry.** [`dynamic-persona-interface.md`](dynamic-persona-interface.md) §3.1: the
@@ -534,7 +585,7 @@ the repository has *written down* a control, not that the control exists.
 | Threat | Specified control | Implemented | Enforced | Honest summary |
 | :--- | :--- | :---: | :---: | :--- |
 | T1 injection | None | No | No | The boundary has never been drawn in any document. |
-| T2 skill escalation | Skill Auditor agent; auto-approval policy; `./ucx skill approve` | **No** | No | The auditor is an LLM grading an LLM; the approve command does not exist; the manifest model has no sandbox or provenance field. |
+| T2 skill escalation | Skill Auditor agent; auto-approval policy; `./ucx skill approve` | **No** | No | The auditor is an LLM grading an LLM; the manifest model has no sandbox or provenance field. **2026-09-27:** approve now exists, asks at the terminal, and pins the approved digest outside the package; a skill edited after approval is not loaded (T2's update). The ledger is writable by anything running as the person. |
 | T3 credentials | Path-traversal blocking in `workspace` | No | No | No env allowlist, no egress allowlist, no read boundary at any level. |
 | T4 A2A peer | A2A v1.0.1 conformance target; TLS validation; out-of-band credentials | **No** (all 17 mandatory rows) | No | Nothing exists; the shipped stubs are themselves non-conformant (issue 2026-09-02-031). |
 | T5 store poisoning | Tier-1 validator; `./ucx ontology teach` | No | No | No provenance, no authority tiers, no promotion criteria, no retraction. |
@@ -582,7 +633,7 @@ findings that remain unfiled are **F1, F3, F5, F6, F7 and F11**.
 | F3 | `AgentEvent.source` / `sender_id` are publisher-supplied and unverified; the bus stamps only `sequence`. Any in-process component can forge a `source="user"` event, so any future event-delivered human approval is forgeable. Any component can `subscribe("*")` and read all traffic. | High | Sharper than issue -021's "contract undefined"; adjacent to -032 (provenance on result envelopes) and -033, neither of which covers publisher-forged `source`. |
 | F4 | `SkillManifest` has **no** sandbox field and is `extra="forbid"`, so the `sandbox_mode` frontmatter that `skill-system-architecture.md` §2.1 specifies would be *rejected* by the shipped model. The spec and the code disagree about the artifact's shape. | Medium | **Now filed** as issue -034, which adds the stronger point that `SkillRegistryProtocol.register()` takes no audit report at all, so skipping the auditor entirely is a type-checked, lint-clean call sequence. |
 | F5 | `SkillAuditReport` defaults are fail-open (`risk_score=0.0`, `recommendation="approve"`), and `recommendation` is an unconstrained `str`. | High | New. Issue -034 covers the missing quarantine and ceiling fields but not the fail-open verdict defaults. |
-| F6 | `./ucx skill approve` / `reject` — the human gate in P9, FR-5.4 and the architecture diagram — **does not exist**. Neither does `./ucx ontology teach` / `forget`. The `never` auto-approval policy is therefore unimplementable today: there is no way for a human to approve anything. | High | Issue -002 proposes the command as a *fix*; that it is already cited as existing is a separate defect (cf. issue -025). |
+| F6 | `./ucx skill approve` / `reject` — the human gate in P9, FR-5.4 and the architecture diagram — **does not exist**. Neither does `./ucx ontology teach` / `forget`. The `never` auto-approval policy is therefore unimplementable today: there is no way for a human to approve anything. | High | Issue -002 proposes the command as a *fix*; that it is already cited as existing is a separate defect (cf. issue -025). **2026-09-27:** `ucx skill approve` / `reject` exist and pin or unpin the approved digest (T2's update); `ontology teach` / `forget` still do not. |
 | F7 | `MCPConnectionConfig` spawns an arbitrary local process with an arbitrary environment and carries no isolation field. MCP is a first-class untrusted-code and injection surface absent from issue -016's table. | High | New. **2026-09-22:** the config has since gained an `isolation` field, and Settings can now add servers. The mitigations and what remains are in T9's update. |
 | F8 | `ToolContext.sandbox_mode` defaults to `NONE` and `workspace_root` defaults to `"."`. The insecure default is duplicated in a second module, and the default workspace root is the developer's current working directory — so `workspace` isolation, at its default, bounds writes to the repository the developer cares about most. | Medium | Extends issue -001 into the tools layer; the duplicated `NONE` default is also in -034. |
 | F9 | The `mode` → `isolation_level` rename recorded in `sandbox-execution-architecture.md` §5 is **documentation-only**. `src/uclone_x/sandbox/models.py` still exports `SandboxMode` and `ExecutionRequest.sandbox_mode`, and `tools/models.py` imports it. The vocabulary collision issue -019 set out to end still exists in code. | Low | **Now filed** as issue -034, which also finds a fourth `WorkspaceMode` value, `BRANCH`, in no specification. |

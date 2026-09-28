@@ -1,0 +1,21 @@
+{
+  "codes": {
+    "loop.help": "ℹ️ **`/loop`로 반복 작업 실행하기:**\n\n• `/loop <간격> <프롬프트>`: 프롬프트를 주기적으로 실행합니다 (예: `/loop 30s 상태 확인` 또는 `/loop 1분마다 하나씩 만들어보자`)\n• `/loop list`: 이 대화의 반복 작업을 확인합니다\n• `/loop stop`: 이 대화의 반복 작업을 중지합니다 (상단의 중지 버튼으로도 중지할 수 있습니다)",
+    "loop.active": "🔄 **실행 중인 반복 작업:** `{job_id}` ({interval}마다)\n프롬프트: \"{prompt}\"",
+    "loop.none_active": "ℹ️ 이 대화에서 실행 중인 반복 작업이 없습니다.",
+    "loop.stopped": "🛑 반복 작업을 중지했습니다.",
+    "loop.nothing_to_stop": "ℹ️ 중지할 반복 작업이 없습니다.",
+    "loop.registered": "🔄 **반복 작업을 등록했습니다** ({interval}마다 실행, ID: `{job_id}`):\n\"{prompt}\"\n\n*중지하려면 `/loop stop`을 입력하거나 대화 상단의 중지 버튼을 누르십시오.*",
+    "loop.missing_prompt": "⚠️ 간격 뒤에 실행할 내용을 적으십시오. 예: `/loop 5m 빌드 확인`",
+    "loop.interval_too_short": "⚠️ 반복 작업은 {interval}에 한 번까지만 실행할 수 있습니다. 더 긴 간격을 선택하십시오.",
+    "loop.no_interval": "⚠️ 이 `/loop` 명령에는 간격이 없습니다. `/loop 5m <프롬프트>` 또는 `/loop 5분마다 <프롬프트>` 형식으로 입력하십시오."
+  },
+  "interval": {
+    "seconds": { "one": "{count}초", "other": "{count}초" },
+    "minutes": { "one": "{count}분", "other": "{count}분" }
+  },
+  "missingImage": {
+    "image": "이미지 도구가 실행되지 않아 {file}이(가) 만들어지지 않았으므로 이 이미지를 표시할 수 없습니다.",
+    "link": "만들어지지 않은 이미지로 가는 링크입니다: {file}"
+  }
+}

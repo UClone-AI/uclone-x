@@ -562,12 +562,30 @@ class LLMSpeakerSelector:
 
     @staticmethod
     def _render(request: SpeakerRequest) -> str:
-        """Render the roster and window as the selector's user message."""
+        """Render the roster, the window and the floor state as the selector's user message.
+
+        **Stable first, volatile last** (design doc `llm-request-layering.md` §5.7, #1641).
+        The roster changes only when somebody joins or leaves, and the conversation only
+        grows at its end, so the two lead and the next selection's request extends this
+        one. The floor state -- autonomous mode, the agent-turn count, the last speaker --
+        changes on every turn, so it goes last: before the window it changed the request a
+        few lines in, and every selection prefilled the whole window again.
+
+        Only utterances are rendered. A membership row names its subject as its sender, so
+        it read as `[critic]: critic joined this conversation`, a line critic never said;
+        a note (`RoomMessageKind.NOTE`) is the application talking to the reader.
+        """
         lines = ["ROSTER:"]
         for participant in request.participants:
             kind = participant.kind.value
             purpose = participant.persona_summary or "(no stated purpose)"
             lines.append(f"- {participant.id} [{kind}] {participant.display_name}: {purpose}")
+
+        lines.append("")
+        lines.append("CONVERSATION:")
+        for message in request.transcript:
+            if message.is_utterance:
+                lines.append(f"[{message.sender_id}]: {message.content}")
 
         last_speaker = request.turn_state.last_speaker_id
         lines.append("")
@@ -577,10 +595,6 @@ class LLMSpeakerSelector:
             f"AGENT TURNS SINCE THE LAST HUMAN MESSAGE: {request.turn_state.agent_turns_since_human}"
         )
         lines.append(f"LAST SPEAKER: {last_speaker or '(none)'}")
-        lines.append("")
-        lines.append("CONVERSATION:")
-        for message in request.transcript:
-            lines.append(f"[{message.sender_id}]: {message.content}")
         return "\n".join(lines)
 
     def _parse(
@@ -632,8 +646,12 @@ def build_selector_chain(
     policy: RoomPolicy,
     provider: LLMProviderProtocol | None = None,
     max_tokens: int = DEFAULT_SELECTOR_MAX_TOKENS,
+    default_model: str | None = None,
 ) -> tuple[SpeakerSelectorProtocol, ...]:
     """The standard chain for a room, cheapest link first.
+
+    `default_model` is the model the routing link asks for when `policy.selector_llm` names
+    none: the head passes the fast model from Settings, since routing is an auxiliary call.
 
     Assembled in the Core rather than by each surface, so a head and a CLI cannot end up
     routing the same room differently — which is the divergence a chain order expressed
@@ -660,7 +678,9 @@ def build_selector_chain(
         DefaultResponderSelector(),
     ]
     if policy.auto_routing and provider is not None:
-        model = policy.selector_llm.model_name if policy.selector_llm is not None else None
+        model = (
+            policy.selector_llm.model_name if policy.selector_llm is not None else None
+        ) or default_model
         temperature = policy.selector_llm.temperature if policy.selector_llm is not None else 0.0
         chain.append(
             LLMSpeakerSelector(

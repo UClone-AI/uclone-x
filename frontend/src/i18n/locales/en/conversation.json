@@ -1,0 +1,105 @@
+{
+  "you": "you",
+  "row": {
+    "retry": "Retry",
+    "silentFinished": "{label} finished this turn without sending any text.",
+    "silentStopped": "{label} stopped partway through this turn and sent no text.",
+    "unsaved": "{label} will not remember this turn after a restart; it could not be saved.",
+    "knowledgeUnsaved": "{label} will not know what it learned in this turn after a restart; it could not be saved.",
+    "knowledgeSetAside": "{label}'s knowledge record for this conversation could not be read, so it was set aside and kept.",
+    "why": "why ›",
+    "servedInstead": "{served} (asked for {requested})"
+  },
+  "membership": {
+    "joined": "{name} joined this conversation",
+    "left": "{name} left this conversation"
+  },
+  "header": {
+    "writing": "Writing…",
+    "modelLabel": "Model for this conversation",
+    "useDefaultNamed": "Use default ({model})",
+    "useDefault": "Use the default model",
+    "autonomousOnLabel": "Autonomous discussion on",
+    "autonomousOffLabel": "Autonomous discussion off",
+    "autonomousOnTitle": "Autonomous discussion active (agents converse while you view)",
+    "autonomousOffTitle": "Turn on autonomous discussion (agents converse while you view)",
+    "autoDiscuss": "Auto discuss",
+    "on": "ON",
+    "off": "OFF",
+    "addSomeone": "Add someone",
+    "clearLabel": "Clear this conversation",
+    "clear": "Clear"
+  },
+  "invite": {
+    "noClones": "No clones are running yet. Send a message in a chat first, and whoever answers can be added here.",
+    "everyoneHere": "Everyone available is already in this conversation."
+  },
+  "empty": {
+    "noOne": "No one is in this conversation yet. Add someone to get a reply.",
+    "nothingSaid": "Nothing has been said here yet. Send a message to start."
+  },
+  "live": {
+    "thinkingLabel": "Thinking",
+    "thinking": "Thinking...",
+    "stopped": "This conversation stopped: {error}"
+  },
+  "notices": {
+    "ceiling": "Paused after {count} replies. Send a message to continue.",
+    "silence": "No one answered your last message, and no one is going to. Address someone with @ to get a reply.",
+    "decidedBy": "Decided by {selector}.",
+    "jumpToLatest": "Jump to latest"
+  },
+  "reset": {
+    "notReset": {
+      "one": "{names} still remembers what was removed here, so a reply may refer to it. Send a message to start again, or clear this conversation.",
+      "other": "{names} still remember what was removed here, so a reply may refer to it. Send a message to start again, or clear this conversation."
+    },
+    "saturated": "{names} reached the {threshold}-turn limit on context. Shorten this conversation to keep going, or start a new one.",
+    "fromRecord": "Counted from the saved record for {names}, which nothing has spoken in since this server started.",
+    "shortening": "Shortening…",
+    "shorten": "Shorten this conversation",
+    "compactBlocked": "A turn is running. Shortening waits until it finishes, so nothing is cut out from under it."
+  },
+  "clearConfirm": {
+    "question": {
+      "one": "Clear this conversation? Its one message is removed for good. It keeps its name and who is in it.",
+      "other": "Clear this conversation? Its {count} messages are removed for good. It keeps its name and who is in it."
+    },
+    "blocked": "A turn is running, so this would be refused. It can be done once that finishes.",
+    "confirm": "Clear",
+    "keep": "Keep everything"
+  },
+  "outcome": {
+    "refusalRemedy": {
+      "budget_exceeded": "Trying again would be refused too. Start a new conversation to continue.",
+      "model_without_tools": "Pick a model that supports tools (for example qwen3:8b) in Settings, then send your message again.",
+      "model_unavailable": "Choose another model in Settings, then send your message again.",
+      "provider_auth": "Paste a new API key in Settings, then send your message again.",
+      "usage_limit": "Raise the limit in Settings → Usage, or switch this clone to a local model, then send your message again. Settings → Usage shows when paid models can be used again."
+    },
+    "refusalRemedyOther": "Trying again would be refused for the same reason.",
+    "refusalReason": {
+      "budget_exceeded": "it has used all the tokens this conversation allows",
+      "model_without_tools": "its model can't use tools, which clones need",
+      "model_unavailable": "no model is chosen for it, or the one chosen is not available from the provider",
+      "provider_auth": "the provider did not accept the API key",
+      "usage_limit": "you've reached your usage limit for paid models"
+    },
+    "refusalReasonOther": "the app refused to run it",
+    "providerRemedy": {
+      "provider_unreachable": "If you set a custom endpoint in Settings, check that address too."
+    },
+    "providerFailed": "{label} couldn't finish this turn. {message}",
+    "refused": "{label} couldn't finish this turn: {reason}.",
+    "stopped": "{label} was stopped before finishing this turn.",
+    "wentWrong": "{label} couldn't finish this turn because something went wrong while it was answering.",
+    "memoryNoneSaved": {
+      "one": "{label} tried to save something to memory, and nothing was saved.",
+      "other": "{label} tried to save {count} things to memory, and none of them were saved."
+    },
+    "memorySomeUnsaved": {
+      "one": "{label} tried to save {total} things to memory, and {count} of them was not saved.",
+      "other": "{label} tried to save {total} things to memory, and {count} of them were not saved."
+    }
+  }
+}

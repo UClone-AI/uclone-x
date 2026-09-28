@@ -18,6 +18,11 @@ from rich.console import Console
 from rich.markup import escape
 from rich.prompt import Confirm
 
+# Re-exported: the probe moved out of `cli/` (#1769), and this module's callers and tests
+# still name it here.
+from uclone_x.tools.builtin.image_status import ImageEngineReport as ImageEngineReport
+from uclone_x.tools.builtin.image_status import probe_image_engines
+
 console = Console()
 
 DEFAULT_OLLAMA_URL = "http://localhost:11434"
@@ -586,101 +591,6 @@ def ensure_local_profile(interactive: bool = True, assume_yes: bool = False) -> 
     """
     result = setup_local_llm(interactive=interactive, assume_yes=assume_yes)
     return result.ready, result.model
-
-
-class ImageEngineReport(NamedTuple):
-    """What each image engine offers right now, inspected rather than assumed (#1095)."""
-
-    remote_url: str | None
-    remote_alive: bool
-    comfy_url: str
-    comfy_alive: bool
-    dependency_problems: tuple[str, ...]
-    checkpoint: str | None
-
-    @property
-    def ready(self) -> bool:
-        """Whether any engine can actually generate an image.
-
-        A configured `UCX_IMAGE_REMOTE_URL` is an address, not a worker. It counts only
-        once `/health` has answered, the same probe `RemoteCudaImageEngine.is_available`
-        makes before the dispatcher will use it; reporting ready from the variable alone
-        promised an engine that then refused to generate (P6).
-        """
-        return self.remote_ready or self.comfy_alive or self.in_process_ready
-
-    @property
-    def remote_ready(self) -> bool:
-        """A remote worker that is both configured and answering."""
-        return bool(self.remote_url) and self.remote_alive
-
-    @property
-    def dependencies_ok(self) -> bool:
-        """Whether every package the in-process engine imports is present and new enough."""
-        return not self.dependency_problems
-
-    @property
-    def in_process_ready(self) -> bool:
-        """The daemon-free baseline: every import is satisfied and a checkpoint file exists."""
-        return self.dependencies_ok and self.checkpoint is not None
-
-    @property
-    def engine(self) -> str:
-        """The engine that would be selected, matching `ImagePipelineDispatcher`'s order."""
-        if self.remote_ready:
-            return "remote-cuda"
-        if self.comfy_alive:
-            return "comfyui-local"
-        if self.in_process_ready:
-            return "diffusers-sdxl"
-        return "none"
-
-
-def probe_image_engines() -> ImageEngineReport:
-    """Inspect all three image engines without installing, starting or downloading anything.
-
-    Every field is read from this machine as it is: two HTTP probes -- the remote worker's
-    `/health` and a ComfyUI daemon somebody else started -- an import, and a file on disk.
-    Nothing here can report ready for an engine that would then fail to produce an image
-    (P6), which is why the remote worker is probed rather than inferred from its variable.
-    """
-    import asyncio
-
-    from uclone_x.tools.builtin.image import (
-        REMOTE_URL_ENV,
-        ComfyUIImageEngine,
-        LocalDiffusersImageEngine,
-        RemoteCudaImageEngine,
-        in_process_dependency_problems,
-    )
-
-    remote_url = os.getenv(REMOTE_URL_ENV) or os.getenv("UCX_MEDIA_REMOTE_URL")
-    try:
-        # Built inside the `try` so that a client which rejects the configured address
-        # reads as "not there", the same as a refused connection. No address, no request.
-        remote_alive = (
-            asyncio.run(RemoteCudaImageEngine(base_url=remote_url).is_available())
-            if remote_url
-            else False
-        )
-    except Exception:
-        remote_alive = False
-    comfy = ComfyUIImageEngine()
-    try:
-        comfy_alive = asyncio.run(comfy.is_available())
-    except Exception:
-        comfy_alive = False
-
-    return ImageEngineReport(
-        remote_url=remote_url or None,
-        remote_alive=remote_alive,
-        comfy_url=comfy.base_url,
-        comfy_alive=comfy_alive,
-        dependency_problems=tuple(
-            problem.describe() for problem in in_process_dependency_problems()
-        ),
-        checkpoint=LocalDiffusersImageEngine().resolve_checkpoint(),
-    )
 
 
 #: What to type when this environment has neither installer (#971 acceptance criterion 2).

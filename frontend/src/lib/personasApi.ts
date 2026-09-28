@@ -2,6 +2,7 @@
  * The two requests behind the persona editor (#892): read the catalogue, save a draft.
  * Kept apart from `personaDraft.ts` so the editor components never import a request.
  */
+import { fmt } from '../i18n/format';
 import type { PersonaCatalog, PersonaInfo } from '../types';
 import { failureOf } from './coreFailure';
 import {
@@ -38,7 +39,7 @@ export const savePersona = async (
       body: JSON.stringify(draft),
     });
   } catch (err) {
-    return { ok: false, message: copy.unreachable(String(err)) };
+    return { ok: false, message: fmt(copy.unreachable, { reason: String(err) }) };
   }
   const body = (await res.json().catch(() => ({}))) as {
     persona?: PersonaInfo;

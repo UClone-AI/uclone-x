@@ -26,7 +26,9 @@ skipping all three. What these pin:
   (`sandbox.story_jail`) that refuses any write in the library, however the path is
   named, and refuses renaming the workspace or a folder above it; the rest of the
   workspace is written as before. Where the jail should exist but cannot start, the
-  command is refused in plain words instead of run without it.
+  command is refused in plain words instead of run without it: a daemon is not reported
+  as started, and a server fails with a sentence rather than `sandbox-exec`'s stderr
+  (#1611).
 
 Not covered: the shell and MCP servers on other systems, MCP servers reached over HTTP, a
 local MCP server whose configured `workspace_root` is not the app's workspace, and a jailed
@@ -47,11 +49,13 @@ import yaml
 
 from uclone_x.agent.base import BaseAgent
 from uclone_x.agent.models import AgentConfig, AgentLLMConfig
+from uclone_x.errors import PlainRefusalError
 from uclone_x.llm.connectors.mock import MockLLMConnector
 from uclone_x.llm.models import ToolCallRequest
 from uclone_x.sandbox import story_jail
-from uclone_x.sandbox.story_jail import JAIL_SETUP_REFUSAL
+from uclone_x.sandbox.story_jail import JAIL_SERVER_REFUSAL, JAIL_SETUP_REFUSAL
 from uclone_x.story.tool import StoryLibraryTool
+from uclone_x.tools.builtin import shell
 from uclone_x.tools.builtin.character import CharacterSheetTool
 from uclone_x.tools.builtin.comfy_client import ComfyClient
 from uclone_x.tools.builtin.comfy_image_tool import ComfyImageGenTool
@@ -280,8 +284,8 @@ class TestEveryGeneralWriterRefuses:
     async def test_generate_image_as_a_batch(self, tmp_path: Path) -> None:
         """Each image of a batch is checked, and the image is refused before its metadata.
 
-        Killed by: src/uclone_x/tools/builtin/image.py :: dest_path = self.resolve_write_path(clean_rel, workspace)
-        Becomes: dest_path = self.resolve_safe_path(clean_rel, workspace)
+        Killed by: src/uclone_x/tools/builtin/image.py :: self.resolve_write_path(clean_rel, workspace)
+        Becomes: self.resolve_safe_path(clean_rel, workspace)
         """
         story_id = await _story(tmp_path)
         dispatcher = AsyncMock(spec=ImagePipelineDispatcher)
@@ -475,8 +479,33 @@ darwin_only = pytest.mark.skipif(
 )
 
 
-async def _shell(workspace: Path, command: str) -> ToolResult:
-    return await BashRunTool().execute({"command": command, "cwd": str(workspace)}, _ctx(workspace))
+async def _shell(workspace: Path, command: str, **extra: Any) -> ToolResult:
+    return await BashRunTool().execute(
+        {"command": command, "cwd": str(workspace), **extra}, _ctx(workspace)
+    )
+
+
+#: What `sandbox-exec` prints when it cannot apply a profile, here with a path added, so a
+#: message that passed any of it on would show.
+_SANDBOX_EXEC_STDERR = (
+    "sandbox-exec: sandbox_apply: /private/var/db/ucx-probe: Operation not permitted"
+)
+
+
+def _failing_sandbox_exec(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make the jail one whose `sandbox-exec` exits 71 without starting anything."""
+    fake = tmp_path / "fake-sandbox-exec"
+    fake.write_text(f"#!/bin/sh\necho '{_SANDBOX_EXEC_STDERR}' >&2\nexit 71\n")
+    fake.chmod(0o755)
+    monkeypatch.setattr(story_jail, "PLATFORM", "darwin")
+    monkeypatch.setattr(story_jail, "SANDBOX_EXEC", fake)
+
+
+def _assert_plain(text: str | None, tmp_path: Path) -> None:
+    """No path, no stderr, no exception text: only the sentence written for a person."""
+    assert text is not None
+    for internal in ("/", "sandbox", "Errno", "Error", "exit code", str(tmp_path)):
+        assert internal not in text, internal
 
 
 @darwin_only
@@ -578,12 +607,28 @@ class TestTheShellCannotChangeTheLibrary:
 class TestACommandThatRanIsNotReportedAsNotRun:
     """Only a jail that never started the command is reported as not running it."""
 
+    async def test_a_daemon_in_the_jail_is_reported_as_started(self, tmp_path: Path) -> None:
+        """Killed by: src/uclone_x/tools/builtin/shell.py :: return True  # the jailed shell created the marker
+        Becomes: return False
+        """
+        tool = BashRunTool()
+        result = await tool.execute(
+            {"command": "exec sleep 30", "cwd": str(tmp_path), "is_daemon": True},
+            _ctx(tmp_path),
+        )
+        assert result.success, result.error
+        assert isinstance(result.output, dict)
+        killed = await tool.execute(
+            {"action": "kill", "daemon_pid": result.output["pid"]}, _ctx(tmp_path)
+        )
+        assert killed.success, killed.error
+
     async def test_a_command_that_prints_what_sandbox_exec_prints_is_reported_as_run(
         self, tmp_path: Path
     ) -> None:
         """A command may run `sandbox-exec` itself, fail, and exit 71 with its message.
 
-        Killed by: src/uclone_x/tools/builtin/shell.py :: started = (started_dir / "started").exists()
+        Killed by: src/uclone_x/tools/builtin/shell.py :: started = has_started(started_dir / "started")
         Becomes: started = False
         """
         result = await _shell(
@@ -599,7 +644,7 @@ class TestACommandThatRanIsNotReportedAsNotRun:
     async def test_the_started_marker_is_removed(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Killed by: src/uclone_x/tools/builtin/shell.py :: shutil.rmtree(started_dir, ignore_errors=True)
+        """Killed by: src/uclone_x/sandbox/story_jail.py :: shutil.rmtree(folder, ignore_errors=True)
         Becomes: pass
         """
         temp = tmp_path / "temp"
@@ -610,6 +655,31 @@ class TestACommandThatRanIsNotReportedAsNotRun:
         for command in ("true", "false"):
             await _shell(workspace, command)
         assert list(temp.iterdir()) == []
+
+    async def test_a_command_that_locks_its_marker_folder_is_reported_as_run(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`chmod 000` on the marker's folder used to fail with a raw error naming it (#1611).
+
+        Killed by: src/uclone_x/sandbox/story_jail.py :: return True  # unreadable: only the command could have changed its folder
+        Becomes: return False
+        Killed by: src/uclone_x/sandbox/story_jail.py :: os.chmod(folder, 0o700)
+        Becomes: pass
+        """
+        temp = tmp_path / "temp"
+        temp.mkdir()
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        monkeypatch.setattr(tempfile, "tempdir", str(temp))
+        try:
+            result = await _shell(workspace, f"printf ran > ran.txt; chmod 000 '{temp}'/ucx-jail-*")
+            left = list(temp.iterdir())
+        finally:
+            for folder in temp.iterdir():  # so pytest can remove `tmp_path` if this fails
+                folder.chmod(0o700)
+        assert (result.success, result.error) == (True, None)
+        assert (workspace / "ran.txt").read_text() == "ran"
+        assert left == []
 
 
 class TestTheShellDoesNotRunWithoutTheJail:
@@ -635,15 +705,92 @@ class TestTheShellDoesNotRunWithoutTheJail:
         Killed by: src/uclone_x/tools/builtin/shell.py :: if jail and not started:
         Becomes: if False:
         """
-        fake = tmp_path / "fake-sandbox-exec"
-        fake.write_text(
-            "#!/bin/sh\necho 'sandbox-exec: sandbox_apply: Operation not permitted' >&2\nexit 71\n"
-        )
+        _failing_sandbox_exec(tmp_path, monkeypatch)
+        result = await _shell(tmp_path, "true")
+        assert (result.success, result.error) == (False, JAIL_SETUP_REFUSAL)
+        _assert_plain(result.error, tmp_path)
+
+    async def test_what_sandbox_exec_printed_is_not_passed_on(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Killed by: src/uclone_x/tools/builtin/shell.py :: output_data = {"stdout": "", "stderr": "", "exit_code": -1}
+        Becomes: output_data = output_data
+        """
+        _failing_sandbox_exec(tmp_path, monkeypatch)
+        result = await _shell(tmp_path, "true")
+        assert result.output == {"stdout": "", "stderr": "", "exit_code": -1}
+
+    async def test_a_daemon_whose_jail_fails_to_start_is_not_reported_as_started(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """It used to answer "Daemon started in background." with the dead process's pid.
+
+        Killed by: src/uclone_x/tools/builtin/shell.py :: if started_dir is not None and not await _jail_started(
+        Becomes: if False and not await _jail_started(
+        """
+        _failing_sandbox_exec(tmp_path, monkeypatch)
+        result = await _shell(tmp_path, "printf x > ran.txt", is_daemon=True)
+        assert (result.success, result.error) == (False, JAIL_SETUP_REFUSAL)
+        _assert_plain(result.error, tmp_path)
+        assert result.output == {"stdout": "", "stderr": "", "exit_code": -1}
+        assert not (tmp_path / "ran.txt").exists()
+
+    async def test_a_daemon_whose_jail_hangs_is_not_reported_as_started(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Killed by: src/uclone_x/tools/builtin/shell.py :: return False
+        Becomes: return True
+        """
+        fake = tmp_path / "hanging-sandbox-exec"
+        fake.write_text("#!/bin/sh\nexec sleep 30\n")
         fake.chmod(0o755)
         monkeypatch.setattr(story_jail, "PLATFORM", "darwin")
         monkeypatch.setattr(story_jail, "SANDBOX_EXEC", fake)
-        result = await _shell(tmp_path, "true")
+        monkeypatch.setattr(shell, "_JAIL_START_SECONDS", 0.2)
+        result = await _shell(tmp_path, "true", is_daemon=True)
         assert (result.success, result.error) == (False, JAIL_SETUP_REFUSAL)
+
+    async def test_a_server_whose_jail_fails_to_start_fails_in_plain_words(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """It used to fail with "MCP server closed stream unexpectedly. Stderr: sandbox-exec: …".
+
+        Killed by: src/uclone_x/tools/client.py :: if started_dir is not None and not has_started(started_dir / "started"):
+        Becomes: if False:
+        """
+        _failing_sandbox_exec(tmp_path, monkeypatch)
+        config = MCPConnectionConfig(
+            server_name="probe",
+            transport=MCPTransport.STDIO,
+            command=sys.executable,
+            args=("-c", "pass"),
+            workspace_root=tmp_path,
+        )
+        with pytest.raises(PlainRefusalError) as raised:
+            async with MCPClient(config=config):
+                pass
+        assert str(raised.value) == JAIL_SERVER_REFUSAL
+        _assert_plain(str(raised.value), tmp_path)
+
+    async def test_a_server_without_sandbox_exec_fails_in_plain_words(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Killed by: src/uclone_x/tools/client.py :: except PlainRefusalError:
+        Becomes: except OSError:
+        """
+        monkeypatch.setattr(story_jail, "PLATFORM", "darwin")
+        monkeypatch.setattr(story_jail, "SANDBOX_EXEC", tmp_path / "missing-sandbox-exec")
+        config = MCPConnectionConfig(
+            server_name="probe",
+            transport=MCPTransport.STDIO,
+            command=sys.executable,
+            args=("-c", "pass"),
+            workspace_root=tmp_path,
+        )
+        with pytest.raises(PlainRefusalError) as raised:
+            async with MCPClient(config=config):
+                pass
+        assert str(raised.value) == JAIL_SERVER_REFUSAL
 
     def test_other_systems_have_no_jail(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -683,8 +830,8 @@ for line in sys.stdin:
 @darwin_only
 class TestALocalMCPServerCannotChangeTheLibrary:
     async def test_a_stdio_server_cannot_write_a_story(self, tmp_path: Path) -> None:
-        """Killed by: src/uclone_x/tools/client.py :: *jail,
-        Becomes: *[],
+        """Killed by: src/uclone_x/tools/client.py :: argv = jailed_exec(jail, argv, started_dir / "started")
+        Becomes: argv = jailed_exec([], argv, started_dir / "started")
         """
         story_id = await _story(tmp_path)
         vane = tmp_path / "stories" / story_id / VANE
@@ -700,8 +847,27 @@ class TestALocalMCPServerCannotChangeTheLibrary:
         assert (tmp_path / "report.txt").read_text() == "PermissionError"
         assert vane.read_text(encoding="utf-8") == VANE_TEXT
 
+    async def test_a_server_that_started_and_failed_keeps_its_own_words(
+        self, tmp_path: Path
+    ) -> None:
+        """Only a jail that never started the server is reported as the jail's failure.
+
+        Killed by: src/uclone_x/tools/client.py :: if started_dir is not None and not has_started(started_dir / "started"):
+        Becomes: if started_dir is not None:
+        """
+        config = MCPConnectionConfig(
+            server_name="crashing",
+            transport=MCPTransport.STDIO,
+            command="/bin/sh",
+            args=("-c", "echo 'the server said no' >&2; exit 3"),
+            workspace_root=tmp_path,
+        )
+        with pytest.raises(RuntimeError, match="the server said no"):
+            async with MCPClient(config=config):
+                pass
+
     async def test_a_missing_server_is_still_named_as_missing(self, tmp_path: Path) -> None:
-        """Killed by: src/uclone_x/tools/client.py :: if jail and not _command_exists(self._config.command, child_env, cwd_str):
+        """Killed by: src/uclone_x/tools/client.py :: if not _command_exists(self._config.command, child_env, cwd_str):
         Becomes: if False:
         """
         config = MCPConnectionConfig(

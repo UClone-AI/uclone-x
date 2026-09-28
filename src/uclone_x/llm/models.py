@@ -124,7 +124,7 @@ class TokenCountSource(StrEnum):
 
     Two producers: a connector completing a usage report that lacks a count
     (`connectors/base.py::resolve_token_counts`, with the UTF-8 byte estimator in
-    `llm/compactor.py`, #939), and `BaseAgent._invoke_model` for a stream that sent no usage
+    `llm/compactor.py`, #939), and `TurnExecutor.invoke_model` for a stream that sent no usage
     (still a character-length heuristic, which undercounted Korean output by about half when
     measured once against a local model). Charged against the budget ceiling exactly like a
     count (#916)."""
@@ -270,6 +270,12 @@ class LLMRequest(BaseModel):
         description="Explicit control over provider reasoning/thinking tokens (e.g. Ollama think parameter). "
         "When None, default provider behavior is preserved.",
     )
+    response_schema: ImmutableJsonMapping | None = Field(
+        default=None,
+        description="A JSON Schema the reply's content must satisfy (structured output). "
+        "Ollama sends it as `format`. A connector with no faithful mapping raises "
+        "`StructuredOutputUnsupportedError` rather than dropping it (P6).",
+    )
 
 
 class LedgerSource(StrEnum):
@@ -311,7 +317,7 @@ class CompactionOutcome(BaseModel):
     publishing it with no attribution would be exactly the unattributed result P6
     forbids. Attribution is built **here**, by the only component that knows which path
     ran, and on the LLM path it is the summarizer's own `ModelResponse.provenance`
-    forwarded verbatim — never synthesized, for the same reason `BaseAgent.execute_turn`
+    forwarded verbatim — never synthesized, for the same reason `TurnExecutor.execute_turn`
     refuses to synthesize one for a model reply.
     """
 
@@ -346,11 +352,15 @@ class TokenBudget(BaseModel):
     not express: it had one undifferentiated pair of counters and no provider dimension
     at all, so a session spanning two providers could not be attributed to either.
     Cost is not tracked: UClone-X counts tokens only (#1392).
+
+    `max_tokens` is `None` -- no session ceiling -- unless one is set explicitly. The
+    budget is the user's system-wide paid-model limit (`llm-token-gateway.md` §4.6); this
+    ledger attributes a session's tokens, and refuses only for a ceiling an embedder set.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
 
-    max_tokens: int = 1_000_000
+    max_tokens: int | None = None
     used_input_tokens: int = 0
     used_output_tokens: int = 0
     per_provider: ImmutableIntMapping = Field(

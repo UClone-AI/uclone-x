@@ -34,9 +34,10 @@ from uclone_x.memory.tools import (
 from uclone_x.tools.base import BaseTool
 from uclone_x.tools.builtin.filesystem import FileReadParams, FileReadTool
 from uclone_x.tools.builtin.skill_loader import LoadSkillTool
+from uclone_x.tools.client import MCPTool
 from uclone_x.tools.protocols import ToolProtocol
-from uclone_x.tools.registry import ToolRegistry, create_default_registry
-from uclone_x.tools.schema import advertised_parameters_schema
+from uclone_x.tools.registry import LocalTool, ToolRegistry, create_default_registry
+from uclone_x.tools.schema import advertised_parameters_schema, advertised_tool_parameters
 
 # --- a params model exercising every rule ------------------------------------------
 
@@ -138,7 +139,7 @@ def test_top_level_description_is_dropped_but_property_descriptions_are_kept() -
     """
     raw = _raw()
     assert raw["description"] == "Parameters for the sample tool."
-    out = advertised_parameters_schema(raw)
+    out = advertised_parameters_schema(raw, params_model=True)
     assert "description" not in out
     assert out["properties"]["colour"]["description"] == "Which colour."
     assert out["$defs"]["Chapter"]["description"].startswith("A nested model")
@@ -192,8 +193,8 @@ def test_null_is_kept_where_it_is_the_meaning() -> None:
 def test_default_suffix_is_stripped_only_when_a_default_key_carries_it() -> None:
     """A trailing `(default: ...)` goes only where the `default` key says it.
 
-    Killed by: src/uclone_x/tools/schema.py :: stripped = _DEFAULT_SUFFIX.sub("", description)
-    Becomes: stripped = description
+    Killed by: src/uclone_x/tools/schema.py :: out["description"] = description[: match.start()]
+    Becomes: out["description"] = description
     """
     out = advertised_parameters_schema(_raw())
     assert out["properties"]["limit"] == {
@@ -211,6 +212,110 @@ def test_default_suffix_is_stripped_only_when_a_default_key_carries_it() -> None
         advertised_parameters_schema(no_default)["properties"]["x"]["description"]
         == "Size (default: 10)"
     )
+
+
+def _described(description: str, default: Any, type_: Any = "integer") -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {"x": {"type": type_, "default": default, "description": description}},
+    }
+
+
+@pytest.mark.parametrize(
+    ("description", "default", "type_"),
+    [
+        ("Where to look (defaults to the workspace root when omitted)", None, ["string", "null"]),
+        ("How many (default: 3, max 10)", 3, "integer"),
+        ("How many bytes (default: 45KB)", 46080, "integer"),
+        ("How many (default: 5)", 3, "integer"),
+        ("Which mode (default: fast)", "slow", "string"),
+        ("(default: 10)", 10, "integer"),
+    ],
+)
+def test_a_default_parenthetical_that_says_more_than_the_default_is_kept(
+    description: str, default: Any, type_: Any
+) -> None:
+    """Only `(default: x)` with `x` equal to the node's `default` restates it (#1543).
+
+    "(defaults to the workspace root when omitted)" is the only place a null default's
+    meaning is written down; "(default: 3, max 10)" carries a limit the key does not.
+
+    A description that is nothing but "(default: 10)" is kept whole, never emptied.
+
+    Killed by: src/uclone_x/tools/schema.py :: if match and match.start() > 0 and _states_default(match.group(1), out["default"]):
+    Becomes: if match and match.start() > 0:
+
+    Killed by: src/uclone_x/tools/schema.py :: if match and match.start() > 0 and
+    Becomes: if match and
+    """
+    out = advertised_parameters_schema(_described(description, default, type_))
+    assert out["properties"]["x"]["description"] == description
+
+
+@pytest.mark.parametrize(
+    ("description", "default", "type_"),
+    [
+        ("How many (default: 10)", 10, "integer"),
+        ("Which mode (default: 'fast')", "fast", "string"),
+        ("Which mode (Default: fast)", "fast", "string"),
+        ("Recurse (default: true)", True, "boolean"),
+        ("Recurse (default: False)", False, "boolean"),
+        ("Scale (default: 1.5)", 1.5, "number"),
+    ],
+)
+def test_a_default_parenthetical_that_restates_the_default_is_stripped(
+    description: str, default: Any, type_: Any
+) -> None:
+    """Quoted or not, JSON or Python spelling: the value the `default` key carries.
+
+    Killed by: src/uclone_x/tools/schema.py :: return text in {json.dumps(default, ensure_ascii=False), str(default)}
+    Becomes: return text in {json.dumps(default, ensure_ascii=False)}
+    """
+    out = advertised_parameters_schema(_described(description, default, type_))
+    assert out["properties"]["x"]["description"] == description.rsplit(" (", 1)[0]
+    assert out["properties"]["x"]["default"] == default
+
+
+def test_top_level_description_is_kept_unless_the_schema_is_a_params_model() -> None:
+    """An MCP server's or a hand-written schema may say what its tool description does not.
+
+    Killed by: src/uclone_x/tools/schema.py :: if params_model:
+    Becomes: if True:
+    """
+    schema = {
+        "type": "object",
+        "description": "Coordinates are WGS84; all times are UTC.",
+        "properties": {"lat": {"type": "number"}},
+    }
+    assert advertised_parameters_schema(schema)["description"] == schema["description"]
+    assert "description" not in advertised_parameters_schema(schema, params_model=True)
+
+
+class _HandWrittenSchemaTool(FileReadTool):
+    """A `BaseTool` that overrides `parameters_schema`: its schema is not the params model's."""
+
+    @property
+    def parameters_schema(self) -> dict[str, Any]:
+        return {"type": "object", "description": "Hand-written.", "properties": {}}
+
+
+def test_advertised_tool_parameters_drops_the_description_only_for_a_params_model() -> None:
+    """The tool, not the schema, says where the schema came from.
+
+    Killed by: src/uclone_x/tools/schema.py :: from_params_model = inherited is BaseTool.parameters_schema
+    Becomes: from_params_model = True
+    """
+    schema: dict[str, Any] = {
+        "type": "object",
+        "description": "Server-side note.",
+        "properties": {},
+    }
+    mcp = MCPTool(name="m", description="d", parameters_schema=schema, client=MagicMock())
+    local = LocalTool(name="l", description="d", parameters_schema=schema)
+    assert advertised_tool_parameters(mcp)["description"] == "Server-side note."
+    assert advertised_tool_parameters(local)["description"] == "Server-side note."
+    assert advertised_tool_parameters(_HandWrittenSchemaTool())["description"] == "Hand-written."
+    assert "description" not in advertised_tool_parameters(FileReadTool())
 
 
 def test_constraints_survive_unchanged() -> None:
@@ -320,16 +425,16 @@ def test_a_collapsed_field_still_accepts_an_explicit_null() -> None:
 # --- the request the connectors send -------------------------------------------------
 
 
-def _connector_parameters(request: LLMRequest) -> dict[str, dict[str, Any]]:
+def _connector_parameters(request: LLMRequest, index: int = 0) -> dict[str, dict[str, Any]]:
     openai = OpenAIConnector(api_key="k")._build_payload(request)  # pyright: ignore[reportPrivateUsage]
     ollama = OllamaConnector()._build_payload(request)  # pyright: ignore[reportPrivateUsage]
     anthropic = AnthropicConnector(api_key="k")._build_payload(request)  # pyright: ignore[reportPrivateUsage]
     gemini = GeminiConnector(api_key="k")._build_payload(request)  # pyright: ignore[reportPrivateUsage]
     return {
-        "openai": openai["tools"][0]["function"]["parameters"],
-        "ollama": ollama["tools"][0]["function"]["parameters"],
-        "anthropic": anthropic["tools"][0]["input_schema"],
-        "gemini": gemini["tools"][0]["functionDeclarations"][0]["parameters"],
+        "openai": openai["tools"][index]["function"]["parameters"],
+        "ollama": ollama["tools"][index]["function"]["parameters"],
+        "anthropic": anthropic["tools"][index]["input_schema"],
+        "gemini": gemini["tools"][0]["functionDeclarations"][index]["parametersJsonSchema"],
     }
 
 
@@ -337,8 +442,11 @@ def _connector_parameters(request: LLMRequest) -> dict[str, dict[str, Any]]:
 async def test_every_connector_sends_the_advertised_schema() -> None:
     """The agent builds its tool definitions from the advertised schema; all four connectors send it.
 
-    Killed by: src/uclone_x/agent/base.py :: parameters=advertised_parameters_schema(t.parameters_schema),
-    Becomes: parameters=t.parameters_schema,
+    A tool whose schema is not a params model's (an MCP tool) keeps its top-level
+    `description` in every connector (#1543).
+
+    Killed by: src/uclone_x/agent/tool_invoker.py :: parameters=advertised_tool_parameters(t),
+    Becomes: parameters=advertised_parameters_schema(t.parameters_schema, params_model=True),
     """
     llm = MagicMock(spec=LLMProviderProtocol)
     llm.generate = AsyncMock(
@@ -359,14 +467,31 @@ async def test_every_connector_sends_the_advertised_schema() -> None:
         system_prompt="Test.",
         llm_config=AgentLLMConfig(model_name="m"),
     )
-    agent = BaseAgent(config=config, llm=llm, tools=ToolRegistry([tool]))
+    mcp_schema = {
+        "type": "object",
+        "description": "Server-side note.",
+        "properties": {"q": {"type": "string", "title": "Q"}},
+    }
+    mcp = MCPTool(
+        name="zz_mcp_lookup",
+        description="Look up.",
+        parameters_schema=mcp_schema,
+        client=MagicMock(),
+    )
+    agent = BaseAgent(config=config, llm=llm, tools=ToolRegistry([tool, mcp]))
     await agent.execute_turn("read something")
 
     request: LLMRequest = llm.generate.call_args[0][0]
-    expected = advertised_parameters_schema(tool.parameters_schema)
+    expected = advertised_tool_parameters(tool)
     sent = _connector_parameters(request)
     for provider, params in sent.items():
         assert params == expected, provider
         assert "title" not in params and "description" not in params, provider
         assert params["properties"]["end_line"]["type"] == "integer", provider
         assert params["required"] == ["path"], provider
+    for provider, params in _connector_parameters(request, index=1).items():
+        assert params == {
+            "type": "object",
+            "description": "Server-side note.",
+            "properties": {"q": {"type": "string"}},
+        }, provider

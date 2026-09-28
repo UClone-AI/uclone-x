@@ -34,6 +34,7 @@ from uclone_x.shells.ui_process import UI_BIND_HOST_ENV_VAR
 from uclone_x.shells.ui_process import stop_ui_server as stop_ui_server
 from uclone_x.ui import build_inputs
 from uclone_x.ui.app import create_ui_app, get_git_commit
+from uclone_x.ui.person import PersonGate
 
 console = Console()
 
@@ -184,11 +185,13 @@ def start_ui_server(
         workspace_dir: Optional workspace directory for tool executions (defaults to cwd).
         timeout_graceful_shutdown: Graceful shutdown timeout in seconds (default 2s, Issue #613).
     """
-    if auto_open_browser:
+    if auto_open_browser and dev:
         import threading
         import webbrowser
 
-        target_url = f"http://{host}:{vite_port if dev else port}"
+        # In development the app is built inside uvicorn's reload process, out of reach
+        # here, so this window is not confirmed; the story view offers to open one that is.
+        target_url = f"http://{host}:{vite_port}"
         threading.Timer(1.2, lambda: webbrowser.open(target_url)).start()
 
     if storage_dir is not None:
@@ -223,6 +226,7 @@ def start_ui_server(
             storage_dir=storage_dir,
             workspace_dir=workspace_dir,
             timeout_graceful_shutdown=timeout_graceful_shutdown,
+            open_browser=auto_open_browser and not dev,
         )
     finally:
         ui_process.remove_dashboard_record(record)
@@ -237,8 +241,14 @@ def _serve(
     storage_dir: Path | None,
     workspace_dir: Path | None,
     timeout_graceful_shutdown: int,
+    open_browser: bool = False,
 ) -> None:
-    """Run the dashboard in the foreground until it exits; `start_ui_server` wraps it."""
+    """Run the dashboard in the foreground until it exits; `start_ui_server` wraps it.
+
+    `open_browser` opens the first window as a confirmed one (`uclone_x.ui.person`): its
+    address carries the pairing code after `#`, which the browser never sends back, and it
+    is handed to the browser only -- not printed, not logged.
+    """
     if dev:
         frontend_dir = Path(__file__).resolve().parents[3] / "frontend"
         vite_proc = None
@@ -339,6 +349,15 @@ def _serve(
         if workspace_dir is not None:
             app_kwargs["workspace_dir"] = workspace_dir
         app_instance = create_ui_app(**app_kwargs)
+        if open_browser:
+            import threading
+
+            gate: PersonGate = app_instance.state.person_gate
+            base_url = f"http://{host}:{port}"
+            # Counted like any other window, so none follows it within the interval.
+            threading.Timer(
+                1.2, lambda: gate.may_open_window() and gate.open_window(base_url)
+            ).start()
         uvicorn.run(
             app_instance,
             host=host,

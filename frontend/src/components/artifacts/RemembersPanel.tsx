@@ -5,6 +5,8 @@ import {
   useRoomRead,
   type SeatKnowledge,
 } from '../../lib/roomDock';
+import { en, type Messages } from '../../i18n/en';
+import { fmt, useCopy } from '../../i18n';
 
 interface RemembersPanelProps {
   /** The conversation on screen. */
@@ -18,8 +20,10 @@ interface RemembersPanelProps {
 }
 
 /** What the panel says when a read fails and the Core gave no plain reason of its own. */
-export const readFailedSentence = (name: string): string =>
-  `What ${name} remembers could not be read.`;
+export const readFailedSentence = (
+  name: string,
+  copy: Messages['dock']['remembers'] = en.dock.remembers,
+): string => fmt(copy.readFailed, { name });
 
 /**
  * What a clone remembers, as plain sentences (#1357, #1401).
@@ -46,17 +50,18 @@ export const RemembersPanel: React.FC<RemembersPanelProps> = ({
 }) => {
   const url = roomId && seatId ? roomDockUrls.knowledge(roomId, seatId) : null;
   const { data, fault } = useRoomRead<SeatKnowledge>(url, refreshKey);
-  const name = seatName || seatId || 'This clone';
+  const t = useCopy().dock.remembers;
+  const name = seatName || seatId || t.thisClone;
 
-  const loadingSentence = `Reading what ${name} remembers…`;
+  const loadingSentence = fmt(t.loading, { name });
   const reason = !roomId
-    ? 'No conversation is open. Open one from the rail to see what its clones remember.'
+    ? t.noRoom
     : !seatId
-      ? 'No clone is seated in this conversation yet, so there is nobody to ask.'
+      ? t.noSeat
       : fault
         ? // The Core's own plain words where it gave them; otherwise a sentence of ours.
           // Never the transport's ("Failed to fetch", a status line).
-          (fault.detail ?? readFailedSentence(name))
+          (fault.detail ?? readFailedSentence(name, t))
         : !data
           ? loadingSentence
           : null;
@@ -67,7 +72,9 @@ export const RemembersPanel: React.FC<RemembersPanelProps> = ({
         <BookOpen className="w-4 h-4 text-cyan-300" />
       </div>
       <div className="min-w-0">
-        <h2 className="text-xs font-bold text-white">What {seatId ? name : 'the clone'} remembers</h2>
+        <h2 className="text-xs font-bold text-white">
+          {fmt(t.title, { name: seatId ? name : t.theClone })}
+        </h2>
       </div>
     </div>
   );
@@ -89,13 +96,13 @@ export const RemembersPanel: React.FC<RemembersPanelProps> = ({
 
   const saved = data.saved_facts ?? null;
   const savedNote =
-    data.saved_facts_reason ?? (saved === null ? `${name}'s saved facts are not listed.` : null);
+    data.saved_facts_reason ?? (saved === null ? fmt(t.savedNotListed, { name }) : null);
   const remembers = data.remembers ?? [];
   // The Core's reason; without one, only that the list is empty -- a list the head was not
   // told the cause of is not "remembers nothing".
   const knownNote =
     remembers.length === 0
-      ? (data.reason ?? `No remembered statements are listed for ${name}.`)
+      ? (data.reason ?? fmt(t.noneKnown, { name }))
       : data.reason;
 
   return (
@@ -103,7 +110,7 @@ export const RemembersPanel: React.FC<RemembersPanelProps> = ({
       {header}
       <div className="flex-1 overflow-y-auto min-h-0 space-y-4 pr-1">
         <section data-testid="remembers-saved" className="space-y-1.5">
-          <h3 className="text-[11px] font-semibold text-slate-300">Saved to memory</h3>
+          <h3 className="text-[11px] font-semibold text-slate-300">{t.savedHeading}</h3>
           {saved && saved.length > 0 && (
             <ul className="space-y-1.5">
               {saved.map((f, i) => (
@@ -114,7 +121,7 @@ export const RemembersPanel: React.FC<RemembersPanelProps> = ({
                 >
                   <span className="flex-1 min-w-0 break-words">{f.statement}</span>
                   {f.saved_here && (
-                    <span className="shrink-0 text-[10px] text-slate-400">saved in this conversation</span>
+                    <span className="shrink-0 text-[10px] text-slate-400">{t.savedHere}</span>
                   )}
                 </li>
               ))}
@@ -128,7 +135,7 @@ export const RemembersPanel: React.FC<RemembersPanelProps> = ({
         </section>
 
         <section data-testid="remembers-known" className="space-y-1.5">
-          <h3 className="text-[11px] font-semibold text-slate-300">Known in this conversation</h3>
+          <h3 className="text-[11px] font-semibold text-slate-300">{t.knownHeading}</h3>
           {remembers.length > 0 && (
             <ul className="space-y-1.5">
               {remembers.map((r, i) => (
@@ -141,10 +148,10 @@ export const RemembersPanel: React.FC<RemembersPanelProps> = ({
                   {r.learned && (
                     <span
                       className="shrink-0 inline-flex items-center gap-1 text-[10px] text-slate-400"
-                      title="Worked out from other things it knew, rather than told"
+                      title={t.workedOutTitle}
                     >
                       <Lightbulb className="w-3 h-3" />
-                      worked out
+                      {t.workedOut}
                     </span>
                   )}
                 </li>

@@ -275,7 +275,7 @@ class TestAFailedTurnLeavesNothingInTheSeat:
 
         Killed by: src/uclone_x/room/orchestrator.py :: rollback_error = None if committed else self._roll_back_seat(agent, speaker, checkpoint)
         Becomes: rollback_error = None
-        Killed by: src/uclone_x/agent/base.py :: live.messages = list(checkpoint.messages)
+        Killed by: src/uclone_x/agent/session_lifecycle.py :: live.messages = list(checkpoint.messages)
         Becomes: pass
         """
         llm = _Script(
@@ -347,7 +347,7 @@ class TestAFailedTurnLeavesNothingInTheSeat:
         request exactly: the next `REQUEST_CONTEXT` records the rewind as a shorter kept
         prefix, not as a gap.
 
-        Killed by: src/uclone_x/agent/base.py :: "type": "TURN_ROLLED_BACK",
+        Killed by: src/uclone_x/agent/session_lifecycle.py :: "type": "TURN_ROLLED_BACK",
         Becomes: "type": "TURN_UNDONE",
         """
         sessions = SessionStore(tmp_path / "sessions")
@@ -435,9 +435,9 @@ class TestTheAgentDropsAnUnansweredStep:
     ) -> None:
         """Stop in a one-to-one chat: the question stays, the half step goes.
 
-        Killed by: src/uclone_x/agent/base.py :: del turn_messages[dangling_index:]
+        Killed by: src/uclone_x/agent/turn_executor.py :: del turn_messages[dangling_index:]
         Becomes: pass
-        Killed by: src/uclone_x/agent/base.py :: return (index, missing) if missing else None
+        Killed by: src/uclone_x/agent/turn_executor.py :: return (index, missing) if missing else None
         Becomes: return None
         """
         held = _HeldTool()
@@ -463,7 +463,7 @@ class TestTheAgentDropsAnUnansweredStep:
     ) -> None:
         """Only an unanswered step is dropped: a completed round is a real exchange.
 
-        Killed by: src/uclone_x/agent/base.py :: return (index, missing) if missing else None
+        Killed by: src/uclone_x/agent/turn_executor.py :: return (index, missing) if missing else None
         Becomes: return (index, missing)
         """
         agent = _seat(
@@ -570,7 +570,7 @@ class TestACompletedTurnKeepsItsAnswer:
         as an unanswered step, so the room's transcript kept the answer while the seat's
         own history ended on the question -- and its next turn was asked it again.
 
-        Killed by: src/uclone_x/agent/base.py :: kept_text = outcome == "completed" and bool(asked.content)
+        Killed by: src/uclone_x/agent/turn_executor.py :: kept_text = outcome == "completed" and bool(asked.content)
         Becomes: kept_text = False
         """
         sessions = SessionStore(tmp_path / "sessions")
@@ -620,7 +620,7 @@ class TestARetryIsToldWhatTheUndoneAttemptRan:
     async def test_the_retry_names_the_call_the_failed_attempt_made(self, tmp_path: Path) -> None:
         """A retry after a rollback sees which tool already ran, without its output.
 
-        Killed by: src/uclone_x/agent/base.py :: live.undone_tool_calls.extend(undone)
+        Killed by: src/uclone_x/agent/session_lifecycle.py :: live.undone_tool_calls.extend(undone)
         Becomes: pass
         """
         sessions = SessionStore(tmp_path / "sessions")
@@ -651,7 +651,7 @@ class TestARetryIsToldWhatTheUndoneAttemptRan:
     ) -> None:
         """The retry that stayed is in history now; later turns are not told again.
 
-        Killed by: src/uclone_x/agent/base.py :: turn_live.undone_tool_calls.clear()
+        Killed by: src/uclone_x/agent/turn_executor.py :: turn_live.undone_tool_calls.clear()
         Becomes: pass
         """
         llm = _Script(
@@ -676,7 +676,7 @@ class TestARetryIsToldWhatTheUndoneAttemptRan:
         So the calls cannot be read back off the pending queue; the turn keeps them on
         the live session for the rollback to name.
 
-        Killed by: src/uclone_x/agent/base.py :: turn_live.last_turn_tool_calls = all_tool_calls[
+        Killed by: src/uclone_x/agent/turn_executor.py :: turn_live.last_turn_tool_calls = all_tool_calls[
         Becomes: turn_live.last_turn_tool_calls = [] and all_tool_calls[
         """
         llm = _Script([_call("c1", "note"), "noted it", "again"])
@@ -704,7 +704,7 @@ class TestUndoneCallsAreNotMatchedByProviderIds:
     ) -> None:
         """Attempt one runs `note` as `call_0`, attempt two runs `memo` as `call_0`.
 
-        Killed by: src/uclone_x/agent/base.py :: live.undone_tool_calls.extend(undone)
+        Killed by: src/uclone_x/agent/session_lifecycle.py :: live.undone_tool_calls.extend(undone)
         Becomes: live.undone_tool_calls.extend(call for call in undone if call.id not in {c.id for c in live.undone_tool_calls})
         """
         llm = _Script(
@@ -737,7 +737,7 @@ class TestUndoneCallsAreNotMatchedByProviderIds:
         The retry is told about both calls, and about the withheld one once: the
         rollback leaves out the calls the refusal already stated, by position.
 
-        Killed by: src/uclone_x/agent/base.py :: : len(all_tool_calls) - withheld_calls
+        Killed by: src/uclone_x/agent/turn_executor.py :: : len(all_tool_calls) - withheld_calls
         Becomes: : len(all_tool_calls)
         """
         from uclone_x.core.tool_results import STEP_OVER_WINDOW_MESSAGE
@@ -769,7 +769,7 @@ class TestUndoneCallsAreNotMatchedByProviderIds:
         also as `call_0`, and that step is refused and withheld while `note` is still
         waiting to be stated. The next retry is told about both.
 
-        Killed by: src/uclone_x/agent/base.py :: live.undone_tool_calls.extend(withheld)
+        Killed by: src/uclone_x/agent/turn_executor.py :: live.undone_tool_calls.extend(withheld)
         Becomes: live.undone_tool_calls.extend(call for call in withheld if call.id not in {c.id for c in live.undone_tool_calls})
         """
         from uclone_x.core.tool_results import STEP_OVER_WINDOW_MESSAGE

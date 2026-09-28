@@ -35,6 +35,25 @@ class SkillProtocol(Protocol):
         ...
 
 
+class SkillStoreProtocol(Protocol):
+    """Where a registry's approved skills come from, so the registry need not be a folder (#1733).
+
+    A store hands back each skill it holds that is marked active, paired with the audit
+    report that approves it; the registry still admits each one only through `register`,
+    so a store cannot activate a skill without an approving report. Only the filesystem
+    store (`FileSystemSkillStore`) binds that report to the content: it audits every
+    package's current bytes as it loads. A store with no files to audit, such as
+    `InMemorySkillStore`, returns the reports it was given and ignores `auditor`, so it is
+    trusted host code -- `register` compares the hashes it hands over, not the content.
+    """
+
+    async def load_approved(
+        self, auditor: SkillAuditorProtocol | None = None
+    ) -> tuple[tuple[SkillProtocol, SkillAuditReport], ...]:
+        """Every active skill in the store with the report approving it; a dropped one is logged."""
+        ...
+
+
 @runtime_checkable
 class SkillRegistryProtocol(Protocol):
     """Protocol for hot-reloading skill discovery and runtime management."""
@@ -79,7 +98,11 @@ class SkillRegistryProtocol(Protocol):
         skills_dir: Path | None = None,
         auditor: SkillAuditorProtocol | None = None,
     ) -> tuple[SkillProtocol, ...]:
-        """Scan skills_dir on disk, audit all packages, and hot-reload approved ones into the registry."""
+        """Hot-reload the approved skills into the registry.
+
+        From `skills_dir` on disk when one is given, else from the registry's own
+        `SkillStoreProtocol` store (#1733); a registry with neither loads nothing.
+        """
         ...
 
 

@@ -5,8 +5,12 @@ import {
   detectKeyProvider,
   validateKeyFormat,
   isCloudProvider,
-  getCuratedModels,
+  describeKeyProblem,
+  PROVIDER_REGISTRY,
 } from './providerRegistry';
+import { en } from '../i18n/en';
+import { ko } from '../i18n/ko';
+import { fmt } from '../i18n/format';
 
 describe('providerRegistry', () => {
   describe('sanitizeApiKey', () => {
@@ -49,15 +53,16 @@ describe('providerRegistry', () => {
     });
   });
 
-  describe('getCuratedModels', () => {
-    it('returns curated models for gemini, openai, and anthropic', () => {
-      expect(getCuratedModels('gemini')).toContain('gemini-1.5-pro');
-      expect(getCuratedModels('openai')).toContain('gpt-4o');
-      expect(getCuratedModels('anthropic')).toContain('claude-3-5-sonnet-20241022');
-    });
-
-    it('returns empty array for local providers', () => {
-      expect(getCuratedModels('ollama')).toEqual([]);
+  describe('no model ids (#1631)', () => {
+    // A model id in the registry is a fact about a provider's catalogue on some date, and
+    // every one written here had been retired by the time it was read. The picker takes its
+    // ids from the provider's own listing, so the registry must hold none.
+    it('carries no default or curated model for any cloud provider', () => {
+      for (const meta of Object.values(PROVIDER_REGISTRY)) {
+        expect(JSON.stringify(meta)).not.toMatch(/gemini-\d|claude-\w+-\d|gpt-\d|\bo\d-/);
+        expect(meta).not.toHaveProperty('defaultModel');
+        expect(meta).not.toHaveProperty('curatedModels');
+      }
     });
   });
 
@@ -97,14 +102,16 @@ describe('providerRegistry', () => {
     it('warns when an OpenAI key is entered for Gemini', () => {
       const res = validateKeyFormat('gemini', 'sk-proj-12345678901234567890');
       expect(res.valid).toBe(false);
-      expect(res.warning).toContain('OpenAI');
+      expect(res.problem).toBe('otherProvider');
+      expect(res.detectedProvider).toBe('openai');
     });
 
     it('warns when a Gemini key is entered for Anthropic', () => {
       const key = 'AIzaSy' + 'A'.repeat(33);
       const res = validateKeyFormat('anthropic', key);
       expect(res.valid).toBe(false);
-      expect(res.warning).toContain('Gemini');
+      expect(res.problem).toBe('otherProvider');
+      expect(res.detectedProvider).toBe('gemini');
     });
 
     it('validates a correct Anthropic key format', () => {
@@ -115,6 +122,36 @@ describe('providerRegistry', () => {
     it('validates a correct OpenAI key format', () => {
       const key = 'sk-proj-' + 'x'.repeat(30);
       expect(validateKeyFormat('openai', key).valid).toBe(true);
+    });
+  });
+
+  describe('describeKeyProblem', () => {
+    const gemini = PROVIDER_REGISTRY.gemini;
+
+    it('names both providers when the key belongs to another one', () => {
+      const res = validateKeyFormat('gemini', 'sk-proj-12345678901234567890');
+      expect(describeKeyProblem(res, gemini, en.settings.apiKey)).toBe(
+        'This looks like a OpenAI key. Check that it is a Google Gemini key.',
+      );
+    });
+
+    it('names the prefix a key lacks', () => {
+      const res = validateKeyFormat('gemini', 'nothing-like-a-key');
+      expect(describeKeyProblem(res, gemini, en.settings.apiKey)).toBe(
+        "A Google Gemini key starts with 'AIzaSy'.",
+      );
+    });
+
+    it('words the problem in the catalog it is given', () => {
+      const res = validateKeyFormat('gemini', 'AIzaSy-too-short');
+      expect(res.problem).toBe('badPattern');
+      expect(describeKeyProblem(res, gemini, ko.settings.apiKey)).toBe(
+        fmt(ko.settings.apiKey.badPattern, { name: 'Google Gemini' }),
+      );
+    });
+
+    it('says nothing about a valid key', () => {
+      expect(describeKeyProblem({ valid: true }, gemini, en.settings.apiKey)).toBeNull();
     });
   });
 });

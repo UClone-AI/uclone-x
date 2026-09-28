@@ -28,8 +28,8 @@ describe('CloneProfile (#1300)', () => {
     expect(screen.getByTestId('clone-profile-avatar')).toBeInTheDocument();
   });
 
-  // Killed by: frontend/src/components/clones/CloneProfile.tsx :: {persona?.role || 'No role set'}
-  // Becomes: {persona?.role ?? 'No role set'}
+  // Killed by: frontend/src/components/clones/CloneProfile.tsx :: {persona?.role || t.noRole}
+  // Becomes: {persona?.role ?? t.noRole}
   it('says a clone has no role rather than leaving the line blank', () => {
     render(
       <CloneProfile
@@ -55,7 +55,7 @@ describe('CloneProfile (#1300)', () => {
     expect(onStartConversation).toHaveBeenCalledWith('reader');
   });
 
-  // Killed by: frontend/src/components/clones/CloneProfile.tsx ::         <PersonaDetail persona={persona} toolsNeedingConversation={toolsNeedingConversation} />
+  // Killed by: frontend/src/components/clones/CloneProfile.tsx ::         <PersonaDetail persona={persona} />
   // Becomes:         <></>
   it('carries the two permissions a clone is trusted with, as sentences', () => {
     // These moved here from the rail row. They are the fields that are safety boundaries
@@ -79,7 +79,7 @@ describe('CloneProfile (#1300)', () => {
     );
   });
 
-  // Killed by: frontend/src/components/clones/CloneProfile.tsx ::           Nothing is installed under this name, so there is no description, model or tool list
+  // Killed by: frontend/src/components/clones/CloneProfile.tsx ::           {t.noDefinition}
   // Becomes:           {''}
   it('says why a running clone with no file behind it shows no settings', () => {
     // The rail builds a row from a live instance too, and an instance can outlive the file it

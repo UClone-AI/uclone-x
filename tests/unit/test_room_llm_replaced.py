@@ -71,7 +71,7 @@ def test_a_conversation_first_used_with_no_model_answers_once_one_is_chosen(
     Becomes:
     Killed by: src/uclone_x/ui/app.py :: listener(new_llm)
     Becomes: pass
-    Killed by: src/uclone_x/room/resolver.py :: self._host = dataclasses.replace(self._host, llm=llm)
+    Killed by: src/uclone_x/room/resolver.py :: self._app = self._app.with_llm(llm)
     Becomes: pass
     """
     stack, mgr = _stack(tmp_path, llm=None)
@@ -91,8 +91,8 @@ def test_a_conversation_first_used_with_no_model_answers_once_one_is_chosen(
 def test_a_seat_already_speaking_moves_to_the_new_connector(tmp_path: Path) -> None:
     """A seat built before the change is the same live agent afterwards, on the new connector.
 
-    Killed by: src/uclone_x/room/resolver.py :: agent.hot_reload_llm(llm)
-    Becomes: pass
+    Killed by: src/uclone_x/room/resolver.py :: agent.hot_reload_llm(
+    Becomes: (lambda *_a, **_k: None)(
     """
     first = MockLLMConnector()
     stack, mgr = _stack(tmp_path, llm=first)
@@ -110,8 +110,8 @@ def test_a_seat_already_speaking_moves_to_the_new_connector(tmp_path: Path) -> N
 def test_a_conversation_that_routes_by_model_routes_with_the_new_one(tmp_path: Path) -> None:
     """The routing model is built from the connector too, and has to follow it.
 
-    Killed by: src/uclone_x/ui/rooms.py :: build_selector_chain(state.policy, provider=llm)
-    Becomes: build_selector_chain(state.policy, provider=None)
+    Killed by: src/uclone_x/ui/rooms.py :: state.policy, provider=llm, default_model=self._session_mgr.fast_model
+    Becomes: state.policy, provider=None, default_model=self._session_mgr.fast_model
     """
     first = MockLLMConnector()
     stack, mgr = _stack(tmp_path, llm=first)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import hashlib
 import ipaddress
 import json
@@ -11,7 +12,6 @@ import logging
 import os
 import re
 import subprocess
-import uuid
 from collections.abc import (
     AsyncGenerator,
     AsyncIterator,
@@ -22,7 +22,6 @@ from collections.abc import (
 )
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
-from enum import StrEnum
 from pathlib import Path
 from typing import Any, cast
 from urllib.parse import urlparse
@@ -51,13 +50,17 @@ except ImportError as exc:
 from uclone_x import __version__
 from uclone_x.acp import AcpConformanceReport, conformance_summary
 from uclone_x.agent.base import BaseAgent
+from uclone_x.agent.clone_builder import AppScope, build_clone, provider_tool_binder
 from uclone_x.agent.models import (
-    AgentConfig,
-    AgentContext,
-    AgentLLMConfig,
-    AgentState,
     PersonaDefinition,
-    TurnResult,
+)
+from uclone_x.agent.persona_avatar import (
+    AVATAR_FORMATS,
+    MAX_AVATAR_BYTES,
+    AvatarPersonaNotFound,
+    AvatarRefused,
+    PersonaAvatarStore,
+    avatar_url,
 )
 from uclone_x.agent.persona_registry import PersonaRegistry, split_appended_default_prompt
 from uclone_x.agent.session import (
@@ -69,7 +72,6 @@ from uclone_x.agent.session import (
     resolve_session_path,
     verify_record_identity,
 )
-from uclone_x.core.agent_home import AgentHomeError
 from uclone_x.core.diagnostic_report import (
     issue_url,
     render_report,
@@ -84,7 +86,6 @@ from uclone_x.core.failure_journal import (
     journal_path,
     read_consent,
     read_journal,
-    record_failure,
     set_consent,
 )
 from uclone_x.core.immutable import unwrap_immutable
@@ -99,61 +100,76 @@ from uclone_x.core.session_diagnostics import (
 from uclone_x.engine.event_bus import (
     AgentEvent,
     EventBus,
-    EventPriority,
     EventSource,
     EventType,
     SubscriptionClosedError,
 )
 from uclone_x.errors import (
-    LLMCredentialsNotConfiguredError,
     LLMProviderError,
-    LLMProviderNotConfiguredError,
     LLMTimeoutError,
     PathTraversalError,
+    PlainRefusalError,
     SessionHistoryRehydrationError,
-    SessionIdCollisionError,
-    SessionMutationDuringTurnError,
-    SessionStoreNotConfiguredError,
-    StaleSessionWriteError,
 )
 from uclone_x.evaluation import (
     EvalBackendUnavailableError,
     create_eval_runner,
     default_reports_dir,
 )
+from uclone_x.i18n import DEFAULT_UI_LANGUAGE, UI_LANGUAGES, UiLanguage, is_ui_language
 from uclone_x.llm import create_llm_connector
 from uclone_x.llm.budget import TokenBudgetManager
-from uclone_x.llm.connectors.factory import saved_choice_in_effect
+from uclone_x.llm.catalog import (
+    CatalogCache,
+    CatalogEntry,
+    CatalogResult,
+    Lister,
+    key_fingerprint,
+    read_catalog,
+)
+from uclone_x.llm.connectors.anthropic import AnthropicConnector
+from uclone_x.llm.connectors.base import BaseLLMConnector
+from uclone_x.llm.connectors.factory import bind_image_engine_settings, saved_choice_in_effect
+from uclone_x.llm.connectors.gemini import GeminiConnector
 from uclone_x.llm.connectors.ollama import (
     delete_model,
     pull_model,
     resolve_ollama_base_url,
-    resolve_ollama_model,
 )
+from uclone_x.llm.connectors.openai import OpenAIConnector
 from uclone_x.llm.connectors.saved_choice import (
+    LLM_MODEL_FAST_KEY,
     SETTINGS_FILE_NAME,
-    key_owner,
+    api_key_for,
+    delete_api_key,
     same_provider,
+    save_api_key,
+    settings_data,
     update_settings_file,
 )
 from uclone_x.llm.connectors.vllm import (
-    VLLM_MODEL_ENV_VAR,
     has_configured_vllm_endpoint,
     resolve_vllm_base_url,
-    resolve_vllm_model,
 )
+from uclone_x.llm.model_policy import recommend
 from uclone_x.llm.models import (
     ChatMessage,
     LLMRequest,
     MessageRole,
-    TokenCountSource,
-    TokenUsage,
     ToolCallRequest,
 )
 from uclone_x.llm.protocols import LLMProviderProtocol
+from uclone_x.llm.providers import (
+    PROVIDERS,
+    canonical_provider,
+    env_key,
+    env_model,
+    spec_for,
+)
+from uclone_x.llm.usage.gate import UsageGate
+from uclone_x.llm.usage.store import USAGE_FILE_NAME
 from uclone_x.memory.store import CrossSessionMemory, default_cross_session_memory
 from uclone_x.ontology.engine import OntologyEngine
-from uclone_x.room.models import turn_refusal
 from uclone_x.room.service import (
     SESSION_ID_PREFIX as _ROOM_SESSION_PREFIX,
 )
@@ -162,14 +178,24 @@ from uclone_x.room.service import (
 )
 from uclone_x.sandbox.path_validator import PathValidator
 from uclone_x.shells.ui_process import UI_BIND_HOST_ENV_VAR
-from uclone_x.skills.auditor import SkillRegistry
+from uclone_x.skills.auditor import (
+    SkillRegistry,
+    load_approved_skills,
+    runtime_skill_store_dir,
+)
 from uclone_x.telemetry.tracer import TelemetryTracer
-from uclone_x.tools.base import tool_needs_room
+from uclone_x.tools.base import replace_file
 from uclone_x.tools.builtin.comfy_client import (
     DEFAULT_COMFYUI_BASE_URL,
     ComfyClient,
 )
 from uclone_x.tools.builtin.comfy_image_tool import ComfyImageGenTool
+from uclone_x.tools.builtin.image import (
+    IMAGE_ENGINE_KEY,
+    IMAGE_MODEL_KEY,
+    parse_image_engine_setting,
+    parse_image_model,
+)
 from uclone_x.tools.mcp_manager import (
     DuplicateServerError,
     MCPServerManager,
@@ -178,16 +204,9 @@ from uclone_x.tools.mcp_manager import (
 )
 from uclone_x.tools.protocols import ToolRegistryProtocol
 from uclone_x.tools.registry import create_default_registry
+from uclone_x.tools.tool_binder import ToolBinder
 from uclone_x.ui.knowledge import knowledge_graph
 from uclone_x.ui.single_flight import SingleFlight
-
-OFFLINE_LLM_DIAGNOSTIC_MESSAGE: str = (
-    "⚠️ No active LLM provider connected.\n\n"
-    "Pick a model in Settings: a local one through Ollama ('ollama serve'), "
-    "or an API key for OpenAI, Anthropic or Gemini.\n"
-    "From a terminal, 'ucx llm status' reports what is reachable."
-)
-
 
 logger = logging.getLogger(__name__)
 _console = Console()
@@ -231,98 +250,20 @@ def get_git_commit() -> str:
     return "dev"
 
 
-def _translate_session_error(exc: Exception) -> HTTPException:
-    """Map a Core session failure onto the HTTP status that describes it.
-
-    Every route used to catch `PathTraversalError` for its 400 and let everything else
-    reach Starlette as a **bare 500 with no body**, which is the wrong answer twice over
-    for the one that matters: a mid-turn reset is a *conflict* — the caller can retry
-    when the turn finishes — and a 500 says the server is broken and gives the frontend
-    nothing to say. The refusal was implemented in the Core and then not translated at
-    the boundary, so from a client's point of view it did not exist.
-    """
-    if isinstance(exc, (LLMProviderNotConfiguredError, LLMCredentialsNotConfiguredError)):
-        # Not a session fault. Reaching this translator at all is an artefact of the
-        # broad handlers that wrap session loading; without a branch it fell through
-        # to a 500 labelled "Session operation failed", naming the wrong subsystem for
-        # a condition the caller can act on (P6).
-        return HTTPException(status_code=503, detail=str(exc))
-    if isinstance(exc, AgentHomeError):
-        # 400, and not the "Session operation failed" 500 it fell through to: the agent
-        # id is supplied by the client, the rule it broke is stated in the message, and a
-        # caller that can fix the request should not be told the server is broken. It is
-        # also not a session fault — naming that subsystem is the mis-attribution P6
-        # forbids.
-        return HTTPException(status_code=400, detail=str(exc))
-    if isinstance(exc, PathTraversalError):
-        return HTTPException(status_code=400, detail=str(exc))
-    if isinstance(exc, SessionIdCollisionError):
-        # 409, not 400: the request is well-formed and the id is legal (#256 states the P3
-        # guard is not implicated). What makes it unserviceable is the *current state of
-        # the store* — another session already occupies the one filename this filesystem
-        # gives both ids — which is exactly what 409 Conflict describes. A 400 would tell
-        # the frontend the id was malformed, and it is not.
-        return HTTPException(status_code=409, detail=str(exc))
-    if isinstance(exc, SessionMutationDuringTurnError):
-        # 409: the request is well-formed and legal, just not right now.
-        return HTTPException(status_code=409, detail=str(exc))
-    if isinstance(exc, SessionHistoryRehydrationError):
-        return HTTPException(status_code=422, detail=str(exc))
-    if isinstance(exc, SessionStoreNotConfiguredError):
-        return HTTPException(status_code=500, detail=str(exc))
-    if isinstance(exc, OSError):
-        return HTTPException(
-            status_code=500,
-            detail=f"Session storage is unwritable or unreadable: {exc}",
-        )
-    return HTTPException(status_code=500, detail=f"Session operation failed: {exc}")
-
-
-def _is_offline_llm_error(error: Exception | str | None) -> bool:
-    """Check if an error string or exception indicates an offline, unreachable, or misconfigured LLM provider."""
-    if error is None:
-        return False
-    err_str = str(error).lower()
-    # If the provider responded with 404 or model not found, the server is ONLINE and responding.
-    # Disguising a missing model as an offline provider creates false diagnostics (P6, P8).
-    if "not found" in err_str or "404" in err_str:
-        return False
-    if isinstance(
-        error,
-        (LLMProviderError, LLMProviderNotConfiguredError, LLMCredentialsNotConfiguredError),
-    ):
-        # An unconfigured provider is an LLM condition, not a transport one. It gates the
-        # same diagnostic, which is the only text naming `ollama serve` and
-        # `ucx llm status` — without this the refusal is less actionable than the
-        # connection error it replaced.
-        return True
-    keywords = (
-        "failed to connect",
-        "connection refused",
-        "connecterror",
-        "connecttimeout",
-        "request error",
-        "unreachable",
-        "no active llm provider",
-        "all connection attempts failed",
-        "unsupported llm provider",
-        "ollama provider returned",
-        "errno 61",
-        "errno 111",
-        "llmprovidererror",
-        "model 'default' not found",
-    )
-    return any(kw in err_str for kw in keywords)
-
-
-def vllm_request_headers(api_key: str | None = None) -> dict[str, str]:
+def vllm_request_headers(
+    api_key: str | None = None, *, env_fallback: bool = True
+) -> dict[str, str]:
     """`Authorization` only when a key exists, because `vllm serve --api-key` is optional.
 
     An empty bearer is not the same as no header: a server started without `--api-key`
     accepts the request either way, but one behind a proxy that reads the header rejects
     `Bearer ` with a 401 that describes a credential nobody configured (#385).
+
+    `env_fallback=False` sends only the key passed in: for an address typed on the form, which
+    must not receive the key held for the saved server (#1666).
     """
-    key = (api_key or os.getenv("VLLM_API_KEY") or "").strip()
+    env_key = os.getenv("VLLM_API_KEY") if env_fallback else None
+    key = (api_key or env_key or "").strip()
     return {"Authorization": f"Bearer {key}"} if key else {}
 
 
@@ -350,59 +291,163 @@ def vllm_model_ids(payload: object) -> list[str]:
     return ids
 
 
-async def fetch_available_models(
+class LocalKeyRefusedError(Exception):
+    """A local server answered 401 or 403: it is running, and it refused the key (#1672).
+
+    Raised by `list_local_models` only when asked to, so the form can say "the server refused
+    the key" rather than "no model list came back", which sends the user to look for a
+    stopped server that is not stopped.
+    """
+
+
+#: The statuses that mean the server is there and turned the key away.
+_KEY_REFUSED_STATUSES = frozenset({401, 403})
+
+
+async def list_local_models(
     provider: str,
     base_url: str | None = None,
     timeout: float = 3.0,
-) -> list[str]:
-    """Enumerate installed or supported models for the provider (P0/Recognition over Recall)."""
+    *,
+    vllm_headers: dict[str, str] | None = None,
+    raise_on_refused_key: bool = False,
+) -> list[str] | None:
+    """The models a local server has installed, or None when no listing came back (#1666).
+
+    None and `[]` are different answers, and Settings says different things for them: no
+    listing (nothing answered, or something that is not this server did) names a stopped
+    server or a wrong address, where an empty list names an install
+    the user has not done yet. `fetch_available_models` folds the two together.
+
+    `vllm_headers` replaces the default ones, which carry `VLLM_API_KEY`; see `preview_catalog`.
+    With `raise_on_refused_key`, a vLLM server's 401 or 403 raises `LocalKeyRefusedError`
+    instead of reading as no listing.
+    """
     clean_provider = provider.strip().lower()
     if clean_provider == "ollama":
         ollama_url = (base_url or "").strip() or resolve_ollama_base_url()
         try:
             async with httpx.AsyncClient(timeout=timeout) as http_c:
                 resp = await http_c.get(f"{ollama_url.rstrip('/')}/api/tags")
-                if resp.status_code == 200:
-                    data_obj: object = resp.json()
-                    models: list[str] = []
-                    if isinstance(data_obj, dict):
-                        raw_models = cast(dict[str, Any], data_obj).get("models")
-                        if isinstance(raw_models, list):
-                            for item in cast(list[object], raw_models):
-                                if isinstance(item, dict):
-                                    name_val = cast(dict[str, Any], item).get("name")
-                                    if name_val is not None:
-                                        models.append(str(name_val))
-                    return models
+                if resp.status_code != 200:
+                    return None  # something answered, but not Ollama's listing
+                data_obj: object = resp.json()
+                models: list[str] = []
+                if isinstance(data_obj, dict):
+                    raw_models = cast(dict[str, Any], data_obj).get("models")
+                    if isinstance(raw_models, list):
+                        for item in cast(list[object], raw_models):
+                            if isinstance(item, dict):
+                                name_val = cast(dict[str, Any], item).get("name")
+                                if name_val is not None:
+                                    models.append(str(name_val))
+                return models
         except Exception as exc:
             logger.debug("Failed to query Ollama tags from %s: %s", ollama_url, exc)
-            return []
-    elif clean_provider == "vllm":
+            return None
+    if clean_provider == "vllm":
         if not has_configured_vllm_endpoint(base_url):
             # An unconfigured endpoint is not an empty inventory. Probing vLLM's documented
             # default port to fill the dropdown would be this module guessing where the
             # operator's server is, and reporting a refused connection as "no models" (P6).
-            return []
+            return None
         vllm_url = resolve_vllm_base_url(base_url)
+        listing_url = f"{vllm_url.rstrip('/')}/models"
+        refused = False
         try:
             async with httpx.AsyncClient(timeout=timeout) as http_c:
                 resp = await http_c.get(
-                    f"{vllm_url.rstrip('/')}/models", headers=vllm_request_headers()
+                    listing_url,
+                    headers=vllm_request_headers() if vllm_headers is None else vllm_headers,
                 )
                 if resp.status_code == 200:
                     return vllm_model_ids(resp.json())
+                refused = resp.status_code in _KEY_REFUSED_STATUSES
         except Exception as exc:
             logger.debug("Failed to query vLLM models from %s: %s", vllm_url, exc)
-            return []
-    elif clean_provider == "openai":
-        return ["gpt-4o", "gpt-4o-mini", "o1-mini", "o3-mini"]
-    elif clean_provider == "anthropic":
-        return ["claude-3-5-sonnet-20241022", "claude-3-5-haiku-20241022", "claude-3-opus-20240229"]
-    elif clean_provider in ("gemini", "google"):
-        return ["gemini-1.5-pro", "gemini-1.5-flash", "gemini-2.0-flash"]
-    elif clean_provider == "mock":
+            return None
+        if refused and raise_on_refused_key:
+            raise LocalKeyRefusedError(vllm_url)
+        return None
+    if clean_provider == "mock":
         return ["mock-gpt-4o", "mock-llm"]
-    return []
+    return None
+
+
+async def fetch_available_models(
+    provider: str,
+    base_url: str | None = None,
+    timeout: float = 3.0,
+) -> list[str]:
+    """Enumerate the models a local server has installed (P0/Recognition over Recall).
+
+    The cloud providers are not answered here: their models come from each provider's own
+    listing, through `read_provider_catalog` (#1631). The remembered lists this function
+    returned for them had retired models in them.
+    """
+    return await list_local_models(provider, base_url, timeout) or []
+
+
+#: The providers whose installed models Settings lists from the server itself (#1666).
+LOCAL_LISTING_PROVIDERS = frozenset({"ollama", "vllm"})
+
+CatalogConnector = type[OpenAIConnector] | type[AnthropicConnector] | type[GeminiConnector]
+
+#: The cloud providers whose own model listing Settings shows (#1631): the settings id, the
+#: connector that reads the listing, and the name the user holds the key with.
+CATALOG_PROVIDERS: dict[str, tuple[str, CatalogConnector, str]] = {
+    "openai": ("openai", OpenAIConnector, "OpenAI"),
+    "anthropic": ("anthropic", AnthropicConnector, "Anthropic"),
+    "gemini": ("gemini", GeminiConnector, "Google"),
+    "google": ("gemini", GeminiConnector, "Google"),
+}
+
+#: A listing takes one request per page; Settings waits for it before the picker fills.
+_CATALOG_TIMEOUT_SECONDS = 10.0
+
+
+async def read_provider_catalog(
+    provider: str,
+    *,
+    base_url: str | None,
+    api_key: str | None,
+    cache: CatalogCache,
+) -> CatalogResult | None:
+    """The provider's own model listing for this key and endpoint, or None for a local server.
+
+    A live listing is reused from `cache` until it expires; anything else is asked again, so
+    a fixed key or network shows on the next open (`CatalogCache`).
+    """
+    spec = CATALOG_PROVIDERS.get(provider.strip().lower())
+    if spec is None:
+        return None
+    settings_id, connector_cls, display_provider = spec
+    endpoint = (base_url or "").strip() or None
+    cache_key = (settings_id, endpoint or "", key_fingerprint(api_key))
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    lister: Lister | None = None
+    if api_key and api_key.strip():
+        key = api_key.strip()
+
+        async def list_models() -> list[CatalogEntry]:
+            connector = connector_cls(
+                api_key=key, base_url=endpoint, timeout=_CATALOG_TIMEOUT_SECONDS
+            )
+            return await connector.list_models()
+
+        lister = list_models
+
+    result = await read_catalog(
+        provider=settings_id,
+        display_provider=display_provider,
+        lister=lister,
+        recommend=recommend,
+    )
+    cache.put(cache_key, result)
+    return result
 
 
 # Global bus and tracer instances for dashboard event monitoring
@@ -635,36 +680,6 @@ def _host_header_port(host: str, scope: Scope) -> int:
 ROOM_SESSION_PREFIX = f"{_ROOM_SESSION_PREFIX}{_ROOM_SESSION_SEPARATOR}"
 
 
-_CLIENT_TURN_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
-
-
-def _client_turn_id(req: dict[str, Any]) -> str | None:
-    """The `client_turn_id` a head sent a turn with, or None when it sent none.
-
-    The id is kept on the saved prompt (#1000), so it is bounded before anything runs: 1 to
-    128 ASCII letters, digits, `-` or `_`, which a UUID or the dashboard's own ids satisfy.
-    A field that is present and outside that -- empty, not a string, null, too long, other
-    characters -- is refused rather than dropped, so a head never believes it sent an id the
-    server did not keep (#1007). Leaving the field out sends the turn without one.
-
-    Raises:
-        HTTPException: 422, naming the field, the rule and the remedy.
-    """
-    if "client_turn_id" not in req:
-        return None
-    turn_id = req["client_turn_id"]
-    if not isinstance(turn_id, str) or not _CLIENT_TURN_ID.fullmatch(turn_id):
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                "client_turn_id must be a string of 1 to 128 ASCII letters, digits, '-' or "
-                "'_'. Send an id of that shape, or leave the field out to send the turn "
-                "without one."
-            ),
-        )
-    return turn_id
-
-
 #: Folders outside the workspace that clones may read, separated by `os.pathsep`; read
 #: before the Settings list.
 READ_ROOTS_ENV_VAR = "UCLONE_READ_ROOTS"
@@ -760,43 +775,18 @@ def _persona_payload(registry: PersonaRegistry, persona: PersonaDefinition) -> d
         "a2a_peers": list(persona.a2a_peers),
         "builtin": builtin,
         "overrides_builtin": not builtin and registry.has_builtin(persona.name),
+        # The address to show its picture from; the `?v=` changes whenever the picture does.
+        "avatar_url": avatar_url(persona.name, PersonaAvatarStore(registry).find(persona.name)),
+        # Whether that picture was chosen here rather than shipped: only a chosen one resets.
+        "avatar_chosen": PersonaAvatarStore(registry).chosen(persona.name) is not None,
     }
-
-
-#: The picture formats a clone's avatar may be in, looked for in this order. Images only:
-#: nothing here draws a face from the clone's name, so a clone with no picture gets the one
-#: default the head ships rather than a generated one that would differ between heads.
-_AVATAR_FORMATS: tuple[tuple[str, str], ...] = (
-    (".png", "image/png"),
-    (".webp", "image/webp"),
-    (".jpg", "image/jpeg"),
-    (".jpeg", "image/jpeg"),
-    (".gif", "image/gif"),
-)
-
-
-def _persona_avatar(registry: PersonaRegistry, name: str) -> tuple[Path, str] | None:
-    """The picture file beside one persona's own definition, or `None` when it has none.
-
-    The path is built from `source_of`, never from the name in the request: a name that no
-    loaded persona carries returns `None` before any path is composed, so `../` in a URL
-    names nothing rather than reaching for a file outside the personas directory.
-    """
-    source = registry.source_of(name)
-    if source is None:
-        return None
-    for suffix, mime in _AVATAR_FORMATS:
-        candidate = source.with_suffix(suffix)
-        if candidate.is_file():
-            return candidate, mime
-    return None
 
 
 def _required_agent_id(raw: object) -> str:
     """Read the agent a request names, refusing the request when it names none.
 
-    These endpoints used to fall back to a built-in persona name when the request
-    carried no `agent_id`. On an install whose agents are its own -- which is every
+    Read by `/api/dispatch`, which, like the retired chat routes (#1731), used to fall
+    back to a built-in persona name when the request carried no `agent_id`. On an install whose agents are its own -- which is every
     install, now that a persona is a file and an agent is a directory -- that
     substituted a name the caller never asked for: the turn ran, answered 200, and was
     recorded against an agent the user had not addressed. A missing name is a missing
@@ -810,34 +800,11 @@ def _required_agent_id(raw: object) -> str:
             status_code=400,
             detail=(
                 "Missing required 'agent_id'. Name the agent this request is for; "
-                "there is no default agent. `GET /api/agents` lists the ones this "
+                "there is no default agent. `GET /api/personas` lists the ones this "
                 "install has."
             ),
         )
     return raw.strip()
-
-
-def _refuse_a_reserved_session_id(session_id: str | None) -> None:
-    """Refuse a caller-supplied session id that belongs to a room's agent.
-
-    `participant_session_id` derives `sess_room__{room}__{agent}` so that no two
-    participants share a `SessionState`. A chat endpoint that accepted any id could park
-    an ordinary conversation on exactly that name -- two writers on one record, which is
-    the failure the derivation exists to prevent -- and `/api/sessions` now filters the
-    prefix, so it would not even be visible. The prefix is reserved at the door.
-
-    Raises:
-        HTTPException: 400, naming the prefix.
-    """
-    if session_id and session_id.startswith(ROOM_SESSION_PREFIX):
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"Session ids beginning {ROOM_SESSION_PREFIX!r} are reserved for the "
-                f"agents seated in a conversation, one session each. Pick another id, or "
-                f"use the conversation's own endpoints."
-            ),
-        )
 
 
 def _next_sequence_number() -> int:
@@ -845,71 +812,6 @@ def _next_sequence_number() -> int:
     global _sequence_counter
     _sequence_counter += 1
     return _sequence_counter
-
-
-def _turn_token_figures(
-    usages: Sequence[TokenUsage] | None,
-) -> tuple[int | None, int | None, str | None]:
-    """The tokens a chat turn booked, as `(total, input, count source)`, from the budget ledger.
-
-    The chat response used to report `100 + len(reply) // 4` and `100 + len(message) // 4`:
-    figures nothing measured, shown as if something had (#939). The ledger holds what the
-    budget actually charged for each step of the turn, provider counts and labelled
-    estimates alike, so the figures are read from there. `usages` is what
-    `TokenBudgetManager.collect_turn_usage` collected for this turn; `None` means the turn
-    failed before collection began. It used to be a slice of the session's ledger from an
-    index taken before the agent's turn lock, which also held any overlapping turn's steps
-    on that session id (#982).
-
-    The label follows the design document's §6.7 rule: a figure the provider did not count
-    is an estimate, and a turn with any estimated step is estimated as a whole. A turn that
-    booked nothing has no figure, not a zero.
-    """
-    if not usages:
-        return None, None, None
-    total = sum(u.input_tokens + u.output_tokens for u in usages)
-    prompt = sum(u.input_tokens for u in usages)
-    estimated = any(u.count_source is TokenCountSource.ESTIMATE for u in usages)
-    source = TokenCountSource.ESTIMATE if estimated else TokenCountSource.PROVIDER
-    return total, prompt, source.value
-
-
-def _serialized_tool_calls(tool_calls: Sequence[ToolCallRequest]) -> list[dict[str, Any]]:
-    """Tool calls as plain JSON-serialisable dicts, for a transcript that reaches disk.
-
-    One function rather than two literals, because the two literals are what went wrong.
-    `ToolCallRequest.arguments` is `ImmutableJsonMapping`, frozen *recursively*, so every
-    nested object inside it is a `MappingProxyType` too; `dict(...)` copies only the top
-    level and leaves the nested proxies for `json.dumps` to choke on (#665). Keeping one
-    spelling of the unwrap means the next transcript writer cannot get half of it right,
-    which is precisely what happened — the correct `unwrap_immutable` sat four lines from
-    the broken `dict()`.
-
-    **Both call sites failed loudly**, and an earlier version of this docstring said
-    otherwise; the #673 review reverted the line and measured it (#665, #673):
-
-    * history synthesised from the Core store — the `TypeError` propagates straight out
-      of `truncate_session_history`, which sits in no `try`;
-    * the tool calls of a completed turn — the same list goes into the response body as
-      well as into `save_session_record`, so FastAPI's response serialiser raises
-      `PydanticSerializationError: Unable to serialize unknown type: <class
-      'mappingproxy'>` before the endpoint's `except Exception: logger.warning(...)`
-      around the save can swallow anything.
-
-    The `except Exception` around `save_session_record` is real and would have hidden a
-    save-only failure; it is not what happened here. The one genuinely silent site in
-    this family is elsewhere — the `PRE_TOOL_USE` script-hook path in `agent/base.py`,
-    where `HookRunner` converts the `TypeError` into a fail-closed `BLOCK` with only a
-    `WARNING`.
-    """
-    return [
-        {
-            "id": tc.id,
-            "name": tc.name,
-            "arguments": cast(dict[str, Any], unwrap_immutable(tc.arguments)),
-        }
-        for tc in tool_calls
-    ]
 
 
 TRANSCRIPT_FAILURE_ROLE = "failure"
@@ -920,38 +822,6 @@ with `Error: ...` content, so the saved conversation claimed a reply and the onl
 was that wording. A record with this role keeps the text the page showed in `content` and
 the turn's error in `error`; it is shown to the user and never rebuilt into model context.
 """
-
-
-class ChatTurnOutcome(StrEnum):
-    """How a chat turn ended, stated by the backend for a head to name (#1007 item 4).
-
-    A head chipped a turn from `provenance.degraded`, which on a chat row is true for a
-    failure, an offline turn, a cancelled one and an answer that was not persisted as well
-    as for a substituted model -- so every one of them read "degraded", and a head wanting
-    to tell them apart had only the row's text. This is the structured status it reads
-    instead, carried on the `/api/turn` result and on every saved agent row.
-    """
-
-    #: The turn reached an answer from the model that was asked.
-    COMPLETED = "completed"
-    #: The turn reached an answer, from a model other than the one requested -- the Core's
-    #: `Provenance.degraded` (`served_by != requested`) and nothing broader.
-    DEGRADED = "degraded"
-    #: The turn ended in an error; `error` says why, and `refusal` whether a retry is refused.
-    FAILED = "failed"
-    #: The turn was stopped before it finished.
-    INTERRUPTED = "interrupted"
-
-
-def _answered_outcome(turn_result: TurnResult) -> ChatTurnOutcome:
-    """The outcome of a turn that returned a result rather than raising."""
-    # `is_completed` is read too: a result without `error` that did not complete has no
-    # answer, and the status line already reports it as an error.
-    if turn_result.error is not None or not turn_result.is_completed:
-        return ChatTurnOutcome.FAILED
-    if turn_result.provenance is not None and turn_result.provenance.degraded:
-        return ChatTurnOutcome.DEGRADED
-    return ChatTurnOutcome.COMPLETED
 
 
 LEGACY_FAILURE_PREFIX = "Error: "
@@ -969,14 +839,6 @@ still showing (#1031, measured end to end in PR #1033's probe).
 The row carries the calls the Core records for the turn in `tool_calls`, so a stop after a
 tool step is visible as one. It never re-enters model context, exactly as a failure row does
 not: `reconstruct_history` drops both, through `_records_a_turn_not_spoken`.
-"""
-
-CANCELLED_TURN_TEXT = "⏹️ [Generation Stopped by User]"
-"""What the saved row says, in the words the page already shows when Stop is pressed.
-
-`App.tsx` writes this sentence into the bubble the moment the stream reports `cancelled`, so
-a conversation reopened later reads as the user left it rather than in a second vocabulary
-for the same event.
 """
 
 
@@ -1002,100 +864,12 @@ def _is_failure_entry(role: str, entry: dict[str, Any]) -> bool:
     )
 
 
-def _cancelled_turn_rows(
-    *,
-    agent_id: str,
-    message: str,
-    client_turn_id: str | None,
-    model: str | None,
-    latency_ms: float,
-    turn_index: int,
-    turn_messages: Sequence[ChatMessage],
-    persist_error: str | None,
-    persist_error_type: str | None,
-) -> list[dict[str, Any]]:
-    """The two transcript rows a cancelled turn owes the page (#1031).
-
-    The prompt row, then a `TRANSCRIPT_CANCELLED_ROLE` row for the turn itself -- the same
-    two-rows-per-turn shape `/api/turn` writes for every other outcome, which is what makes
-    the truncation mapping work across a cancelled turn without teaching the index walk
-    anything about turns (#1024's three blockers all came from doing that).
-
-    **The prompt row is written even when the Core did not keep the prompt.** A turn
-    cancelled before `BaseAgent` appended it, and a retry whose prompt repeats the
-    unanswered one already in the Core (#1022), both leave a row the Core has no message
-    for -- which is exactly a failure row's shape, and the walk already handles it: the row
-    matches nothing and advances nothing. The page showed the prompt, so the record does.
-
-    `tool_calls` comes from the Core messages this turn appended, which is the only record
-    of it that exists: a cancelled turn produces no `TurnResult`. **No `tool_executions`
-    key is written**, because the Core states which calls were made and not how each one
-    ended, and a status nothing measured is the substituted default P6 forbids. Whether the
-    partial `TOOL` messages themselves should be *shown* is #1024's open question, not
-    decided here: they are treated exactly as a failed turn's are, and this change moves
-    nothing. (Precisely: they are in the Core, no row of the live transcript renders them,
-    and no row of the live transcript renders them -- identical for a failed turn.)
-    """
-    now = datetime.now(UTC).isoformat()
-    prompt_row: dict[str, Any] = {
-        "id": f"user-{uuid.uuid4().hex[:12]}",
-        "sender": "user",
-        "role": "user",
-        "content": message,
-        "timestamp": now,
-        "model": model,
-    }
-    if client_turn_id is not None:
-        prompt_row["client_turn_id"] = client_turn_id
-    cancelled_row: dict[str, Any] = {
-        "id": f"agent-{uuid.uuid4().hex[:12]}",
-        "sender": "agent",
-        "role": TRANSCRIPT_CANCELLED_ROLE,
-        "outcome": ChatTurnOutcome.INTERRUPTED,
-        "content": CANCELLED_TURN_TEXT,
-        "timestamp": now,
-        "agent_id": agent_id,
-        "model": model,
-        "latency_ms": latency_ms,
-        "turn_count": turn_index,
-        "tool_calls": [
-            call for msg in turn_messages for call in _serialized_tool_calls(msg.tool_calls or ())
-        ],
-        "provenance": {
-            "component": "uclone_x.ui.app",
-            "producer": agent_id,
-            "content_hash": hashlib.sha256(
-                f"{agent_id}:{message}:{CANCELLED_TURN_TEXT}".encode()
-            ).hexdigest(),
-            # The turn produced no answer, which is what the page already records for a stop
-            # it watched (`App.tsx`), and `path` says why rather than leaving it to be
-            # inferred. It is not a provider failure: no failover was attempted.
-            "degraded": True,
-            "path": "CANCELLED",
-            "served_by": None,
-        },
-        "durability": {
-            "persisted": persist_error is None,
-            "error": persist_error,
-            "error_type": persist_error_type,
-            "stale_conflict": persist_error_type == "StaleSessionWriteError",
-        },
-    }
-    return [prompt_row, cancelled_row]
-
-
 def _records_a_turn_not_spoken(role: str, entry: dict[str, Any]) -> bool:
     """Whether this row records how a turn ended rather than something that was said (#1031).
 
-    A failed turn and a cancelled one are the same kind of row to the two callers that ask:
-    `reconstruct_history` must keep both out of rebuilt model context (neither is anything
-    the agent said), and `_with_turn_outcome_rows_restored` must carry both back through a
-    compaction the Core cannot re-derive them from. Asking one question in one place is what
-    stops the two answers drifting -- the defect #872 and #1022 each found a copy of.
-
-    It is deliberately **not** asked where the Core is cut. That count is derived from the
-    Core's own messages (`_core_index_for_transcript`), because a predicate that reads a
-    row's wording decides a deletion by guess (#1024 review).
+    `reconstruct_history` must keep both out of rebuilt model context: neither is anything
+    the agent said. Such rows exist only in transcripts the retired single-agent chat path
+    (`/api/turn`, removed in #1731) saved before every conversation became a room.
     """
     return role == TRANSCRIPT_CANCELLED_ROLE or _is_failure_entry(role, entry)
 
@@ -1103,157 +877,12 @@ def _records_a_turn_not_spoken(role: str, entry: dict[str, Any]) -> bool:
 def _is_presentable_role(role: str, compaction_ledger: bool) -> bool:
     """Whether a message with this role belongs in the transcript the user reads.
 
-    The rule is stated over the two fields it actually depends on because it is needed on
-    both sides of the transcript boundary, where the message has two different types:
-    `_is_presentable` asks it of a typed `ChatMessage` on the way out, and
-    `reconstruct_history` asks it of a persisted transcript dict on the way back in.
-    Those were independent copies that happened to agree — the same shape of defect the
-    single predicate was extracted to prevent, one layer down (#872).
+    Stated over the two fields it actually depends on, because `reconstruct_history` asks
+    it of a persisted transcript dict rather than of a typed `ChatMessage` (#872).
 
     A system message is an anchor, not conversation, *unless* it is a compaction ledger.
     """
     return role != MessageRole.SYSTEM.value or compaction_ledger
-
-
-def _is_presentable(msg: ChatMessage) -> bool:
-    """Whether a Core message belongs in the transcript the user reads.
-
-    One predicate, because three callers need the same answer and a second copy of it is
-    how they come to disagree: `_core_messages_to_transcript` renders these messages,
-    `_truncate_core_messages` cuts the Core at an index counted over it, and
-    `reconstruct_history` reaches the same rule through `_is_presentable_role`.
-    """
-    return _is_presentable_role(msg.role.value, bool(msg.compaction_ledger))
-
-
-def _truncate_core_messages(messages: Sequence[ChatMessage], index: int) -> list[ChatMessage]:
-    """Cut the Core's message sequence at an index over its presentable messages (#872).
-
-    The index arrives from the UI as an offset into the transcript the user reads, and
-    `_is_presentable` is what defines that list. Partitioning the Core on
-    `role != SYSTEM` instead counted a different one: from the first compaction onward
-    the transcript leads with a ledger that partition drops, so the same number cut the
-    two lists in different places and a turn the user had just deleted stayed in the
-    Core for the next turn to answer against.
-
-    The offset is mapped through `_core_index_for_transcript` before it arrives here: the
-    transcript holds rows the Core has no message for, and a tool-using turn is the reverse,
-    one row over several messages (#1023, FR-13.7).
-
-    Messages that are not presentable are anchors (the system prompt), not conversation:
-    they are retained whole, ahead of the surviving prefix, exactly as before.
-    """
-    anchored = [m for m in messages if not _is_presentable(m)]
-    presentable = [m for m in messages if _is_presentable(m)]
-    return [*anchored, *presentable[:index]]
-
-
-def _core_messages_to_transcript(
-    messages: Sequence[ChatMessage],
-    agent_id: str,
-    timestamp: str,
-) -> list[dict[str, Any]]:
-    """The rendered transcript alone, for callers with no use for the source messages."""
-    return [entry for _, entry in _core_messages_to_transcript_pairs(messages, agent_id, timestamp)]
-
-
-def _core_messages_to_transcript_pairs(
-    messages: Sequence[ChatMessage],
-    agent_id: str,
-    timestamp: str,
-) -> list[tuple[ChatMessage, dict[str, Any]]]:
-    """Render the Core's message sequence as the UI transcript derived from it.
-
-    Each rendered entry is returned beside the Core message it was derived from, so a
-    caller that needs both reads them off one pass instead of re-deriving the filtered
-    subsequence and zipping the two together. That zip was correct — both sides filtered
-    through `_is_presentable`, so `strict=True` could not desync — but it held only
-    while two expressions stayed in lockstep, and the failure mode if one ever drifted
-    was an uncaught `ValueError` out of the compaction path: a presentation bug
-    answering **500**. Pairing them here makes the correspondence structural.
-
-    The Core session is the single source of truth for what the conversation *is*; the
-    transcript is a presentation view over it, and this is the one place that derivation
-    is written. Anchored system prompts are not conversation and are omitted, but a
-    **compaction ledger is** — it is the only surviving record of the turns compaction
-    discarded, and dropping it left the user unable to see what had happened to their
-    conversation (#872, P6). It is rendered as its own `system` sender rather than as an
-    agent turn: attribution is never inferred (FR-13.4).
-    """
-    transcript: list[tuple[ChatMessage, dict[str, Any]]] = []
-    for idx, msg in enumerate(messages):
-        if not _is_presentable(msg):
-            continue
-        role_str = msg.role.value
-        if role_str == "system":
-            transcript.append(
-                (
-                    msg,
-                    {
-                        "id": f"ledger-{idx}",
-                        "sender": "system",
-                        "role": "system",
-                        "content": msg.content,
-                        "timestamp": timestamp,
-                        "agent_id": agent_id,
-                        "compaction_ledger": True,
-                    },
-                )
-            )
-            continue
-        sender = "user" if role_str == "user" else "agent"
-        msg_dict: dict[str, Any] = {
-            "id": f"{sender}-{idx}",
-            "sender": sender,
-            "role": role_str,
-            "content": msg.content,
-            "timestamp": timestamp,
-            "agent_id": agent_id,
-        }
-        if msg.name is not None:
-            msg_dict["name"] = msg.name
-        if msg.tool_call_id is not None:
-            msg_dict["tool_call_id"] = msg.tool_call_id
-        if msg.tool_calls:
-            msg_dict["tool_calls"] = _serialized_tool_calls(msg.tool_calls)
-        if sender == "agent":
-            msg_dict["provenance"] = {
-                "component": "uclone_x.llm.orchestrator",
-                "producer": agent_id,
-                "content_hash": hashlib.sha256(
-                    f"{agent_id}:{msg.content or ''}".encode()
-                ).hexdigest(),
-                "degraded": False,
-                "path": "primary",
-                "served_by": None,
-            }
-        transcript.append((msg, msg_dict))
-    return transcript
-
-
-def _transcript_role(entry: dict[str, Any]) -> str:
-    """The role a persisted transcript entry states, falling back to its sender.
-
-    One spelling of the fallback, because three callers need it: the matching key below,
-    and the two places #1023 asks whether an entry is a failed turn. An entry saved by an
-    older head carries `sender` alone, and the answer must not depend on which caller asks.
-    """
-    role = str(entry.get("role") or "").strip().lower()
-    if role:
-        return role
-    sender = str(entry.get("sender") or "").strip().lower()
-    return "user" if sender == "user" else "assistant" if sender == "agent" else sender
-
-
-def _transcript_key(entry: dict[str, Any]) -> tuple[str, str | None]:
-    """Identity of a transcript entry for matching it against a Core message.
-
-    Role and content, because those are the only two fields both sides agree on: ids and
-    timestamps exist on the transcript alone, and the Core message is the authority on
-    everything else.
-    """
-    raw_content = entry.get("content")
-    return _transcript_role(entry), (None if raw_content is None else str(raw_content))
 
 
 def _turns_taken(transcript: Sequence[dict[str, Any]]) -> int:
@@ -1263,105 +892,13 @@ def _turns_taken(transcript: Sequence[dict[str, Any]]) -> int:
     four sends of which one failed -- so a failure row counts here, and `turn_counter` stays
     the lifetime figure it is (P5).
 
-    This is deliberately **not** the question `_core_index_for_transcript` answers. That one
-    asks how far into the Core's messages a prefix of rows reaches, where a failed turn
-    reaches nothing. The two numbers sit side by side in `truncate_session_history` and are
-    different on purpose.
+    Read by `active_turns` only when the Core has nothing to say about the session.
     """
     return sum(
         1
         for entry in transcript
         if entry.get("role") in ("assistant", "agent") or entry.get("sender") == "agent"
     )
-
-
-def _core_key(msg: ChatMessage) -> tuple[str, str | None]:
-    """A Core message's identity for matching a transcript row against it.
-
-    The mirror of `_transcript_key`, so the two sides of the correspondence are written
-    once each and cannot drift into asking different questions.
-    """
-    return msg.role.value, msg.content
-
-
-def _is_folded_into_its_turns_row(msg: ChatMessage) -> bool:
-    """Whether the live transcript folds this Core message into its turn's single row.
-
-    `/api/turn` writes exactly two transcript rows per turn -- the prompt and one agent
-    row (`updated_history = [*current_history, user_msg_entry, agent_msg_entry]`) -- while
-    a tool-using turn leaves four or more messages in the Core: the prompt, an `ASSISTANT`
-    message carrying that step's tool calls, the `TOOL` result, and the reply. The middle
-    ones reach the page inside the agent row's `tool_calls` and `tool_executions`, never as
-    rows of their own, so an index counted over the transcript steps past them.
-
-    **The property is carrying tool calls, not lacking content.** `base.py` appends
-    `ChatMessage(ASSISTANT, content=resp_content or None, tool_calls=tool_calls)` under
-    `if tool_calls or resp_content:`, so a step that printed a preamble *and* called a tool
-    has both. Keying on absent content left that message unfolded and stalled the walk
-    exactly as strict lockstep does: measured on a cut that deleted nothing, the Core kept
-    1 message where 4 is right, losing the preamble, the tool result and the turn's **own
-    final reply** (#1024 review B2).
-
-    They are *not* skipped when the transcript does render them as rows: a conversation
-    rebuilt from the Core alone (`_core_messages_to_transcript_pairs`) gives every
-    presentable message its own row, and a row that matches is always consumed before this
-    question is asked.
-    """
-    return msg.role == MessageRole.TOOL or (
-        msg.role == MessageRole.ASSISTANT and (msg.content is None or bool(msg.tool_calls))
-    )
-
-
-def _core_index_for_transcript(
-    transcript: Sequence[dict[str, Any]], messages: Sequence[ChatMessage]
-) -> int:
-    """How far into the Core's presentable messages a transcript prefix reaches (#1023).
-
-    The page counts a truncation index over the transcript it renders, and #872 made the
-    Core's own cut agree with that count. The two lists are not the same length: a failed
-    turn is a row with no Core message (the Core holds the prompt that went unanswered and
-    no reply to add), and a tool-using turn is the reverse, one row over several messages.
-
-    **The count is derived from the Core, never from what a row's text looks like.** An
-    earlier version of this asked `_is_failure_entry`, which calls an assistant row a
-    failed turn when its content begins `Error: ` under degraded provenance. That
-    predicate answers a different question -- "may the model be shown this row?", where a
-    false positive costs one row of rebuilt context (#1022 accepted that window). Deciding
-    a *cut* with it **deletes** a message instead: a real reply beginning `Error: ` whose
-    provenance is degraded (a failed `persist_session`, or plain provider-side model-alias
-    resolution) was cut out of the Core, and off the disk, by a truncation that deleted
-    nothing, while the page went on showing it (#1024 review).
-
-    So a row advances the index when the Core's next message matches it, and a row the
-    Core has no message for advances nothing of its own -- recognised by the Core's silence
-    rather than by its wording, which makes both spellings of a failed turn fall out for
-    free. It does carry with it whatever its turn folded in, which is what keeps a failed
-    tool turn whole.
-
-    Rejected: **strict lockstep** with no skipping (it stalls on the first tool turn and
-    under-counts by three -- the same loss, differently caused); **searching ahead for the
-    next match of any kind** (a repeated prompt matches a *later* Core message and swallows
-    the reply between them -- measured 3 where 1 is right, worse than the defect it would
-    replace).
-    """
-    presentable = [m for m in messages if _is_presentable(m)]
-    index = 0
-    for entry in transcript:
-        key = _transcript_key(entry)
-        candidate = index
-        while (
-            candidate < len(presentable)
-            and _core_key(presentable[candidate]) != key
-            and _is_folded_into_its_turns_row(presentable[candidate])
-        ):
-            candidate += 1
-        matched = candidate < len(presentable) and _core_key(presentable[candidate]) == key
-        # What was stepped over is kept either way. A row that matches nothing is still a
-        # row *about* a turn -- a failed one -- and the messages folded into it are the
-        # Core's record of that turn, so they survive with it. Leaving them uncounted cut a
-        # turn that failed after its tool step to 1 message where 3 is right (#1024 B2).
-        index = candidate + 1 if matched else candidate
-    return index
 
 
 def _sse_provenance_block(event: AgentEvent) -> dict[str, Any]:
@@ -1407,6 +944,22 @@ def _extract_markdown_title(path: Path) -> str:
     except Exception:
         pass
     return path.stem.replace("-", " ").replace("_", " ").title()
+
+
+#: No key held for a provider: no key, no source, no variable.
+_NO_KEY: tuple[None, None, None] = (None, None, None)
+
+
+class KeyRemovalRefused(ValueError):
+    """A key removal Settings refuses, with a stable `code` a screen can translate.
+
+    `code` is ``"unknown_provider"`` or ``"key_in_use"``; the message is the English
+    sentence for a caller that shows text as it comes.
+    """
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 class AgentSessionManager:
@@ -1471,7 +1024,15 @@ class AgentSessionManager:
         self._transcript_dir.mkdir(parents=True, exist_ok=True)
         reap_orphaned_temp_files(self._transcript_dir)
         self._ontology_engine = ontology_engine if ontology_engine is not None else OntologyEngine()
-        self._skill_registry = skill_registry if skill_registry is not None else SkillRegistry()
+        # Over the runtime skill store by default, which `ucx skill approve` writes; the
+        # approved skills in it are loaded at app startup (`create_ui_app`'s lifespan).
+        # A registry built with no directory is inert: `reload_approved` loads nothing,
+        # every `load_skill` is refused and the prompt lists no skill (P9).
+        self._skill_registry = (
+            skill_registry
+            if skill_registry is not None
+            else SkillRegistry(skills_dir=runtime_skill_store_dir())
+        )
         self._budget_tracker = (
             budget_tracker if budget_tracker is not None else TokenBudgetManager()
         )
@@ -1484,22 +1045,43 @@ class AgentSessionManager:
         # whole fact set in memory and each `save()` the whole of it, so the second writer
         # drops whatever the first recorded after it loaded (#1097).
         self._agent_memories: dict[str, CrossSessionMemory] = {}
+        #: (provider, base URL) -> the host binder for it, or `None` where every tool is
+        #: pinned. Shared by every clone, so a tool description is embedded once.
+        self._tool_binders: dict[tuple[str, str], ToolBinder | None] = {}
         self._session_messages: dict[str, list[dict[str, Any]]] = {}
         self._lock = asyncio.Lock()
         self._configured_provider: str | None = None
         self._configured_base_url: str | None = None
-        self._configured_api_key: str | None = None
-        #: The provider `_configured_api_key` was saved for; `_api_key_for` applies it only there.
-        self._configured_api_key_provider: str | None = None
+        #: The deep model: what a clone's turns run on unless its persona names its own.
         self._configured_model: str | None = None
+        #: The fast model, for auxiliary calls (room routing); `None` means the deep one.
+        self._configured_model_fast: str | None = None
+        #: Chat agent -> whether its (deep, fast) model follows Settings, i.e. its persona
+        #: named none. A Settings save moves only those; a persona's own model stays.
+        self._follows_settings: dict[str, tuple[bool, bool]] = {}
         self._configured_comfyui_url: str | None = os.getenv(
             "COMFYUI_BASE_URL", DEFAULT_COMFYUI_BASE_URL
         )
         #: Folders outside the workspace that clones may read, as the user entered them.
         self._configured_read_roots: tuple[str, ...] = ()
+        #: The language the heads and the CLI write in; `"system"` follows the OS or browser.
+        self._configured_ui_language: UiLanguage = DEFAULT_UI_LANGUAGE
         # The same file `ucx run` and `ucx install` read and seed (`saved_choice.py`).
         self._settings_file: Path = self._storage_dir / SETTINGS_FILE_NAME
+        # This dashboard's paid calls are held to the limits in its own settings file and
+        # booked in its own storage directory, which its Usage panel reads.
+        self._usage_file: Path = self._storage_dir / USAGE_FILE_NAME
+        self._usage_gate = UsageGate.for_storage(self._settings_file, self._usage_file)
         self._load_persisted_settings()
+        # Pictures follow this dashboard's settings file, the chat provider in effect and
+        # the Gemini address the chat uses, all read again on every draw, so a change in
+        # Settings applies to the next one.
+        bind_image_engine_settings(
+            self._tools.get("generate_image"),
+            self._settings_file,
+            lambda: self.provider_in_effect,
+            self.gemini_base_url_in_effect,
+        )
         for entry in self._env_read_root_entries():
             if (problem := _read_root_problem(entry, self._storage_dir)) is not None:
                 logger.warning("Ignoring %s entry: %s", READ_ROOTS_ENV_VAR, problem)
@@ -1533,6 +1115,28 @@ class AgentSessionManager:
     @property
     def storage_dir(self) -> Path:
         return self._storage_dir
+
+    @property
+    def settings_file(self) -> Path:
+        """This dashboard's `settings.json`, in its storage directory."""
+        return self._settings_file
+
+    @property
+    def usage_file(self) -> Path:
+        """This dashboard's paid-model usage store, in its storage directory."""
+        return self._usage_file
+
+    def build_llm(self, **kwargs: Any) -> BaseLLMConnector:
+        """A connector for this dashboard: `create_llm_connector` bound to its storage.
+
+        Every connector the dashboard builds comes from here, so a paid one is held to the
+        limits its Usage panel shows, and a connector resolved from a saved choice uses the
+        choice this dashboard's Settings saved, even when `storage_dir` is not the session
+        root.
+        """
+        return create_llm_connector(
+            usage_gate=self._usage_gate, saved_choice_file=self._settings_file, **kwargs
+        )
 
     @property
     def bus(self) -> EventBus:
@@ -1603,8 +1207,106 @@ class AgentSessionManager:
 
     @property
     def configured_model(self) -> str | None:
-        """Configured model override for the UI session manager."""
+        """The deep model saved in Settings, or `None` when none was."""
         return self._configured_model
+
+    @property
+    def configured_model_fast(self) -> str | None:
+        """The fast model saved in Settings, or `None` when fast follows deep."""
+        return self._configured_model_fast
+
+    @property
+    def deep_model(self) -> str | None:
+        """The model a clone's turn runs on when its persona names none.
+
+        The one saved in Settings, else the active provider's model variable. `None` when
+        neither names one: the request is then refused in plain words rather than sent with
+        a model id written in source.
+        """
+        return self._model_state(self.provider_in_effect)[0]
+
+    @property
+    def fast_model(self) -> str | None:
+        """The model auxiliary calls (room routing) run on: the fast one, else deep."""
+        return self._saved_fast_model(self.provider_in_effect) or self.deep_model
+
+    # -- What is in effect: an explicit argument, then the environment, then the file. --
+    #
+    # A variable the operator set wins over a choice saved in Settings, for the provider,
+    # its model and its endpoint as for its key. A saved model or endpoint belongs to the
+    # saved provider: when the environment names another provider, they are not carried
+    # over to it.
+
+    def _provider_state(self) -> tuple[str | None, str, str]:
+        """``(provider, source, variable)``: `LLM_PROVIDER` when it names one, else the file."""
+        from_env = canonical_provider(os.getenv("LLM_PROVIDER"))
+        if from_env is not None:
+            return from_env, "env", "LLM_PROVIDER"
+        if self._configured_provider:
+            return self._configured_provider, "settings", ""
+        return None, "", ""
+
+    def _saved_applies(self, provider: str | None) -> bool:
+        """Whether the model and endpoint saved in the file are ``provider``'s."""
+        return (
+            self._configured_provider is None
+            or provider is None
+            or same_provider(self._configured_provider, provider)
+        )
+
+    def _model_state(self, provider: str | None) -> tuple[str | None, str, str]:
+        """``(model, source, variable)`` for ``provider``: its model variable, else the file."""
+        from_env = env_model(provider)
+        if from_env is not None:
+            return from_env[0], "env", from_env[1]
+        if self._configured_model and self._saved_applies(provider):
+            return self._configured_model, "settings", ""
+        return None, "", ""
+
+    def _saved_fast_model(self, provider: str | None) -> str | None:
+        return self._configured_model_fast if self._saved_applies(provider) else None
+
+    def _base_url_state(self, provider: str | None) -> tuple[str | None, str, str]:
+        """``(endpoint, source, variable)`` for ``provider``: its endpoint variable, else the file."""
+        spec = spec_for(provider)
+        if spec is not None and spec.base_url_env:
+            value = (os.getenv(spec.base_url_env) or "").strip()
+            if value:
+                return value, "env", spec.base_url_env
+        if self._configured_base_url and self._saved_applies(provider):
+            return self._configured_base_url, "settings", ""
+        return None, "", ""
+
+    @property
+    def provider_in_effect(self) -> str | None:
+        """The provider a turn goes to: `LLM_PROVIDER`, else the one saved; `None` if neither."""
+        return self._provider_state()[0]
+
+    def base_url_in_effect(self, provider: str | None) -> str | None:
+        """The endpoint ``provider``'s requests go to, when one is set for it."""
+        return self._base_url_state(provider)[0]
+
+    def gemini_base_url_in_effect(self) -> str | None:
+        """The Gemini address a Gemini chat here goes to, for pictures to reuse (#1769).
+
+        `None` unless Gemini is the chat provider in effect or the one saved: a saved
+        address with no saved provider may belong to another provider's server, and a
+        picture request sent there would carry the Gemini key to it.
+        """
+        if not (
+            same_provider(self.provider_in_effect, "gemini")
+            or same_provider(self._configured_provider, "gemini")
+        ):
+            return None
+        return self.base_url_in_effect("gemini")
+
+    def _build_llm_in_effect(self) -> BaseLLMConnector:
+        provider = self.provider_in_effect
+        return self._build_configured_llm(provider, self.base_url_in_effect(provider))
+
+    def global_models(self) -> tuple[str | None, str | None]:
+        """``(deep, fast)`` as Settings holds them now; read per build, never cached."""
+        return self.deep_model, self.fast_model
 
     @property
     def configured_provider(self) -> str | None:
@@ -1613,24 +1315,86 @@ class AgentSessionManager:
 
     @property
     def configured_api_key(self) -> str | None:
-        """Configured API key for the configured provider, when it was saved for that one."""
-        return self._api_key_for(self._configured_provider)
+        """The key a request to the configured provider carries, when one is held for it."""
+        return self._api_key_for(self.provider_in_effect)
+
+    def _key_state(self, provider: str | None) -> tuple[str | None, str | None, str | None]:
+        """``(key, source, variable)`` for ``provider``: the environment first, then the file.
+
+        `source` is ``"env"`` or ``"settings"``, and `variable` names the environment
+        variable when that is where the key came from. Read from the file on every call, so
+        a key saved by `ucx key set` while this dashboard runs is seen at once.
+        """
+        from_env = env_key(provider)
+        if from_env is not None:
+            return from_env[0], "env", from_env[1]
+        canonical = canonical_provider(provider)
+        if canonical is None:
+            return _NO_KEY
+        saved = api_key_for(settings_data(self._settings_file), canonical)
+        if saved:
+            return saved, "settings", None
+        return _NO_KEY
 
     def _api_key_for(self, provider: str | None) -> str | None:
-        """The configured key, only when it belongs to ``provider`` (see ``key_belongs_to``).
+        """The key held for ``provider`` and only for it, or `None`."""
+        return self._key_state(provider)[0]
 
-        The settings file keeps one key while the provider changes, so a key saved for
-        OpenAI is still there after a switch to Anthropic -- and must not be sent to it. A
-        key with no known owner (entered before any provider was) goes wherever it is used,
-        as every key did before keys were tagged.
+    def resolved_api_key(self, provider: str | None) -> str | None:
+        """The key a request to ``provider`` would carry: its own, else the live connector's.
+
+        The live connector's key counts only when that connector is ``provider``'s, so a key
+        is never sent to a provider it was not saved for.
         """
-        key = self._configured_api_key
-        if not key:
-            return None
-        owner = self._configured_api_key_provider
-        if owner is None or same_provider(owner, provider):
-            return key
+        own = self._api_key_for(provider)
+        if own:
+            return own
+        live = self._llm
+        if live is not None and same_provider(getattr(live, "provider_name", None), provider):
+            return cast(str | None, getattr(live, "api_key", None))
         return None
+
+    def stored_api_key_for(self, provider: str, base_url: str | None = None) -> str | None:
+        """A key already held for ``provider``, and only for it: saved for it, or its env var.
+
+        For a provider the user has picked but not saved (#1657). The live connector's key
+        is not used: it may belong to the provider in use, and must not be sent to another
+        one to preview its models.
+
+        A held key goes only to the provider's own server, or to the endpoint saved with it.
+        An endpoint left on the form from another provider (a vLLM box, a proxy) gets none.
+        """
+        if base_url is not None and not (
+            self._configured_provider is not None
+            and same_provider(self._configured_provider, provider)
+            and base_url.rstrip("/") == (self._configured_base_url or "").rstrip("/")
+        ):
+            return None
+        return self._api_key_for(provider)
+
+    @staticmethod
+    def _mask_key(key: str) -> str:
+        """``AQ.…abcd``-style: enough to recognise a key, never enough to use it."""
+        trimmed = key.strip()
+        return f"{trimmed[:3]}...{trimmed[-4:]}" if len(trimmed) > 8 else "***"
+
+    def _provider_key_states(self) -> list[dict[str, Any]]:
+        """Every keyed provider's key state, whichever provider is active."""
+        states: list[dict[str, Any]] = []
+        for spec in PROVIDERS.values():
+            if not spec.key_env_vars:
+                continue
+            key, source, variable = self._key_state(spec.id)
+            states.append(
+                {
+                    "id": spec.id,
+                    "key_set": bool(key),
+                    "key_masked": self._mask_key(key) if key else "",
+                    "key_source": source or "",
+                    "key_env_var": variable or "",
+                }
+            )
+        return states
 
     @property
     def configured_base_url(self) -> str | None:
@@ -1642,101 +1406,74 @@ class AgentSessionManager:
         """Default or configured LLM provider connector."""
         return self._llm
 
+    def _build_configured_llm(self, provider: str | None, base_url: str | None) -> BaseLLMConnector:
+        """A connector for ``provider`` from explicit values, the deep model as its default.
+
+        Everything is passed as an argument: nothing is exported into the environment for
+        the connector to find there.
+        """
+        extra: dict[str, Any] = {}
+        deep = self.deep_model
+        if deep:
+            extra["model"] = deep
+        return self.build_llm(
+            provider=provider or None,
+            api_key=self._api_key_for(provider),
+            base_url=base_url or None,
+            fallback_to_mock=self._fallback_to_mock,
+            **extra,
+        )
+
     def _load_persisted_settings(self) -> None:
-        """Load persisted settings from storage directory if available."""
-        if self._settings_file.is_file():
+        """Load persisted settings from storage directory if available.
+
+        Nothing read here is copied into `os.environ`: the connector is built from explicit
+        arguments, and the environment stays what the operator set.
+        """
+        if not self._settings_file.is_file():
+            return
+        try:
+            data = json.loads(self._settings_file.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logger.warning("Failed to read settings file %s: %s", self._settings_file, exc)
+            return
+        if not isinstance(data, dict):
+            return
+        cfg = cast(dict[str, Any], data)
+        if isinstance(cfg.get("llm_provider"), str):
+            raw_provider = cast(str, cfg["llm_provider"]).strip().lower()
+            self._configured_provider = canonical_provider(raw_provider) or raw_provider or None
+        if isinstance(cfg.get("llm_base_url"), str):
+            self._configured_base_url = cast(str, cfg["llm_base_url"]).strip()
+        if isinstance(cfg.get("llm_model"), str):
+            self._configured_model = cast(str, cfg["llm_model"]).strip() or None
+        if isinstance(cfg.get(LLM_MODEL_FAST_KEY), str):
+            self._configured_model_fast = cast(str, cfg[LLM_MODEL_FAST_KEY]).strip() or None
+        if isinstance(cfg.get("comfyui_base_url"), str):
+            self._configured_comfyui_url = cast(str, cfg["comfyui_base_url"]).strip()
+            img_tool = self._tools.get("generate_image")
+            if self._configured_comfyui_url and isinstance(img_tool, ComfyImageGenTool):
+                img_tool.update_base_url(self._configured_comfyui_url)
+        raw_language: object = cfg.get("ui_language")
+        if is_ui_language(raw_language):
+            self._configured_ui_language = raw_language
+        raw_roots: object = cfg.get("read_roots")
+        if isinstance(raw_roots, list):
+            self._configured_read_roots = tuple(
+                entry.strip()
+                for entry in cast(list[object], raw_roots)
+                if isinstance(entry, str) and entry.strip()
+            )
+
+        if self._llm is None and (self._configured_provider or self._configured_base_url):
             try:
-                data = json.loads(self._settings_file.read_text(encoding="utf-8"))
-                if isinstance(data, dict):
-                    cfg = cast(dict[str, Any], data)
-                    if "llm_provider" in cfg and isinstance(cfg["llm_provider"], str):
-                        self._configured_provider = cfg["llm_provider"].strip().lower()
-                    if "llm_base_url" in cfg and isinstance(cfg["llm_base_url"], str):
-                        self._configured_base_url = cfg["llm_base_url"].strip()
-                    if "llm_model" in cfg and isinstance(cfg["llm_model"], str):
-                        self._configured_model = cfg["llm_model"].strip()
-                    if "llm_api_key" in cfg and isinstance(cfg["llm_api_key"], str):
-                        self._configured_api_key = cfg["llm_api_key"].strip()
-                        owner = key_owner(cfg)
-                        self._configured_api_key_provider = owner.lower() if owner else None
-                    if "comfyui_base_url" in cfg and isinstance(cfg["comfyui_base_url"], str):
-                        self._configured_comfyui_url = cfg["comfyui_base_url"].strip()
-                    raw_roots: object = cfg.get("read_roots")
-                    if isinstance(raw_roots, list):
-                        self._configured_read_roots = tuple(
-                            entry.strip()
-                            for entry in cast(list[object], raw_roots)
-                            if isinstance(entry, str) and entry.strip()
-                        )
-
-                    # Propagate loaded settings into process environment if not already overridden
-                    eff_provider = self._configured_provider
-                    if eff_provider and "LLM_PROVIDER" not in os.environ:
-                        os.environ["LLM_PROVIDER"] = eff_provider
-
-                    if self._configured_base_url:
-                        if eff_provider == "ollama" and "OLLAMA_BASE_URL" not in os.environ:
-                            os.environ["OLLAMA_BASE_URL"] = self._configured_base_url
-                        elif eff_provider == "vllm" and "VLLM_BASE_URL" not in os.environ:
-                            os.environ["VLLM_BASE_URL"] = self._configured_base_url
-                        elif eff_provider == "openai" and "OPENAI_BASE_URL" not in os.environ:
-                            os.environ["OPENAI_BASE_URL"] = self._configured_base_url
-                        elif eff_provider == "anthropic" and "ANTHROPIC_BASE_URL" not in os.environ:
-                            os.environ["ANTHROPIC_BASE_URL"] = self._configured_base_url
-
-                    if self._configured_model:
-                        if eff_provider == "ollama" and "OLLAMA_MODEL" not in os.environ:
-                            os.environ["OLLAMA_MODEL"] = self._configured_model
-                        elif eff_provider == "vllm" and VLLM_MODEL_ENV_VAR not in os.environ:
-                            # Load-bearing, not symmetry: `VLLMConnector` refuses a request
-                            # that names no model unless this variable does, so a saved
-                            # vLLM configuration that skipped this line would come back
-                            # after a restart as "no model is configured".
-                            os.environ[VLLM_MODEL_ENV_VAR] = self._configured_model
-                        elif eff_provider == "openai" and "OPENAI_MODEL" not in os.environ:
-                            os.environ["OPENAI_MODEL"] = self._configured_model
-                        elif eff_provider == "anthropic" and "ANTHROPIC_MODEL" not in os.environ:
-                            os.environ["ANTHROPIC_MODEL"] = self._configured_model
-                        elif (
-                            eff_provider in ("gemini", "google")
-                            and "GEMINI_MODEL" not in os.environ
-                        ):
-                            os.environ["GEMINI_MODEL"] = self._configured_model
-
-                    # Only a key saved for this provider is exported: exporting another
-                    # provider's key under this one's variable sends it to the wrong service.
-                    own_key = self._api_key_for(eff_provider)
-                    if own_key:
-                        if eff_provider == "openai" and "OPENAI_API_KEY" not in os.environ:
-                            os.environ["OPENAI_API_KEY"] = own_key
-                        elif eff_provider == "vllm" and "VLLM_API_KEY" not in os.environ:
-                            os.environ["VLLM_API_KEY"] = own_key
-                        elif eff_provider == "anthropic" and "ANTHROPIC_API_KEY" not in os.environ:
-                            os.environ["ANTHROPIC_API_KEY"] = own_key
-                        elif (
-                            eff_provider in ("gemini", "google")
-                            and "GEMINI_API_KEY" not in os.environ
-                        ):
-                            os.environ["GEMINI_API_KEY"] = own_key
-
-                    if self._llm is None and (
-                        self._configured_provider or self._configured_base_url
-                    ):
-                        try:
-                            self._llm = create_llm_connector(
-                                provider=self._configured_provider or None,
-                                api_key=self._api_key_for(self._configured_provider),
-                                base_url=self._configured_base_url or None,
-                                fallback_to_mock=self._fallback_to_mock,
-                            )
-                        except Exception as exc:
-                            logger.warning(
-                                "Failed to initialize active LLM connector from persisted settings %s: %s",
-                                self._settings_file,
-                                exc,
-                            )
+                self._llm = self._build_llm_in_effect()
             except Exception as exc:
-                logger.warning("Failed to read settings file %s: %s", self._settings_file, exc)
+                logger.warning(
+                    "Failed to initialize active LLM connector from persisted settings %s: %s",
+                    self._settings_file,
+                    exc,
+                )
 
     def _adopt_saved_choice(self) -> None:
         """Pick up a model choice saved after this dashboard started, while it has none.
@@ -1753,21 +1490,13 @@ class AgentSessionManager:
         saved = saved_choice_in_effect(path=self._settings_file)
         if saved is None:
             return
-        self._configured_provider = saved.provider
+        self._configured_provider = canonical_provider(saved.provider) or saved.provider
         self._configured_model = self._configured_model or saved.model
+        self._configured_model_fast = self._configured_model_fast or saved.model_fast
         self._configured_base_url = self._configured_base_url or saved.base_url
-        if not self._configured_api_key and saved.api_key:
-            # `saved.api_key` is only ever the key saved for `saved.provider`.
-            self._configured_api_key = saved.api_key
-            self._configured_api_key_provider = saved.provider
         if self._llm is None:
             try:
-                adopted = create_llm_connector(
-                    provider=saved.provider,
-                    api_key=self._api_key_for(saved.provider),
-                    base_url=self._configured_base_url or None,
-                    fallback_to_mock=self._fallback_to_mock,
-                )
+                adopted = self._build_llm_in_effect()
             except Exception as exc:
                 logger.warning(
                     "Failed to initialize the LLM connector saved in %s: %s",
@@ -1781,11 +1510,23 @@ class AgentSessionManager:
         """Make ``new_llm`` the connector, and hand it to every open agent and room (#1446).
 
         A Settings save and a choice adopted after startup both go through here, so a room
-        opened before either picks the new connector up the same way.
+        opened before either picks the new connector up the same way. An agent takes the
+        Settings models only in the slots its persona left empty; a persona's own model is
+        never replaced by a Settings save.
         """
         self._llm = new_llm
-        for agent in self._agents.values():
-            agent.hot_reload_llm(new_llm, model_name=self._configured_model)
+        deep, fast = self.global_models()
+        seen: set[int] = set()
+        for key, agent in self._agents.items():
+            if id(agent) in seen:
+                continue
+            seen.add(id(agent))
+            deep_follows, fast_follows = self._follows_settings.get(key, (True, True))
+            agent.hot_reload_llm(
+                new_llm,
+                model_name=deep if deep_follows else None,
+                fast_model=fast if fast_follows else None,
+            )
         for listener in self._llm_listeners:
             listener(new_llm)
 
@@ -1795,16 +1536,17 @@ class AgentSessionManager:
         Only `changes` are written: the file is shared with setup and `ucx llm use`, and
         rewriting it whole from memory put `"llm_provider": null` back over a model saved
         after this dashboard started. When the file cannot be read, it is replaced with
-        everything this dashboard holds, as a Settings save always did.
+        everything this dashboard holds, as a Settings save always did. Keys are not held
+        here, so they are written by `save_api_key` alone.
         """
         everything: dict[str, Any] = {
             "llm_provider": self._configured_provider,
             "llm_base_url": self._configured_base_url,
             "llm_model": self._configured_model,
-            "llm_api_key": self._configured_api_key,
-            "llm_api_key_provider": self._configured_api_key_provider,
+            LLM_MODEL_FAST_KEY: self._configured_model_fast,
             "comfyui_base_url": self._configured_comfyui_url,
             "read_roots": list(self._configured_read_roots),
+            "ui_language": self._configured_ui_language,
         }
         try:
             update_settings_file(
@@ -1813,17 +1555,47 @@ class AgentSessionManager:
         except Exception as exc:
             logger.warning("Failed to write settings file %s: %s", self._settings_file, exc)
 
-    def get_settings(self) -> dict[str, Any]:
-        """Return active endpoints, configurations, and masked credentials."""
-        self._adopt_saved_choice()
-        active_provider = (
-            self._configured_provider
+    def _active_provider(self) -> str:
+        """The provider Settings reports: `LLM_PROVIDER`, saved, the live connector's, or ollama."""
+        return (
+            self.provider_in_effect
             or (getattr(self._llm, "provider_name", None) if self._llm else None)
-            or os.getenv("LLM_PROVIDER")
             or "ollama"
         )
 
-        active_base_url = self._configured_base_url
+    def _env_overrides(self, provider: str) -> list[dict[str, str]]:
+        """Each setting an environment variable decides instead of the file, in plain words.
+
+        Saving Settings still writes the file; these say why the saved choice is not the
+        one in use while the variable stays set.
+        """
+        overrides: list[dict[str, str]] = []
+        for field, label, (_, source, variable) in (
+            ("llm_provider", "provider", self._provider_state()),
+            ("llm_model", "model", self._model_state(provider)),
+            ("llm_base_url", "endpoint", self._base_url_state(provider)),
+        ):
+            if source == "env" and variable:
+                overrides.append(
+                    {
+                        "field": field,
+                        "env_var": variable,
+                        "message": (
+                            f"The environment variable {variable} is set, so it is used "
+                            f"instead of the {label} chosen here. Saving still keeps your "
+                            f"choice for when the variable is removed."
+                        ),
+                    }
+                )
+        return overrides
+
+    def get_settings(self) -> dict[str, Any]:
+        """Return active endpoints, configurations, and masked credentials."""
+        self._adopt_saved_choice()
+        active_provider = self._active_provider()
+        spec = spec_for(active_provider)
+
+        active_base_url, base_url_source, base_url_var = self._base_url_state(active_provider)
         if not active_base_url and self._llm and hasattr(self._llm, "base_url"):
             active_base_url = cast(str | None, getattr(self._llm, "base_url", None))
         if not active_base_url:
@@ -1833,60 +1605,26 @@ class AgentSessionManager:
                 # `resolve_vllm_base_url` refuses rather than defaults, and the refusal
                 # belongs on a turn, not on opening the panel where the endpoint is typed.
                 active_base_url = resolve_vllm_base_url() if has_configured_vllm_endpoint() else ""
-            elif active_provider == "openai":
-                active_base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
-            elif active_provider == "anthropic":
-                active_base_url = os.getenv("ANTHROPIC_BASE_URL", "https://api.anthropic.com")
-            else:
-                active_base_url = ""
+            elif spec is not None and spec.base_url_env:
+                active_base_url = os.getenv(spec.base_url_env) or ""
 
-        active_model = self._configured_model
-        if not active_model:
-            for ag in self._agents.values():
-                if ag.config.llm_config.model_name:
-                    active_model = ag.config.llm_config.model_name
-                    break
-        if not active_model:
-            if active_provider == "ollama":
-                active_model = os.getenv("OLLAMA_MODEL") or os.getenv("OLLAMA_INDEPTH_MODEL") or ""
-            elif active_provider == "vllm":
-                active_model = resolve_vllm_model() or ""
-            elif active_provider == "openai":
-                active_model = os.getenv("OPENAI_MODEL", "gpt-4o")
-            elif active_provider == "anthropic":
-                active_model = os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-20241022")
-            elif active_provider in ("gemini", "google"):
-                active_model = os.getenv("GEMINI_MODEL", "gemini-1.5-pro")
-            else:
-                active_model = ""
+        # A cloud model is the one the user or `*_MODEL` named, or none: an unset model is
+        # filled from the provider's listing (`catalog.recommended`), never from a
+        # remembered id, which is how Settings came to show a retired one (#1631).
+        active_model, model_source, model_var = self._model_state(active_provider)
+        _, provider_source, provider_var = self._provider_state()
 
-        raw_key = self._api_key_for(active_provider)
-        if not raw_key and self._llm and hasattr(self._llm, "api_key"):
-            raw_key = cast(str | None, getattr(self._llm, "api_key", None))
-        if not raw_key:
-            if active_provider == "openai":
-                raw_key = os.getenv("OPENAI_API_KEY")
-            elif active_provider == "vllm":
-                raw_key = os.getenv("VLLM_API_KEY")
-            elif active_provider == "anthropic":
-                raw_key = os.getenv("ANTHROPIC_API_KEY")
-            elif active_provider in ("gemini", "google"):
-                raw_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
-
-        key_set = bool(raw_key and raw_key.strip())
-        masked_key = ""
-        if key_set and raw_key:
-            trimmed = raw_key.strip()
-            if len(trimmed) > 8:
-                masked_key = f"{trimmed[:3]}...{trimmed[-4:]}"
-            else:
-                masked_key = "***"
+        key, source, variable = self._key_state(active_provider)
+        if not key:
+            live_key = self.resolved_api_key(active_provider)
+            if live_key:
+                key, source = live_key, "settings"
 
         comfy_url = self._configured_comfyui_url or os.getenv(
             "COMFYUI_BASE_URL", DEFAULT_COMFYUI_BASE_URL
         )
 
-        available_providers = ["ollama", "vllm", "openai", "anthropic", "gemini"]
+        available_providers = [pid for pid in PROVIDERS if pid != "mock"]
         if active_provider == "mock":
             available_providers.append("mock")
 
@@ -1894,11 +1632,24 @@ class AgentSessionManager:
             "llm_provider": active_provider,
             "llm_base_url": active_base_url or "",
             "llm_model": active_model or "",
-            "llm_api_key_set": key_set,
-            "llm_api_key_masked": masked_key,
+            "llm_model_fast": self._saved_fast_model(active_provider) or "",
+            "llm_provider_source": provider_source,
+            "llm_provider_env_var": provider_var,
+            "llm_model_source": model_source,
+            "llm_model_env_var": model_var,
+            "llm_base_url_source": base_url_source,
+            "llm_base_url_env_var": base_url_var,
+            "env_overrides": self._env_overrides(active_provider),
+            "llm_api_key_set": bool(key),
+            "llm_api_key_masked": self._mask_key(key) if key else "",
+            "llm_api_key_source": source or "",
+            "llm_api_key_env_var": variable or "",
+            "providers": self._provider_key_states(),
             "comfyui_base_url": comfy_url,
+            **self._image_settings(),
             "providers_available": available_providers,
             "workspace_dir": str(self._workspace_dir),
+            "ui_language": self._configured_ui_language,
             "read_roots": list(self._configured_read_roots),
             "read_roots_missing": [
                 entry
@@ -1919,9 +1670,59 @@ class AgentSessionManager:
             ],
         }
 
+    def _image_settings(self) -> dict[str, str]:
+        """``image_engine`` and ``image_model`` as saved, read from the file each time.
+
+        The file is their only home: the dispatcher reads it on every draw, so a copy held
+        here could only disagree with it. A stored value the dispatcher would refuse is
+        shown as saved, with the refusal in ``image_settings_problem``.
+        """
+        data = settings_data(self._settings_file)
+        raw_engine: object = data.get(IMAGE_ENGINE_KEY)
+        raw_model: object = data.get(IMAGE_MODEL_KEY)
+        problem = ""
+        try:
+            engine: str = parse_image_engine_setting(raw_engine)
+        except PlainRefusalError as exc:
+            engine, problem = str(raw_engine), str(exc)
+        try:
+            model = parse_image_model(raw_model)
+        except PlainRefusalError as exc:
+            model, problem = str(raw_model), problem or str(exc)
+        return {"image_engine": engine, "image_model": model, "image_settings_problem": problem}
+
     def on_llm_replaced(self, listener: Callable[[LLMProviderProtocol | None], None]) -> None:
         """Call `listener` with the new connector whenever Settings replaces it."""
         self._llm_listeners.append(listener)
+
+    def set_agent_model(self, agent: BaseAgent, model_name: str) -> None:
+        """Give ``agent`` its own deep model; a later Settings save no longer moves it."""
+        agent.hot_reload_llm(self._llm or agent.llm, model_name=model_name)
+        for key, held in self._agents.items():
+            if held is agent:
+                _, fast_follows = self._follows_settings.get(key, (True, True))
+                self._follows_settings[key] = (False, fast_follows)
+
+    def remove_api_key(self, provider: str) -> dict[str, Any]:
+        """Remove the key saved for ``provider``; return the settings as they now are.
+
+        The key the active connector is using is not removed: the next turn would fail with
+        no key. The person switches provider first, or pastes a new key over it.
+
+        Raises:
+            KeyRemovalRefused: an unknown provider, or the active provider's key.
+        """
+        canonical = canonical_provider(provider)
+        if canonical is None:
+            raise KeyRemovalRefused("unknown_provider", "That provider is not one Settings knows.")
+        if same_provider(self._active_provider(), canonical) and self._llm is not None:
+            raise KeyRemovalRefused(
+                "key_in_use",
+                "This key is in use. Switch to another provider first, "
+                "or paste a new key to replace it.",
+            )
+        delete_api_key(canonical, path=self._settings_file)
+        return self.get_settings()
 
     def update_settings(
         self,
@@ -1931,113 +1732,123 @@ class AgentSessionManager:
         llm_model: str | None = None,
         comfyui_base_url: str | None = None,
         read_roots: list[str] | None = None,
+        ui_language: object = None,
+        llm_model_fast: str | None = None,
+        llm_api_key_provider: str | None = None,
+        image_engine: object = None,
+        image_model: object = None,
     ) -> dict[str, Any]:
-        """Update configurations, hot-reload LLM connectors and tools across active agents."""
+        """Update configurations, hot-reload LLM connectors and tools across active agents.
+
+        Nothing is written into `os.environ`. A key is saved for the provider it names
+        (`llm_api_key_provider`, else the provider this save leaves active) and for no other.
+        """
         self._adopt_saved_choice()
+        if ui_language is not None and not is_ui_language(ui_language):
+            raise ValueError(
+                f"ui_language must be one of {', '.join(UI_LANGUAGES)}, got {ui_language!r}"
+            )
+        # Refused before anything is changed, like `ui_language`: a save carrying an
+        # unknown picture engine changes nothing else either.
+        image_changes: dict[str, str] = {}
+        try:
+            if image_engine is not None:
+                image_changes[IMAGE_ENGINE_KEY] = parse_image_engine_setting(image_engine)
+            if image_model is not None:
+                image_changes[IMAGE_MODEL_KEY] = parse_image_model(image_model)
+        except PlainRefusalError as exc:
+            raise ValueError(str(exc)) from exc
         clean_roots = (
             _validate_read_roots(read_roots, self._storage_dir, self._configured_read_roots)
             if read_roots is not None
             else None
         )
-        env_updates: dict[str, str] = {}
-        state_updates: dict[str, str] = {}
+        state_updates: dict[str, str | None] = {}
 
         if llm_provider is not None and llm_provider.strip():
-            prov_clean = llm_provider.strip().lower()
-            allowed = {"ollama", "vllm", "openai", "anthropic", "gemini", "google", "mock"}
-            if prov_clean not in allowed:
-                raise ValueError(f"Unsupported LLM provider: {prov_clean}")
+            prov_clean = canonical_provider(llm_provider)
+            if prov_clean is None:
+                raise ValueError(f"Unsupported LLM provider: {llm_provider.strip().lower()}")
             state_updates["_configured_provider"] = prov_clean
-            env_updates["LLM_PROVIDER"] = prov_clean
 
         eff_provider = state_updates.get("_configured_provider", self._configured_provider)
 
         if llm_base_url is not None:
-            clean_base = llm_base_url.strip()
-            state_updates["_configured_base_url"] = clean_base
-            if eff_provider == "ollama":
-                env_updates["OLLAMA_BASE_URL"] = clean_base
-            elif eff_provider == "vllm":
-                env_updates["VLLM_BASE_URL"] = clean_base
-            elif eff_provider == "openai":
-                env_updates["OPENAI_BASE_URL"] = clean_base
-            elif eff_provider == "anthropic":
-                env_updates["ANTHROPIC_BASE_URL"] = clean_base
+            state_updates["_configured_base_url"] = llm_base_url.strip()
 
         if llm_model is not None and llm_model.strip():
-            clean_model = llm_model.strip()
-            state_updates["_configured_model"] = clean_model
-            if eff_provider == "ollama":
-                env_updates["OLLAMA_MODEL"] = clean_model
-            elif eff_provider == "vllm":
-                env_updates[VLLM_MODEL_ENV_VAR] = clean_model
-            elif eff_provider == "openai":
-                env_updates["OPENAI_MODEL"] = clean_model
-            elif eff_provider == "anthropic":
-                env_updates["ANTHROPIC_MODEL"] = clean_model
-            elif eff_provider in ("gemini", "google"):
-                env_updates["GEMINI_MODEL"] = clean_model
+            state_updates["_configured_model"] = llm_model.strip()
 
+        if llm_model_fast is not None:
+            # Empty is a choice here, not an omission: fast follows deep again.
+            state_updates["_configured_model_fast"] = llm_model_fast.strip() or None
+
+        new_key: tuple[str, str] | None = None
         if llm_api_key is not None:
             clean_key = llm_api_key.strip()
             if clean_key and not clean_key.startswith("***") and "..." not in clean_key:
-                state_updates["_configured_api_key"] = clean_key
-                key_for = (
+                key_for = canonical_provider(llm_api_key_provider) or canonical_provider(
                     eff_provider
                     or (getattr(self._llm, "provider_name", None) if self._llm else None)
                     or os.getenv("LLM_PROVIDER")
                 )
-                if key_for:
-                    # Recorded with the key, so a later switch to another provider keeps
-                    # the key without sending it there.
-                    state_updates["_configured_api_key_provider"] = str(key_for).strip().lower()
-                if eff_provider == "openai":
-                    env_updates["OPENAI_API_KEY"] = clean_key
-                elif eff_provider == "vllm":
-                    env_updates["VLLM_API_KEY"] = clean_key
-                elif eff_provider == "anthropic":
-                    env_updates["ANTHROPIC_API_KEY"] = clean_key
-                elif eff_provider in ("gemini", "google"):
-                    env_updates["GEMINI_API_KEY"] = clean_key
+                if key_for is None:
+                    raise ValueError("Choose which provider this key is for, then save again.")
+                new_key = (key_for, clean_key)
 
-        eff_provider_for_llm = str(
-            eff_provider
-            or (getattr(self._llm, "provider_name", None) if self._llm else None)
-            or os.getenv("LLM_PROVIDER")
-            or ""
+        # A save that names no LLM field (the language control's) keeps the connector: rebuilding
+        # it re-probes the provider, and a failed probe would refuse a language save.
+        reload_llm = any(
+            v is not None
+            for v in (llm_provider, llm_base_url, llm_api_key, llm_model, llm_model_fast)
         )
-        new_llm = create_llm_connector(
-            # Empty means "resolve from configuration". The literal "ollama" here made the
-            # settings path build a localhost connector for a user who had configured
-            # nothing, which is the case #533's refusal exists to report.
-            provider=eff_provider_for_llm or None,
-            api_key=state_updates.get("_configured_api_key")
-            or self._api_key_for(eff_provider_for_llm or None),
-            base_url=state_updates.get("_configured_base_url", self._configured_base_url) or None,
-            fallback_to_mock=self._fallback_to_mock,
-        )
-
-        for k, v in env_updates.items():
-            os.environ[k] = v
+        previous = {attr: getattr(self, attr) for attr in state_updates}
         for k, v in state_updates.items():
             setattr(self, k, v)
-        self._install_llm(new_llm)
+        if new_key is not None:
+            # The key is saved before the rebuild reads it, and stays saved if the rebuild
+            # fails: it is the person's key for that provider whatever happens to the probe.
+            save_api_key(new_key[0], new_key[1], path=self._settings_file)
+        new_llm = None
+        if reload_llm:
+            # The provider in effect after this save: `LLM_PROVIDER` still wins over the
+            # one just saved, which is written to the file all the same.
+            eff_provider_for_llm = str(
+                self.provider_in_effect
+                or (getattr(self._llm, "provider_name", None) if self._llm else None)
+                or ""
+            )
+            try:
+                new_llm = self._build_configured_llm(
+                    # Empty means "resolve from configuration". The literal "ollama" here made
+                    # the settings path build a localhost connector for a user who had
+                    # configured nothing, which is the case #533's refusal exists to report.
+                    eff_provider_for_llm or None,
+                    self.base_url_in_effect(eff_provider_for_llm or None),
+                )
+            except Exception:
+                for k, v in previous.items():
+                    setattr(self, k, v)
+                raise
 
-        logger.info(
-            "⚙️ [UI Settings] Model/Settings updated: provider=%s, model=%s, base_url=%s",
-            eff_provider,
-            self._configured_model,
-            self._configured_base_url,
-        )
-        _console.print(
-            f"[bold green]⚙️ [UI Settings] Active model updated:[/bold green] [bold yellow]{self._configured_model}[/bold yellow] "
-            f"(provider: [cyan]{eff_provider}[/cyan])"
-        )
+        if new_llm is not None:
+            self._install_llm(new_llm)
+
+            logger.info(
+                "⚙️ [UI Settings] Model/Settings updated: provider=%s, model=%s, fast=%s, base_url=%s",
+                eff_provider,
+                self._configured_model,
+                self._configured_model_fast,
+                self._configured_base_url,
+            )
+            _console.print(
+                f"[bold green]⚙️ [UI Settings] Active model updated:[/bold green] [bold yellow]{self._configured_model}[/bold yellow] "
+                f"(provider: [cyan]{eff_provider}[/cyan])"
+            )
 
         if comfyui_base_url is not None and comfyui_base_url.strip():
             clean_comfy = comfyui_base_url.strip()
             self._configured_comfyui_url = clean_comfy
-            os.environ["COMFYUI_BASE_URL"] = clean_comfy
             img_tool = self._tools.get("generate_image")
             if isinstance(img_tool, ComfyImageGenTool):
                 img_tool.update_base_url(clean_comfy)
@@ -2054,8 +1865,7 @@ class AgentSessionManager:
                 ("llm_provider", "_configured_provider"),
                 ("llm_base_url", "_configured_base_url"),
                 ("llm_model", "_configured_model"),
-                ("llm_api_key", "_configured_api_key"),
-                ("llm_api_key_provider", "_configured_api_key_provider"),
+                (LLM_MODEL_FAST_KEY, "_configured_model_fast"),
             )
             if attr in state_updates
         }
@@ -2063,6 +1873,10 @@ class AgentSessionManager:
             changes["comfyui_base_url"] = self._configured_comfyui_url
         if clean_roots is not None:
             changes["read_roots"] = list(self._configured_read_roots)
+        if ui_language is not None:
+            self._configured_ui_language = ui_language
+            changes["ui_language"] = ui_language
+        changes.update(image_changes)
         self._save_persisted_settings(changes)
         return self.get_settings()
 
@@ -2072,7 +1886,7 @@ class AgentSessionManager:
         Under `<root>/ui/`, not `<root>/` — the root path belongs to the Core store and
         sharing it destroyed conversations in both directions.
 
-        Delegates to `uclone_x.agent.session.resolve_session_path`, which is the single
+        Delegates to `uclone_x.core.session.resolve_session_path`, which is the single
         implementation of this guard. It previously existed twice — here and in the Core
         store — and a duplicated security control is one that gets fixed in a single copy.
 
@@ -2102,9 +1916,9 @@ class AgentSessionManager:
         **A transcript belonging to a different session is refused (#256).** The Core store
         is not the only artifact keyed by a session id in a filename, so it is not the only
         one the case- and normalization-insensitive filesystem folds. Measured on
-        `e8b3e2f`: after `save_session_record("SessA", ...)`,
+        `e8b3e2f`: after a transcript was saved for `"SessA"`,
         `load_session_record("SESSA")` returned `SessA`'s transcript — including its
-        `session_id` — and `get_session_history` cached it under `"SESSA"`, so the
+        `session_id` — and the history reader cached it under `"SESSA"`, so the
         dashboard displayed one session's conversation as another's. `#256` names only the
         Core store; this door was found by enumerating the id-bearing surface. The rule is
         `agent.session.verify_record_identity`, the same one the Core store uses, not a
@@ -2116,7 +1930,7 @@ class AgentSessionManager:
         handled by the shape mismatch below.
 
         Raises:
-            PathTraversalError: See `agent.session.resolve_session_path`.
+            PathTraversalError: See `core.session.resolve_session_path`.
             SessionIdCollisionError: If the transcript found identifies another session.
         """
         path = self.get_session_path(session_id)
@@ -2140,80 +1954,6 @@ class AgentSessionManager:
         if isinstance(recorded_id, str):
             verify_record_identity(session_id, recorded_id, path)
         return record
-
-    def save_session_record(
-        self,
-        session_id: str,
-        agent_id: str,
-        messages: list[dict[str, Any]],
-        turns: int = 0,
-    ) -> None:
-        """Atomically persist session record to disk."""
-        path = self.get_session_path(session_id)
-        existing = self.load_session_record(session_id)
-        now_iso = datetime.now(UTC).isoformat()
-        created_at = existing.get("created_at", now_iso) if existing else now_iso
-        record: dict[str, Any] = {
-            "session_id": session_id,
-            "agent_id": agent_id,
-            "created_at": created_at,
-            "updated_at": now_iso,
-            "turns": turns,
-            "messages": list(messages),
-        }
-        self._storage_dir.mkdir(parents=True, exist_ok=True)
-        # Atomic file write via temporary file. The temporary name comes from the pid
-        # plus a random suffix, not from `asyncio.get_running_loop().time()`: that call
-        # raises `RuntimeError` when no loop is running, which made this synchronous
-        # method unusable from synchronous callers — including tests of it. Matches
-        # `SessionStore.save`, which never had the defect (#183).
-        #
-        # Adopted flush() and os.fsync() on temp descriptor for crash durability (#219, #257).
-        tmp_path = path.with_name(f"{path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}")
-        try:
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                f.write(json.dumps(record, indent=2))
-                f.flush()
-                os.fsync(f.fileno())
-            tmp_path.replace(path)
-        except Exception:
-            if tmp_path.exists():
-                tmp_path.unlink(missing_ok=True)
-            raise
-
-        # Only once the record is on disk does the view change. This assignment used to
-        # come first, so an `OSError` from the write left the in-memory transcript
-        # rewritten over a stale record — and the compaction path re-raises, answering
-        # 5xx over a view it had already mutated. The two stores this method exists to
-        # keep in step were then out of step precisely when the caller was told nothing
-        # had happened (P6).
-        self._session_messages[session_id] = list(messages)
-
-    def get_session_history(self, agent_id: str, session_id: str) -> list[dict[str, Any]]:
-        """Return persisted or in-memory conversation message history."""
-        if session_id in self._session_messages:
-            msgs = list(self._session_messages[session_id])
-            _, typed_msgs = self.reconstruct_history(msgs, session_id=session_id)
-            self._session_messages[session_id] = list(typed_msgs)
-            return list(typed_msgs)
-        record = self.load_session_record(session_id)
-        if record is not None:
-            raw_msgs: object = record.get("messages", [])
-            if isinstance(raw_msgs, list):
-                raw_list: list[object] = cast(list[object], raw_msgs)
-                _, typed_msgs = self.reconstruct_history(raw_list, session_id=session_id)
-                self._session_messages[session_id] = list(typed_msgs)
-                return list(typed_msgs)
-        state = self._core_store.load(session_id)
-        if state is not None and state.messages:
-            core_msgs = _core_messages_to_transcript(
-                state.messages,
-                agent_id=state.agent_id or agent_id,
-                timestamp=state.updated_at,
-            )
-            self._session_messages[session_id] = list(core_msgs)
-            return list(core_msgs)
-        return []
 
     def _live_messages(
         self, agent_id: str, session_id: str, agent: BaseAgent | None = None
@@ -2256,74 +1996,6 @@ class AgentSessionManager:
             return 0
         return _turns_taken(transcript)
 
-    def truncate_session_history(
-        self,
-        agent_id: str,
-        session_id: str,
-        index: int,
-    ) -> list[dict[str, Any]]:
-        """Truncate UI transcript and Core session memory back to index (FR-13.7, P8).
-
-        Parameters:
-            agent_id: The agent ID associated with the session.
-            session_id: The session ID to truncate.
-            index: The 0-based message index to truncate to (retains messages 0..index-1).
-
-        Raises:
-            PathTraversalError: If session_id attempts path traversal.
-            SessionIdCollisionError: If session record identifies another session.
-            SessionMutationDuringTurnError: If target session has a turn in flight.
-            ValueError: If index is negative.
-        """
-        if index < 0:
-            raise ValueError("'index' must be non-negative")
-
-        # Path resolution and ownership checks
-        self.get_session_path(session_id)
-        self.load_session_record(session_id)
-
-        # Truncate UI presentation transcript
-        transcript_msgs = self.get_session_history(agent_id, session_id)
-        truncated_transcript = transcript_msgs[:index]
-        # Counted over the transcript **raw**, failure rows included, and deliberately not
-        # mapped like the Core index below: `turn_counter` is the lifetime figure for turns
-        # this session has taken, and a turn that failed was still taken -- the Core's own
-        # counter reads 4 after four sends of which one failed (#1023).
-        new_turn_counter = _turns_taken(truncated_transcript)
-        self._session_messages[session_id] = list(truncated_transcript)
-        self.save_session_record(
-            session_id=session_id,
-            agent_id=agent_id,
-            messages=truncated_transcript,
-            turns=new_turn_counter,
-        )
-
-        # Truncate Core session memory. The index is an offset into the transcript, so it
-        # is mapped against the very messages about to be cut rather than counted over the
-        # rows -- the two lists do not have the same length (#1023).
-        agent = self.get_agent(agent_id, session_id)
-        state = (
-            agent.get_session(session_id)
-            if agent is not None
-            else self._core_store.load(session_id)
-        )
-        core_messages = list(state.messages) if state is not None else []
-        core_index = _core_index_for_transcript(truncated_transcript, core_messages)
-
-        if agent is not None:
-            new_msgs = _truncate_core_messages(core_messages, core_index)
-            agent.load_history(new_msgs, turn_counter=new_turn_counter, session_id=session_id)
-            try:
-                agent.persist_session(session_id)
-            except SessionStoreNotConfiguredError:
-                pass
-        elif state is not None:
-            new_msgs = _truncate_core_messages(core_messages, core_index)
-            new_state = state.with_messages(new_msgs, turn_counter=new_turn_counter)
-            self._core_store.save(new_state)
-
-        return list(truncated_transcript)
-
     def clear_session_history(
         self, agent_id: str, session_id: str, agent: BaseAgent | None = None
     ) -> None:
@@ -2355,7 +2027,7 @@ class AgentSessionManager:
         branch, so the in-memory copy and the record are cut by the same call.
 
         Raises:
-            PathTraversalError: See `agent.session.resolve_session_path`.
+            PathTraversalError: See `core.session.resolve_session_path`.
             SessionIdCollisionError: If either artifact at this id's paths identifies a
                 different session. Nothing is reset or unlinked.
         """
@@ -2652,6 +2324,56 @@ class AgentSessionManager:
 
         return history_messages, typed_session_msgs
 
+    def app_scope(self, llm: LLMProviderProtocol | None = None) -> AppScope:
+        """The app scope every clone this manager serves is built from (§5.9.2).
+
+        One for a 1:1 chat and one per room, over the same parts: the chat and a room seat
+        of one clone differ only in what the room adds (owner ruling 2026-09-27). `llm` is
+        the connector for a chat agent built before Settings installed one.
+
+        The persona registry is read afresh, against the live tool inventory -- MCP names
+        included -- so `allowed_tools` is checked against what is registered now. The
+        binder is kept per (provider, base URL), so each tool description is embedded once
+        for every clone; the grow-only bound set itself is per session.
+        """
+        from uclone_x.agent.persona_registry import get_default_persona_registry
+
+        settings = self.get_settings()
+        binder_key = (
+            str(settings.get("llm_provider") or ""),
+            str(settings.get("llm_base_url") or ""),
+        )
+        if binder_key not in self._tool_binders:
+            self._tool_binders[binder_key] = provider_tool_binder(*binder_key)
+        scope = AppScope.create(
+            workspace_root=self._workspace_dir,
+            persona_registry=get_default_persona_registry(
+                self._workspace_dir,
+                tool_names=[tool.name for tool in self._tools.list_tools()],
+            ),
+            memory_for=self.memory_for,
+            global_models=self.global_models,
+            read_roots=lambda: self.read_roots,
+            bus=self._bus,
+            llm=self._llm or llm,
+            tools=self._tools,
+            tracer=self._tracer,
+            store=self._core_store,
+            budget=self._budget_tracker,
+            skills=self._skill_registry,
+            ontology=self._ontology_engine,
+            tool_binder=self._tool_binders[binder_key],
+            # The desktop app has no approval prompt in a conversation, so a call that
+            # needs a person is refused at once and names where to decide instead (the
+            # story view for codex proposals; owner decision 2026-09-26).
+            approvals_answered=False,
+        )
+        # A peer a chat clone calls is answered on the connector in effect at the call,
+        # so a model chosen in Settings since reaches the callee too.
+        return dataclasses.replace(
+            scope, live_host=lambda: dataclasses.replace(scope.host, llm=self._llm or llm)
+        )
+
     def memory_for(self, agent_id: str) -> CrossSessionMemory:
         """The one cross-session memory store for `agent_id`, created on first use.
 
@@ -2701,99 +2423,32 @@ class AgentSessionManager:
             use_fallback = (
                 fallback_to_mock if fallback_to_mock is not None else self._fallback_to_mock
             )
-            llm = self._llm or create_llm_connector(
-                provider=self._configured_provider or None,
-                api_key=self._api_key_for(self._configured_provider),
-                base_url=self._configured_base_url or None,
-                fallback_to_mock=use_fallback,
-            )
-            from uclone_x.agent.bootstrap import agent_config_for_persona
-            from uclone_x.agent.models import DEFAULT_SYSTEM_PROMPT
-            from uclone_x.agent.persona_registry import get_default_persona_registry
-            from uclone_x.tools.scoped_registry import ScopedToolRegistry
-
-            effective_target_model = model_name or self._configured_model or None
-            # The tool inventory is passed so `allowed_tools` is checked against what is
-            # actually registered -- MCP-provided names included, which is why it is read
-            # from the live registry here rather than from a constant.
-            persona_reg = get_default_persona_registry(
-                self._workspace_dir,
-                tool_names=[tool.name for tool in self._tools.list_tools()],
-            )
-            persona_def = persona_reg.get_persona(agent_id)
-
-            if persona_def is not None:
-                # The persona's tools are resolved by the agent, not copied in here, so an
-                # edit `apply_persona` hands it reaches them (#892); the rule is kept, with
-                # the room's, in `agent_config_for_persona` (#1448).
-                config = agent_config_for_persona(
-                    persona_def,
-                    agent_id=agent_id,
-                    system_prompt=system_prompt or persona_def.system_prompt,
-                )
+            if self._llm is not None:
+                llm = self._llm
             else:
-                default_prompt = system_prompt or (
-                    f"You are {agent_id}, a specialized UClone-X autonomous agent assistant. "
-                    f"You collaborate with the user, execute tools, and maintain rigorous accuracy.\n\n{DEFAULT_SYSTEM_PROMPT}"
-                )
-                config = AgentConfig(
-                    agent_id=agent_id,
-                    name=agent_id,
-                    system_prompt=default_prompt,
-                    llm_config=AgentLLMConfig(
-                        model_name=effective_target_model,
-                        temperature=0.7,
-                        max_tokens=2048,
-                    ),
+                deep = self.deep_model
+                provider = self.provider_in_effect
+                llm = self.build_llm(
+                    provider=provider,
+                    api_key=self._api_key_for(provider),
+                    base_url=self.base_url_in_effect(provider),
+                    fallback_to_mock=use_fallback,
+                    **({"model": deep} if deep else {}),
                 )
 
-            if (
-                effective_target_model is not None
-                and config.llm_config.model_name != effective_target_model
-            ):
-                updated_llm_cfg = config.llm_config.model_copy(
-                    update={"model_name": effective_target_model}
-                )
-                config = config.model_copy(update={"llm_config": updated_llm_cfg})
-            config = config.model_copy(update={"read_roots": self.read_roots})
-            context = AgentContext(
+            # Built as a room seat of this clone is built (owner ruling 2026-09-27); a chat
+            # adds nothing a room adds. A model asked for with this request wins, else the
+            # persona's own, else Settings'; only the slots left empty follow Settings.
+            built = build_clone(
+                self.app_scope(llm),
+                clone_id=agent_id,
                 session_id=effective_session_id,
-                agent_id=agent_id,
-                current_state=AgentState.IDLE,
-                # Every agent this manager creates was asked for directly, so none of
-                # them has a parent. This read `"champion" if agent_id != "champion"`,
-                # which drew an edge on `/api/agents/graph` from an agent that had
-                # delegated nothing to an agent it had never heard of -- a hierarchy
-                # invented from the id. A real subagent gets its parent from the agent
-                # that spawned it (`BaseAgent`, `parent_agent_id=self.agent_id`).
-                parent_agent_id=None,
-                workspace_root=self._workspace_dir,
+                model_name=model_name,
+                fallback_prompt=system_prompt or None,
             )
-            from uclone_x.agent.composition import HostDependencies, compose_agent
-
-            # For a persona agent `config.allowed_tools` is now empty, so the agent's own
-            # scope (advertised list, mid-turn refusal, direct-call refusal) is what enforces
-            # the persona's tools; a proxy fixed here would outlive an edit to them.
-            agent_tools = (
-                ScopedToolRegistry(backing=self._tools, allowed_tools=config.allowed_tools)
-                if config.allowed_tools
-                else self._tools
-            )
-            host = HostDependencies(
-                bus=self._bus,
-                llm=llm,
-                tools=agent_tools,
-                tracer=self._tracer,
-                store=self._core_store,
-                budget=self._budget_tracker,
-                skills=self._skill_registry,
-                ontology=self._ontology_engine,
-                # One store per agent id, shared across that agent's sessions: the point
-                # of the facts is that they outlive the session that recorded them, and
-                # two sessions holding two stores over one file lose each other's writes.
-                memory=self.memory_for(agent_id),
-            )
-            agent = compose_agent(config=config, host=host, context=context)
+            agent = built.agent
+            config = agent.config
+            follows = built.follows
 
             # P8: the Core session record is the primary source of the conversation. Try
             # it first; only fall back to reconstructing `ChatMessage`s from the UI's
@@ -2815,8 +2470,10 @@ class AgentSessionManager:
                         ]
                 await agent.start()
                 self._agents[agent_key] = agent
+                self._follows_settings[agent_key] = follows
                 if agent_id not in self._agents:
                     self._agents[agent_id] = agent
+                    self._follows_settings[agent_id] = follows
                 return agent
 
             # Legacy path: reconstruct history from the UI transcript.
@@ -2839,8 +2496,10 @@ class AgentSessionManager:
 
             await agent.start()
             self._agents[agent_key] = agent
+            self._follows_settings[agent_key] = follows
             if agent_id not in self._agents:
                 self._agents[agent_id] = agent
+                self._follows_settings[agent_id] = follows
             return agent
 
     async def stop_agent(self, agent_id: str, session_id: str | None = None) -> None:
@@ -3252,14 +2911,72 @@ def create_ui_app(
         workspace_root=session_mgr.workspace_dir,
     )
     tunnel_manager = SSHTunnelManager()
-    _previous_remote_settings: dict[str, Any] = {}
+    # What a remote-GPU connect overwrote, kept on disk rather than in memory: the tunnel is
+    # a child process that dies with this one (or on its own), and a restore held only in
+    # memory left `127.0.0.1:11435` saved as the LLM address after a restart, pointing at
+    # nothing. The record holds, per field the connect changed, the value it replaced
+    # ("original") and the value it wrote ("applied"). A field is put back only while it
+    # still holds the applied value, so an address the user changed by hand in between
+    # is left alone.
+    remote_restore_path = session_mgr.storage_dir / "remote_gpu_restore.json"
+
+    def _str_map(raw: object) -> dict[str, str]:
+        if not isinstance(raw, dict):
+            return {}
+        items = cast("dict[object, object]", raw).items()
+        return {k: v for k, v in items if isinstance(k, str) and isinstance(v, str)}
+
+    def _read_remote_restore() -> tuple[dict[str, str], dict[str, str]]:
+        """The (original, applied) maps of the saved record; empty when there is none."""
+        try:
+            raw: object = json.loads(remote_restore_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}, {}
+        if not isinstance(raw, dict):
+            return {}, {}
+        record = cast("dict[object, object]", raw)
+        return _str_map(record.get("original")), _str_map(record.get("applied"))
+
+    def _restore_remote_settings() -> dict[str, str]:
+        """Put back what the last connect overwrote and is still in place, then forget it.
+
+        Returns only the fields actually put back.
+        """
+        original, applied = _read_remote_restore()
+        cur = session_mgr.get_settings()
+        restored: dict[str, str] = {}
+        for field in ("llm_base_url", "comfyui_base_url"):
+            if field in original and str(cur.get(field) or "") == applied.get(field):
+                restored[field] = original[field]
+        # The provider was switched to reach the tunnel's Ollama; it goes back with the
+        # address, never on its own.
+        if "llm_base_url" in restored and "llm_provider" in original:
+            restored["llm_provider"] = original["llm_provider"]
+        if restored:
+            session_mgr.update_settings(
+                llm_provider=restored.get("llm_provider"),
+                llm_base_url=restored.get("llm_base_url"),
+                comfyui_base_url=restored.get("comfyui_base_url"),
+            )
+        with contextlib.suppress(FileNotFoundError):
+            remote_restore_path.unlink()
+        return restored
 
     @asynccontextmanager
     async def _app_lifespan(app_inst: FastAPI) -> AsyncGenerator[None, None]:
+        # Before the first turn: an approved skill that is not loaded is one no clone is
+        # told about and `load_skill` refuses. A missing store loads nothing.
+        await load_approved_skills(session_mgr.skill_registry)
         # In the background: a local server launched through `npx` may spend a minute
         # downloading, and the dashboard must not wait on it to open. Until it answers,
         # the server reads as "connecting".
         mcp_start = asyncio.create_task(mcp_manager.start())
+        # A record left on disk means the previous run was connected when it stopped. Its
+        # tunnel died with it, so the addresses it saved lead nowhere.
+        if tunnel_manager.get_status().connected is False and _read_remote_restore()[0]:
+            with contextlib.suppress(Exception):
+                restored = _restore_remote_settings()
+                logger.info("Restored settings a remote-GPU tunnel had replaced: %s", restored)
         yield
         mcp_start.cancel()
         with contextlib.suppress(BaseException):
@@ -3326,8 +3043,8 @@ def create_ui_app(
     # The dock's reads for the conversation on screen and its selected seat (#1353-#1357).
     register_room_dock_routes(app, room_stack)
 
-    # `/api/agents` below lists live instances; this lists what is *installed*, which on a
-    # fresh install is the only one of the two with anything in it (#1190). It is handed
+    # This lists what is *installed*, not what is running (#1190; the live-instance
+    # `/api/agents` was removed 2026-09-27, #1775). It is handed
     # the room stack as well as the session manager because a clone is running in either
     # seat, and under D1 the conversation seat is the ordinary one.
     from uclone_x.ui.clones import register_clone_routes
@@ -3337,8 +3054,15 @@ def create_ui_app(
     # The Files screen: the artifact folders across every conversation, including deleted
     # ones, apart from the room-scoped Docs dock (#1554).
     from uclone_x.ui.artifacts import register_artifact_routes
+    from uclone_x.ui.person import PersonGate, register_person_routes
 
-    register_artifact_routes(app, room_stack)
+    # The secret that tells a person's decision from a program's (#1589 item 6). Made here,
+    # per app, and kept in memory only: never in `os.environ`, where every tool subprocess
+    # would inherit it.
+    person_gate = PersonGate()
+    app.state.person_gate = person_gate
+    register_person_routes(app, person_gate)
+    register_artifact_routes(app, room_stack, person_gate)
 
     @app.get("/api/health")
     async def health() -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
@@ -3419,29 +3143,134 @@ def create_ui_app(
             },
         }
 
+    catalog_cache = CatalogCache()
+
+    async def _catalog_for(provider: str) -> CatalogResult | None:
+        # Only an endpoint the user set is sent: the listing goes where the turns would.
+        return await read_provider_catalog(
+            provider,
+            base_url=session_mgr.base_url_in_effect(provider),
+            api_key=session_mgr.resolved_api_key(provider),
+            cache=catalog_cache,
+        )
+
+    async def _model_ids(
+        provider: str, settings: dict[str, Any], catalog: CatalogResult | None
+    ) -> list[str]:
+        if catalog is not None:
+            return [entry.id for entry in catalog.entries if entry.chat_capable]
+        return await fetch_available_models(
+            provider=provider,
+            base_url=cast(str | None, settings.get("llm_base_url")) or None,
+        )
+
+    @app.get("/api/media/status")
+    async def media_status(request: Request) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
+        """Which image engine would draw now, under the `image_engine` setting, and why.
+
+        The probe `ucx media status` prints, run off the event loop: it makes two local
+        HTTP probes. Gemini is judged by whether its key is there, never by a request.
+        A stored setting the dispatcher would refuse answers 409 with that refusal.
+        """
+        _refuse_cross_origin(request)
+        from uclone_x.tools.builtin.image_status import probe_image_engines
+
+        try:
+            report = await asyncio.to_thread(
+                probe_image_engines, session_mgr.settings_file, session_mgr.provider_in_effect
+            )
+        except PlainRefusalError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {
+            "ready": report.ready,
+            "engine": report.engine,
+            "setting": report.image_engine,
+            "engines": [
+                {"name": name, "ready": ready, "reason_code": code}
+                for name, ready, code in report.engine_states()
+            ],
+        }
+
     @app.get("/api/settings")
     async def get_settings(request: Request) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
         """Retrieve current active endpoints, configurations, and available providers."""
         _refuse_cross_origin(request)  # names the folders clones can read, and the workspace
         settings = session_mgr.get_settings()
-        models = await fetch_available_models(
-            provider=str(settings.get("llm_provider", "ollama")),
-            base_url=cast(str | None, settings.get("llm_base_url")) or None,
-        )
-        settings["available_models"] = models
+        provider = str(settings.get("llm_provider", "ollama"))
+        catalog = await _catalog_for(provider)
+        settings["catalog"] = catalog.model_dump(mode="json") if catalog else None
+        settings["available_models"] = await _model_ids(provider, settings, catalog)
         return settings
 
     @app.get("/api/models")
-    async def get_models() -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
-        """Enumerate installed/available models for active provider (P0/Recognition over Recall)."""
+    async def get_models(refresh: bool = False) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
+        """Enumerate installed/available models for active provider (P0/Recognition over Recall).
+
+        `refresh=1` forgets the kept listings first, for the picker's "Refresh list".
+        """
+        if refresh:
+            catalog_cache.clear()  # the saved provider's "Refresh list"
         settings = session_mgr.get_settings()
         provider = str(settings.get("llm_provider", "ollama"))
-        base_url = cast(str | None, settings.get("llm_base_url")) or None
-        models = await fetch_available_models(provider=provider, base_url=base_url)
+        catalog = await _catalog_for(provider)
+        return {
+            "provider": provider,
+            "models": await _model_ids(provider, settings, catalog),
+            "current_model": settings.get("llm_model", ""),
+            "catalog": catalog.model_dump(mode="json") if catalog else None,
+        }
+
+    @app.post("/api/models/catalog")
+    async def preview_catalog(request: Request, req: dict[str, Any]) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
+        """The model listing for a provider picked on the form, before it is saved (#1657).
+
+        The key and endpoint come from the form, in the body, never the URL. With no key typed,
+        only a key already held for that provider is used (`stored_api_key_for`). A local
+        provider (Ollama, vLLM) answers `catalog: null`, the models its server has installed,
+        and whether anything answered at all (`reachable`, #1666).
+        """
+        _refuse_cross_origin(request)  # a page in another tab must not spend the user's key
+        provider = str(req.get("provider", "")).strip().lower()
+        if not provider:
+            raise HTTPException(status_code=400, detail="provider is required")
+        if req.get("refresh"):
+            catalog_cache.clear()
+        typed_key = str(req.get("api_key") or "").strip()
+        base_url = str(req.get("base_url") or "").strip() or None
+        api_key = typed_key or session_mgr.stored_api_key_for(provider, base_url)
+        catalog = await read_provider_catalog(
+            provider, base_url=base_url, api_key=api_key, cache=catalog_cache
+        )
+        if catalog is None and provider in LOCAL_LISTING_PROVIDERS:
+            # The server's installed models, at the address on the form (#1666). `reachable`
+            # tells a stopped server apart from one with nothing installed.
+            # The address is whatever is typed, fetched with no click: only the typed key, or
+            # one held for this exact saved endpoint, goes with it, never `VLLM_API_KEY`.
+            headers = vllm_request_headers(api_key, env_fallback=False)
+            try:
+                local = await list_local_models(
+                    provider, base_url, vllm_headers=headers, raise_on_refused_key=True
+                )
+            except LocalKeyRefusedError:
+                # Running, and it turned the key away: not "nothing answered" (#1672).
+                return {
+                    "provider": provider,
+                    "models": [],
+                    "reachable": True,
+                    "key_refused": True,
+                    "catalog": None,
+                }
+            return {
+                "provider": provider,
+                "models": local or [],
+                "reachable": local is not None,
+                "catalog": None,
+            }
+        models = [entry.id for entry in catalog.entries if entry.chat_capable] if catalog else []
         return {
             "provider": provider,
             "models": models,
-            "current_model": settings.get("llm_model", ""),
+            "catalog": catalog.model_dump(mode="json") if catalog else None,
         }
 
     @app.post("/api/models/pull")
@@ -3539,6 +3368,11 @@ def create_ui_app(
                 llm_model=req.get("llm_model"),
                 comfyui_base_url=req.get("comfyui_base_url"),
                 read_roots=req.get("read_roots"),
+                ui_language=req.get("ui_language"),
+                llm_model_fast=req.get("llm_model_fast"),
+                llm_api_key_provider=req.get("llm_api_key_provider"),
+                image_engine=req.get("image_engine"),
+                image_model=req.get("image_model"),
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -3557,6 +3391,19 @@ def create_ui_app(
             )
         )
         return updated
+
+    @app.delete("/api/settings/api-keys/{provider}")
+    async def remove_api_key(request: Request, provider: str) -> Any:  # pyright: ignore[reportUnusedFunction]
+        """Remove the key saved for one provider; every other provider's key stays.
+
+        A refusal answers 400 with ``detail`` (English) and ``code``, which the screen
+        translates rather than showing the English text.
+        """
+        _refuse_cross_origin(request)
+        try:
+            return session_mgr.remove_api_key(provider)
+        except KeyRemovalRefused as exc:
+            return JSONResponse({"detail": str(exc), "code": exc.code}, status_code=400)
 
     def _mcp_payload() -> dict[str, Any]:
         return {
@@ -3735,10 +3582,13 @@ def create_ui_app(
                         }
                     else:
                         vllm_url = resolve_vllm_base_url(eff_base)
+                        # The address may be one just typed: it gets the typed key, or one
+                        # held for this exact saved endpoint, never `VLLM_API_KEY` (#1672).
+                        vllm_key = eff_key or session_mgr.stored_api_key_for("vllm", eff_base)
                         async with httpx.AsyncClient(timeout=5.0) as http_c:
                             resp = await http_c.get(
                                 f"{vllm_url.rstrip('/')}/models",
-                                headers=vllm_request_headers(eff_key),
+                                headers=vllm_request_headers(vllm_key, env_fallback=False),
                             )
                             if resp.status_code == 200:
                                 results["llm"] = {
@@ -3753,28 +3603,21 @@ def create_ui_app(
                                     "provider": "vllm",
                                     "url": vllm_url,
                                     "error": f"vLLM HTTP {resp.status_code}",
+                                    "key_refused": resp.status_code in _KEY_REFUSED_STATUSES,
                                 }
-                elif eff_provider in ("openai", "anthropic", "gemini", "google"):
-                    key_present = bool(
-                        eff_key
-                        or (eff_provider == "openai" and os.getenv("OPENAI_API_KEY"))
-                        or (eff_provider == "anthropic" and os.getenv("ANTHROPIC_API_KEY"))
-                        or (
-                            eff_provider in ("gemini", "google")
-                            and (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY"))
-                        )
-                    )
+                elif (keyed := spec_for(eff_provider)) is not None and keyed.requires_key:
+                    key_present = bool(eff_key or session_mgr.stored_api_key_for(keyed.id))
                     if key_present:
                         results["llm"] = {
                             "status": "ok",
                             "provider": eff_provider,
-                            "message": f"{eff_provider.title()} credentials configured",
+                            "message": f"{keyed.display_name} key saved",
                         }
                     else:
                         results["llm"] = {
                             "status": "warning",
                             "provider": eff_provider,
-                            "message": f"{eff_provider.title()} API key not set",
+                            "message": f"No {keyed.display_name} key is saved yet",
                         }
                 else:
                     results["llm"] = {
@@ -3815,13 +3658,22 @@ def create_ui_app(
         _refuse_unless_local(request)
         host = str(req.get("host", "")).strip()
         apply_settings = bool(req.get("apply_settings", True))
-        timeout = float(req.get("timeout", 10.0))
+        auto_start_comfyui = bool(req.get("auto_start_comfyui", True))
+        # The LLM moves to the remote worker only when asked. It used to follow whenever the
+        # remote Ollama held a model of the same name, so a worker meant for images also
+        # answered every turn, and nothing on the Settings card said so.
+        sync_llm = req.get("sync_llm") is True
+        timeout = float(req.get("timeout", 15.0))
         if not host:
             raise HTTPException(
                 status_code=400,
                 detail="Field 'host' is required",
             )
-        tunnel_status = await tunnel_manager.connect(host=host, timeout=timeout)
+        tunnel_status = await tunnel_manager.connect(
+            host=host,
+            auto_start_comfyui=auto_start_comfyui,
+            timeout=timeout,
+        )
         if not tunnel_status.connected:
             return {
                 "status": "error",
@@ -3831,16 +3683,41 @@ def create_ui_app(
             }
 
         changes: dict[str, Any] = {}
+        llm_skipped: str | None = None
         if apply_settings:
             cur = session_mgr.get_settings()
-            _previous_remote_settings.clear()
-            _previous_remote_settings["llm_provider"] = cur.get("llm_provider")
-            _previous_remote_settings["llm_base_url"] = cur.get("llm_base_url")
-            _previous_remote_settings["comfyui_base_url"] = cur.get("comfyui_base_url")
+            # A reconnect keeps the first record: the current values are the tunnel's own.
+            original, applied = _read_remote_restore()
+            current_model = str(cur.get("llm_model") or "").strip()
 
-            # Map forwarded local ports into active runtime settings
             for m in tunnel_status.mappings:
                 if m.service_name == "ollama":
+                    if not sync_llm:
+                        continue
+                    remote_models = tunnel_status.ollama_models
+                    current_bare = current_model.split(":")[0].lower()
+                    model_on_remote = (
+                        not current_model
+                        or not remote_models
+                        or any(
+                            rm.lower() == current_model.lower()
+                            or rm.lower().startswith(current_bare + ":")
+                            for rm in remote_models
+                        )
+                    )
+                    if not model_on_remote:
+                        # Switching would 404 every turn with "model not found".
+                        llm_skipped = "model_not_on_remote"
+                        logger.info(
+                            "Preserving local llm_base_url; active model %r not found on remote worker models %r",
+                            current_model,
+                            remote_models,
+                        )
+                        continue
+                    original.setdefault("llm_provider", str(cur.get("llm_provider") or ""))
+                    original.setdefault("llm_base_url", str(cur.get("llm_base_url") or ""))
+                    applied["llm_provider"] = "ollama"
+                    applied["llm_base_url"] = f"http://127.0.0.1:{m.local_port}"
                     session_mgr.update_settings(
                         llm_provider="ollama",
                         llm_base_url=f"http://127.0.0.1:{m.local_port}",
@@ -3848,16 +3725,23 @@ def create_ui_app(
                     changes["llm_provider"] = "ollama"
                     changes["llm_base_url"] = f"http://127.0.0.1:{m.local_port}"
                 elif m.service_name == "comfyui":
+                    original.setdefault("comfyui_base_url", str(cur.get("comfyui_base_url") or ""))
+                    applied["comfyui_base_url"] = f"http://127.0.0.1:{m.local_port}"
                     session_mgr.update_settings(
                         comfyui_base_url=f"http://127.0.0.1:{m.local_port}",
                     )
                     changes["comfyui_base_url"] = f"http://127.0.0.1:{m.local_port}"
+            if original:
+                remote_restore_path.parent.mkdir(parents=True, exist_ok=True)
+                record = {"original": original, "applied": applied}
+                replace_file(remote_restore_path, json.dumps(record, indent=2).encode())
 
         return {
             "status": "ok",
             "connected": True,
             "tunnel": tunnel_status.to_dict(),
             "applied_changes": changes,
+            "llm_skipped": llm_skipped,
         }
 
     @app.post("/api/settings/remote-gpu/disconnect")
@@ -3867,15 +3751,7 @@ def create_ui_app(
         """Disconnect the active SSH tunnel session and restore previous endpoints."""
         _refuse_unless_local(request)
         await tunnel_manager.disconnect()
-        restored: dict[str, Any] = {}
-        if _previous_remote_settings:
-            session_mgr.update_settings(
-                llm_provider=_previous_remote_settings.get("llm_provider"),
-                llm_base_url=_previous_remote_settings.get("llm_base_url"),
-                comfyui_base_url=_previous_remote_settings.get("comfyui_base_url"),
-            )
-            restored.update(_previous_remote_settings)
-            _previous_remote_settings.clear()
+        restored: dict[str, Any] = dict(_restore_remote_settings())
 
         return {
             "status": "ok",
@@ -3888,108 +3764,18 @@ def create_ui_app(
     async def get_remote_gpu_status(  # pyright: ignore[reportUnusedFunction]
         request: Request,
     ) -> dict[str, Any]:
-        """Return the current status of the remote GPU tunnel."""
+        """Return the current status of the remote GPU tunnel.
+
+        A tunnel whose ssh process has exited reads as disconnected here, and the addresses
+        it saved are put back at the same moment, so a dead tunnel does not stay the LLM or
+        ComfyUI address until someone presses Disconnect.
+        """
         _refuse_unless_local(request)
-        return tunnel_manager.get_status().to_dict()
-
-    @app.get("/api/agents")
-    async def list_agents(session_id: str | None = None) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
-        """Project the runtime agent topology for the dashboard from live session manager."""
-        live_agents = session_mgr.list_agents(session_id=session_id)
-        agents_data: list[dict[str, Any]] = []
-
-        for ag in live_agents:
-            agent_id = ag.agent_id
-            state_val = ag.state.value
-            depth = ag.context.depth
-            parent_id = ag.context.parent_agent_id
-            allowed_tools = list(ag.config.allowed_tools)
-            # What the agent holds, not what it is permitted: a permitted name can have no
-            # tool behind it (a memory tool on an agent with no store, #1431), and an empty
-            # permission list permits every registered tool. Not what its last turn was
-            # offered either: an agent that has not yet run in a conversation still holds
-            # the tools a turn outside one is not offered (`needs_room`), and those are
-            # named as such (#1576).
-            held = ag.held_tools()
-            capabilities = [tool.name for tool in held]
-            capabilities_needing_room = [tool.name for tool in held if tool_needs_room(tool)]
-            role = ag.config.role or "Agent"
-            isolation_level = ag.config.isolation.level.value
-            subagent_ids = [
-                sub.agent_id for sub in live_agents if sub.context.parent_agent_id == agent_id
-            ]
-            current_turn = "Ready for instruction" if state_val == "IDLE" else f"State: {state_val}"
-            agents_data.append(
-                {
-                    "id": agent_id,
-                    "label": ag.config.name or agent_id,
-                    "role": role,
-                    "state": state_val,
-                    "status": state_val,
-                    "depth": depth,
-                    "isolation_level": isolation_level,
-                    "allowed_tools": allowed_tools,
-                    "capabilities": capabilities,
-                    "capabilities_needing_room": capabilities_needing_room,
-                    "turn_index": ag.context.turn_index,
-                    "current_turn": current_turn,
-                    "current_task": current_turn,
-                    "parent_agent_id": parent_id,
-                    "parent_id": parent_id,
-                    "subagents": subagent_ids,
-                    "uptime_s": 0,
-                    "max_steps": ag.config.max_steps,
-                    # Deprecated alias, still emitted for clients pinned to the old key.
-                    "max_turns": ag.config.max_steps,
-                }
-            )
-
-        nodes: list[dict[str, Any]] = [
-            {
-                "id": ag["id"],
-                "label": ag["label"],
-                "role": ag["role"],
-                "state": ag["state"],
-                "status": ag["status"],
-                "depth": ag["depth"],
-                "isolation_level": ag["isolation_level"],
-                "allowed_tools": ag["allowed_tools"],
-                "capabilities": ag["capabilities"],
-                "capabilities_needing_room": ag["capabilities_needing_room"],
-                "current_turn": ag["current_turn"],
-                "current_task": ag["current_task"],
-                "turn_index": ag["turn_index"],
-                "max_steps": ag["max_steps"],
-                "max_turns": ag["max_steps"],
-                "position": {
-                    "x": 100 + (idx % 3) * 200,
-                    "y": 40 + int(ag["depth"]) * 140,
-                },
-            }
-            for idx, ag in enumerate(agents_data)
-        ]
-
-        edges: list[dict[str, Any]] = [
-            {
-                "id": f"e-{ag['parent_agent_id']}-{ag['id']}",
-                "source": ag["parent_agent_id"],
-                "target": ag["id"],
-                "type": "subagent_spawn",
-                "label": "Spawn Sub-Agent",
-                "animated": ag["state"] not in ("idle", "terminated", "error"),
-            }
-            for ag in agents_data
-            if ag.get("parent_agent_id") is not None
-        ]
-
-        return {
-            "data_source": "live",
-            "agents": agents_data,
-            "topology": {
-                "nodes": nodes,
-                "edges": edges,
-            },
-        }
+        status = tunnel_manager.get_status()
+        payload = status.to_dict()
+        if not status.connected and _read_remote_restore()[0]:
+            payload["restored_settings"] = _restore_remote_settings()
+        return payload
 
     @app.get("/api/personas")
     async def list_personas() -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
@@ -4064,6 +3850,23 @@ def create_ui_app(
             },
         )
 
+    def _avatar_registry() -> PersonaRegistry:
+        from uclone_x.agent.persona_registry import get_default_persona_registry
+
+        return get_default_persona_registry(
+            session_mgr.workspace_dir,
+            tool_names=[tool.name for tool in session_mgr.tools.list_tools()],
+        )
+
+    def _registry_for_a_picture_change(request: Request) -> PersonaRegistry:
+        """The registry, after refusing a request another site's page sent.
+
+        The app answers every origin, so without this an unrelated open tab could replace
+        a clone's face.
+        """
+        _refuse_cross_origin(request)  # before anything is read or written
+        return _avatar_registry()
+
     @app.get("/api/personas/{name}/avatar")
     async def get_persona_avatar(name: str) -> Response:  # pyright: ignore[reportUnusedFunction]
         """Return one clone's picture, or refuse with what would put a picture there.
@@ -4071,26 +3874,154 @@ def create_ui_app(
         A 404 here is an ordinary answer, not a fault: most clones have no picture, and the
         head draws its default when this refuses. The detail still names the remedy, because
         this is also what a reader sees who went looking for the file they thought they had
-        installed.
+        installed. `no-cache` because the persona's `avatar_url` carries a `?v=` that
+        changes with the picture, and a cached old face under a new `?v=` would hide that.
         """
-        from uclone_x.agent.persona_registry import get_default_persona_registry
-
-        registry = get_default_persona_registry(
-            session_mgr.workspace_dir,
-            tool_names=[tool.name for tool in session_mgr.tools.list_tools()],
-        )
-        found = _persona_avatar(registry, name)
+        found = PersonaAvatarStore(_avatar_registry()).find(name)
         if found is None:
-            formats = ", ".join(suffix for suffix, _ in _AVATAR_FORMATS)
+            formats = ", ".join(suffix for suffix, _ in AVATAR_FORMATS)
             raise HTTPException(
                 status_code=404,
                 detail=(
-                    f"No picture is set for '{name}'. Put an image file beside its "
-                    f"definition, named after it and ending in one of {formats}."
+                    f"No picture is set for '{name}'. Choose one from its profile, or put an "
+                    f"image file beside its definition, named after it and ending in one of "
+                    f"{formats}."
                 ),
             )
-        path, mime = found
-        return Response(content=path.read_bytes(), media_type=mime)
+        return Response(
+            content=found.path.read_bytes(),
+            media_type=found.mime,
+            headers={"X-Content-Type-Options": "nosniff", "Cache-Control": "no-cache"},
+        )
+
+    def _avatar_answer(
+        registry: PersonaRegistry, name: str, *, undo_with: Path | None = None
+    ) -> dict[str, Any]:
+        """The changed clone, and the kept picture that would undo the change.
+
+        `previous_path` is the workspace path to `PUT` back to undo it; `null` means the
+        clone had no chosen picture before, so undoing is a `DELETE`.
+        """
+        persona = registry.get_persona(name)
+        if persona is None:
+            raise HTTPException(status_code=404, detail=f"There is no clone named '{name}' here.")
+        return {
+            "status": "ok",
+            "persona": _persona_payload(registry, persona),
+            "previous_path": _workspace_relative(undo_with),
+        }
+
+    def _workspace_relative(path: Path | None) -> str | None:
+        if path is None:
+            return None
+        try:
+            return path.resolve().relative_to(Path(session_mgr.workspace_dir).resolve()).as_posix()
+        except ValueError:
+            return None
+
+    def _avatar_refusal(exc: AvatarRefused) -> JSONResponse:
+        """The refusal as `{"detail": <plain words>, "code": <which reason>}`.
+
+        The head words its own message from `code` (a path outside the workspace and a file
+        in the wrong format ask for different things); `detail` is for everything else.
+        """
+        status = 404 if isinstance(exc, AvatarPersonaNotFound) else 422
+        return JSONResponse({"detail": str(exc), "code": exc.reason_code}, status_code=status)
+
+    async def _avatar_upload(request: Request) -> bytes:
+        """The uploaded picture, read no further than the size cap.
+
+        `content-length` is checked first, but a chunked upload carries none, so the body
+        is also counted as it arrives and reading stops once it passes the cap.
+        """
+        declared = request.headers.get("content-length", "")
+        if declared.isdigit() and int(declared) > MAX_AVATAR_BYTES:
+            raise _avatar_too_large()
+        body = bytearray()
+        async for chunk in request.stream():
+            body.extend(chunk)
+            if len(body) > MAX_AVATAR_BYTES:
+                raise _avatar_too_large()
+        return bytes(body)
+
+    def _avatar_too_large() -> AvatarRefused:
+        return AvatarRefused(
+            f"That picture is larger than {MAX_AVATAR_BYTES // (1024 * 1024)} MB, "
+            "the most a clone's picture can be. Choose a smaller one.",
+            reason_code="too_large",
+        )
+
+    async def _avatar_json(request: Request) -> object:
+        """The JSON body, or a plain refusal when it is not JSON at all."""
+        try:
+            return await request.json()
+        except ValueError as exc:
+            raise _avatar_no_source() from exc
+
+    def _avatar_no_source() -> AvatarRefused:
+        return AvatarRefused(
+            'Name the picture to use as {"source_path": "<path in the workspace>"}.',
+            reason_code="no_source",
+        )
+
+    @app.put("/api/personas/{name}/avatar")
+    async def put_persona_avatar(name: str, request: Request) -> Any:  # pyright: ignore[reportUnusedFunction]
+        """Set one clone's picture from a workspace file or from the image in the body.
+
+        The body is either JSON `{"source_path": "<path in the workspace>"}`, normally an
+        image a clone just drew, or the picture itself with an `image/*` content type, for
+        an upload. Either way the bytes must be a PNG, JPEG, WebP or GIF image; the picture
+        it replaces is kept as `<name>.prev.<ext>`.
+        """
+        registry = _registry_for_a_picture_change(request)
+        store = PersonaAvatarStore(registry)
+        had_chosen = store.chosen(name) is not None
+        content_type = request.headers.get("content-type", "").split(";")[0].strip().lower()
+        try:
+            if content_type == "application/json":
+                store.set_from_path(name, _avatar_source(await _avatar_json(request)))
+            elif content_type.startswith("image/"):
+                store.set(name, await _avatar_upload(request))
+            else:
+                return JSONResponse(
+                    {
+                        "detail": (
+                            "Send the picture itself as an image, or name a picture in the "
+                            'workspace as {"source_path": "..."}.'
+                        ),
+                        "code": "not_an_image",
+                    },
+                    status_code=415,
+                )
+        except AvatarRefused as exc:
+            return _avatar_refusal(exc)
+        return _avatar_answer(
+            registry, name, undo_with=store.previous(name) if had_chosen else None
+        )
+
+    def _avatar_source(body: object) -> Path:
+        """The workspace file a `PUT` names, resolved as tools resolve a path."""
+        raw = cast(dict[str, object], body).get("source_path") if isinstance(body, dict) else None
+        if not isinstance(raw, str) or raw.strip() == "":
+            raise _avatar_no_source()
+        try:
+            return PathValidator().resolve_safe_path(Path(raw), session_mgr.workspace_dir)
+        except PathTraversalError as exc:
+            raise AvatarRefused(
+                "That picture is outside the workspace, so it was not used. Choose one in the "
+                "workspace, or upload it instead.",
+                reason_code="outside_workspace",
+            ) from exc
+
+    @app.delete("/api/personas/{name}/avatar")
+    async def delete_persona_avatar(name: str, request: Request) -> Any:  # pyright: ignore[reportUnusedFunction]
+        """Put a clone's chosen picture aside, so it shows its shipped one or the default."""
+        registry = _registry_for_a_picture_change(request)
+        try:
+            kept = PersonaAvatarStore(registry).reset(name)
+        except AvatarRefused as exc:
+            return _avatar_refusal(exc)
+        return _avatar_answer(registry, name, undo_with=kept)
 
     @app.post("/api/personas")
     async def create_persona(req: dict[str, Any]) -> Any:  # pyright: ignore[reportUnusedFunction]
@@ -4129,16 +4060,18 @@ def create_ui_app(
             )
 
         try:
-            llm = session_mgr.default_llm or create_llm_connector(
-                provider=session_mgr.configured_provider or None,
-                api_key=session_mgr.configured_api_key or None,
-                base_url=session_mgr.configured_base_url or None,
+            draft_provider = session_mgr.provider_in_effect
+            llm = session_mgr.default_llm or session_mgr.build_llm(
+                provider=draft_provider,
+                api_key=session_mgr.resolved_api_key(draft_provider),
+                base_url=session_mgr.base_url_in_effect(draft_provider),
                 fallback_to_mock=False,
+                **({"model": session_mgr.deep_model} if session_mgr.deep_model else {}),
             )
             response = await asyncio.wait_for(
                 llm.generate(
                     LLMRequest(
-                        model=session_mgr.configured_model or None,
+                        model=session_mgr.deep_model,
                         messages=(
                             ChatMessage(role=MessageRole.SYSTEM, content=_PERSONA_DRAFT_SYSTEM),
                             ChatMessage(
@@ -4169,774 +4102,6 @@ def create_ui_app(
                 "source": "template",
                 "fallback_reason": reason,
             }
-
-    def _record_cancelled_turn(
-        *,
-        agent: BaseAgent | None,
-        agent_id: str,
-        session_id: str,
-        message: str,
-        client_turn_id: str | None,
-        model: str | None,
-        latency_ms: float,
-        core_len_before: int | None,
-    ) -> None:
-        """Save the record a cancelled turn leaves, and keep the Core it left behind (#1031).
-
-        Cancelling the turn task makes `execute_turn` re-raise, and
-        `asyncio.CancelledError` is a `BaseException`: it walks straight past the handler
-        that writes a failed turn's rows. So a stop used to write **nothing** while the Core
-        kept the prompt, the `ASSISTANT` message carrying that step's tool calls and the
-        `TOOL` result. The user saw no sign a tool had run, and the orphaned prompt -- a Core
-        message no row could match and no rule could fold -- stalled `_core_index_for_transcript`
-        permanently: measured end to end, a truncation that deleted *nothing* then cut the
-        Core from 7 messages to 2, in memory and on disk, losing a turn still on the page and
-        with it what the next request carried (#1031, PR #1033's probe).
-
-        The repair is a record, not a rule in the index walk: with its own two rows the
-        cancelled turn is shaped like every other turn, and the walk that already handles a
-        failed one handles this one unchanged.
-
-        Everything here is synchronous on purpose. The task is already cancelled, so the
-        first `await` would raise `CancelledError` again and abandon the record half-written.
-        Nothing raises out either: the caller re-raises the cancellation, and a failure to
-        save must not become a different exception on the way out.
-        """
-        turn_messages: list[ChatMessage] = []
-        turn_index = 0
-        persist_error: str | None = None
-        persist_error_type: str | None = None
-        if agent is not None:
-            try:
-                state = agent.get_session(session_id)
-                # Only what this turn appended. `None` means the turn was cancelled before
-                # the length was taken, and a guess at the boundary would put an earlier
-                # turn's tool calls on this row.
-                if core_len_before is not None:
-                    turn_messages = list(state.messages)[core_len_before:]
-                turn_index = state.turn_counter
-            except Exception as exc:
-                persist_error = str(exc)
-                persist_error_type = type(exc).__name__
-                logger.warning(
-                    "Could not read the Core session %s while recording a cancelled turn: %s",
-                    session_id,
-                    exc,
-                    exc_info=True,
-                )
-            try:
-                # The Core already holds the cancelled turn's messages, and this is what
-                # puts them on disk: nothing else on this path writes the Core. Measured by
-                # removing it -- a session whose first turn is stopped has **no** Core record
-                # at all afterwards, and a session with earlier turns keeps only those, so
-                # the saved row would describe a turn a restart could not find (#1031).
-                # Spelled with the keyword because that makes this the one call site the
-                # mutation below names.
-                agent.persist_session(session_id=session_id)
-            except SessionStoreNotConfiguredError:
-                pass
-            except Exception as exc:
-                persist_error = str(exc)
-                persist_error_type = type(exc).__name__
-                logger.warning(
-                    "Failed to persist Core session %s after a cancelled turn: %s",
-                    session_id,
-                    exc,
-                    exc_info=True,
-                )
-
-        try:
-            current_history = session_mgr.get_session_history(agent_id, session_id)
-        except Exception:
-            logger.warning(
-                "Failed to read session history for agent %s, session %s; the cancelled "
-                "turn was not recorded",
-                agent_id,
-                session_id,
-                exc_info=True,
-            )
-            return
-
-        updated_history = [
-            *current_history,
-            *_cancelled_turn_rows(
-                agent_id=agent_id,
-                message=message,
-                client_turn_id=client_turn_id,
-                model=model,
-                latency_ms=latency_ms,
-                turn_index=turn_index,
-                turn_messages=turn_messages,
-                persist_error=persist_error,
-                persist_error_type=persist_error_type,
-            ),
-        ]
-        try:
-            session_mgr.save_session_record(
-                session_id=session_id,
-                agent_id=agent_id,
-                messages=updated_history,
-                # A cancelled turn was still a turn taken -- `execute_turn` increments the
-                # counter before it calls the model -- so the saved figure is the Core's own
-                # counter, and `_turns_taken` over the rows agrees because the row is sent by
-                # the agent (#1023).
-                turns=turn_index or _turns_taken(updated_history),
-            )
-        except Exception:
-            logger.warning(
-                "Failed to save the transcript for session %s after a cancelled turn",
-                session_id,
-                exc_info=True,
-            )
-
-    async def _execute_turn_logic_impl(req: dict[str, Any]) -> dict[str, Any]:
-        """Execute turn logic against live BaseAgent and return formatted turn result with P6 trace."""
-        _refuse_a_reserved_session_id(
-            req.get("session_id") if isinstance(req.get("session_id"), str) else None
-        )
-        client_turn_id = _client_turn_id(req)
-        message = str(req.get("message", "")).strip()
-        if not message:
-            return {"error": "Message cannot be empty", "status": "error"}
-        model_req = str(req.get("model") or req.get("llm_model") or "").strip() or None
-        agent_id = _required_agent_id(req.get("agent_id"))
-        session_id = str(req.get("session_id", f"sess_{agent_id}"))
-
-        bus = session_mgr.bus
-        start_time = asyncio.get_running_loop().time()
-
-        agent: BaseAgent | None = None
-        session_load_failed = False
-        turn_booked: list[TokenUsage] | None = None
-        # Read where this turn's own Core messages begin, so a cancellation can report the
-        # calls it made and nothing an earlier turn made. `None` until the turn is about to
-        # run: before that there is no boundary to report (#1031).
-        core_len_before: int | None = None
-        active_model: str | None = None
-        try:
-            # Obtain live BaseAgent instance from session manager
-            try:
-                agent = await session_mgr.get_or_create_agent(
-                    agent_id=agent_id,
-                    session_id=session_id,
-                    model_name=model_req,
-                )
-            except Exception:
-                session_load_failed = True
-                raise
-
-            assert agent is not None
-
-            active_provider = (
-                session_mgr.configured_provider
-                or (getattr(agent.llm, "provider_name", None) if agent.llm else None)
-                or (
-                    getattr(session_mgr.default_llm, "provider_name", None)
-                    if session_mgr.default_llm
-                    else None
-                )
-                or os.getenv("LLM_PROVIDER")
-                or "ollama"
-            )
-
-            # Ensure agent's active model matches requested model or configured model
-            target_model = (
-                model_req
-                or session_mgr.configured_model
-                or agent.config.llm_config.model_name
-                or (resolve_ollama_model(None) if active_provider == "ollama" else None)
-            )
-
-            if target_model and agent.config.llm_config.model_name != target_model:
-                agent.hot_reload_llm(session_mgr.default_llm or agent.llm, model_name=target_model)
-
-            active_model = agent.config.llm_config.model_name or target_model or "default"
-
-            logger.info(
-                "💬 [UI Chat] Turn starting: agent=%s, session=%s, provider=%s, model=%s, prompt=%r",
-                agent_id,
-                session_id,
-                active_provider,
-                active_model,
-                message[:60],
-            )
-            _console.print(
-                f"[bold blue]💬 [UI Chat] Turn executing:[/bold blue] agent=[cyan]{agent_id}[/cyan] | "
-                f"provider=[cyan]{active_provider}[/cyan] | model=[bold yellow]{active_model}[/bold yellow] | prompt={message[:50]!r}"
-            )
-
-            user_pub = bus.register_publisher(
-                sender_id="user",
-                source=EventSource.USER,
-                capabilities={"user_source"},
-            )
-            await user_pub.publish(
-                AgentEvent(
-                    type=EventType.USER_INPUT,
-                    recipient_id=agent_id,
-                    topic="agent.chat.input",
-                    payload={"message": message, "session_id": session_id},
-                )
-            )
-
-            core_len_before = len(agent.get_session(session_id).messages)
-
-            # The turn's figures are the steps booked from inside this block, not a slice of
-            # the session's ledger: another turn on this session id, waiting on the agent's
-            # turn lock or run by another agent, books into the same ledger (#982).
-            with session_mgr.budget_tracker.collect_turn_usage(session_id) as turn_booked:
-                # Delegate turn execution directly to BaseAgent (P8, Issue #175).
-                # No `stream_callback` arm: `/api/chat/stream` was its only caller and
-                # retired with the playground (#1208). A room streams through the room
-                # orchestrator, which calls `BaseAgent.execute_turn` itself.
-                try:
-                    turn_result = await agent.execute_turn(message, stream_callback=None)
-                except TypeError:
-                    turn_result = await agent.execute_turn(message)
-
-        except asyncio.CancelledError:
-            # Not an `Exception`: Stop's cancellation walks past the handler below, which is
-            # how a cancelled turn came to write no record at all (#1031). Recorded here and
-            # re-raised unchanged, so a cancelled turn behaves exactly as before.
-            _record_cancelled_turn(
-                agent=agent,
-                agent_id=agent_id,
-                session_id=session_id,
-                message=message,
-                client_turn_id=client_turn_id,
-                model=active_model,
-                latency_ms=(asyncio.get_running_loop().time() - start_time) * 1000,
-                core_len_before=core_len_before,
-            )
-            raise
-
-        except Exception as exc:
-            latency_ms = (asyncio.get_running_loop().time() - start_time) * 1000
-            # The dashboard is where a beginner meets this failure, and where the
-            # traceback never appears at all -- they see a red bubble. Recording it
-            # is what makes `ucx report` and the dashboard's own report view able to
-            # say anything later. Consent-gated; a no-op without it.
-            record_failure(exc, context={"surface": "ui.turn"})
-            logger.error("❌ [UI Chat] Turn execution failed: %s", exc)
-            _console.print(f"[bold red]✖ [UI Chat] Turn failed:[/bold red] {exc}")
-            is_offline = _is_offline_llm_error(exc)
-            # `session_load_failed` is set by the broad handler wrapping `get_or_create_agent`,
-            # which also builds the connector — so an LLM configuration fault arrives here
-            # flagged as a session fault and gets `component=uclone_x.agent.session` with
-            # `path=SESSION_LOAD_ERROR`. Naming the wrong subsystem is the mis-attribution P6
-            # forbids, and it also produced a self-contradictory record
-            # (`SESSION_LOAD_ERROR` carrying `served_by=offline_diagnostic`).
-            # An unusable agent name arrives the same way: it is raised while the agent's
-            # home directory is resolved, inside the same broad handler, and so inherits
-            # `session_load_failed` from it. The session store is not involved and the
-            # request is what is wrong, so naming that component would send the reader to
-            # a subsystem with nothing to fix.
-            is_session_err = (
-                session_load_failed and not is_offline and not isinstance(exc, AgentHomeError)
-            ) or isinstance(
-                exc,
-                (
-                    SessionHistoryRehydrationError,
-                    SessionIdCollisionError,
-                    SessionMutationDuringTurnError,
-                    SessionStoreNotConfiguredError,
-                    PathTraversalError,
-                ),
-            )
-            if isinstance(exc, LLMProviderNotConfiguredError) and "model" in str(exc).lower():
-                reply_content = f"⚠️ {exc}"
-                status = "warning"
-            elif is_offline:
-                reply_content = OFFLINE_LLM_DIAGNOSTIC_MESSAGE
-                status = "warning"
-            else:
-                reply_content = f"Error: {exc}"
-                status = "error"
-
-            prov_hash = hashlib.sha256(f"{agent_id}:{message}:{reply_content}".encode()).hexdigest()
-            provenance_data: dict[str, Any] = {
-                "component": (
-                    "uclone_x.agent.session" if is_session_err else "uclone_x.llm.orchestrator"
-                ),
-                "producer": agent_id,
-                "content_hash": prov_hash,
-                "degraded": True,
-                "path": (
-                    "SESSION_LOAD_ERROR"
-                    if is_session_err
-                    else ("OFFLINE_FALLBACK" if is_offline else "FAILOVER")
-                ),
-                "served_by": "offline_diagnostic" if is_offline else None,
-            }
-            if agent is not None and (agent.persona_name or agent.persona):
-                provenance_data["persona"] = agent.persona_name or agent.persona
-
-            # A turn that raised may still have booked steps first; they are reported.
-            failed_tokens_used, failed_prompt_tokens_used, failed_count_source = (
-                _turn_token_figures(turn_booked)
-            )
-            default_max_steps = cast(int, AgentConfig.model_fields["max_steps"].default or 50)
-            budget_max = agent.config.max_steps if agent is not None else default_max_steps
-            turn_idx = agent.turn_counter if agent is not None else 0
-            run_steps = agent.run_steps if agent is not None else 0
-            return {
-                "status": status,
-                "outcome": ChatTurnOutcome.FAILED,  # raised
-                "error": str(exc),
-                # Nothing that raised out of the turn is a refusal: a budget ceiling is
-                # returned by `BaseAgent` as a result, never raised past it.
-                "refusal": None,
-                "agent_id": agent_id,
-                "response": reply_content,
-                "latency_ms": latency_ms,
-                "turn_count": turn_idx,
-                "run_turns": run_steps,
-                "run_steps": run_steps,
-                "turn_budget_max": budget_max,
-                "turns_remaining": max(0, budget_max - run_steps),
-                "step_budget_max": budget_max,
-                "steps_remaining": max(0, budget_max - run_steps),
-                "tokens_used": failed_tokens_used,
-                "token_count_source": failed_count_source,
-                "tool_calls": [],
-                "tool_executions": [],
-                "debug_info": {
-                    "active_invariants": [],
-                    "prompt_tokens_used": failed_prompt_tokens_used,
-                    "system_prompt_excerpt": "",
-                },
-                "provenance": provenance_data,
-                "durability": {
-                    "persisted": False,
-                    "error": str(exc),
-                    "error_type": type(exc).__name__,
-                    "stale_conflict": isinstance(exc, StaleSessionWriteError),
-                },
-                "persona": (agent.persona_name or agent.persona) if agent is not None else None,
-            }
-
-        latency_ms = (asyncio.get_running_loop().time() - start_time) * 1000
-        tokens_used, prompt_tokens_used, token_count_source = _turn_token_figures(turn_booked)
-
-        # Check if turn_result had an offline LLM error
-        is_offline = bool(turn_result.error and _is_offline_llm_error(turn_result.error))
-
-        if is_offline:
-            reply_content = OFFLINE_LLM_DIAGNOSTIC_MESSAGE
-            status = "warning"
-        elif turn_result.error:
-            reply_content = f"Error: {turn_result.error}"
-            status = "error"
-        else:
-            reply_content = turn_result.content or ""
-            status = "success" if turn_result.is_completed else "error"
-
-        # Extract and serialize real tool call records and executions
-        serialized_tool_calls: list[dict[str, Any]] = _serialized_tool_calls(turn_result.tool_calls)
-        serialized_tool_executions: list[dict[str, Any]] = [
-            {
-                "tool_call_id": te.tool_call_id,
-                "tool_name": te.tool_name,
-                "arguments": cast(dict[str, Any], unwrap_immutable(te.arguments)),
-                "output": unwrap_immutable(te.output),
-                "status": te.status,
-                "error": te.error,
-                "duration_ms": te.duration_ms,
-            }
-            for te in turn_result.tool_executions
-        ]
-
-        active_invariants: list[str] = []
-        if agent.ontology is not None:
-            try:
-                invariants = agent.ontology.get_active_invariants(tier_filter="all")
-                active_invariants = [
-                    f"{inv.name} ({inv.tier.value}): {inv.predicate or inv.description or inv.name}"
-                    for inv in invariants
-                ]
-            except Exception:
-                logger.warning(
-                    "Failed to retrieve active ontology invariants for agent %s",
-                    agent_id,
-                    exc_info=True,
-                )
-
-        debug_info: dict[str, Any] = {
-            "active_invariants": active_invariants,
-            "prompt_tokens_used": prompt_tokens_used,
-            "system_prompt_excerpt": (
-                (
-                    agent.config.system_prompt[:200]
-                    + ("..." if len(agent.config.system_prompt) > 200 else "")
-                )
-                if agent.config.system_prompt
-                else ""
-            ),
-        }
-
-        # Publish tool trace events for SSE subscribers if tools were called
-        for tc in turn_result.tool_calls:
-            tool_arguments = cast(dict[str, Any], unwrap_immutable(tc.arguments))
-            tool_pub = bus.register_publisher(
-                sender_id=agent_id,
-                source=EventSource.TOOL,
-            )
-            await tool_pub.publish(
-                AgentEvent(
-                    type=EventType.TOOL_CALL,
-                    recipient_id=agent_id,
-                    topic="agent.chat.tool",
-                    payload={
-                        "tool_id": tc.id,
-                        "name": tc.name,
-                        "arguments": tool_arguments,
-                    },
-                )
-            )
-
-        # Publish AGENT_REPLY event to bus for real-time subscribers (SSE)
-        agent_pub = bus.register_publisher(
-            sender_id=agent_id,
-            source=EventSource.AGENT,
-        )
-        reply_payload: dict[str, Any] = {
-            "message": reply_content,
-            "model": active_model,
-            "latency_ms": latency_ms,
-            "tool_count": len(serialized_tool_calls),
-            "turn_index": turn_result.turn_index,
-            "is_completed": str(turn_result.is_completed),
-            "tool_executions": serialized_tool_executions,
-            "debug_info": debug_info,
-        }
-        if turn_result.error is not None:
-            reply_payload["error"] = turn_result.error
-        if turn_result.persona is not None:
-            reply_payload["persona"] = turn_result.persona
-
-        await agent_pub.publish(
-            AgentEvent(
-                type=EventType.AGENT_REPLY,
-                recipient_id="user",
-                topic="agent.chat.reply",
-                priority=EventPriority.NORMAL,
-                payload=reply_payload,
-                # Forwarded verbatim from turn_result.provenance (Issue #117, #175)
-                provenance=turn_result.provenance,
-                trace_id=session_mgr.tracer.trace_id,
-            )
-        )
-
-        # Build provenance record conforming to P6
-        prov_hash = hashlib.sha256(f"{agent_id}:{message}:{reply_content}".encode()).hexdigest()
-        if is_offline:
-            served_model: str | None = "offline_diagnostic"
-        elif turn_result.provenance and turn_result.provenance.served_by:
-            srv = turn_result.provenance.served_by
-            if srv.model:
-                if srv.model.startswith(f"{srv.provider}:"):
-                    served_model = srv.model
-                else:
-                    served_model = f"{srv.provider}:{srv.model}"
-            else:
-                served_model = srv.provider
-        else:
-            served_model = None
-
-        prov_path = (
-            "OFFLINE_FALLBACK"
-            if is_offline
-            else (
-                turn_result.provenance.path.value
-                if turn_result.provenance
-                else ("PRIMARY" if turn_result.is_completed else "FAILOVER")
-            )
-        )
-
-        is_degraded = (
-            is_offline
-            or not turn_result.is_completed
-            or bool(turn_result.provenance and turn_result.provenance.degraded)
-        )
-        outcome = _answered_outcome(turn_result)
-        # From the turn's stated stop reason, never from the wording of `error` (#969).
-        refusal = turn_refusal(turn_result.stop_reason) if turn_result.error is not None else None
-
-        provenance_data: dict[str, Any] = {
-            "component": "uclone_x.llm.orchestrator",
-            "producer": agent_id,
-            "content_hash": prov_hash,
-            "degraded": is_degraded,
-            "path": prov_path,
-            "served_by": served_model,
-        }
-        if turn_result.persona is not None:
-            provenance_data["persona"] = turn_result.persona
-
-        user_msg_entry = {
-            "id": f"user-{int(start_time * 1000)}",
-            "sender": "user",
-            "role": "user",
-            "content": message,
-            "timestamp": datetime.now(UTC).isoformat(),
-            "model": active_model,
-        }
-        # The id a head sent this turn with, kept on the saved prompt so a head reloading the
-        # conversation finds this turn's copy by identity rather than by prompt text, which a
-        # retry repeats word for word (#1000). Optional: without it the entry is as it was.
-        if client_turn_id is not None:
-            user_msg_entry["client_turn_id"] = client_turn_id
-        agent_msg_entry = {
-            "id": f"agent-{int(asyncio.get_running_loop().time() * 1000)}",
-            "sender": "agent",
-            "role": "assistant",
-            "content": reply_content,
-            "timestamp": datetime.now(UTC).isoformat(),
-            "latency_ms": latency_ms,
-            "agent_id": agent_id,
-            "model": active_model,
-            # `turn_count` keeps its meaning: turns in this conversation. The budget
-            # fields report the quantity `max_steps` actually bounds — a run of steps the
-            # agent takes without returning to its caller. Reporting the lifetime count
-            # against that ceiling filled a red bar to 51/50 during an ordinary
-            # conversation and then refused the next message.
-            "turn_count": turn_result.turn_index,
-            "run_turns": agent.run_steps,
-            "run_steps": agent.run_steps,
-            "turn_budget_max": agent.config.max_steps,
-            "turns_remaining": agent.steps_remaining,
-            "step_budget_max": agent.config.max_steps,
-            "steps_remaining": agent.steps_remaining,
-            "tokens_used": tokens_used,
-            "token_count_source": token_count_source,  # persisted, so a reload labels it
-            "tool_calls": serialized_tool_calls,
-            "tool_executions": serialized_tool_executions,
-            "debug_info": debug_info,
-            "provenance": provenance_data,
-            "outcome": outcome,
-        }
-        if turn_result.persona is not None:
-            agent_msg_entry["persona"] = turn_result.persona
-        if turn_result.error is not None:
-            # Saved as the failure it was, not as a reply (#969): `content` keeps the text the
-            # page showed, `error` the turn's own reason.
-            agent_msg_entry["role"] = TRANSCRIPT_FAILURE_ROLE
-            agent_msg_entry["error"] = turn_result.error
-            if refusal is not None:
-                agent_msg_entry["refusal"] = refusal
-
-        # Core session durability (Domain layer, #183, #229, #240, #247)
-        persist_error: str | None = None
-        persist_error_type: str | None = None
-        is_stale_write = False
-        try:
-            agent.persist_session(session_id)
-        except StaleSessionWriteError as exc:
-            is_stale_write = True
-            persist_error_type = "StaleSessionWriteError"
-            persist_error = str(exc)
-            logger.warning(
-                "Stale write refusing Core session %s persist after turn: %s",
-                session_id,
-                exc,
-            )
-        except Exception as exc:
-            persist_error_type = type(exc).__name__
-            persist_error = str(exc)
-            logger.warning(
-                "Failed to persist Core session %s after a turn; the reply was returned "
-                "but the conversation may not be durable: %s",
-                session_id,
-                exc,
-                exc_info=True,
-            )
-
-        # Truth in provenance (P6, #247): If persistence failed, the turn outcome was
-        # degraded, even if the model inference itself succeeded without error.
-        if persist_error is not None:
-            provenance_data["degraded"] = True
-            if status == "success":
-                status = "warning"
-
-        durability_data: dict[str, Any] = {
-            "persisted": persist_error is None,
-            "error": persist_error,
-            "error_type": persist_error_type,
-            "stale_conflict": is_stale_write,
-        }
-
-        # Transcript history read & save (Presentation layer, #229, #247)
-        current_history: list[dict[str, Any]] | None = None
-        try:
-            current_history = session_mgr.get_session_history(agent_id, session_id)
-        except Exception:
-            logger.warning(
-                "Failed to read session history for agent %s, session %s; skipping transcript update",
-                agent_id,
-                session_id,
-                exc_info=True,
-            )
-
-        agent_msg_entry["provenance"] = provenance_data
-        agent_msg_entry["durability"] = durability_data
-
-        if current_history is not None:
-            updated_history = [*current_history, user_msg_entry, agent_msg_entry]
-            try:
-                session_mgr.save_session_record(
-                    session_id=session_id,
-                    agent_id=agent_id,
-                    messages=updated_history,
-                    turns=turn_result.turn_index,
-                )
-            except Exception:
-                logger.warning(
-                    "Failed to save transcript for session %s after turn",
-                    session_id,
-                    exc_info=True,
-                )
-
-        logger.info(
-            "💬 [UI Chat] Turn finished: agent=%s, model=%s, latency_ms=%.1f, status=%s",
-            agent_id,
-            active_model,
-            latency_ms,
-            status,
-        )
-        _console.print(
-            f"[bold green]✔ [UI Chat] Turn finished:[/bold green] agent=[cyan]{agent_id}[/cyan] | "
-            f"model=[bold yellow]{active_model}[/bold yellow] | latency={latency_ms:.1f}ms | status={status}"
-        )
-
-        return {
-            "status": status,
-            "outcome": outcome,
-            "error": turn_result.error,
-            "refusal": refusal,
-            "agent_id": agent_id,
-            "model": active_model,
-            "response": reply_content,
-            "latency_ms": latency_ms,
-            # `turn_count` keeps its meaning: turns in this conversation. The budget
-            # fields report the quantity `max_steps` actually bounds — a run of steps the
-            # agent takes without returning to its caller. Reporting the lifetime count
-            # against that ceiling filled a red bar to 51/50 during an ordinary
-            # conversation and then refused the next message.
-            "turn_count": turn_result.turn_index,
-            "run_turns": agent.run_steps,
-            "run_steps": agent.run_steps,
-            "turn_budget_max": agent.config.max_steps,
-            "turns_remaining": agent.steps_remaining,
-            "step_budget_max": agent.config.max_steps,
-            "steps_remaining": agent.steps_remaining,
-            "tokens_used": tokens_used,
-            "token_count_source": token_count_source,
-            "tool_calls": serialized_tool_calls,
-            "tool_executions": serialized_tool_executions,
-            "debug_info": debug_info,
-            "provenance": provenance_data,
-            "durability": durability_data,
-            "persona": turn_result.persona,
-        }
-
-    @app.post("/api/turn")
-    async def chat_with_agent(req: dict[str, Any]) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
-        """Send message prompt to live BaseAgent and receive execution turn result with P6 trace."""
-        return await _execute_turn_logic_impl(req)
-
-    @app.get("/api/session/history")
-    async def get_chat_history(  # pyright: ignore[reportUnusedFunction]
-        agent_id: str,
-        session_id: str | None = None,
-    ) -> dict[str, Any]:
-        """Return persisted or in-memory conversation history for agent and session."""
-        eff_session_id = session_id if session_id else f"sess_{agent_id}"
-        try:
-            messages = session_mgr.get_session_history(agent_id=agent_id, session_id=eff_session_id)
-            active = session_mgr.active_turns(agent_id=agent_id, session_id=eff_session_id)
-        except Exception as exc:
-            raise _translate_session_error(exc) from exc
-        return {
-            "session_id": eff_session_id,
-            "agent_id": agent_id,
-            "messages": messages,
-            # Reported here as well as on `/api/sessions` so a surface that has just
-            # reloaded the conversation can settle the saturation notice from the same
-            # response, rather than from a second request that may not have run yet.
-            "active_turns": active,
-            "is_saturated": active >= SATURATION_TURNS_THRESHOLD,
-        }
-
-    @app.post("/api/session/history/truncate")
-    async def truncate_chat_history(  # pyright: ignore[reportUnusedFunction]
-        req: dict[str, Any] | None = None,
-        index: int | None = None,
-        agent_id: str | None = None,
-        session_id: str | None = None,
-    ) -> dict[str, Any]:
-        """Truncate conversation history and Core session state back to specified index (FR-13.7)."""
-        body = req or {}
-        raw_index = body.get("index") if "index" in body else index
-        if raw_index is None:
-            raise HTTPException(status_code=400, detail="Missing required 'index' parameter")
-        try:
-            eff_index = int(raw_index)
-        except (ValueError, TypeError) as exc:
-            raise HTTPException(status_code=400, detail="'index' must be an integer") from exc
-        if eff_index < 0:
-            raise HTTPException(status_code=400, detail="'index' must be non-negative")
-
-        eff_agent_id = _required_agent_id(body.get("agent_id") or agent_id)
-        raw_session = body.get("session_id") if "session_id" in body else session_id
-        eff_session_id = f"sess_{eff_agent_id}" if raw_session is None else str(raw_session)
-
-        try:
-            remaining_messages = session_mgr.truncate_session_history(
-                agent_id=eff_agent_id,
-                session_id=eff_session_id,
-                index=eff_index,
-            )
-        except Exception as exc:
-            raise _translate_session_error(exc) from exc
-
-        return {
-            "status": "truncated",
-            "session_id": eff_session_id,
-            "agent_id": eff_agent_id,
-            "index": eff_index,
-            "messages": remaining_messages,
-        }
-
-    @app.delete("/api/session/history")
-    async def delete_chat_history(  # pyright: ignore[reportUnusedFunction]
-        agent_id: str,
-        session_id: str | None = None,
-        index: int | None = None,
-    ) -> dict[str, Any]:
-        """Clear or truncate persisted conversation history and active in-memory session."""
-        eff_session_id = session_id if session_id else f"sess_{agent_id}"
-        try:
-            if index is not None:
-                if index < 0:
-                    raise HTTPException(status_code=400, detail="'index' must be non-negative")
-                remaining = session_mgr.truncate_session_history(
-                    agent_id=agent_id,
-                    session_id=eff_session_id,
-                    index=index,
-                )
-                return {
-                    "status": "truncated",
-                    "session_id": eff_session_id,
-                    "agent_id": agent_id,
-                    "index": index,
-                    "messages": remaining,
-                }
-            session_mgr.clear_session_history(agent_id=agent_id, session_id=eff_session_id)
-        except Exception as exc:
-            # A head clears history through this route, so an untranslated refusal
-            # here is the one a user actually meets.
-            raise _translate_session_error(exc) from exc
-        return {"status": "cleared"}
 
     @app.get("/api/sessions")
     async def list_sessions() -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
@@ -5176,6 +4341,17 @@ def create_ui_app(
                 ),
             )
 
+    from uclone_x.ui.usage import register_usage_routes
+
+    # Settings → Usage (`llm-token-gateway.md` §4.5): the dashboard's own settings file and
+    # the usage store beside it, the same two its paid connectors' gate reads.
+    register_usage_routes(
+        app,
+        settings_file=session_mgr.settings_file,
+        usage_file=session_mgr.usage_file,
+        refuse_cross_origin=_refuse_cross_origin,
+    )
+
     @app.get("/api/diagnostics/consent")
     async def get_diagnostics_consent(request: Request) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
         """Whether failures may be recorded locally: granted, denied, or unasked."""
@@ -5189,8 +4365,14 @@ def create_ui_app(
 
     @app.post("/api/diagnostics/consent")
     async def set_diagnostics_consent(request: Request) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
-        """Record the answer. `collect` must be present: there is no default."""
+        """Record the answer. `collect` must be present: there is no default.
+
+        The answer is the person's consent, so it is taken only from a window this server
+        confirmed (#1589, `uclone_x.ui.person`), before the body is read: a program on this
+        computer, the model's shell included, cannot give it on their behalf.
+        """
         _refuse_cross_origin(request)
+        person_gate.require(request)
         payload: dict[str, Any] = await request.json()
         collect = payload.get("collect")
         if not isinstance(collect, bool):
@@ -5422,10 +4604,7 @@ def create_ui_app(
                     "version": __version__,
                     "endpoints": [
                         "/api/health",
-                        "/api/agents",
                         "/api/sessions",
-                        "/api/session/history",
-                        "/api/session/history/truncate",
                         "/api/ontology",
                         "/api/skills",
                         "/api/budget",

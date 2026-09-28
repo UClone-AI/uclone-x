@@ -5,6 +5,7 @@ import {
   dictationErrorMessage,
   speechRecognitionConstructor,
 } from './dictation';
+import { dictationLang } from './dictation';
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -29,8 +30,8 @@ describe('speechRecognitionConstructor', () => {
 });
 
 describe('dictationErrorMessage', () => {
-  // Killed by: frontend/src/lib/dictation.ts :: return 'The browser is not letting this page use the microphone. Allow it for this site in the browser, then press the mic again.';
-  // Becomes: return 'Listening failed.';
+  // Killed by: frontend/src/lib/dictation.ts :: return copy.notAllowed;
+  // Becomes: return copy.noSpeech;
   it('names the remedy for a refused microphone, not just the refusal', () => {
     // The one error with an obvious way out. A sentence that says only that it failed
     // leaves the reader nothing to do, which is what this surface calls a defect.
@@ -70,5 +71,21 @@ describe('appendPhrase', () => {
 
   it('leaves the draft alone when nothing was heard', () => {
     expect(appendPhrase('check the index', '   ')).toBe('check the index');
+  });
+});
+
+describe('dictationLang', () => {
+  // Killed by: frontend/src/lib/dictation.ts :: if (browser && browser.split('-')[0].toLowerCase() === language) return browser;
+  // Becomes: if (browser) return browser;
+  it('listens in the language on screen, not the browser language, when the two differ', () => {
+    // A reader who chose Korean on an English browser speaks Korean to the composer.
+    expect(dictationLang('ko', 'en-US')).toBe('ko-KR');
+    expect(dictationLang('en', 'ko-KR')).toBe('en-US');
+  });
+
+  it('keeps the regional spelling of the browser when it is the same language', () => {
+    expect(dictationLang('en', 'en-GB')).toBe('en-GB');
+    expect(dictationLang('ko', 'ko-KR')).toBe('ko-KR');
+    expect(dictationLang('ko', undefined)).toBe('ko-KR');
   });
 });

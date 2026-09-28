@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import pytest
-from playwright.async_api import Locator, Page, async_playwright
+from playwright.async_api import Locator, Page, Route, async_playwright
 
 from tests.e2e.conftest import (
     SURFACE_OVERFLOW,
@@ -13,6 +14,7 @@ from tests.e2e.conftest import (
     dock_locator,
     open_diagnostics,
     set_the_rail,
+    show_dock_surface,
     turn_on_developer_mode,
 )
 
@@ -139,8 +141,8 @@ async def test_3_panel_workspace_layout_and_toggles(ui_test_server: str, tmp_pat
         # not replaced. The chip it clicked was `PlaygroundTab`'s inline tool card, and the
         # room transcript has no tool rendering to click: `RoomMessage` excludes tool calls
         # and results deliberately (`room/models.py`), so a seat's executions never reach
-        # the transcript at all. The data still reaches the wire -- `test_ui_tool_rendering.py`
-        # is what pins that -- and no surface draws it. That gap is a follow-up issue.
+        # the transcript at all. The legacy chat routes that still carried it were removed
+        # in #1731, and no surface draws it. That gap is a follow-up issue.
 
         # 6. Verify zero window scroll invariant
         scroll_y = await page.evaluate("window.scrollY")
@@ -333,6 +335,11 @@ def _tab_testid(tab: str) -> str:
     return f"dev-tab-{tab}" if tab in _DEVELOPER_TABS else f"tab-{tab}"
 
 
+async def _show_surface(page: Page, tab: str) -> None:
+    """Select `tab` and return once its read has settled and its layout is readable (#1722)."""
+    await show_dock_surface(page, _tab_testid(tab), tab)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("width", [320, 375, 400])
 async def test_the_open_dock_fits_a_narrow_window_on_every_surface(
@@ -386,8 +393,7 @@ async def test_the_open_dock_fits_a_narrow_window_on_every_surface(
             await dock.wait_for(state="visible", timeout=5000)
 
             for tab in _DOCK_TABS:
-                await page.click(f"[data-testid='{_tab_testid(tab)}']")
-                await page.evaluate(TWO_FRAMES)
+                await _show_surface(page, tab)
                 problems = await page.evaluate(_DOCK_OFF_SCREEN, _tab_testid(tab))
                 assert problems == [], f"{width}px, {tab}: {problems}"
 
@@ -439,7 +445,7 @@ async def test_no_dock_surface_holds_a_control_past_its_edge(
                 # Below 600px an open rail overlays the dock's tab strip (#1062) and takes the
                 # click, so the tab is chosen with the rail closed and the rail set after.
                 await set_the_rail(page, "closed")
-                await page.click(f"[data-testid='{_tab_testid(tab)}']")
+                await _show_surface(page, tab)
                 await set_the_rail(page, rail)
                 await page.evaluate(TWO_FRAMES)
                 problems = await page.evaluate(SURFACE_OVERFLOW)
@@ -503,8 +509,7 @@ async def test_a_dock_narrower_than_its_grids_lays_them_out_in_one_column(
 
             columns: dict[str, list[int]] = {}
             for tab in _GRID_TABS:
-                await page.click(f"[data-testid='{_tab_testid(tab)}']")
-                await page.evaluate(TWO_FRAMES)
+                await _show_surface(page, tab)
                 counts = await page.evaluate(_SURFACE_GRID_COLUMNS)
                 assert counts, f"{stored}px, {tab}: no column grid rendered to measure"
                 columns[tab] = counts
@@ -516,6 +521,63 @@ async def test_a_dock_narrower_than_its_grids_lays_them_out_in_one_column(
                 assert all(max(cs) > 1 for cs in columns.values()), (
                     f"the {stored}px dock lost its columns: {columns}"
                 )
+        finally:
+            await browser.close()
+
+
+@pytest.mark.asyncio
+async def test_the_topology_grid_is_measured_after_its_read_not_while_it_is_out(
+    ui_test_server: str,
+) -> None:
+    """#1722: a slow topology read is waited for, not measured through.
+
+    `TopologyTab` draws its seat grid only once `GET /api/rooms/{id}/topology` answers. The
+    grid case above waited two frames after the click and measured, which under the load a
+    gate leaves behind read the loading line: "no column grid rendered to measure", on 481
+    and 520 in turn. Here the read is held by the test and let go only after the page has
+    had its frames, so the order is decided rather than hoped for: the surface must still be
+    waiting when the read is released, and the grid it then draws is the one measured.
+
+    Killed by: tests/e2e/conftest.py :: await page.wait_for_function(SURFACE_READ_SETTLED, arg=surface, timeout=10000)
+    Becomes: pass
+    That leaves the two-frame wait #1722 was filed on: `show_dock_surface` returns while the
+    read is still held, and the `not shown.done()` assertion below fails. Watched by hand.
+    """
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        try:
+            page: Page = await browser.new_page(viewport={"width": 1280, "height": 900})
+            await page.add_init_script(
+                "try { localStorage.setItem('uclone-x.dock.width', '360') } catch (e) {}"
+            )
+            let_the_read_go = asyncio.Event()
+            held: list[str] = []
+
+            async def hold_the_topology_read(route: Route) -> None:
+                held.append(route.request.url)
+                await let_the_read_go.wait()
+                await route.continue_()
+
+            await page.route("**/api/rooms/*/topology", hold_the_topology_read)
+            await page.goto(ui_test_server, wait_until="commit")
+            await page.wait_for_selector("[data-testid='room-composer']", timeout=20000)
+            await set_the_rail(page, "closed")
+            await turn_on_developer_mode(page)
+            await _open_the_dock(page)
+
+            shown = asyncio.create_task(_show_surface(page, "topology"))
+            try:
+                await page.wait_for_selector("[data-testid='topology-reason']", timeout=10000)
+                await page.evaluate(TWO_FRAMES)
+                await page.evaluate(TWO_FRAMES)
+                assert held, "the topology read never reached the held route"
+                assert not shown.done(), "the surface was measured while its read was still out"
+            finally:
+                let_the_read_go.set()
+            await shown
+
+            counts = await page.evaluate(_SURFACE_GRID_COLUMNS)
+            assert counts == [1], f"a 360px dock's topology grid, once read: {counts}"
         finally:
             await browser.close()
 

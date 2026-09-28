@@ -1271,7 +1271,7 @@ async def test_a_configured_context_limit_is_sent_as_num_ctx_and_is_the_limit(
     """`context_limit` is what the request asks the daemon for and what the trigger
     counts against, so the two agree by construction.
 
-    Killed by: src/uclone_x/agent/base.py :: if (self._config.llm_config.context_limit or 0) > 0
+    Killed by: src/uclone_x/agent/turn_executor.py :: if (self._config.llm_config.context_limit or 0) > 0
     Becomes: if (self._config.llm_config.context_limit or 0) > 10**9
     """
     daemon = _FakeOllamaDaemon(trained_ctx=131_072)
@@ -1348,8 +1348,8 @@ async def test_an_untagged_model_sent_a_num_ctx_is_read_back_once_and_the_clamp_
 
     Killed by: src/uclone_x/llm/connectors/ollama.py :: window_key = ollama_model_key(model)
     Becomes: window_key = model
-    Killed by: src/uclone_x/llm/connectors/ollama.py :: name = ollama_model_key(resolve_ollama_model(model))
-    Becomes: name = resolve_ollama_model(model)
+    Killed by: src/uclone_x/llm/connectors/ollama.py :: name = ollama_model_key(chosen)
+    Becomes: name = chosen
     """
     daemon = _FakeOllamaDaemon(trained_ctx=131_072)
     daemon.loaded["llama3.2:latest"] = _SERVED_WINDOW
@@ -1396,7 +1396,7 @@ async def test_the_compaction_check_reads_the_served_window_before_counting(
     """A daemon that already has the model loaded is asked before the first check, so a
     long resumed session is counted against the served window on its first turn.
 
-    Killed by: src/uclone_x/agent/base.py :: await self._observe_context_window()
+    Killed by: src/uclone_x/agent/compaction_driver.py :: await self._observe_context_window()
     Becomes: pass
     """
     daemon = _FakeOllamaDaemon()

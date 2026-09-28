@@ -17,6 +17,7 @@ import { ActivityTimeline } from '../artifacts/ActivityTimeline';
 import { ResourceSummary } from '../artifacts/ResourceSummary';
 import { RemembersPanel } from '../artifacts/RemembersPanel';
 import { agentSeats } from '../../lib/roomDock';
+import { useCopy } from '../../i18n';
 // The dock is one of the workspace's top-level regions and its parent spans the window, so the
 // quantity that decides whether it fits on screen is the window's own width. The panels
 // *inside* it follow the dock's width instead, through `.dock-scope` (ui-authoring §3).
@@ -168,8 +169,6 @@ export interface ArtifactsDockProps {
   onCloneModeChange?: (mode: 'view' | 'edit' | 'create') => void;
   /** Available tools from runtime. */
   availableTools?: readonly string[];
-  /** The picked clone's tools that it is given only inside a conversation (#1595). */
-  cloneToolsNeedingConversation?: readonly string[];
   /** Available models from runtime. */
   availableModels?: readonly string[];
   /** Whether the workspace directory is writable. */
@@ -221,7 +220,6 @@ export const ArtifactsDock: React.FC<ArtifactsDockProps> = ({
   cloneMode = 'view',
   onCloneModeChange,
   availableTools,
-  cloneToolsNeedingConversation,
   availableModels,
   canWritePersonas,
   onSavePersona,
@@ -233,6 +231,9 @@ export const ArtifactsDock: React.FC<ArtifactsDockProps> = ({
   const [width, setWidth] = useState<number>(readStoredWidth);
   const draggingRef = useRef<boolean>(false);
   const windowWidth = useWindowWidth();
+  // The product surfaces' names and the dock's own chrome. The developer drawer's tabs stay
+  // English with the instruments they open (`multilingual-ui.md` step 7).
+  const t = useCopy().dock;
   // What is on screen, which is the selection unless developer mode is off and the selection is
   // one of its surfaces: then Docs & Artifacts, never a blank panel.
   const surface = shownSurface(activeSurface, developerMode);
@@ -310,18 +311,18 @@ export const ArtifactsDock: React.FC<ArtifactsDockProps> = ({
   const primaryTabs: SurfaceTabDef[] = [
     // First, because it is the one surface about the thing the user picked rather than about
     // the runtime: picking a clone in the rail opens the dock here.
-    { id: 'clone', label: 'Clone', icon: <Bot className="w-3.5 h-3.5" />, accent: 'indigo' },
+    { id: 'clone', label: t.tabs.clone, icon: <Bot className="w-3.5 h-3.5" />, accent: 'indigo' },
     // Beside Clone for the same reason: it is about what the reader picked -- the turn
     // `why ›` was pressed on -- and not about the runtime at large.
     {
       id: 'turn',
-      label: 'Turn',
+      label: t.tabs.turn,
       icon: <MessageSquare className="w-3.5 h-3.5" />,
       accent: 'sky',
     },
     {
       id: 'artifacts',
-      label: 'Docs & Artifacts',
+      label: t.tabs.artifacts,
       icon: <FileText className="w-3.5 h-3.5" />,
       accent: 'cyan',
     },
@@ -329,19 +330,19 @@ export const ArtifactsDock: React.FC<ArtifactsDockProps> = ({
     // instrument; this is the everyday reading of the same store.
     {
       id: 'remembers',
-      label: 'Remembers',
+      label: t.tabs.remembers,
       icon: <BookOpen className="w-3.5 h-3.5" />,
       accent: 'violet',
     },
     {
       id: 'activity',
-      label: 'Activity & Tools',
+      label: t.tabs.activity,
       icon: <Activity className="w-3.5 h-3.5" />,
       accent: 'amber',
     },
     {
       id: 'resource',
-      label: 'Resource',
+      label: t.tabs.resource,
       icon: <Gauge className="w-3.5 h-3.5" />,
       accent: 'emerald',
     },
@@ -390,7 +391,7 @@ export const ArtifactsDock: React.FC<ArtifactsDockProps> = ({
         role="separator"
         aria-orientation="vertical"
         onMouseDown={startDrag}
-        title="Drag to resize workspace dock"
+        title={t.chrome.resize}
         className="absolute left-0 top-0 h-full w-1 hover:w-1.5 cursor-col-resize bg-transparent hover:bg-cyan-500/60 transition-all z-30"
       />}
 
@@ -421,7 +422,7 @@ export const ArtifactsDock: React.FC<ArtifactsDockProps> = ({
           data-testid="dock-close"
           onClick={onClose}
           className="p-1 rounded-lg text-slate-500 hover:text-white hover:bg-slate-900 transition-colors shrink-0"
-          title="Close workspace dock"
+          title={t.chrome.close}
         >
           <X className="w-4 h-4" />
         </button>
@@ -431,7 +432,7 @@ export const ArtifactsDock: React.FC<ArtifactsDockProps> = ({
           with one seat there is nothing to pick, and a control with one option is noise. */}
       {seatScoped && seats.length > 1 && (
         <div className="px-3 pt-2 flex flex-wrap items-center gap-2 text-[11px] text-slate-400 shrink-0">
-          <label htmlFor="dock-seat-picker">Showing</label>
+          <label htmlFor="dock-seat-picker">{t.chrome.showing}</label>
           <select
             id="dock-seat-picker"
             data-testid="dock-seat-picker"
@@ -468,7 +469,6 @@ export const ArtifactsDock: React.FC<ArtifactsDockProps> = ({
               mode={cloneMode}
               onModeChange={onCloneModeChange}
               availableTools={availableTools}
-              toolsNeedingConversation={cloneToolsNeedingConversation}
               availableModels={availableModels}
               existingNames={personas.map((p) => p.name)}
               canWrite={canWritePersonas}

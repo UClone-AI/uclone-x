@@ -8,7 +8,7 @@ so a second writer would overwrite the parent's.
 
 Before this, a child inherited its parent's whole resolved list, memory tools included, while
 being built with no store: permitted three tools it did not have, and reported on
-`/api/agents` as having them.
+`/api/agents` as having them. (2026-09-27: `/api/agents` removed, #1775.)
 """
 
 from __future__ import annotations
@@ -17,7 +17,6 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from fastapi.testclient import TestClient
 
 from uclone_x.agent.base import BaseAgent
 from uclone_x.agent.models import (
@@ -35,7 +34,6 @@ from uclone_x.tools.builtin.filesystem import FileReadTool
 from uclone_x.tools.builtin.subagent import SubagentDelegationParams, SubagentDelegationTool
 from uclone_x.tools.models import ToolContext, ToolResultStatus
 from uclone_x.tools.registry import ToolRegistry
-from uclone_x.ui.app import AgentSessionManager, create_ui_app
 
 RECORD = "record_memory_fact"
 QUERY = "query_memory_facts"
@@ -216,7 +214,7 @@ class TestSharingTheParentsMemory:
         parent = _lead(tmp_path)
         child = await parent.spawn_subagent(role="helper", goal="help", share_parent_memory=True)
 
-        reader = child._resolve_tool(QUERY)  # pyright: ignore[reportPrivateUsage]
+        reader = child._tool_invoker.resolve(QUERY)  # pyright: ignore[reportPrivateUsage]
         assert isinstance(reader, QueryMemoryFactsTool)
         bound = reader._memory  # pyright: ignore[reportPrivateUsage]
         assert isinstance(bound, ReadOnlyMemory)
@@ -360,43 +358,3 @@ class TestTheDelegationTool:
         assert result.success, result.error
         assert "parent_memory" not in result.output
         assert not set(BASE_MEMORY_TOOLS) & _held(spawned[0])
-
-
-class TestTheTopologyReportsHeldTools:
-    """`/api/agents` reports `capabilities` as the tools an agent has, not its permissions."""
-
-    @pytest.mark.asyncio
-    async def test_a_sub_agent_and_an_agent_with_no_store(self, tmp_path: Path) -> None:
-        """Killed by: src/uclone_x/ui/app.py :: "capabilities": capabilities,
-        Becomes: "capabilities": allowed_tools,
-        """
-        registry = ToolRegistry(tools=[FileReadTool()])
-        session_mgr = AgentSessionManager(storage_dir=tmp_path / "sessions", tools=registry)
-        parent = _lead(tmp_path, tools=registry, allowed_tools=("file_read",))
-        child = await parent.spawn_subagent(role="helper", goal="help")
-        storeless = _lead(
-            tmp_path, tools=registry, allowed_tools=("file_read",), memory=False, agent_id="bare"
-        )
-        agents = session_mgr._agents  # pyright: ignore[reportPrivateUsage]
-        for agent in (parent, child, storeless):
-            agents[f"{agent.agent_id}:{agent.context.session_id}"] = agent
-
-        client = TestClient(
-            create_ui_app(
-                static_dir=tmp_path / "static",
-                storage_dir=tmp_path / "sessions",
-                llm=MockLLMConnector(),
-                session_manager=session_mgr,
-            )
-        )
-        response = client.get("/api/agents")
-        assert response.status_code == 200, response.text
-        rows = {row["id"]: row for row in response.json()["agents"]}
-
-        assert set(rows[parent.agent_id]["capabilities"]) == {"file_read", *BASE_MEMORY_TOOLS}
-        assert rows[child.agent_id]["capabilities"] == ["file_read"]
-        assert rows["bare"]["capabilities"] == ["file_read"]
-        # The permission list is still reported, under its own name.
-        assert set(BASE_MEMORY_TOOLS) <= set(rows["bare"]["allowed_tools"])
-        nodes = {node["id"]: node for node in response.json()["topology"]["nodes"]}
-        assert nodes["bare"]["capabilities"] == ["file_read"]

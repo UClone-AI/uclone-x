@@ -1,0 +1,12 @@
+id: doyun
+name: 도윤
+profile: 라온의 소꿉친구이자 은월성의 궁수.
+state:
+  status: alive
+  friend_of: raon
+  possesses: [ash_bow]
+visual:
+  tags: [1boy, brown_hair, green_eyes]
+  prose: 부스스한 갈색 머리에 초록 눈.
+  gender: male
+  base_seed: 30551

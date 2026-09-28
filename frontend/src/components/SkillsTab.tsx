@@ -12,40 +12,41 @@ import {
   Layers,
 } from 'lucide-react';
 import { SkillsData, SkillManifest } from '../types';
+import { fmt, useCopy, type Messages } from '../i18n';
+import { placeholders } from '../i18n/format';
+
+type NotLoadedCopy = Messages['skills']['notLoaded'];
 
 /**
- * Plain words for the checker's own labels (#1369).
+ * Why a skill is not used, in the reader's language (#1777).
+ *
+ * The Core sends a `not_loaded_code` and its params (`uclone_x/skills/refusals.py`), and the
+ * sentence is written here from the `skills` catalog, the way the conversation notices are
+ * (`lib/notices.ts`). The English `not_loaded_reason` shows only when there is no code, when
+ * the code is one this head does not know (a newer Core), or when the params lack a value the
+ * sentence needs; a reason is never left blank or half-filled.
+ */
+export const notLoadedText = (skill: SkillManifest, t: NotLoadedCopy): string | null => {
+  const code = skill.not_loaded_code;
+  const fallback = skill.not_loaded_reason ?? null;
+  if (!code || !Object.prototype.hasOwnProperty.call(t.codes, code)) return fallback;
+  const template = t.codes[code as keyof NotLoadedCopy['codes']];
+  const values = skill.not_loaded_params ?? {};
+  if (!placeholders(template).every((name) => Object.prototype.hasOwnProperty.call(values, name))) {
+    return fallback;
+  }
+  return fmt(template, values);
+};
+
+/**
+ * Plain words for the checker's own labels (#1369), from `skills.tab` in the reader's language
+ * (#1782).
  *
  * The catalogue is shown to every user in Settings, including one who has never read the code,
- * so the runtime's terms -- quarantine, AST, verdict, synthesized -- are translated here rather
- * than printed. A value this table does not know is printed as the runtime sent it: an
+ * so the runtime's terms -- quarantine, AST, verdict, synthesized -- are translated rather than
+ * printed. A value the catalog does not know is printed as the runtime sent it: an
  * unrecognised state is shown, never guessed at.
  */
-const STATUS_LABEL: Record<string, string> = {
-  active: 'Ready to use',
-  pending: 'Waiting for review',
-  quarantined: 'Blocked',
-  rejected: 'Turned down',
-};
-
-const ORIGIN_LABEL: Record<string, string> = {
-  human: 'Written by a person',
-  synthesized: 'Written by the assistant',
-};
-
-const ISOLATION_LABEL: Record<string, string> = {
-  none: 'Runs without a sandbox',
-  workspace: 'Runs in your workspace folder',
-  container: 'Runs in a container',
-  wasm: 'Runs in a sandbox',
-};
-
-const RECOMMENDATION_LABEL: Record<string, string> = {
-  approve: 'Safe to use',
-  require_human_review: 'Needs your review',
-  reject: 'Not safe to use',
-};
-
 const labelOf = (table: Record<string, string>, value: string): string => table[value] ?? value;
 
 interface SkillsTabProps {
@@ -87,6 +88,10 @@ export function SkillsTab({ skillsData, onRefresh, isLoading }: SkillsTabProps) 
 
   const activeSkill: SkillManifest | null =
     skills.find((s) => s.name === selectedSkillName) || skills[0] || null;
+  const skillsCopy = useCopy().skills;
+  const copy = skillsCopy.tab;
+  const notLoadedCopy = skillsCopy.notLoaded;
+  const notLoaded = activeSkill ? notLoadedText(activeSkill, notLoadedCopy) : null;
 
   return (
     <div className="space-y-6">
@@ -94,38 +99,38 @@ export function SkillsTab({ skillsData, onRefresh, isLoading }: SkillsTabProps) 
       <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
         <div className="p-4 bg-slate-900/80 border border-slate-800 rounded-2xl shadow-lg">
           <div className="flex items-center justify-between text-slate-400 text-xs">
-            <span>Skills</span>
+            <span>{copy.cards.total.label}</span>
             <Layers className="w-4 h-4 text-cyan-400" />
           </div>
           <p className="mt-2 text-2xl font-bold text-white">{summary.total_skills}</p>
-          <p className="text-[11px] text-slate-400 mt-0.5">Installed</p>
+          <p className="text-[11px] text-slate-400 mt-0.5">{copy.cards.total.hint}</p>
         </div>
 
         <div className="p-4 bg-slate-900/80 border border-slate-800 rounded-2xl shadow-lg">
           <div className="flex items-center justify-between text-slate-400 text-xs">
-            <span>Ready to use</span>
+            <span>{copy.cards.active.label}</span>
             <ShieldCheck className="w-4 h-4 text-emerald-400" />
           </div>
           <p className="mt-2 text-2xl font-bold text-emerald-400">{summary.active_count}</p>
-          <p className="text-[11px] text-slate-400 mt-0.5">Passed the safety check</p>
+          <p className="text-[11px] text-slate-400 mt-0.5">{copy.cards.active.hint}</p>
         </div>
 
         <div className="p-4 bg-slate-900/80 border border-slate-800 rounded-2xl shadow-lg">
           <div className="flex items-center justify-between text-slate-400 text-xs">
-            <span>Waiting for review</span>
+            <span>{copy.cards.pending.label}</span>
             <ShieldAlert className="w-4 h-4 text-amber-400" />
           </div>
           <p className="mt-2 text-2xl font-bold text-amber-400">{summary.pending_count}</p>
-          <p className="text-[11px] text-slate-400 mt-0.5">Needs a person to approve it</p>
+          <p className="text-[11px] text-slate-400 mt-0.5">{copy.cards.pending.hint}</p>
         </div>
 
         <div className="p-4 bg-slate-900/80 border border-slate-800 rounded-2xl shadow-lg">
           <div className="flex items-center justify-between text-slate-400 text-xs">
-            <span>Blocked</span>
+            <span>{copy.cards.blocked.label}</span>
             <ShieldX className="w-4 h-4 text-rose-400" />
           </div>
           <p className="mt-2 text-2xl font-bold text-rose-400">{summary.quarantined_count}</p>
-          <p className="text-[11px] text-slate-400 mt-0.5">Failed the safety check</p>
+          <p className="text-[11px] text-slate-400 mt-0.5">{copy.cards.blocked.hint}</p>
         </div>
       </div>
 
@@ -135,7 +140,7 @@ export function SkillsTab({ skillsData, onRefresh, isLoading }: SkillsTabProps) 
           <Search className="w-4 h-4 absolute left-3 top-2.5 text-slate-500" />
           <input
             type="text"
-            placeholder="Search skills by name, description, or tags..."
+            placeholder={copy.search}
             value={searchTerm}
             onChange={(e) => setSearchTerm(e.target.value)}
             className="w-full pl-9 pr-4 py-2 bg-slate-950 border border-slate-800 rounded-xl text-xs text-slate-200 placeholder-slate-500 focus:outline-none focus:border-cyan-500 shadow-inner"
@@ -148,10 +153,10 @@ export function SkillsTab({ skillsData, onRefresh, isLoading }: SkillsTabProps) 
             onChange={(e) => setStatusFilter(e.target.value)}
             className="bg-slate-950 border border-slate-800 text-xs text-slate-300 rounded-xl px-3 py-2 focus:outline-none focus:border-cyan-500 font-mono shadow-inner"
           >
-            <option value="ALL">Any status</option>
-            <option value="active">{STATUS_LABEL.active}</option>
-            <option value="pending">{STATUS_LABEL.pending}</option>
-            <option value="quarantined">{STATUS_LABEL.quarantined}</option>
+            <option value="ALL">{copy.anyStatus}</option>
+            <option value="active">{copy.status.active}</option>
+            <option value="pending">{copy.status.pending}</option>
+            <option value="quarantined">{copy.status.quarantined}</option>
           </select>
 
           <select
@@ -159,9 +164,9 @@ export function SkillsTab({ skillsData, onRefresh, isLoading }: SkillsTabProps) 
             onChange={(e) => setOriginFilter(e.target.value)}
             className="bg-slate-950 border border-slate-800 text-xs text-slate-300 rounded-xl px-3 py-2 focus:outline-none focus:border-cyan-500 font-mono shadow-inner"
           >
-            <option value="ALL">Anyone</option>
-            <option value="human">{ORIGIN_LABEL.human}</option>
-            <option value="synthesized">{ORIGIN_LABEL.synthesized}</option>
+            <option value="ALL">{copy.anyone}</option>
+            <option value="human">{copy.origin.human}</option>
+            <option value="synthesized">{copy.origin.synthesized}</option>
           </select>
 
           <button
@@ -169,7 +174,7 @@ export function SkillsTab({ skillsData, onRefresh, isLoading }: SkillsTabProps) 
             disabled={isLoading}
             className="px-3 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs rounded-xl font-medium transition-colors border border-slate-700 whitespace-nowrap"
           >
-            {isLoading ? 'Refreshing…' : 'Refresh'}
+            {isLoading ? copy.refreshing : copy.refresh}
           </button>
         </div>
       </div>
@@ -181,7 +186,7 @@ export function SkillsTab({ skillsData, onRefresh, isLoading }: SkillsTabProps) 
           <div className="flex items-center justify-between pb-3 border-b border-slate-800">
             <h3 className="text-sm font-semibold text-white flex items-center gap-2">
               <FileCode className="w-4 h-4 text-cyan-400" />
-              Skills ({filteredSkills.length})
+              {fmt(copy.listHeading, { count: filteredSkills.length })}
             </h3>
           </div>
 
@@ -214,7 +219,7 @@ export function SkillsTab({ skillsData, onRefresh, isLoading }: SkillsTabProps) 
                           : 'bg-rose-950 text-rose-300 border border-rose-800/60'
                       }`}
                     >
-                      {labelOf(STATUS_LABEL, skill.status)}
+                      {labelOf(copy.status, skill.status)}
                     </span>
                   </div>
 
@@ -225,10 +230,10 @@ export function SkillsTab({ skillsData, onRefresh, isLoading }: SkillsTabProps) 
                   <div className="mt-2.5 flex flex-wrap items-center justify-between gap-1 text-[10px] text-slate-500">
                     <span className="flex items-center gap-1">
                       <Lock className="w-3 h-3 text-slate-500" />
-                      {labelOf(ISOLATION_LABEL, skill.isolation_level)}
+                      {labelOf(copy.isolation, skill.isolation_level)}
                     </span>
                     <span className="px-1.5 py-0.2 rounded bg-slate-900 text-slate-300">
-                      v{skill.version} • {labelOf(ORIGIN_LABEL, skill.origin)}
+                      v{skill.version} • {labelOf(copy.origin, skill.origin)}
                     </span>
                   </div>
                 </div>
@@ -242,7 +247,7 @@ export function SkillsTab({ skillsData, onRefresh, isLoading }: SkillsTabProps) 
           <div className="flex items-center justify-between pb-3 border-b border-slate-800">
             <div className="flex items-center gap-2">
               <ShieldCheck className="w-4 h-4 text-emerald-400" />
-              <h3 className="text-sm font-semibold text-white">Safety check</h3>
+              <h3 className="text-sm font-semibold text-white">{copy.checkHeading}</h3>
             </div>
           </div>
 
@@ -258,7 +263,7 @@ export function SkillsTab({ skillsData, onRefresh, isLoading }: SkillsTabProps) 
                     <p className="text-slate-400 text-xs mt-0.5">{activeSkill.description}</p>
                   </div>
                   <div className="text-right text-[11px]">
-                    <span className="text-slate-400">Author: </span>
+                    <span className="text-slate-400">{copy.author} </span>
                     <span className="text-slate-200">{activeSkill.author}</span>
                   </div>
                 </div>
@@ -266,12 +271,12 @@ export function SkillsTab({ skillsData, onRefresh, isLoading }: SkillsTabProps) 
                 <div className="pt-2 border-t border-slate-800/80 flex flex-wrap items-center justify-between gap-2 text-[11px] text-slate-400">
                   <span className="flex items-center gap-1" title={activeSkill.content_sha256}>
                     <Hash className="w-3 h-3 text-slate-500" />
-                    Fingerprint{' '}
+                    {copy.fingerprint}{' '}
                     <span className="font-mono">{activeSkill.content_sha256.slice(0, 12)}…</span>
                   </span>
                   <span>
                     <strong className="text-slate-200">
-                      {labelOf(ISOLATION_LABEL, activeSkill.isolation_level)}
+                      {labelOf(copy.isolation, activeSkill.isolation_level)}
                     </strong>
                   </span>
                 </div>
@@ -280,7 +285,7 @@ export function SkillsTab({ skillsData, onRefresh, isLoading }: SkillsTabProps) 
               {/* The check's result, and how risky it judged the skill */}
               <div className="p-4 rounded-xl bg-slate-950/90 border border-slate-800 space-y-3">
                 <div className="flex items-center justify-between">
-                  <span className="text-xs font-semibold text-slate-200">Result</span>
+                  <span className="text-xs font-semibold text-slate-200">{copy.result}</span>
                   <span
                     className={`font-bold text-xs px-2.5 py-1 rounded ${
                       activeSkill.audit_report.recommendation === 'approve'
@@ -290,14 +295,14 @@ export function SkillsTab({ skillsData, onRefresh, isLoading }: SkillsTabProps) 
                         : 'bg-rose-950 text-rose-300 border border-rose-800'
                     }`}
                   >
-                    {labelOf(RECOMMENDATION_LABEL, activeSkill.audit_report.recommendation)}
+                    {labelOf(copy.recommendation, activeSkill.audit_report.recommendation)}
                   </span>
                 </div>
 
                 {/* Risk, as a bar */}
                 <div>
                   <div className="flex justify-between text-[11px] text-slate-400 mb-1">
-                    <span>Risk found in its code</span>
+                    <span>{copy.risk}</span>
                     <span className="font-bold text-slate-200">
                       {(activeSkill.audit_report.risk_score * 100).toFixed(0)}%
                     </span>
@@ -321,12 +326,12 @@ export function SkillsTab({ skillsData, onRefresh, isLoading }: SkillsTabProps) 
                 {/* What the check found */}
                 <div>
                   <span className="text-[11px] font-semibold text-slate-300">
-                    What the check found
+                    {copy.findings}
                   </span>
                   {activeSkill.audit_report.detected_risks.length === 0 ? (
                     <div className="mt-1.5 p-2.5 rounded-lg bg-emerald-950/30 border border-emerald-800/40 text-emerald-300 flex items-center gap-2 text-[11px]">
                       <CheckCircle2 className="w-4 h-4 text-emerald-400" />
-                      <span>Nothing unsafe was found in this skill's code.</span>
+                      <span>{copy.noFindings}</span>
                     </div>
                   ) : (
                     <div className="mt-1.5 space-y-1.5">
@@ -343,16 +348,25 @@ export function SkillsTab({ skillsData, onRefresh, isLoading }: SkillsTabProps) 
                   )}
                 </div>
 
+                {notLoaded && (
+                  <div
+                    data-testid="skill-not-loaded-reason"
+                    className="p-3 rounded-lg bg-rose-950/40 border border-rose-800/60 text-rose-200 text-xs"
+                  >
+                    <strong>{notLoadedCopy.label}</strong> {notLoaded}
+                  </div>
+                )}
+
                 {activeSkill.rejection_reason && (
                   <div className="p-3 rounded-lg bg-rose-950/40 border border-rose-800/60 text-rose-200 text-xs">
-                    <strong>Why it was turned down:</strong> {activeSkill.rejection_reason}
+                    <strong>{copy.turnedDown}</strong> {activeSkill.rejection_reason}
                   </div>
                 )}
               </div>
             </div>
           ) : (
             <div className="p-10 text-center text-slate-500 text-xs">
-              Choose a skill to see its safety check.
+              {copy.choose}
             </div>
           )}
         </div>

@@ -189,8 +189,5 @@ async def test_artifact_hallucination_persists_sanitized_by_tier2_hook(tmp_path:
 
     # Tier 2 hook sanitized the second hallucinated image so no 404 is rendered
     assert "img_fake1.png" in result.content
-    assert (
-        "> ⚠️ *[이미지 생성 도구가 실행되지 않아 이미지가 표시되지 않습니다: img_fake1.png]*"
-        in result.content
-    )
+    assert ':missing-image{file="img_fake1.png"}' in result.content
     assert "/api/artifacts/content" not in result.content

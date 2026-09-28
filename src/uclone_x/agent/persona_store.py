@@ -14,6 +14,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
 from uclone_x.agent.models import (
+    RETIRED_MODEL_TIERS,
     AgentLLMConfig,
     ModelTier,
     PersonaDefinition,
@@ -77,7 +78,8 @@ class PersonaDraft(BaseModel):
     append_default_prompt: bool = False
     allowed_tools: list[str] = Field(default_factory=list[str])
     model_name: str | None = None
-    model_tier: Literal["inherit", "fast", "pro", "flash_lite", "custom"] = "inherit"
+    fast_model: str | None = None
+    model_tier: Literal["inherit", "fast"] = "inherit"
     temperature: float = Field(default=0.7, ge=0.0, le=2.0)
     max_tokens: int | None = Field(default=None, gt=0)
     enable_write_tools: bool = False
@@ -157,6 +159,8 @@ def _file_contents(draft: PersonaDraft) -> dict[str, Any]:
     }
     if draft.model_name is not None:
         llm_config["model_name"] = draft.model_name
+    if draft.fast_model is not None:
+        llm_config["fast_model"] = draft.fast_model
     if draft.max_tokens is not None:
         llm_config["max_tokens"] = draft.max_tokens
     contents: dict[str, Any] = {
@@ -310,6 +314,9 @@ class YamlFilePersonaStore:
             raw_llm_dict = cast(dict[object, object], raw_llm)
             llm_dict: dict[str, Any] = {str(k): v for k, v in raw_llm_dict.items()}
             tier: object = llm_dict.get("model_tier")
+            if isinstance(tier, str) and tier in RETIRED_MODEL_TIERS:
+                # Offered once, read by nothing: the file keeps loading, following Settings.
+                tier = ModelTier.INHERIT.value
             if isinstance(tier, str):
                 try:
                     llm_dict["model_tier"] = ModelTier(tier)
@@ -473,6 +480,8 @@ class InMemoryPersonaStore:
         }
         if draft.model_name is not None:
             llm_dict["model_name"] = draft.model_name
+        if draft.fast_model is not None:
+            llm_dict["fast_model"] = draft.fast_model
         if draft.max_tokens is not None:
             llm_dict["max_tokens"] = draft.max_tokens
 

@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "uclone-x"
-version = "0.2.2"
-description = "Next-Generation Event-Driven AI Agent Core & High-Performance Collaboration Framework"
+version = "0.3.0"
+description = "Local AI clones with memory, tools and group chat, on an event-driven agent runtime"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
@@ -31,6 +31,7 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Topic :: Software Development :: Libraries :: Application Frameworks",
 ]
@@ -144,6 +145,13 @@ all = [
 ]
 
 
+[project.urls]
+Homepage = "https://github.com/UClone-AI/uclone-x"
+Documentation = "https://github.com/UClone-AI/uclone-x#readme"
+Source = "https://github.com/UClone-AI/uclone-x"
+Issues = "https://github.com/UClone-AI/uclone-x/issues"
+Changelog = "https://github.com/UClone-AI/uclone-x/blob/main/CHANGELOG.md"
+
 [project.scripts]
 ucx = "uclone_x.shells.entry:main"
 
@@ -225,6 +233,9 @@ addopts = "--cov=src/uclone_x --cov-branch --cov-report=term-missing --cov-fail-
 
 [tool.coverage.run]
 branch = true
+# sys.monitoring (3.14+) measures branches at ~60% of ctrace's CPU; on 3.12 coverage warns
+# `no-sysmon` and falls back to ctrace, so this only pays off once the venv is on 3.14.
+core = "sysmon"
 source = ["src/uclone_x"]
 omit = [
     "src/uclone_x/ui_static/*",

@@ -1,54 +1,58 @@
-import React from 'react';
+import React, { useMemo } from 'react';
 import { Bot, Check, ChevronLeft, MessageSquare, Pencil, Plus, Trash2, X } from 'lucide-react';
 import type { RoomSummary } from '../../types';
 import { emptyCause } from '../../lib/emptyStates';
-import { relativeTimeLabel } from '../../lib/relativeTime';
+import { exactTimeLabel, relativeTimeLabel } from '../../lib/relativeTime';
+import { fmt, plural, useCopy, useLocale, type Language, type Messages } from '../../i18n';
+import { en } from '../../i18n/en';
 import { useEscapeOwner } from '../../lib/escapePrecedence';
 import { ConversationList as KitConversationList } from '../../ui-kit';
 import type { ConversationListCopy, ConversationListIcons, UseKitEscape } from '../../ui-kit';
 
 /**
- * Every word the conversation list shows, as this head words it.
+ * Every word the conversation list shows, as this head words it, in `language`.
  *
  * The list itself is `ui-kit/rail/ConversationList.tsx` (#1158), which holds no words. The
- * empty-state sentences stay in `lib/emptyStates.ts`, because the Agents section of the rail
- * states the same fact and used to state it differently (#1060).
+ * sentences are the `conversationList` catalog's; the empty-state ones stay in `emptyStates`
+ * (`lib/emptyStates.ts`), because the Agents section of the rail states the same fact and used
+ * to state it differently (#1060). The kit asks for functions where a sentence carries a
+ * value; they are filled here, from the catalog's templates.
  */
-export const CONVERSATION_LIST_COPY: ConversationListCopy = {
-  heading: 'Conversations',
-  newLabel: 'New',
-  newTitle: 'Start a new conversation',
-  collapse: 'Collapse sidebar',
-  rename: 'Rename',
-  renameLabel: (name) => `Rename “${name}”`,
-  delete: 'Delete',
-  deleteLabel: (name) => `Delete “${name}”`,
-  emptyCause,
-  lastActive: relativeTimeLabel,
-  lastActiveTitle: (timestamp) => `Last active ${new Date(timestamp).toLocaleString()}`,
-  editor: {
-    titleLabel: 'Conversation title',
-    save: 'Save title',
-    cancel: 'Cancel rename',
-  },
-  deleteDialog: {
-    heading: (name) => `Delete “${name}”?`,
-    body: (entries, who) =>
-      `Its whole transcript (${entries} ${entries === 1 ? 'entry' : 'entries'}) and its record ` +
-      `of who was in it (${who}) will be removed, and any reply still being written in it is ` +
-      'stopped. This cannot be undone.',
-    // "clones", not "agents": §3.2.2 R3 gives the product one word for the thing the user
-    // talks to, and this sentence is one a user reads.
-    noAgents: 'no clones',
-    cancel: 'Cancel',
-    close: 'Close',
-    confirm: 'Delete conversation',
-    confirming: 'Deleting…',
-    unreadableHeading: 'Delete the conversation that could not be read?',
-    unreadableBody: 'Its saved copy will be removed. This cannot be undone.',
-  },
-  unreadableTitle: 'A conversation that could not be read',
-  unreadableDeleteLabel: 'Delete the conversation that could not be read',
+export const conversationListCopy = (t: Messages, language: Language): ConversationListCopy => {
+  const c = t.conversationList;
+  return {
+    heading: c.heading,
+    newLabel: c.newLabel,
+    newTitle: c.newTitle,
+    collapse: c.collapse,
+    rename: c.rename,
+    renameLabel: (name) => fmt(c.renameLabel, { name }),
+    delete: c.delete,
+    deleteLabel: (name) => fmt(c.deleteLabel, { name }),
+    emptyCause: (modelConfigured, agentCount) => emptyCause(modelConfigured, agentCount, t.emptyStates),
+    lastActive: (timestamp, now) => relativeTimeLabel(timestamp, now, language),
+    lastActiveTitle: (timestamp) => exactTimeLabel(timestamp, language),
+    editor: { ...c.editor },
+    deleteDialog: {
+      ...c.deleteDialog,
+      heading: (name) => fmt(c.deleteDialog.heading, { name }),
+      // "clones", not "agents", in `noAgents`: §3.2.2 R3 gives the product one word for the
+      // thing the user talks to, and this sentence is one a user reads.
+      body: (entries, who) => plural(c.deleteDialog.body, entries, { who }),
+    },
+    unreadableTitle: c.unreadableTitle,
+    unreadableDeleteLabel: c.unreadableDeleteLabel,
+  };
+};
+
+/** The conversation list's words in English, for callers outside a `LocaleProvider`. */
+export const CONVERSATION_LIST_COPY: ConversationListCopy = conversationListCopy(en, 'en');
+
+/** The conversation list's words in the screen's language, rebuilt only when it changes. */
+export const useConversationListCopy = (): ConversationListCopy => {
+  const t = useCopy();
+  const { language } = useLocale();
+  return useMemo(() => conversationListCopy(t, language), [t, language]);
 };
 
 /**
@@ -103,11 +107,14 @@ interface ConversationListProps {
 }
 
 /** The kit's conversation list, bound to this head's words and icons. */
-export const ConversationList: React.FC<ConversationListProps> = (props) => (
-  <KitConversationList
-    {...props}
-    copy={CONVERSATION_LIST_COPY}
-    icons={CONVERSATION_LIST_ICONS}
-    useEscape={CONVERSATION_LIST_ESCAPE}
-  />
-);
+export const ConversationList: React.FC<ConversationListProps> = (props) => {
+  const copy = useConversationListCopy();
+  return (
+    <KitConversationList
+      {...props}
+      copy={copy}
+      icons={CONVERSATION_LIST_ICONS}
+      useEscape={CONVERSATION_LIST_ESCAPE}
+    />
+  );
+};

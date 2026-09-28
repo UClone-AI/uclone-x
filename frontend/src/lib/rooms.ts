@@ -7,6 +7,7 @@
  * the composer is allowed to promise about who will answer.
  */
 import type {
+  RoomActiveTurn,
   RoomCompaction,
   RoomContext,
   RoomHistoryAnswer,
@@ -20,6 +21,8 @@ import type {
   RoomSummary,
   RoomTranscriptMessage,
 } from '../types';
+import { en, type Messages } from '../i18n/en';
+import { fmt } from '../i18n/format';
 
 /**
  * A non-2xx answer from `/api/rooms`, and whether the Core itself said why.
@@ -79,16 +82,16 @@ async function readOrThrow(res: Response): Promise<any> {
 }
 
 /** Said when a request never got an answer: the Core is stopped, restarting, or unreachable. */
-export const ROOM_READ_NO_ANSWER = "The app's background service didn't answer.";
+export const ROOM_READ_NO_ANSWER = en.composer.sendFailure.noAnswer;
 /** Said when the Core answered a read with a failure but did not say why. */
 export const ROOM_READ_NO_REASON = 'Something went wrong reading it.';
 /** Said when the Core answered any other request with a failure but did not say why. */
-export const ROOM_ACTION_NO_REASON = "Something went wrong in the app's background service.";
+export const ROOM_ACTION_NO_REASON = en.composer.sendFailure.noReason;
 /**
  * Said for a failure that is neither the Core's answer nor a missing one: the head's own
  * code threw (#1441). Not blamed on the background service, which may have done nothing.
  */
-export const ROOM_APP_FAULT = 'Something went wrong in the app.';
+export const ROOM_APP_FAULT = en.composer.sendFailure.appFault;
 
 /**
  * Why a request to `/api/rooms` failed, in a sentence fit for someone who does not read code.
@@ -101,13 +104,18 @@ export const ROOM_APP_FAULT = 'Something went wrong in the app.';
  * so copy can follow it.
  *
  * `noReason` is what to say when the Core answered with a failure and no reason: a read and
- * an action fail in different words.
+ * an action fail in different words. `words` are the head's own two sentences, in the
+ * reader's language; the Core's `detail` is its own and passes through as written.
  */
-export function roomFailureReason(err: unknown, noReason: string = ROOM_ACTION_NO_REASON): string {
+export function roomFailureReason(
+  err: unknown,
+  noReason: string = ROOM_ACTION_NO_REASON,
+  words: { noAnswer: string; appFault: string } = en.composer.sendFailure,
+): string {
   let reason: string;
   if (err instanceof RoomsApiError) reason = err.coreDetail ?? noReason;
-  else if (err instanceof RoomsNoAnswerError) reason = ROOM_READ_NO_ANSWER;
-  else reason = ROOM_APP_FAULT;
+  else if (err instanceof RoomsNoAnswerError) reason = words.noAnswer;
+  else reason = words.appFault;
   reason = reason.trim();
   return /[.!?…]$/.test(reason) ? reason : `${reason}.`;
 }
@@ -174,16 +182,19 @@ export function messageArrived(room: RoomState, content: string, afterSeq: numbe
  * The composer's line for a send that did not go through, true in the outcome it is for.
  *
  * "Not sent" only when the Core refused; for a missing answer the head cannot say that, and
- * says what it knows instead.
+ * says what it knows instead. `copy` is `composer.sendFailure` in the reader's language.
  */
-export function sendFailureNotice(err: unknown): string {
+export function sendFailureNotice(
+  err: unknown,
+  copy: Messages['composer']['sendFailure'] = en.composer.sendFailure,
+): string {
   if (!(err instanceof RoomSendError)) {
-    return `Could not confirm whether this conversation has your message: ${ROOM_APP_FAULT}`;
+    return fmt(copy.unconfirmed, { reason: copy.appFault });
   }
-  const reason = roomFailureReason(err.sendCause);
-  if (err.outcome === 'refused') return `Not sent: ${reason}`;
-  if (err.outcome === 'absent') return `${reason} Your message is not in this conversation.`;
-  return `Could not confirm whether this conversation has your message: ${reason}`;
+  const reason = roomFailureReason(err.sendCause, copy.noReason, copy);
+  if (err.outcome === 'refused') return fmt(copy.refused, { reason });
+  if (err.outcome === 'absent') return fmt(copy.absent, { reason });
+  return fmt(copy.unconfirmed, { reason });
 }
 
 /**
@@ -399,12 +410,15 @@ export function serviceRefLabel(ref: RoomServiceRef | null | undefined): string 
  * exists so that substitution is visible rather than inferred from the text, so when the
  * two differ the line says both.
  */
-export function servedByLabel(provenance: RoomProvenance | null | undefined): string | null {
+export function servedByLabel(
+  provenance: RoomProvenance | null | undefined,
+  instead: string = en.conversation.row.servedInstead,
+): string | null {
   const served = serviceRefLabel(provenance?.served_by);
   if (!served) return null;
   const requested = serviceRefLabel(provenance?.requested);
   if (provenance?.degraded && requested && requested !== served) {
-    return `${served} (asked for ${requested})`;
+    return fmt(instead, { served, requested });
   }
   return served;
 }
@@ -664,11 +678,18 @@ export function participantLabel(participant: RoomParticipant): string {
   return participant.display_name || participant.id;
 }
 
-/** A row's sender, shown as the roster knows it -- or as the raw id, never as a guess. */
-export function senderLabel(room: RoomState, senderId: string): string {
+/**
+ * A row's sender, shown as the roster knows it -- or as the raw id, never as a guess. `you`
+ * is the reader's own name for themselves, in their language.
+ */
+export function senderLabel(
+  room: RoomState,
+  senderId: string,
+  you: string = en.conversation.you,
+): string {
   const participant = senderOf(room.participants, senderId);
   if (!participant) return senderId;
-  if (participant.kind === 'human') return 'you';
+  if (participant.kind === 'human') return you;
   return participantLabel(participant);
 }
 
@@ -763,6 +784,7 @@ export function answerHint(
   draft: string,
   defaultResponderId: string,
   maxAgentTurnsPerHumanMessage: number,
+  copy: Messages['composer']['hint'] = en.composer.hint,
 ): string {
   const who = answeringSeats(
     participants,
@@ -774,17 +796,15 @@ export function answerHint(
     // The Core refuses the whole address before serving any of it, so nothing here
     // may promise an answer -- not even the only agent in the room.
     return who.reason === 'empty-room'
-      ? 'No one is in this conversation yet.'
-      : `No one here is called @${who.token}, so this message will not be answered.`;
+      ? copy.emptyRoom
+      : fmt(copy.noSuchName, { token: who.token });
   }
-  if (who.kind === 'unresolved') return 'Someone will pick this up';
+  if (who.kind === 'unresolved') return copy.unresolved;
 
-  const answering = who.seats.map(participantLabel).join(', ');
-  if (who.cutOff > 0) {
-    return `${answering} will answer, in that order. Paused after ${who.seats.length} replies, so the rest of those you named will not.`;
-  }
-  if (who.seats.length === 1) return `${answering} will answer`;
-  return `${answering} will answer, in that order`;
+  const names = who.seats.map(participantLabel).join(', ');
+  if (who.cutOff > 0) return fmt(copy.cutOff, { names, count: who.seats.length });
+  if (who.seats.length === 1) return fmt(copy.one, { names });
+  return fmt(copy.inOrder, { names });
 }
 
 /**
@@ -969,6 +989,36 @@ export interface RoomLiveState {
 }
 
 export const EMPTY_LIVE: RoomLiveState = { turn: null, error: null };
+
+/**
+ * Restore live turn state from a room's in-flight turn, if present.
+ *
+ * Used on initial open or re-read so that refreshing the page while a turn runs
+ * does not wipe the spinner or switch Stop back to Send.
+ */
+export function restoreLiveFromActiveTurn(
+  live: RoomLiveState,
+  activeTurn?: RoomActiveTurn | null,
+): RoomLiveState {
+  if (!activeTurn || !activeTurn.in_flight) {
+    return live;
+  }
+  // If the head already has a live turn for this turn, do not disturb it.
+  // Real-time SSE deltas append to live.turn.text; overwriting or seeding
+  // while the stream is already live races with in-flight deltas and duplicates tokens.
+  if (live.turn && (!activeTurn.turn_id || live.turn.turnId === activeTurn.turn_id)) {
+    return live;
+  }
+  return {
+    turn: {
+      agentId: activeTurn.agent_id ?? '',
+      turnId: activeTurn.turn_id ?? '',
+      text: activeTurn.accumulated_text ?? '',
+      statusText: activeTurn.detail || undefined,
+    },
+    error: null,
+  };
+}
 
 /**
  * Fold one room event into the live turn the transcript renders underneath its rows.

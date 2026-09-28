@@ -13,6 +13,10 @@ answered with a warning and exit code 0. Those tests are here too.
 from __future__ import annotations
 
 import asyncio
+import functools
+import os
+import sys
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -338,3 +342,51 @@ def test_the_engines_the_image_pipeline_replacement_removed_can_no_longer_be_ins
         assert "mflux" not in offered and "mlx" not in offered, reason
 
     assert resolve_installable("diffusers")[0] == ("diffusers",)
+
+
+@pytest.fixture
+def terminal_input() -> Iterator[None]:
+    """Put a line on this process's fd 0, as a person typing in the UI server's terminal."""
+    saved = os.dup(0)
+    read_end, write_end = os.pipe()
+    os.write(write_end, b"TERMINAL-INPUT\n")
+    os.close(write_end)
+    os.dup2(read_end, 0)
+    os.close(read_end)
+    try:
+        yield
+    finally:
+        os.dup2(saved, 0)
+        os.close(saved)
+
+
+def _probe_command(probe: str, *_packages: str) -> list[str]:
+    return [sys.executable, "-c", probe]
+
+
+def _nothing_missing(_packages: tuple[str, ...]) -> tuple[str, ...]:
+    return ()
+
+
+def test_the_installer_reads_eof_not_the_terminal_the_server_runs_in(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, terminal_input: None
+) -> None:
+    """The model names the package; the installer it starts gets no stdin (#1589).
+
+    A real child stands in for the installer and records what it read.
+
+    Killed by: src/uclone_x/core/environment_install.py :: result = subprocess.run(command, check=False, stdin=subprocess.DEVNULL)
+    Becomes: result = subprocess.run(command, check=False)
+    """
+    report = tmp_path / "installer-stdin.txt"
+    probe = f"import sys; open({str(report)!r}, 'w').write(repr(sys.stdin.read()))"
+    monkeypatch.setattr(
+        "uclone_x.core.environment_install.installer_command",
+        functools.partial(_probe_command, probe),
+    )
+    monkeypatch.setattr("uclone_x.core.environment_install.still_missing", _nothing_missing)
+
+    installed, reason = install_into_running_environment("pillow")
+
+    assert installed is True, reason
+    assert report.read_text() == "''"

@@ -1,6 +1,8 @@
 """Skills subsystem: SKILL.md dynamic packages, autonomous synthesis, and security auditor."""
 
 from uclone_x.skills.auditor import (
+    FileSystemSkillStore,
+    InMemorySkillStore,
     Skill,
     SkillAuditor,
     SkillRegistry,
@@ -23,6 +25,7 @@ from uclone_x.skills.protocols import (
     SkillAuditorProtocol,
     SkillProtocol,
     SkillRegistryProtocol,
+    SkillStoreProtocol,
     SkillSynthesizerProtocol,
 )
 from uclone_x.skills.synthesizer import SkillSynthesizer
@@ -30,6 +33,8 @@ from uclone_x.skills.synthesizer import SkillSynthesizer
 __all__ = [
     "AuditVerdict",
     "AutoApprovalPolicy",
+    "FileSystemSkillStore",
+    "InMemorySkillStore",
     "Skill",
     "SkillAuditReport",
     "SkillAuditor",
@@ -39,6 +44,7 @@ __all__ = [
     "SkillProtocol",
     "SkillRegistry",
     "SkillRegistryProtocol",
+    "SkillStoreProtocol",
     "SkillStatus",
     "SkillSynthesizer",
     "SkillSynthesizerProtocol",

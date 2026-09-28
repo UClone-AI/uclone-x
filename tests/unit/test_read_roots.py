@@ -303,7 +303,7 @@ def _system_prompt(llm: _RecordingLLM) -> str:
 async def test_the_turn_states_the_workspace_and_every_read_root(
     workspace: Path, papers: Path
 ) -> None:
-    """Killed by: src/uclone_x/agent/base.py :: lines.extend(f"- {root.resolve()}" for root in read_roots)
+    """Killed by: src/uclone_x/agent/prompt_assembler.py :: lines.extend(f"- {root.resolve()}" for root in read_roots)
     Becomes: lines.extend(())
     """
     llm = _RecordingLLM(default_response="ok")
@@ -320,7 +320,7 @@ async def test_the_turn_states_the_workspace_and_every_read_root(
 
 @pytest.mark.asyncio
 async def test_an_agent_holding_no_file_tool_gets_no_workspace_section(workspace: Path) -> None:
-    """Killed by: src/uclone_x/agent/base.py :: if allowed and not any(
+    """Killed by: src/uclone_x/agent/prompt_assembler.py :: if allowed and not any(
     Becomes: if False and not any(
     """
     llm = _RecordingLLM(default_response="ok")
@@ -443,8 +443,8 @@ def test_the_environment_list_is_merged_before_the_settings_list(
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("no_env_roots")
 async def test_new_and_live_agents_both_receive_the_list(tmp_path: Path, papers: Path) -> None:
-    """Killed by: src/uclone_x/ui/app.py :: config = config.model_copy(update={"read_roots": self.read_roots})
-    Becomes: pass
+    """Killed by: src/uclone_x/ui/app.py :: read_roots=lambda: self.read_roots,
+    Becomes: read_roots=lambda: (),
     Killed by: src/uclone_x/ui/app.py :: agent.set_read_roots(effective_roots)
     Becomes: pass
     """
@@ -560,9 +560,9 @@ async def test_another_origin_cannot_change_the_list(tmp_path: Path, papers: Pat
 
 @pytest.mark.asyncio
 async def test_a_room_seat_follows_the_list_after_it_is_built(tmp_path: Path, papers: Path) -> None:
-    """Killed by: src/uclone_x/room/resolver.py :: read_roots = self._read_roots()
+    """Killed by: src/uclone_x/agent/clone_builder.py :: read_roots = app.read_roots()
     Becomes: read_roots = ()
-    Killed by: src/uclone_x/room/resolver.py :: cached.set_read_roots(self._read_roots())
+    Killed by: src/uclone_x/room/resolver.py :: cached.set_read_roots(self._app.read_roots())
     Becomes: pass
     """
     current: list[tuple[Path, ...]] = [(papers,)]

@@ -3,6 +3,24 @@
 from __future__ import annotations
 
 import re
+from typing import Literal
+
+LoopParseReason = Literal["usage", "missing_prompt", "interval_too_short", "no_interval"]
+"""Why a `/loop` command could not be read, for a caller that words the answer itself."""
+
+
+class LoopParseError(ValueError):
+    """A `/loop` command that could not be read, with the reason as a value.
+
+    The message is for the CLI and the log. A conversation does not show it: it says
+    `reason` in the reader's language instead (`room/notices.py`), so the sentence is never
+    matched on or relayed.
+    """
+
+    def __init__(self, message: str, *, reason: LoopParseReason) -> None:
+        super().__init__(message)
+        self.reason: LoopParseReason = reason
+
 
 # Minimum allowed interval to protect against tight spin loops and API abuse (P4)
 MIN_INTERVAL_SECONDS: float = 1.0
@@ -94,8 +112,9 @@ def parse_interval_string(val: str) -> float:
         raise ValueError(f"Invalid numeric value in interval: '{num_str}'") from exc
 
     if seconds < MIN_INTERVAL_SECONDS:
-        raise ValueError(
-            f"Interval must be at least {MIN_INTERVAL_SECONDS:.1f}s to prevent spin loops; got {seconds}s."
+        raise LoopParseError(
+            f"Interval must be at least {MIN_INTERVAL_SECONDS:.1f}s to prevent spin loops; got {seconds}s.",
+            reason="interval_too_short",
         )
 
     return seconds
@@ -117,24 +136,29 @@ def parse_loop_command_input(text: str) -> tuple[float, str]:
            '/loop every 10 minutes check git log' -> (600.0, 'check git log')
 
     Raises:
-        ValueError: If no interval can be recognized or prompt is empty.
+        LoopParseError: If no interval can be recognized or prompt is empty; `reason` says
+            which.
     """
     clean_text = text.strip()
     if not clean_text:
-        raise ValueError("Usage: /loop <interval> <prompt> (e.g. /loop 5m ./ucx test check)")
+        raise LoopParseError(
+            "Usage: /loop <interval> <prompt> (e.g. /loop 5m ./ucx test check)", reason="usage"
+        )
 
     # 1. If only a single token was provided and it looks like an interval, raise missing prompt error
     parts = clean_text.split(maxsplit=1)
     if len(parts) == 1:
         try:
             parse_interval_string(parts[0])
-            raise ValueError(
-                f"Missing prompt after interval '{parts[0]}'. Usage: /loop {parts[0]} <prompt>"
+            raise LoopParseError(
+                f"Missing prompt after interval '{parts[0]}'. Usage: /loop {parts[0]} <prompt>",
+                reason="missing_prompt",
             )
-        except ValueError as err:
-            if "Missing prompt" in str(err):
-                raise
+        except LoopParseError:
+            raise
+        except ValueError:
             # Not a valid interval either, continue to fallback error
+            pass
 
     # 2. Try scanning for natural language interval patterns across the full sentence first
     for pattern in NATURAL_LANGUAGE_PATTERNS:
@@ -146,15 +170,18 @@ def parse_loop_command_input(text: str) -> tuple[float, str]:
             if multiplier is not None:
                 seconds = float(num_str) * multiplier
                 if seconds < MIN_INTERVAL_SECONDS:
-                    raise ValueError(
-                        f"Interval must be at least {MIN_INTERVAL_SECONDS:.1f}s; got {seconds}s."
+                    raise LoopParseError(
+                        f"Interval must be at least {MIN_INTERVAL_SECONDS:.1f}s; got {seconds}s.",
+                        reason="interval_too_short",
                     )
                 # Remove matched interval expression to form clean prompt
                 prompt = (clean_text[: match.start()] + clean_text[match.end() :]).strip()
                 prompt = re.sub(r"^(?:간격으로|마다|주기로|[,;\s])+", "", prompt).strip()
                 prompt = re.sub(r"[,;\s]+$", "", prompt).strip()
                 if not prompt:
-                    raise ValueError("Prompt is empty after extracting interval.")
+                    raise LoopParseError(
+                        "Prompt is empty after extracting interval.", reason="missing_prompt"
+                    )
                 return seconds, prompt
 
     # 3. Try first whitespace-delimited token as a structured interval (e.g. '5m', '30s')
@@ -164,16 +191,19 @@ def parse_loop_command_input(text: str) -> tuple[float, str]:
         prompt = parts[1].strip() if len(parts) > 1 else ""
         prompt = re.sub(r"^(?:간격으로|마다|주기로|[,;\s])+", "", prompt).strip()
         if not prompt:
-            raise ValueError(
+            raise LoopParseError(
                 f"Missing prompt after interval '{first_token}'. "
-                f"Usage: /loop {first_token} <prompt>"
+                f"Usage: /loop {first_token} <prompt>",
+                reason="missing_prompt",
             )
         return seconds, prompt
-    except ValueError as err:
-        if "Missing prompt" in str(err):
-            raise
+    except LoopParseError:
+        raise
+    except ValueError:
+        pass
 
-    raise ValueError(
+    raise LoopParseError(
         "Could not recognize interval in command. "
-        "Expected e.g. '/loop 5m <prompt>' or '/loop 5분마다 <prompt>'."
+        "Expected e.g. '/loop 5m <prompt>' or '/loop 5분마다 <prompt>'.",
+        reason="no_interval",
     )

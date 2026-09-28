@@ -269,6 +269,52 @@ describe('StoryView, a story in Files (#1560)', () => {
     expectPlain(notice.textContent);
   });
 
+  it('a decision from a window the Core did not open shows its refusal and offers a confirmed window', async () => {
+    // Killed by: frontend/src/components/artifacts/StoryView.tsx :: setUnconfirmed(err instanceof CoreFailure && err.status === 403);
+    // Becomes: setUnconfirmed(false);
+    const refusal = 'Only you can make this decision, and this window could not show that it is you.';
+    answers[SHOW] = ok(overview());
+    answers[APPROVE] = { status: 403, body: { detail: refusal } };
+    answers['POST /api/person/window'] = ok({ opened: true });
+    renderView();
+
+    fireEvent.click(await screen.findByTestId('story-approve'));
+
+    const notice = await screen.findByTestId('story-view-notice');
+    expect(notice).toHaveTextContent(refusal);
+    fireEvent.click(within(notice).getByTestId('story-open-confirmed-window'));
+    expect(await screen.findByText(STORY_COPY.windowOpened)).toBeInTheDocument();
+    expect(calls.filter((c) => c.url === '/api/person/window')).toHaveLength(1);
+  });
+
+  it('says plainly when no confirmed window could be opened', async () => {
+    // Killed by: frontend/src/components/artifacts/StoryView.tsx :: setNotice([plainFailure(err, STORY_COPY.windowFailed)]);
+    // Becomes: setNotice([String(err)]);
+    answers[SHOW] = ok(overview());
+    answers[APPROVE] = { status: 403, body: { detail: 'Only you can make this decision.' } };
+    answers['POST /api/person/window'] = { status: 502, body: '<html>Bad Gateway</html>' };
+    renderView();
+
+    fireEvent.click(await screen.findByTestId('story-approve'));
+    fireEvent.click(await screen.findByTestId('story-open-confirmed-window'));
+
+    expect(await screen.findByText(STORY_COPY.windowFailed)).toBeInTheDocument();
+    expectPlain(screen.getByTestId('story-view-notice').textContent);
+  });
+
+  it('offers no confirmed window for a refusal that is not about the window', async () => {
+    // Killed by: frontend/src/components/artifacts/StoryView.tsx :: setUnconfirmed(err instanceof CoreFailure && err.status === 403);
+    // Becomes: setUnconfirmed(err instanceof CoreFailure);
+    answers[SHOW] = ok(overview());
+    answers[APPROVE] = { status: 400, body: { detail: 'It changed after it was shown.' } };
+    renderView();
+
+    fireEvent.click(await screen.findByTestId('story-approve'));
+
+    expect(await screen.findByTestId('story-view-notice')).toHaveTextContent('It changed after it was shown.');
+    expect(screen.queryByTestId('story-open-confirmed-window')).toBeNull();
+  });
+
   it('when a decision cannot be saved, says why and offers no button that would fail', async () => {
     const note =
       'No conversation is writing “Night Train”, so a decision cannot be saved. Open the story in a conversation, then decide here.';

@@ -13,6 +13,7 @@ from typing import Final
 
 import pytest
 
+from uclone_x.agent.models import AgentLLMConfig
 from uclone_x.errors import SpeakerSelectionError, UnknownRoomParticipantError
 from uclone_x.llm.connectors.mock import MockLLMConnector
 from uclone_x.llm.models import FinishReason, LLMRequest, ModelResponse
@@ -20,6 +21,7 @@ from uclone_x.room.models import (
     Participant,
     ParticipantKind,
     RoomMessage,
+    RoomMessageKind,
     RoomPolicy,
     SelectionVerdict,
     SpeakerDecision,
@@ -865,6 +867,74 @@ class TestNoMalformedReplyBecomesASilentSilence:
         assert decision.speaker_id == "scout"
 
 
+class TestSelectorPromptIsStableFirst:
+    """Design doc `llm-request-layering.md` §5.7 (#1641): roster, conversation, floor state.
+
+    The floor state changes on every selection; leading with it made each selection's
+    request diverge a few lines in, so none extended the one before it.
+    """
+
+    def test_the_floor_state_follows_the_conversation(self) -> None:
+        request = _request(
+            ALICE,
+            SCOUT,
+            CRITIC,
+            utterances=(("alice", "where is the cache?"),),
+            turn_state=TurnState(agent_turns_since_human=1, last_speaker_id="scout-1"),
+            policy=RoomPolicy(autonomous=True),
+        )
+        rendered = LLMSpeakerSelector._render(request)  # pyright: ignore[reportPrivateUsage]
+
+        roster = rendered.index("ROSTER:")
+        conversation = rendered.index("CONVERSATION:")
+        last_line = rendered.index("[alice]: where is the cache?")
+        assert roster < conversation < last_line
+        for volatile in (
+            "AUTONOMOUS DISCUSSION MODE: ENABLED",
+            "AGENT TURNS SINCE THE LAST HUMAN MESSAGE: 1",
+            "LAST SPEAKER: scout-1",
+        ):
+            assert rendered.index(volatile) > last_line, (volatile, rendered)
+
+    def test_the_next_selection_extends_this_one(self) -> None:
+        """Everything above the floor state is shared by consecutive selections."""
+        first = _request(ALICE, SCOUT, CRITIC, utterances=(("alice", "q"),), turn_state=TurnState())
+        second = _request(
+            ALICE,
+            SCOUT,
+            CRITIC,
+            utterances=(("alice", "q"), ("scout-1", "an answer")),
+            turn_state=TurnState(agent_turns_since_human=1, last_speaker_id="scout-1"),
+        )
+        a = LLMSpeakerSelector._render(first)  # pyright: ignore[reportPrivateUsage]
+        b = LLMSpeakerSelector._render(second)  # pyright: ignore[reportPrivateUsage]
+
+        # The blank line that sets the floor state off is where the next line of
+        # conversation goes, so the shared part ends at the last line before it.
+        stable = a[: a.index("AGENT TURNS SINCE THE LAST HUMAN MESSAGE")].rstrip("\n") + "\n"
+        assert "[alice]: q" in stable, "the floor state comes before the conversation"
+        assert b.startswith(stable), (a, b)
+
+    def test_a_note_is_not_rendered_as_conversation(self) -> None:
+        """A `/loop` note is the application talking to the reader, not a speaker (#1641)."""
+        request = SpeakerRequest(
+            room_id="r1",
+            participants=(ALICE, SCOUT, CRITIC),
+            transcript=(
+                RoomMessage(seq=1, sender_id="alice", content="hello"),
+                RoomMessage(
+                    seq=2, sender_id="system", content="LOOP-HELP", kind=RoomMessageKind.NOTE
+                ),
+            ),
+            turn_state=TurnState(),
+            policy=RoomPolicy(),
+        )
+        rendered = LLMSpeakerSelector._render(request)  # pyright: ignore[reportPrivateUsage]
+
+        assert "[alice]: hello" in rendered
+        assert "LOOP-HELP" not in rendered
+
+
 class TestLLMSelectorAutonomousAndThinking:
     """Verify autonomous mode rendering and thinking=False parameter on LLMRequest."""
 
@@ -928,3 +998,22 @@ class TestLLMSelectorAutonomousAndThinking:
         request = _request(ALICE, SCOUT, CRITIC)
         with pytest.raises(SpeakerSelectionError, match="token budget was exhausted"):
             await LLMSpeakerSelector(llm).select(request)
+
+
+class TestRoutingRunsOnTheFastModel:
+    """Routing is an auxiliary call: it asks for the model the head passes, unless the
+    room's own selector names one."""
+
+    def _selector(self, chain: tuple[object, ...]) -> LLMSpeakerSelector:
+        return next(s for s in chain if isinstance(s, LLMSpeakerSelector))
+
+    def test_the_head_default_model_is_used_when_the_room_names_none(self) -> None:
+        chain = build_selector_chain(
+            RoomPolicy(), provider=MockLLMConnector(), default_model="fast-1"
+        )
+        assert self._selector(chain)._model == "fast-1"  # pyright: ignore[reportPrivateUsage]
+
+    def test_the_rooms_own_selector_model_wins(self) -> None:
+        policy = RoomPolicy(selector_llm=AgentLLMConfig(model_name="room-own"))
+        chain = build_selector_chain(policy, provider=MockLLMConnector(), default_model="fast-1")
+        assert self._selector(chain)._model == "room-own"  # pyright: ignore[reportPrivateUsage]

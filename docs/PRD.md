@@ -254,8 +254,8 @@ flowchart TD
   - *Tier 1 (Inline Turn)*: Compiled Pydantic v2 validator hooks, deterministic only against a pinned ontology `content_hash`. Budget in [`docs/nfr-performance-budgets.md`](nfr-performance-budgets.md).
   - *Tier 2 (Background)*: Async knowledge graph expansion and semantic alignment.
 * **FR-4.4**: An autonomously induced term must not become enforcing, or matchable across agents, without human promotion. Below the matching confidence threshold the task asks a human or fails with a typed error — there is no proceed-on-best-guess path. Promotion, contradiction and retraction rules are in [`docs/ontology-alignment-spec.md`](ontology-alignment-spec.md).
-* **FR-4.5**: **User/Workspace Isolation & Automated Curation Pipeline**:
-  - Ontologies and accumulated knowledge are strictly partitioned per user (`~/.ucx/knowledge/users/`) and workspace (`~/.ucx/knowledge/workspaces/`).
+* **FR-4.5**: **Per-Clone Isolation & Automated Curation Pipeline**:
+  - Ontologies and accumulated knowledge are partitioned per clone (P7, amended 2026-09-25, #1654). A clone's knowledge is not partitioned by conversation or workspace, and no clone reads, writes, or merges another clone's knowledge.
   - Knowledge ingestion enforces a 4-stage curation filter: (1) Durable Knowledge Gate (filtering conversational transient noise), (2) Semantic Deduplication & Conflict Superseding, (3) Confidence Scoring (empirical reward/penalty), and (4) Temporal Decay & Automated Pruning of unreinforced or poisoned assertions.
 * **Acceptance**: the quality gate validates a pinned ontology snapshot identified by content hash, so two runs of the same commit give the same verdict; an induced candidate cannot reject an action; retracting a term whose dependent is human-asserted is refused rather than silently cascaded; knowledge decayed below threshold is pruned automatically.
 
@@ -301,7 +301,7 @@ flowchart TD
 | `./ucx setup` | Bootstrap venv, dependencies and UI assets | **Stub** — prints success, does nothing |
 | `./ucx run [agent]` | Start the in-memory runtime | **Stub** |
 | `./ucx ui` | Launch the developer dashboard | **Stub** |
-| `./ucx skill list --pending\|approve\|reject` | The human gate FR-5.7 requires | **Planned** |
+| `./ucx skill list --pending\|approve\|reject` | The human gate FR-5.7 requires | **Implemented** (`src/uclone_x/cli/commands/skill.py`) |
 | `./ucx ontology teach\|forget\|arbitrate` | Human ontology steering (FR-4.2) | **Planned** |
 | `./ucx test live` | Integration tests consuming real tokens, with token guardrails | **Planned** |
 

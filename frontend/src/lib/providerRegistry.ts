@@ -1,69 +1,68 @@
+/**
+ * The public cloud providers this head knows key formats for.
+ *
+ * The registry holds no sentences: a provider's cost tip and every key warning are in the
+ * catalog (`settings.providers`, `settings.apiKey`), so they follow the language setting.
+ * `validateKeyFormat` says what is wrong as a `problem` and Settings words it.
+ */
+import { fmt } from '../i18n/format';
+
+export type CloudProviderId = 'gemini' | 'anthropic' | 'openai';
+
 export interface ProviderKeyMetadata {
-  id: string;
+  id: CloudProviderId;
   displayName: string;
-  badgeText?: string;
   keyConsoleUrl: string;
   keyPrefix: string;
   keyPattern: RegExp;
   placeholder: string;
-  costTip: string;
-  defaultModel: string;
+  /**
+   * The company's own name, as a sentence about its model list uses it ("Google's list").
+   * `displayName` names the product ("Google Gemini"), which reads wrongly there. A proper
+   * noun, so it is the same in every language.
+   */
+  vendorName: string;
   defaultBaseUrl: string;
-  curatedModels: string[];
 }
 
-export const PROVIDER_REGISTRY: Record<string, ProviderKeyMetadata> = {
+export const PROVIDER_REGISTRY: Record<CloudProviderId, ProviderKeyMetadata> = {
   gemini: {
     id: 'gemini',
+    vendorName: 'Google',
     displayName: 'Google Gemini',
-    badgeText: '무료 티어 제공',
     keyConsoleUrl: 'https://aistudio.google.com/app/apikey',
     keyPrefix: 'AIzaSy',
     keyPattern: /^AIzaSy[A-Za-z0-9_-]{33}$/,
     placeholder: 'AIzaSy...',
-    costTip: 'Google AI Studio에서 신용카드 등록 없이 분당 15회 무료(Free Tier) 키를 발급받을 수 있습니다.',
-    defaultModel: 'gemini-1.5-pro',
     defaultBaseUrl: 'https://generativelanguage.googleapis.com/v1beta',
-    curatedModels: ['gemini-1.5-flash', 'gemini-1.5-pro', 'gemini-2.0-flash-exp'],
   },
   anthropic: {
     id: 'anthropic',
+    vendorName: 'Anthropic',
     displayName: 'Anthropic Claude',
     keyConsoleUrl: 'https://console.anthropic.com/settings/keys',
     keyPrefix: 'sk-ant-',
     keyPattern: /^sk-ant-[A-Za-z0-9_-]{20,}$/,
     placeholder: 'sk-ant-api03-...',
-    costTip: 'Anthropic Console의 API Keys 메뉴에서 키를 발급받을 수 있습니다 (Credit 충전 필요).',
-    defaultModel: 'claude-3-5-sonnet-20241022',
     defaultBaseUrl: 'https://api.anthropic.com',
-    curatedModels: ['claude-3-5-sonnet-20241022', 'claude-3-5-haiku-20241022', 'claude-3-opus-20240229'],
   },
   openai: {
     id: 'openai',
+    vendorName: 'OpenAI',
     displayName: 'OpenAI',
     keyConsoleUrl: 'https://platform.openai.com/api-keys',
     keyPrefix: 'sk-',
     keyPattern: /^sk-(?:proj-)?[A-Za-z0-9_-]{20,}$/,
     placeholder: 'sk-proj-...',
-    costTip: 'OpenAI Platform의 API Keys 메뉴에서 비밀 키를 생성할 수 있습니다.',
-    defaultModel: 'gpt-4o',
     defaultBaseUrl: 'https://api.openai.com/v1',
-    curatedModels: ['gpt-4o', 'gpt-4o-mini', 'o1-mini', 'o3-mini'],
   },
 };
 
 /**
  * Whether the provider is a managed public cloud provider requiring an API key.
  */
-export function isCloudProvider(providerId: string): boolean {
+export function isCloudProvider(providerId: string): providerId is CloudProviderId {
   return providerId in PROVIDER_REGISTRY;
-}
-
-/**
- * Returns curated model presets for a provider, or empty array if none.
- */
-export function getCuratedModels(providerId: string): string[] {
-  return PROVIDER_REGISTRY[providerId]?.curatedModels ?? [];
 }
 
 /**
@@ -81,13 +80,13 @@ export function sanitizeApiKey(key: string): string {
  * Retrieve metadata for a public LLM provider, or null if self-hosted / mock.
  */
 export function getProviderMeta(providerId: string): ProviderKeyMetadata | null {
-  return PROVIDER_REGISTRY[providerId] || null;
+  return isCloudProvider(providerId) ? PROVIDER_REGISTRY[providerId] : null;
 }
 
 /**
  * Detect which provider a key likely belongs to based on known prefixes.
  */
-export function detectKeyProvider(key: string): string | null {
+export function detectKeyProvider(key: string): CloudProviderId | null {
   const sanitized = sanitizeApiKey(key);
   if (!sanitized) return null;
   if (sanitized.startsWith('AIzaSy')) return 'gemini';
@@ -96,10 +95,46 @@ export function detectKeyProvider(key: string): string | null {
   return null;
 }
 
+/**
+ * What is wrong with a key: it belongs to `detectedProvider`, it lacks the provider's prefix,
+ * or it has the prefix but not the length or characters.
+ */
+export type KeyProblem = 'otherProvider' | 'wrongPrefix' | 'badPattern';
+
 export interface KeyValidationResult {
   valid: boolean;
-  warning?: string;
-  detectedProvider?: string;
+  problem?: KeyProblem;
+  detectedProvider?: CloudProviderId;
+}
+
+/** The words for each `KeyProblem`, from the catalog's `settings.apiKey`. */
+export interface KeyProblemCopy {
+  /** `{detected}` and `{expected}` are providers' display names. */
+  otherProvider: string;
+  /** `{name}` is the provider's display name, `{prefix}` its key prefix. */
+  wrongPrefix: string;
+  badPattern: string;
+}
+
+/** The sentence Settings shows under a key `validateKeyFormat` found a problem with. */
+export function describeKeyProblem(
+  result: KeyValidationResult,
+  meta: ProviderKeyMetadata,
+  copy: KeyProblemCopy,
+): string | null {
+  switch (result.problem) {
+    case 'otherProvider':
+      return fmt(copy.otherProvider, {
+        detected: result.detectedProvider ? PROVIDER_REGISTRY[result.detectedProvider].displayName : '',
+        expected: meta.displayName,
+      });
+    case 'wrongPrefix':
+      return fmt(copy.wrongPrefix, { name: meta.displayName, prefix: meta.keyPrefix });
+    case 'badPattern':
+      return fmt(copy.badPattern, { name: meta.displayName });
+    default:
+      return null;
+  }
 }
 
 /**
@@ -118,27 +153,15 @@ export function validateKeyFormat(providerId: string, key: string): KeyValidatio
 
   const detected = detectKeyProvider(sanitized);
   if (detected && detected !== providerId) {
-    const detectedMeta = getProviderMeta(detected);
-    const detectedName = detectedMeta ? detectedMeta.displayName : detected;
-    return {
-      valid: false,
-      warning: `${detectedName} 형식의 키가 입력되었습니다. ${meta.displayName} 키가 맞는지 확인해 주세요.`,
-      detectedProvider: detected,
-    };
+    return { valid: false, problem: 'otherProvider', detectedProvider: detected };
   }
 
   if (!sanitized.startsWith(meta.keyPrefix)) {
-    return {
-      valid: false,
-      warning: `${meta.displayName} 키는 '${meta.keyPrefix}'로 시작해야 합니다.`,
-    };
+    return { valid: false, problem: 'wrongPrefix' };
   }
 
   if (!meta.keyPattern.test(sanitized)) {
-    return {
-      valid: false,
-      warning: `${meta.displayName} 키 형식이 올바르지 않습니다 (길이나 문자를 확인해 주세요).`,
-    };
+    return { valid: false, problem: 'badPattern' };
   }
 
   return { valid: true };

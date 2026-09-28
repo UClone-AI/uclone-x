@@ -189,10 +189,12 @@ class HookRunner:
                 await self._publish_event(
                     EventType.HOOK_EXECUTED, hook.name, event_type, decision, current_context
                 )
-                if decision.action == HookAction.ASK and modified:
+                if decision.action == HookAction.ASK and (modified or decision.modified_payload):
                     # The person is asked about the call as the hooks before this one left
                     # it, and that call is what runs once they approve (#1601); the asking
-                    # hook's own rewrite, if any, goes on top as a `MODIFY` would.
+                    # hook's own rewrite, if any, goes on top as a `MODIFY` would. An ASK
+                    # with a rewrite and no `MODIFY` before it is merged the same way, so
+                    # both carry the whole payload with the fixed keys restored (#1613).
                     asked = active_payload | (decision.modified_payload or {})
                     if fixed is not None:
                         asked = _with_fixed_keys(asked, fixed)

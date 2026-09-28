@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import platform
+import re
 import secrets
 import shutil
 import subprocess
@@ -17,15 +18,19 @@ import sys
 import threading
 import time
 from abc import ABC, abstractmethod
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, ClassVar, Literal
+from typing import Any, ClassVar, Literal, Protocol
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field
 
-from uclone_x.errors import UCloneXError
+from uclone_x.errors import LLMError, PlainRefusalError, UCloneXError
+from uclone_x.skills.models import SkillStatus
+from uclone_x.skills.protocols import SkillRegistryProtocol
 from uclone_x.tools.base import BaseTool, artifact_content_url, replace_file
 from uclone_x.tools.builtin.comfy_client import (
     DEFAULT_COMFYUI_BASE_URL,
@@ -33,6 +38,7 @@ from uclone_x.tools.builtin.comfy_client import (
     default_comfy_checkpoint,
 )
 from uclone_x.tools.builtin.comfy_image_tool import build_txt2img_workflow
+from uclone_x.tools.builtin.image_set_intent import asks_for_variety
 from uclone_x.tools.builtin.media_registry import (
     ModelProfile,
     ModelRegistry,
@@ -64,8 +70,16 @@ DEFAULT_CHECKPOINTS = (
     # path the prober searches are the same string in one place (#1095 follow-up).
     "~/ai_models/checkpoints/sd_xl_base_1.0.safetensors",
 )
+#: Denoising steps and guidance for the in-process engine when no registered model profile
+#: is active (the generic fallback). With a profile, its own `steps` and `cfg` are used —
+#: `default_models.yaml` gives Illustrious 30 steps at cfg 5.5, and these two constants
+#: used to override that for every checkpoint.
 DIFFUSERS_STEPS = 20
 DIFFUSERS_GUIDANCE = 7.0
+#: Text the CLIP encoders read per 77-token window: 75 prompt tokens between the
+#: begin and end markers. Anything past it used to be dropped silently; longer prompts are
+#: now encoded in windows of this size and joined (see `long_prompt_embeds`).
+CLIP_CHUNK_TOKENS = 75
 #: Free CUDA memory below which the SDXL pipeline is offloaded to the CPU instead of being
 #: loaded onto the card whole. An estimate, not a measurement: SDXL's float16 weights are
 #: about 7 GB (UNet ~5.1 GB, both text encoders ~1.6 GB, VAE ~0.2 GB), and denoising plus
@@ -296,8 +310,15 @@ def in_process_install_remedy() -> str:
     )
 
 
-def style_guided_prompt(prompt: str, style: str) -> str:
-    """The prompt with its style preset appended, or unchanged for an unknown preset."""
+def style_guided_prompt(prompt: str, style: str, family: PromptFamily | None = None) -> str:
+    """The prompt with its style preset appended, or unchanged for an unknown preset.
+
+    A `danbooru` prompt is left unchanged whatever the preset: it is a tag list whose
+    style tags the domain skill already supplied, and a prose suffix such as
+    `photorealistic, sharp focus, natural lighting` contradicts them (design §3.6).
+    """
+    if family is PromptFamily.DANBOORU:
+        return prompt
     suffix = STYLE_SUFFIXES.get(style)
     return f"{prompt}, {suffix}" if suffix else prompt
 
@@ -306,14 +327,137 @@ class ImageGenerationError(UCloneXError):
     """Raised when image generation fails due to engine, memory, or network errors."""
 
 
+class NoImageEngineError(ImageGenerationError):
+    """No engine the dispatcher tried could draw. The message is the engine-by-engine account."""
+
+
+#: What a conversation shows when no engine can draw: plain words and what to do about it.
+#: The engine-by-engine account goes to the log and `ucx media status`, not to the model,
+#: which would otherwise hand it to the person as the reason.
+NO_IMAGE_ENGINE_TEXT = (
+    "No image model is connected, so I can't draw right now. To fix this, connect one in "
+    "Settings › Images, or upload a picture instead."
+)
+
+
+#: Generic quality defense tags that should not trigger false-positive conflict errors when
+#: appearing in negative prompts alongside photographic or artistic positive descriptors.
+GENERIC_NEGATIVE_BOILERPLATE = frozenset(
+    {
+        "worst quality",
+        "low quality",
+        "normal quality",
+        "bad quality",
+        "poor quality",
+        "bad anatomy",
+        "bad hands",
+        "bad feet",
+        "bad proportions",
+        "blurry",
+        "blur",
+        "deformed",
+        "disfigured",
+        "mutated",
+        "extra limbs",
+        "missing limbs",
+        "extra fingers",
+        "fewer fingers",
+        "missing fingers",
+        "extra digits",
+        "fewer digits",
+        "cropped",
+        "jpeg artifacts",
+        "watermark",
+        "signature",
+        "username",
+        "artist name",
+        "text",
+        "error",
+    }
+)
+
+
+def find_prompt_conflicts(prompt: str, negative_prompt: str) -> list[str]:
+    """Find exclusion terms from negative_prompt that contradictorily appear in prompt.
+
+    Ignores generic quality boilerplate tags (e.g. blurry, worst quality, bad hands).
+    Cleans weights and formatting brackets before checking word boundaries.
+    """
+    if not prompt or not negative_prompt:
+        return []
+
+    raw_tags = re.split(r"[,;\n]", negative_prompt)
+    conflicts: list[str] = []
+    seen: set[str] = set()
+    prompt_lower = prompt.lower()
+
+    for raw in raw_tags:
+        clean = re.sub(r"[:\d\.]+$", "", raw.strip(" ()[]{}\"'\t")).strip().lower()
+        if len(clean) < 2 or clean in GENERIC_NEGATIVE_BOILERPLATE or clean in seen:
+            continue
+
+        pattern = r"(?<![\w-])" + re.escape(clean) + r"(?![\w-])"
+        if re.search(pattern, prompt_lower):
+            conflicts.append(clean)
+            seen.add(clean)
+
+    return conflicts
+
+
+COUNT_FOR_VARIETY_REFUSAL = (
+    "The request asks for images that differ from one another, but 'count' only renders "
+    "the same prompt again with a new seed, so every image would show the same scene. "
+    "Write one distinct prompt per image and pass them in 'prompts' instead, for example "
+    "generate_image(prompts=['first scene ...', 'second scene ...'])."
+)
+
+
+def asks_for_varied_images(request: str) -> bool:
+    """Whether the person asked for images that differ -- the reading the planner uses."""
+    return asks_for_variety(request)
+
+
+def latest_user_request(context: ToolContext) -> str | None:
+    """The text of the newest user message in the calling agent's history, if it has one.
+
+    Read through the agent's public `history`; None when the tool runs without an agent
+    (a direct call) or the history holds no user message.
+    """
+    agent: Any = getattr(context, "agent_delegate", None)
+    if agent is None:
+        return None
+    try:
+        history: Any = agent.history
+        messages = tuple(history)
+    except Exception:
+        return None
+    for message in reversed(messages):
+        role: Any = getattr(message, "role", None)
+        if str(getattr(role, "value", role)) == "user":
+            content = getattr(message, "content", None)
+            return content if isinstance(content, str) else None
+    return None
+
+
 class GenerateImageParams(BaseModel):
     """Parameters for generating an image via the default image pipeline."""
 
     model_config = ConfigDict(extra="forbid", strict=True)
 
     prompt: str = Field(
-        ...,
-        description="Positive text prompt describing the visual composition of the image to generate.",
+        default="",
+        description=(
+            "Positive text prompt describing the visual composition of the image to generate. "
+            "Required unless 'prompts' is provided for diverse multi-image generation."
+        ),
+    )
+    prompts: list[str] | None = Field(
+        default=None,
+        description=(
+            "Optional list of distinct prompts (1-10) for diverse multi-image generation "
+            "(e.g. multiple distinct poses, scenes, or camera angles for the same character). "
+            "When provided, an image is generated for each prompt, and 'count' is ignored."
+        ),
     )
     style: Literal["photorealistic", "anime", "artistic", "diagram"] = Field(
         default="photorealistic",
@@ -335,13 +479,17 @@ class GenerateImageParams(BaseModel):
     )
     output_path: str | None = Field(
         default=None,
-        description="Optional relative file path within workspace. Defaults to 'artifacts/images/img_{seed}.png'.",
+        description="Optional relative file path within workspace. Defaults to 'artifacts/images/img_{id}.png'; the suffix follows the format drawn (.jpg for a JPEG).",
     )
     count: int = Field(
         default=1,
         ge=1,
         le=10,
-        description="Number of images to generate (1-10) with progressive seeds.",
+        description=(
+            "How many times to render the SAME 'prompt' (1-10), each with a different seed: "
+            "variations of one scene. For different scenes, poses, characters, expressions "
+            "or outfits, do not use count; pass one distinct prompt per image in 'prompts'."
+        ),
     )
 
 
@@ -356,6 +504,7 @@ class ImageGenerationResult:
     duration_seconds: float
     width: int
     height: int
+    mime_type: str = "image/png"
 
 
 class BaseImageEngine(ABC):
@@ -374,8 +523,18 @@ class BaseImageEngine(ABC):
         height: int,
         seed: int,
         style: str,
+        *,
+        steps: int | None = None,
+        cfg: float | None = None,
+        family: PromptFamily | None = None,
     ) -> ImageGenerationResult:
-        """Generate an image returning raw image bytes and execution metadata."""
+        """Generate an image returning raw image bytes and execution metadata.
+
+        `steps` and `cfg` come from the active model profile; None leaves each engine on
+        its own default, which is what the generic fallback profile gets. `family` is the
+        profile's prompt family, which decides whether the style suffix is appended
+        (`style_guided_prompt`).
+        """
 
 
 class RemoteCudaImageEngine(BaseImageEngine):
@@ -410,12 +569,18 @@ class RemoteCudaImageEngine(BaseImageEngine):
         height: int,
         seed: int,
         style: str,
+        *,
+        steps: int | None = None,
+        cfg: float | None = None,
+        family: PromptFamily | None = None,
     ) -> ImageGenerationResult:
         """Dispatch generation request to remote CUDA worker."""
         if not self._base_url:
             raise ImageGenerationError("Remote CUDA engine URL is not configured.")
 
-        payload = {
+        # `family` is not sent: the worker's payload has no such field, so a danbooru
+        # prompt there still gets whatever the worker does with `style`.
+        payload: dict[str, Any] = {
             "prompt": prompt,
             "negative_prompt": negative_prompt,
             "width": width,
@@ -423,6 +588,12 @@ class RemoteCudaImageEngine(BaseImageEngine):
             "seed": seed,
             "style": style,
         }
+        # Sent only when a profile set them, so a worker that predates these fields gets
+        # the exact payload it always did for the fallback profile.
+        if steps is not None:
+            payload["steps"] = steps
+        if cfg is not None:
+            payload["cfg"] = cfg
 
         start_t = time.monotonic()
         try:
@@ -715,6 +886,117 @@ def torch_out_of_memory_types(torch: Any) -> tuple[type[BaseException], ...]:
     )
 
 
+def clip_token_ids(tokenizer: Any, text: str) -> list[int]:
+    """The CLIP token ids of `text`: no begin/end markers, no padding, no truncation."""
+    if not text:
+        return []
+    encoded: Any = tokenizer(text, add_special_tokens=False, truncation=False, verbose=False)
+    return [int(token) for token in encoded.input_ids]
+
+
+def clip_windows(ids: list[int], tokenizer: Any, count: int) -> list[list[int]]:
+    """`ids` cut into `count` windows of `CLIP_CHUNK_TOKENS`, each framed as CLIP expects.
+
+    Every window is `[begin] + up to 75 tokens + [end]`, padded to 77 with the tokenizer's
+    own pad token — the layout diffusers' `encode_prompt` builds for a single window.
+    Windows past the end of `ids` are empty (`[begin, end, pad...]`), which is how a
+    shorter prompt is brought to the same length as its longer counterpart.
+    """
+    begin, end = tokenizer.bos_token_id, tokenizer.eos_token_id
+    pad = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else end
+    width = CLIP_CHUNK_TOKENS + 2
+    windows: list[list[int]] = []
+    for index in range(count):
+        chunk = ids[index * CLIP_CHUNK_TOKENS : (index + 1) * CLIP_CHUNK_TOKENS]
+        window = [begin, *chunk, end]
+        windows.append(window + [pad] * (width - len(window)))
+    return windows
+
+
+def encode_clip_windows(
+    torch: Any, encoder: Any, windows: list[list[int]], device: Any
+) -> tuple[Any, Any]:
+    """Each window's penultimate hidden state, joined along the sequence, and window 1's `[0]`.
+
+    The penultimate layer is what SDXL conditions on (diffusers' `hidden_states[-2]` with
+    no clip skip). Output `[0]` is the pooled, projected embedding on `text_encoder_2`; on
+    `text_encoder` it is unused.
+    """
+    hidden: list[Any] = []
+    first: Any = None
+    for window in windows:
+        output: Any = encoder(torch.tensor([window], device=device), output_hidden_states=True)
+        if first is None:
+            first = output[0]
+        hidden.append(output.hidden_states[-2])
+    return torch.cat(hidden, dim=1), first
+
+
+def long_prompt_embeds(
+    pipeline: Any, torch: Any, prompt: str, negative_prompt: str
+) -> dict[str, Any] | None:
+    """SDXL embeddings for a prompt longer than one CLIP window, or None when it fits.
+
+    The pipeline's own encoder truncates at 77 tokens, so everything past the 75th prompt
+    token was dropped without a word. Here both prompts are tokenized by both tokenizers,
+    cut into 75-token windows, each window encoded by its text encoder, and the windows
+    joined along the sequence axis; the negative prompt is given as many windows as the
+    positive so the two can be batched for guidance. The pooled embedding is
+    `text_encoder_2`'s on the first window. Weight syntax and BREAK are not parsed.
+
+    None — the plain `prompt=` path, unchanged — when both prompts fit in one window, or
+    when the pipeline lacks either tokenizer or encoder.
+    """
+    tokenizers = (getattr(pipeline, "tokenizer", None), getattr(pipeline, "tokenizer_2", None))
+    encoders = (getattr(pipeline, "text_encoder", None), getattr(pipeline, "text_encoder_2", None))
+    if any(part is None for part in (*tokenizers, *encoders)):
+        return None
+    ids = [
+        (clip_token_ids(tok, prompt), clip_token_ids(tok, negative_prompt)) for tok in tokenizers
+    ]
+    longest = max(len(sequence) for pair in ids for sequence in pair)
+    if longest <= CLIP_CHUNK_TOKENS:
+        return None
+    count = -(-longest // CLIP_CHUNK_TOKENS)
+    device: Any = getattr(pipeline, "_execution_device", None) or getattr(pipeline, "device", "cpu")
+    config: Any = getattr(pipeline, "config", None)
+    zero_negative = not negative_prompt and bool(
+        getattr(config, "force_zeros_for_empty_prompt", False)
+    )
+    with torch.no_grad():
+        positive: list[Any] = []
+        negative: list[Any] = []
+        pooled: Any = None
+        negative_pooled: Any = None
+        for tokenizer, encoder, (prompt_ids, negative_ids) in zip(
+            tokenizers, encoders, ids, strict=True
+        ):
+            embeds, first = encode_clip_windows(
+                torch, encoder, clip_windows(prompt_ids, tokenizer, count), device
+            )
+            positive.append(embeds)
+            pooled = first  # the last encoder's is kept: text_encoder_2's
+            if not zero_negative:
+                embeds, first = encode_clip_windows(
+                    torch, encoder, clip_windows(negative_ids, tokenizer, count), device
+                )
+                negative.append(embeds)
+                negative_pooled = first
+        prompt_embeds = torch.cat(positive, dim=-1)
+        if zero_negative:
+            # What diffusers does for an empty negative when the checkpoint's config asks.
+            negative_embeds = torch.zeros_like(prompt_embeds)
+            negative_pooled = torch.zeros_like(pooled)
+        else:
+            negative_embeds = torch.cat(negative, dim=-1)
+    return {
+        "prompt_embeds": prompt_embeds,
+        "negative_prompt_embeds": negative_embeds,
+        "pooled_prompt_embeds": pooled,
+        "negative_pooled_prompt_embeds": negative_pooled,
+    }
+
+
 class LocalDiffusersImageEngine(BaseImageEngine):
     """In-process generation from a single-file SDXL checkpoint, with no daemon (#1095).
 
@@ -863,6 +1145,9 @@ class LocalDiffusersImageEngine(BaseImageEngine):
         height: int,
         seed: int,
         style: str,
+        steps: int | None = None,
+        cfg: float | None = None,
+        family: PromptFamily | None = None,
     ) -> bytes:
         """Run the diffusion loop on a worker thread and return PNG bytes."""
         import io
@@ -874,13 +1159,21 @@ class LocalDiffusersImageEngine(BaseImageEngine):
 
             torch = importlib.import_module("torch")
             generator: Any = torch.Generator(device="cpu").manual_seed(seed)
+            guided = style_guided_prompt(prompt, style, family)
+            # Past 75 CLIP tokens the pipeline's own encoder truncates; those prompts are
+            # encoded here in windows instead. Short ones keep the plain arguments.
+            embeds = long_prompt_embeds(pipeline, torch, guided, negative_prompt)
+            text_args: dict[str, Any] = (
+                embeds
+                if embeds is not None
+                else {"prompt": guided, "negative_prompt": negative_prompt or None}
+            )
             output: Any = pipeline(
-                prompt=style_guided_prompt(prompt, style),
-                negative_prompt=negative_prompt or None,
+                **text_args,
                 width=width,
                 height=height,
-                num_inference_steps=DIFFUSERS_STEPS,
-                guidance_scale=DIFFUSERS_GUIDANCE,
+                num_inference_steps=steps if steps is not None else DIFFUSERS_STEPS,
+                guidance_scale=cfg if cfg is not None else DIFFUSERS_GUIDANCE,
                 generator=generator,
             )
             images: Any = getattr(output, "images", None)
@@ -910,6 +1203,10 @@ class LocalDiffusersImageEngine(BaseImageEngine):
         height: int,
         seed: int,
         style: str,
+        *,
+        steps: int | None = None,
+        cfg: float | None = None,
+        family: PromptFamily | None = None,
     ) -> ImageGenerationResult:
         """Run the diffusion loop in a worker thread and return PNG bytes without blocking event loop."""
         start_t = time.monotonic()
@@ -921,6 +1218,9 @@ class LocalDiffusersImageEngine(BaseImageEngine):
             height=height,
             seed=seed,
             style=style,
+            steps=steps,
+            cfg=cfg,
+            family=family,
         )
         duration = time.monotonic() - start_t
         return ImageGenerationResult(
@@ -970,18 +1270,29 @@ class ComfyUIImageEngine(BaseImageEngine):
         height: int,
         seed: int,
         style: str,
+        *,
+        steps: int | None = None,
+        cfg: float | None = None,
+        family: PromptFamily | None = None,
     ) -> ImageGenerationResult:
         """Queue a txt2img graph on the running daemon and fetch the produced PNG."""
         client = ComfyClient(base_url=self._base_url)
         start_t = time.monotonic()
+        # None keeps the workflow's own defaults, as before profiles reached here.
+        sampling: dict[str, Any] = {}
+        if steps is not None:
+            sampling["steps"] = steps
+        if cfg is not None:
+            sampling["cfg"] = cfg
         try:
             workflow = build_txt2img_workflow(
-                prompt=style_guided_prompt(prompt, style),
+                prompt=style_guided_prompt(prompt, style, family),
                 negative_prompt=negative_prompt,
                 width=width,
                 height=height,
                 seed=seed,
                 checkpoint=self._checkpoint,
+                **sampling,
             )
             prompt_id = await client.queue_prompt(workflow)
             filenames = await client.wait_for_output(prompt_id)
@@ -1011,6 +1322,324 @@ class ComfyUIImageEngine(BaseImageEngine):
         )
 
 
+#: The settings.json fields choosing who draws a picture (`image_engine`) and, when Google
+#: Gemini does, which of its image models (`image_model`). The shell reads them and hands
+#: the dispatcher an `ImageEngineChoice`; this module never reads the file itself.
+IMAGE_ENGINE_KEY = "image_engine"
+IMAGE_MODEL_KEY = "image_model"
+#: `auto` uses a ready local engine, and Gemini only when none is ready and Gemini is the
+#: chat provider with a key; `local` never sends a picture request over the internet;
+#: `gemini` draws with Gemini only.
+ImageEngineSetting = Literal["auto", "local", "gemini"]
+IMAGE_ENGINE_SETTINGS: tuple[ImageEngineSetting, ...] = ("auto", "local", "gemini")
+DEFAULT_IMAGE_ENGINE: ImageEngineSetting = "auto"
+DEFAULT_IMAGE_MODEL = "gemini-2.5-flash-image"
+#: The engine name results and sidecars carry for a picture Gemini drew.
+GEMINI_ENGINE_NAME = "gemini"
+#: A model id is interpolated into a URL path, so it is held to the characters ids use.
+_IMAGE_MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+#: How long one look at the local engines stands for, under `auto` with Gemini as the
+#: fallback. The tool description and the next draw read the same look, so the engine
+#: the description names is the one that draws.
+LOCAL_PROBE_TTL_SECONDS = 30.0
+NO_GEMINI_KEY_MESSAGE = (
+    "Pictures are set to be drawn by Google Gemini, but no Gemini API key is saved. "
+    "Add a Gemini key in Settings, or set the picture engine back to automatic."
+)
+
+
+def parse_image_engine_setting(value: object) -> ImageEngineSetting:
+    """`value` as an `image_engine` setting; absent means `auto`, anything unknown is refused."""
+    if value is None:
+        return DEFAULT_IMAGE_ENGINE
+    for setting in IMAGE_ENGINE_SETTINGS:
+        if value == setting:
+            return setting
+    raise PlainRefusalError(
+        f"The picture engine must be auto, local or gemini; {value!r} is not one of them."
+    )
+
+
+def parse_image_model(value: object) -> str:
+    """`value` as an `image_model` setting; absent means `DEFAULT_IMAGE_MODEL`."""
+    if value is None:
+        return DEFAULT_IMAGE_MODEL
+    if isinstance(value, str) and _IMAGE_MODEL_ID.fullmatch(value):
+        return value
+    raise PlainRefusalError(
+        f"The picture model must be a Gemini model id such as {DEFAULT_IMAGE_MODEL}; "
+        f"{value!r} is not one."
+    )
+
+
+class GeminiImageClient(Protocol):
+    """What `GeminiImageEngine` needs from the Gemini connector, which it cannot import."""
+
+    async def generate_image(self, prompt: str, aspect_ratio: str, model: str) -> tuple[bytes, str]:
+        """One picture as ``(bytes, MIME type)``, or a `ProviderFailureError`."""
+        ...
+
+
+@dataclass(frozen=True)
+class ImageEngineChoice:
+    """The picture settings in effect, as the shell read them.
+
+    ``gemini`` is a client only when a Gemini key is saved or set; ``chat_provider`` is the
+    canonical id of the chat provider in effect. The default is the choice of a head that
+    binds nothing: `auto` with no Gemini client, which never leaves the local engines.
+    """
+
+    setting: ImageEngineSetting = DEFAULT_IMAGE_ENGINE
+    model: str = DEFAULT_IMAGE_MODEL
+    chat_provider: str | None = None
+    gemini: GeminiImageClient | None = None
+
+    @property
+    def gemini_in_auto(self) -> bool:
+        """Whether `auto` may fall back to Gemini: Gemini chat, and a key to draw with."""
+        return self.chat_provider == GEMINI_ENGINE_NAME and self.gemini is not None
+
+
+class ImageEngineRefusal(ImageGenerationError, PlainRefusalError):
+    """A picture an engine could not draw, told in words already written for a person."""
+
+
+def png_dimensions(data: bytes) -> tuple[int, int] | None:
+    """Width and height from a PNG's IHDR chunk, or ``None`` for bytes that are no PNG."""
+    if len(data) < 24 or data[:8] != b"\x89PNG\r\n\x1a\n" or data[12:16] != b"IHDR":
+        return None
+    return int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big")
+
+
+def jpeg_dimensions(data: bytes) -> tuple[int, int] | None:
+    """Width and height from a JPEG's SOF marker, or ``None`` for bytes that are no JPEG."""
+    if len(data) < 4 or data[:2] != b"\xff\xd8":
+        return None
+    idx = 2
+    while idx < len(data) - 8:
+        if data[idx] != 0xFF:
+            return None
+        while idx < len(data) and data[idx] == 0xFF:
+            idx += 1
+        if idx >= len(data):
+            return None
+        marker = data[idx]
+        idx += 1
+        if marker in (0xD8, 0xD9) or 0xD0 <= marker <= 0xD7:
+            continue
+        if idx + 2 > len(data):
+            return None
+        seg_len = int.from_bytes(data[idx : idx + 2], "big")
+        # SOF markers: C0, C1, C2, C3, C5, C6, C7, C9, CA, CB, CD, CE, CF
+        if marker in (
+            0xC0,
+            0xC1,
+            0xC2,
+            0xC3,
+            0xC5,
+            0xC6,
+            0xC7,
+            0xC9,
+            0xCA,
+            0xCB,
+            0xCD,
+            0xCE,
+            0xCF,
+        ):
+            if idx + 2 + 5 <= len(data):
+                height = int.from_bytes(data[idx + 3 : idx + 5], "big")
+                width = int.from_bytes(data[idx + 5 : idx + 7], "big")
+                return width, height
+        idx += seg_len
+    return None
+
+
+def webp_dimensions(data: bytes) -> tuple[int, int] | None:
+    """Width and height from a WebP's first chunk (VP8, VP8L or VP8X), or ``None`` otherwise."""
+    if len(data) < 30 or data[:4] != b"RIFF" or data[8:12] != b"WEBP":
+        return None
+    chunk = data[12:16]
+    if chunk == b"VP8X":
+        width = 1 + int.from_bytes(data[24:27], "little")
+        return width, 1 + int.from_bytes(data[27:30], "little")
+    if chunk == b"VP8L" and data[20] == 0x2F:
+        bits = int.from_bytes(data[21:25], "little")
+        return (bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1
+    if chunk == b"VP8 " and data[23:26] == b"\x9d\x01\x2a":
+        width = int.from_bytes(data[26:28], "little") & 0x3FFF
+        return width, int.from_bytes(data[28:30], "little") & 0x3FFF
+    return None
+
+
+#: The picture formats a drawn picture is saved as: MIME type, the suffix it is written
+#: under, every suffix that already names it, and the reader that finds its size.
+_SAVED_PICTURE_FORMATS: tuple[
+    tuple[str, str, frozenset[str], Callable[[bytes], tuple[int, int] | None]], ...
+] = (
+    ("image/png", ".png", frozenset({".png"}), png_dimensions),
+    ("image/jpeg", ".jpg", frozenset({".jpg", ".jpeg"}), jpeg_dimensions),
+    ("image/webp", ".webp", frozenset({".webp"}), webp_dimensions),
+)
+_PICTURE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".webp", ".gif"})
+
+
+def sniff_picture(data: bytes) -> tuple[str, tuple[int, int]] | None:
+    """The MIME type and size ``data`` is by its own bytes, or ``None`` for no saved format.
+
+    Decided by content, never by the MIME type a reply claims: the file is named after
+    what this returns, so a label that disagrees with the bytes cannot make it lie.
+    """
+    for mime, _suffix, _names, reader in _SAVED_PICTURE_FORMATS:
+        size = reader(data)
+        if size is not None and size[0] > 0 and size[1] > 0:
+            return mime, size
+    return None
+
+
+def image_extension_for(mime: str) -> str:
+    """File extension (with dot) for a picture MIME type; PNG, which local engines write, otherwise."""
+    if mime == "image/jpg":
+        mime = "image/jpeg"
+    for known, suffix, _names, _reader in _SAVED_PICTURE_FORMATS:
+        if known == mime:
+            return suffix
+    return ".png"
+
+
+def picture_path_for(rel: str, mime: str) -> str:
+    """``rel`` under a suffix naming the format written, so a file never lies about what it is.
+
+    A suffix that already names the format (``.jpeg`` for a JPEG) is kept; another picture
+    suffix is replaced (``face.png`` holding a JPEG becomes ``face.jpg``); anything else
+    has the suffix added.
+    """
+    suffix = image_extension_for(mime)
+    names = next(
+        (n for known, _s, n, _r in _SAVED_PICTURE_FORMATS if known == mime), frozenset({suffix})
+    )
+    path = Path(rel)
+    if path.suffix.lower() in names:
+        return rel
+    if path.suffix.lower() in _PICTURE_SUFFIXES:
+        return str(path.with_suffix(suffix))
+    return f"{rel}{suffix}"
+
+
+def sidecar_path_for(picture_rel: str) -> str:
+    """The recipe `.json` saved beside ``picture_rel``, named after the picture's final name."""
+    path = Path(picture_rel)
+    return str(path.parent / f"{path.stem}.json")
+
+
+#: Last path parts that name no picture file: a folder, or a bare suffix like `.png`.
+_NO_FILE_NAMES = _PICTURE_SUFFIXES | {"", ".", ".."}
+
+
+def names_no_file(rel: str) -> bool:
+    """Whether ``rel`` names a folder or a bare suffix rather than a picture file.
+
+    An empty ``rel`` (or one that is only slashes) is not refused: it falls back to the
+    default name, as it always has.
+    """
+    if not rel.strip("/\\"):
+        return False
+    return rel.endswith(("/", "\\")) or Path(rel).name.lower() in _NO_FILE_NAMES
+
+
+def aspect_ratio_for(width: int, height: int) -> str:
+    """The supported ratio string closest to ``width`` x ``height``."""
+    target = width / height if height else 1.0
+    ratios = {"1:1": 1.0, "16:9": 16 / 9, "9:16": 9 / 16, "4:3": 4 / 3, "3:4": 3 / 4}
+    return min(ratios, key=lambda name: abs(ratios[name] - target))
+
+
+def gemini_profile(model: str) -> ModelProfile:
+    """The model profile a Gemini image model is prompted by: prose, no negative prompt."""
+    return ModelProfile(
+        model_id=model,
+        display_name=f"Google Gemini ({model})",
+        family=PromptFamily.NATURAL_PROSE,
+        suppress_negative=True,
+    )
+
+
+class GeminiImageEngine(BaseImageEngine):
+    """Draws with a Google Gemini image model, over the internet, with the saved key.
+
+    Gemini takes no seed, steps or guidance: the seed is recorded in the result as the
+    other engines record theirs, but it does not make a Gemini picture reproducible.
+    """
+
+    def __init__(self, client: GeminiImageClient | None, model: str = DEFAULT_IMAGE_MODEL) -> None:
+        self._client = client
+        self._model = model
+
+    @property
+    def model(self) -> str:
+        """The Gemini image model this engine asks."""
+        return self._model
+
+    async def is_available(self) -> bool:
+        """Whether a Gemini key is there to draw with. Nothing is sent to find out."""
+        return self._client is not None
+
+    async def generate(
+        self,
+        prompt: str,
+        negative_prompt: str,
+        width: int,
+        height: int,
+        seed: int,
+        style: str,
+        *,
+        steps: int | None = None,
+        cfg: float | None = None,
+        family: PromptFamily | None = None,
+    ) -> ImageGenerationResult:
+        """`draw` at the ratio closest to ``width`` x ``height``; the negative prompt is unused."""
+        return await self.draw(prompt, aspect_ratio_for(width, height), seed)
+
+    async def draw(self, prompt: str, aspect_ratio: str, seed: int) -> ImageGenerationResult:
+        """One picture at ``aspect_ratio``, or an `ImageEngineRefusal` saying why not."""
+        if self._client is None:
+            raise ImageEngineRefusal(NO_GEMINI_KEY_MESSAGE)
+        start_t = time.monotonic()
+        try:
+            data, mime = await self._client.generate_image(
+                prompt=prompt, aspect_ratio=aspect_ratio, model=self._model
+            )
+        except LLMError as exc:
+            raise ImageEngineRefusal(str(exc)) from exc
+        picture = sniff_picture(data)
+        if picture is None:
+            # Only PNG, JPEG and WebP are saved; any other bytes would be a file that no
+            # picture viewer here opens.
+            logger.info(
+                "Gemini image model %s returned %s bytes that are no PNG, JPEG or WebP",
+                self._model,
+                mime,
+            )
+            raise ImageEngineRefusal(
+                "Google Gemini sent back a picture in a format that cannot be saved here. "
+                "Try again, or choose another picture model."
+            )
+        real_mime, size = picture
+        if real_mime != mime:
+            logger.info(
+                "Gemini image model %s labelled a %s picture %s", self._model, real_mime, mime
+            )
+        return ImageGenerationResult(
+            image_bytes=data,
+            seed=seed,
+            engine_name=GEMINI_ENGINE_NAME,
+            device_info=f"Google Gemini API ({self._model})",
+            duration_seconds=round(time.monotonic() - start_t, 3),
+            width=size[0],
+            height=size[1],
+            mime_type=real_mime,
+        )
+
+
 def compute_deterministic_seed(
     session_id: str,
     turn_idx: int,
@@ -1024,34 +1653,73 @@ def compute_deterministic_seed(
     return int(hashlib.md5(token.encode("utf-8")).hexdigest()[:8], 16)
 
 
+#: SDXL's ~1-megapixel training buckets, per aspect ratio. Illustrious excluded images under
+#: 768x768 from training, and the community renders it at these sizes; the sub-megapixel
+#: table below rendered it below the size it was trained at. 3:4 is 896x1152, the
+#: bucket, rather than the profile's own 832x1216, which is 2:3: one rule for every ratio.
+SDXL_MEGAPIXEL_BUCKETS: dict[str, tuple[int, int]] = {
+    "1:1": (1024, 1024),
+    "3:4": (896, 1152),
+    "4:3": (1152, 896),
+    "9:16": (768, 1344),
+    "16:9": (1344, 768),
+}
+#: The sub-megapixel sizes kept for the generic fallback and for small-canvas profiles.
+LEGACY_ASPECT_DIMENSIONS: dict[str, tuple[int, int]] = {
+    "1:1": (768, 768),
+    "3:4": (576, 768),
+    "4:3": (768, 576),
+    "9:16": (512, 896),
+    "16:9": (896, 512),
+}
+#: The model id `ModelRegistry` gives an unrecognised checkpoint. Its settings are a guess,
+#: so it keeps the legacy sizes and the engines' own step and guidance defaults.
+GENERIC_FALLBACK_MODEL_ID = "generic_fallback"
+#: A profile whose native canvas is at least this many pixels is a megapixel-class model
+#: (SDXL, Illustrious, FLUX) and is rendered at `SDXL_MEGAPIXEL_BUCKETS`. 90% of 1024x1024
+#: admits 832x1216 (1,011,712 px) and excludes an SD 1.5-style 512x768 profile.
+MEGAPIXEL_PROFILE_MIN_PIXELS = int(0.9 * 1024 * 1024)
+
+
+def is_registered_profile(profile: ModelProfile | None) -> bool:
+    """Whether `profile` describes a known checkpoint rather than the generic fallback."""
+    return profile is not None and profile.model_id != GENERIC_FALLBACK_MODEL_ID
+
+
 def resolve_aspect_dimensions(
     aspect_ratio: str,
     profile: ModelProfile | None = None,
 ) -> tuple[int, int]:
-    """Calculate pixel dimensions aligned to 64-pixel multiples."""
-    if profile is not None and profile.family == PromptFamily.DANBOORU:
-        match aspect_ratio:
-            case "16:9":
-                return (896, 512)
-            case "9:16":
-                return (512, 896)
-            case "4:3":
-                return (768, 576)
-            case "3:4":
-                return (576, 768)
-            case _:
-                return (768, 768)
-    match aspect_ratio:
-        case "16:9":
-            return (896, 512)
-        case "9:16":
-            return (512, 896)
-        case "4:3":
-            return (768, 576)
-        case "3:4":
-            return (576, 768)
-        case _:
-            return (768, 768)
+    """Pixel dimensions for an aspect ratio, all multiples of 64.
+
+    A registered profile with a megapixel-class native canvas gets SDXL's ~1MP buckets;
+    everything else — no profile, the generic fallback, a small-canvas profile — keeps the
+    legacy sub-megapixel sizes. An unknown ratio reads as 1:1 in both tables.
+    """
+    megapixel = (
+        is_registered_profile(profile)
+        and profile is not None
+        and profile.width * profile.height >= MEGAPIXEL_PROFILE_MIN_PIXELS
+    )
+    table = SDXL_MEGAPIXEL_BUCKETS if megapixel else LEGACY_ASPECT_DIMENSIONS
+    return table.get(aspect_ratio, table["1:1"])
+
+
+def resolve_sampling(profile: ModelProfile | None) -> tuple[int | None, float | None]:
+    """The steps and guidance a registered profile asks for, or (None, None) for none.
+
+    None means "the engine's own default": `DIFFUSERS_STEPS`/`DIFFUSERS_GUIDANCE` in
+    process, the workflow's defaults on ComfyUI, and nothing sent to a remote worker.
+    """
+    if profile is None or not is_registered_profile(profile):
+        return None, None
+    return profile.steps, profile.cfg
+
+
+def _log_failed_refresh(task: asyncio.Task[bool]) -> None:
+    """Log a background look at the local engines that raised, so it is not lost."""
+    if not task.cancelled() and (error := task.exception()) is not None:
+        logger.warning("Could not look at the local image engines: %s", error)
 
 
 class ImagePipelineDispatcher:
@@ -1070,18 +1738,140 @@ class ImagePipelineDispatcher:
         comfy_engine: ComfyUIImageEngine | None = None,
         local_engine: LocalDiffusersImageEngine | None = None,
         registry: ModelRegistry | None = None,
+        engine_settings: Callable[[], ImageEngineChoice] | None = None,
     ) -> None:
         self._remote_engine = remote_engine or RemoteCudaImageEngine()
         self._comfy_engine = comfy_engine or ComfyUIImageEngine()
         self._local_engine = local_engine or LocalDiffusersImageEngine()
         self._registry = registry or ModelRegistry()
+        self._engine_settings: Callable[[], ImageEngineChoice] = (
+            engine_settings or ImageEngineChoice
+        )
+        #: When the local engines were last looked at, and whether any was ready.
+        self._local_probe: tuple[float, bool] | None = None
+        #: The look a stale description started on the running loop, while it runs.
+        self._local_refresh: asyncio.Task[bool] | None = None
 
     @property
     def registry(self) -> ModelRegistry:
         """The model registry managing model profiles and prompt families."""
         return self._registry
 
+    def bind_engine_settings(self, source: Callable[[], ImageEngineChoice]) -> None:
+        """Read the picture settings from ``source`` on every draw and description.
+
+        Called per read rather than once, so a setting changed in Settings applies to the
+        next picture without rebuilding the tool.
+        """
+        self._engine_settings = source
+        self._local_probe = None
+
+    def engine_choice(self) -> ImageEngineChoice:
+        """The picture settings in effect now."""
+        return self._engine_settings()
+
+    def _local_engines(self) -> list[tuple[str, BaseImageEngine]]:
+        """The local engines, in the order they are tried."""
+        return [
+            ("Remote CUDA worker", self._remote_engine),
+            ("detected local ComfyUI daemon", self._comfy_engine),
+            ("in-process diffusers engine", self._local_engine),
+        ]
+
+    async def _probe_local_engines(self) -> bool:
+        for _label, engine in self._local_engines():
+            if await engine.is_available():
+                return True
+        return False
+
+    def _fresh_local_probe(self) -> bool | None:
+        probe = self._local_probe
+        if probe is not None and time.monotonic() - probe[0] < LOCAL_PROBE_TTL_SECONDS:
+            return probe[1]
+        return None
+
+    async def _look_at_local_engines(self) -> bool:
+        ready = await self._probe_local_engines()
+        self._local_probe = (time.monotonic(), ready)
+        return ready
+
+    async def _any_local_ready(self) -> bool:
+        cached = self._fresh_local_probe()
+        if cached is not None:
+            return cached
+        refresh = self._local_refresh
+        if (
+            refresh is not None
+            and not refresh.done()
+            and refresh.get_loop() is asyncio.get_running_loop()
+        ):
+            return await refresh
+        return await self._look_at_local_engines()
+
+    def _any_local_ready_without_blocking(self) -> bool:
+        """`_any_local_ready` for synchronous code, never stalling a running event loop.
+
+        With no loop running, the engines are looked at here. Under a running loop (the
+        tool description is read inside a turn) only the very first look waits; after that
+        a stale answer is served while one refresh runs on the loop, so a probe that takes
+        its full timeout never holds a turn up (#1769). `dispatch` looks again itself.
+        """
+        cached = self._fresh_local_probe()
+        if cached is not None:
+            return cached
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop is None:
+            ready = asyncio.run(self._probe_local_engines())
+            self._local_probe = (time.monotonic(), ready)
+            return ready
+        last = self._local_probe
+        if last is None:
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                ready = pool.submit(asyncio.run, self._probe_local_engines()).result()
+            self._local_probe = (time.monotonic(), ready)
+            return ready
+        if self._local_refresh is None or self._local_refresh.done():
+            self._local_refresh = loop.create_task(self._look_at_local_engines())
+            self._local_refresh.add_done_callback(_log_failed_refresh)
+        return last[1]
+
+    def _setting_decides(self, choice: ImageEngineChoice) -> bool | None:
+        """Whether Gemini draws, when the setting alone says; `None` when `auto` must look.
+
+        `local` never does; `gemini` always does; `auto` does only when Gemini may be the
+        fallback and no local engine is ready, which is looked at only in that case.
+        """
+        if choice.setting != "auto":
+            return choice.setting == GEMINI_ENGINE_NAME
+        if not choice.gemini_in_auto:
+            return False
+        return None
+
+    def draws_with_gemini(self, choice: ImageEngineChoice | None = None) -> bool:
+        """Whether the next picture goes to Gemini under ``choice`` (the settings by default)."""
+        choice = choice if choice is not None else self.engine_choice()
+        decided = self._setting_decides(choice)
+        if decided is not None:
+            return decided
+        return not self._any_local_ready_without_blocking()
+
+    async def _draws_with_gemini_now(self, choice: ImageEngineChoice) -> bool:
+        decided = self._setting_decides(choice)
+        if decided is not None:
+            return decided
+        return not await self._any_local_ready()
+
     def get_active_profile(self) -> ModelProfile:
+        """The profile of the engine that draws next: Gemini's, or the local checkpoint's."""
+        choice = self.engine_choice()
+        if self.draws_with_gemini(choice):
+            return gemini_profile(choice.model)
+        return self._local_profile()
+
+    def _local_profile(self) -> ModelProfile:
         """Resolve profile for currently configured or detected checkpoint."""
         ckpt: Any = getattr(self._comfy_engine, "_checkpoint", None)
         if isinstance(ckpt, (str, Path)) and ckpt:
@@ -1117,15 +1907,26 @@ class ImagePipelineDispatcher:
         seed: int,
         style: str,
     ) -> ImageGenerationResult:
-        """Route to the highest priority available local-private engine."""
+        """Route to the engine the picture settings name (`draws_with_gemini`).
+
+        Otherwise the highest priority available local-private engine.
+        """
+        choice = self.engine_choice()
+        if await self._draws_with_gemini_now(choice):
+            gemini = GeminiImageEngine(choice.gemini, choice.model)
+            family = PromptFamily.NATURAL_PROSE
+            gemini_prompt, _ = optimize_prompts(
+                prompt, negative_prompt, gemini_profile(choice.model)
+            )
+            logger.info("Dispatching image generation to Google Gemini (%s)...", choice.model)
+            return await gemini.draw(
+                style_guided_prompt(gemini_prompt, style, family), aspect_ratio, seed
+            )
         profile = self.get_active_profile()
         effective_prompt, effective_negative = optimize_prompts(prompt, negative_prompt, profile)
         width, height = resolve_aspect_dimensions(aspect_ratio, profile=profile)
-        attempts: list[tuple[str, BaseImageEngine]] = [
-            ("Remote CUDA worker", self._remote_engine),
-            ("detected local ComfyUI daemon", self._comfy_engine),
-            ("in-process diffusers engine", self._local_engine),
-        ]
+        steps, cfg = resolve_sampling(profile)
+        attempts = self._local_engines()
 
         for label, engine in attempts:
             if await engine.is_available():
@@ -1137,9 +1938,12 @@ class ImagePipelineDispatcher:
                     height=height,
                     seed=seed,
                     style=style,
+                    steps=steps,
+                    cfg=cfg,
+                    family=profile.family,
                 )
 
-        raise ImageGenerationError(
+        raise NoImageEngineError(
             "No image generation engine available. Local Private-First enforcement: "
             + self.diagnostics()
         )
@@ -1193,18 +1997,64 @@ class ImagePipelineDispatcher:
             )
         else:
             parts.append("The in-process engine is installed but declined; see the log above.")
+        parts.append(self._gemini_diagnostic())
         return " ".join(parts)
+
+    def _gemini_diagnostic(self) -> str:
+        """Why Google Gemini did not draw, in the terms of the `image_engine` rule."""
+        try:
+            choice = self.engine_choice()
+        except UCloneXError as exc:
+            return str(exc)
+        if choice.setting == "local":
+            return "Google Gemini is not used, because image_engine is set to local."
+        if choice.gemini is None:
+            return "Google Gemini can draw only with a Gemini API key saved in Settings."
+        if choice.setting == "auto" and not choice.gemini_in_auto:
+            return (
+                "With image_engine set to auto, Google Gemini draws only while Gemini is "
+                "the chat provider."
+            )
+        return f"Google Gemini ({choice.model}) is ready."
+
+
+#: The core grammar of each prompt family, carried by `generate_image`'s description so a
+#: prompt needs one skill load, not two (design §3.1.2). Domain rules are in the skills.
+FAMILY_GRAMMAR: dict[PromptFamily, str] = {
+    PromptFamily.DANBOORU: (
+        "Prompt MUST use English Danbooru tags (e.g. 1girl, solo, armor, glowing sword) "
+        "rather than natural Korean sentences."
+    ),
+    PromptFamily.NATURAL_PROSE: (
+        "Prompt should be descriptive English prose detailing lighting, composition, "
+        "and subject. This model does not use negative prompts; leave negative_prompt empty."
+    ),
+    PromptFamily.GENERIC: "Formulate prompts in English.",
+}
 
 
 class GenerateImageTool(BaseTool[GenerateImageParams]):
-    """Agent tool to generate visual illustrations, diagrams, and photos locally."""
+    """Agent tool to generate visual illustrations, diagrams, and photos locally.
+
+    `description` is computed on every read, because the agent reads it each time it
+    builds a request and the active checkpoint can change mid-session: one built at
+    construction kept advertising the old model (design §3.1.2).
+    """
 
     name = "generate_image"
     writes_files: ClassVar[bool] = True  # can create, modify or delete a file on the host (#1167)
-    description = (
+    BASE_DESCRIPTION: ClassVar[str] = (
         "Generate a local-private image, illustration, or diagram from a text prompt. "
         "Runs in this process from a local checkpoint, on a detected local ComfyUI daemon, or on "
         "a local-network CUDA GPU worker — never on a paid cloud service. "
+        "Saves the resulting image as an artifact in the workspace. "
+        "To present the result to the user, include standard markdown ![description](relative_url) or [title](relative_url)."
+    )
+    #: The base text while Google Gemini draws, which the local text would misstate.
+    GEMINI_BASE_DESCRIPTION: ClassVar[str] = (
+        "Generate an image, illustration, or diagram from a text prompt. "
+        "Pictures are drawn by a Google Gemini image model over the internet with the "
+        "Gemini API key saved in Settings, so the prompt is sent to Google. "
         "Saves the resulting image as an artifact in the workspace. "
         "To present the result to the user, include standard markdown ![description](relative_url) or [title](relative_url)."
     )
@@ -1214,43 +2064,96 @@ class GenerateImageTool(BaseTool[GenerateImageParams]):
         self,
         dispatcher: ImagePipelineDispatcher | None = None,
     ) -> None:
-        dispatcher = dispatcher or ImagePipelineDispatcher()
-        tool_desc = self.description
-        profile: ModelProfile | None = None
-        if hasattr(dispatcher, "get_active_profile"):
-            try:
-                candidate: Any = dispatcher.get_active_profile()
-                if isinstance(candidate, ModelProfile):
-                    profile = candidate
-            except Exception:
-                profile = None
+        super().__init__(name=self.name, params_type=GenerateImageParams)
+        self._dispatcher = dispatcher or ImagePipelineDispatcher()
+        self._skills: SkillRegistryProtocol | None = None
 
-        if profile is not None:
-            tool_desc = (
-                f"{self.description} Active Model: '{profile.model_id}' "
-                f"({profile.family.value} prompt family). "
-            )
-            if profile.family == PromptFamily.DANBOORU:
-                tool_desc += (
-                    "Prompt MUST use English Danbooru tags (e.g. 1girl, solo, armor, glowing sword) "
-                    "rather than natural Korean sentences. Safety/anatomy defense tags are automatically merged into negative_prompt if omitted. "
-                    "Consult skill 'media-prompt-danbooru'."
-                )
-            elif profile.family == PromptFamily.NATURAL_PROSE:
-                tool_desc += (
-                    "Prompt should be descriptive English prose detailing lighting, composition, "
-                    "and subject. This model does not use negative prompts; leave negative_prompt empty. "
-                    "Consult skill 'media-prompt-flux'."
-                )
-            elif profile.family == PromptFamily.GENERIC:
-                tool_desc += "Formulate prompts in English. Consult skill 'media-prompt-generic'."
+    def active_profile(self) -> ModelProfile:
+        """The profile of the checkpoint a generation would use now (`ImageModelSource`)."""
+        return self._dispatcher.get_active_profile()
 
-        super().__init__(
-            name=self.name,
-            description=tool_desc,
-            params_type=GenerateImageParams,
+    def bind_skill_registry(self, registry: SkillRegistryProtocol) -> None:
+        """Set the skill store the description lists image domains from (`ImageModelSource`).
+
+        The tool sits in a registry every agent of the process shares, so the last agent
+        to bind wins. Every head passes the same runtime store, so the domain list does
+        not depend on which agent that was.
+        """
+        self._skills = registry
+
+    def bind_engine_settings(self, source: Callable[[], ImageEngineChoice]) -> None:
+        """Read the picture settings (`image_engine`, `image_model`) from ``source``."""
+        self._dispatcher.bind_engine_settings(source)
+
+    def domain_skill_names(self) -> list[str]:
+        """Names of the active skills declaring `family_sections: true`, sorted."""
+        if self._skills is None:
+            return []
+        return sorted(
+            skill.manifest.name
+            for skill in self._skills.list_skills()
+            if skill.manifest.family_sections and skill.manifest.status == SkillStatus.ACTIVE
         )
-        self._dispatcher = dispatcher
+
+    # A read-only property where `BaseTool` declares a plain attribute: readers only read
+    # it (`ToolProtocol.description` is a property), and nothing assigns this one, since
+    # `__init__` passes no description to `BaseTool`.
+    @property
+    def description(self) -> str:  # pyright: ignore[reportIncompatibleVariableOverride]
+        """The base text, plus the active model, its family's grammar and the domains.
+
+        Resolving the profile costs a few `stat` calls. A failure is logged and the base
+        text returned: a broken checkpoint lookup must not take the whole tool listing
+        down with it, and `generate_image` itself reports that failure when it runs.
+        """
+        try:
+            # Asked before the profile, which asks the same question again: under `auto`
+            # both read one look at the local engines, so they cannot disagree.
+            gemini = self._dispatcher.draws_with_gemini()
+            profile = self.active_profile()
+            domains = self.domain_skill_names()
+        except Exception:
+            logger.exception("Could not resolve the active image model for generate_image")
+            return self.BASE_DESCRIPTION
+        parts = [
+            self.GEMINI_BASE_DESCRIPTION if gemini else self.BASE_DESCRIPTION,
+            f"Active model: '{profile.model_id}' ({profile.family.value} prompt family).",
+        ]
+        grammar = FAMILY_GRAMMAR.get(profile.family)
+        if grammar:
+            parts.append(grammar)
+        if domains:
+            listed = ", ".join(f"load_skill('{name}')" for name in domains)
+            parts.append(
+                f"Before writing the prompt, load the one skill for the image's domain: {listed}."
+            )
+        return " ".join(parts)
+
+    async def _dispatch_or_refuse(
+        self,
+        *,
+        prompt: str,
+        negative_prompt: str,
+        aspect_ratio: str,
+        seed: int,
+        style: str,
+    ) -> ImageGenerationResult:
+        """Draw one image, refusing in plain words when no engine can.
+
+        Raises:
+            PlainRefusalError: `NO_IMAGE_ENGINE_TEXT`, with `reason_code="no_image_engine"`.
+        """
+        try:
+            return await self._dispatcher.dispatch(
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                aspect_ratio=aspect_ratio,
+                seed=seed,
+                style=style,
+            )
+        except NoImageEngineError as exc:
+            logger.warning("generate_image: no engine could draw: %s", exc)
+            raise PlainRefusalError(NO_IMAGE_ENGINE_TEXT, reason_code="no_image_engine") from exc
 
     async def run(
         self,
@@ -1258,42 +2161,93 @@ class GenerateImageTool(BaseTool[GenerateImageParams]):
         context: ToolContext,
     ) -> dict[str, Any]:
         """Execute image generation, write artifact, and return structured metadata."""
+        if params.prompts is not None:
+            if len(params.prompts) == 0:
+                raise PlainRefusalError("The 'prompts' list must contain at least 1 prompt.")
+            if len(params.prompts) > 10:
+                raise PlainRefusalError(
+                    "A maximum of 10 prompts can be generated in a single batch."
+                )
+            for idx, p_text in enumerate(params.prompts):
+                if not p_text.strip():
+                    raise PlainRefusalError(f"Prompt at index {idx} in 'prompts' cannot be empty.")
+                conflicts = find_prompt_conflicts(p_text, params.negative_prompt)
+                if conflicts:
+                    term_str = ", ".join(f"'{c}'" for c in conflicts)
+                    raise PlainRefusalError(
+                        f"Prompt conflict detected in prompts[{idx}]: {term_str} appears in both positive prompt and negative_prompt. "
+                        "If you want to exclude these elements, remove them from the positive prompt. "
+                        "If you want to include them, remove them from the negative prompt."
+                    )
+        elif not params.prompt.strip():
+            raise PlainRefusalError("Either 'prompt' or 'prompts' must be provided.")
+        else:
+            if params.count > 1:
+                composite_pose_pattern = r"\b(dynamic poses? including|poses? including|poses? such as|various poses? including)\b"
+                if re.search(composite_pose_pattern, params.prompt, re.IGNORECASE):
+                    raise PlainRefusalError(
+                        "Multiple poses detected in a single prompt for multi-image generation. "
+                        "A single diffusion prompt can only depict one physical posture at a time. "
+                        "Please plan separate prompts for each pose and pass them via the 'prompts' parameter: "
+                        "generate_image(prompts=['[pose 1]...', '[pose 2]...', ...])."
+                    )
+                request = latest_user_request(context)
+                if request is not None and asks_for_varied_images(request):
+                    raise PlainRefusalError(COUNT_FOR_VARIETY_REFUSAL)
+
+            conflicts = find_prompt_conflicts(params.prompt, params.negative_prompt)
+            if conflicts:
+                term_str = ", ".join(f"'{c}'" for c in conflicts)
+                raise PlainRefusalError(
+                    f"Prompt conflict detected: {term_str} appears in both positive prompt and negative_prompt. "
+                    "If you want to exclude these elements, remove them from the positive prompt. "
+                    "If you want to include them, remove them from the negative prompt."
+                )
+
+        if params.output_path is not None and names_no_file(params.output_path):
+            raise PlainRefusalError(
+                f"'{params.output_path}' has no file name, so no picture was made. "
+                "Give a file name, such as 'artifacts/images/face.png'."
+            )
+
         session_id = context.session_id or "sess_default"
         turn_idx = getattr(context, "turn_index", 0) or 0
         if not turn_idx and getattr(context, "agent_delegate", None) is not None:
             turn_idx = getattr(context.agent_delegate, "_turn_counter", 0) or 0
 
+        base_prompt = params.prompts[0] if params.prompts is not None else params.prompt
         actual_seed = compute_deterministic_seed(
             session_id=session_id,
             turn_idx=turn_idx,
-            prompt=params.prompt,
+            prompt=base_prompt,
             seed_override=params.seed_override,
         )
 
-        if params.count > 1:
+        if params.prompts is not None or params.count > 1:
+            prompt_list = (
+                params.prompts if params.prompts is not None else [params.prompt] * params.count
+            )
             images: list[dict[str, Any]] = []
             last_engine = ""
             last_device = ""
             batch_id = secrets.token_hex(3)
-            for i in range(params.count):
+            for i, p_text in enumerate(prompt_list):
                 curr_seed = (actual_seed + i) % (2**32)
                 if params.output_path is not None:
                     p = Path(params.output_path)
                     candidate = p.parent / f"{p.stem}_{i + 1}{p.suffix or '.png'}"
                     clean_rel = str(candidate).lstrip("/\\")
                     workspace = context.require_workspace()
-                    dest_path = self.resolve_write_path(clean_rel, workspace)
-                    meta_candidate = p.parent / f"{p.stem}_{i + 1}.json"
-                    meta_rel = str(meta_candidate).lstrip("/\\")
-                    meta_path = self.resolve_write_path(meta_rel, workspace)
+                    # Refused here, before anything is drawn; resolved again once the
+                    # picture's own format has fixed the suffix.
+                    self.resolve_write_path(clean_rel, workspace)
+                    resolve_image = self.resolve_write_path
                 else:
-                    default_rel = f"artifacts/images/img_{batch_id}_{i + 1}.png"
-                    dest_path = self.resolve_safe_path(default_rel, context.require_workspace())
-                    meta_rel = f"artifacts/images/img_{batch_id}_{i + 1}.json"
-                    meta_path = self.resolve_write_path(meta_rel, context.require_workspace())
+                    clean_rel = f"artifacts/images/img_{batch_id}_{i + 1}.png"
+                    resolve_image = self.resolve_safe_path
 
-                gen_result = await self._dispatcher.dispatch(
-                    prompt=params.prompt,
+                gen_result = await self._dispatch_or_refuse(
+                    prompt=p_text,
                     negative_prompt=params.negative_prompt,
                     aspect_ratio=params.aspect_ratio,
                     seed=curr_seed,
@@ -1301,6 +2255,10 @@ class GenerateImageTool(BaseTool[GenerateImageParams]):
                 )
                 last_engine = gen_result.engine_name
                 last_device = gen_result.device_info
+                batch_rel = picture_path_for(clean_rel, gen_result.mime_type)
+                dest_path = resolve_image(batch_rel, context.require_workspace())
+                batch_meta_rel = sidecar_path_for(batch_rel)
+                meta_path = self.resolve_write_path(batch_meta_rel, context.require_workspace())
 
                 # Named apart from the single-image writes, so a test can pin these two.
                 batch_image = gen_result.image_bytes
@@ -1320,13 +2278,13 @@ class GenerateImageTool(BaseTool[GenerateImageParams]):
                     rel_meta_path = str(meta_path)
 
                 recipe_hash = hashlib.sha256(
-                    f"{params.prompt}__{curr_seed}__{gen_result.engine_name}".encode()
+                    f"{p_text}__{params.negative_prompt}__{curr_seed}__{gen_result.engine_name}".encode()
                 ).hexdigest()[:12]
 
                 meta_data: dict[str, Any] = {
                     "id": f"{batch_id}_{i + 1}",
                     "image_path": rel_path,
-                    "prompt": params.prompt,
+                    "prompt": p_text,
                     "negative_prompt": params.negative_prompt,
                     "seed": curr_seed,
                     "style": params.style,
@@ -1335,6 +2293,7 @@ class GenerateImageTool(BaseTool[GenerateImageParams]):
                     "height": gen_result.height,
                     "engine": gen_result.engine_name,
                     "device": gen_result.device_info,
+                    "mime_type": gen_result.mime_type,
                     "duration_seconds": gen_result.duration_seconds,
                     "recipe_hash": recipe_hash,
                     "created_at": datetime.now(UTC).isoformat(),
@@ -1353,16 +2312,18 @@ class GenerateImageTool(BaseTool[GenerateImageParams]):
                         "bytes_written": len(gen_result.image_bytes),
                         "width": gen_result.width,
                         "height": gen_result.height,
+                        "mime_type": gen_result.mime_type,
                         "duration_seconds": gen_result.duration_seconds,
+                        "prompt": p_text,
                     }
                 )
 
             gallery_md = "\n".join(
-                f"{idx + 1}. ![{params.prompt[:30]} #{idx + 1}]({img['relative_url']})"
+                f"{idx + 1}. ![{img['prompt'][:30]} #{idx + 1}]({img['relative_url']})"
                 for idx, img in enumerate(images)
             )
 
-            return {
+            res_dict: dict[str, Any] = {
                 "status": "success",
                 "count": len(images),
                 "path": images[0]["path"],
@@ -1373,36 +2334,41 @@ class GenerateImageTool(BaseTool[GenerateImageParams]):
                 "relative_urls": [img["relative_url"] for img in images],
                 "images": images,
                 "markdown_gallery": gallery_md,
-                "prompt": params.prompt,
+                "prompt": images[0]["prompt"],
                 "style": params.style,
                 "aspect_ratio": params.aspect_ratio,
                 "engine": last_engine,
                 "device": last_device,
             }
+            if params.prompts is not None:
+                res_dict["prompts"] = [img["prompt"] for img in images]
+            return res_dict
 
         short_id = secrets.token_hex(3)
-        # 1. Resolve safe destination path
+        # 1. Resolve and validate safe destination path when output_path is provided
         if params.output_path is not None:
             clean_rel = params.output_path.lstrip("/\\") or f"artifacts/images/img_{short_id}.png"
-            dest_path = self.resolve_write_path(clean_rel, context.require_workspace())
-            p = Path(clean_rel)
-            meta_candidate = p.parent / f"{p.stem}.json"
-            meta_rel = str(meta_candidate).lstrip("/\\")
-            meta_path = self.resolve_write_path(meta_rel, context.require_workspace())
+            # Refused here, before anything is drawn; resolved again once the picture's own
+            # format has fixed the suffix.
+            self.resolve_write_path(clean_rel, context.require_workspace())
+            resolve_dest = self.resolve_write_path
         else:
-            default_rel = f"artifacts/images/img_{short_id}.png"
-            dest_path = self.resolve_safe_path(default_rel, context.require_workspace())
-            meta_rel = f"artifacts/images/img_{short_id}.json"
-            meta_path = self.resolve_write_path(meta_rel, context.require_workspace())
+            clean_rel = f"artifacts/images/img_{short_id}.png"
+            resolve_dest = self.resolve_safe_path
 
         # 2. Dispatch generation
-        gen_result = await self._dispatcher.dispatch(
+        gen_result = await self._dispatch_or_refuse(
             prompt=params.prompt,
             negative_prompt=params.negative_prompt,
             aspect_ratio=params.aspect_ratio,
             seed=actual_seed,
             style=params.style,
         )
+
+        picture_rel = picture_path_for(clean_rel, gen_result.mime_type)
+        dest_path = resolve_dest(picture_rel, context.require_workspace())
+        meta_rel = sidecar_path_for(picture_rel)
+        meta_path = self.resolve_write_path(meta_rel, context.require_workspace())
 
         # 3. Write image artifact securely
         dest_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1419,7 +2385,7 @@ class GenerateImageTool(BaseTool[GenerateImageParams]):
             rel_meta_path = str(meta_path)
 
         recipe_hash = hashlib.sha256(
-            f"{params.prompt}__{actual_seed}__{gen_result.engine_name}".encode()
+            f"{params.prompt}__{params.negative_prompt}__{actual_seed}__{gen_result.engine_name}".encode()
         ).hexdigest()[:12]
 
         meta_data = {
@@ -1434,6 +2400,7 @@ class GenerateImageTool(BaseTool[GenerateImageParams]):
             "height": gen_result.height,
             "engine": gen_result.engine_name,
             "device": gen_result.device_info,
+            "mime_type": gen_result.mime_type,
             "duration_seconds": gen_result.duration_seconds,
             "recipe_hash": recipe_hash,
             "created_at": datetime.now(UTC).isoformat(),
@@ -1455,6 +2422,7 @@ class GenerateImageTool(BaseTool[GenerateImageParams]):
             "recipe_hash": recipe_hash,
             "engine": gen_result.engine_name,
             "device": gen_result.device_info,
+            "mime_type": gen_result.mime_type,
             "duration_seconds": gen_result.duration_seconds,
             "bytes_written": len(gen_result.image_bytes),
         }

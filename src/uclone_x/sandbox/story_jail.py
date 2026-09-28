@@ -34,6 +34,8 @@ What this does not stop:
 
 from __future__ import annotations
 
+import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -43,8 +45,12 @@ __all__ = [
     "PLATFORM",
     "SANDBOX_EXEC",
     "JAIL_SETUP_REFUSAL",
+    "JAIL_SERVER_REFUSAL",
     "story_library_jail",
     "jailed_shell",
+    "jailed_exec",
+    "has_started",
+    "remove_started_folder",
 ]
 
 #: Where macOS keeps `sandbox-exec`. An absolute path, so `PATH` cannot substitute another.
@@ -56,11 +62,20 @@ JAIL_SETUP_REFUSAL = (
     "from changing the story library."
 )
 
+#: What a person is told when a local MCP server could not be started in the jail (#1611).
+JAIL_SERVER_REFUSAL = (
+    "The server was not started: this computer could not start it in the way that keeps "
+    "it from changing the story library."
+)
+
 #: The system this runs on, read at call time.
 PLATFORM = sys.platform
 
 #: Creates the file named by `$0`, then runs `$1` in a new `/bin/sh -c`.
 _MARK_STARTED = ': > "$0" && exec /bin/sh -c "$1"'
+
+#: Creates the file named by `$0`, then becomes the program named by the rest.
+_MARK_STARTED_EXEC = ': > "$0" && exec "$@"'
 
 _PROFILE_HEAD = "(version 1)\n(allow default)\n(deny file-write*\n"
 
@@ -118,3 +133,37 @@ def jailed_shell(jail: list[str], command: str, started: Path | None) -> list[st
     if started is None:
         return [*jail, "/bin/sh", "-c", command]
     return [*jail, "/bin/sh", "-c", _MARK_STARTED, str(started), command]
+
+
+def jailed_exec(jail: list[str], argv: list[str], started: Path) -> list[str]:
+    """The arguments that start `argv` inside `jail`, creating `started` first.
+
+    `jailed_shell` for a program rather than a command string: the shell creates the file
+    and then `exec`s the program, so the program keeps the process `sandbox-exec` started.
+    """
+    return [*jail, "/bin/sh", "-c", _MARK_STARTED_EXEC, str(started), *argv]
+
+
+def has_started(started: Path) -> bool:
+    """Whether the jailed shell created `started`, so the jail did start the command.
+
+    Only a missing file answers no. The folder is this process's own, made for this one
+    command, so a file that cannot be looked at means the command changed the folder
+    (`chmod 000`), and it can only have done that by running (#1611).
+    """
+    try:
+        os.stat(started)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True  # unreadable: only the command could have changed its folder
+    return True
+
+
+def remove_started_folder(folder: Path) -> None:
+    """Remove the folder `started` was made in, even if the command changed its mode."""
+    try:
+        os.chmod(folder, 0o700)
+    except OSError:
+        pass
+    shutil.rmtree(folder, ignore_errors=True)

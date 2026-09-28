@@ -81,7 +81,7 @@ from uclone_x.tools import (
 
 def test_agent_models_and_immutability() -> None:
     llm_cfg = AgentLLMConfig(
-        model_tier=ModelTier.PRO,
+        model_tier=ModelTier.FAST,
         model_name="claude-3-7-sonnet",
         temperature=0.2,
         max_tokens=4096,
@@ -97,7 +97,7 @@ def test_agent_models_and_immutability() -> None:
     )
     assert config.agent_id == "agent-1"
     assert config.role == "Lead Architect"
-    assert config.llm_config.model_tier == ModelTier.PRO
+    assert config.llm_config.model_tier == ModelTier.FAST
     assert config.llm_config.model_name == "claude-3-7-sonnet"
     assert config.max_subagent_depth == 2
 
@@ -119,13 +119,13 @@ def test_agent_models_and_immutability() -> None:
         description="Audits codebase for security vulnerabilities",
         system_prompt="Focus on AST, auth, and sandbox boundaries",
         allowed_tools=("grep_search", "view_file"),
-        llm_config=AgentLLMConfig(model_tier=ModelTier.PRO),
+        llm_config=AgentLLMConfig(model_tier=ModelTier.FAST),
         enable_write_tools=False,
         enable_subagent_tools=False,
     )
     assert persona.name == "security_reviewer"
     assert persona.enable_write_tools is False
-    assert persona.llm_config.model_tier == ModelTier.PRO
+    assert persona.llm_config.model_tier == ModelTier.FAST
 
     # SubagentInvocation test
     invocation = SubagentInvocation(

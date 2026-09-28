@@ -42,6 +42,7 @@ import pytest
 from playwright.async_api import Page, ViewportSize, async_playwright
 
 from tests.e2e.conftest import mock_llm, running_ui
+from uclone_x.errors import ModelNotAvailableError, ProviderFailureError, ProviderQuotaError
 from uclone_x.llm.budget import TokenBudgetManager
 from uclone_x.llm.connectors.mock import MockLLMConnector
 from uclone_x.llm.models import LLMRequest, ModelResponse, StreamChunk
@@ -103,6 +104,42 @@ class _FailsOnceThenAnswers(MockLLMConnector):
         self._drop_the_first_call()
         async for chunk in super().stream(request):
             yield chunk
+
+
+class _ProviderFails(MockLLMConnector):
+    """A hosted provider that answers every call with one classified failure (#1630).
+
+    Raised on both paths, so the row is the same whichever one the room's turn takes.
+    """
+
+    def __init__(self, failure: ProviderFailureError, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.failure = failure
+
+    async def generate(self, request: LLMRequest) -> ModelResponse:
+        raise self.failure
+
+    async def stream(self, request: LLMRequest) -> AsyncIterator[StreamChunk]:
+        raise self.failure
+        yield  # pragma: no cover  # an async generator, as the connector's stream is
+
+
+RETIRED = ModelNotAvailableError(provider="Google", model="gemini-1.5-pro")
+SPENT = ProviderQuotaError(provider="Anthropic", model="claude-sonnet-4-5")
+
+
+@pytest.fixture
+def retired_model_ui_server(tmp_path: Path) -> Iterator[str]:
+    """A UI server whose provider no longer serves the model it is asked for."""
+    with running_ui(storage_dir=tmp_path, llm=_ProviderFails(RETIRED)) as url:
+        yield url
+
+
+@pytest.fixture
+def spent_quota_ui_server(tmp_path: Path) -> Iterator[str]:
+    """A UI server whose provider says the key's usage limit is reached."""
+    with running_ui(storage_dir=tmp_path, llm=_ProviderFails(SPENT)) as url:
+        yield url
 
 
 @pytest.fixture
@@ -348,5 +385,65 @@ async def test_a_failed_row_and_a_good_one_differ_by_more_than_their_words(
 
             assert failed["animation"] == "none", f"the marker moves: {failed}"
             assert failed["boxShadow"] == "none", f"the marker glows: {failed}"
+        finally:
+            await browser.close()
+
+
+@pytest.mark.asyncio
+async def test_a_retired_model_says_so_on_its_row_and_sends_the_user_to_settings(
+    retired_model_ui_server: str,
+) -> None:
+    """The provider's failure reaches the row as its cause, with no Retry (#1630).
+
+    A retired model fails the same way on every retry, so the row offers the Settings remedy
+    instead, live and on a cold mount from the stored transcript.
+    """
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(headless=True)
+        try:
+            page = await browser.new_page(viewport=VIEWPORT)
+            room_id = await _open_a_conversation(page, retired_model_ui_server)
+            await _say(page, PROMPT)
+
+            for reloaded in (False, True):
+                if reloaded:
+                    await _reopen(page, retired_model_ui_server, room_id)
+                row = page.locator("[data-testid='row-4']")
+                await row.locator("[data-testid='row-error-4']").wait_for(timeout=20000)
+                stated = " ".join(
+                    (await row.locator("[data-testid='row-error-4']").inner_text()).split()
+                )
+                assert f"couldn't finish this turn. {RETIRED}" in stated, stated
+                remedy = (await row.locator("[data-testid='row-remedy-4']").inner_text()).strip()
+                assert remedy == "Choose another model in Settings, then send your message again."
+                assert await row.locator("[data-testid='retry-turn']").count() == 0, (
+                    "the row offered a Retry that meets the same retired model again"
+                )
+                for internal in ("404", "{", "Error", "http"):
+                    assert internal not in stated, internal
+        finally:
+            await browser.close()
+
+
+@pytest.mark.asyncio
+async def test_a_spent_quota_says_so_on_its_row_and_keeps_retry(
+    spent_quota_ui_server: str,
+) -> None:
+    """The control: a quota comes back, so its row states the cause and still offers Retry."""
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(headless=True)
+        try:
+            page = await browser.new_page(viewport=VIEWPORT)
+            await _open_a_conversation(page, spent_quota_ui_server)
+            await _say(page, PROMPT)
+
+            row = page.locator("[data-testid='row-4']")
+            await row.locator("[data-testid='row-error-4']").wait_for(timeout=20000)
+            stated = " ".join(
+                (await row.locator("[data-testid='row-error-4']").inner_text()).split()
+            )
+            assert f"couldn't finish this turn. {SPENT}" in stated, stated
+            assert await row.locator("[data-testid='retry-turn']").count() == 1
+            assert await row.locator("[data-testid='row-remedy-4']").count() == 0
         finally:
             await browser.close()

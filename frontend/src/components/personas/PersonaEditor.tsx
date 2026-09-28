@@ -3,6 +3,8 @@ import type { PersonaModelTier } from '../../types';
 import {
   MODEL_TIERS,
   draftProblem,
+  fmt,
+  plural,
   type PersonaDraft,
   type PersonaEditMode,
   type PersonaEditorCopy,
@@ -132,7 +134,7 @@ export const PersonaEditor: React.FC<PersonaEditorProps> = ({
       <div className="flex items-center justify-between gap-2 border-b border-slate-800 pb-3">
         <div>
           <h3 className="text-sm font-semibold text-white">
-            {mode === 'create' ? copy.createTitle : copy.editTitle(draft.name)}
+            {mode === 'create' ? copy.createTitle : fmt(copy.editTitle, { name: draft.name })}
           </h3>
           {mode === 'edit' && isBuiltin ? (
             <p data-testid="persona-builtin-note" className="text-[11px] text-slate-400 mt-0.5">
@@ -210,15 +212,15 @@ export const PersonaEditor: React.FC<PersonaEditorProps> = ({
                 try {
                   const result = await onSynthesizePrompt();
                   if (!result.ok) {
-                    setDraftNotice({ tone: 'warn', text: copy.fields.draftFailed(result.message) });
+                    setDraftNotice({ tone: 'warn', text: fmt(copy.fields.draftFailed, { reason: result.message }) });
                     return;
                   }
                   if (draft.system_prompt.trim()) setReplacedPrompt(draft.system_prompt);
                   set('system_prompt', result.prompt);
                   setDraftNotice(
                     result.source === 'llm'
-                      ? { tone: 'info', text: copy.fields.draftedByModel(result.model) }
-                      : { tone: 'warn', text: copy.fields.draftedFromTemplate(result.fallbackReason) },
+                      ? { tone: 'info', text: fmt(copy.fields.draftedByModel, { model: result.model }) }
+                      : { tone: 'warn', text: fmt(copy.fields.draftedFromTemplate, { reason: result.fallbackReason }) },
                   );
                 } finally {
                   setIsSynthesizing(false);
@@ -305,7 +307,7 @@ export const PersonaEditor: React.FC<PersonaEditorProps> = ({
                 >
                   <span className="w-1.5 h-1.5 rounded-full bg-amber-400 inline-block" />
                   {copy.fields.toolsRestrictedBadge
-                    ? copy.fields.toolsRestrictedBadge(draft.allowed_tools.length, toolChoices.length)
+                    ? fmt(copy.fields.toolsRestrictedBadge, { count: draft.allowed_tools.length, total: toolChoices.length })
                     : `Restricted allowlist (${draft.allowed_tools.length}/${toolChoices.length})`}
                 </span>
               )
@@ -368,7 +370,7 @@ export const PersonaEditor: React.FC<PersonaEditorProps> = ({
             <span className="text-amber-400 text-xs">🔒</span>
             <span>
               {copy.fields.toolsRestrictedNotice
-                ? copy.fields.toolsRestrictedNotice(draft.allowed_tools.length)
+                ? plural(copy.fields.toolsRestrictedNotice, draft.allowed_tools.length)
                 : `Restricted mode: Only the ${draft.allowed_tools.length} selected tool(s) will be available. All other tools are disabled.`}
             </span>
           </p>

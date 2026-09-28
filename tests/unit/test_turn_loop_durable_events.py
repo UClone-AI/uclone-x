@@ -112,7 +112,8 @@ class DummyEchoTool(BaseTool[DummyToolParams]):
 async def test_durable_events_pairing() -> None:
     """Emission preserves assistant/tool pairing and records requests and attempts.
 
-    Killed by: src/uclone_x/agent/base.py :: self._pending_durable_events.extend(durable_events)
+    Killed by: src/uclone_x/agent/turn_executor.py :: self._pending_durable_events.extend(durable_events)
+    Becomes: self._pending_durable_events.extend([])
     """
     writer = DummyLogWriter()
     store = DummySessionStore(writer)

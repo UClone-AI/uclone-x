@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { relativeTimeLabel } from './relativeTime';
+import { exactTimeLabel, relativeTimeLabel } from './relativeTime';
 
 // Local times, so "yesterday" is tested as a calendar fact in whatever zone runs this.
 const NOW = new Date(2026, 8, 19, 12, 0, 0).getTime();
@@ -43,5 +43,42 @@ describe('relativeTimeLabel', () => {
   it('returns null for a stamp that is not a date, rather than "NaN years ago"', () => {
     expect(relativeTimeLabel('not a date', NOW)).toBeNull();
     expect(relativeTimeLabel('', NOW)).toBeNull();
+  });
+});
+
+describe('relativeTimeLabel in Korean', () => {
+  // Killed by: frontend/src/lib/relativeTime.ts :: const t = CATALOGS[language].time;
+  // Becomes: const t = CATALOGS.en.time;
+  it('writes the same compact labels with Korean units', () => {
+    expect(relativeTimeLabel(ago(10_000), NOW, 'ko')).toBe('지금');
+    expect(relativeTimeLabel(ago(5 * MINUTE + 30_000), NOW, 'ko')).toBe('5분');
+    expect(relativeTimeLabel(ago(23 * HOUR), NOW, 'ko')).toBe('23시간');
+    expect(relativeTimeLabel(at(2026, 8, 18, 9, 0), NOW, 'ko')).toBe('1일');
+    expect(relativeTimeLabel(at(2026, 8, 12, 12, 0), NOW, 'ko')).toBe('1주');
+    expect(relativeTimeLabel(at(2026, 6, 1, 12, 0), NOW, 'ko')).toBe('2개월');
+    expect(relativeTimeLabel(at(2025, 8, 1, 12, 0), NOW, 'ko')).toBe('1년');
+    expect(relativeTimeLabel('not a date', NOW, 'ko')).toBeNull();
+  });
+});
+
+describe('exactTimeLabel', () => {
+  const noon = new Date(2026, 8, 19, 12, 0, 5).toISOString();
+
+  // Killed by: frontend/src/lib/relativeTime.ts :: month: 'numeric',
+  // Becomes: month: 'short',
+  it('writes the moment as the browser used to, in English', () => {
+    expect(exactTimeLabel(noon, 'en')).toBe('Last active 9/19/2026, 12:00:05 PM');
+  });
+
+  // Killed by: frontend/src/lib/relativeTime.ts :: : new Intl.DateTimeFormat(language, {
+  // Becomes: : new Intl.DateTimeFormat('en', {
+  it("writes the moment in Korean's own date order", () => {
+    expect(exactTimeLabel(noon, 'ko')).toBe('마지막 활동: 2026. 9. 19. 오후 12:00:05');
+  });
+
+  // Killed by: frontend/src/lib/relativeTime.ts :: const when = Number.isNaN(then)
+  // Becomes: const when = false
+  it('names a stamp that is not a date as it arrived, rather than throwing', () => {
+    expect(exactTimeLabel('not a date', 'ko')).toBe('마지막 활동: not a date');
   });
 });

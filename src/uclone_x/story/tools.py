@@ -9,21 +9,25 @@ file changed by hand after it was read is not overwritten.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from datetime import UTC, datetime
-from typing import Any, ClassVar, Literal
+from typing import Any, ClassVar, Literal, cast
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError, model_validator
+from pydantic_core import PydanticCustomError
 
 from uclone_x.story.context import (
     CodexIndex,
     UnreadableFile,
+    changed_before_and_named,
+    continuity_note,
     last_and_next,
     recap,
     scene_context,
 )
-from uclone_x.story.library import StoryError, StoryLibrary
+from uclone_x.story.library import StoryChangedError, StoryError, StoryLibrary
 from uclone_x.story.proposals import apply_proposal, check_applies, reject_proposal
 from uclone_x.story.quotes import MIN_QUOTE_CHARACTERS, quote_found, quote_too_short
 from uclone_x.story.schemas import (
@@ -51,12 +55,14 @@ from uclone_x.story.work import (
     manuscript_file,
     proposal_file,
 )
-from uclone_x.tools.base import BaseTool
+from uclone_x.tools.base import PLAIN_ERROR_PREFIX, BaseTool
 from uclone_x.tools.models import ToolContext
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "AUDIT_FACTS_NEEDED",
+    "AUDIT_FACT_EXAMPLE",
     "StoryAuditTool",
     "StoryCodexTool",
     "StoryContextTool",
@@ -70,9 +76,9 @@ __all__ = [
 _ARGUMENTS = ConfigDict(frozen=True, extra="forbid")
 _ENTRY_ID = re.compile(ENTRY_ID_PATTERN)
 
-#: What an unanswered `apply` says (#1557). The desktop app does not ask during a
-#: conversation, so there every apply ends with this sentence; a person decides the
-#: proposal in the story's view instead (#1560). No story or file tool reaches that view;
+#: What an unanswered `apply` says (#1557), in an app that asks a person during a turn and
+#: got no answer. The desktop app does not ask at all and says `APPLY_NOT_ASKED_NOTE` at
+#: once instead (owner decision 2026-09-26). No story or file tool reaches the story view;
 #: a persona with an unconfined shell (Clone's `bash_run`) can call its local API (#1589).
 #:
 #: The runtime says it before the tool runs, for every shell and every proposal id, so it
@@ -83,6 +89,15 @@ APPLY_NOT_APPROVED_NOTE = (
     "needs a person to approve the call, and no one did. Where the app does not ask during "
     "a conversation, as the desktop app does not, a person approves or rejects proposals "
     "in the story's view, under Files."
+)
+
+#: What `apply` says, at once, in an app that cannot ask a person during a conversation --
+#: the desktop app, where a person decides proposals in the story's view (#1560). Said
+#: before the tool runs, so, like the note above, it claims nothing about the proposal id.
+APPLY_NOT_ASKED_NOTE = (
+    "The change was not applied, and nothing in the story changed: this app does not ask "
+    "for approval during a conversation, so a proposal cannot be applied from here. A "
+    "person approves or rejects proposals in the story's view, under Files."
 )
 
 
@@ -151,7 +166,11 @@ class StoryOutlineParams(BaseModel):
     )
     beats: list[str] | None = Field(default=None, description="The scene's beats, in order.")
     story_time: str | int | None = Field(
-        default=None, description="When the scene happens in the story."
+        default=None,
+        description="When the scene happens in the story, e.g. 'day 3' or '2024.10.01'. "
+        "Numbers compare as numbers, and a dot separates parts rather than marking a decimal: "
+        "1.10 comes after 1.9 and after 1.5. For a fraction of a unit, write whole units "
+        "in separate parts ('day 3, hour 12'), not a decimal ('day 3.5').",
     )
     before: str | None = Field(default=None, description="For 'move': the scene to put it before.")
 
@@ -497,7 +516,8 @@ class StoryCodexTool(BaseTool[StoryCodexParams]):
         "kept in the story as its own file. 'get' reads one entry in full; 'search' finds "
         "entries by name, alias or profile. When a scene changes an entry (a death, a lost "
         "sword, a new scar), 'propose' the change with the quote that shows it; a person "
-        "decides: 'apply' asks them for approval, and 'reject' drops it."
+        "decides: 'apply' asks them for approval where the app can ask (otherwise they "
+        "decide in the story's view, under Files), and 'reject' drops it."
     )
     params_type = StoryCodexParams
     writes_files: ClassVar[bool] = True
@@ -505,6 +525,7 @@ class StoryCodexTool(BaseTool[StoryCodexParams]):
     needs_room: ClassVar[bool] = True
     approval_actions: ClassVar[frozenset[str]] = frozenset({"apply"})
     approval_timeout_note: ClassVar[str | None] = APPLY_NOT_APPROVED_NOTE
+    approval_unavailable_note: ClassVar[str | None] = APPLY_NOT_ASKED_NOTE
     not_run_note: ClassVar[str] = "Nothing was looked up or changed."
 
     def __init__(self) -> None:
@@ -794,6 +815,28 @@ def _draft(
 
 # -- story_audit -------------------------------------------------------------------------
 
+#: One fact as story_audit takes it: written out in the description of `facts` (a
+#: description reaches the model through every connector; an `examples` key need not) and
+#: in the refusal of a call with none, because a small model left `facts` out of 8 of 9
+#: first calls when it saw neither (#1613). The quote is copied from the scene in whatever language the scene is in.
+AUDIT_FACT_EXAMPLE: dict[str, str] = {
+    "subject": "Vane",
+    "predicate": "status",
+    "object": "dead",
+    "quote": "Vane did not rise again",
+}
+#: What a call with no facts is told: what to send, with one fact written out, and that
+#: nothing was checked. The tool never reads facts out of the scene itself: which facts a
+#: scene states is the model's reading; what they contradict is decided by code (§5.3).
+AUDIT_FACTS_NEEDED = (
+    "No facts were given in 'facts', and the check compares only the facts it is given. "
+    "Read the scene "
+    "(story_manuscript 'read'), then call story_audit 'check' again with the same scene_id "
+    "and 'facts': a list with one object per fact the scene states -- who is alive or "
+    "dead, who has what, where someone is -- each with the exact words of the scene it "
+    "comes from, for example facts=[{example}]"
+)
+
 
 class AuditFact(BaseModel):
     """One fact read from the scene."""
@@ -808,8 +851,13 @@ class AuditFact(BaseModel):
     quote: str | None = Field(
         default=None,
         description="The words of the scene the fact is read from, copied exactly as whole "
-        "words. A fact without one is not checked.",
+        "words, in the scene's own language. A fact without one is not checked.",
     )
+
+
+def _without_facts(arguments: object) -> bool:
+    """Whether a call's arguments give no facts: none, `null`, or an empty list."""
+    return isinstance(arguments, dict) and not cast("dict[str, Any]", arguments).get("facts")
 
 
 class StoryAuditParams(BaseModel):
@@ -823,9 +871,23 @@ class StoryAuditParams(BaseModel):
     )
     scene_id: str = Field(description="The scene the facts are read from.")
     facts: list[AuditFact] = Field(
-        default_factory=list[AuditFact],
-        description="The facts the scene states or shows, each with its quote.",
+        min_length=1,
+        description="Required, at least one: the facts the scene states or shows, one "
+        "object each with subject, predicate, object and quote, e.g. "
+        f"[{json.dumps(AUDIT_FACT_EXAMPLE)}].",
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _facts_given(cls, data: object) -> object:
+        """A call with no facts is told what to send, with an example (#1613)."""
+        if _without_facts(data):
+            raise PydanticCustomError(
+                f"{PLAIN_ERROR_PREFIX}audit_facts_needed",
+                AUDIT_FACTS_NEEDED,
+                {"example": json.dumps(AUDIT_FACT_EXAMPLE)},
+            )
+        return data
 
 
 class StoryAuditTool(BaseTool[StoryAuditParams]):
@@ -835,7 +897,8 @@ class StoryAuditTool(BaseTool[StoryAuditParams]):
     description = (
         "Check a written scene for continuity errors. Read the scene, list the facts it "
         "states or shows (who is alive or dead, who has what, where someone is), each with "
-        "the exact words it comes from, and 'check' them: they are compared with the codex "
+        "the exact words it comes from, and 'check' them, in 'facts' (required): they are "
+        "compared with the codex "
         "as it stands at that point of the story, under the story's rules. A contradiction "
         "names every fact involved and where it came from. Nothing is changed."
     )
@@ -858,11 +921,6 @@ class StoryAuditTool(BaseTool[StoryAuditParams]):
         text = work.manuscript(scene_id)
         if text is None:
             raise StoryError(f"Scene '{scene_id}' has no text yet, so there is nothing to check.")
-        if not params.facts:
-            raise StoryError(
-                "Give the facts the scene states, each with its quote, in 'facts'. Nothing "
-                "was checked."
-            )
         axioms, defaults = work.axioms()
         return audit_scene(
             story_id=work.story_id,
@@ -962,14 +1020,20 @@ class StoryManuscriptTool(BaseTool[StoryManuscriptParams]):
                 f"The outline has no scene '{scene_id}', so nothing was written. Add it with "
                 "story_outline 'set_scene' first."
             )
-        digest, notes = work.write_scene(
-            scene_id,
-            params.text,
-            room_id=room_id,
-            expected_digest=params.digest,
-            agent_id=context.agent_id,
-            turn_index=context.turn_index,
-        )
+        # Read before the write replaces it: whether this conversation wrote the text being
+        # replaced, which makes this write the revision a first notice asked for.
+        rewrite_of_own = work.last_writer(scene_id) == room_id
+        try:
+            digest, notes = work.write_scene(
+                scene_id,
+                params.text,
+                room_id=room_id,
+                expected_digest=params.digest,
+                agent_id=context.agent_id,
+                turn_index=context.turn_index,
+            )
+        except StoryChangedError as exc:
+            raise StoryError(_unwritten_scene(scene_id, params.digest)) from exc
         try:
             work.note_session(room_id, scene_written=scene_id, summary=params.session_summary)
         except (StoryError, StoryFileError) as exc:
@@ -979,9 +1043,41 @@ class StoryManuscriptTool(BaseTool[StoryManuscriptParams]):
             "digest": digest,
             "path": work.workspace_path(manuscript_file(scene_id)),
         }
+        try:
+            continuity = changed_before_and_named(outline, scene_id, work.codex(), params.text)
+        except (StoryError, StoryFileError, ValueError):
+            notes.append(
+                "The scene was saved, but it could not be checked against what the story "
+                "changed before it."
+            )
+            continuity = []
+        if continuity:
+            result["continuity"] = continuity
+            result["continuity_note"] = continuity_note(
+                scene_id, digest, params.text, rewrite_of_own=rewrite_of_own
+            )
         if notes:
             result["notes"] = notes
         return result
+
+
+def _unwritten_scene(scene_id: str, digest: str | None) -> str:
+    """Why a scene's text was not written over, in words that say what to pass (#1613).
+
+    With no digest the writer did not show which version it is replacing, so the refusal
+    names the one argument to add; re-reading would not help, and a model told only to
+    read again reads and repeats the same call. With a digest that no longer matches, the
+    scene changed since it was read, so it has to be read again. Neither names a file.
+    """
+    if digest is None:
+        return (
+            f"Scene '{scene_id}' already has text, so nothing was written. To replace it, "
+            "pass the digest that reading the scene returned, as 'digest'."
+        )
+    return (
+        f"Scene '{scene_id}' changed after it was read, so nothing was written. Read it "
+        "again and make the change on the current version, with the digest that returns."
+    )
 
 
 # -- story_context -----------------------------------------------------------------------
@@ -998,6 +1094,12 @@ class StoryContextParams(BaseModel):
         "conversation."
     )
     scene_id: str | None = Field(default=None, description="For 'for_scene': the scene.")
+    request: str | None = Field(
+        default=None,
+        description="For 'for_scene': the person's request or brief for this scene, word "
+        "for word. Anything it names that the story already ended before the scene (a death, "
+        "a loss) comes back first, under request_conflicts.",
+    )
 
 
 class StoryContextTool(BaseTool[StoryContextParams]):
@@ -1008,8 +1110,9 @@ class StoryContextTool(BaseTool[StoryContextParams]):
         "Gather the open story's context. 'recap' at the start of a conversation: what the "
         "story is, what earlier conversations wrote, and the next scene's context. "
         "'for_scene' before writing a scene: the scene, its neighbours, the end of the scene "
-        "before, and the codex entries it needs, with a manifest of what was included, what "
-        "was left out, and why."
+        "before, the codex entries it needs, and one line for each other entry the story "
+        "changed before the scene (a death, a loss), with a manifest of what was included, "
+        "what was left out, and why."
     )
     params_type = StoryContextParams
     writes_files: ClassVar[bool] = False
@@ -1031,7 +1134,7 @@ class StoryContextTool(BaseTool[StoryContextParams]):
             outline, _ = work.require_outline()
             if outline.find(scene_id) is None:
                 raise StoryError(f"The outline has no scene '{scene_id}'.")
-            return self._bundle(work, outline, scene_id, work.codex(), meta)
+            return self._bundle(work, outline, scene_id, work.codex(), meta, request=params.request)
         current = work.outline()
         outline = current[0] if current else None
         written = work.written_scenes()
@@ -1069,6 +1172,8 @@ class StoryContextTool(BaseTool[StoryContextParams]):
         scene_id: str,
         codex: CodexIndex,
         meta: dict[str, Any],
+        *,
+        request: str | None = None,
     ) -> dict[str, Any]:
         ordered = [s.id for _, s in outline.scenes_in_order()]
         index = ordered.index(scene_id)
@@ -1079,4 +1184,5 @@ class StoryContextTool(BaseTool[StoryContextParams]):
             codex,
             previous_text=previous.text if previous else None,
             story=meta,
+            request=request,
         )

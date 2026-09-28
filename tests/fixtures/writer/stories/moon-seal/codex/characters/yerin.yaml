@@ -1,0 +1,18 @@
+id: yerin
+name: 예린
+profile: 은월성 기사단장이자 라온의 스승.
+state:
+  status: alive
+  possesses: [moon_sword]
+progressions:
+  - at: ch01.s01
+    set: {possesses: []}
+    note: 월광검을 라온에게 물려줌
+  - at: ch01.s03
+    set: {status: dead}
+    note: 은월성 습격 때 라온을 지키다 카엘의 칼에 전사
+visual:
+  tags: [1girl, black_hair, short_hair, grey_eyes]
+  prose: 짧은 흑발에 잿빛 눈.
+  gender: female
+  base_seed: 7719

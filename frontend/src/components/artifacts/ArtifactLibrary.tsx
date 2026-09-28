@@ -97,7 +97,6 @@ type Pending =
   | {
       kind: 'in-use';
       entry: ArtifactEntry;
-      action: 'archive' | 'delete';
       reason: string;
       /** The refused request was already a go-ahead, so offering one again is a retry. */
       retry: boolean;
@@ -209,15 +208,13 @@ export const ArtifactLibrary: React.FC<ArtifactLibraryProps> = ({ isOpen, onClos
     act(
       () => artifactLibraryApi.archive(entry.path, releaseWriter),
       FILES_COPY.archived(entry.name),
-      { kind: 'in-use', entry, action: 'archive', reason: '', retry: releaseWriter },
+      { kind: 'in-use', entry, reason: '', retry: releaseWriter },
     );
 
-  const remove = (entry: ArtifactEntry, releaseWriter = false) =>
-    act(
-      () => artifactLibraryApi.remove(entry.path, releaseWriter),
-      FILES_COPY.deleted(entry.name),
-      { kind: 'in-use', entry, action: 'delete', reason: '', retry: releaseWriter },
-    );
+  // Only an archived entry can be deleted, and no conversation writes an archived story,
+  // so a delete has no writer to release.
+  const remove = (entry: ArtifactEntry) =>
+    act(() => artifactLibraryApi.remove(entry.path, false), FILES_COPY.deleted(entry.name));
 
   const restore = (entry: ArtifactEntry) =>
     act(() => artifactLibraryApi.restore(entry.path), FILES_COPY.restored(entry.name));
@@ -363,7 +360,7 @@ export const ArtifactLibrary: React.FC<ArtifactLibraryProps> = ({ isOpen, onClos
                         onArchive={(release) => void archive(entry, release)}
                         onRestore={() => void restore(entry)}
                         onAskDelete={() => setPending({ kind: 'delete', entry })}
-                        onDelete={(release) => void remove(entry, release)}
+                        onDelete={() => void remove(entry)}
                         onCancel={() => setPending(null)}
                         onOpenStory={() => void openStory(entry)}
                         onViewStory={() => entry.story && setViewing(entry.story.story_id)}
@@ -412,7 +409,7 @@ interface EntryRowProps {
   onArchive: (releaseWriter: boolean) => void;
   onRestore: () => void;
   onAskDelete: () => void;
-  onDelete: (releaseWriter: boolean) => void;
+  onDelete: () => void;
   onCancel: () => void;
   onOpenStory: () => void;
   onViewStory: () => void;
@@ -476,7 +473,7 @@ const EntryRow: React.FC<EntryRowProps> = ({
         <div role="alertdialog" aria-label="Confirm delete" className="mt-2 rounded border border-rose-800 bg-rose-950/40 p-2">
           <p className="text-rose-200">{FILES_COPY.confirmDelete(entry.name)}</p>
           <div className="mt-2 flex gap-2">
-            <Button variant="solid" disabled={busy} data-testid="files-confirm-delete" onClick={() => onDelete(false)}>
+            <Button variant="solid" disabled={busy} data-testid="files-confirm-delete" onClick={onDelete}>
               Delete for good
             </Button>
             <Button variant="outline" disabled={busy} onClick={onCancel}>
@@ -493,7 +490,7 @@ const EntryRow: React.FC<EntryRowProps> = ({
               variant="solid"
               disabled={busy}
               data-testid="files-go-ahead"
-              onClick={() => (pending.action === 'archive' ? onArchive(true) : onDelete(true))}
+              onClick={() => onArchive(true)}
             >
               {pending.retry ? FILES_COPY.tryAgain : FILES_COPY.goAhead}
             </Button>
@@ -531,7 +528,9 @@ const EntryRow: React.FC<EntryRowProps> = ({
               Restore
             </Button>
           )}
-          {entry.managed && (
+          {/* Permanent delete lives in the archive only: archive is the default, restorable
+              way to remove something (owner decision 2026-09-26). */}
+          {entry.managed && entry.archived && (
             <Button variant="outline" disabled={busy} data-testid="files-delete" onClick={onAskDelete}>
               Delete
             </Button>
