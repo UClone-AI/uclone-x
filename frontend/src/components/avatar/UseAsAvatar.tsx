@@ -3,18 +3,17 @@ import { ChevronDown, UserRound } from 'lucide-react';
 import { fmt, useCopy } from '../../i18n';
 import {
   canWearPicture,
-  noteAvatarChange,
   setAvatarFromPath,
   undoAvatarChange,
+  undoStillOffered,
   useAvatarAuthor,
   useAvatarChoice,
-  useLatestAvatarChange,
   type AvatarFailure,
 } from '../../lib/avatarChoice';
 import { usePopover } from './usePopover';
 
 type Outcome =
-  | { kind: 'set'; name: string; previousPath: string | null; change: number }
+  | { kind: 'set'; name: string; previousPath: string | null; changeId: number | null }
   | { kind: 'undone'; name: string }
   | { kind: 'failed'; name: string; failure: AvatarFailure };
 
@@ -27,8 +26,9 @@ type Outcome =
  * Undo that puts back what it replaced. A failure is said in the head's own words.
  *
  * Offered only inside a clone's message, and only for a picture in the workspace (`path`)
- * that the runtime would take: never under an SVG. The Undo goes once a later change to
- * the same clone's picture is made, since it would no longer put back what this replaced.
+ * that the runtime would take: never under an SVG. The Undo goes once the listing shows a
+ * later change to the same clone's picture, made anywhere, since it would no longer put back
+ * what this replaced; one the runtime refuses as too late is said in plain words.
  */
 export const UseAsAvatar: React.FC<{ path: string }> = ({ path }) => {
   const choice = useAvatarChoice();
@@ -37,7 +37,6 @@ export const UseAsAvatar: React.FC<{ path: string }> = ({ path }) => {
   const menu = usePopover<HTMLSpanElement>();
   const [working, setWorking] = useState(false);
   const [outcome, setOutcome] = useState<Outcome | null>(null);
-  const latest = useLatestAvatarChange(outcome?.name ?? null);
 
   if (choice === null || author === null || !canWearPicture(path)) return null;
   const labelOf = (name: string) => choice.clones.find((c) => c.name === name)?.label ?? name;
@@ -49,23 +48,26 @@ export const UseAsAvatar: React.FC<{ path: string }> = ({ path }) => {
     const result = await setAvatarFromPath(name, path);
     setWorking(false);
     if (result.ok) {
-      setOutcome({ kind: 'set', name, previousPath: result.previousPath, change: noteAvatarChange(name) });
+      setOutcome({ kind: 'set', name, previousPath: result.previousPath, changeId: result.changeId });
       choice.onChanged();
     } else {
       setOutcome({ kind: 'failed', name, failure: result.failure });
     }
   };
 
-  const undo = async (name: string, previousPath: string | null) => {
+  const undo = async (name: string, previousPath: string | null, changeId: number | null) => {
+    if (changeId === null) return;
     setWorking(true);
-    const result = await undoAvatarChange(name, previousPath);
+    const result = await undoAvatarChange(name, previousPath, changeId);
     setWorking(false);
     if (result.ok) {
-      noteAvatarChange(name);
       setOutcome({ kind: 'undone', name });
       choice.onChanged();
     } else {
-      setOutcome({ kind: 'failed', name, failure: result.failure });
+      const { failure } = result;
+      setOutcome({ kind: 'failed', name, failure });
+      // Changed elsewhere: read the pictures again, so the one shown is the one in force.
+      if (failure === 'staleChange') choice.onChanged();
     }
   };
 
@@ -82,11 +84,11 @@ export const UseAsAvatar: React.FC<{ path: string }> = ({ path }) => {
       {!working && outcome?.kind === 'set' && (
         <span role="status" data-testid="use-as-avatar-done" className="inline-flex items-center gap-1.5 text-slate-400">
           {fmt(copy.card.set, { name: labelOf(outcome.name) })}
-          {latest === outcome.change && (
+          {undoStillOffered(outcome.changeId, outcome.name, choice.latestChanges) && (
             <button
               type="button"
               data-testid="use-as-avatar-undo"
-              onClick={() => void undo(outcome.name, outcome.previousPath)}
+              onClick={() => void undo(outcome.name, outcome.previousPath, outcome.changeId)}
               className="text-slate-300 underline hover:text-slate-100"
             >
               {copy.card.undo}

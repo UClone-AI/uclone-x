@@ -2,13 +2,10 @@
 
 from __future__ import annotations
 
-import ast
 import json
 from pathlib import Path
-from typing import Any
 
 import pytest
-import yaml
 
 from uclone_x.engine.event_bus import AgentEvent, EventSource, EventType
 from uclone_x.errors import SkillAuditError
@@ -23,7 +20,6 @@ from uclone_x.skills.auditor import (
 from uclone_x.skills.models import (
     AuditVerdict,
     AutoApprovalPolicy,
-    SkillManifest,
     SkillOrigin,
     SkillStatus,
 )
@@ -231,88 +227,78 @@ def test_extract_workflow_from_session(tmp_path: Path) -> None:
     assert steps_disk == ["Step A", "Step B"]
 
 
-def test_generate_skill_code() -> None:
-    """generate_skill_code produces clean, type-checked Python source code."""
-    synth = SkillSynthesizer()
-    steps = ["Read input configuration", "Filter invalid records", "Save clean dataset"]
-    code = synth.generate_skill_code("data_cleaner", steps, "Clean datasets")
+def test_the_instructions_say_when_to_use_the_skill_then_give_the_steps() -> None:
+    """The `SKILL.md` body is a prompt, not code: a title, when to use it, the steps (#1810).
 
-    # AST validation
-    tree = ast.parse(code)
-    func_names = [n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]
-    assert "execute_workflow" in func_names
-    assert "main" in func_names
-    assert "data_cleaner" in code
-
-
-#: Steps a trace can really hold: both quote kinds, backslashes, a docstring delimiter.
-_AWKWARD_STEPS = [
-    'Reply "done" to the user',
-    r"Open C:\Users\me\notes.txt",
-    "Say \"\"\"hi\"\"\" and '''bye'''",
-]
-
-
-def _run_generated(code: str) -> dict[str, Any]:
-    namespace: dict[str, Any] = {}
-    exec(compile(code, "main.py", "exec"), namespace)  # noqa: S102 - the stub this test generated
-    result: dict[str, Any] = namespace["execute_workflow"]()
-    return result
-
-
-def test_a_step_with_a_double_quote_survives_into_the_generated_code() -> None:
-    """A step holding a double quote is written as a valid literal, read back unchanged (#1723).
-
-    The steps list was written as `"{step}"`, so one double quote in a step ended the
-    literal early and the generated `main.py` failed to parse.
-
-    Killed by: src/uclone_x/skills/synthesizer.py :: f"            {step!r}" for step in workflow_steps)
-    Becomes: f'            "{step}"' for step in workflow_steps)
+    Killed by: src/uclone_x/skills/synthesizer.py :: title = task_name.replace("_", " ").replace("-", " ").title()
+    Becomes: title = task_name
     """
-    code = SkillSynthesizer().generate_skill_code("replier", _AWKWARD_STEPS[:1])
+    body = SkillSynthesizer().format_instructions("db_indexer", ["Connect to replica", "Write DDL"])
 
-    assert _run_generated(code)["steps_executed"] == _AWKWARD_STEPS[:1]
-
-
-def test_any_step_text_survives_into_the_generated_code() -> None:
-    """Backslashes and triple quotes, in the steps list and in the docstring (#1723).
-
-    Killed by: src/uclone_x/skills/synthesizer.py :: f"        {i + 1}. {_docstring_text(step)}" for i, step in enumerate(workflow_steps)
-    Becomes: f"        {i + 1}. {step}" for i, step in enumerate(workflow_steps)
-    """
-    code = SkillSynthesizer().generate_skill_code("awkward", _AWKWARD_STEPS)
-
-    result = _run_generated(code)
-    assert result["steps_executed"] == _AWKWARD_STEPS
-    assert result["skill"] == "awkward"
-
-
-def test_generate_manifest_yaml() -> None:
-    """generate_manifest_yaml produces LinkML-compatible YAML manifest specification."""
-    synth = SkillSynthesizer()
-    manifest = SkillManifest(
-        name="log_analyzer",
-        description="Analyzes structured logs",
-        origin=SkillOrigin.SYNTHESIZED,
-        status=SkillStatus.PENDING,
-        requested_isolation=IsolationLevel.WORKSPACE,
-        content_sha256="abc123def456",
+    assert body == (
+        "# Db Indexer\n\n"
+        "Synthesized from a recorded session. It is instructions only and carries no script.\n\n"
+        "## When to use\n\n"
+        "When a task calls for the steps below, as the session this skill was recorded from did."
+        "\n\n## Steps\n\n"
+        "Follow these steps in order. They were recorded from one session, so adapt names, "
+        "paths and values to the task at hand.\n\n"
+        "1. Connect to replica\n"
+        "2. Write DDL\n"
     )
-    steps = ["Step 1", "Step 2"]
-    manifest_yaml = synth.generate_manifest_yaml(manifest, steps)
-    parsed: dict[str, Any] = yaml.safe_load(manifest_yaml)
 
-    assert parsed["name"] == "log_analyzer"
-    assert parsed["origin"] == "synthesized"
-    assert parsed["status"] == "pending"
-    assert parsed["requested_isolation"] == "workspace"
-    assert parsed["workflow_steps"] == ["Step 1", "Step 2"]
-    assert parsed["content_sha256"] == "abc123def456"
+
+#: Step text a recorded session can hold, and the one line of Markdown each becomes.
+_AWKWARD_STEPS = {
+    "<!-- hide --> keep": "\\<!-- hide --\\> keep",
+    "# Not a heading": "\\# Not a heading",
+    "one\nline\u2028two": "one line two",
+    "1. not an item": "1\\. not an item",
+    "- nor this": "\\- nor this",
+    "```sh\nrm -rf /\n```": "\\`\\`\\`sh rm -rf / \\`\\`\\`",
+    "a\u202ereversed": "areversed",
+    "*bold* [link](http://e) a_b & |c|": "\\*bold\\* \\[link\\](http://e) a\\_b \\& \\|c\\|",
+}
+
+
+def test_step_text_cannot_hide_itself_or_pose_as_another_part_of_the_skill() -> None:
+    """Each step is one line of escaped text, so the approver reads what the agent will (#1810).
+
+    An HTML comment would hide text from the rendered view; a heading, a fence or a
+    list marker would pose as another section or another step; a bidirectional override
+    would make a step read differently from what it holds.
+
+    Killed by: src/uclone_x/skills/synthesizer.py :: escaped = _MARKDOWN_PUNCTUATION.sub(r"\\\1", _one_line(text))
+    Becomes: escaped = _one_line(text)
+
+    Killed by: src/uclone_x/skills/synthesizer.py :: flat = _BREAKS.sub(" ", text)
+    Becomes: flat = text
+
+    Killed by: src/uclone_x/skills/synthesizer.py :: if unicodedata.category(ch) not in ("Cc", "Cf")
+    Becomes: if unicodedata.category(ch) not in ("Cc",)
+
+    Killed by: src/uclone_x/skills/synthesizer.py :: lambda m: f"{m[1]}\\{m[2]}" if m[1] is not None else f"\\{m[3]}", escaped
+    Becomes: lambda m: m[0], escaped
+    """
+    body = SkillSynthesizer().format_instructions(
+        "awkward", [*_AWKWARD_STEPS, "   ", "\x00"], "Use <b>it</b>\n# now"
+    )
+
+    steps = body.split("adapt names, paths and values to the task at hand.\n\n")[1]
+    assert steps.splitlines() == [
+        f"{i}. {line}" for i, line in enumerate(_AWKWARD_STEPS.values(), start=1)
+    ]
+    when = body.split("## When to use\n\n")[1].split("\n\n")[0]
+    assert when == r"Use \<b\>it\</b\> \# now"
 
 
 @pytest.mark.asyncio
 async def test_synthesize_skill_quarantine_lifecycle(tmp_path: Path) -> None:
-    """synthesize_skill generates package files in quarantine with SHA-256 binding (P9)."""
+    """synthesize_skill writes one pending SKILL.md in quarantine with SHA-256 binding (P9).
+
+    Killed by: src/uclone_x/skills/synthesizer.py :: save_skill(skill_dir, manifest, instructions)
+    Becomes: save_skill(skill_dir, manifest, instructions); (skill_dir / "main.py").write_text("")
+    """
     synth = SkillSynthesizer()
     steps = [
         "Connect to database replica",
@@ -333,18 +319,15 @@ async def test_synthesize_skill_quarantine_lifecycle(tmp_path: Path) -> None:
     assert manifest.origin is SkillOrigin.SYNTHESIZED
     assert manifest.status is SkillStatus.PENDING
     assert manifest.requested_isolation is IsolationLevel.WORKSPACE
-    assert manifest.entrypoint == "main.py"
-    assert manifest.scripts == ("main.py",)
+    assert manifest.entrypoint is None
+    assert manifest.scripts == ()
     assert manifest.tags == ("sql", "perf")
     assert manifest.content_sha256 is not None
     assert len(manifest.content_sha256) == 64
 
-    # 2. Package files created
+    # 2. The package is the one prompt-only file: no script, no second manifest (#1810)
     skill_dir = tmp_path / "db_indexer"
-    assert skill_dir.is_dir()
-    assert (skill_dir / "SKILL.md").is_file()
-    assert (skill_dir / "manifest.yaml").is_file()
-    assert (skill_dir / "main.py").is_file()
+    assert sorted(p.name for p in skill_dir.iterdir()) == ["SKILL.md"]
 
     # 3. Verify load_skill_from_dir loads cleanly
     loaded = load_skill_from_dir(skill_dir)
@@ -382,6 +365,27 @@ async def test_synthesize_skill_invalid_inputs_raises(tmp_path: Path) -> None:
             workflow_steps=[],
             quarantine_dir=tmp_path,
         )
+
+
+@pytest.mark.asyncio
+async def test_a_description_holding_the_header_delimiter_is_refused(tmp_path: Path) -> None:
+    """`---` in the description would end the `SKILL.md` header early, so it is refused.
+
+    Killed by: src/uclone_x/skills/synthesizer.py :: if "---" in given:
+    Becomes: if False:
+    """
+    with pytest.raises(ValueError) as refused:
+        await SkillSynthesizer().synthesize_skill(
+            task_name="cutter",
+            workflow_steps=["Step 1"],
+            quarantine_dir=tmp_path,
+            description="Before --- after",
+        )
+
+    assert str(refused.value) == (
+        "The description cannot contain '---', because that marks the end of the skill's header."
+    )
+    assert not (tmp_path / "cutter").exists()
 
 
 @pytest.mark.asyncio

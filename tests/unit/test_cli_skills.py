@@ -177,6 +177,39 @@ def test_cli_skill_list_and_filtering(tmp_path: Path) -> None:
     assert "No pending skills awaiting review" in res_no_pending.output
 
 
+def test_cli_skill_list_reports_a_folder_it_cannot_open_and_lists_the_rest(
+    tmp_path: Path,
+) -> None:
+    """A skill folder that can be listed but not searched is named, not skipped (#1824).
+
+    `Path.is_file()` raised there on Python 3.11 to 3.13 and crashed the command, and on
+    3.14 answers False, which left the folder out without a word.
+
+    Killed by: src/uclone_x/cli/commands/skill.py :: if _is_file(child / "SKILL.md"):
+    Becomes: if (child / "SKILL.md").is_file():
+    """
+    if not hasattr(os, "geteuid") or os.geteuid() == 0:
+        pytest.skip("root searches any folder, and the test needs one it cannot")
+    _pending_skill(tmp_path, "readable_skill")
+    locked = _pending_skill(tmp_path, "locked_skill")
+    locked.chmod(0o600)
+    try:
+        result = runner.invoke(
+            app, ["skill", "list", "--dir", str(tmp_path)], env={"COLUMNS": "400"}
+        )
+    finally:
+        locked.chmod(0o755)
+
+    assert result.exit_code == 0
+    assert result.exception is None
+    assert (
+        "The skill folder 'locked_skill' could not be opened, so it is not listed. Check that "
+        "you may open it."
+    ) in " ".join(result.output.split())
+    assert "readable_skill" in result.output
+    assert "No skills found" not in result.output
+
+
 def test_cli_skill_approve_promotes_skill(tmp_path: Path) -> None:
     skill_dir = tmp_path / "data_exporter"
     save_skill(
@@ -477,12 +510,9 @@ def test_cli_skill_synthesize_from_steps(tmp_path: Path) -> None:
     assert "Audit Verdict" in result.output
     assert "approve" in result.output
 
-    # Check files on disk
+    # The package on disk is the one prompt-only SKILL.md (#1810)
     skill_dir = tmp_path / "csv_exporter"
-    assert skill_dir.is_dir()
-    assert (skill_dir / "SKILL.md").is_file()
-    assert (skill_dir / "manifest.yaml").is_file()
-    assert (skill_dir / "main.py").is_file()
+    assert sorted(p.name for p in skill_dir.iterdir()) == ["SKILL.md"]
 
     loaded = load_skill_from_dir(skill_dir)
     assert loaded.manifest.status is SkillStatus.PENDING
@@ -575,33 +605,25 @@ def test_cli_skill_synthesize_from_a_session_with_no_trace_writes_nothing(
     assert not (tmp_path / "store" / "ghost_skill").exists()
 
 
-def test_cli_skill_synthesize_auto_approve(tmp_path: Path) -> None:
-    """CLI synthesize with --auto-approve automatically activates safe skills."""
-    result = runner.invoke(
-        app,
-        [
-            "skill",
-            "synthesize",
-            "--name",
-            "auto_promoted_skill",
-            "--step",
-            "Step 1: Compute hash",
-            "--step",
-            "Step 2: Validate token",
-            "--auto-approve",
-            "--dir",
-            str(tmp_path),
-        ],
-        env={"COLUMNS": "200"},
-    )
-    assert result.exit_code == 0
-    assert "Auto-approved and registered skill" in result.output
-    assert "active" in result.output
+def test_cli_skill_synthesize_has_no_auto_approve_and_leaves_the_skill_pending(
+    tmp_path: Path,
+) -> None:
+    """An LLM-authored skill is never auto-approved, so the option is gone (#1824).
 
-    skill_dir = tmp_path / "auto_promoted_skill"
-    loaded = load_skill_from_dir(skill_dir)
-    assert loaded.manifest.status is SkillStatus.ACTIVE
-    assert loaded.manifest.approved_by == "synthesizer:auto"
+    The package is written pending, and only `approve` makes it active.
+    """
+    args = ["skill", "synthesize", "--name", "hash_checker", "--step", "Compute the hash"]
+    refused = runner.invoke(app, [*args, "--auto-approve", "--dir", str(tmp_path)])
+    assert refused.exit_code == 2
+    assert "No such option" in refused.output
+    assert not (tmp_path / "hash_checker").exists()
+
+    written = runner.invoke(app, [*args, "--dir", str(tmp_path)], env={"COLUMNS": "200"})
+    assert written.exit_code == 0
+    assert "Skill is quarantined (pending)" in written.output
+    loaded = load_skill_from_dir(tmp_path / "hash_checker")
+    assert loaded.manifest.status is SkillStatus.PENDING
+    assert loaded.manifest.approved_by is None
 
 
 def test_cli_skill_synthesize_missing_inputs_fails(tmp_path: Path) -> None:

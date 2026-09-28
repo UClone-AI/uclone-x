@@ -6,17 +6,20 @@
 > (`src/uclone_x/skills/protocols.py`), and the auditor, registry and SKILL.md
 > load/save layer (`src/uclone_x/skills/auditor.py`) exist, together with the
 > `./ucx skill` approval CLI (`src/uclone_x/cli/commands/skill.py`). They are exercised
-> by `tests/unit/test_skills.py` and `tests/unit/test_cli_skills.py`. The **autonomous
-> synthesizer does not exist** — `SkillSynthesizerProtocol` has no implementation, so
-> nothing in the shipped system produces a skill without a human writing it. Every
-> section below is marked **Implemented** or **Planned**.
+> by `tests/unit/test_skills.py` and `tests/unit/test_cli_skills.py`. The synthesizer
+> writes a **prompt-only** skill: `SkillSynthesizer` (`src/uclone_x/skills/synthesizer.py`)
+> implements `SkillSynthesizerProtocol`, and `./ucx skill synthesize` runs it to turn a
+> recorded session's steps into a pending `SKILL.md` of instructions, with no script
+> (§5.1; #1810, owner ruling 2026-09-27). Its one caller in `src/` is that command
+> (`grep -rn 'SkillSynthesizer(' src/`), so a skill is synthesized only when someone runs
+> it. Every section below is marked **Implemented**, **Partly implemented** or **Planned**.
 
 ## 1. Executive Summary
 
 Per **Principle 9**, UClone-X treats **Skills** as first-class, modular, hot-reloadable capability packages.
 
 Skills bridge the gap between static code tools and dynamic prompt instructions:
-1. **Autonomous Synthesis** *(Planned)*: Agents distill successful workflows and bash/python scripts into permanent, reusable skills.
+1. **Autonomous Synthesis** *(Partly implemented)*: Agents distill successful workflows into permanent, reusable skills. Today `./ucx skill synthesize`, run by a person, writes a pending prompt-only `SKILL.md` from given steps, a trace file or a session's trace; it writes no script, and the skill becomes active only through `./ucx skill approve` (§5.1).
 2. **Developer Injection** *(Partly implemented)*: Developers author skills in declarative folders; the load, audit, approve and reject paths exist. Natural-language teaching does not.
 3. **Pluggable Execution** *(Partly implemented)*: A skill declares a *requested* isolation level; the runtime decides the actual one.
 
@@ -246,18 +249,43 @@ Pyright rejects it before the code runs. That is the fix: not a new check inside
 to know *which* packages appeared before deciding anything — and **activates nothing**.
 It is `async` (via `asyncio.to_thread`) because it touches the filesystem, which under
 P1 must not block the event loop. A missing directory returns `()`; a package that
-fails to load is skipped. `get` and `list_skills` return only what was admitted.
+fails to load is not skipped but returned as a `REJECTED` manifest under its folder name,
+with the error in `rejection_reason`. So is a folder whose `SKILL.md` cannot be checked
+because the folder can be listed but not searched (#1612). `get` and `list_skills` return
+only what was admitted.
 
 *Verified in* `test_skill_registry_registration_and_gating` (name mismatch, hash
-mismatch, `REJECT` verdict, and the passing case) and `test_skill_registry_scan`.
+mismatch, `REJECT` verdict, and the passing case), `test_skill_registry_scan` and
+`test_scan_reports_a_package_folder_it_cannot_search`.
 
-### 5.1 Synthesis, When It Lands — *Planned*
+### 5.1 Synthesis — *Implemented (prompt-only)*
 
 `SkillSynthesizerProtocol.synthesize_skill(task_name, workflow_steps, quarantine_dir)`
-is specified and unimplemented. Its destination parameter is named `quarantine_dir`,
-not `output_dir`, deliberately: the returned manifest is `SkillStatus.PENDING`, and
-synthesis has **no** path that produces an active skill. Promotion is a separate,
-audited act.
+is implemented by `SkillSynthesizer` (`src/uclone_x/skills/synthesizer.py`). Its
+destination parameter is named `quarantine_dir`, not `output_dir`, deliberately: the
+package it writes is `origin: synthesized`, `status: pending`, and `synthesize_skill` has
+no path that produces an active skill.
+
+A synthesized skill is **prompt-only** (#1810, owner ruling 2026-09-27): the package is
+the one file `SKILL.md`, with no `entrypoint`, no `scripts` and no `manifest.yaml`. The
+steps come from `--step`, a trace file (`--from-trace`) or a session's recorded trace
+(`--session-id`); a session with no trace is refused and nothing is written. The body
+(`SkillSynthesizer.format_instructions`) is a title, a line saying it was synthesized
+and carries no script, a *When to use* section (the `--description`, or a default
+sentence), and a *Steps* section giving the steps as a numbered list of instructions.
+
+Each step, and the description, is session text, so it is written as one line of escaped
+Markdown: line and paragraph breaks become spaces, control and Unicode format characters
+(which include bidirectional overrides) are dropped, Markdown punctuation is
+backslash-escaped, and a leading list or underline marker is escaped. A step therefore
+cannot open a heading, a code block, an HTML comment or another list item. A
+description holding `---` is refused, because the loader ends the frontmatter at the
+first `---`.
+
+The skill becomes active only through `./ucx skill approve`, which pins its digest in the
+approvals ledger (§7.2). `synthesize` has no `--auto-approve`: an LLM-authored skill is
+never auto-approved (#1824, owner ruling 2026-09-27). `--policy` still sets the policy of
+the audit `synthesize` prints, and changes nothing on disk.
 
 ---
 
@@ -348,7 +376,7 @@ and `test_skill_auditor_safe_skill`.
 flowchart TD
     subgraph Author["Authoring"]
         Human["Developer writes SKILL.md<br/>(origin: human)"]
-        Synth["Synthesizer<br/>(origin: synthesized)<br/><i>Planned — not implemented</i>"]
+        Synth["./ucx skill synthesize<br/>(origin: synthesized)<br/><i>prompt-only — §5.1</i>"]
     end
 
     subgraph Disk["ucx-agent-skills/ on disk"]
@@ -384,10 +412,11 @@ The transitions are **writes to the `SKILL.md` frontmatter on disk**, performed 
 
 | Command | Effect |
 | :--- | :--- |
-| `./ucx skill list [--pending] [--all] [--dir PATH]` | Loads every `<dir>/*/SKILL.md` and tables name, version, origin, status, requested isolation, approver, description. `--pending` filters to `PENDING` and `QUARANTINED`; `REJECTED` is hidden unless `--all`. Unparseable packages are skipped silently. |
+| `./ucx skill list [--pending] [--all] [--dir PATH]` | Loads every `<dir>/*/SKILL.md` and tables name, version, origin, status, requested isolation, approver, description. `--pending` filters to `PENDING` and `QUARANTINED`; `REJECTED` is hidden unless `--all`. A folder whose `SKILL.md` cannot be checked because the folder cannot be opened is named in a warning line instead of listed (#1824). Unparseable packages are skipped silently. |
 | `./ucx skill audit <name> [--policy safe_only\|never\|always]` | Runs the auditor and prints verdict, `is_safe`, risk score, evaluated policy, content digest and every detected risk. **Read-only** — it changes no status. Exits 1 on an audit error or an invalid policy. |
 | `./ucx skill approve <name> [--approver ID] [--force]` | Re-runs the auditor and asks for a typed "yes" at the terminal it was run from (#1589), then on a non-`REJECT` verdict writes `status: active`, `approved_by`, `approved_at` (UTC ISO-8601), takes the digest of the package **as that write left it**, records it as `content_sha256`, and pins it in the approvals ledger (§7.2, #1720). Clears any prior rejection fields. A `REJECT` verdict exits 1 and lists the risks unless `--force` is given. An `ACTIVE` skill whose current digest is already pinned is a no-op without `--force`; one edited since its approval is audited and asked about again. An audit that cannot finish (`SkillAuditError`, e.g. a folder the hash cannot list) exits 1 with the reason and changes nothing, `--force` included. |
 | `./ucx skill reject <name> [--reason TEXT] [--rejecter ID]` | Removes the skill's pin from the approvals ledger, then writes `status: rejected` plus `rejected_by`, `rejected_at`, `rejection_reason`. Runs **no** audit and has no `--force`; rejection needs no justification from the auditor. |
+| `./ucx skill synthesize --name NAME (--step TEXT... \| --from-trace PATH \| --session-id ID) [--dir PATH] [--policy ...]` | Writes a `pending`, prompt-only package through `SkillSynthesizer` and audits it (§5.1). It never makes the skill active; `approve` does (#1824). |
 
 Reachable states: `PENDING` (the default on disk) → `ACTIVE` via `approve`, or
 → `REJECTED` via `reject`; `REJECTED` → `ACTIVE` via `approve` (which clears the
@@ -427,8 +456,12 @@ current digest is its ledger pin or its shipped pin. A refused package is kept i
 code, `not_loaded_code` with `not_loaded_params` (#1777). The codes are
 `SkillRefusalCode` in `src/uclone_x/skills/refusals.py`: changed after approval, approved
 before pins, never approved, failed the safety check, check not finished (the audit could
-not read the package), and unreadable (the instructions did not parse; listed under the
-folder name). The Settings Skills panel words the code from its catalog, in the person's
+not read the package), and unreadable (the instructions could not be read or did not
+parse, or the package folder can be listed but not searched so its `SKILL.md` cannot be
+checked (#1612); listed under the folder name). Such a refusal does not stop the other
+packages from loading. The `SKILL.md` check uses `os.stat` rather than `Path.is_file()`,
+whose answer for that folder differs between Python 3.11–3.13 (it raises) and 3.14 (it
+answers False). The Settings Skills panel words the code from its catalog, in the person's
 language, under "Why it is not used"; `not_loaded_reason` carries the English sentence for
 the log, the CLI and a head that does not know the code. `InMemorySkillStore` is trusted and
 checks no pin.
@@ -456,9 +489,10 @@ class AutoApprovalPolicy(StrEnum):
 | `never` | A clean package gets `REQUIRE_HUMAN_REVIEW`. Nothing is ever auto-approved. |
 
 > [!IMPORTANT]
-> **Whether synthesized skills may auto-approve at all is not decided.** It is an open
-> governance question for the project owner, registered as
-> `2026-09-02-002` and weighed as
+> **A skill `./ucx skill synthesize` writes is never auto-approved** (#1824, owner ruling
+> 2026-09-27): the command has no promotion path, and `./ucx skill approve` is the only way
+> such a skill becomes active (§5.1). The wider question — how the audit policy applies to
+> agent-authored skills — was registered as `2026-09-02-002` and weighed as
 > decision **D2** in [`security-threat-model.md`](security-threat-model.md), which
 > records four options and a recommendation — *not* a ruling. The recommendation there
 > (split synthesis from persistence: a synthesized skill activates for its own agent and
@@ -515,9 +549,12 @@ findings.
    audit log outside the frontmatter itself. The approvals ledger (§7.2) now holds what
    was approved outside the package, but it is a plain file in the person's home, writable
    by anything that runs as them.
-4. **No synthesizer** (§5.1), so autonomous synthesis — P9's headline claim and PRD
-   FR-5.2 — is unimplemented. Consequently the whole quarantine mechanism is currently
-   unexercised by real synthesized code.
+4. **Synthesis is prompt-only and run by hand** (§5.1). `./ucx skill synthesize` writes a
+   pending `SKILL.md` of instructions and no script (#1810, owner ruling 2026-09-27), and
+   its one caller in `src/` is that command, so no agent synthesizes a skill on its own
+   — P9's headline claim and PRD FR-5.2 are met only in part. The quarantine mechanism is
+   exercised by `tests/unit/test_skill_synthesizer.py` and the `synthesize` cases in
+   `tests/unit/test_cli_skills.py`.
 5. **Loaded once, at startup; no hot-reload.** The web app (`create_ui_app`'s lifespan)
    and the CLI heads (`run`, `loop`, `room`, `a2a`, `acp`) build their registry over
    `runtime_skill_store_dir()` and call `load_approved_skills`, which re-audits every
@@ -529,7 +566,7 @@ findings.
    document — are not defined anywhere in `src/`.
 6. **`./ucx skill add` and `./ucx skill teach` do not exist.** Earlier revisions of this
    document showed both. The implemented commands are exactly `list`, `audit`,
-   `approve`, `reject`.
+   `approve`, `reject` and `synthesize` (§7.1).
 7. **No revoke, no TTL or size bound** on `ucx-agent-skills/`, all of which
    `2026-09-02-002` asked for, alongside version pinning. Pinning now exists (§7.2);
    `reject` removes a pin, which is the nearest thing to a revoke.
@@ -541,6 +578,17 @@ findings.
     reads it and resolves it against a floor; the auditor only comments on it. The
     clamping function exists and is tested in the sandbox layer, but the skill layer
     does not yet call it.
+11. **The digest is checked when a skill is loaded, not when it is used** (#1612 item 1).
+    Decided: it is checked at load only, with no per-call re-check (owner ruling
+    2026-09-27). Since #1720 the file-system store refuses an active package whose
+    current digest is not its pin (`changed_after_approval`, §7.2), and that check runs at
+    every `reload_approved` — which a head calls at startup. The paths a tool call takes
+    do not re-compute it: `load_skill` serves the instructions held in memory from the
+    load, and the story tools read `resources/story/` data files from disk on each call
+    without re-hashing them (`src/uclone_x/story/skill_data.py`). So an edit after startup
+    to a loaded skill's data files is read by those tools until a later load refuses the
+    package. Within one load, `SKILL.md` is read before the audit hashes the folder, so the
+    instructions held and the digest checked are two reads, not one snapshot.
 
 ---
 

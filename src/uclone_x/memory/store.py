@@ -262,8 +262,13 @@ class CrossSessionMemory:
         provenance: Provenance,
         session_id: str | None = None,
     ) -> MemoryFact:
-        """Explicitly retract a fact by ID, preserving the audit trail."""
+        """Explicitly retract a fact by ID, preserving the audit trail.
+
+        The document is re-read first, so a fact another writer saved since this object
+        loaded can be retracted, and a retraction made elsewhere is not repeated.
+        """
         require_provenance(provenance, "retract_fact")
+        self._absorb_concurrent_writes()  # the fact may be newer than this object
         if fact_id not in self._facts:
             raise KeyError(f"Memory fact '{fact_id}' not found")
 
@@ -280,14 +285,105 @@ class CrossSessionMemory:
                 "updated_at": utc_now_iso(),
             }
         )
+        held = dict(self._facts)
         self._facts[fact_id] = retracted
+        self._save_or_restore(held)
         # A retracted fact is excluded from every candidate set, so its vector is dead
         # weight in the index. Dropping it here keeps the index the same size as the
-        # corpus it claims to describe.
+        # corpus it claims to describe. After the save, so a failed one leaves it indexed.
         self.forget_vector(fact_id)
-        self.save()
         logger.info("Retracted fact %s: %s", fact_id, clean_reason)
         return retracted
+
+    def correct_fact(
+        self,
+        fact_id: str,
+        value: str,
+        provenance: Provenance,
+        reason: str = "corrected by the user",
+    ) -> MemoryFact:
+        """A person's correction: a `corrected` fact that supersedes `fact_id` (design §3.6).
+
+        The new fact keeps the old one's subject and predicate, and where it was learned
+        (session, conversation, turn), so it stays in the same place in Remembers. It is
+        written at confidence `1.0` with origin `corrected`, and names the old fact in
+        `contradicts_fact_id`. The old fact is kept, retracted with `reason`. Any other
+        active fact on the same subject and predicate is superseded as `record_fact` does.
+
+        The document is re-read before the lookup, as `retract_fact` does, and all of it is
+        one save.
+
+        Raises:
+            KeyError: No fact has that id.
+            ValueError: The fact is already retracted, or `value` is blank.
+        """
+        require_provenance(provenance, "correct_fact")
+        clean_value = value.strip()
+        if not clean_value:
+            raise ValueError("value cannot be empty")
+        self._absorb_concurrent_writes()  # as retract_fact: find a newer writer's fact
+        current = self._facts.get(fact_id)
+        if current is None:
+            raise KeyError(f"Memory fact '{fact_id}' not found")
+        if current.retracted:
+            raise ValueError(f"Memory fact '{fact_id}' is retracted and cannot be corrected")
+
+        corrected = MemoryFact(
+            subject=current.subject,
+            predicate=current.predicate,
+            object_value=clean_value,
+            provenance=require_provenance(provenance, "MemoryFact"),
+            source_session_id=current.source_session_id,
+            confidence=1.0,
+            tags=current.tags,
+            origin="corrected",
+            source_room_id=current.source_room_id,
+            source_turn_id=current.source_turn_id,
+            contradicts_fact_id=current.fact_id,
+        )
+        now = utc_now_iso()
+        held = dict(self._facts)
+        superseded = [current.fact_id]
+        self._facts[current.fact_id] = current.model_copy(
+            update={
+                "retracted": True,
+                "retraction_reason": reason,
+                "retracted_at": now,
+                "updated_at": now,
+            }
+        )
+        for existing in list(self._facts.values()):
+            if existing.conflicts_with(corrected):
+                superseded.append(existing.fact_id)
+                self._facts[existing.fact_id] = existing.model_copy(
+                    update={
+                        "retracted": True,
+                        "retraction_reason": f"Superseded by fact {corrected.fact_id}",
+                        "retracted_at": now,
+                        "updated_at": now,
+                    }
+                )
+        self._facts[corrected.fact_id] = corrected
+        self._save_or_restore(held)
+        for fact_id_gone in superseded:
+            self.forget_vector(fact_id_gone)
+        logger.info("Fact %s corrected as %s", current.fact_id, corrected.fact_id)
+        return corrected
+
+    def _save_or_restore(self, held: dict[str, MemoryFact]) -> None:
+        """Save, or put back the facts held before this edit if the save raised.
+
+        A person's Forget or Correct changes the live copy and then saves. Left changed
+        after a failed save, the copy already reads as retracted: a retried Forget
+        returned it as done without writing anything, so it was lost on the next load,
+        and a retried Correct was refused as a retraction the disk had never seen
+        (#1719 review). Restoring makes the retry do the whole edit again.
+        """
+        try:
+            self.save()
+        except BaseException:
+            self._facts = held
+            raise
 
     def get_fact(self, fact_id: str) -> MemoryFact | None:
         """Look up a fact by ID."""
@@ -569,7 +665,7 @@ class CrossSessionMemory:
             return
 
         self._storage_path.parent.mkdir(parents=True, exist_ok=True)
-        self._absorb_concurrent_writes()
+        self._absorb_concurrent_writes()  # keep what another process saved since we loaded
         dumped = {
             "version": _DOCUMENT_VERSION,
             "facts": [fact.model_dump(mode="json") for fact in self._facts.values()],

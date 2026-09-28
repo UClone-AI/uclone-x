@@ -13,6 +13,10 @@ What these pin:
   deep.
 * **Reset** puts the chosen picture aside and the shipped one shows again.
 * **Version** changes when the picture does, so the head's `?v=` address changes.
+* **Change order** is the store's (#1809): every change gets the next id, counted on disk so
+  a new store (a restart) goes on from it, and an undo naming a change that is no longer
+  the latest is refused with nothing written -- including after A, B, C, B, where the
+  picture is B again but the change that made it the first time is not the latest.
 * **The write guard**: general writing tools refuse any path in the personas folder,
   however it is spelled, while writing elsewhere under `.uclone/` is unchanged.
 """
@@ -26,10 +30,12 @@ from unittest.mock import AsyncMock
 import pytest
 import yaml
 
+from uclone_x.agent import persona_avatar
 from uclone_x.agent.persona_avatar import (
     MAX_AVATAR_BYTES,
     AvatarPersonaNotFound,
     AvatarRefused,
+    AvatarStaleChange,
     PersonaAvatarStore,
     avatar_url,
     sniff_image_format,
@@ -148,7 +154,9 @@ class TestLookup:
         store = _store(tmp_path)
 
         assert avatar_url("surveyor", store.find("surveyor")) is None
-        record = store.set("surveyor", PNG)
+        store.set("surveyor", PNG)
+        record = store.find("surveyor")
+        assert record is not None
         assert avatar_url("surveyor", record) == f"/api/personas/surveyor/avatar?v={record.version}"
 
 
@@ -219,8 +227,8 @@ class TestSet:
         assert not (tmp_path / PERSONAS / "surveyor.png").exists()
 
     def test_the_replaced_picture_is_kept_one_deep(self, tmp_path: Path) -> None:
-        """Killed by: src/uclone_x/agent/persona_avatar.py :: if current:
-        Becomes: if False:
+        """Killed by: src/uclone_x/agent/persona_avatar.py :: replaced = self._keep_previous(name, current[0]) if current else None
+        Becomes: replaced = None
         Killed by: src/uclone_x/agent/persona_avatar.py :: if older != kept:
         Becomes: if False:
         """
@@ -243,15 +251,150 @@ class TestSet:
         _install(tmp_path, "surveyor")
         store = _store(tmp_path)
 
-        first = store.set("surveyor", PNG).version
-        second = store.set("surveyor", PNG + b"\x00").version
+        store.set("surveyor", PNG)
+        first = store.find("surveyor")
+        store.set("surveyor", PNG + b"\x00")
+        second = store.find("surveyor")
+        assert first is not None and second is not None
 
-        assert first != second
+        assert first.version != second.version
 
     def test_a_name_no_clone_carries_is_refused(self, tmp_path: Path) -> None:
         with pytest.raises(AvatarPersonaNotFound):
             _store(tmp_path).set("nobody", PNG)
         assert not (tmp_path / PERSONAS / "nobody.png").exists()
+
+
+def _files(folder: Path) -> dict[str, bytes]:
+    """Every file in the personas folder, by name, for "nothing on disk changed"."""
+    return {p.name: p.read_bytes() for p in sorted(folder.iterdir()) if p.is_file()}
+
+
+class TestChangeOrder:
+    def test_each_change_gets_the_next_id(self, tmp_path: Path) -> None:
+        """Killed by: src/uclone_x/agent/persona_avatar.py :: change_id = latest + 1
+        Becomes: change_id = 1
+        """
+        _install(tmp_path, "surveyor")
+        store = _store(tmp_path)
+
+        ids = [
+            store.set("surveyor", PNG).change_id,
+            store.set("surveyor", JPEG).change_id,
+            store.reset("surveyor").change_id,
+            store.reset("surveyor").change_id,  # nothing to put aside, still a change
+        ]
+
+        assert ids == [1, 2, 3, 4]
+        assert store.latest_change("surveyor") == 4
+
+    def test_the_count_survives_a_new_store(self, tmp_path: Path) -> None:
+        """A restart builds a new store; the ids go on rather than starting again.
+
+        Killed by: src/uclone_x/agent/persona_avatar.py :: replace_file(_change_file(folder, name),
+        Becomes: (_change_file(folder, name),
+        """
+        _install(tmp_path, "surveyor")
+        _store(tmp_path).set("surveyor", PNG)
+        _store(tmp_path).set("surveyor", JPEG)
+
+        after_restart = _store(tmp_path)
+
+        assert after_restart.latest_change("surveyor") == 2
+        assert after_restart.set("surveyor", GIF).change_id == 3
+
+    def test_a_change_that_fails_part_way_still_takes_its_id(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The id is counted before the picture is written, so a write that fails (or a crash)
+        after `.prev` moved cannot leave an older Undo matching a picture it no longer describes.
+
+        Killed by: src/uclone_x/agent/persona_avatar.py :: replace_file(_change_file(folder, name),
+        Becomes: (_change_file(folder, name),
+        """
+        _install(tmp_path, "surveyor")
+        store = _store(tmp_path)
+        store.set("surveyor", PNG)
+        held = store.set("surveyor", JPEG)  # the Undo a tab is holding
+        real_replace = persona_avatar.replace_file
+
+        def picture_write_fails(path: Path, data: bytes) -> None:
+            if not path.name.startswith("."):
+                raise OSError("disk full")
+            real_replace(path, data)
+
+        monkeypatch.setattr(persona_avatar, "replace_file", picture_write_fails)
+        with pytest.raises(OSError):
+            store.set("surveyor", GIF)
+        monkeypatch.undo()
+
+        assert store.latest_change("surveyor") == held.change_id + 1
+        with pytest.raises(AvatarStaleChange):
+            store.set("surveyor", PNG, undo_of=held.change_id)
+
+    def test_an_undo_after_a_b_c_b_is_refused_and_writes_nothing(self, tmp_path: Path) -> None:
+        """The picture is B again, but the change that first made it B is not the latest.
+
+        Called on `set` directly, not `set_from_path`, so it is the check under the lock
+        that refuses.
+
+        Killed by: src/uclone_x/agent/persona_avatar.py :: if undo_of is not None and (undo_of < 1 or undo_of != latest):
+        Becomes: if False:
+        """
+        _install(tmp_path, "surveyor")
+        store = _store(tmp_path)
+        store.set("surveyor", PNG)  # A, change 1
+        first_b = store.set("surveyor", JPEG)  # B, change 2
+        store.set("surveyor", GIF)  # C, change 3
+        store.set("surveyor", JPEG)  # B again, change 4
+        folder = tmp_path / PERSONAS
+        before = _files(folder)
+
+        with pytest.raises(AvatarStaleChange) as refused:
+            store.set("surveyor", PNG, undo_of=first_b.change_id)
+        with pytest.raises(AvatarStaleChange):
+            store.reset("surveyor", undo_of=first_b.change_id)
+
+        assert refused.value.reason_code == "stale_change"
+        assert _files(folder) == before
+        assert store.latest_change("surveyor") == 4
+
+    def test_an_undo_of_the_latest_change_is_made(self, tmp_path: Path) -> None:
+        """Killed by: src/uclone_x/agent/persona_avatar.py :: or undo_of != latest):
+        Becomes: or undo_of == latest):
+        """
+        _install(tmp_path, "surveyor")
+        store = _store(tmp_path)
+        store.set("surveyor", PNG)
+        replaced = store.set("surveyor", JPEG)
+        assert replaced.previous is not None
+
+        undone = store.set_from_path("surveyor", replaced.previous, undo_of=replaced.change_id)
+
+        assert undone.change_id == 3
+        found = store.find("surveyor")
+        assert found is not None and found.path.read_bytes() == PNG
+
+    def test_a_stale_undo_whose_kept_copy_is_gone_says_stale_not_missing(
+        self, tmp_path: Path
+    ) -> None:
+        """A PNG, then a JPEG, then a GIF: the kept `.prev.png` is replaced by `.prev.jpg`.
+
+        The Undo of the JPEG change still names `.prev.png`; it must be refused for what it
+        is -- a later change -- not as a missing file.
+
+        Killed by: src/uclone_x/agent/persona_avatar.py :: if undo_of is not None and undo_of != self.latest_change(name):
+        Becomes: if False:
+        """
+        _install(tmp_path, "surveyor")
+        store = _store(tmp_path)
+        store.set("surveyor", PNG)
+        to_jpeg = store.set("surveyor", JPEG)
+        store.set("surveyor", GIF)
+        assert to_jpeg.previous is not None and not to_jpeg.previous.exists()
+
+        with pytest.raises(AvatarStaleChange):
+            store.set_from_path("surveyor", to_jpeg.previous, undo_of=to_jpeg.change_id)
 
 
 class TestReset:
@@ -264,7 +407,7 @@ class TestReset:
         store = _store(tmp_path)
         store.set("artist", JPEG)
 
-        kept = store.reset("artist")
+        kept = store.reset("artist").previous
 
         assert kept == tmp_path / PERSONAS / "artist.prev.jpg"
         assert kept is not None and kept.read_bytes() == JPEG
@@ -273,7 +416,7 @@ class TestReset:
         assert found.path == BUILTIN_PERSONAS_DIR / "artist.png"
 
     def test_reset_with_nothing_chosen_changes_nothing(self, tmp_path: Path) -> None:
-        assert _store(tmp_path).reset("artist") is None
+        assert _store(tmp_path).reset("artist").previous is None
 
 
 def _ctx(workspace: Path) -> ToolContext:

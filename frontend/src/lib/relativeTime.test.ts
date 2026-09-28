@@ -72,8 +72,11 @@ describe('exactTimeLabel', () => {
 
   // Killed by: frontend/src/lib/relativeTime.ts :: : new Intl.DateTimeFormat(language, {
   // Becomes: : new Intl.DateTimeFormat('en', {
+  // How the day period is spelled ('오후' or 'PM') depends on the ICU data the runtime
+  // ships: Node 24 writes 오후, the Node 22 in the public CI writes PM. Only the date
+  // order and the time are this function's own.
   it("writes the moment in Korean's own date order", () => {
-    expect(exactTimeLabel(noon, 'ko')).toBe('마지막 활동: 2026. 9. 19. 오후 12:00:05');
+    expect(exactTimeLabel(noon, 'ko')).toMatch(/^마지막 활동: 2026\. 9\. 19\. \S+ 12:00:05$/);
   });
 
   // Killed by: frontend/src/lib/relativeTime.ts :: const when = Number.isNaN(then)

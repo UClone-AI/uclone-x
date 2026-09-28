@@ -20,7 +20,7 @@ import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, ClassVar, Literal, Protocol
@@ -43,7 +43,7 @@ from uclone_x.tools.builtin.media_registry import (
     ModelProfile,
     ModelRegistry,
     PromptFamily,
-    optimize_prompts,
+    fill_prompt_defaults,
 )
 from uclone_x.tools.models import ToolContext, ToolResult
 
@@ -505,6 +505,9 @@ class ImageGenerationResult:
     width: int
     height: int
     mime_type: str = "image/png"
+    #: What the active model family's defaults added to the prompt, or left out of it,
+    #: one plain sentence each (`fill_prompt_defaults`). Set by the dispatcher.
+    prompt_changes: tuple[str, ...] = ()
 
 
 class BaseImageEngine(ABC):
@@ -1915,15 +1918,16 @@ class ImagePipelineDispatcher:
         if await self._draws_with_gemini_now(choice):
             gemini = GeminiImageEngine(choice.gemini, choice.model)
             family = PromptFamily.NATURAL_PROSE
-            gemini_prompt, _ = optimize_prompts(
+            gemini_fill = fill_prompt_defaults(
                 prompt, negative_prompt, gemini_profile(choice.model)
             )
             logger.info("Dispatching image generation to Google Gemini (%s)...", choice.model)
-            return await gemini.draw(
-                style_guided_prompt(gemini_prompt, style, family), aspect_ratio, seed
+            drawn = await gemini.draw(
+                style_guided_prompt(gemini_fill.prompt, style, family), aspect_ratio, seed
             )
+            return replace(drawn, prompt_changes=gemini_fill.changes)
         profile = self.get_active_profile()
-        effective_prompt, effective_negative = optimize_prompts(prompt, negative_prompt, profile)
+        fill = fill_prompt_defaults(prompt, negative_prompt, profile)
         width, height = resolve_aspect_dimensions(aspect_ratio, profile=profile)
         steps, cfg = resolve_sampling(profile)
         attempts = self._local_engines()
@@ -1931,9 +1935,9 @@ class ImagePipelineDispatcher:
         for label, engine in attempts:
             if await engine.is_available():
                 logger.info("Dispatching image generation to %s...", label)
-                return await engine.generate(
-                    prompt=effective_prompt,
-                    negative_prompt=effective_negative,
+                generated = await engine.generate(
+                    prompt=fill.prompt,
+                    negative_prompt=fill.negative_prompt,
                     width=width,
                     height=height,
                     seed=seed,
@@ -1942,6 +1946,7 @@ class ImagePipelineDispatcher:
                     cfg=cfg,
                     family=profile.family,
                 )
+                return replace(generated, prompt_changes=fill.changes)
 
         raise NoImageEngineError(
             "No image generation engine available. Local Private-First enforcement: "
@@ -2018,27 +2023,14 @@ class ImagePipelineDispatcher:
         return f"Google Gemini ({choice.model}) is ready."
 
 
-#: The core grammar of each prompt family, carried by `generate_image`'s description so a
-#: prompt needs one skill load, not two (design §3.1.2). Domain rules are in the skills.
-FAMILY_GRAMMAR: dict[PromptFamily, str] = {
-    PromptFamily.DANBOORU: (
-        "Prompt MUST use English Danbooru tags (e.g. 1girl, solo, armor, glowing sword) "
-        "rather than natural Korean sentences."
-    ),
-    PromptFamily.NATURAL_PROSE: (
-        "Prompt should be descriptive English prose detailing lighting, composition, "
-        "and subject. This model does not use negative prompts; leave negative_prompt empty."
-    ),
-    PromptFamily.GENERIC: "Formulate prompts in English.",
-}
-
-
 class GenerateImageTool(BaseTool[GenerateImageParams]):
     """Agent tool to generate visual illustrations, diagrams, and photos locally.
 
-    `description` is computed on every read, because the agent reads it each time it
-    builds a request and the active checkpoint can change mid-session: one built at
-    construction kept advertising the old model (design §3.1.2).
+    `description` names no model and no prompt family, so switching the checkpoint
+    mid-session leaves the tools layer of the request as it was. The active family's rules
+    reach the prompt in two other ways: `load_skill` returns the section for that family,
+    and `fill_prompt_defaults` fills in, at call time, what the prompt left open, which
+    the result reports under `prompt_changes` (owner ruling on #1723).
     """
 
     name = "generate_image"
@@ -2048,6 +2040,9 @@ class GenerateImageTool(BaseTool[GenerateImageParams]):
         "Runs in this process from a local checkpoint, on a detected local ComfyUI daemon, or on "
         "a local-network CUDA GPU worker — never on a paid cloud service. "
         "Saves the resulting image as an artifact in the workspace. "
+        "Write the prompt in English, whatever language the person wrote in. "
+        "What the prompt leaves out that the image model needs, such as quality tags or a "
+        "negative prompt, is filled in, and the result lists it under prompt_changes. "
         "To present the result to the user, include standard markdown ![description](relative_url) or [title](relative_url)."
     )
     #: The base text while Google Gemini draws, which the local text would misstate.
@@ -2056,6 +2051,8 @@ class GenerateImageTool(BaseTool[GenerateImageParams]):
         "Pictures are drawn by a Google Gemini image model over the internet with the "
         "Gemini API key saved in Settings, so the prompt is sent to Google. "
         "Saves the resulting image as an artifact in the workspace. "
+        "Anything left out of the request, such as a negative prompt this model cannot use, is "
+        "listed in the result under prompt_changes. "
         "To present the result to the user, include standard markdown ![description](relative_url) or [title](relative_url)."
     )
     params_type = GenerateImageParams
@@ -2100,28 +2097,20 @@ class GenerateImageTool(BaseTool[GenerateImageParams]):
     # `__init__` passes no description to `BaseTool`.
     @property
     def description(self) -> str:  # pyright: ignore[reportIncompatibleVariableOverride]
-        """The base text, plus the active model, its family's grammar and the domains.
+        """The base text for the engine that draws, plus the image domains.
 
-        Resolving the profile costs a few `stat` calls. A failure is logged and the base
-        text returned: a broken checkpoint lookup must not take the whole tool listing
-        down with it, and `generate_image` itself reports that failure when it runs.
+        It never names the active model or its prompt family (owner ruling on #1723):
+        it changes only with the picture settings and the skill store. A failure to read
+        them is logged and the base text returned: it must not take the whole tool
+        listing down with it, and `generate_image` itself reports that failure when it runs.
         """
         try:
-            # Asked before the profile, which asks the same question again: under `auto`
-            # both read one look at the local engines, so they cannot disagree.
             gemini = self._dispatcher.draws_with_gemini()
-            profile = self.active_profile()
             domains = self.domain_skill_names()
         except Exception:
-            logger.exception("Could not resolve the active image model for generate_image")
+            logger.exception("Could not read the picture settings for generate_image")
             return self.BASE_DESCRIPTION
-        parts = [
-            self.GEMINI_BASE_DESCRIPTION if gemini else self.BASE_DESCRIPTION,
-            f"Active model: '{profile.model_id}' ({profile.family.value} prompt family).",
-        ]
-        grammar = FAMILY_GRAMMAR.get(profile.family)
-        if grammar:
-            parts.append(grammar)
+        parts = [self.GEMINI_BASE_DESCRIPTION if gemini else self.BASE_DESCRIPTION]
         if domains:
             listed = ", ".join(f"load_skill('{name}')" for name in domains)
             parts.append(
@@ -2255,6 +2244,7 @@ class GenerateImageTool(BaseTool[GenerateImageParams]):
                 )
                 last_engine = gen_result.engine_name
                 last_device = gen_result.device_info
+                batch_changes = list(gen_result.prompt_changes)
                 batch_rel = picture_path_for(clean_rel, gen_result.mime_type)
                 dest_path = resolve_image(batch_rel, context.require_workspace())
                 batch_meta_rel = sidecar_path_for(batch_rel)
@@ -2315,6 +2305,7 @@ class GenerateImageTool(BaseTool[GenerateImageParams]):
                         "mime_type": gen_result.mime_type,
                         "duration_seconds": gen_result.duration_seconds,
                         "prompt": p_text,
+                        "prompt_changes": batch_changes,
                     }
                 )
 
@@ -2425,6 +2416,7 @@ class GenerateImageTool(BaseTool[GenerateImageParams]):
             "mime_type": gen_result.mime_type,
             "duration_seconds": gen_result.duration_seconds,
             "bytes_written": len(gen_result.image_bytes),
+            "prompt_changes": list(gen_result.prompt_changes),
         }
 
     async def execute(

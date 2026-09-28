@@ -7,7 +7,9 @@ What these pin:
   persona's picture. With no agent there is no one to change, and the tool says so.
 * **Which file**: a path in the workspace; one outside it is refused in plain words.
 * **Undo**: the `previous_path` a set returns sets the old picture back, and a first set
-  returns none, so the clone knows to reset instead.
+  returns none, so the clone knows to reset instead. Each call returns the `change_id` of
+  its change; an undo passing it as `undo_of` is refused, with nothing changed, once a
+  later change was made -- by a person in the head, say, while the clone was talking (#1809).
 * **Binding**: in the default catalog, not a writing tool, and named by every shipped
   clone that has a tool list.
 * **No image model**: `generate_image` refuses in plain words with
@@ -139,8 +141,8 @@ class TestWhosePicture:
 
 class TestUndo:
     async def test_previous_path_sets_the_old_picture_back(self, tmp_path: Path) -> None:
-        """Killed by: src/uclone_x/agent/avatar_tool.py :: kept = store.previous(persona) if had_chosen else None
-        Becomes: kept = None
+        """Killed by: src/uclone_x/agent/avatar_tool.py :: "previous_path": _relative(change.previous, workspace),
+        Becomes: "previous_path": None,
         """
         _install(tmp_path, "surveyor")
         tool = SetAvatarTool()
@@ -158,6 +160,72 @@ class TestUndo:
 
         assert undone.success, undone.error
         assert (tmp_path / PERSONAS / "surveyor.png").read_bytes() == PNG
+
+    async def test_each_call_returns_its_change_id_and_an_undo_passes_it_back(
+        self, tmp_path: Path
+    ) -> None:
+        """Killed by: src/uclone_x/agent/avatar_tool.py :: "change_id": change.change_id,
+        Becomes: "change_id": None,
+        """
+        _install(tmp_path, "surveyor")
+        tool = SetAvatarTool()
+        ctx = _ctx(tmp_path, persona="surveyor")
+        first = await tool.execute({"image_path": _image(tmp_path, "a.png", PNG)}, ctx)
+        second = await tool.execute({"image_path": _image(tmp_path, "b.png", OTHER_PNG)}, ctx)
+        assert isinstance(first.output, dict) and isinstance(second.output, dict)
+        assert (first.output["change_id"], second.output["change_id"]) == (1, 2)
+
+        undone = await tool.execute(
+            {"image_path": second.output["previous_path"], "undo_of": second.output["change_id"]},
+            ctx,
+        )
+
+        assert undone.success, undone.error
+        assert isinstance(undone.output, dict)
+        assert undone.output["change_id"] == 3
+        assert (tmp_path / PERSONAS / "surveyor.png").read_bytes() == PNG
+
+    async def test_an_undo_after_a_later_change_is_refused_and_changes_nothing(
+        self, tmp_path: Path
+    ) -> None:
+        """A person changed the picture in the head after the clone's change.
+
+        Killed by: src/uclone_x/agent/avatar_tool.py :: change = store.set_from_path(persona, source, undo_of=params.undo_of)
+        Becomes: change = store.set_from_path(persona, source)
+        """
+        _install(tmp_path, "surveyor")
+        tool = SetAvatarTool()
+        ctx = _ctx(tmp_path, persona="surveyor")
+        await tool.execute({"image_path": _image(tmp_path, "a.png", PNG)}, ctx)
+        mine = await tool.execute({"image_path": _image(tmp_path, "b.png", OTHER_PNG)}, ctx)
+        assert isinstance(mine.output, dict)
+        later = PNG + b"later"
+        await tool.execute({"image_path": _image(tmp_path, "c.png", later)}, ctx)
+
+        undone = await tool.execute(
+            {"image_path": mine.output["previous_path"], "undo_of": mine.output["change_id"]}, ctx
+        )
+
+        assert undone.success is False
+        assert undone.output == {"reason_code": "stale_change"}
+        assert undone.error is not None and "changed again" in undone.error
+        assert (tmp_path / PERSONAS / "surveyor.png").read_bytes() == later
+
+    async def test_a_reset_undo_after_a_later_change_is_refused(self, tmp_path: Path) -> None:
+        """Killed by: src/uclone_x/agent/avatar_tool.py :: change = store.reset(persona, undo_of=params.undo_of)
+        Becomes: change = store.reset(persona)
+        """
+        _install(tmp_path, "surveyor")
+        tool = SetAvatarTool()
+        ctx = _ctx(tmp_path, persona="surveyor")
+        mine = await tool.execute({"image_path": _image(tmp_path, "a.png", PNG)}, ctx)
+        assert isinstance(mine.output, dict) and mine.output["previous_path"] is None
+        await tool.execute({"image_path": _image(tmp_path, "b.png", OTHER_PNG)}, ctx)
+
+        undone = await tool.execute({"reset": True, "undo_of": mine.output["change_id"]}, ctx)
+
+        assert undone.success is False
+        assert (tmp_path / PERSONAS / "surveyor.png").read_bytes() == OTHER_PNG
 
     async def test_reset_goes_back_to_the_shipped_picture(self, tmp_path: Path) -> None:
         ctx = _ctx(tmp_path, persona="artist")

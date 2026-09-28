@@ -232,3 +232,165 @@ class TestARowWrittenBeforeTheFieldsLoadsAsSaved:
             assert kept[key] == value, key
         assert kept["origin"] == "saved"
         assert len(rows) == 2
+
+
+class TestACorrectionIsACorrectedFact:
+    """`correct_fact`: the store half of the dock's Correct (#1638 step 3, design §3.6)."""
+
+    def test_the_new_fact_is_corrected_and_the_old_one_is_kept_retracted(
+        self, tmp_path: Path
+    ) -> None:
+        """Killed by: src/uclone_x/memory/store.py :: origin="corrected",
+        Becomes: origin="saved",
+        Killed by: src/uclone_x/memory/store.py :: "retraction_reason": reason,
+        Becomes: "retraction_reason": "x",
+        """
+        path = tmp_path / "memory.json"
+        memory = CrossSessionMemory(storage_path=path)
+        old = memory.record_fact(
+            subject="Kenny",
+            predicate="lives_in",
+            object_value="Busan",
+            provenance=_provenance(),
+            source_session_id="sess_1",
+            confidence=0.6,
+            source_room_id="room_a",
+            source_turn_id="turn_3",
+        )
+
+        new = memory.correct_fact(old.fact_id, "  Seoul ", _provenance())
+
+        assert (new.origin, new.object_value, new.confidence) == ("corrected", "Seoul", 1.0)
+        assert (new.subject, new.predicate) == ("Kenny", "lives_in")
+        assert (new.source_room_id, new.source_turn_id) == ("room_a", "turn_3")
+        assert new.contradicts_fact_id == old.fact_id
+        reloaded = CrossSessionMemory(storage_path=path)
+        kept = reloaded.get_fact(old.fact_id)
+        assert kept is not None and kept.retracted
+        assert kept.retraction_reason == "corrected by the user"
+        assert [f.object_value for f in reloaded.list_facts()] == ["Seoul"]
+
+    def test_a_retracted_unknown_or_blank_correction_is_refused(self, tmp_path: Path) -> None:
+        memory = CrossSessionMemory(storage_path=tmp_path / "memory.json")
+        fact = memory.record_fact(
+            subject="Kenny",
+            predicate="lives_in",
+            object_value="Busan",
+            provenance=_provenance(),
+            source_session_id="sess_1",
+        )
+        with pytest.raises(ValueError):
+            memory.correct_fact(fact.fact_id, "   ", _provenance())
+        with pytest.raises(KeyError):
+            memory.correct_fact("mem_missing", "Seoul", _provenance())
+        memory.retract_fact(fact.fact_id, "moved", _provenance())
+        with pytest.raises(ValueError):
+            memory.correct_fact(fact.fact_id, "Seoul", _provenance())
+
+    def test_a_fact_another_writer_saved_can_be_corrected_and_forgotten(
+        self, tmp_path: Path
+    ) -> None:
+        """The dashboard's store loaded before a chat saved the fact; the edit still finds it.
+
+        Killed by: src/uclone_x/memory/store.py :: self._absorb_concurrent_writes()  # the fact may be newer than this object
+        Becomes: pass
+        Killed by: src/uclone_x/memory/store.py :: self._absorb_concurrent_writes()  # as retract_fact: find a newer writer's fact
+        Becomes: pass
+        """
+        path = tmp_path / "memory.json"
+        corrector = CrossSessionMemory(storage_path=path)
+        forgetter = CrossSessionMemory(storage_path=path)
+        chat = CrossSessionMemory(storage_path=path)
+        told = chat.record_fact(
+            subject="Kenny",
+            predicate="lives_in",
+            object_value="Busan",
+            provenance=_provenance(),
+            source_session_id="sess_1",
+        )
+        other = chat.record_fact(
+            subject="Kenny",
+            predicate="works_at",
+            object_value="UClone",
+            provenance=_provenance(),
+            source_session_id="sess_1",
+        )
+
+        corrector.correct_fact(told.fact_id, "Seoul", _provenance())
+        forgetter.retract_fact(other.fact_id, "forgotten by the user", _provenance())
+
+        on_disk = CrossSessionMemory(storage_path=path)
+        assert [f.object_value for f in on_disk.list_facts()] == ["Seoul"]
+
+
+class TestARetryAfterAFailedSaveWrites:
+    """A Forget or Correct whose save raised leaves nothing changed, so the retry saves.
+
+    The dock returns 500 when the save fails and the person presses the button again.
+    Both tests make the first `os.replace` raise, retry, and read the result back from disk.
+    """
+
+    @staticmethod
+    def _fail_the_next_replace(monkeypatch: pytest.MonkeyPatch) -> None:
+        import os
+
+        real_replace = os.replace
+        calls = {"n": 0}
+
+        def replace_once_failing(src: str, dst: object) -> None:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise OSError(28, "No space left on device")
+            real_replace(src, dst)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(os, "replace", replace_once_failing)
+
+    @staticmethod
+    def _told(memory: CrossSessionMemory) -> MemoryFact:
+        return memory.record_fact(
+            subject="Kenny",
+            predicate="lives_in",
+            object_value="Busan",
+            provenance=_provenance(),
+            source_session_id="sess_1",
+        )
+
+    def test_a_retried_forget_is_on_disk(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Killed by: src/uclone_x/memory/store.py :: self._facts = held
+        Becomes: pass
+        """
+        path = tmp_path / "memory.json"
+        memory = CrossSessionMemory(storage_path=path)
+        fact = self._told(memory)
+        self._fail_the_next_replace(monkeypatch)
+
+        with pytest.raises(OSError):
+            memory.retract_fact(fact.fact_id, "forgotten by the user", _provenance())
+        memory.retract_fact(fact.fact_id, "forgotten by the user", _provenance())
+
+        kept = CrossSessionMemory(storage_path=path).get_fact(fact.fact_id)
+        assert kept is not None and kept.retracted
+        assert kept.retraction_reason == "forgotten by the user"
+
+    def test_a_retried_correct_is_on_disk(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Killed by: src/uclone_x/memory/store.py :: self._facts = held
+        Becomes: pass
+        """
+        path = tmp_path / "memory.json"
+        memory = CrossSessionMemory(storage_path=path)
+        fact = self._told(memory)
+        self._fail_the_next_replace(monkeypatch)
+
+        with pytest.raises(OSError):
+            memory.correct_fact(fact.fact_id, "Seoul", _provenance())
+        assert [f.object_value for f in memory.list_facts()] == ["Busan"]
+        memory.correct_fact(fact.fact_id, "Seoul", _provenance())
+
+        on_disk = CrossSessionMemory(storage_path=path)
+        assert [f.object_value for f in on_disk.list_facts()] == ["Seoul"]
+        old = on_disk.get_fact(fact.fact_id)
+        assert old is not None and old.retracted

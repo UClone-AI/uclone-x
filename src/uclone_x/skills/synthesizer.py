@@ -1,15 +1,16 @@
-"""Autonomous dynamic skill synthesis pipeline conforming to Principle 9.
+"""Skill synthesis from a recorded session (Principle 9).
 
-Extracts reusable workflow steps from session events/traces, generates sandboxed
-Python execution modules, LinkML-compatible manifest.yaml, and SKILL.md packages
-into quarantine (status=pending), and integrates with SkillAuditor and SkillRegistry.
+Extracts the steps a session took from its trace or events and writes them into quarantine
+as a prompt-only `SKILL.md` package (`status: pending`): when to use the skill, then the
+steps as instructions, with no script (#1810, owner ruling 2026-09-27). The package does
+nothing until a person approves it with `ucx skill approve`, which pins its digest.
 """
 
 from __future__ import annotations
 
-import ast
 import json
 import re
+import unicodedata
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, cast
@@ -44,6 +45,11 @@ _NO_SESSION_STEPS = (
     "into a skill."
 )
 
+#: Why a description holding `---` is refused.
+_DESCRIPTION_HOLDS_A_DELIMITER = (
+    "The description cannot contain '---', because that marks the end of the skill's header."
+)
+
 
 def _to_json_serializable(obj: object) -> Any:
     """Recursively convert MappingProxy and sequences into JSON-serializable primitives."""
@@ -55,17 +61,60 @@ def _to_json_serializable(obj: object) -> Any:
     return obj
 
 
-def _docstring_text(text: str) -> str:
-    """`text` made safe inside a generated triple-quoted docstring, one line."""
-    return text.replace("\\", "\\\\").replace('"', '\\"').replace("\r", " ").replace("\n", " ")
+#: Characters that end a line, or a paragraph, in some reader: each becomes a space.
+_BREAKS: re.Pattern[str] = re.compile(r"[\t\n\v\f\r\x1c-\x1f\x85\u2028\u2029]+")
+
+#: Markdown punctuation that can start a heading, emphasis, a link, a code span, a table
+#: cell, strikethrough, an entity or inline HTML (an HTML comment hides its text when the
+#: package is shown rendered). Each is written with a backslash before it, which CommonMark
+#: reads as the plain character.
+_MARKDOWN_PUNCTUATION: re.Pattern[str] = re.compile(r"([\\`*_\[\]<>#|~&])")
+
+#: A line that starts with one of these would open a list item or a setext underline.
+_BLOCK_START: re.Pattern[str] = re.compile(r"^(\d+)([.)])|^([-+=])")
+
+#: What a synthesized skill says about itself, under its title.
+_SYNTHESIZED_NOTE = (
+    "Synthesized from a recorded session. It is instructions only and carries no script."
+)
+
+#: The "When to use" text when the person gave no description.
+_DEFAULT_WHEN_TO_USE = (
+    "When a task calls for the steps below, as the session this skill was recorded from did."
+)
+
+#: The line before the steps.
+_STEPS_LEAD = (
+    "Follow these steps in order. They were recorded from one session, so adapt names, "
+    "paths and values to the task at hand."
+)
+
+
+def _one_line(text: str) -> str:
+    """`text` as one line: breaks become spaces, control and format characters are dropped.
+
+    Format characters (Unicode category Cf) include the bidirectional overrides that can
+    make text read differently from what it holds.
+    """
+    flat = _BREAKS.sub(" ", text)
+    kept = "".join(ch for ch in flat if unicodedata.category(ch) not in ("Cc", "Cf"))
+    return " ".join(kept.split())
+
+
+def _markdown_text(text: str) -> str:
+    """`text` as one line of Markdown that reads as the plain text it holds."""
+    escaped = _MARKDOWN_PUNCTUATION.sub(r"\\\1", _one_line(text))
+    return _BLOCK_START.sub(
+        lambda m: f"{m[1]}\\{m[2]}" if m[1] is not None else f"\\{m[3]}", escaped
+    )
 
 
 class SkillSynthesizer(SkillSynthesizerProtocol):
-    """Autonomous skill distillation engine implementing SkillSynthesizerProtocol (P9).
+    """Skill distillation implementing SkillSynthesizerProtocol (P9).
 
-    Discovers workflow patterns from session traces or turn event logs, synthesizes
-    quarantined packages (`status: pending`), generates sandboxed Python code and
-    `manifest.yaml` / `SKILL.md` artifacts, and connects to `SkillAuditor`.
+    Extracts the steps from a session's trace or turn events and writes them as a
+    quarantined, prompt-only `SKILL.md` package (`status: pending`); `synthesize_and_audit`
+    also runs the `SkillAuditor` over it.
     """
 
     def __init__(
@@ -259,117 +308,34 @@ class SkillSynthesizer(SkillSynthesizerProtocol):
         # which synthesized a skill out of nothing and reported it as distilled (P6).
         raise SkillAuditError(_NO_SESSION_STEPS.format(session_id=session_id))
 
-    def generate_skill_code(
+    def format_instructions(
         self,
         task_name: str,
         workflow_steps: Sequence[str],
-        description: str = "",
+        when_to_use: str | None = None,
     ) -> str:
-        """Generate sandboxed Python code (main.py) implementing the skill workflow."""
-        # A step is free text from a trace, so it is written as a `repr` literal, which is
-        # valid Python for any string -- quotes, backslashes and newlines included. The
-        # docstring copy is escaped separately: a docstring cannot hold `repr` output.
-        steps_doc = "\n".join(
-            f"        {i + 1}. {_docstring_text(step)}" for i, step in enumerate(workflow_steps)
-        )
-        steps_quoted = ",\n".join(f"            {step!r}" for step in workflow_steps)
-        name_doc = _docstring_text(task_name)
+        """The `SKILL.md` body: when to use the skill, then the steps as instructions.
 
-        code = f'''"""Synthesized skill: {name_doc}
+        Every step is free text from a recorded session, so each is written as one line of
+        escaped Markdown text (`_markdown_text`): it cannot open a heading, a code block, an
+        HTML comment or a new list item, and so cannot hide text from the person reading
+        the package before approving it, or pose as another section of it.
 
-Autonomously generated by UClone-X Skill Synthesizer (Principle 9).
-"""
-
-from __future__ import annotations
-
-from typing import Any
-
-
-def execute_workflow(inputs: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Execute the synthesized {name_doc} workflow steps.
-
-    Workflow steps:
-{steps_doc}
-    """
-    context_inputs = inputs or {{}}
-    results: dict[str, Any] = {{
-        "status": "success",
-        "skill": {task_name!r},
-        "inputs": context_inputs,
-        "steps_executed": [
-{steps_quoted}
-        ],
-    }}
-    return results
-
-
-def main() -> None:
-    """CLI entrypoint for standalone skill invocation."""
-    out = execute_workflow()
-    print(f"Executed skill {{out['skill']!r}}: {{out['status']}}")
-
-
-if __name__ == "__main__":
-    main()
-'''
-        # Verify generated code parses cleanly with Python AST
-        try:
-            ast.parse(code, filename="main.py")
-        except SyntaxError as exc:
-            raise SkillAuditError(f"Generated skill code failed AST validation: {exc}") from exc
-
-        return code
-
-    def generate_manifest_yaml(
-        self,
-        manifest: SkillManifest,
-        workflow_steps: Sequence[str],
-    ) -> str:
-        """Generate LinkML-compatible manifest.yaml schema specification for the skill."""
-        manifest_data: dict[str, Any] = {
-            "id": f"https://uclone.ai/skills/{manifest.name}",
-            "name": manifest.name,
-            "description": manifest.description,
-            "version": manifest.version,
-            "origin": manifest.origin.value,
-            "status": manifest.status.value,
-            "requested_isolation": (
-                manifest.requested_isolation.value if manifest.requested_isolation else "workspace"
-            ),
-            "entrypoint": manifest.entrypoint or "main.py",
-            "scripts": list(manifest.scripts) if manifest.scripts else ["main.py"],
-            "tags": list(manifest.tags) if manifest.tags else ["synthesized", manifest.name],
-            "workflow_steps": list(workflow_steps),
-        }
-        if manifest.author:
-            manifest_data["author"] = manifest.author
-        if manifest.content_sha256:
-            manifest_data["content_sha256"] = manifest.content_sha256
-
-        return yaml.dump(manifest_data, sort_keys=False)
-
-    def _format_instructions(
-        self,
-        task_name: str,
-        description: str,
-        workflow_steps: Sequence[str],
-    ) -> str:
-        """Format markdown body for SKILL.md."""
+        Raises:
+            ValueError: No step has any text left once it is made one plain line.
+        """
+        steps = [text for text in (_markdown_text(step) for step in workflow_steps) if text]
+        if not steps:
+            raise ValueError("workflow_steps cannot be empty.")
         title = task_name.replace("_", " ").replace("-", " ").title()
-        steps_list = "\n".join(f"{i + 1}. {step}" for i, step in enumerate(workflow_steps))
-
-        return f"""# {title} Skill
-
-## Description
-{description}
-
-## Step-by-Step Workflow
-{steps_list}
-
-## Execution Notes
-This skill package is autonomously synthesized and executes within an isolated sandbox
-environment adhering to Principle P3 (Sandboxing) and Principle P9 (Dynamic Skills).
-"""
+        when = _markdown_text(when_to_use or "") or _DEFAULT_WHEN_TO_USE
+        steps_list = "\n".join(f"{i + 1}. {step}" for i, step in enumerate(steps))
+        return (
+            f"# {_markdown_text(title)}\n\n"
+            f"{_SYNTHESIZED_NOTE}\n\n"
+            f"## When to use\n\n{when}\n\n"
+            f"## Steps\n\n{_STEPS_LEAD}\n\n{steps_list}\n"
+        )
 
     async def synthesize_skill(
         self,
@@ -381,9 +347,17 @@ environment adhering to Principle P3 (Sandboxing) and Principle P9 (Dynamic Skil
         requested_isolation: IsolationLevel | None = None,
         author: str | None = None,
     ) -> SkillManifest:
-        """Write a SKILL.md package into quarantine and return its manifest.
+        """Write a prompt-only `SKILL.md` package into quarantine and return its manifest.
 
-        Conforms strictly to SkillSynthesizerProtocol.
+        The package is the one file `SKILL.md`: its frontmatter says `origin: synthesized`
+        and `status: pending`, and its body says when to use the skill and gives the steps
+        as instructions (`format_instructions`). It carries no script (#1810). A pending
+        package is inert: it becomes active only through `ucx skill approve`, which pins its
+        digest in the approvals ledger.
+
+        Raises:
+            ValueError: The name is not an identifier, no step has any text, or the
+                description holds `---`, which would end the `SKILL.md` header early.
         """
         clean_name = task_name.strip().lower()
         if not clean_name or not _IDENTIFIER_PATTERN.match(clean_name):
@@ -392,8 +366,12 @@ environment adhering to Principle P3 (Sandboxing) and Principle P9 (Dynamic Skil
                 f"with underscores or hyphens."
             )
 
-        if not workflow_steps:
-            raise ValueError("workflow_steps cannot be empty.")
+        # The description is written into the header, which the loader ends at the first
+        # `---` it finds, so one inside it would cut the header short.
+        given = _one_line(description or "")
+        if "---" in given:
+            raise ValueError(_DESCRIPTION_HOLDS_A_DELIMITER)
+        instructions = self.format_instructions(clean_name, workflow_steps, given)
 
         # Determine target skill directory
         if quarantine_dir.name == clean_name:
@@ -403,50 +381,20 @@ environment adhering to Principle P3 (Sandboxing) and Principle P9 (Dynamic Skil
 
         skill_dir.mkdir(parents=True, exist_ok=True)
 
-        desc = description or f"Autonomously synthesized skill for {clean_name}"
-        isolation = requested_isolation or self._default_isolation
-
-        # 1. Generate sandboxed Python module (main.py)
-        code = self.generate_skill_code(
-            task_name=clean_name,
-            workflow_steps=workflow_steps,
-            description=desc,
-        )
-        main_py = skill_dir / "main.py"
-        main_py.write_text(code, encoding="utf-8")
-
-        # 2. Build initial SkillManifest
-        initial_manifest = SkillManifest(
+        manifest = SkillManifest(
             name=clean_name,
-            description=desc,
+            description=given or f"Synthesized from a recorded session: {clean_name}",
             version="0.1.0",
             author=author or "agent:synthesizer",
             origin=SkillOrigin.SYNTHESIZED,
             status=SkillStatus.PENDING,
-            requested_isolation=isolation,
-            entrypoint="main.py",
-            scripts=("main.py",),
+            requested_isolation=requested_isolation or self._default_isolation,
             tags=tags or ("synthesized", clean_name),
         )
+        save_skill(skill_dir, manifest, instructions)
 
-        # 3. Generate LinkML manifest.yaml
-        manifest_yaml = self.generate_manifest_yaml(
-            manifest=initial_manifest,
-            workflow_steps=workflow_steps,
-        )
-        (skill_dir / "manifest.yaml").write_text(manifest_yaml, encoding="utf-8")
-
-        # 4. Generate SKILL.md
-        instructions = self._format_instructions(
-            task_name=clean_name,
-            description=desc,
-            workflow_steps=workflow_steps,
-        )
-        save_skill(skill_dir, initial_manifest, instructions)
-
-        # 5. Compute SHA-256 content hash of quarantine files
         content_hash = compute_skill_sha256(skill_dir)
-        return initial_manifest.model_copy(update={"content_sha256": content_hash})
+        return manifest.model_copy(update={"content_sha256": content_hash})
 
     async def synthesize_and_audit(
         self,

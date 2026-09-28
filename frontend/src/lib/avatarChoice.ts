@@ -1,4 +1,4 @@
-import { createContext, useContext, useSyncExternalStore } from 'react';
+import { createContext, useContext } from 'react';
 import type { RoomState } from '../types';
 import { personaAvatarUrl } from './personaAvatar';
 
@@ -24,10 +24,18 @@ export interface AvatarChoice {
   /** Called after a picture changed, so every surface that shows one reads it again. */
   onChanged: () => void;
   /**
+   * The id of the latest change to each clone's picture, as the listing last gave it
+   * (`avatar_change_id`), made anywhere: this tab, another one, or the clone itself. An
+   * Undo is shown only while its change is not behind this. Absent for a clone the listing
+   * carries no id for.
+   */
+  latestChanges?: AvatarChangeIds;
+  /**
    * Open a conversation with this clone with a request for a picture waiting in the box.
    * It is not sent: the person reads it, changes it if they like, and sends it themselves.
+   * `request` is the sentence to put there, already in the person's language.
    */
-  askFor: (name: string) => void;
+  askFor: (name: string, request: string) => void;
 }
 
 export const AvatarChoiceContext = createContext<AvatarChoice | null>(null);
@@ -50,6 +58,38 @@ export const useAvatarAuthor = () => useContext(AvatarAuthorContext);
 export const personaOfSeat = (room: RoomState, participantId: string): string => {
   const seat = room.participants.find((p) => p.id === participantId);
   return seat?.persona || participantId;
+};
+
+/** Each clone's latest picture change id, by name. */
+export type AvatarChangeIds = Readonly<Record<string, number>>;
+
+/** The `avatar_change_id` of every listed persona that carries one. */
+export const avatarChangeIdsOf = (
+  personas: readonly { name: string; avatar_change_id?: number }[] | undefined,
+): AvatarChangeIds => {
+  const ids: Record<string, number> = {};
+  for (const persona of personas ?? []) {
+    if (typeof persona.avatar_change_id === 'number') ids[persona.name] = persona.avatar_change_id;
+  }
+  return ids;
+};
+
+/**
+ * Whether the Undo of change `changeId` to `name`'s picture is still worth showing.
+ *
+ * Not once the listing says a later change was made, since the runtime would refuse it. A
+ * listing not yet read again since this change says an earlier id, which is not a later
+ * change. No id at all (a runtime that sends none) offers no Undo: the runtime could not
+ * check it.
+ */
+export const undoStillOffered = (
+  changeId: number | null,
+  name: string,
+  latest: AvatarChangeIds | undefined,
+): boolean => {
+  if (changeId === null) return false;
+  const known = latest?.[name];
+  return known === undefined || known <= changeId;
 };
 
 /** Each clone's `avatar_url`, by name: `null` for a clone with no picture. */
@@ -108,10 +148,16 @@ export type AvatarFailure =
   | 'noWorkspace'
   | 'outsideWorkspace'
   | 'noFile'
+  | 'staleChange'
   | 'failed';
 
+/**
+ * A change made: `previousPath` is what undoing it puts back (`null`: undoing resets), and
+ * `changeId` the runtime's id for it, which the Undo sends so the runtime can refuse it
+ * once a later change was made. `null` when the runtime sent none.
+ */
 export type AvatarResult =
-  | { ok: true; previousPath: string | null }
+  | { ok: true; previousPath: string | null; changeId: number | null }
   | { ok: false; failure: AvatarFailure };
 
 const FAILURE_OF_CODE: Readonly<Record<string, AvatarFailure>> = {
@@ -122,6 +168,7 @@ const FAILURE_OF_CODE: Readonly<Record<string, AvatarFailure>> = {
   no_workspace: 'noWorkspace',
   outside_workspace: 'outsideWorkspace',
   no_file: 'noFile',
+  stale_change: 'staleChange',
 };
 
 const failureOf = (status: number, code: unknown): AvatarFailure => {
@@ -140,25 +187,27 @@ const codeOf = async (res: Response): Promise<unknown> => {
   }
 };
 
-async function change(name: string, init: RequestInit): Promise<AvatarResult> {
+async function change(name: string, init: RequestInit, query = ''): Promise<AvatarResult> {
   let res: Response;
   try {
-    res = await fetch(personaAvatarUrl(name), init);
+    res = await fetch(personaAvatarUrl(name) + query, init);
   } catch {
     return { ok: false, failure: 'unreachable' };
   }
   if (!res.ok) return { ok: false, failure: failureOf(res.status, await codeOf(res)) };
   let previousPath: string | null = null;
+  let changeId: number | null = null;
   try {
     const body: unknown = await res.json();
     if (typeof body === 'object' && body !== null) {
-      const raw = (body as { previous_path?: unknown }).previous_path;
+      const { previous_path: raw, change_id: id } = body as { previous_path?: unknown; change_id?: unknown };
       if (typeof raw === 'string' && raw !== '') previousPath = raw;
+      if (typeof id === 'number' && Number.isInteger(id)) changeId = id;
     }
   } catch {
-    // The picture changed; an answer without a readable body only loses the Undo target.
+    // The picture changed; an answer without a readable body only loses the Undo.
   }
-  return { ok: true, previousPath };
+  return { ok: true, previousPath, changeId };
 }
 
 /** Give `name` the picture at `path`, a file in the workspace such as a drawn image. */
@@ -181,9 +230,24 @@ export const uploadAvatar = (name: string, file: File): Promise<AvatarResult> =>
 export const resetAvatar = (name: string): Promise<AvatarResult> =>
   change(name, { method: 'DELETE' });
 
-/** Take back a change: put back the picture it replaced, or reset when there was none. */
-export const undoAvatarChange = (name: string, previousPath: string | null): Promise<AvatarResult> =>
-  previousPath ? setAvatarFromPath(name, previousPath) : resetAvatar(name);
+/**
+ * Take back change `changeId`: put back the picture it replaced, or reset when there was none.
+ *
+ * The id goes with it, so the runtime makes the undo only while that change is still the
+ * latest and otherwise refuses it as `staleChange`, having changed nothing.
+ */
+export const undoAvatarChange = (
+  name: string,
+  previousPath: string | null,
+  changeId: number,
+): Promise<AvatarResult> =>
+  previousPath
+    ? change(name, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ source_path: previousPath, undo_of: changeId }),
+      })
+    : change(name, { method: 'DELETE' }, `?undo_of=${changeId}`);
 
 /** The formats the upload offers. GIF is also accepted by the runtime, but not offered. */
 export const UPLOAD_TYPES = ['image/png', 'image/jpeg', 'image/webp'] as const;
@@ -216,35 +280,6 @@ export const uploadProblem = (file: {
   if (file.size > MAX_UPLOAD_BYTES) return 'tooLarge';
   return null;
 };
-
-/**
- * The last change made to each clone's picture from this head, as a count.
- *
- * An Undo puts back what one change replaced, so it is only right while that change is
- * still the latest: after a later one it would put back the wrong picture, or reset a newer
- * choice. Each place that offers an Undo notes the count its change left and shows the
- * Undo only while the count is the same.
- */
-const changeCounts = new Map<string, number>();
-const changeListeners = new Set<() => void>();
-
-/** Note that `name`'s picture changed; returns the count this change left. */
-export const noteAvatarChange = (name: string): number => {
-  const next = (changeCounts.get(name) ?? 0) + 1;
-  changeCounts.set(name, next);
-  for (const listener of changeListeners) listener();
-  return next;
-};
-
-/** The count the latest change to `name`'s picture left; `0` before any. */
-export const useLatestAvatarChange = (name: string | null): number =>
-  useSyncExternalStore(
-    (listener) => {
-      changeListeners.add(listener);
-      return () => changeListeners.delete(listener);
-    },
-    () => (name === null ? 0 : (changeCounts.get(name) ?? 0)),
-  );
 
 /**
  * Whether a drawn picture at `path` is one a clone can wear. The runtime takes PNG, JPEG,

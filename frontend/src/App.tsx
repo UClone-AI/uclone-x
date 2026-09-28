@@ -42,9 +42,11 @@ import { CoreFailure } from './lib/coreFailure';
 import { OpenInDocsContext, defaultSeat } from './lib/roomDock';
 import {
   AvatarChoiceContext,
+  avatarChangeIdsOf,
   avatarUrlsOf,
   personaOfSeat,
   type AvatarChoice,
+  type AvatarChangeIds,
   type AvatarUrls,
 } from './lib/avatarChoice';
 import { savePersona } from './lib/personasApi';
@@ -957,6 +959,12 @@ export function App() {
    */
   const avatarUrlsKey = JSON.stringify(avatarUrlsOf(personas));
   const avatarUrls = useMemo<AvatarUrls>(() => JSON.parse(avatarUrlsKey) as AvatarUrls, [avatarUrlsKey]);
+  /** Each clone's latest picture change id, keyed the same way, for the Undo offers. */
+  const avatarChangeIdsKey = JSON.stringify(avatarChangeIdsOf(personas));
+  const avatarChangeIds = useMemo<AvatarChangeIds>(
+    () => JSON.parse(avatarChangeIdsKey) as AvatarChangeIds,
+    [avatarChangeIdsKey],
+  );
   /**
    * A request for pictures put in the open conversation's box, from the profile's menu. It
    * names its conversation and reaches the composer only there, so opening another one does
@@ -968,7 +976,6 @@ export function App() {
   useEffect(() => setInsertDraft(null), [currentRoomId]);
   const currentIsGroup = currentRoomId !== null && groupRoomIds.includes(currentRoomId);
   const openCloneName = room && seatedCloneId && !currentIsGroup ? personaOfSeat(room, seatedCloneId) : null;
-  const askText = copy.avatar.askText;
   /**
    * What every place that changes a clone's picture is handed.
    *
@@ -981,7 +988,8 @@ export function App() {
     () => ({
       clones: personas.map((p) => ({ name: p.name, label: p.name })),
       onChanged: () => void fetchAllMetadata(),
-      askFor: (name: string) => {
+      latestChanges: avatarChangeIds,
+      askFor: (name: string, askText: string) => {
         setCloneStudioRequested(false);
         if (openCloneName === name && currentRoomId !== null) {
           setInsertDraft({ id: Date.now(), text: askText, roomId: currentRoomId });
@@ -992,7 +1000,7 @@ export function App() {
       },
     }),
     // `closeOverlaidRail` is re-made every render and reads only `railIsOverlaid`.
-    [personas, fetchAllMetadata, openCloneName, currentRoomId, askText, handleNewRoom, railIsOverlaid],
+    [personas, avatarChangeIds, fetchAllMetadata, openCloneName, currentRoomId, handleNewRoom, railIsOverlaid],
   );
 
   useEffect(() => {

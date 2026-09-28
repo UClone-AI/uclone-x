@@ -228,29 +228,23 @@ export interface RoomTopology {
   reason: string | null;
 }
 
-export interface RememberedStatement {
-  statement: string;
-  subject: string;
-  relation: string;
-  object: string;
-  /** The conversation it was learned in; `null` is "not recorded", not "nowhere". */
-  source_session_id: string | null;
-  confidence: number | null;
-  /** True when the clone worked it out from other things it knew, rather than was told. */
-  learned: boolean;
-}
+/** How a fact came to be in the clone's memory (clone-knowledge-graph §3.2). */
+export type FactOrigin = 'told' | 'found' | 'saved' | 'corrected';
 
-/** A fact the clone saved to its own memory (#1401). */
-export interface SavedFact {
+/** One fact the clone knows, from its own memory (#1638 step 3). */
+export interface KnownFact {
+  fact_id: string;
   statement: string;
   subject: string;
-  relation: string;
-  object: string;
-  /** The conversation it was saved in; `null` is "not recorded", not "nowhere". */
-  source_session_id: string | null;
-  /** True when it was saved in the conversation on screen. */
-  saved_here: boolean;
+  predicate: string;
+  object_value: string;
+  origin: FactOrigin;
+  /** True when it was learned in the conversation on screen. */
+  learned_here: boolean;
+  /** The turn it was learned in; `null` is "not recorded", not "no turn". */
+  source_turn_id: string | null;
   confidence: number | null;
+  created_at: string | null;
 }
 
 /**
@@ -266,14 +260,14 @@ export type SeatKnowledge = {
   session_id: string;
   status: 'ok' | 'not_recorded' | 'unreadable' | 'no_ontology';
   reason: string | null;
-  remembers: RememberedStatement[] | null;
   /**
-   * The facts this clone saved to its own memory, on every status (#1401): they belong to
-   * the clone, not to this conversation's record. `null` when they could not be read;
-   * `saved_facts_reason` says so, and says when none are listed.
+   * What the clone knows, one clone-wide list on every status (#1638 step 3): the facts in
+   * its own memory, each with `learned_here`. `null` when they could not be read;
+   * `facts_reason` says so, and says when none are listed. `status`, `reason` and the
+   * graph fields describe the per-seat record, for the developer graph only.
    */
-  saved_facts: SavedFact[] | null;
-  saved_facts_reason: string | null;
+  facts: KnownFact[] | null;
+  facts_reason: string | null;
 } & (
   | ({ status: 'ok' } & KnowledgeGraphResponse)
   | {
@@ -296,6 +290,8 @@ export const roomDockUrls = {
   topology: (roomId: string): string => `/api/rooms/${enc(roomId)}/topology`,
   knowledge: (roomId: string, seatId: string): string =>
     `/api/rooms/${enc(roomId)}/knowledge?agent_id=${enc(seatId)}`,
+  memoryFact: (agentId: string, factId: string): string =>
+    `/api/agents/${enc(agentId)}/memory/${enc(factId)}`,
 };
 
 /** A failed read: `message` is technical, `fault` is what a U0 surface may say. */
@@ -331,6 +327,38 @@ async function readOrThrow<T>(res: Response): Promise<T> {
       kind: 'unreadable',
       detail: null,
     });
+  }
+}
+
+/**
+ * How a Correct or Forget ended. A refusal carries its HTTP status only: the head says a
+ * sentence of its own for it, in the reader's language, and never the transport's words.
+ * `status` is `null` when the Core could not be reached.
+ */
+export type MemoryEditOutcome = { ok: true } | { ok: false; status: number | null };
+
+/**
+ * Correct (`value` given) or Forget (`value` null) one of a clone's facts (#1638 step 3).
+ * Never throws.
+ */
+export async function editMemoryFact(
+  agentId: string,
+  factId: string,
+  value: string | null,
+): Promise<MemoryEditOutcome> {
+  const init: RequestInit =
+    value === null
+      ? { method: 'DELETE' }
+      : {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ value }),
+        };
+  try {
+    const res = await fetch(roomDockUrls.memoryFact(agentId, factId), init);
+    return res.ok ? { ok: true } : { ok: false, status: res.status };
+  } catch {
+    return { ok: false, status: null };
   }
 }
 

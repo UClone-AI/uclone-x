@@ -36,18 +36,19 @@ const choice = (over: Partial<AvatarChoice> = {}): AvatarChoice => ({
   ...over,
 });
 
-const renderCard = (
+const card = (
   { value = choice(), author = 'scout' as string | null, korean = false, content = REPLY } = {},
-) =>
-  render(
-    <LocaleProvider hints={[korean ? 'ko-KR' : 'en-US']}>
-      <AvatarChoiceContext.Provider value={value}>
-        <AvatarAuthorContext.Provider value={author}>
-          <RichText content={content} />
-        </AvatarAuthorContext.Provider>
-      </AvatarChoiceContext.Provider>
-    </LocaleProvider>,
-  );
+) => (
+  <LocaleProvider hints={[korean ? 'ko-KR' : 'en-US']}>
+    <AvatarChoiceContext.Provider value={value}>
+      <AvatarAuthorContext.Provider value={author}>
+        <RichText content={content} />
+      </AvatarAuthorContext.Provider>
+    </AvatarChoiceContext.Provider>
+  </LocaleProvider>
+);
+
+const renderCard = (options: Parameters<typeof card>[0] = {}) => render(card(options));
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -88,11 +89,11 @@ describe('Use as avatar, under a drawn picture', () => {
     expect(screen.queryByTestId('use-as-avatar-list')).toBeNull();
   });
 
-  // Killed by: frontend/src/components/avatar/UseAsAvatar.tsx :: onClick={() => void undo(outcome.name, outcome.previousPath)}
-  // Becomes: onClick={() => void undo(outcome.name, null)}
+  // Killed by: frontend/src/components/avatar/UseAsAvatar.tsx :: onClick={() => void undo(outcome.name, outcome.previousPath, outcome.changeId)}
+  // Becomes: onClick={() => void undo(outcome.name, null, outcome.changeId)}
   it('undoes by putting back the picture the change replaced', async () => {
     const calls = pictureRoutes(
-      answer(200, { status: 'ok', previous_path: '.uclone/personas/scout.prev.png' }),
+      answer(200, { status: 'ok', previous_path: '.uclone/personas/scout.prev.png', change_id: 7 }),
       answer(200, { status: 'ok' }),
     );
     const value = choice();
@@ -104,7 +105,7 @@ describe('Use as avatar, under a drawn picture', () => {
     await waitFor(() => expect(screen.getByTestId('use-as-avatar-undone')).toBeInTheDocument());
     const [, init] = calls[1];
     expect(init.method).toBe('PUT');
-    expect(JSON.parse(init.body as string)).toEqual({ source_path: '.uclone/personas/scout.prev.png' });
+    expect(JSON.parse(init.body as string)).toEqual({ source_path: '.uclone/personas/scout.prev.png', undo_of: 7 });
     expect(value.onChanged).toHaveBeenCalledTimes(2);
   });
 
@@ -141,18 +142,17 @@ describe('Use as avatar, under a drawn picture', () => {
     expect(screen.queryByTestId('use-as-avatar')).toBeNull();
   });
 
-  // Killed by: frontend/src/components/avatar/UseAsAvatar.tsx :: {latest === outcome.change && (
+  // Killed by: frontend/src/components/avatar/UseAsAvatar.tsx :: {undoStillOffered(outcome.changeId, outcome.name, choice.latestChanges) && (
   // Becomes: {true && (
   it('drops its Undo once a later change is made to the same clone`s picture (#1780)', async () => {
     // Undo puts back what its own change replaced; after a later change that would put
     // back the wrong picture, or reset the newer choice.
     pictureRoutes(
-      answer(200, { status: 'ok', previous_path: '.uclone/personas/scout.prev.png' }),
-      answer(200, { status: 'ok', previous_path: '.uclone/personas/scout.prev.png' }),
+      answer(200, { status: 'ok', previous_path: '.uclone/personas/scout.prev.png', change_id: 1 }),
+      answer(200, { status: 'ok', previous_path: '.uclone/personas/scout.prev.png', change_id: 2 }),
     );
-    renderCard({
-      content: `![A](/api/artifacts/content?path=artifacts/images/a.png)\n\n![B](/api/artifacts/content?path=artifacts/images/b.png)`,
-    });
+    const content = `![A](/api/artifacts/content?path=artifacts/images/a.png)\n\n![B](/api/artifacts/content?path=artifacts/images/b.png)`;
+    const { rerender } = renderCard({ content });
     const [first, second] = screen.getAllByTestId('use-as-avatar-btn');
 
     fireEvent.click(first);
@@ -160,6 +160,8 @@ describe('Use as avatar, under a drawn picture', () => {
     fireEvent.click(second);
 
     await waitFor(() => expect(screen.getAllByTestId('use-as-avatar-done')).toHaveLength(2));
+    // The listing, read again after the second change, names it as the latest.
+    rerender(card({ content, value: choice({ latestChanges: { scout: 2 } }) }));
     // Only the later card still offers an Undo.
     const cards = screen.getAllByTestId('use-as-avatar');
     expect(cards[0].querySelector('[data-testid="use-as-avatar-undo"]')).toBeNull();
@@ -204,5 +206,25 @@ describe('Use as avatar, under a drawn picture', () => {
     const failed = await screen.findByTestId('use-as-avatar-failed');
     expectPlain(failed.textContent);
     expect(failed.textContent).toMatch(/니다/);
+  });
+
+  // Killed by: frontend/src/components/avatar/UseAsAvatar.tsx :: setOutcome({ kind: 'failed', name, failure });
+  // Becomes: void failure;
+  it('says in Korean that an Undo came too late, and offers it no more (#1809)', async () => {
+    pictureRoutes(
+      answer(200, { status: 'ok', previous_path: '.uclone/personas/scout.prev.png', change_id: 5 }),
+      answer(409, { detail: 'The picture was changed again after that change.', code: 'stale_change' }),
+    );
+    renderCard({ korean: true });
+
+    fireEvent.click(screen.getByTestId('use-as-avatar-btn'));
+    fireEvent.click(await screen.findByTestId('use-as-avatar-undo'));
+
+    const failed = await screen.findByTestId('use-as-avatar-failed');
+    expectPlain(failed.textContent);
+    expect(failed.textContent).not.toMatch(/stale_change|409|change_id|undo_of/);
+    expect(failed).toHaveTextContent(/scout의 그림이 다시 바뀌어/);
+    expect(failed.textContent).toMatch(/니다/);
+    expect(screen.queryByTestId('use-as-avatar-undo')).toBeNull();
   });
 });

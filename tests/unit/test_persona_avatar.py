@@ -206,8 +206,8 @@ def test_the_persona_payload_says_where_its_picture_is_shown_from(tmp_path: Path
 def test_put_with_a_workspace_path_sets_the_picture(tmp_path: Path) -> None:
     """The route a head calls when the user clicks Use as avatar under a drawn image.
 
-    Killed by: src/uclone_x/ui/app.py :: store.set_from_path(name, _avatar_source(await _avatar_json(request)))
-    Becomes: pass
+    Killed by: src/uclone_x/ui/app.py :: change = store.set_from_path(name, _avatar_source(body), undo_of=undo_of)
+    Becomes: change = AvatarChange(change_id=0, previous=None)
     """
     _install(tmp_path, "surveyor")
     drawn = tmp_path / "artifacts" / "images" / "img_1.png"
@@ -228,8 +228,8 @@ def test_put_with_a_workspace_path_sets_the_picture(tmp_path: Path) -> None:
 def test_put_with_the_image_itself_sets_the_picture(tmp_path: Path) -> None:
     """An upload: the body is the picture.
 
-    Killed by: src/uclone_x/ui/app.py :: store.set(name, await _avatar_upload(request))
-    Becomes: pass
+    Killed by: src/uclone_x/ui/app.py :: change = store.set(name, await _avatar_upload(request))
+    Becomes: change = AvatarChange(change_id=0, previous=None)
     """
     _install(tmp_path, "surveyor")
     client = _client(tmp_path)
@@ -401,8 +401,8 @@ def test_put_for_a_name_no_clone_carries_is_404(tmp_path: Path) -> None:
 
 
 def test_delete_goes_back_to_the_shipped_picture(tmp_path: Path) -> None:
-    """Killed by: src/uclone_x/ui/app.py :: PersonaAvatarStore(registry).reset(name)
-    Becomes: None
+    """Killed by: src/uclone_x/ui/app.py :: change = PersonaAvatarStore(registry).reset(name, undo_of=_undo_of_query(request))
+    Becomes: change = AvatarChange(change_id=0, previous=None)
     """
     client = _client(tmp_path)
     client.put(
@@ -471,8 +471,8 @@ def test_another_site_cannot_change_a_clones_picture(tmp_path: Path, method: str
 def test_a_change_answers_with_the_picture_that_undoes_it(tmp_path: Path) -> None:
     """The head's Undo puts back what `previous_path` names, or resets when it is null.
 
-    Killed by: src/uclone_x/ui/app.py :: registry, name, undo_with=store.previous(name) if had_chosen else None
-    Becomes: registry, name
+    Killed by: src/uclone_x/ui/app.py :: "previous_path": _workspace_relative(change.previous),
+    Becomes: "previous_path": None,
     """
     _install(tmp_path, "surveyor")
     client = _client(tmp_path)
@@ -499,8 +499,8 @@ def test_a_change_answers_with_the_picture_that_undoes_it(tmp_path: Path) -> Non
 def test_a_reset_answers_with_the_picture_it_put_aside(tmp_path: Path) -> None:
     """Undoing a reset puts the kept copy back.
 
-    Killed by: src/uclone_x/ui/app.py :: return _avatar_answer(registry, name, undo_with=kept)
-    Becomes: return _avatar_answer(registry, name)
+    Killed by: src/uclone_x/agent/persona_avatar.py :: return AvatarChange(change_id=change_id, previous=kept)
+    Becomes: return AvatarChange(change_id=change_id, previous=None)
     """
     _install(tmp_path, "surveyor")
     client = _client(tmp_path)
@@ -517,4 +517,97 @@ def test_a_reset_answers_with_the_picture_it_put_aside(tmp_path: Path) -> None:
 
     client.put("/api/personas/surveyor/avatar", json={"source_path": kept})
 
+    assert client.get("/api/personas/surveyor/avatar").content == ONE_PIXEL_PNG
+
+
+def _upload(client: TestClient, data: bytes) -> dict[str, Any]:
+    response = client.put(
+        "/api/personas/surveyor/avatar", content=data, headers={"content-type": "image/png"}
+    )
+    assert response.status_code == 200, response.text
+    body: dict[str, Any] = response.json()
+    return body
+
+
+def test_a_stale_undo_is_refused_with_409_and_changes_nothing(tmp_path: Path) -> None:
+    """The Undo from a tab that did not see a later change (#1809).
+
+    Killed by: src/uclone_x/ui/app.py :: else 409
+    Becomes: else 422
+    Killed by: src/uclone_x/ui/app.py :: return raw if isinstance(raw, int) and not isinstance(raw, bool) else 0
+    Becomes: return None
+    """
+    _install(tmp_path, "surveyor")
+    client = _client(tmp_path)
+    first, second, third = ONE_PIXEL_PNG, ONE_PIXEL_PNG + b"\x00", ONE_PIXEL_PNG + b"\x01"
+    _upload(client, first)
+    mine = _upload(client, second)
+    _upload(client, third)  # another tab
+
+    response = client.put(
+        "/api/personas/surveyor/avatar",
+        json={"source_path": mine["previous_path"], "undo_of": mine["change_id"]},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "stale_change"
+    assert client.get("/api/personas/surveyor/avatar").content == third
+    assert (tmp_path / PERSONAS_SUBDIR / "surveyor.prev.png").read_bytes() == second
+
+
+def test_a_stale_undo_by_reset_is_refused_and_keeps_the_newer_choice(tmp_path: Path) -> None:
+    """The first choice's Undo is a reset; after a later choice it must not remove that one.
+
+    Killed by: src/uclone_x/ui/app.py :: return int(raw) if raw.isascii() and raw.isdigit() else 0
+    Becomes: return None
+    """
+    _install(tmp_path, "surveyor")
+    client = _client(tmp_path)
+    mine = _upload(client, ONE_PIXEL_PNG)
+    assert mine["previous_path"] is None
+    newer = ONE_PIXEL_PNG + b"\x00"
+    _upload(client, newer)
+
+    response = client.delete(f"/api/personas/surveyor/avatar?undo_of={mine['change_id']}")
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "stale_change"
+    assert client.get("/api/personas/surveyor/avatar").content == newer
+
+
+def test_an_undo_id_in_non_ascii_digits_is_stale_not_a_server_error(tmp_path: Path) -> None:
+    """`"²".isdigit()` is true but `int("²")` raises, so the guard must take ASCII digits only.
+
+    Killed by: src/uclone_x/ui/app.py :: return int(raw) if raw.isascii() and raw.isdigit() else 0
+    Becomes: return int(raw) if raw.isdigit() else 0
+    """
+    _install(tmp_path, "surveyor")
+    client = _client(tmp_path)
+    _upload(client, ONE_PIXEL_PNG)
+
+    response = client.delete("/api/personas/surveyor/avatar?undo_of=%C2%B2")
+
+    assert response.status_code == 409
+    assert response.json()["code"] == "stale_change"
+    assert client.get("/api/personas/surveyor/avatar").content == ONE_PIXEL_PNG
+
+
+def test_a_fresh_undo_is_made_and_the_listing_carries_the_latest_change(tmp_path: Path) -> None:
+    """Killed by: src/uclone_x/ui/app.py :: "avatar_change_id": PersonaAvatarStore(registry).latest_change(persona.name),
+    Becomes: "avatar_change_id": 0,
+    """
+    _install(tmp_path, "surveyor")
+    client = _client(tmp_path)
+    _upload(client, ONE_PIXEL_PNG)
+    mine = _upload(client, ONE_PIXEL_PNG + b"\x00")
+    assert _payload(client, "surveyor")["avatar_change_id"] == mine["change_id"]
+
+    response = client.put(
+        "/api/personas/surveyor/avatar",
+        json={"source_path": mine["previous_path"], "undo_of": mine["change_id"]},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["change_id"] == mine["change_id"] + 1
+    assert _payload(client, "surveyor")["avatar_change_id"] == mine["change_id"] + 1
     assert client.get("/api/personas/surveyor/avatar").content == ONE_PIXEL_PNG

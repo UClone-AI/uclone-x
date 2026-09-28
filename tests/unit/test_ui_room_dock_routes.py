@@ -939,7 +939,9 @@ class TestASeatsKnowledge:
 
         assert body["status"] == "ok"
         assert body["participant_id"] == "scout"
-        assert [s["statement"] for s in body["remembers"]] == ["Postgres is a Database"]
+        assert ("Postgres", "is_a", "Database") in {
+            (t["subject"], t["predicate"], t["object"]) for t in body["triples"]
+        }
         assert body["triples"], body
         assert body["reason"] is None
 
@@ -956,7 +958,7 @@ class TestASeatsKnowledge:
         body = client.get(f"/api/rooms/{room_id}/knowledge", params={"agent_id": "scout"}).json()
 
         assert body["status"] == "not_recorded"
-        assert body["triples"] is None and body["remembers"] is None
+        assert body["triples"] is None
         assert "no knowledge record in this conversation" in body["reason"]
 
     def test_a_missing_agent_id_is_refused_naming_the_seats(self, client: TestClient) -> None:
@@ -1439,7 +1441,9 @@ def _memory_file(seat: str) -> Path:
     return AgentHome.for_username(seat).memory_path
 
 
-def _record(seat: str, subject: str, predicate: str, value: str, session: str) -> str:
+def _record(
+    seat: str, subject: str, predicate: str, value: str, session: str, room: str | None = None
+) -> str:
     from uclone_x.core.provenance import Provenance
     from uclone_x.memory.store import default_cross_session_memory
 
@@ -1449,12 +1453,15 @@ def _record(seat: str, subject: str, predicate: str, value: str, session: str) -
         object_value=value,
         provenance=Provenance.primary(provider=f"agent.{seat}", model="memory"),
         source_session_id=session,
+        source_room_id=room,
     )
     return fact.fact_id
 
 
-class TestRemembersListsSavedMemoryFacts:
-    def test_a_fact_saved_in_a_room_turn_is_listed_for_that_seat(
+class TestRemembersListsTheClonesFacts:
+    """One clone-wide list, each fact marked `learned_here` (#1401, #1638 step 3)."""
+
+    def test_a_fact_saved_in_a_room_turn_is_listed_as_learned_here(
         self, saving_client: TestClient
     ) -> None:
         """The whole path: a real room turn, the seat's real `record_memory_fact`, the read.
@@ -1464,22 +1471,28 @@ class TestRemembersListsSavedMemoryFacts:
         where the tool saved it. `sage` names no shipped persona, so it has every tool, as a
         new clone does.
 
-        Killed by: src/uclone_x/ui/room_dock.py :: **_saved_memory(seat),
-        Becomes: **{"saved_facts": [], "saved_facts_reason": None},
+        Killed by: src/uclone_x/ui/room_dock.py :: **_known_facts(state.room_id, seat),
+        Becomes: **{"facts": [], "facts_reason": None},
         """
         room_id = _create(saving_client, ["sage"])
         saving_client.post(f"/api/rooms/{room_id}/messages", json={"content": "I like teal"})
         _wait_for_rows(saving_client, room_id, 2)
-        room = saving_client.get(f"/api/rooms/{room_id}").json()
-        session_id = next(p["session_id"] for p in room["participants"] if p["id"] == "sage")
 
         body = _knowledge(saving_client, room_id, "sage")
 
-        assert [f["statement"] for f in body["saved_facts"]] == ["Kenny favourite colour teal"]
-        (fact,) = body["saved_facts"]
-        assert fact["saved_here"] is True
-        assert fact["source_session_id"] == session_id
-        assert body["saved_facts_reason"] is None
+        assert [f["statement"] for f in body["facts"]] == ["Kenny favourite colour teal"]
+        (fact,) = body["facts"]
+        assert fact["learned_here"] is True
+        assert fact["origin"] == "saved"
+        assert (fact["subject"], fact["predicate"], fact["object_value"]) == (
+            "Kenny",
+            "favourite_colour",
+            "teal",
+        )
+        assert fact["fact_id"].startswith("mem_")
+        assert fact["source_turn_id"], "the turn it was learned in is on the fact"
+        assert body["facts_reason"] is None
+        assert "saved_facts" not in body and "remembers" not in body
 
     def test_another_clones_facts_are_not_listed(self, client: TestClient) -> None:
         """Each clone's memory is its own (P7); `critic` must not show what `scout` saved.
@@ -1494,16 +1507,43 @@ class TestRemembersListsSavedMemoryFacts:
         scout = _knowledge(client, room_id, "scout")
         critic = _knowledge(client, room_id, "critic")
 
-        assert [f["statement"] for f in scout["saved_facts"]] == ["Kenny favourite colour teal"]
-        assert [f["statement"] for f in critic["saved_facts"]] == ["Build status green"]
-        assert critic["saved_facts"][0]["saved_here"] is False
+        assert [f["statement"] for f in scout["facts"]] == ["Kenny favourite colour teal"]
+        assert [f["statement"] for f in critic["facts"]] == ["Build status green"]
+        assert critic["facts"][0]["learned_here"] is False
 
-    def test_saved_facts_are_listed_when_the_seat_has_no_knowledge_record(
+    def test_learned_here_is_this_conversation_and_legacy_rows_go_by_session(
         self, client: TestClient
     ) -> None:
-        """A seat nobody has spoken to here still remembers what it saved elsewhere.
+        """A fact names its conversation; one saved before #1716 goes by the seat's session.
 
-        Killed by: src/uclone_x/ui/room_dock.py :: **_saved_memory(seat),
+        Killed by: src/uclone_x/ui/knowledge.py :: here = fact.source_room_id == room_id
+        Becomes: here = fact.source_room_id != room_id
+        Killed by: src/uclone_x/ui/knowledge.py :: here = session_id is not None and fact.source_session_id == session_id
+        Becomes: here = session_id is not None
+        """
+        room_id = _create(client, ["scout"])
+        room = client.get(f"/api/rooms/{room_id}").json()
+        session_id = next(p["session_id"] for p in room["participants"] if p["id"] == "scout")
+        _record("scout", "Kenny", "lives_in", "Seoul", "s-1", room=room_id)
+        _record("scout", "Kenny", "works_at", "UClone", "s-2", room="another-room")
+        _record("scout", "Kenny", "likes", "tea", session_id)
+        _record("scout", "Kenny", "drives", "a bike", "a-chat")
+
+        facts = _knowledge(client, room_id, "scout")["facts"]
+
+        assert {f["statement"]: f["learned_here"] for f in facts} == {
+            "Kenny lives in Seoul": True,
+            "Kenny works at UClone": False,
+            "Kenny likes tea": True,
+            "Kenny drives a bike": False,
+        }
+
+    def test_facts_are_listed_when_the_seat_has_no_knowledge_record(
+        self, client: TestClient
+    ) -> None:
+        """A seat nobody has spoken to here still knows what it learned elsewhere.
+
+        Killed by: src/uclone_x/ui/room_dock.py :: **_known_facts(state.room_id, seat),
         Becomes: **{},
         """
         room_id = _create(client, ["scout"])
@@ -1512,8 +1552,7 @@ class TestRemembersListsSavedMemoryFacts:
         body = _knowledge(client, room_id, "scout")
 
         assert body["status"] == "not_recorded"
-        assert body["remembers"] is None
-        assert [f["statement"] for f in body["saved_facts"]] == ["Kenny lives in Seoul"]
+        assert [f["statement"] for f in body["facts"]] == ["Kenny lives in Seoul"]
 
     def test_a_retracted_fact_is_not_listed(self, client: TestClient) -> None:
         """Killed by: src/uclone_x/memory/store.py :: if not fact.retracted]
@@ -1531,39 +1570,36 @@ class TestRemembersListsSavedMemoryFacts:
 
         body = _knowledge(client, room_id, "scout")
 
-        assert [f["statement"] for f in body["saved_facts"]] == ["Kenny works at UClone"]
+        assert [f["statement"] for f in body["facts"]] == ["Kenny works at UClone"]
 
-    def test_with_no_saved_facts_the_list_says_what_it_covers(self, client: TestClient) -> None:
-        """An empty list is 'none listed', never 'the clone saved nothing' (P6)."""
+    def test_with_no_facts_the_list_says_what_it_covers(self, client: TestClient) -> None:
+        """An empty list is 'none listed', never 'the clone knows nothing' (P6)."""
         room_id = _create(client, ["scout"])
 
         body = _knowledge(client, room_id, "scout")
 
-        assert body["saved_facts"] == []
-        assert body["saved_facts_reason"] == "No saved facts are listed for scout."
-        assert not _absence_claim(body["saved_facts_reason"])
+        assert body["facts"] == []
+        assert body["facts_reason"] == "No facts are listed for scout."
+        assert not _absence_claim(body["facts_reason"])
 
     def test_a_seat_whose_id_names_no_agent_home_lists_none_and_claims_no_read(self) -> None:
         """No memory can be saved under such an id, so there are no facts that failed to read.
 
         `memory_for` refuses the id as `read_saved_facts` does, so the answer is the empty
-        list's sentence, not "its saved facts could not be read" (#1429 review).
+        list's sentence, not "could not be read" (#1429 review).
 
-        Killed by: src/uclone_x/ui/room_dock.py :: except AgentHomeError:
-        Becomes: except ZeroDivisionError:
+        Killed by: src/uclone_x/ui/room_dock.py :: except AgentHomeError:  # no home, so nothing saved to read
+        Becomes: except ZeroDivisionError:  # no home, so nothing saved to read
         """
-        from uclone_x.ui.room_dock import _saved_memory  # pyright: ignore[reportPrivateUsage]
+        from uclone_x.ui.room_dock import _known_facts  # pyright: ignore[reportPrivateUsage]
 
         seat = Participant(
             id="CON", kind=ParticipantKind.AGENT, display_name="Con", session_id="s-1"
         )
 
-        answer = _saved_memory(seat)
+        answer = _known_facts("room-1", seat)
 
-        assert answer == {
-            "saved_facts": [],
-            "saved_facts_reason": "No saved facts are listed for Con.",
-        }
+        assert answer == {"facts": [], "facts_reason": "No facts are listed for Con."}
 
     def test_an_unreadable_memory_is_said_plainly_and_left_where_it_is(
         self, client: TestClient
@@ -1573,8 +1609,8 @@ class TestRemembersListsSavedMemoryFacts:
         The failure is real -- the store's own parser meets bytes that are not JSON -- so
         the check reads whatever that failure would have put in front of the reader.
 
-        Killed by: src/uclone_x/ui/room_dock.py :: "saved_facts": None,
-        Becomes: "saved_facts": [],
+        Killed by: src/uclone_x/ui/room_dock.py :: "facts": None,
+        Becomes: "facts": [],
         """
         room_id = _create(client, ["scout"])
         path = _memory_file("scout")
@@ -1583,12 +1619,228 @@ class TestRemembersListsSavedMemoryFacts:
 
         body = _knowledge(client, room_id, "scout")
 
-        assert body["saved_facts"] is None
-        reason = body["saved_facts_reason"]
-        assert reason == "scout's saved facts could not be read, so they cannot be shown."
+        assert body["facts"] is None
+        reason = body["facts_reason"]
+        assert reason == "What scout knows could not be read, so it cannot be shown."
         assert not _TECHNICAL.search(reason), reason
+        assert not _absence_claim(reason), reason
         assert path.read_text(encoding="utf-8") == '{"facts": [ {"subject": '
         assert not list(path.parent.glob("memory.json.unreadable-*")), "a read moved it"
+
+
+# --------------------------------------------------------------------------------------
+# Correct and Forget: PATCH / DELETE /api/agents/{agent_id}/memory/{fact_id} (#1638 step 3)
+# --------------------------------------------------------------------------------------
+
+
+def _file_facts(seat: str) -> dict[str, dict[str, Any]]:
+    """Every fact in the clone's memory document, retracted ones included, read from disk."""
+    import json
+
+    document = json.loads(_memory_file(seat).read_text(encoding="utf-8"))
+    return {f["fact_id"]: f for f in document["facts"]}
+
+
+def _assert_plain_refusal(detail: Any, *internals: str) -> None:
+    """A refusal a person reads: one plain sentence with no id, path or exception text."""
+    assert isinstance(detail, str), detail
+    assert not _TECHNICAL.search(detail), detail
+    for internal in internals:
+        assert internal not in detail, (internal, detail)
+    assert "mem_" not in detail and "KeyError" not in detail, detail
+
+
+class TestForgetAFact:
+    def test_forget_retracts_durably_and_leaves_the_list_and_the_prompt(
+        self, client: TestClient
+    ) -> None:
+        """Forget is a retraction on disk with the user's reason, never a hard delete.
+
+        Killed by: src/uclone_x/ui/room_dock.py :: lambda: store.retract_fact(fact_id, "forgotten by the user", _user_provenance()),
+        Becomes: lambda: store.get_fact(fact_id),
+        """
+        from uclone_x.memory.store import default_cross_session_memory
+
+        room_id = _create(client, ["scout"])
+        kept = _record("scout", "Kenny", "works_at", "UClone", "a-chat")
+        gone = _record("scout", "Kenny", "lives_in", "Busan", "a-chat")
+
+        answered = client.delete(f"/api/agents/scout/memory/{gone}")
+
+        assert answered.status_code == 200, answered.text
+        assert answered.json()["fact"]["retracted"] is True
+        on_disk = _file_facts("scout")
+        assert on_disk[gone]["retracted"] is True
+        assert on_disk[gone]["retraction_reason"] == "forgotten by the user"
+        assert on_disk[kept]["retracted"] is False
+        facts = _knowledge(client, room_id, "scout")["facts"]
+        assert [f["fact_id"] for f in facts] == [kept]
+        # A store loaded afresh -- the next process, the next prompt -- does not use it.
+        prompt = default_cross_session_memory("scout").format_prompt_section()
+        assert "Busan" not in prompt and "UClone" in prompt
+
+    def test_forget_reaches_a_running_clones_store(self, saving_client: TestClient) -> None:
+        """The edit goes through the store the seat uses, so a running clone stops using it.
+
+        Killed by: src/uclone_x/ui/room_dock.py :: return stack.session_manager().memory_for(agent_id)
+        Becomes: return CrossSessionMemory(storage_path=stack.session_manager().memory_for(agent_id).storage_path)
+        """
+        room_id = _create(saving_client, ["sage"])
+        saving_client.post(f"/api/rooms/{room_id}/messages", json={"content": "I like teal"})
+        _wait_for_rows(saving_client, room_id, 2)
+        (fact,) = _knowledge(saving_client, room_id, "sage")["facts"]
+        live = _stack(saving_client).session_manager().memory_for("sage")
+        assert live.get_fact(fact["fact_id"]) is not None
+
+        answered = saving_client.delete(f"/api/agents/sage/memory/{fact['fact_id']}")
+
+        assert answered.status_code == 200, answered.text
+        held = live.get_fact(fact["fact_id"])
+        assert held is not None and held.retracted
+        assert "teal" not in live.format_prompt_section()
+
+    def test_an_unknown_fact_is_a_plain_404(self, client: TestClient) -> None:
+        _create(client, ["scout"])
+        _record("scout", "Kenny", "works_at", "UClone", "a-chat")
+
+        refused = client.delete("/api/agents/scout/memory/mem_000000000000")
+
+        assert refused.status_code == 404
+        detail = refused.json()["detail"]
+        assert detail == (
+            "This fact is no longer in the clone's memory. It may have been forgotten or "
+            "corrected already."
+        )
+        _assert_plain_refusal(detail, "mem_000000000000", "scout")
+
+    def test_forgetting_twice_is_a_plain_404_and_changes_nothing(self, client: TestClient) -> None:
+        """The store answers a second retraction quietly; the route checks the fact is active.
+
+        Killed by: src/uclone_x/ui/room_dock.py :: if not facts or all(fact.fact_id != fact_id for fact in facts):
+        Becomes: if not facts:
+        """
+        _create(client, ["scout"])
+        gone = _record("scout", "Kenny", "lives_in", "Busan", "a-chat")
+        _record("scout", "Kenny", "works_at", "UClone", "a-chat")
+        assert client.delete(f"/api/agents/scout/memory/{gone}").status_code == 200
+        before = _file_facts("scout")
+
+        refused = client.delete(f"/api/agents/scout/memory/{gone}")
+
+        assert refused.status_code == 404
+        _assert_plain_refusal(refused.json()["detail"], gone)
+        assert _file_facts("scout") == before
+
+    def test_a_clone_with_no_memory_or_no_home_is_a_plain_404_and_creates_nothing(
+        self, client: TestClient
+    ) -> None:
+        """Killed by: src/uclone_x/ui/room_dock.py :: except AgentHomeError:  # an id no clone can have, so no fact of its
+        Becomes: except ZeroDivisionError:  # an id no clone can have, so no fact of its
+        """
+        _create(client, ["scout"])
+
+        nothing_saved = client.delete("/api/agents/scout/memory/mem_000000000000")
+        no_home = client.delete("/api/agents/NOT A NAME/memory/mem_000000000000")
+
+        assert nothing_saved.status_code == 404
+        assert no_home.status_code == 404
+        _assert_plain_refusal(nothing_saved.json()["detail"], "scout")
+        _assert_plain_refusal(no_home.json()["detail"], "NOT A NAME")
+        assert not _memory_file("scout").exists()
+
+    def test_an_unreadable_memory_refuses_plainly_and_is_left_where_it_is(
+        self, client: TestClient
+    ) -> None:
+        """Killed by: src/uclone_x/ui/room_dock.py :: raise _memory_edit_refusal(409, "memory_unreadable") from None
+        Becomes: raise _memory_edit_refusal(404, "fact_not_found") from None
+        """
+        _create(client, ["scout"])
+        path = _memory_file("scout")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('{"facts": [ {"subject": ', encoding="utf-8")
+
+        refused = client.delete("/api/agents/scout/memory/mem_000000000000")
+
+        assert refused.status_code == 409
+        detail = refused.json()["detail"]
+        assert detail == "The clone's memory could not be read, so nothing was changed."
+        _assert_plain_refusal(detail, str(path), "JSONDecodeError")
+        assert path.read_text(encoding="utf-8") == '{"facts": [ {"subject": '
+
+    def test_a_failed_save_refuses_plainly(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Killed by: src/uclone_x/ui/room_dock.py :: raise _memory_edit_refusal(500, "save_failed") from None
+        Becomes: raise
+        """
+        from uclone_x.memory.store import CrossSessionMemory
+
+        _create(client, ["scout"])
+        gone = _record("scout", "Kenny", "lives_in", "Busan", "a-chat")
+
+        def refuse(self: CrossSessionMemory) -> None:
+            raise PermissionError(13, "Permission denied", "/secret/home/scout/memory.json")
+
+        monkeypatch.setattr(CrossSessionMemory, "save", refuse)
+        refused = client.delete(f"/api/agents/scout/memory/{gone}")
+
+        assert refused.status_code == 500
+        detail = refused.json()["detail"]
+        assert detail == "The change could not be saved, so it may not last after a restart."
+        _assert_plain_refusal(detail, "/secret", "Permission denied", gone)
+
+
+class TestCorrectAFact:
+    def test_correct_records_a_corrected_fact_and_keeps_the_old_one_retracted(
+        self, client: TestClient
+    ) -> None:
+        """Killed by: src/uclone_x/ui/room_dock.py :: lambda: store.correct_fact(fact_id, value, _user_provenance())
+        Becomes: lambda: store.retract_fact(fact_id, "corrected by the user", _user_provenance())
+        """
+        room_id = _create(client, ["scout"])
+        old = _record("scout", "Kenny", "lives_in", "Busan", "s-1", room=room_id)
+
+        answered = client.patch(f"/api/agents/scout/memory/{old}", json={"value": " Seoul "})
+
+        assert answered.status_code == 200, answered.text
+        new = answered.json()["fact"]
+        assert new["origin"] == "corrected"
+        assert new["object_value"] == "Seoul"
+        assert new["confidence"] == 1.0
+        assert new["contradicts_fact_id"] == old
+        on_disk = _file_facts("scout")
+        assert on_disk[old]["retracted"] is True
+        assert on_disk[old]["retraction_reason"] == "corrected by the user"
+        assert on_disk[new["fact_id"]]["origin"] == "corrected"
+        (listed,) = _knowledge(client, room_id, "scout")["facts"]
+        assert listed["statement"] == "Kenny lives in Seoul"
+        assert listed["origin"] == "corrected"
+        assert listed["learned_here"] is True, "a correction stays where it was learned"
+
+    def test_a_blank_value_is_refused_plainly_and_changes_nothing(self, client: TestClient) -> None:
+        """Killed by: src/uclone_x/ui/room_dock.py :: if not isinstance(value, str) or not value.strip():
+        Becomes: if not isinstance(value, str):
+        """
+        _create(client, ["scout"])
+        old = _record("scout", "Kenny", "lives_in", "Busan", "a-chat")
+        before = _file_facts("scout")
+
+        for body in ({"value": "   "}, {"value": 7}, {}):
+            refused = client.patch(f"/api/agents/scout/memory/{old}", json=body)
+            assert refused.status_code == 400, body
+            detail = refused.json()["detail"]
+            assert detail == "Write what it should say instead."
+            _assert_plain_refusal(detail, old)
+        assert _file_facts("scout") == before
+
+    def test_correcting_an_unknown_fact_is_a_plain_404(self, client: TestClient) -> None:
+        _create(client, ["scout"])
+        _record("scout", "Kenny", "lives_in", "Busan", "a-chat")
+
+        refused = client.patch("/api/agents/scout/memory/mem_000000000000", json={"value": "x"})
+
+        assert refused.status_code == 404
+        _assert_plain_refusal(refused.json()["detail"], "mem_000000000000")
 
 
 class TestAnEmptyKnowledgeRecordIsNotPresentedAsNothingLearned:
@@ -1606,7 +1858,7 @@ class TestAnEmptyKnowledgeRecordIsNotPresentedAsNothingLearned:
 
         body = _knowledge(client, room_id, "scout")
 
-        assert body["status"] == "ok" and body["remembers"] == []
+        assert body["status"] == "ok" and body["triples"] == []
         assert body["reason"] is None
 
     def test_no_record_yet_says_only_that_there_is_none(self, client: TestClient) -> None:
@@ -1649,7 +1901,7 @@ class TestAnEmptyKnowledgeRecordIsNotPresentedAsNothingLearned:
         assert "knowledge record for this conversation could not be read" in body["reason"]
         assert not _absence_claim(body["reason"]), body["reason"]
         assert "saved memory" not in body["reason"], "the record is not the saved memory"
-        assert [f["statement"] for f in body["saved_facts"]] == ["Kenny lives in Seoul"]
+        assert [f["statement"] for f in body["facts"]] == ["Kenny lives in Seoul"]
         assert record.read_text(encoding="utf-8") == "concepts: [unterminated"
 
 

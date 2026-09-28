@@ -321,9 +321,9 @@ def test_cross_session_memory_p9_skill_synthesizer_input() -> None:
     assert any("pre_check" in s for s in steps)
 
     synthesizer = SkillSynthesizer()
-    code = synthesizer.generate_skill_code("pr_routine", steps)
-    assert "pr_routine" in code
-    assert "run quality gate before commit" in code
+    instructions = synthesizer.format_instructions("pr_routine", steps)
+    assert instructions.startswith("# Pr Routine\n")
+    assert "run quality gate before commit" in instructions
 
 
 def test_cross_session_memory_p7_ontology_evidence_and_promotion() -> None:

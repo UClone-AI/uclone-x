@@ -57,8 +57,10 @@ from uclone_x.agent.models import (
 from uclone_x.agent.persona_avatar import (
     AVATAR_FORMATS,
     MAX_AVATAR_BYTES,
+    AvatarChange,
     AvatarPersonaNotFound,
     AvatarRefused,
+    AvatarStaleChange,
     PersonaAvatarStore,
     avatar_url,
 )
@@ -779,6 +781,9 @@ def _persona_payload(registry: PersonaRegistry, persona: PersonaDefinition) -> d
         "avatar_url": avatar_url(persona.name, PersonaAvatarStore(registry).find(persona.name)),
         # Whether that picture was chosen here rather than shipped: only a chosen one resets.
         "avatar_chosen": PersonaAvatarStore(registry).chosen(persona.name) is not None,
+        # The id of the latest change to that picture, from any tab or the clone itself: a
+        # head hides an Undo whose change is no longer the latest.
+        "avatar_change_id": PersonaAvatarStore(registry).latest_change(persona.name),
     }
 
 
@@ -3895,12 +3900,13 @@ def create_ui_app(
         )
 
     def _avatar_answer(
-        registry: PersonaRegistry, name: str, *, undo_with: Path | None = None
+        registry: PersonaRegistry, name: str, change: AvatarChange
     ) -> dict[str, Any]:
-        """The changed clone, and the kept picture that would undo the change.
+        """The changed clone, the kept picture that would undo the change, and its id.
 
         `previous_path` is the workspace path to `PUT` back to undo it; `null` means the
-        clone had no chosen picture before, so undoing is a `DELETE`.
+        clone had no chosen picture before, so undoing is a `DELETE`. Either way the undo
+        carries `change_id` as `undo_of`, and is refused if a later change was made.
         """
         persona = registry.get_persona(name)
         if persona is None:
@@ -3908,7 +3914,8 @@ def create_ui_app(
         return {
             "status": "ok",
             "persona": _persona_payload(registry, persona),
-            "previous_path": _workspace_relative(undo_with),
+            "previous_path": _workspace_relative(change.previous),
+            "change_id": change.change_id,
         }
 
     def _workspace_relative(path: Path | None) -> str | None:
@@ -3925,7 +3932,13 @@ def create_ui_app(
         The head words its own message from `code` (a path outside the workspace and a file
         in the wrong format ask for different things); `detail` is for everything else.
         """
-        status = 404 if isinstance(exc, AvatarPersonaNotFound) else 422
+        status = (
+            404
+            if isinstance(exc, AvatarPersonaNotFound)
+            else 409
+            if isinstance(exc, AvatarStaleChange)
+            else 422
+        )
         return JSONResponse({"detail": str(exc), "code": exc.reason_code}, status_code=status)
 
     async def _avatar_upload(request: Request) -> bytes:
@@ -3971,17 +3984,20 @@ def create_ui_app(
         The body is either JSON `{"source_path": "<path in the workspace>"}`, normally an
         image a clone just drew, or the picture itself with an `image/*` content type, for
         an upload. Either way the bytes must be a PNG, JPEG, WebP or GIF image; the picture
-        it replaces is kept as `<name>.prev.<ext>`.
+        it replaces is kept as `<name>.prev.<ext>`. A JSON body may add `"undo_of": <id>`,
+        the `change_id` of the change it undoes; it is then made only while that change is
+        still the latest, and refused with 409 `stale_change` otherwise.
         """
         registry = _registry_for_a_picture_change(request)
         store = PersonaAvatarStore(registry)
-        had_chosen = store.chosen(name) is not None
         content_type = request.headers.get("content-type", "").split(";")[0].strip().lower()
         try:
             if content_type == "application/json":
-                store.set_from_path(name, _avatar_source(await _avatar_json(request)))
+                body = await _avatar_json(request)
+                undo_of = _undo_of_body(body)
+                change = store.set_from_path(name, _avatar_source(body), undo_of=undo_of)
             elif content_type.startswith("image/"):
-                store.set(name, await _avatar_upload(request))
+                change = store.set(name, await _avatar_upload(request))
             else:
                 return JSONResponse(
                     {
@@ -3995,9 +4011,21 @@ def create_ui_app(
                 )
         except AvatarRefused as exc:
             return _avatar_refusal(exc)
-        return _avatar_answer(
-            registry, name, undo_with=store.previous(name) if had_chosen else None
-        )
+        return _avatar_answer(registry, name, change)
+
+    def _undo_of_body(body: object) -> int | None:
+        """The `undo_of` a JSON body names; `0`, which no change has, for one that is not a count."""
+        raw = cast(dict[str, object], body).get("undo_of") if isinstance(body, dict) else None
+        if raw is None:
+            return None
+        return raw if isinstance(raw, int) and not isinstance(raw, bool) else 0
+
+    def _undo_of_query(request: Request) -> int | None:
+        """The `?undo_of=` a `DELETE` names, read as `_undo_of_body` reads a body."""
+        raw = request.query_params.get("undo_of")
+        if raw is None:
+            return None
+        return int(raw) if raw.isascii() and raw.isdigit() else 0
 
     def _avatar_source(body: object) -> Path:
         """The workspace file a `PUT` names, resolved as tools resolve a path."""
@@ -4015,13 +4043,16 @@ def create_ui_app(
 
     @app.delete("/api/personas/{name}/avatar")
     async def delete_persona_avatar(name: str, request: Request) -> Any:  # pyright: ignore[reportUnusedFunction]
-        """Put a clone's chosen picture aside, so it shows its shipped one or the default."""
+        """Put a clone's chosen picture aside, so it shows its shipped one or the default.
+
+        `?undo_of=<id>` makes it the undo of that change, refused as `PUT`'s is.
+        """
         registry = _registry_for_a_picture_change(request)
         try:
-            kept = PersonaAvatarStore(registry).reset(name)
+            change = PersonaAvatarStore(registry).reset(name, undo_of=_undo_of_query(request))
         except AvatarRefused as exc:
             return _avatar_refusal(exc)
-        return _avatar_answer(registry, name, undo_with=kept)
+        return _avatar_answer(registry, name, change)
 
     @app.post("/api/personas")
     async def create_persona(req: dict[str, Any]) -> Any:  # pyright: ignore[reportUnusedFunction]

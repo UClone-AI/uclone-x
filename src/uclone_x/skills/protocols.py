@@ -145,10 +145,13 @@ class SkillSynthesizerProtocol(Protocol):
         workflow_steps: list[str],
         quarantine_dir: Path,
     ) -> SkillManifest:
-        """Write a SKILL.md package into quarantine and return its manifest.
+        """Write a prompt-only SKILL.md package into quarantine and return its manifest.
 
-        The destination is named `quarantine_dir`, not `output_dir`: the returned
-        manifest is `SkillStatus.PENDING` and synthesis has no path that produces an
-        active skill. Promotion is a separate, audited act.
+        The package is instructions, not code: when to use the skill, then
+        `workflow_steps` as its steps, with no script (#1810). The destination is named
+        `quarantine_dir`, not `output_dir`: the returned manifest is
+        `SkillStatus.PENDING` and synthesis has no path that produces an active skill.
+        Promotion is a separate, audited act (`ucx skill approve` and its ledger pin); an
+        LLM-authored skill is never auto-approved (#1824).
         """
         ...

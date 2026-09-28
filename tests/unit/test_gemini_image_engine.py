@@ -292,8 +292,8 @@ async def test_auto_prefers_a_ready_local_engine_over_gemini() -> None:
 async def test_under_auto_the_description_names_the_engine_that_then_draws(tmp_path: Path) -> None:
     """The description and the draw read one look at the local engines, so they agree.
 
-    Killed by: src/uclone_x/tools/builtin/image.py :: self.GEMINI_BASE_DESCRIPTION if gemini else self.BASE_DESCRIPTION,
-    Becomes: self.BASE_DESCRIPTION,
+    Killed by: src/uclone_x/tools/builtin/image.py :: parts = [self.GEMINI_BASE_DESCRIPTION if gemini else self.BASE_DESCRIPTION]
+    Becomes: parts = [self.BASE_DESCRIPTION]
     Killed by: src/uclone_x/tools/builtin/image.py :: if probe is not None and time.monotonic() - probe[0] < LOCAL_PROBE_TTL_SECONDS:
     Becomes: if False:
     """
@@ -315,7 +315,6 @@ async def test_under_auto_the_description_names_the_engine_that_then_draws(tmp_p
 
     assert description.startswith(GenerateImageTool.GEMINI_BASE_DESCRIPTION)
     assert "never on a paid cloud service" not in description
-    assert "(prose prompt family)" in description
     assert result["engine"] == "gemini"
     # One look served the description and the draw.
     assert local.is_available.await_count == 1
@@ -381,11 +380,52 @@ async def test_gemini_setting_draws_with_gemini_and_records_it(tmp_path: Path) -
         ToolContext(agent_id="a", session_id="s", workspace_root=tmp_path),
     )
 
-    assert "Active model: 'gemini-test-image' (prose prompt family)." in description
+    # The profile `load_skill` routes the prompt rules by; the description names no model.
+    assert tool.active_profile().model_id == "gemini-test-image"
+    assert "gemini-test-image" not in description
     assert result["engine"] == "gemini"
     sidecar = json.loads((tmp_path / result["meta_path"]).read_text())
     assert sidecar["engine"] == "gemini"
     assert gemini.calls[0][1:] == ("3:4", "gemini-test-image")
+
+
+@pytest.mark.asyncio
+async def test_a_negative_gemini_cannot_use_is_reported_in_the_result(tmp_path: Path) -> None:
+    """Gemini takes no negative prompt; the result says it went unused (P6, #1723).
+
+    Killed by: src/uclone_x/tools/builtin/image.py ::             return replace(drawn, prompt_changes=gemini_fill.changes)
+    Becomes:             return drawn
+    """
+    from uclone_x.tools.builtin.media_registry import NEGATIVE_NOT_USED
+
+    gemini = _FakeGemini()
+    choice = ImageEngineChoice(setting="gemini", model="gemini-test-image", gemini=gemini)
+    tool = GenerateImageTool(dispatcher=_dispatcher(choice, local_ready=False))
+
+    result = await tool.run(
+        GenerateImageParams(prompt="a lighthouse at dawn", negative_prompt="people"),
+        ToolContext(agent_id="a", session_id="s", workspace_root=tmp_path),
+    )
+
+    assert result["prompt_changes"] == [NEGATIVE_NOT_USED]
+    assert "people" not in gemini.calls[0][0]
+
+
+def test_the_gemini_description_tells_the_model_where_the_notes_are() -> None:
+    """The Gemini path returns prompt_changes, so its description says where to read them.
+
+    Killed by: src/uclone_x/tools/builtin/image.py ::         "listed in the result under prompt_changes. "
+    Becomes:         "listed in the result. "
+    """
+    tool = GenerateImageTool(
+        dispatcher=_dispatcher(
+            ImageEngineChoice(setting="gemini", model="gemini-test-image", gemini=_FakeGemini()),
+            local_ready=False,
+        )
+    )
+
+    assert "prompt_changes" in tool.description
+    assert "English" not in tool.description
 
 
 @pytest.mark.asyncio

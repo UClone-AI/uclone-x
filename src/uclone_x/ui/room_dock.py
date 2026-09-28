@@ -37,6 +37,7 @@ from uclone_x.agent.turn_trace import (
     trace_turn,
 )
 from uclone_x.core.agent_home import AgentHomeError
+from uclone_x.core.provenance import Provenance
 from uclone_x.errors import (
     LogHeaderError,
     MemoryStoreUnreadableError,
@@ -45,7 +46,8 @@ from uclone_x.errors import (
     UnknownLogEventError,
 )
 from uclone_x.log import read_session_log
-from uclone_x.memory.store import read_saved_facts
+from uclone_x.memory.models import MemoryFact
+from uclone_x.memory.store import CrossSessionMemory, read_saved_facts
 from uclone_x.room.models import (
     Participant,
     ParticipantKind,
@@ -57,11 +59,7 @@ from uclone_x.room.models import (
 from uclone_x.room.service import participant_session_id
 from uclone_x.room.turn_summary import TurnNotFoundError, summarize_turn
 from uclone_x.sandbox.path_validator import PathValidator
-from uclone_x.ui.knowledge import (
-    knowledge_graph,
-    remembered_statements,
-    saved_fact_statements,
-)
+from uclone_x.ui.knowledge import knowledge_graph, known_facts
 from uclone_x.ui.rooms import _http_error, seated_agents  # pyright: ignore[reportPrivateUsage]
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle; the app imports this module
@@ -312,18 +310,19 @@ def _no_turns_reason(state: RoomState, name: str, unsaved: int, in_progress: boo
     return f"{name} has not taken a turn in this conversation yet."
 
 
-def _saved_memory(seat: Participant) -> dict[str, Any]:
-    """The seat's saved memory facts, or why they cannot be listed (#1401).
+def _known_facts(room_id: str, seat: Participant) -> dict[str, Any]:
+    """The clone's facts, one clone-wide list, or why they cannot be listed (#1638 step 3).
 
     Read from the memory the seat's `record_memory_fact` writes: the store the room's
     resolver composes the seat with is `memory_for(participant.id)`, one document per agent
-    id, shared with that clone in every other conversation. Read-only -- a GET never moves a
-    damaged document aside, and never creates the agent's home.
+    id, shared with that clone in every other conversation. Each fact says whether it was
+    learned in this conversation (`learned_here`); the head groups by it. Read-only -- a
+    GET never moves a damaged document aside, and never creates the agent's home.
     """
     name = seat.display_name
     try:
         facts = read_saved_facts(seat.id)
-    except AgentHomeError:
+    except AgentHomeError:  # no home, so nothing saved to read
         # An id that cannot name an agent home has no memory to read: `memory_for` refuses
         # it too, so no fact can have been saved under it.
         facts = None
@@ -331,17 +330,39 @@ def _saved_memory(seat: Participant) -> dict[str, Any]:
         # The path and the parser's words go to the log; the person reading the dock can act
         # on neither.
         logger.warning(
-            "Saved memory of seat %r could not be read: %s",
+            "Memory of seat %r could not be read: %s",
             seat.id,
             getattr(exc, "cause", None) or exc,
         )
         return {
-            "saved_facts": None,
-            "saved_facts_reason": f"{name}'s saved facts could not be read, so they cannot be shown.",
+            "facts": None,
+            "facts_reason": f"What {name} knows could not be read, so it cannot be shown.",
         }
-    listed = saved_fact_statements(facts or [], seat.session_id or "")
-    reason = None if listed else f"No saved facts are listed for {name}."
-    return {"saved_facts": listed, "saved_facts_reason": reason}
+    listed = known_facts(facts or [], room_id, seat.session_id)
+    reason = None if listed else f"No facts are listed for {name}."
+    return {"facts": listed, "facts_reason": reason}
+
+
+#: What a person is told when Correct or Forget cannot be done (#1638 step 3). Plain words
+#: only: no fact id, no path, no exception text -- the log has those.
+MEMORY_EDIT_REFUSALS: dict[str, str] = {
+    "fact_not_found": (
+        "This fact is no longer in the clone's memory. It may have been forgotten or "
+        "corrected already."
+    ),
+    "memory_unreadable": "The clone's memory could not be read, so nothing was changed.",
+    "value_missing": "Write what it should say instead.",
+    "save_failed": "The change could not be saved, so it may not last after a restart.",
+}
+
+
+def _memory_edit_refusal(status_code: int, code: str) -> HTTPException:
+    return HTTPException(status_code=status_code, detail=MEMORY_EDIT_REFUSALS[code])
+
+
+def _user_provenance() -> Provenance:
+    """Who made a Correct or Forget: the person at the dock, not a model."""
+    return Provenance.primary(provider="user", model="dock")
 
 
 #: Why a turn cannot be traced (the turn-inspection design, §4.4.3). The code is for
@@ -943,14 +964,14 @@ def register_room_dock_routes(app: FastAPI, stack: RoomStack) -> None:
         * `unreadable`: a saved record is there and could not be read;
         * `no_ontology`: running without a knowledge store.
 
-        `remembers` is the same content as `triples`, as plain statements for a reader who
-        is not a programmer; the head writes the words around them.
+        `status`, `reason` and the graph fields describe that per-seat record, for the
+        developer graph; step 6 of the clone-knowledge-graph design retires it.
 
-        `saved_facts` is the other half of what the clone remembers, and on every answer
-        whatever the knowledge record's status (#1401): the facts it saved to memory with
-        `record_memory_fact`, from its own memory -- never another clone's. `null` with
-        `saved_facts_reason` when they could not be read; an empty list with a reason saying
-        none are listed.
+        `facts` is what the clone knows, one clone-wide list on every answer whatever the
+        record's status (#1638 step 3): the facts in its own memory -- never another
+        clone's -- each with `learned_here` for the conversation on screen. `null` with
+        `facts_reason` when they could not be read; an empty list with a reason saying none
+        are listed.
         """
         state = _room(room_id)
         if not agent_id:
@@ -964,16 +985,15 @@ def register_room_dock_routes(app: FastAPI, stack: RoomStack) -> None:
             "room_id": state.room_id,
             "participant_id": seat.id,
             "session_id": seat.session_id,
-            # Read whatever the knowledge record says: a seat's saved facts are in its
-            # memory, not in its knowledge engine (#1401).
-            **_saved_memory(seat),
+            # Read whatever the knowledge record says: a clone's facts are in its memory,
+            # not in its per-seat knowledge engine (#1401, #1638).
+            **_known_facts(state.room_id, seat),
         }
         empty: dict[str, Any] = {
             "triples": None,
             "nodes": None,
             "edges": None,
             "summary": None,
-            "remembers": None,
         }
         live = stack.live_agent(state.room_id, seat.session_id)
         if live is not None and live.ontology is None:
@@ -1012,11 +1032,74 @@ def register_room_dock_routes(app: FastAPI, stack: RoomStack) -> None:
                     ),
                 }
         graph = knowledge_graph(engine)
-        remembers = remembered_statements(graph["triples"])
         return {
             **base,
             **graph,
-            "remembers": remembers,
             "status": "ok",
             "reason": None,
         }
+
+    def _editable_memory(agent_id: str, fact_id: str) -> CrossSessionMemory:
+        """The clone's live memory store, once the fact is known to be active in it.
+
+        Checked read-only first, so an id that names no clone, or a fact that is not there,
+        is refused without creating a home or loading a store. The store returned is the
+        one the clone's seats and chats write through (`memory_for`), so the edit is seen
+        by a running clone at once and is not a second whole-document writer.
+        """
+        try:
+            facts = read_saved_facts(agent_id)
+        except AgentHomeError:  # an id no clone can have, so no fact of its
+            raise _memory_edit_refusal(404, "fact_not_found") from None
+        except MemoryStoreUnreadableError as exc:
+            logger.warning(
+                "Memory of %r could not be read for an edit: %s",
+                agent_id,
+                getattr(exc, "cause", None) or exc,
+            )
+            raise _memory_edit_refusal(409, "memory_unreadable") from None
+        if not facts or all(fact.fact_id != fact_id for fact in facts):
+            raise _memory_edit_refusal(404, "fact_not_found")
+        return stack.session_manager().memory_for(agent_id)
+
+    def _edited(agent_id: str, edit: Any) -> MemoryFact:
+        """Run one store edit, turning its failures into plain refusals."""
+        try:
+            fact: MemoryFact = edit()
+        except (KeyError, ValueError):
+            # Gone between the check and the edit: another writer forgot or corrected it.
+            raise _memory_edit_refusal(404, "fact_not_found") from None
+        except OSError as exc:
+            logger.error("Memory edit for %r could not be saved: %s", agent_id, exc)
+            raise _memory_edit_refusal(500, "save_failed") from None
+        return fact
+
+    @app.patch("/api/agents/{agent_id}/memory/{fact_id}")
+    async def correct_memory_fact(  # pyright: ignore[reportUnusedFunction]
+        agent_id: str, fact_id: str, req: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Correct: a `corrected` fact that supersedes this one (design §3.6, §3.8).
+
+        Body `{value}`. Returns the new fact. The old one stays in the file, retracted with
+        the reason "corrected by the user".
+        """
+        value = req.get("value")
+        if not isinstance(value, str) or not value.strip():
+            raise _memory_edit_refusal(400, "value_missing")
+        store = _editable_memory(agent_id, fact_id)
+        fact = _edited(agent_id, lambda: store.correct_fact(fact_id, value, _user_provenance()))
+        return {"fact": fact.model_dump(mode="json")}
+
+    @app.delete("/api/agents/{agent_id}/memory/{fact_id}")
+    async def forget_memory_fact(agent_id: str, fact_id: str) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
+        """Forget: a retraction, never a hard delete (design §3.6, §3.8).
+
+        The fact leaves every future prompt and every list; the audit record stays in the
+        file with the reason "forgotten by the user". Returns the retracted fact.
+        """
+        store = _editable_memory(agent_id, fact_id)
+        fact = _edited(
+            agent_id,
+            lambda: store.retract_fact(fact_id, "forgotten by the user", _user_provenance()),
+        )
+        return {"fact": fact.model_dump(mode="json")}

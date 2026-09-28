@@ -3276,13 +3276,12 @@ def _profile(model_id: str, family: Any) -> Any:
     return ModelProfile(model_id=model_id, display_name=model_id, family=family)
 
 
-def test_the_description_follows_the_active_model_on_every_read() -> None:
-    """The model a turn will use, and its grammar, are read when the tool list is built.
+def test_the_description_stays_the_same_across_a_model_switch() -> None:
+    """Switching the checkpoint leaves the tools layer of the request unchanged (#1723).
 
-    Killed by: src/uclone_x/tools/builtin/image.py :: parts.append(grammar)
-    Becomes: pass
+    Killed by: src/uclone_x/tools/builtin/image.py :: parts = [self.GEMINI_BASE_DESCRIPTION if gemini else self.BASE_DESCRIPTION]
+    Becomes: parts = [self.GEMINI_BASE_DESCRIPTION if gemini else self.BASE_DESCRIPTION, self.active_profile().family.value]
     """
-    from uclone_x.tools.builtin.image import FAMILY_GRAMMAR
     from uclone_x.tools.builtin.media_registry import PromptFamily
 
     dispatcher = _SwitchableDispatcher(_profile("anime_model", PromptFamily.DANBOORU))
@@ -3292,15 +3291,10 @@ def test_the_description_follows_the_active_model_on_every_read() -> None:
     dispatcher.profile = _profile("flux_model", PromptFamily.NATURAL_PROSE)
     second = tool.description
 
-    assert "Active model: 'anime_model' (danbooru prompt family)." in first
-    assert "Active model: 'flux_model' (prose prompt family)." in second
-    assert FAMILY_GRAMMAR[PromptFamily.DANBOORU] in first
-    assert FAMILY_GRAMMAR[PromptFamily.NATURAL_PROSE] in second
-    assert FAMILY_GRAMMAR[PromptFamily.NATURAL_PROSE] not in first
-    assert first != second
+    assert first == second == GenerateImageTool.BASE_DESCRIPTION
     for text in (first, second):
-        assert "media-prompt" not in text
-        assert "automatically merged" not in text
+        assert "anime_model" not in text and "flux_model" not in text
+        assert "danbooru" not in text and "prose" not in text
         assert "load_skill" not in text  # no domain skills bound
 
 
@@ -3335,7 +3329,7 @@ def test_the_description_lists_only_active_family_sections_skills() -> None:
     assert "media-draft" not in text
 
 
-def test_a_failing_profile_lookup_leaves_the_base_description_and_a_log(
+def test_a_failing_settings_read_leaves_the_base_description_and_a_log(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Killed by: src/uclone_x/tools/builtin/image.py :: return self.BASE_DESCRIPTION
@@ -3343,8 +3337,8 @@ def test_a_failing_profile_lookup_leaves_the_base_description_and_a_log(
     """
 
     class _Broken(ImagePipelineDispatcher):
-        def get_active_profile(self) -> Any:
-            raise OSError("checkpoint directory unreadable")
+        def draws_with_gemini(self, choice: Any = None) -> bool:
+            raise OSError("settings file unreadable")
 
     tool = GenerateImageTool(dispatcher=_Broken())
 
@@ -3352,7 +3346,7 @@ def test_a_failing_profile_lookup_leaves_the_base_description_and_a_log(
         text = tool.description
 
     assert text == GenerateImageTool.BASE_DESCRIPTION
-    assert "Could not resolve the active image model" in caplog.text
+    assert "Could not read the picture settings" in caplog.text
 
 
 _ANATOMY_TERMS = ("anatomy", "hands", "fingers", "limbs", "animal", "deformed", "extra")
@@ -3378,7 +3372,7 @@ def test_an_architecture_prompt_gets_no_anatomy_negative_from_any_shipped_profil
     tmp_path: Path,
 ) -> None:
     """The negative an architecture render actually receives, per shipped model."""
-    from uclone_x.tools.builtin.media_registry import optimize_prompts
+    from uclone_x.tools.builtin.media_registry import fill_prompt_defaults
 
     registry = _default_registry(tmp_path)
     for checkpoint in (
@@ -3387,8 +3381,8 @@ def test_an_architecture_prompt_gets_no_anatomy_negative_from_any_shipped_profil
         "flux-2-klein-base-4b.safetensors",
         "mystery.safetensors",
     ):
-        _, negative = optimize_prompts(
+        negative = fill_prompt_defaults(
             "modern architecture, glass facade, no humans", "", registry.resolve(checkpoint)
-        )
+        ).negative_prompt
         for term in _ANATOMY_TERMS:
             assert term not in negative.lower(), (checkpoint, term)

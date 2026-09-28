@@ -1,21 +1,25 @@
-"""A fact a clone saves in a conversation is listed on the dock's Remembers tab (#1401).
+"""A fact a clone saves is listed on Remembers, and can be corrected and forgotten there.
 
-Before #1401 the tab listed only the seat's knowledge record for the conversation, which
-nothing in a room turn adds to (#1404), so in real use it never filled: a clone could save
-"Kenny's favourite colour is teal" to its own memory and Remembers still said nothing was
-listed. The tab now lists the facts the clone saved to memory as well.
+#1401 put the facts a clone saved to memory on the dock's Remembers tab. #1638 step 3 made
+that the tab's one list, grouped by where each fact was learned, with a `⋯` on each fact
+that corrects or forgets it (clone-knowledge-graph §3.6).
 
 The provider is scripted to ask for one `record_memory_fact`; everything after it -- the
 tool, the agent loop, the orchestrator, the clone's memory file, `GET
-/api/rooms/{id}/knowledge` and the render -- is the shipped code.
+/api/rooms/{id}/knowledge`, `PATCH`/`DELETE /api/agents/{id}/memory/{fact}` and the render
+-- is the shipped code.
+
+The design's end-to-end row also forgets a fact from the turn row that learned it; that row
+line arrives with the extractor (step 4), so this test forgets from Remembers.
 
 Mutation-checked by hand rather than as a kill declaration, because the lethality ratchet
 runs a browser test against the committed bundle without rebuilding it (see
 `tests/e2e/test_room_failed_turn_row_e2e.py`). The Core half is declared in
 `tests/unit/test_ui_room_dock_routes.py`; rebuilt with `vite build`, this fails when
-`frontend/src/components/artifacts/RemembersPanel.tsx`'s `{saved && saved.length > 0 && (`
-becomes `{saved && saved.length > 99 && (`. It also fails against the bundle this change
-replaced, which had no saved-facts group.
+`frontend/src/components/artifacts/RemembersPanel.tsx`'s
+`const onChanged = () => setEdits((n) => n + 1);` becomes
+`const onChanged = () => setEdits((n) => n);`.
+It also fails against the bundle this change replaced, which had no `known-fact` rows.
 """
 
 from __future__ import annotations
@@ -99,14 +103,41 @@ async def test_a_fact_saved_in_the_conversation_is_listed_on_remembers(
             await dock.wait_for(state="visible", timeout=10000)
             await dock.locator("[data-testid='tab-remembers']").click()
 
-            fact = dock.locator("[data-testid='saved-fact']")
+            fact = dock.locator("[data-testid='known-fact']")
             await fact.first.wait_for(timeout=15000)
             assert await fact.count() == 1
+            here = dock.locator("[data-testid='remembers-here']")
+            assert "Learned in this conversation" in await here.inner_text()
             text = await fact.first.inner_text()
             assert "Kenny favourite colour teal" in text
-            assert "saved in this conversation" in text
+            assert "saved" in text
+
+            # Correct: the value is edited in place, and the list is read again.
+            await fact.first.locator("[data-testid='fact-actions']").click()
+            await fact.first.locator("[data-testid='fact-correct']").click()
+            await fact.first.locator("[data-testid='fact-correct-input']").fill("navy")
+            await fact.first.locator("[data-testid='fact-correct-save']").click()
+            await dock.get_by_text("Kenny favourite colour navy").wait_for(timeout=10000)
+            assert await fact.count() == 1
+            assert "corrected" in await fact.first.inner_text()
+
+            # Forget: asked first, then gone from the list.
+            await fact.first.locator("[data-testid='fact-actions']").click()
+            await fact.first.locator("[data-testid='fact-forget']").click()
+            confirm = await fact.first.locator("[data-testid='fact-forget-confirm']").inner_text()
+            assert confirm == "clone will stop using this. Forget it?"
+            await fact.first.locator("[data-testid='fact-forget-yes']").click()
+            reason = dock.locator("[data-testid='remembers-reason']")
+            await reason.get_by_text("No facts are listed for clone.").wait_for(timeout=10000)
+            assert await fact.count() == 0
 
             panel = await dock.locator("[data-testid='remembers-panel']").inner_text()
             assert not TECHNICAL.search(panel), f"Remembers shows technical text: {panel}"
+
+            # Durable: a fresh read of the clone's memory lists nothing either.
+            answer = await page.request.get(
+                f"{saving_ui_server}/api/rooms/{room_id}/knowledge?agent_id=clone"
+            )
+            assert (await answer.json())["facts"] == []
         finally:
             await browser.close()

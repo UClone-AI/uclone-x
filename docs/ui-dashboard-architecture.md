@@ -219,19 +219,20 @@ off):
    generated image, on a media card — fronts this surface on that file (`OpenInDocsContext`).
    A failed read of the list shows the Core's own `detail` or a fixed sentence, and a file
    whose content cannot be read shows a fixed sentence; never transport text (#1435).
-4. **Remembers** — what the seat's clone remembers, one plain sentence per item, in two
-   groups (`RemembersPanel`, `GET /api/rooms/{id}/knowledge?agent_id=`). **Saved to memory**
-   (`saved_facts[]`, #1401) is the facts the clone saved to its own memory, from any
-   conversation, never another clone's; the ones saved here are
-   marked. **Known in this conversation** (`remembers[]`) is the seat's knowledge record for
-   this conversation. Where a group has nothing to list, or cannot be read, the panel
-   says that none are listed or that it could not be read, never "nothing was learned" (P6). A
-   failed read shows the Core's own `detail` or a fixed sentence, never transport text. A seat that is not running is read from its saved knowledge
-   record (#1367); a turn that set an unreadable record aside says so on its row; the clone's saved memory facts are another file and stay listed. This is U0's view of the same knowledge the developer Knowledge Graph draws; nothing
-   on it names the graph's parts (#1357).
-   *Planned (#1638, owner ruling 2026-09-25, relayed by an agent; P7 amended to match, #1654):* one clone-wide list, "What {name} knows", with what
-   this conversation taught first, and **Correct** / **Forget** on each fact; the turn that taught
-   something says so on its row. See design/clone-knowledge-graph.md §3.6.
+4. **Remembers** — "What {name} knows": the seat's clone's facts, one plain sentence each,
+   in one clone-wide list (`RemembersPanel`, `GET /api/rooms/{id}/knowledge?agent_id=`,
+   `facts[]`, #1638 step 3). The list comes from the clone's own memory, from any
+   conversation, never another clone's. It has two groups: **Learned in this conversation**
+   (`learned_here`), then **From other conversations**. Each fact says how it was learned
+   (told, found, saved, corrected), and its `⋯` opens **Correct** (edit the value; a
+   `corrected` fact supersedes the old one) and **Forget** (asks first; a retraction, the
+   audit record stays). With no facts, or facts that cannot be read, the panel says that none
+   are listed or that they could not be read, never "nothing was learned" (P6). A failed read,
+   or a refused Correct or Forget, shows a plain sentence, never transport text, an id or a
+   path. The per-seat knowledge record's `status` and graph fields are for the developer
+   Knowledge Graph only; nothing on this tab names the graph's parts (#1357). The turn row
+   that taught something ("will remember") arrives with the extractor (clone-knowledge-graph
+   step 4). See design/clone-knowledge-graph.md §3.6.
 5. **Activity & Tools** — the seat's tool calls in this conversation (`ActivityTimeline`):
    the recorded ones from `GET /api/rooms/{id}/seats/{pid}/history`, plus live `TOOL_CALL` /
    `TOOL_RESULT` envelopes on topic `room.{id}.tool`, matched without regard to case (#1353).
@@ -397,7 +398,7 @@ records what each one replaced:
 | :--- | :--- | :--- |
 | Docs & Artifacts | `GET /api/rooms/{id}/artifacts` | `GET /api/artifacts`, which lists the whole workspace. The room read lists only the paths its seats wrote through a tool that declares `writes_files` (#1167). `unattributed_writes` counts calls that may have written without naming a path (a shell, a helper); the list never claims that nothing was written |
 | Knowledge Graph (developer drawer) | `GET /api/rooms/{id}/knowledge?agent_id=<seat>` | `GET /api/knowledge-graph`, which reads the manager's shared engine. That engine is never a seat's (P7). A seat not running in this process is read from its saved knowledge (#1367); with none saved the room read answers `status: "not_recorded"` with `null` lists, never an empty graph |
-| Remembers | `saved_facts[]` and `remembers[]` of the same knowledge read | Nothing: U0 had no view of what a clone remembers. The saved facts are listed on every status; `not_recorded`, `unreadable` and `no_ontology` show the Core's `reason` for the conversation's record |
+| Remembers | `facts[]` of the knowledge read, grouped by `learned_here`; `PATCH`/`DELETE /api/agents/{id}/memory/{fact_id}` for Correct and Forget | Nothing: U0 had no view of what a clone knows. The facts are listed on every status; the per-seat record's `status` and `reason` are for the developer graph |
 | Activity & Tools | `GET /api/rooms/{id}/seats/{seat}/history`, live on `room.{id}.tool` | The session's tool trace, which a seat's traces never reach (G2). A turn whose tools were not recorded carries `tools: null` and a reason, never `[]` |
 | DAG (developer drawer) | `GET /api/rooms/{id}/topology` | `GET /api/agents`, which listed the chat manager's agents (2026-09-27: `/api/agents` removed, #1775). A seat was not among them. Every seated agent is a node, including an idle one |
 

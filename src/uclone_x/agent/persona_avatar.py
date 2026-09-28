@@ -9,6 +9,9 @@ writing tools cannot reach the directory at all (`BaseTool.resolve_write_path`).
 
 from __future__ import annotations
 
+import os
+from collections.abc import Generator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -17,12 +20,19 @@ from uclone_x.agent.persona_store import BUILTIN_PERSONAS_DIR
 from uclone_x.errors import PlainRefusalError
 from uclone_x.tools.base import replace_file
 
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - not POSIX (Windows): changes go unserialised
+    fcntl = None
+
 __all__ = [
     "AVATAR_FORMATS",
     "MAX_AVATAR_BYTES",
+    "AvatarChange",
     "AvatarPersonaNotFound",
     "AvatarRecord",
     "AvatarRefused",
+    "AvatarStaleChange",
     "PersonaAvatarStore",
     "avatar_url",
     "sniff_image_format",
@@ -58,12 +68,27 @@ class AvatarRefused(PlainRefusalError):
 
     `reason_code` names which reason, so the head can say what to do without reading the
     sentence: `no_clone`, `not_saved`, `no_workspace`, `too_large`, `not_an_image`,
-    `no_file`, `outside_workspace`, `no_source`.
+    `no_file`, `outside_workspace`, `no_source`, `stale_change`.
     """
 
 
 class AvatarPersonaNotFound(AvatarRefused):
     """The name is not a clone this head has loaded from a file."""
+
+
+class AvatarStaleChange(AvatarRefused):
+    """An undo named a change that is no longer the clone's latest, so nothing was done.
+
+    Another tab, another device, or the clone itself changed the picture after the change
+    being undone; putting back what that one replaced would now undo the wrong picture.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "The picture was changed again after that change, so it was not undone. "
+            "Choose the picture you want from the clone's profile instead.",
+            reason_code="stale_change",
+        )
 
 
 @dataclass(frozen=True)
@@ -73,6 +98,21 @@ class AvatarRecord:
     path: Path
     mime: str
     version: str
+
+
+@dataclass(frozen=True)
+class AvatarChange:
+    """One change to a clone's picture, as the store made it.
+
+    `change_id` names this change among every change to this clone's picture, counted on
+    disk, so it survives a restart and two changes to the same picture (A, B, A) still get
+    different ids. An undo passes it back as `undo_of`. `previous` is the kept picture
+    that undoing it would put back, or `None` when the clone had no chosen picture before,
+    so undoing is a reset.
+    """
+
+    change_id: int
+    previous: Path | None
 
 
 def sniff_image_format(data: bytes) -> str | None:
@@ -171,11 +211,22 @@ class PersonaAvatarStore:
             )
         return folder
 
-    def set(self, name: str, data: bytes) -> AvatarRecord:
+    def latest_change(self, name: str) -> int:
+        """The id of the latest change to `name`'s picture; `0` before any, or for no clone."""
+        if self._registry.source_of(name) is None:
+            return 0
+        folder = self._custom_dir()
+        return 0 if folder is None else _read_change(folder, name)
+
+    def set(self, name: str, data: bytes, *, undo_of: int | None = None) -> AvatarChange:
         """Make `data` the picture for `name`, keeping the one it replaces as `<name>.prev.<ext>`.
+
+        With `undo_of`, this is the undo of that change, and it is made only while that
+        change is still the latest; checked and made under one lock.
 
         Raises:
             AvatarPersonaNotFound: `name` is not a clone loaded here.
+            AvatarStaleChange: `undo_of` is not the latest change; nothing was written.
             AvatarRefused: the picture is too large or not a PNG, JPEG, WebP or GIF image,
                 or the clone has nowhere to keep it.
         """
@@ -193,19 +244,22 @@ class PersonaAvatarStore:
                 "Choose a picture in one of those formats.",
                 reason_code="not_an_image",
             )
-        folder.mkdir(parents=True, exist_ok=True)
-        current = self._custom_files(name, stem=name)
-        if current:
-            self._keep_previous(name, current[0])
-        target = folder / f"{name}{_SUFFIX_FOR_MIME[mime]}"
-        replace_file(target, data)
-        for other in current:
-            if other != target:
-                other.unlink(missing_ok=True)
-        return _record(target, mime)
+        with _changing(folder, name, undo_of) as change_id:
+            current = self._custom_files(name, stem=name)
+            replaced = self._keep_previous(name, current[0]) if current else None
+            target = folder / f"{name}{_SUFFIX_FOR_MIME[mime]}"
+            replace_file(target, data)
+            for other in current:
+                if other != target:
+                    other.unlink(missing_ok=True)
+            return AvatarChange(change_id=change_id, previous=replaced)
 
-    def set_from_path(self, name: str, path: Path) -> AvatarRecord:
+    def set_from_path(self, name: str, path: Path, *, undo_of: int | None = None) -> AvatarChange:
         """`set` with the bytes of `path`, a file the caller has already resolved safely."""
+        if undo_of is not None and undo_of != self.latest_change(name):
+            # Said before the file checks, so a stale undo is not reported as a missing file;
+            # `set` checks again under the lock, which is what makes the refusal hold.
+            raise AvatarStaleChange()
         if not path.is_file():
             raise AvatarRefused(
                 f"There is no picture at '{path.name}', so none was set. Check the file's name.",
@@ -217,22 +271,24 @@ class PersonaAvatarStore:
                 "a clone's picture can be. Choose a smaller one.",
                 reason_code="too_large",
             )
-        return self.set(name, path.read_bytes())
+        return self.set(name, path.read_bytes(), undo_of=undo_of)
 
-    def reset(self, name: str) -> Path | None:
-        """Put the chosen picture aside as `<name>.prev.<ext>`; return where it went.
+    def reset(self, name: str, *, undo_of: int | None = None) -> AvatarChange:
+        """Put the chosen picture aside as `<name>.prev.<ext>`; `previous` says where it went.
 
-        The clone then shows its shipped picture, or the head's default. `None` when there
-        was no chosen picture to put aside.
+        The clone then shows its shipped picture, or the head's default. `previous` is
+        `None` when there was no chosen picture to put aside; the call still counts as a
+        change, so an Undo offered before it no longer matches. `undo_of` is as for `set`.
         """
-        self._require_settable(name)
-        current = self._custom_files(name, stem=name)
-        if not current:
-            return None
-        kept = self._keep_previous(name, current[0])
-        for other in current:
-            other.unlink(missing_ok=True)
-        return kept
+        folder = self._require_settable(name)
+        with _changing(folder, name, undo_of) as change_id:
+            current = self._custom_files(name, stem=name)
+            if not current:
+                return AvatarChange(change_id=change_id, previous=None)
+            kept = self._keep_previous(name, current[0])
+            for other in current:
+                other.unlink(missing_ok=True)
+            return AvatarChange(change_id=change_id, previous=kept)
 
     def chosen(self, name: str) -> Path | None:
         """The picture chosen for `name` in the workspace, not the shipped one, if any."""
@@ -257,3 +313,51 @@ class PersonaAvatarStore:
                 older.unlink(missing_ok=True)
         replace_file(kept, data)
         return kept
+
+
+def _change_file(folder: Path, name: str) -> Path:
+    return folder / f".{name}.avatar-change"
+
+
+def _read_change(folder: Path, name: str) -> int:
+    """The counted id of `name`'s latest change; `0` when none was counted or it is unreadable."""
+    try:
+        text = _change_file(folder, name).read_text(encoding="ascii").strip()
+    except (OSError, UnicodeDecodeError):
+        return 0
+    return int(text) if text.isascii() and text.isdigit() else 0
+
+
+@contextmanager
+def _changing(folder: Path, name: str, undo_of: int | None) -> Generator[int]:
+    """Hold `name`'s picture lock for one change and yield the id that change gets.
+
+    The id is counted on disk, beside the picture, and written before the change is made.
+    A change that fails part-way then still takes its id, which only makes older Undos
+    stale; counting afterwards would let a crash between the two leave an older Undo
+    matching a picture it no longer describes. With `undo_of`, the change goes ahead only
+    while `undo_of` is still the latest id, checked under the same lock that covers the
+    write, so a change from another tab or the clone itself cannot land in between.
+
+    The lock is a sidecar file locked with `flock`, across processes as well as threads;
+    where `fcntl` does not exist, changes are not serialised.
+    """
+    folder.mkdir(parents=True, exist_ok=True)
+    fd: int | None = None
+    if fcntl is not None:
+        try:
+            fd = os.open(folder / f".{name}.avatar-lock", os.O_RDONLY | os.O_CREAT, 0o600)
+        except OSError:
+            fd = None
+    try:
+        if fd is not None and fcntl is not None:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        latest = _read_change(folder, name)
+        if undo_of is not None and (undo_of < 1 or undo_of != latest):
+            raise AvatarStaleChange()
+        change_id = latest + 1
+        replace_file(_change_file(folder, name), f"{change_id}\n".encode("ascii"))
+        yield change_id
+    finally:
+        if fd is not None:
+            os.close(fd)  # closing the descriptor releases the lock

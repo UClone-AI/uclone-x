@@ -18,6 +18,23 @@
     "resetDone": "{name} shows its default picture again."
   },
   "askText": "Please draw a few profile pictures of yourself and show them to me, so I can choose one.",
+  "askTextStyled": "Please draw a few profile pictures of yourself in the {style} style and show them to me, so I can choose one.",
+  "style": {
+    "group": "Style",
+    "chip": {
+      "default": "Default (pastel close-up)",
+      "watercolor": "Watercolor",
+      "realistic": "Realistic portrait",
+      "pixelArt": "Pixel art",
+      "flat": "Flat illustration"
+    },
+    "name": {
+      "watercolor": "watercolor",
+      "realistic": "realistic portrait",
+      "pixelArt": "pixel art",
+      "flat": "flat illustration"
+    }
+  },
   "upload": {
     "wrongType": "That file is not a PNG, JPEG or WebP picture, so it was not used.",
     "tooLarge": "That picture is larger than 10 MB, so it was not used. Choose a smaller one."
@@ -31,6 +48,7 @@
     "noWorkspace": "UClone-X has no workspace folder open, so {name}'s picture was not changed. Open a workspace and try again.",
     "outsideWorkspace": "That picture is outside the workspace, so it was not given to {name}. Upload it from this computer instead.",
     "noFile": "That picture is no longer in the workspace, so {name}'s picture was not changed.",
+    "staleChange": "{name}'s picture was changed again since then, so that change was not undone. Choose the picture you want from its profile menu.",
     "failed": "Something went wrong, so {name}'s picture was not changed. Try again."
   }
 }

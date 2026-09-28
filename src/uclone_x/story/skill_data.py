@@ -18,7 +18,8 @@ What the loader checks on a skill's data, refusing the whole call when one fails
   folder, and each file is then opened one folder at a time from the skill's folder
   without following a link, so a folder swapped for a link after that check is refused
   rather than followed out;
-* the file name follows the id rule, so it does not start with a dot;
+* the file name follows the id rule, so it does not start with a dot; a macOS AppleDouble
+  file (`._<name>.yaml`) is not data and is skipped, not refused;
 * the file is a regular file, not a folder, FIFO or other special file;
 * the file is at most `MAX_DATA_FILE_BYTES`, and repeats nothing by YAML alias;
 * a data file that is a link that loops, a `muse` or `structures` folder that cannot be
@@ -91,6 +92,9 @@ MAX_DATA_FILE_BYTES = 256 * 1024
 
 _ID = r"^[a-z0-9]+(?:-[a-z0-9]+)*$"
 _ID_RE = re.compile(_ID)
+
+#: The prefix of the AppleDouble files macOS leaves beside copied files; skipped, not refused.
+_APPLEDOUBLE_PREFIX = "._"
 
 
 class SkillDataError(UCloneXError):
@@ -482,10 +486,19 @@ def _yaml_files(directory: Path, root: Path) -> list[Path]:
 
     `Path.glob` answers nothing for a folder it may not list (e.g. mode 000), which would let
     a skill silently supply nothing; `os.scandir` raises, and that becomes the plain refusal.
+
+    A name starting with `._` is left out: macOS writes such AppleDouble files beside each
+    file it copies to a volume that cannot hold its metadata, and they are not data (#1612,
+    owner ruling 2026-09-27). Any other name that starts with a dot is still listed, and
+    refused by the id rule.
     """
     try:
         with os.scandir(directory) as entries:
-            names = [entry.name for entry in entries if entry.name.endswith(".yaml")]
+            names = [
+                entry.name
+                for entry in entries
+                if entry.name.endswith(".yaml") and not entry.name.startswith(_APPLEDOUBLE_PREFIX)
+            ]
     except OSError as exc:  # listing refused
         raise _unreadable(root, directory, exc) from exc
     return sorted(directory / name for name in names)

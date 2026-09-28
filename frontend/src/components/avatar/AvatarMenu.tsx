@@ -4,30 +4,39 @@ import { Avatar } from '../../ui-kit';
 import { fmt, useCopy } from '../../i18n';
 import {
   UPLOAD_ACCEPT,
-  noteAvatarChange,
   resetAvatar,
   undoAvatarChange,
+  undoStillOffered,
   uploadAvatar,
   uploadProblem,
   useAvatarChoice,
-  useLatestAvatarChange,
   type AvatarFailure,
 } from '../../lib/avatarChoice';
 import { usePopover } from './usePopover';
 
 type Outcome =
-  | { kind: 'uploaded' | 'reset'; previousPath: string | null; change: number }
+  | { kind: 'uploaded' | 'reset'; previousPath: string | null; changeId: number | null }
   | { kind: 'undone' }
   | { kind: 'failed'; failure: AvatarFailure }
   | { kind: 'badFile'; problem: 'wrongType' | 'tooLarge' };
 
 /**
+ * The drawing styles a person can pick before asking, by the names the avatar skill's presets
+ * use. `default` is the house style, "pastel close-up", and the request leaves it unnamed: a
+ * request with no style is what the skill draws in that style.
+ */
+const STYLES = ['default', 'watercolor', 'realistic', 'pixelArt', 'flat'] as const;
+type AvatarStyle = (typeof STYLES)[number];
+
+/**
  * A clone's picture on its profile, as the way to change it.
  *
  * Three things, each a plain act: upload a picture from this computer, ask the clone to draw
- * some (a request put in the composer, not sent -- generation stays in the conversation), or
+ * some in a style picked here (a request put in the composer, not sent -- generation stays in
+ * the conversation, and the person can still rewrite the style there), or
  * go back to the default. An upload or reset answers under the picture with an Undo, which
- * goes once a later change to this clone's picture is made anywhere in the head.
+ * goes once the listing shows a later change to this clone's picture, made anywhere. The
+ * runtime refuses an Undo it reaches too late, and the menu then says so in plain words.
  *
  * Without the app's avatar context, or for a clone with no installed definition to keep a
  * picture beside, it is the plain picture it was.
@@ -49,7 +58,7 @@ export const AvatarMenu: React.FC<{
   const fileRef = useRef<HTMLInputElement | null>(null);
   const [working, setWorking] = useState(false);
   const [outcome, setOutcome] = useState<Outcome | null>(null);
-  const latest = useLatestAvatarChange(name);
+  const [style, setStyle] = useState<AvatarStyle>('default');
 
   const picture = (onClick?: () => void) => (
     <Avatar
@@ -72,7 +81,7 @@ export const AvatarMenu: React.FC<{
     const result = await act();
     setWorking(false);
     if (result.ok) {
-      setOutcome({ kind, previousPath: result.previousPath, change: noteAvatarChange(name) });
+      setOutcome({ kind, previousPath: result.previousPath, changeId: result.changeId });
       choice.onChanged();
     } else {
       setOutcome({ kind: 'failed', failure: result.failure });
@@ -92,18 +101,25 @@ export const AvatarMenu: React.FC<{
     void run('uploaded', () => uploadAvatar(name, file));
   };
 
-  const undo = async (previousPath: string | null) => {
+  const undo = async (previousPath: string | null, changeId: number | null) => {
+    if (changeId === null) return;
     setWorking(true);
-    const result = await undoAvatarChange(name, previousPath);
+    const result = await undoAvatarChange(name, previousPath, changeId);
     setWorking(false);
     if (result.ok) {
-      noteAvatarChange(name);
       setOutcome({ kind: 'undone' });
       choice.onChanged();
     } else {
-      setOutcome({ kind: 'failed', failure: result.failure });
+      const { failure } = result;
+      setOutcome({ kind: 'failed', failure });
+      // Changed elsewhere: read the pictures again, so the one shown is the one in force.
+      if (failure === 'staleChange') choice.onChanged();
     }
   };
+
+  /** The request put in the composer: it names the picked style, and none for the default. */
+  const request = () =>
+    style === 'default' ? copy.askText : fmt(copy.askTextStyled, { style: copy.style.name[style] });
 
   const item =
     'flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs text-slate-200 hover:bg-slate-800 disabled:opacity-50 disabled:hover:bg-transparent';
@@ -133,6 +149,30 @@ export const AvatarMenu: React.FC<{
               <ImageUp className="h-3.5 w-3.5 text-slate-400" />
               {copy.menu.upload}
             </button>
+            <div
+              role="group"
+              aria-label={copy.style.group}
+              data-testid="clone-avatar-styles"
+              className="flex flex-wrap gap-1 px-3 pb-1 pt-1.5"
+            >
+              {STYLES.map((option) => (
+                <button
+                  key={option}
+                  type="button"
+                  role="menuitemradio"
+                  aria-checked={style === option}
+                  data-testid={`clone-avatar-style-${option}`}
+                  onClick={() => setStyle(option)}
+                  className={`rounded-full border px-2 py-0.5 text-[11px] ${
+                    style === option
+                      ? 'border-sky-500 bg-sky-500/15 text-sky-200'
+                      : 'border-slate-700 text-slate-300 hover:bg-slate-800'
+                  }`}
+                >
+                  {copy.style.chip[option]}
+                </button>
+              ))}
+            </div>
             <button
               type="button"
               role="menuitem"
@@ -140,7 +180,7 @@ export const AvatarMenu: React.FC<{
               className={item}
               onClick={() => {
                 menu.setOpen(false);
-                choice.askFor(name);
+                choice.askFor(name, request());
               }}
             >
               <Sparkles className="h-3.5 w-3.5 text-slate-400" />
@@ -179,11 +219,11 @@ export const AvatarMenu: React.FC<{
       {!working && (outcome?.kind === 'uploaded' || outcome?.kind === 'reset') && (
         <p role="status" data-testid="clone-avatar-done" className="text-[11px] text-slate-400">
           {fmt(outcome.kind === 'uploaded' ? copy.menu.uploaded : copy.menu.resetDone, { name })}{' '}
-          {latest === outcome.change && (
+          {undoStillOffered(outcome.changeId, name, choice.latestChanges) && (
             <button
               type="button"
               data-testid="clone-avatar-undo"
-              onClick={() => void undo(outcome.previousPath)}
+              onClick={() => void undo(outcome.previousPath, outcome.changeId)}
               className="text-slate-300 underline hover:text-slate-100"
             >
               {copy.card.undo}

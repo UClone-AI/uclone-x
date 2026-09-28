@@ -38,6 +38,13 @@ class SetAvatarParams(BaseModel):
         default=False,
         description="True to stop using a chosen picture and show the shipped one again.",
     )
+    undo_of: int | None = Field(
+        default=None,
+        description=(
+            "Only when undoing: the change_id the change being undone returned. The undo "
+            "is refused, and nothing changes, if the picture was changed again since."
+        ),
+    )
 
 
 class SetAvatarTool(BaseTool[SetAvatarParams]):
@@ -55,13 +62,14 @@ class SetAvatarTool(BaseTool[SetAvatarParams]):
     description = (
         "Set your own profile picture from an image in the workspace, usually one "
         "generate_image just made. Pass image_path to set it, or reset=true to go back to "
-        "your shipped picture. Returns avatar_url and previous_path; to undo, call "
-        "set_avatar again with image_path set to previous_path (or reset=true when "
-        "previous_path is null). It changes only your own picture."
+        "your shipped picture. Returns avatar_url, previous_path and change_id; to undo, "
+        "call set_avatar again with image_path set to previous_path (or reset=true when "
+        "previous_path is null) and undo_of set to that change_id. An undo is refused if "
+        "the picture was changed again since. It changes only your own picture."
     )
     params_type = SetAvatarParams
 
-    def run(self, params: SetAvatarParams, context: ToolContext) -> dict[str, str | None]:
+    def run(self, params: SetAvatarParams, context: ToolContext) -> dict[str, str | int | None]:
         """Set or reset the picture and say where it is shown from."""
         agent = context.agent_delegate
         persona: object = getattr(agent, "persona_name", None) if agent is not None else None
@@ -78,7 +86,7 @@ class SetAvatarTool(BaseTool[SetAvatarParams]):
         workspace = context.require_workspace()
         store = PersonaAvatarStore(get_default_persona_registry(workspace))
         if params.image_path is None:
-            kept = store.reset(persona)
+            change = store.reset(persona, undo_of=params.undo_of)
         else:
             try:
                 source = self.resolve_safe_path(params.image_path, workspace)
@@ -87,12 +95,11 @@ class SetAvatarTool(BaseTool[SetAvatarParams]):
                     f"'{params.image_path}' is outside the workspace, so it was not used. "
                     "Use a picture in the workspace."
                 ) from exc
-            had_chosen = store.chosen(persona) is not None
-            store.set_from_path(persona, source)
-            kept = store.previous(persona) if had_chosen else None
+            change = store.set_from_path(persona, source, undo_of=params.undo_of)
         return {
             "avatar_url": avatar_url(persona, store.find(persona)),
-            "previous_path": _relative(kept, workspace),
+            "previous_path": _relative(change.previous, workspace),
+            "change_id": change.change_id,
         }
 
 

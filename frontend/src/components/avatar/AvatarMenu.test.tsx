@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { act, render, screen, fireEvent, waitFor } from '@testing-library/react';
+import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import { CloneProfile } from '../clones/CloneProfile';
-import { AvatarChoiceContext, noteAvatarChange, type AvatarChoice } from '../../lib/avatarChoice';
+import { AvatarChoiceContext, type AvatarChoice } from '../../lib/avatarChoice';
 import { LocaleProvider } from '../../i18n';
 import { makePersonaInfo } from '../../test/fixtures';
 import { expectPlain } from '../../test/plainCopy';
@@ -29,23 +29,24 @@ const choice = (): AvatarChoice => ({
   askFor: vi.fn(),
 });
 
-const renderProfile = ({
+const profile = ({
   value = choice() as AvatarChoice | null,
   avatarUrl = '/api/personas/reader/avatar?v=1' as string | null,
   avatarChosen = true,
   korean = false,
-} = {}) =>
-  render(
-    <LocaleProvider hints={[korean ? 'ko-KR' : 'en-US']}>
-      <AvatarChoiceContext.Provider value={value}>
-        <CloneProfile
-          cloneId="reader"
-          persona={makePersonaInfo({ avatar_url: avatarUrl, avatar_chosen: avatarChosen })}
-          onStartConversation={vi.fn()}
-        />
-      </AvatarChoiceContext.Provider>
-    </LocaleProvider>,
-  );
+} = {}) => (
+  <LocaleProvider hints={[korean ? 'ko-KR' : 'en-US']}>
+    <AvatarChoiceContext.Provider value={value}>
+      <CloneProfile
+        cloneId="reader"
+        persona={makePersonaInfo({ avatar_url: avatarUrl, avatar_chosen: avatarChosen })}
+        onStartConversation={vi.fn()}
+      />
+    </AvatarChoiceContext.Provider>
+  </LocaleProvider>
+);
+
+const renderProfile = (options: Parameters<typeof profile>[0] = {}) => render(profile(options));
 
 const openMenu = () => fireEvent.click(screen.getByTestId('clone-profile-avatar'));
 
@@ -90,7 +91,7 @@ describe('the avatar menu on a clone`s profile', () => {
     expect(failed).toHaveTextContent(/PNG, JPEG or WebP/);
   });
 
-  // Killed by: frontend/src/components/avatar/AvatarMenu.tsx :: choice.askFor(name);
+  // Killed by: frontend/src/components/avatar/AvatarMenu.tsx :: choice.askFor(name, request());
   // Becomes: void name;
   it('asks the clone for pictures without sending anything itself', () => {
     const calls = pictureRoutes();
@@ -100,18 +101,75 @@ describe('the avatar menu on a clone`s profile', () => {
     openMenu();
     fireEvent.click(screen.getByTestId('clone-avatar-ask'));
 
-    expect(value.askFor).toHaveBeenCalledWith('reader');
+    // The default style goes unnamed: a request with no style is drawn in the house style.
+    expect(value.askFor).toHaveBeenCalledWith(
+      'reader',
+      'Please draw a few profile pictures of yourself and show them to me, so I can choose one.',
+    );
     expect(calls).toEqual([]);
     expect(screen.queryByTestId('clone-avatar-menu-list')).toBeNull();
   });
 
+  // Killed by: frontend/src/components/avatar/AvatarMenu.tsx :: useState<AvatarStyle>('default')
+  // Becomes: useState<AvatarStyle>('watercolor')
+  it('starts with the default style picked', () => {
+    pictureRoutes();
+    renderProfile();
+
+    openMenu();
+    const picked = screen
+      .getAllByRole('menuitemradio')
+      .filter((chip) => chip.getAttribute('aria-checked') === 'true');
+    expect(picked).toEqual([screen.getByTestId('clone-avatar-style-default')]);
+    expect(picked[0]).toHaveTextContent('Default (pastel close-up)');
+  });
+
+  // Killed by: frontend/src/components/avatar/AvatarMenu.tsx :: onClick={() => setStyle(option)}
+  // Becomes: onClick={() => undefined}
+  // Killed by: frontend/src/components/avatar/AvatarMenu.tsx :: fmt(copy.askTextStyled, { style: copy.style.name[style] })
+  // Becomes: copy.askText
+  it('names the picked style in the request it puts in the box', () => {
+    pictureRoutes();
+    const value = choice();
+    renderProfile({ value });
+
+    openMenu();
+    fireEvent.click(screen.getByTestId('clone-avatar-style-pixelArt'));
+    expect(screen.getByTestId('clone-avatar-style-pixelArt')).toHaveAttribute('aria-checked', 'true');
+    expect(screen.getByTestId('clone-avatar-style-default')).toHaveAttribute('aria-checked', 'false');
+    fireEvent.click(screen.getByTestId('clone-avatar-ask'));
+
+    expect(value.askFor).toHaveBeenCalledTimes(1);
+    const [, request] = vi.mocked(value.askFor).mock.calls[0];
+    expect(request).toBe(
+      'Please draw a few profile pictures of yourself in the pixel art style and show them to me, so I can choose one.',
+    );
+    expectPlain(request);
+  });
+
+  // Killed by: frontend/src/components/avatar/AvatarMenu.tsx :: onClick={() => setStyle(option)}
+  // Becomes: onClick={() => choice.askFor(name, request())}
+  it('puts nothing in the box and sends nothing when a style is picked', () => {
+    // Picking is only picking: the request goes in when the person asks, and then unsent.
+    const calls = pictureRoutes();
+    const value = choice();
+    renderProfile({ value });
+
+    openMenu();
+    fireEvent.click(screen.getByTestId('clone-avatar-style-watercolor'));
+
+    expect(value.askFor).not.toHaveBeenCalled();
+    expect(calls).toEqual([]);
+    expect(screen.getByTestId('clone-avatar-menu-list')).toBeInTheDocument();
+  });
+
   // Killed by: frontend/src/components/avatar/AvatarMenu.tsx :: void run('reset', () => resetAvatar(name));
   // Becomes: void 0;
-  // Killed by: frontend/src/components/avatar/AvatarMenu.tsx :: onClick={() => void undo(outcome.previousPath)}
-  // Becomes: onClick={() => void undo(null)}
+  // Killed by: frontend/src/components/avatar/AvatarMenu.tsx :: onClick={() => void undo(outcome.previousPath, outcome.changeId)}
+  // Becomes: onClick={() => void undo(null, outcome.changeId)}
   it('resets to the default, and Undo puts the chosen picture back', async () => {
     const calls = pictureRoutes(
-      answer(200, { status: 'ok', previous_path: '.uclone/personas/reader.prev.png' }),
+      answer(200, { status: 'ok', previous_path: '.uclone/personas/reader.prev.png', change_id: 3 }),
       answer(200, { status: 'ok' }),
     );
     renderProfile();
@@ -123,7 +181,11 @@ describe('the avatar menu on a clone`s profile', () => {
     await waitFor(() => expect(screen.getByTestId('clone-avatar-undone')).toBeInTheDocument());
     expect(calls[0][1].method).toBe('DELETE');
     expect(calls[1][1].method).toBe('PUT');
-    expect(JSON.parse(calls[1][1].body as string)).toEqual({ source_path: '.uclone/personas/reader.prev.png' });
+    // The Undo names the change it takes back, so the runtime can refuse it if another came after.
+    expect(JSON.parse(calls[1][1].body as string)).toEqual({
+      source_path: '.uclone/personas/reader.prev.png',
+      undo_of: 3,
+    });
   });
 
   // Killed by: frontend/src/components/clones/CloneProfile.tsx :: hasChosenPicture={persona?.avatar_chosen === true}
@@ -147,22 +209,52 @@ describe('the avatar menu on a clone`s profile', () => {
     expect(screen.getByTestId('clone-avatar-reset')).toBeDisabled();
   });
 
-  // Killed by: frontend/src/components/avatar/AvatarMenu.tsx :: {latest === outcome.change && (
+  // Killed by: frontend/src/components/avatar/AvatarMenu.tsx :: {undoStillOffered(outcome.changeId, name, choice.latestChanges) && (
   // Becomes: {true && (
-  it('drops its Undo once the picture is changed again elsewhere (#1780)', async () => {
-    pictureRoutes(answer(200, { status: 'ok', previous_path: '.uclone/personas/reader.prev.png' }));
-    renderProfile();
+  it('drops its Undo once the listing shows a later change, made anywhere (#1780, #1809)', async () => {
+    pictureRoutes(answer(200, { status: 'ok', previous_path: '.uclone/personas/reader.prev.png', change_id: 3 }));
+    const { rerender } = renderProfile();
 
     openMenu();
     fireEvent.click(screen.getByTestId('clone-avatar-reset'));
     await screen.findByTestId('clone-avatar-undo');
-    // A card under a drawn picture, say, gives reader another one.
-    act(() => {
-      noteAvatarChange('reader');
-    });
+    // The listing read again after this change names it as the latest: the Undo stays.
+    rerender(profile({ value: { ...choice(), latestChanges: { reader: 3 } } }));
+    expect(screen.getByTestId('clone-avatar-undo')).toBeInTheDocument();
+    // Another tab, or the clone itself, then gives reader another picture.
+    rerender(profile({ value: { ...choice(), latestChanges: { reader: 4 } } }));
 
     expect(screen.getByTestId('clone-avatar-done')).toBeInTheDocument();
     expect(screen.queryByTestId('clone-avatar-undo')).toBeNull();
+  });
+
+  // Killed by: frontend/src/components/avatar/AvatarMenu.tsx :: setOutcome({ kind: 'failed', failure });
+  // Becomes: void failure;
+  // Killed by: frontend/src/components/avatar/AvatarMenu.tsx :: if (failure === 'staleChange') choice.onChanged();
+  // Becomes: if (false) choice.onChanged();
+  // Killed by: frontend/src/lib/avatarChoice.ts :: stale_change: 'staleChange',
+  // Becomes: stale_change: 'failed',
+  it('says plainly that an Undo came too late, drops it, and reads the pictures again (#1809)', async () => {
+    // The listing had not caught up yet, so the Undo was still offered; the runtime refused it.
+    const calls = pictureRoutes(
+      answer(200, { status: 'ok', previous_path: '.uclone/personas/reader.prev.png', change_id: 3 }),
+      answer(409, { detail: 'The picture was changed again after that change.', code: 'stale_change' }),
+    );
+    const value = choice();
+    renderProfile({ value });
+
+    openMenu();
+    fireEvent.click(screen.getByTestId('clone-avatar-reset'));
+    fireEvent.click(await screen.findByTestId('clone-avatar-undo'));
+
+    const failed = await screen.findByTestId('clone-avatar-failed');
+    expectPlain(failed.textContent);
+    expect(failed.textContent).not.toMatch(/stale_change|409|change_id|undo_of/);
+    expect(failed).toHaveTextContent(/reader's picture was changed again/);
+    expect(screen.queryByTestId('clone-avatar-undo')).toBeNull();
+    expect(calls).toHaveLength(2);
+    // Once for the reset, once more so the picture shown is the newer one in force.
+    expect(value.onChanged).toHaveBeenCalledTimes(2);
   });
 
   // Killed by: frontend/src/components/avatar/AvatarMenu.tsx :: {fmt(copy.failure[outcome.failure], { name })}
@@ -191,10 +283,15 @@ describe('the avatar menu on a clone`s profile', () => {
 
   it('reads in Korean', () => {
     pictureRoutes();
-    renderProfile({ korean: true });
+    const value = choice();
+    renderProfile({ value, korean: true });
 
     openMenu();
     expect(screen.getByTestId('clone-avatar-upload')).toHaveTextContent('그림 올리기');
     expect(screen.getByTestId('clone-avatar-ask')).toHaveTextContent('reader에게 만들어 달라고 하기');
+    expect(screen.getByTestId('clone-avatar-style-default')).toHaveTextContent('기본(파스텔 클로즈업)');
+    fireEvent.click(screen.getByTestId('clone-avatar-style-watercolor'));
+    fireEvent.click(screen.getByTestId('clone-avatar-ask'));
+    expect(vi.mocked(value.askFor).mock.calls[0][1]).toContain('수채화 스타일로');
   });
 });

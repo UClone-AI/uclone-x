@@ -17,7 +17,7 @@ from uclone_x.skills.approvals import SkillApprovalLedger, SkillPin
 from uclone_x.skills.auditor import (
     Skill,
     SkillAuditor,
-    SkillRegistry,
+    _is_file,  # pyright: ignore[reportPrivateUsage]
     compute_skill_sha256,
     copy_skill_package,
     load_skill_from_dir,
@@ -53,6 +53,12 @@ def _skills_dir(custom_path: Path | None = None) -> Path:
     path.mkdir(parents=True, exist_ok=True)
     return path
 
+
+#: What `skill list` says about a skill folder it may list but not look inside (#1824).
+LIST_FOLDER_UNOPENED = (
+    "The skill folder '{name}' could not be opened, so it is not listed. Check that you "
+    "may open it."
+)
 
 #: What `skill approve` says when there is no terminal to ask the person at (#1589).
 APPROVE_NEEDS_TERMINAL = (
@@ -147,9 +153,24 @@ def skill_list(
         console.print(f"[yellow]Skills directory not found: {root}[/yellow]")
         return
 
-    skill_folders = sorted([p for p in root.iterdir() if p.is_dir() and (p / "SKILL.md").is_file()])
+    skill_folders: list[Path] = []
+    unopened: list[str] = []
+    for child in sorted(root.iterdir()):
+        if not child.is_dir():
+            continue
+        # `_is_file`, not `Path.is_file()`: a folder that can be listed but not searched
+        # raises on Python 3.11 to 3.13 and is answered False on 3.14. Either way the person
+        # is told about it instead of the command failing or leaving it out unsaid (#1824).
+        try:
+            if _is_file(child / "SKILL.md"):
+                skill_folders.append(child)
+        except OSError:
+            unopened.append(child.name)
+    for folder_name in unopened:
+        console.print(f"[yellow]{LIST_FOLDER_UNOPENED.format(name=folder_name)}[/yellow]")
     if not skill_folders:
-        console.print(f"[yellow]No skills found in {root}[/yellow]")
+        if not unopened:
+            console.print(f"[yellow]No skills found in {root}[/yellow]")
         return
 
     table = Table(title="🧩 Dynamic Skill Registry (UClone-X)")
@@ -529,10 +550,6 @@ def skill_synthesize(
         Path | None,
         typer.Option("--dir", "-d", help="Custom skills directory path"),
     ] = None,
-    auto_approve: Annotated[
-        bool,
-        typer.Option("--auto-approve", help="Automatically approve and promote if audit passes"),
-    ] = False,
     policy_str: Annotated[
         str,
         typer.Option(
@@ -542,7 +559,10 @@ def skill_synthesize(
         ),
     ] = "safe_only",
 ) -> None:
-    """Autonomously synthesize a new skill package from session traces or workflow steps."""
+    """Synthesize a pending, prompt-only skill from a session's trace or given steps.
+
+    The package is left pending: `./ucx skill approve` is the only way it becomes active.
+    """
     name_clean = name.strip()
     if not name_clean:
         console.print("[bold red]✖ Skill name cannot be empty.[/bold red]")
@@ -643,33 +663,9 @@ def skill_synthesize(
 
     console.print(table)
 
-    # 4. Admission / Promotion logic
-    if auto_approve:
-        if report.is_safe and report.recommendation is AuditVerdict.APPROVE:
-            updated_manifest = manifest.model_copy(
-                update={
-                    "status": SkillStatus.ACTIVE,
-                    "approved_by": "synthesizer:auto",
-                    "approved_at": _now(),
-                    "content_sha256": report.content_sha256,
-                }
-            )
-            skill = load_skill_from_dir(skill_dir)
-            save_skill(skill_dir, updated_manifest, skill.instructions_markdown)
-            registry = SkillRegistry(root)
-            registry.register(load_skill_from_dir(skill_dir), report)
-            console.print(
-                f"[bold green]✔ Auto-approved and registered skill:[/bold green] [cyan]{name_clean}[/cyan] "
-                f"(status: [green]active[/green])"
-            )
-        else:
-            console.print(
-                f"[bold yellow]⚠️ Auto-approval skipped:[/bold yellow] Audit verdict is '{report.recommendation.value}'. "
-                f"Skill remains in quarantine ([yellow]pending[/yellow]). "
-                f"Run [bold cyan]./ucx skill approve {name_clean}[/bold cyan] to review."
-            )
-    else:
-        console.print(
-            f"[bold cyan]ℹ Skill is quarantined ([yellow]pending[/yellow]).[/bold cyan] "
-            f"Run [bold cyan]./ucx skill approve {name_clean}[/bold cyan] to audit and activate."
-        )
+    # 4. Always left pending: an LLM-authored skill is never auto-approved (#1824, owner
+    # ruling 2026-09-27). Only `approve` makes it active, and only its pin makes it load.
+    console.print(
+        f"[bold cyan]ℹ Skill is quarantined ([yellow]pending[/yellow]).[/bold cyan] "
+        f"Run [bold cyan]./ucx skill approve {name_clean}[/bold cyan] to audit and activate."
+    )

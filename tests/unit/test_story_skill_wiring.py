@@ -210,6 +210,31 @@ def test_a_damaged_skill_table_is_refused_naming_the_skill_in_plain_words(tmp_pa
     )
 
 
+def test_a_macos_appledouble_file_is_skipped_but_another_dot_file_is_still_refused(
+    tmp_path: Path,
+) -> None:
+    """A copy from a Mac leaves `._western.yaml` beside the table; it is ignored (#1612).
+
+    Only the `._` prefix is skipped: `.hidden.yaml` is still refused by the id rule.
+
+    Killed by: src/uclone_x/story/skill_data.py :: and not entry.name.startswith(_APPLEDOUBLE_PREFIX)
+    Becomes: and True
+    """
+    files = {"muse/western.yaml": _WESTERN, "muse/._western.yaml": "\x00\x05\x16\x07junk"}
+    skill = _skill(tmp_path / "skills", "weird-west", files)
+
+    drawn = _ok(MuseSparkTool(), _ctx(tmp_path, skills=(skill,)), action="draw", genre="western")
+    assert drawn["source"] == "skill 'weird-west'"
+
+    _write(skill / "resources" / "story" / "muse" / ".hidden.yaml", _WESTERN)
+    result = _run(MuseSparkTool(), _ctx(tmp_path, skills=(skill,)), action="draw", genre="western")
+    assert not result.success
+    assert result.error == (
+        "The idea tables could not be loaded, so nothing was drawn: muse/.hidden.yaml of the "
+        "skill 'weird-west' has a name that is not lowercase letters, digits and hyphens."
+    )
+
+
 _REFUSED = "The idea tables could not be loaded, so nothing was drawn: "
 
 

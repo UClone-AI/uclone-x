@@ -940,22 +940,25 @@ class SkillRegistry:
 
         manifests: list[SkillManifest] = []
         for child in sorted(skills_dir.iterdir()):
-            if child.is_dir():
-                skill_file = child / "SKILL.md"
-                if skill_file.is_file():
-                    try:
-                        skill = load_skill_from_dir(child)
-                        manifests.append(skill.manifest)
-                    except Exception as exc:
-                        manifests.append(
-                            SkillManifest(
-                                name=child.name,
-                                description=f"Unparseable skill package: {exc}",
-                                origin=SkillOrigin.SYNTHESIZED,
-                                status=SkillStatus.REJECTED,
-                                rejection_reason=f"Package failed to parse: {exc}",
-                            )
-                        )
+            if not child.is_dir():
+                continue
+            try:
+                # `_is_file`, not `Path.is_file()`: a folder that can be listed but not
+                # searched is reported below on every Python version, not dropped (#1612).
+                if not _is_file(child / "SKILL.md"):
+                    continue
+                skill = load_skill_from_dir(child)
+                manifests.append(skill.manifest)
+            except Exception as exc:
+                manifests.append(
+                    SkillManifest(
+                        name=child.name,
+                        description=f"Unparseable skill package: {exc}",
+                        origin=SkillOrigin.SYNTHESIZED,
+                        status=SkillStatus.REJECTED,
+                        rejection_reason=f"Package failed to parse: {exc}",
+                    )
+                )
         return tuple(manifests)
 
     async def reload_approved(
@@ -1072,7 +1075,24 @@ class FileSystemSkillStore:
         approved: list[tuple[SkillProtocol, SkillAuditReport]] = []
         refused: list[SkillRefusal] = []
         for child in sorted(target_dir.iterdir()):
-            if child.is_dir() and (child / "SKILL.md").is_file():
+            if not child.is_dir():
+                continue
+            try:
+                is_package = _is_file(child / "SKILL.md")
+            except OSError as exc:
+                # A folder that can be listed but not searched (#1612): whether it holds a
+                # SKILL.md cannot be checked. `Path.is_file()` raised here on Python 3.11 to
+                # 3.13, failing the whole reload, and answers False on 3.14, dropping the
+                # package unseen. `_is_file` raises on every version, and the folder is
+                # refused by name like any other package whose instructions cannot be read.
+                refused.append(SkillRefusal(_unreadable_manifest(child), None, "unreadable"))
+                logger.warning(
+                    "The skill '%s' was not loaded: its SKILL.md could not be checked (%s)",
+                    child.name,
+                    exc.strerror,
+                )
+                continue
+            if is_package:
                 # Why a package failed to load or to be audited, or why an active one was
                 # not approved; logged as a warning, not at debug, because an active skill
                 # that stops loading is otherwise invisible and the tools that read its data

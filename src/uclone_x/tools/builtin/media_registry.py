@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
+from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol, cast, runtime_checkable
@@ -98,36 +100,101 @@ class ImageModelSource(Protocol):
         ...
 
 
-def optimize_prompts(
-    prompt: str,
-    negative_prompt: str,
-    profile: ModelProfile,
-) -> tuple[str, str]:
-    """Optimize positive and negative prompts according to the model profile and grammar family."""
-    cleaned_neg = negative_prompt.strip()
+#: The quality tags the `danbooru` sections of the `media-*` skills end a prompt with. They
+#: are added at call time, and only to a prompt that states no quality of its own
+#: (Decision A: a skill fills in only what the person left open).
+DANBOORU_QUALITY_TAGS = "masterpiece, best quality, newest, absurdres"
 
-    # 1. Negative prompt handling
-    if profile.suppress_negative or profile.family == PromptFamily.NATURAL_PROSE:
-        # Flow-matching and prose models (e.g. FLUX) degrade with negative prompts
-        effective_negative = ""
-    elif not cleaned_neg:
-        effective_negative = profile.default_negative
-    elif profile.family == PromptFamily.DANBOORU and profile.default_negative:
-        # Merge user-supplied negative tags with default safety tags, avoiding duplicates
-        user_tags = [t.strip() for t in cleaned_neg.split(",") if t.strip()]
-        default_tags = [t.strip() for t in profile.default_negative.split(",") if t.strip()]
-        user_tag_set = {t.lower() for t in user_tags}
-        merged_tags = list(user_tags)
-        for dt in default_tags:
-            if dt.lower() not in user_tag_set:
-                merged_tags.append(dt)
-        effective_negative = ", ".join(merged_tags)
-    else:
-        effective_negative = cleaned_neg
+#: Tags that already state a quality. A prompt carrying any one of them, or a Pony-style
+#: `score_*` tag, gets no quality tags added.
+QUALITY_TAG_NAMES = frozenset(
+    {
+        "masterpiece",
+        "best quality",
+        "high quality",
+        "amazing quality",
+        "very aesthetic",
+        "newest",
+        "absurdres",
+        "highres",
+    }
+)
 
-    # 2. Positive prompt handling
+#: What the tool result says when a negative prompt the model gave cannot be used.
+NEGATIVE_NOT_USED = "The negative prompt was not used: this image model ignores negative prompts."
+
+
+@dataclass(frozen=True)
+class PromptFill:
+    """The prompt and negative prompt an engine receives, and what was changed to get them.
+
+    `changes` holds one plain sentence per change, for the tool result (P6: nothing is
+    added or left out without saying so).
+    """
+
+    prompt: str
+    negative_prompt: str
+    changes: tuple[str, ...] = ()
+
+
+def _tag_name(raw: str) -> str:
+    """A comma-separated tag with its weight syntax removed: `(masterpiece:1.2)` -> `masterpiece`."""
+    return re.sub(r":[\d.]+$", "", raw.strip(" ()[]{}\t\n")).strip().lower()
+
+
+def has_quality_tag(prompt: str) -> bool:
+    """Whether ``prompt`` already carries a quality tag of its own.
+
+    Tags are separated by commas or newlines, and `_` reads as a space (`best_quality`).
+    """
+    for line in prompt.splitlines():
+        for raw in line.split(","):
+            name = _tag_name(raw).replace("_", " ")
+            if name in QUALITY_TAG_NAMES or name.startswith("score "):
+                return True
+    return False
+
+
+def names_term(prompt: str, term: str) -> bool:
+    """Whether ``term`` appears in ``prompt`` as a whole word or phrase, ignoring case."""
+    pattern = r"(?<![\w-])" + re.escape(term.lower()) + r"(?![\w-])"
+    return re.search(pattern, prompt.lower()) is not None
+
+
+def fill_prompt_defaults(prompt: str, negative_prompt: str, profile: ModelProfile) -> PromptFill:
+    """Fill in only what the prompt left open, by the active model family's rules.
+
+    Deterministic, with no model call. The rules (the owner's ruling on #1723):
+
+    1. The prompt's own words are never removed or reordered, and it is never translated.
+    2. `danbooru`: `DANBOORU_QUALITY_TAGS` are appended only when the prompt has no
+       quality tag (`has_quality_tag`). Other families get nothing added to the prompt.
+    3. A negative prompt the model gave is passed on unchanged.
+    4. With none given, the profile's `default_negative` is used, less any term the prompt
+       itself names (a diagram asking for text labels keeps its text).
+    5. A model that ignores negative prompts (`prose`, `suppress_negative`) gets none, and
+       a negative the model gave is reported as unused rather than dropped silently.
+    """
+    changes: list[str] = []
     effective_prompt = prompt.strip()
-    return effective_prompt, effective_negative
+    if profile.family == PromptFamily.DANBOORU and not has_quality_tag(effective_prompt):
+        effective_prompt = ", ".join(t for t in (effective_prompt, DANBOORU_QUALITY_TAGS) if t)
+        changes.append(f"Added quality tags the prompt did not have: {DANBOORU_QUALITY_TAGS}.")
+
+    given_negative = negative_prompt.strip()
+    if profile.suppress_negative or profile.family == PromptFamily.NATURAL_PROSE:
+        if given_negative:
+            changes.append(NEGATIVE_NOT_USED)
+        return PromptFill(effective_prompt, "", tuple(changes))
+    if given_negative:
+        return PromptFill(effective_prompt, given_negative, tuple(changes))
+
+    defaults = [t.strip() for t in profile.default_negative.split(",") if t.strip()]
+    kept = [t for t in defaults if not names_term(prompt, t)]
+    effective_negative = ", ".join(kept)
+    if effective_negative:
+        changes.append(f"No negative prompt was given, so this one was used: {effective_negative}.")
+    return PromptFill(effective_prompt, effective_negative, tuple(changes))
 
 
 class ModelRegistry:

@@ -17,10 +17,12 @@ from uclone_x.tools.builtin.image import (
     resolve_aspect_dimensions,
 )
 from uclone_x.tools.builtin.media_registry import (
+    DANBOORU_QUALITY_TAGS,
+    NEGATIVE_NOT_USED,
     ModelProfile,
     ModelRegistry,
     PromptFamily,
-    optimize_prompts,
+    fill_prompt_defaults,
 )
 
 
@@ -231,95 +233,215 @@ async def test_dispatcher_injects_default_negative_prompt_when_empty() -> None:
     assert call_kwargs["negative_prompt"] == active_profile.default_negative
 
 
-def test_generate_image_tool_dynamic_description() -> None:
-    """GenerateImageTool dynamically decorates tool description with active model prompt family."""
+def test_the_description_names_neither_the_active_model_nor_its_family() -> None:
+    """The tools layer stays the same whatever checkpoint is active (layering §5.1, #1723).
+
+    Killed by: src/uclone_x/tools/builtin/image.py :: parts = [self.GEMINI_BASE_DESCRIPTION if gemini else self.BASE_DESCRIPTION]
+    Becomes: parts = [self.GEMINI_BASE_DESCRIPTION if gemini else self.BASE_DESCRIPTION, self.active_profile().model_id]
+    """
     dispatcher = ImagePipelineDispatcher()
     tool = GenerateImageTool(dispatcher=dispatcher)
 
     profile = dispatcher.get_active_profile()
-    assert f"Active model: '{profile.model_id}'" in tool.description
-    assert f"({profile.family.value} prompt family)" in tool.description
-    assert "media-prompt" not in tool.description
+    text = tool.description
+
+    assert profile.model_id not in text
+    assert "prompt family" not in text
+    assert "media-prompt" not in text
 
 
-def test_optimize_prompts_flux_suppresses_negative() -> None:
-    """Prose/FLUX models suppress negative prompts completely."""
-    flux_profile = ModelProfile(
-        model_id="flux-test",
-        display_name="FLUX Test",
-        family=PromptFamily.NATURAL_PROSE,
-        default_negative="",
-        suppress_negative=True,
-    )
-
-    pos, neg = optimize_prompts(
-        prompt="A cinematic photo of a knight",
-        negative_prompt="worst quality, blurry",
-        profile=flux_profile,
-    )
-    assert pos == "A cinematic photo of a knight"
-    assert neg == ""
-
-    # Even with empty input, remains empty
-    _, empty_neg = optimize_prompts(
-        prompt="A photo",
-        negative_prompt="",
-        profile=flux_profile,
-    )
-    assert empty_neg == ""
+# ------------------------------------------------ fill_prompt_defaults (owner ruling, #1723)
 
 
-def test_optimize_prompts_danbooru_merges_negative() -> None:
-    """Danbooru models automatically merge user negative tags with default defense tags."""
-    danbooru_profile = ModelProfile(
+def _danbooru(default_negative: str = "worst quality, text, watermark, blurry") -> ModelProfile:
+    return ModelProfile(
         model_id="danbooru-test",
         display_name="Danbooru Test",
         family=PromptFamily.DANBOORU,
-        default_negative="worst quality, bad anatomy, deformed, bad hands",
+        default_negative=default_negative,
     )
 
-    # Empty user negative -> uses default negative
-    pos, neg = optimize_prompts(
-        prompt="1girl, solo",
-        negative_prompt="",
-        profile=danbooru_profile,
+
+def test_a_negative_the_model_gave_is_passed_on_unchanged() -> None:
+    """Rule 3: an explicit negative is never merged with the profile's defaults.
+
+    Killed by: src/uclone_x/tools/builtin/media_registry.py ::         return PromptFill(effective_prompt, given_negative, tuple(changes))
+    Becomes:         pass
+    """
+    fill = fill_prompt_defaults("1girl, solo, masterpiece", "animal, extra limbs", _danbooru())
+
+    assert fill.negative_prompt == "animal, extra limbs"
+    assert fill.changes == ()
+
+
+def test_quality_tags_are_added_only_to_a_prompt_without_any() -> None:
+    """Rule 2: the danbooru quality tags fill an open slot, and say so.
+
+    Killed by: src/uclone_x/tools/builtin/media_registry.py ::     if profile.family == PromptFamily.DANBOORU and not has_quality_tag(effective_prompt):
+    Becomes:     if profile.family == PromptFamily.DANBOORU:
+    Killed by: src/uclone_x/tools/builtin/media_registry.py ::         changes.append(f"Added quality tags the prompt did not have: {DANBOORU_QUALITY_TAGS}.")
+    Becomes:         pass
+    """
+    open_slot = fill_prompt_defaults("1girl, solo", "x", _danbooru())
+    assert open_slot.prompt == f"1girl, solo, {DANBOORU_QUALITY_TAGS}"
+    assert any(DANBOORU_QUALITY_TAGS in change for change in open_slot.changes)
+
+    stated = fill_prompt_defaults("1girl, solo, best quality", "x", _danbooru())
+    assert stated.prompt == "1girl, solo, best quality"
+    assert stated.changes == ()
+
+
+def test_a_weighted_or_score_quality_tag_counts_as_stated() -> None:
+    """Rule 2: `(masterpiece:1.2)` and a Pony `score_9` are the prompt's own quality.
+
+    Killed by: src/uclone_x/tools/builtin/media_registry.py ::             name = _tag_name(raw).replace("_", " ")
+    Becomes:             name = raw.strip().lower()
+    Killed by: src/uclone_x/tools/builtin/media_registry.py ::             if name in QUALITY_TAG_NAMES or name.startswith("score "):
+    Becomes:             if name in QUALITY_TAG_NAMES:
+    """
+    for prompt in ("1girl, (Masterpiece:1.2)", "score_9, score_8_up, 1girl"):
+        assert fill_prompt_defaults(prompt, "x", _danbooru()).prompt == prompt
+
+
+def test_a_quality_tag_on_its_own_line_counts_as_stated() -> None:
+    """Rule 2: tags split by a newline are tags too, so the defaults are not added twice.
+
+    Killed by: src/uclone_x/tools/builtin/media_registry.py ::     for line in prompt.splitlines():
+    Becomes:     for line in [prompt]:
+    """
+    prompt = "1girl, solo\nmasterpiece"
+    fill = fill_prompt_defaults(prompt, "x", _danbooru())
+
+    assert fill.prompt == prompt
+    assert fill.changes == ()
+
+
+def test_an_underscored_quality_tag_counts_as_stated() -> None:
+    """Rule 2: `best_quality` is the Danbooru spelling of `best quality`.
+
+    Killed by: src/uclone_x/tools/builtin/media_registry.py ::             name = _tag_name(raw).replace("_", " ")
+    Becomes:             name = _tag_name(raw)
+    """
+    prompt = "1girl, best_quality"
+    fill = fill_prompt_defaults(prompt, "x", _danbooru())
+
+    assert fill.prompt == prompt
+    assert fill.changes == ()
+
+
+def test_the_prompt_is_never_translated_reordered_or_cut() -> None:
+    """Rule 1: the person's words come first and whole; fills only ever append.
+
+    Killed by: src/uclone_x/tools/builtin/media_registry.py ::         effective_prompt = ", ".join(t for t in (effective_prompt, DANBOORU_QUALITY_TAGS) if t)
+    Becomes:         effective_prompt = ", ".join(t for t in (DANBOORU_QUALITY_TAGS, effective_prompt) if t)
+    """
+    korean = "  갑옷을 입은 전사, 1girl  "
+    fill = fill_prompt_defaults(korean, "", _danbooru())
+    assert fill.prompt.startswith("갑옷을 입은 전사, 1girl, ")
+
+    generic = ModelProfile(
+        model_id="g", display_name="g", family=PromptFamily.GENERIC, default_negative="blurry"
     )
-    assert pos == "1girl, solo"
-    assert neg == "worst quality, bad anatomy, deformed, bad hands"
-
-    # User supplied some negative tags -> deduplicates and merges
-    pos, neg = optimize_prompts(
-        prompt="1girl, solo",
-        negative_prompt="animal, bad anatomy, extra limbs",
-        profile=danbooru_profile,
-    )
-    assert pos == "1girl, solo"
-    # user tags first, followed by missing default tags
-    assert "animal" in neg
-    assert "extra limbs" in neg
-    assert "worst quality" in neg
-    assert "bad hands" in neg
-    assert "deformed" in neg
-    # Ensure no duplicate "bad anatomy"
-    assert neg.count("bad anatomy") == 1
+    assert fill_prompt_defaults("갑옷을 입은 전사", "", generic).prompt == "갑옷을 입은 전사"
 
 
-def test_optimize_prompts_generic_fallback() -> None:
-    """Generic models keep user negative if provided, or fallback to default."""
-    generic_profile = ModelProfile(
-        model_id="generic-test",
-        display_name="Generic Test",
-        family=PromptFamily.GENERIC,
-        default_negative="worst quality, blurry",
+def test_the_default_negative_drops_what_the_prompt_asks_for() -> None:
+    """Rule 4: a diagram asking for text labels does not get `text` in its negative.
+
+    Killed by: src/uclone_x/tools/builtin/media_registry.py ::     kept = [t for t in defaults if not names_term(prompt, t)]
+    Becomes:     kept = defaults
+    Killed by: src/uclone_x/tools/builtin/media_registry.py ::         changes.append(f"No negative prompt was given, so this one was used: {effective_negative}.")
+    Becomes:         pass
+    """
+    fill = fill_prompt_defaults("flowchart, text labels, masterpiece", "", _danbooru())
+
+    assert fill.negative_prompt == "worst quality, watermark, blurry"
+    assert fill.changes == (
+        "No negative prompt was given, so this one was used: worst quality, watermark, blurry.",
     )
 
-    # Empty -> fallback
-    _, neg_empty = optimize_prompts("prompt", "", generic_profile)
-    assert neg_empty == "worst quality, blurry"
 
-    # Provided -> retained as-is
-    _, neg_provided = optimize_prompts("prompt", "custom negative tag", generic_profile)
-    assert neg_provided == "custom negative tag"
+def test_a_term_inside_another_word_is_not_a_request_for_it() -> None:
+    """Rule 4 matches whole words: `context` does not ask for `text`.
+
+    Killed by: src/uclone_x/tools/builtin/media_registry.py ::     return re.search(pattern, prompt.lower()) is not None
+    Becomes:     return term.lower() in prompt.lower()
+    """
+    fill = fill_prompt_defaults("1girl, historical context, masterpiece", "", _danbooru())
+
+    assert fill.negative_prompt == "worst quality, text, watermark, blurry"
+
+
+def test_a_negative_on_a_model_that_ignores_it_is_reported_unused() -> None:
+    """Rule 5: prose and suppress_negative models get no negative, and never silently.
+
+    Killed by: src/uclone_x/tools/builtin/media_registry.py ::             changes.append(NEGATIVE_NOT_USED)
+    Becomes:             pass
+    Killed by: src/uclone_x/tools/builtin/media_registry.py ::     if profile.suppress_negative or profile.family == PromptFamily.NATURAL_PROSE:
+    Becomes:     if profile.suppress_negative:
+    """
+    prose = ModelProfile(
+        model_id="flux-test",
+        display_name="FLUX Test",
+        family=PromptFamily.NATURAL_PROSE,
+        default_negative="blurry",
+    )
+
+    given = fill_prompt_defaults("A cinematic photo of a knight", "worst quality", prose)
+    assert given.prompt == "A cinematic photo of a knight"
+    assert given.negative_prompt == ""
+    assert given.changes == (NEGATIVE_NOT_USED,)
+
+    empty = fill_prompt_defaults("A photo", "", prose)
+    assert empty.negative_prompt == ""
+    assert empty.changes == ()
+
+
+def _gen_result() -> ImageGenerationResult:
+    return ImageGenerationResult(
+        image_bytes=b"png",
+        seed=1,
+        engine_name="mock",
+        device_info="test",
+        duration_seconds=0.1,
+        width=1024,
+        height=1024,
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_tool_result_lists_what_was_filled_in(tmp_path: Path) -> None:
+    """P6: what the defaults added reaches the model in the tool result, single and batch.
+
+    Killed by: src/uclone_x/tools/builtin/image.py ::                 return replace(generated, prompt_changes=fill.changes)
+    Becomes:                 return generated
+    """
+    from uclone_x.tools.builtin.image import GenerateImageParams
+    from uclone_x.tools.models import ToolContext
+
+    mock_engine = AsyncMock()
+    mock_engine.is_available.return_value = True
+    mock_engine.generate.return_value = _gen_result()
+    dispatcher = ImagePipelineDispatcher(
+        remote_engine=mock_engine, comfy_engine=mock_engine, local_engine=mock_engine
+    )
+    profile = _danbooru()
+    dispatcher.get_active_profile = lambda: profile  # type: ignore[method-assign]
+    tool = GenerateImageTool(dispatcher=dispatcher)
+    context = ToolContext(agent_id="a", session_id="s", workspace_root=tmp_path)
+
+    single = await tool.run(GenerateImageParams(prompt="1girl, solo"), context)
+    batch = await tool.run(GenerateImageParams(prompts=["1girl", "1boy, masterpiece"]), context)
+
+    expected = list(fill_prompt_defaults("1girl, solo", "", profile).changes)
+    assert expected and single["prompt_changes"] == expected
+    assert mock_engine.generate.call_args_list[0].kwargs["prompt"] == (
+        f"1girl, solo, {DANBOORU_QUALITY_TAGS}"
+    )
+    assert [img["prompt_changes"] for img in batch["images"]] == [
+        list(fill_prompt_defaults("1girl", "", profile).changes),
+        list(fill_prompt_defaults("1boy, masterpiece", "", profile).changes),
+    ]
 
 
 @pytest.mark.asyncio

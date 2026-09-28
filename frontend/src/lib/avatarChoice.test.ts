@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import {
+  avatarChangeIdsOf,
   avatarUrlsOf,
   personaOfSeat,
   personaPicture,
@@ -7,6 +8,7 @@ import {
   resetAvatar,
   setAvatarFromPath,
   undoAvatarChange,
+  undoStillOffered,
   uploadAvatar,
   uploadProblem,
   MAX_UPLOAD_BYTES,
@@ -71,34 +73,58 @@ describe('where a picture is drawn from', () => {
 describe('changing a picture', () => {
   // Killed by: frontend/src/lib/avatarChoice.ts :: body: JSON.stringify({ source_path: path }),
   // Becomes: body: JSON.stringify({ path }),
+  // Killed by: frontend/src/lib/avatarChoice.ts :: if (typeof id === 'number' && Number.isInteger(id)) changeId = id;
+  // Becomes: if (false) changeId = id;
   it('gives a drawn picture by its place in the workspace, and keeps what undoes it', async () => {
     const fetchMock = vi.fn(async () =>
-      answer(200, { status: 'ok', persona: 'scout', previous_path: '.uclone/personas/scout.prev.png' }),
+      answer(200, { status: 'ok', persona: 'scout', previous_path: '.uclone/personas/scout.prev.png', change_id: 4 }),
     );
     vi.stubGlobal('fetch', fetchMock);
 
     const result = await setAvatarFromPath('scout', 'artifacts/images/a.png');
 
-    expect(result).toEqual({ ok: true, previousPath: '.uclone/personas/scout.prev.png' });
+    expect(result).toEqual({ ok: true, previousPath: '.uclone/personas/scout.prev.png', changeId: 4 });
     const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
     expect(url).toBe('/api/personas/scout/avatar');
     expect(init.method).toBe('PUT');
     expect(JSON.parse(init.body as string)).toEqual({ source_path: 'artifacts/images/a.png' });
   });
 
-  // Killed by: frontend/src/lib/avatarChoice.ts :: previousPath ? setAvatarFromPath(name, previousPath) : resetAvatar(name);
-  // Becomes: resetAvatar(name);
-  it('undoes by putting back the kept picture, or by resetting when there was none', async () => {
+  // Killed by: frontend/src/lib/avatarChoice.ts :: body: JSON.stringify({ source_path: previousPath, undo_of: changeId }),
+  // Becomes: body: JSON.stringify({ source_path: previousPath }),
+  // Killed by: frontend/src/lib/avatarChoice.ts :: : change(name, { method: 'DELETE' }, `?undo_of=${changeId}`);
+  // Becomes: : change(name, { method: 'DELETE' });
+  it('undoes by putting back the kept picture, or by resetting, naming the change it takes back', async () => {
     const fetchMock = vi.fn(async () => answer(200, { status: 'ok' }));
     vi.stubGlobal('fetch', fetchMock);
 
-    await undoAvatarChange('scout', '.uclone/personas/scout.prev.png');
-    await undoAvatarChange('scout', null);
+    await undoAvatarChange('scout', '.uclone/personas/scout.prev.png', 6);
+    await undoAvatarChange('scout', null, 9);
 
     const [first, second] = fetchMock.mock.calls as unknown as [string, RequestInit][];
     expect(first[1].method).toBe('PUT');
-    expect(JSON.parse(first[1].body as string)).toEqual({ source_path: '.uclone/personas/scout.prev.png' });
+    expect(JSON.parse(first[1].body as string)).toEqual({ source_path: '.uclone/personas/scout.prev.png', undo_of: 6 });
+    expect(second[0]).toBe('/api/personas/scout/avatar?undo_of=9');
     expect(second[1].method).toBe('DELETE');
+  });
+
+  // Killed by: frontend/src/lib/avatarChoice.ts :: return known === undefined || known <= changeId;
+  // Becomes: return known === undefined || known < changeId;
+  it('offers an Undo until the listing shows a later change to that clone (#1809)', () => {
+    expect(undoStillOffered(3, 'scout', { scout: 3 })).toBe(true);
+    // The listing not read again yet still says the change before this one.
+    expect(undoStillOffered(3, 'scout', { scout: 2 })).toBe(true);
+    expect(undoStillOffered(3, 'scout', { scout: 4 })).toBe(false);
+    expect(undoStillOffered(3, 'scout', { critic: 9 })).toBe(true);
+    // A change the runtime gave no id cannot be checked, so it is not offered.
+    expect(undoStillOffered(null, 'scout', undefined)).toBe(false);
+  });
+
+  // Killed by: frontend/src/lib/avatarChoice.ts :: if (typeof persona.avatar_change_id === 'number') ids[persona.name] = persona.avatar_change_id;
+  // Becomes: ids[persona.name] = 0;
+  it('reads each clone`s latest change from the listing', () => {
+    expect(avatarChangeIdsOf([{ name: 'scout', avatar_change_id: 5 }, { name: 'critic' }])).toEqual({ scout: 5 });
+    expect(avatarChangeIdsOf(undefined)).toEqual({});
   });
 
   // Killed by: frontend/src/lib/avatarChoice.ts :: status === 404 ? 'noClone' : status === 422 || status === 415 ? 'refused' : 'failed';
@@ -123,7 +149,7 @@ describe('changing a picture', () => {
   // Killed by: frontend/src/lib/avatarChoice.ts :: return FAILURE_OF_CODE[code];
   // Becomes: return 'refused';
   it('tells each refusal apart by the reason the runtime gives (#1780)', async () => {
-    const codes = ['no_clone', 'not_an_image', 'too_large', 'not_saved', 'no_workspace', 'outside_workspace', 'no_file', 'new_reason'];
+    const codes = ['no_clone', 'not_an_image', 'too_large', 'not_saved', 'no_workspace', 'outside_workspace', 'no_file', 'stale_change', 'new_reason'];
     let i = 0;
     vi.stubGlobal(
       'fetch',
@@ -139,6 +165,7 @@ describe('changing a picture', () => {
       'noWorkspace',
       'outsideWorkspace',
       'noFile',
+      'staleChange',
       // A reason this head does not know yet falls back to the status.
       'refused',
     ]);

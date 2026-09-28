@@ -696,6 +696,36 @@ async def test_skill_registry_scan(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_scan_reports_a_package_folder_it_cannot_search(tmp_path: Path) -> None:
+    """A folder that can be listed but not searched is reported as rejected, not left out.
+
+    `Path.is_file()` answers False for it on Python 3.14 and raises on 3.11 to 3.13 (#1612).
+
+    Killed by: src/uclone_x/skills/auditor.py :: if not _is_file(child / "SKILL.md"):
+    Becomes: if not (child / "SKILL.md").is_file():
+    """
+    if not hasattr(os, "geteuid") or os.geteuid() == 0:
+        pytest.skip("root searches any folder, and the test needs one it cannot")
+    save_skill(
+        tmp_path / "open",
+        SkillManifest(name="open", description="S", origin=SkillOrigin.HUMAN),
+        "# Open",
+    )
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    (locked / "SKILL.md").write_text("---\nname: locked\n---\n# Locked\n", encoding="utf-8")
+    locked.chmod(0o600)
+    try:
+        manifests = await SkillRegistry().scan(tmp_path)
+    finally:
+        locked.chmod(0o755)
+
+    by_name = {m.name: m for m in manifests}
+    assert set(by_name) == {"open", "locked"}
+    assert by_name["locked"].status is SkillStatus.REJECTED
+
+
+@pytest.mark.asyncio
 async def test_skill_auditor_isolation_level_strength_pairs(tmp_path: Path) -> None:
     """SkillAuditor correctly uses strength ordering for all 16 (requested, floor) pairs (Issue #44)."""
     from uclone_x.sandbox.models import is_weaker_isolation

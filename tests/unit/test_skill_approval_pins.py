@@ -201,6 +201,42 @@ async def test_an_approved_skill_the_check_cannot_read_in_full_is_listed_with_a_
     assert _INTERNALS.search(str(reason)) is None, reason
 
 
+@pytest.mark.asyncio
+async def test_a_package_folder_that_cannot_be_searched_is_refused_and_the_rest_still_load(
+    tmp_path: Path,
+) -> None:
+    """A folder that can be listed but not searched is refused by name, not skipped (#1612).
+
+    Before, `(child / "SKILL.md").is_file()` ran outside the refusal handling: on Python 3.11
+    to 3.13 it raised and failed the whole reload, and on 3.14 it answered False and the
+    package vanished. Now it is refused the same way on every version.
+
+    Killed by: src/uclone_x/skills/auditor.py :: is_package = _is_file(child / "SKILL.md")
+    Becomes: is_package = (child / "SKILL.md").is_file()
+
+    Killed by: src/uclone_x/skills/auditor.py :: refused.append(SkillRefusal(_unreadable_manifest(child), None, "unreadable"))
+    Becomes: pass
+    """
+    if not hasattr(os, "geteuid") or os.geteuid() == 0:
+        pytest.skip("root searches any folder, and the test needs one it cannot")
+    _approve(_active_skill(tmp_path))
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    (locked / "SKILL.md").write_text("---\nname: locked\n---\n# Locked\n", encoding="utf-8")
+    locked.chmod(0o600)
+    try:
+        registry = SkillRegistry(skills_dir=tmp_path)
+        loaded = await registry.reload_approved()
+    finally:
+        locked.chmod(0o755)
+
+    assert [s.manifest.name for s in loaded] == [NAME]
+    [entry] = [s for s in registry.get_summary()["skills"] if s["name"] == "locked"]
+    assert entry["status"] == SkillStatus.QUARANTINED.value
+    assert entry["not_loaded_code"] == "unreadable"
+    assert entry["not_loaded_reason"] == refusal_reason("unreadable", "locked")
+
+
 def test_every_refusal_reason_is_plain_words() -> None:
     """The one technical thing a reason may carry is the command to run."""
     for code, template in SKILL_REFUSAL_FALLBACK.items():

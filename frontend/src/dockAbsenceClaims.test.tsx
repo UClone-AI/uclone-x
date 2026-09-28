@@ -136,7 +136,8 @@ const knowledge = (over: Partial<SeatKnowledge>): SeatKnowledge =>
     session_id: 's1',
     status: 'ok',
     reason: null,
-    remembers: [],
+    facts: [],
+    facts_reason: null,
     triples: [],
     nodes: [],
     edges: [],
@@ -302,7 +303,7 @@ describe('the dock makes no categorical absence claim (#1374)', () => {
     );
     await waitFor(() =>
       expect(screen.getByTestId('remembers-reason')).toHaveTextContent(
-        'No remembered statements are listed for Scout.',
+        'No facts are listed for Scout.',
       ),
     );
     expect(text(container)).not.toMatch(/has not remembered anything yet/);
@@ -319,8 +320,8 @@ const DOCK_CATALOGS: Record<string, string> = import.meta.glob(
 describe('the dock catalogs (#1366, #1374)', () => {
   // `DOCK_SOURCES` are `.tsx` files; the sentences they rendered now live in these catalogs,
   // so the source scan above no longer reads them.
-  // Killed by: frontend/src/i18n/locales/en/dock.json :: "noneKnown": "No remembered statements are listed for {name}.",
-  // Becomes: "noneKnown": "{name} remembers nothing.",
+  // Killed by: frontend/src/i18n/locales/en/dock.json :: "noneListed": "No facts are listed for {name}.",
+  // Becomes: "noneListed": "{name} knows nothing.",
   it('holds no such claim in the English dock copy', () => {
     const paths = Object.keys(DOCK_CATALOGS);
     expect(paths).toHaveLength(2);

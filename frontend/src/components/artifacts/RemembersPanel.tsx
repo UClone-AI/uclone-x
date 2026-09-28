@@ -1,12 +1,16 @@
-import React from 'react';
-import { BookOpen, Lightbulb } from 'lucide-react';
+import React, { useMemo, useState } from 'react';
+import { BookOpen, MoreHorizontal } from 'lucide-react';
 import {
+  editMemoryFact,
   roomDockUrls,
   useRoomRead,
+  type KnownFact,
   type SeatKnowledge,
 } from '../../lib/roomDock';
 import { en, type Messages } from '../../i18n/en';
 import { fmt, useCopy } from '../../i18n';
+
+type Copy = Messages['dock']['remembers'];
 
 interface RemembersPanelProps {
   /** The conversation on screen. */
@@ -20,27 +24,190 @@ interface RemembersPanelProps {
 }
 
 /** What the panel says when a read fails and the Core gave no plain reason of its own. */
-export const readFailedSentence = (
-  name: string,
-  copy: Messages['dock']['remembers'] = en.dock.remembers,
-): string => fmt(copy.readFailed, { name });
+export const readFailedSentence = (name: string, copy: Copy = en.dock.remembers): string =>
+  fmt(copy.readFailed, { name });
 
 /**
- * What a clone remembers, as plain sentences (#1357, #1401).
+ * Why a Correct or Forget did not happen, in the reader's language. The head's own words
+ * for each refusal the Core can give; never the transport's, never an id.
+ */
+export const editRefusedSentence = (
+  status: number | null,
+  name: string,
+  copy: Copy = en.dock.remembers,
+): string => {
+  if (status === 400) return copy.valueMissing;
+  if (status === 404) return fmt(copy.factGone, { name });
+  if (status === 409) return fmt(copy.memoryUnreadable, { name });
+  return copy.editFailed;
+};
+
+type Editing = { kind: 'menu' } | { kind: 'correct'; value: string } | { kind: 'forget' };
+
+interface FactRowProps {
+  fact: KnownFact;
+  seatId: string;
+  name: string;
+  t: Copy;
+  onChanged: () => void;
+}
+
+/** One fact: its sentence, how it was learned, and the `⋯` that corrects or forgets it. */
+const FactRow: React.FC<FactRowProps> = ({ fact, seatId, name, t, onChanged }) => {
+  const [editing, setEditing] = useState<Editing | null>(null);
+  const [working, setWorking] = useState(false);
+  const [refusal, setRefusal] = useState<string | null>(null);
+
+  const close = () => {
+    setEditing(null);
+    setRefusal(null);
+  };
+
+  const apply = async (value: string | null) => {
+    if (value !== null && value.trim() === '') {
+      setRefusal(t.valueMissing);
+      return;
+    }
+    setWorking(true);
+    setRefusal(null);
+    const outcome = await editMemoryFact(seatId, fact.fact_id, value);
+    setWorking(false);
+    if (outcome.ok) {
+      setEditing(null);
+      onChanged();
+    } else {
+      setRefusal(editRefusedSentence(outcome.status, name, t));
+    }
+  };
+
+  return (
+    <li
+      data-testid="known-fact"
+      className="px-3 py-2 rounded-xl bg-slate-900/60 border border-slate-800 text-xs text-slate-200 space-y-2"
+    >
+      <div className="flex items-start gap-2">
+        <span className="flex-1 min-w-0 break-words">{fact.statement}</span>
+        <span data-testid="fact-origin" className="shrink-0 text-[10px] text-slate-400">
+          {t.origin[fact.origin] ?? fact.origin}
+        </span>
+        <button
+          type="button"
+          data-testid="fact-actions"
+          aria-label={t.actions}
+          title={t.actions}
+          aria-expanded={editing !== null}
+          onClick={() => (editing ? close() : setEditing({ kind: 'menu' }))}
+          className="shrink-0 p-0.5 rounded text-slate-400 hover:text-white hover:bg-slate-800"
+        >
+          <MoreHorizontal className="w-3.5 h-3.5" />
+        </button>
+      </div>
+
+      {editing?.kind === 'menu' && (
+        <div className="flex gap-2">
+          <button
+            type="button"
+            data-testid="fact-correct"
+            onClick={() => setEditing({ kind: 'correct', value: fact.object_value })}
+            className="px-2 py-1 rounded-lg bg-slate-800 text-[11px] text-slate-200 hover:bg-slate-700"
+          >
+            {t.correct}
+          </button>
+          <button
+            type="button"
+            data-testid="fact-forget"
+            onClick={() => setEditing({ kind: 'forget' })}
+            className="px-2 py-1 rounded-lg bg-slate-800 text-[11px] text-rose-300 hover:bg-slate-700"
+          >
+            {t.forget}
+          </button>
+        </div>
+      )}
+
+      {editing?.kind === 'correct' && (
+        <form
+          className="flex flex-wrap items-center gap-2"
+          onSubmit={(e) => {
+            e.preventDefault();
+            void apply(editing.value);
+          }}
+        >
+          <input
+            data-testid="fact-correct-input"
+            aria-label={t.correctLabel}
+            placeholder={t.correctLabel}
+            value={editing.value}
+            disabled={working}
+            onChange={(e) => setEditing({ kind: 'correct', value: e.target.value })}
+            className="flex-1 min-w-0 px-2 py-1 rounded-lg bg-slate-950 border border-slate-700 text-[11px] text-slate-100"
+          />
+          <button
+            type="submit"
+            data-testid="fact-correct-save"
+            disabled={working}
+            className="px-2 py-1 rounded-lg bg-cyan-700 text-[11px] text-white disabled:opacity-50"
+          >
+            {working ? t.working : t.save}
+          </button>
+          <button
+            type="button"
+            onClick={close}
+            disabled={working}
+            className="px-2 py-1 rounded-lg bg-slate-800 text-[11px] text-slate-300"
+          >
+            {t.cancel}
+          </button>
+        </form>
+      )}
+
+      {editing?.kind === 'forget' && (
+        <div className="space-y-1.5">
+          <p data-testid="fact-forget-confirm" className="text-[11px] text-slate-300">
+            {fmt(t.forgetConfirm, { name })}
+          </p>
+          <div className="flex gap-2">
+            <button
+              type="button"
+              data-testid="fact-forget-yes"
+              disabled={working}
+              onClick={() => void apply(null)}
+              className="px-2 py-1 rounded-lg bg-rose-700 text-[11px] text-white disabled:opacity-50"
+            >
+              {working ? t.working : t.forget}
+            </button>
+            <button
+              type="button"
+              onClick={close}
+              disabled={working}
+              className="px-2 py-1 rounded-lg bg-slate-800 text-[11px] text-slate-300"
+            >
+              {t.cancel}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {refusal && (
+        <p data-testid="fact-edit-refusal" role="alert" className="text-[11px] text-amber-300">
+          {refusal}
+        </p>
+      )}
+    </li>
+  );
+};
+
+/**
+ * What a clone knows, as plain sentences (#1357, #1401, #1638 step 3).
  *
- * Two groups, each in the Core's own words:
+ * One clone-wide list from the clone's own memory (`facts`), in two groups: what it learned
+ * in the conversation on screen, then what it learned elsewhere. Each fact says how it was
+ * learned, and its `⋯` corrects it (a `corrected` fact that supersedes it) or forgets it (a
+ * retraction; the audit record stays in the Core). After either, the list is read again.
  *
- * - **Saved to memory** (`saved_facts`): the facts the clone saved to its own memory. They
- *   belong to the clone, so they are listed whichever conversation is on screen, and never
- *   another clone's.
- * - **Known in this conversation** (`remembers`): what the clone holds in this
- *   conversation's knowledge record.
- *
- * Where a group has nothing to list, the panel shows the Core's sentence or its own "none
- * listed" (P6): an empty list is "none listed", never "nothing learned".
- * A failed read shows the Core's own plain `detail` or a fixed sentence, never transport
- * text. The graph those sentences come from stays a developer surface; nothing here names
- * its parts.
+ * With no facts the panel shows the Core's sentence or its own "none listed" (P6): an empty
+ * list is "none listed", never "nothing learned". A failed read shows the Core's own plain
+ * `detail` or a fixed sentence, never transport text. The per-seat record's `status` and
+ * graph fields are for the developer graph and are not shown here.
  */
 export const RemembersPanel: React.FC<RemembersPanelProps> = ({
   roomId,
@@ -48,8 +215,11 @@ export const RemembersPanel: React.FC<RemembersPanelProps> = ({
   seatName,
   refreshKey,
 }) => {
+  const [edits, setEdits] = useState(0);
+  // One key for "the conversation moved on" and "a fact was just changed here".
+  const readKey = useMemo(() => ({ refreshKey, edits }), [refreshKey, edits]);
   const url = roomId && seatId ? roomDockUrls.knowledge(roomId, seatId) : null;
-  const { data, fault } = useRoomRead<SeatKnowledge>(url, refreshKey);
+  const { data, fault } = useRoomRead<SeatKnowledge>(url, readKey);
   const t = useCopy().dock.remembers;
   const name = seatName || seatId || t.thisClone;
 
@@ -79,7 +249,7 @@ export const RemembersPanel: React.FC<RemembersPanelProps> = ({
     </div>
   );
 
-  if (reason || !data) {
+  if (reason || !data || !seatId) {
     return (
       <div data-testid="remembers-panel" className="flex flex-col h-full gap-3 min-h-0">
         {header}
@@ -94,76 +264,50 @@ export const RemembersPanel: React.FC<RemembersPanelProps> = ({
     );
   }
 
-  const saved = data.saved_facts ?? null;
-  const savedNote =
-    data.saved_facts_reason ?? (saved === null ? fmt(t.savedNotListed, { name }) : null);
-  const remembers = data.remembers ?? [];
-  // The Core's reason; without one, only that the list is empty -- a list the head was not
-  // told the cause of is not "remembers nothing".
-  const knownNote =
-    remembers.length === 0
-      ? (data.reason ?? fmt(t.noneKnown, { name }))
-      : data.reason;
+  const facts = data.facts ?? null;
+  // The Core's reason; without one, only that the list is empty or not listed -- a list the
+  // head was not told the cause of is not "knows nothing".
+  const note =
+    data.facts_reason ??
+    (facts === null
+      ? fmt(t.notListed, { name })
+      : facts.length === 0
+        ? fmt(t.noneListed, { name })
+        : null);
+  const here = (facts ?? []).filter((f) => f.learned_here);
+  const elsewhere = (facts ?? []).filter((f) => !f.learned_here);
+  const onChanged = () => setEdits((n) => n + 1);
+
+  const group = (testid: string, heading: string, list: KnownFact[]) =>
+    list.length > 0 && (
+      <section data-testid={testid} className="space-y-1.5">
+        <h3 className="text-[11px] font-semibold text-slate-300">{heading}</h3>
+        <ul className="space-y-1.5">
+          {list.map((f) => (
+            <FactRow
+              key={f.fact_id}
+              fact={f}
+              seatId={seatId}
+              name={name}
+              t={t}
+              onChanged={onChanged}
+            />
+          ))}
+        </ul>
+      </section>
+    );
 
   return (
     <div data-testid="remembers-panel" className="flex flex-col h-full gap-3 min-h-0">
       {header}
       <div className="flex-1 overflow-y-auto min-h-0 space-y-4 pr-1">
-        <section data-testid="remembers-saved" className="space-y-1.5">
-          <h3 className="text-[11px] font-semibold text-slate-300">{t.savedHeading}</h3>
-          {saved && saved.length > 0 && (
-            <ul className="space-y-1.5">
-              {saved.map((f, i) => (
-                <li
-                  key={`${f.statement}:${i}`}
-                  data-testid="saved-fact"
-                  className="px-3 py-2 rounded-xl bg-slate-900/60 border border-slate-800 text-xs text-slate-200 flex items-start gap-2"
-                >
-                  <span className="flex-1 min-w-0 break-words">{f.statement}</span>
-                  {f.saved_here && (
-                    <span className="shrink-0 text-[10px] text-slate-400">{t.savedHere}</span>
-                  )}
-                </li>
-              ))}
-            </ul>
-          )}
-          {savedNote && (
-            <p data-testid="saved-facts-reason" className="text-[11px] text-slate-400">
-              {savedNote}
-            </p>
-          )}
-        </section>
-
-        <section data-testid="remembers-known" className="space-y-1.5">
-          <h3 className="text-[11px] font-semibold text-slate-300">{t.knownHeading}</h3>
-          {remembers.length > 0 && (
-            <ul className="space-y-1.5">
-              {remembers.map((r, i) => (
-                <li
-                  key={`${r.statement}:${i}`}
-                  data-testid="remembered-statement"
-                  className="px-3 py-2 rounded-xl bg-slate-900/60 border border-slate-800 text-xs text-slate-200 flex items-start gap-2"
-                >
-                  <span className="flex-1 min-w-0 break-words">{r.statement}</span>
-                  {r.learned && (
-                    <span
-                      className="shrink-0 inline-flex items-center gap-1 text-[10px] text-slate-400"
-                      title={t.workedOutTitle}
-                    >
-                      <Lightbulb className="w-3 h-3" />
-                      {t.workedOut}
-                    </span>
-                  )}
-                </li>
-              ))}
-            </ul>
-          )}
-          {knownNote && (
-            <p data-testid="remembers-reason" className="text-[11px] text-slate-400">
-              {knownNote}
-            </p>
-          )}
-        </section>
+        {group('remembers-here', t.hereHeading, here)}
+        {group('remembers-elsewhere', t.elsewhereHeading, elsewhere)}
+        {note && (
+          <p data-testid="remembers-reason" className="text-[11px] text-slate-400">
+            {note}
+          </p>
+        )}
       </div>
     </div>
   );

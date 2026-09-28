@@ -1,28 +1,38 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { render, screen } from '@testing-library/react';
-import { RemembersPanel, readFailedSentence } from './RemembersPanel';
-import type { RememberedStatement, SavedFact, SeatKnowledge } from '../../lib/roomDock';
+import { fireEvent, render, screen, within } from '@testing-library/react';
+import { RemembersPanel, editRefusedSentence, readFailedSentence } from './RemembersPanel';
+import type { KnownFact, SeatKnowledge } from '../../lib/roomDock';
 import { ABSENCE_CLAIM } from '../../lib/absenceGuard';
+import { ko } from '../../i18n/ko';
 
-const said = (statement: string, over: Partial<RememberedStatement> = {}): RememberedStatement => ({
+const fact = (statement: string, over: Partial<KnownFact> = {}): KnownFact => ({
+  fact_id: `mem_${statement.length}${statement.charCodeAt(0)}`,
   statement,
-  subject: 'x',
-  relation: 'is_a',
-  object: 'y',
-  source_session_id: 'sess_room__room-a__scout',
-  confidence: 0.9,
-  learned: false,
+  subject: 'Kenny',
+  predicate: 'favourite_colour',
+  object_value: 'teal',
+  origin: 'saved',
+  learned_here: true,
+  source_turn_id: 'turn-1',
+  confidence: 1,
+  created_at: '2026-09-26T00:00:00Z',
   ...over,
 });
 
-const okKnowledge = (remembers: RememberedStatement[], reason: string | null = null): SeatKnowledge =>
+const knowledge = (
+  facts: KnownFact[] | null,
+  facts_reason: string | null = null,
+  status: SeatKnowledge['status'] = 'ok',
+  reason: string | null = null,
+): SeatKnowledge =>
   ({
     room_id: 'room-a',
     participant_id: 'scout',
     session_id: 'sess_room__room-a__scout',
-    status: 'ok',
+    status,
     reason,
-    remembers,
+    facts,
+    facts_reason,
     // The raw graph the developer surface draws; this panel must not show any of it.
     triples: [{ subject: 'tide', predicate: 'is_a', object: 'rhythm', tier: 'T2' }],
     nodes: [{ id: 'tide', label: 'tide', tier: 'T2', ontology: 'core' }],
@@ -30,33 +40,31 @@ const okKnowledge = (remembers: RememberedStatement[], reason: string | null = n
     summary: { total_nodes: 2, total_edges: 1 },
   }) as unknown as SeatKnowledge;
 
-const absent = (
-  status: 'not_recorded' | 'unreadable' | 'no_ontology',
-  reason: string,
-): SeatKnowledge => ({
-  room_id: 'room-a',
-  participant_id: 'scout',
-  session_id: 'sess_room__room-a__scout',
-  status,
-  reason,
-  remembers: null,
-  saved_facts: null,
-  saved_facts_reason: null,
-  triples: null,
-  nodes: null,
-  edges: null,
-  summary: null,
-});
+interface Call {
+  url: string;
+  method: string;
+  body: unknown;
+}
 
 let answers: Record<string, unknown>;
+let edits: Record<string, { status: number; body: unknown }>;
 let requested: string[];
+let calls: Call[];
 
 beforeEach(() => {
   answers = {};
+  edits = {};
   requested = [];
+  calls = [];
   vi.stubGlobal(
     'fetch',
-    vi.fn(async (url: string) => {
+    vi.fn(async (url: string, init?: RequestInit) => {
+      const method = init?.method ?? 'GET';
+      calls.push({ url, method, body: init?.body ? JSON.parse(String(init.body)) : undefined });
+      if (method !== 'GET') {
+        const edit = edits[`${method} ${url}`] ?? { status: 200, body: { fact: {} } };
+        return new Response(JSON.stringify(edit.body), { status: edit.status });
+      }
       requested.push(url);
       const body = answers[url];
       if (body === undefined) {
@@ -72,79 +80,77 @@ afterEach(() => {
 });
 
 const URL_A = '/api/rooms/room-a/knowledge?agent_id=scout';
-const FORBIDDEN = /triple|predicate|tier|ontology/i;
+const FORBIDDEN = /triple|predicate|tier|ontology|mem_/i;
 
-describe('RemembersPanel: what the clone remembers (#1357)', () => {
-  it('lists each remembered statement plainly, read for the seat in this conversation', async () => {
-    answers[URL_A] = okKnowledge([
-      said('tide is a rhythm'),
-      said('the harbour closes at dusk', { learned: true }),
+describe('RemembersPanel: one clone-wide list in two groups (#1638 step 3)', () => {
+  it('groups what was learned here before what was learned elsewhere, each with how', async () => {
+    // Killed by: frontend/src/components/artifacts/RemembersPanel.tsx :: const here = (facts ?? []).filter((f) => f.learned_here);
+    // Becomes: const here = (facts ?? []).filter((f) => !f.learned_here);
+    answers[URL_A] = knowledge([
+      fact('Kenny works at Hanbit', { learned_here: false, origin: 'told' }),
+      fact('Kenny favourite colour teal'),
+      fact('Project X uses Postgres 16', { origin: 'corrected' }),
     ]);
     const { container } = render(<RemembersPanel roomId="room-a" seatId="scout" seatName="Scout" />);
 
-    const items = await screen.findAllByTestId('remembered-statement');
-    expect(items.map((i) => i.textContent)).toEqual(
-      expect.arrayContaining([expect.stringContaining('tide is a rhythm')]),
-    );
-    expect(items).toHaveLength(2);
+    const here = await screen.findByTestId('remembers-here');
+    const elsewhere = screen.getByTestId('remembers-elsewhere');
+    expect(here).toHaveTextContent('Learned in this conversation');
+    expect(elsewhere).toHaveTextContent('From other conversations');
+    expect(within(here).getAllByTestId('known-fact').map((i) => i.textContent)).toEqual([
+      'Kenny favourite colour tealsaved',
+      'Project X uses Postgres 16corrected',
+    ]);
+    expect(within(elsewhere).getAllByTestId('known-fact').map((i) => i.textContent)).toEqual([
+      'Kenny works at Hanbittold',
+    ]);
+    expect(screen.getByText('What Scout knows')).toBeInTheDocument();
     expect(requested).toEqual([URL_A]);
     expect(container.textContent ?? '').not.toMatch(FORBIDDEN);
   });
 
-  // A missing store must not read as an empty memory. The declaration pins the first case;
-  // the second is the same check for the other status the Core can give.
-  it('shows the reason when nothing the seat learned has been saved (not_recorded)', async () => {
-    // Killed by: frontend/src/components/artifacts/RemembersPanel.tsx :: (data.reason ?? fmt(t.noneKnown, { name }))
-    // Becomes: (fmt(t.noneKnown, { name }))
-    const reason = 'Scout has no knowledge record in this conversation.';
-    answers[URL_A] = absent('not_recorded', reason);
-    const { container } = render(<RemembersPanel roomId="room-a" seatId="scout" seatName="Scout" />);
-    expect(await screen.findByTestId('remembers-reason')).toHaveTextContent(reason);
-    expect(screen.queryByTestId('remembered-statement')).toBeNull();
-    expect(container.textContent ?? '').not.toMatch(FORBIDDEN);
+  it('lists the facts whatever the per-seat record says, and does not show its reason', async () => {
+    const recordReason = 'Scout has no knowledge record in this conversation.';
+    answers[URL_A] = knowledge(
+      [fact('Kenny favourite colour teal', { learned_here: false })],
+      null,
+      'not_recorded',
+      recordReason,
+    );
+    render(<RemembersPanel roomId="room-a" seatId="scout" seatName="Scout" />);
+    expect(await screen.findAllByTestId('known-fact')).toHaveLength(1);
+    expect(screen.queryByText(recordReason)).toBeNull();
+    expect(screen.queryByTestId('remembers-here')).toBeNull();
   });
 
-  it('shows the reason when the knowledge record could not be read (unreadable)', async () => {
-    // The Core's sentence (room_dock.py). It concerns this conversation's record only: the
-    // saved memory facts are another file, still read and listed beside it (#1429, #1434).
-    const reason =
-      "Scout's knowledge record for this conversation could not be read, so it cannot be " +
-      'shown.';
-    answers[URL_A] = withSaved(absent('unreadable', reason), [fact('Kenny favourite colour teal')]);
-    const { container } = render(<RemembersPanel roomId="room-a" seatId="scout" seatName="Scout" />);
-    expect(await screen.findByTestId('remembers-reason')).toHaveTextContent(reason);
-    expect(screen.queryByTestId('remembered-statement')).toBeNull();
-    expect(screen.getAllByTestId('saved-fact')).toHaveLength(1);
+  it('shows the Core’s sentence when there are no facts to list, or they could not be read', async () => {
+    // Killed by: frontend/src/components/artifacts/RemembersPanel.tsx :: data.facts_reason ??
+    // Becomes: null ??
+    const empty = 'No facts are listed for Scout.';
+    answers[URL_A] = knowledge([], empty);
+    const { container, unmount } = render(
+      <RemembersPanel roomId="room-a" seatId="scout" seatName="Scout" />,
+    );
+    expect(await screen.findByTestId('remembers-reason')).toHaveTextContent(empty);
+    expect(screen.queryByTestId('known-fact')).toBeNull();
     expect(container.textContent ?? '').not.toMatch(ABSENCE_CLAIM);
-    expect(container.textContent ?? '').not.toMatch(FORBIDDEN);
-  });
+    unmount();
 
-  it('shows the reason when the seat has no knowledge store (no_ontology)', async () => {
-    const reason = 'Scout is running without a knowledge store.';
-    answers[URL_A] = absent('no_ontology', reason);
-    const { container } = render(<RemembersPanel roomId="room-a" seatId="scout" seatName="Scout" />);
-    expect(await screen.findByTestId('remembers-reason')).toHaveTextContent(reason);
-    expect(screen.queryByTestId('remembered-statement')).toBeNull();
-    expect(container.textContent ?? '').not.toMatch(FORBIDDEN);
-  });
-
-  it('says why the list is empty, in the Core’s words', async () => {
-    const reason = 'Scout has no remembered facts on record in this conversation.';
-    answers[URL_A] = okKnowledge([], reason);
-    const { container } = render(<RemembersPanel roomId="room-a" seatId="scout" seatName="Scout" />);
-    expect(await screen.findByTestId('remembers-reason')).toHaveTextContent(reason);
-    expect(container.textContent ?? '').not.toMatch(FORBIDDEN);
+    const unread = 'What Scout knows could not be read, so it cannot be shown.';
+    answers[URL_A] = knowledge(null, unread, 'unreadable');
+    render(<RemembersPanel roomId="room-a" seatId="scout" seatName="Scout" />);
+    expect(await screen.findByTestId('remembers-reason')).toHaveTextContent(unread);
   });
 
   // Without the Core's reason the panel knows only that the list is empty -- not that the
-  // clone remembers nothing (#1366).
+  // clone knows nothing (#1366).
   it('says only that none are listed when the Core gives no reason', async () => {
-    answers[URL_A] = okKnowledge([], null);
+    answers[URL_A] = knowledge([], null);
     const { container } = render(<RemembersPanel roomId="room-a" seatId="scout" seatName="Scout" />);
     expect(await screen.findByTestId('remembers-reason')).toHaveTextContent(
-      'No remembered statements are listed for Scout.',
+      'No facts are listed for Scout.',
     );
-    expect(container.textContent ?? '').not.toMatch(/has not remembered anything yet/);
+    expect(container.textContent ?? '').not.toMatch(ABSENCE_CLAIM);
   });
 
   it('never shows builder words in any state it can be in', async () => {
@@ -159,8 +165,8 @@ describe('RemembersPanel: what the clone remembers (#1357)', () => {
   });
 
   it('re-reads when the seat changes', async () => {
-    answers[URL_A] = okKnowledge([said('tide is a rhythm')]);
-    answers['/api/rooms/room-a/knowledge?agent_id=critic'] = okKnowledge([said('ropes fray')]);
+    answers[URL_A] = knowledge([fact('tide is a rhythm')]);
+    answers['/api/rooms/room-a/knowledge?agent_id=critic'] = knowledge([fact('ropes fray')]);
     const { rerender } = render(<RemembersPanel roomId="room-a" seatId="scout" />);
     await screen.findByText(/tide is a rhythm/);
     rerender(<RemembersPanel roomId="room-a" seatId="critic" />);
@@ -169,66 +175,128 @@ describe('RemembersPanel: what the clone remembers (#1357)', () => {
   });
 });
 
-const fact = (statement: string, over: Partial<SavedFact> = {}): SavedFact => ({
-  statement,
-  subject: 'Kenny',
-  relation: 'favourite_colour',
-  object: 'teal',
-  source_session_id: 'sess_room__room-a__scout',
-  saved_here: true,
-  confidence: 1,
-  ...over,
-});
+describe('RemembersPanel: Correct and Forget (#1638 step 3)', () => {
+  const teal = fact('Kenny favourite colour teal', { fact_id: 'mem_teal' });
+  const MEMORY_URL = '/api/agents/scout/memory/mem_teal';
 
-const withSaved = (
-  base: SeatKnowledge,
-  saved_facts: SavedFact[] | null,
-  saved_facts_reason: string | null = null,
-): SeatKnowledge => ({ ...base, saved_facts, saved_facts_reason }) as SeatKnowledge;
+  const openMenu = async () => {
+    fireEvent.click(await screen.findByTestId('fact-actions'));
+  };
 
-describe('RemembersPanel: the facts the clone saved to memory (#1401)', () => {
-  it('lists the saved facts, and marks the ones saved in this conversation', async () => {
-    answers[URL_A] = withSaved(okKnowledge([said('tide is a rhythm')]), [
-      fact('Kenny favourite colour teal'),
-      fact('the harbour closes at dusk', { saved_here: false }),
+  it('Forget asks first, then retracts and reads the list again', async () => {
+    // Killed by: frontend/src/components/artifacts/RemembersPanel.tsx :: const onChanged = () => setEdits((n) => n + 1);
+    // Becomes: const onChanged = () => setEdits((n) => n);
+    answers[URL_A] = knowledge([teal]);
+    render(<RemembersPanel roomId="room-a" seatId="scout" seatName="Scout" />);
+    await openMenu();
+    fireEvent.click(screen.getByTestId('fact-forget'));
+
+    expect(screen.getByTestId('fact-forget-confirm')).toHaveTextContent(
+      'Scout will stop using this. Forget it?',
+    );
+    expect(calls.filter((c) => c.method !== 'GET')).toEqual([]);
+
+    answers[URL_A] = knowledge([], 'No facts are listed for Scout.');
+    fireEvent.click(screen.getByTestId('fact-forget-yes'));
+
+    expect(await screen.findByText('No facts are listed for Scout.')).toBeInTheDocument();
+    expect(calls.filter((c) => c.method !== 'GET')).toEqual([
+      { url: MEMORY_URL, method: 'DELETE', body: undefined },
     ]);
+    expect(requested).toEqual([URL_A, URL_A]);
+  });
+
+  it('Correct sends the new value and shows the corrected fact', async () => {
+    // Killed by: frontend/src/lib/roomDock.ts :: body: JSON.stringify({ value }),
+    // Becomes: body: JSON.stringify({ value: '' }),
+    answers[URL_A] = knowledge([teal]);
+    render(<RemembersPanel roomId="room-a" seatId="scout" seatName="Scout" />);
+    await openMenu();
+    fireEvent.click(screen.getByTestId('fact-correct'));
+    const input = screen.getByTestId('fact-correct-input');
+    expect(input).toHaveValue('teal');
+    fireEvent.change(input, { target: { value: 'navy' } });
+
+    answers[URL_A] = knowledge([
+      fact('Kenny favourite colour navy', { fact_id: 'mem_navy', origin: 'corrected' }),
+    ]);
+    fireEvent.click(screen.getByTestId('fact-correct-save'));
+
+    expect(await screen.findByText('Kenny favourite colour navy')).toBeInTheDocument();
+    expect(calls.filter((c) => c.method !== 'GET')).toEqual([
+      { url: MEMORY_URL, method: 'PATCH', body: { value: 'navy' } },
+    ]);
+    expect(screen.getByTestId('fact-origin')).toHaveTextContent('corrected');
+  });
+
+  it('a blank correction is refused here and sends nothing', async () => {
+    answers[URL_A] = knowledge([teal]);
+    render(<RemembersPanel roomId="room-a" seatId="scout" seatName="Scout" />);
+    await openMenu();
+    fireEvent.click(screen.getByTestId('fact-correct'));
+    fireEvent.change(screen.getByTestId('fact-correct-input'), { target: { value: '   ' } });
+    fireEvent.click(screen.getByTestId('fact-correct-save'));
+
+    expect(screen.getByTestId('fact-edit-refusal')).toHaveTextContent(
+      'Write what it should say instead.',
+    );
+    expect(calls.filter((c) => c.method !== 'GET')).toEqual([]);
+  });
+
+  // Each refusal the Core can give, and a runtime that cannot be reached: the panel's own
+  // sentence, never the Core's detail, the status, the fact id or the transport's words.
+  const PLAIN = /mem_|\/api\/|\b[45]\d\d\b|Error|Failed to fetch|detail|Traceback|KeyError/i;
+
+  it.each([
+    [404, "This fact is no longer in Scout's memory. It may have been forgotten or corrected already."],
+    [409, "Scout's memory could not be read, so nothing was changed."],
+    [500, 'The change could not be made. Try again.'],
+  ])('a %i refusal reads as a plain sentence and keeps the fact listed', async (status, said) => {
+    // Killed by: frontend/src/components/artifacts/RemembersPanel.tsx :: if (status === 404) return fmt(copy.factGone, { name });
+    // Becomes: if (status === 404) return copy.editFailed;
+    answers[URL_A] = knowledge([teal]);
+    edits[`DELETE ${MEMORY_URL}`] = {
+      status,
+      body: { detail: 'KeyError: mem_teal at /home/scout/memory.json' },
+    };
     const { container } = render(<RemembersPanel roomId="room-a" seatId="scout" seatName="Scout" />);
+    await openMenu();
+    fireEvent.click(screen.getByTestId('fact-forget'));
+    fireEvent.click(screen.getByTestId('fact-forget-yes'));
 
-    const items = await screen.findAllByTestId('saved-fact');
-    expect(items.map((i) => i.textContent)).toEqual([
-      'Kenny favourite colour tealsaved in this conversation',
-      'the harbour closes at dusk',
-    ]);
-    // The conversation's own record is still listed, as its own group.
-    expect(screen.getAllByTestId('remembered-statement')).toHaveLength(1);
-    expect(screen.getByTestId('remembers-saved')).toHaveTextContent('Saved to memory');
-    expect(container.textContent ?? '').not.toMatch(FORBIDDEN);
+    expect(await screen.findByTestId('fact-edit-refusal')).toHaveTextContent(said);
+    expect(container.textContent ?? '').not.toMatch(PLAIN);
+    expect(screen.getAllByTestId('known-fact')).toHaveLength(1);
+    expect(requested).toEqual([URL_A]);
   });
 
-  // The seat never ran in a way that left a record here, but its memory is its own: the
-  // saved facts are listed even so.
-  it('lists the saved facts when this conversation has no knowledge record', async () => {
-    const reason = 'Scout has no knowledge record in this conversation.';
-    answers[URL_A] = withSaved(absent('not_recorded', reason), [fact('Kenny favourite colour teal')]);
-    render(<RemembersPanel roomId="room-a" seatId="scout" seatName="Scout" />);
-    expect(await screen.findAllByTestId('saved-fact')).toHaveLength(1);
-    expect(screen.getByTestId('remembers-reason')).toHaveTextContent(reason);
+  it('an unreachable runtime reads as a plain sentence', async () => {
+    // Killed by: frontend/src/lib/roomDock.ts :: return { ok: false, status: null };
+    // Becomes: return { ok: true };
+    answers[URL_A] = knowledge([teal]);
+    const { container } = render(<RemembersPanel roomId="room-a" seatId="scout" seatName="Scout" />);
+    await openMenu();
+    fireEvent.click(screen.getByTestId('fact-forget'));
+    const stubbed = globalThis.fetch;
+    vi.stubGlobal('fetch', async () => {
+      throw new TypeError('Failed to fetch');
+    });
+    fireEvent.click(screen.getByTestId('fact-forget-yes'));
+
+    expect(await screen.findByTestId('fact-edit-refusal')).toHaveTextContent(
+      'The change could not be made. Try again.',
+    );
+    expect(container.textContent ?? '').not.toMatch(PLAIN);
+    vi.stubGlobal('fetch', stubbed);
   });
 
-  it('shows the Core’s sentence when there are no saved facts to list, or they could not be read', async () => {
-    // Killed by: frontend/src/components/artifacts/RemembersPanel.tsx :: data.saved_facts_reason ?? (saved === null ? fmt(t.savedNotListed, { name }) : null);
-    // Becomes: (saved === null ? fmt(t.savedNotListed, { name }) : null);
-    const empty = 'No saved facts are listed for Scout.';
-    answers[URL_A] = withSaved(okKnowledge([]), [], empty);
-    const { unmount } = render(<RemembersPanel roomId="room-a" seatId="scout" seatName="Scout" />);
-    expect(await screen.findByTestId('saved-facts-reason')).toHaveTextContent(empty);
-    expect(screen.queryByTestId('saved-fact')).toBeNull();
-    unmount();
-
-    const unread = "Scout's saved facts could not be read, so they cannot be shown.";
-    answers[URL_A] = withSaved(okKnowledge([]), null, unread);
-    render(<RemembersPanel roomId="room-a" seatId="scout" seatName="Scout" />);
-    expect(await screen.findByTestId('saved-facts-reason')).toHaveTextContent(unread);
+  it('says every refusal in Korean when the screen is Korean', () => {
+    const copy = ko.dock.remembers;
+    for (const status of [400, 404, 409, 500, null]) {
+      const said = editRefusedSentence(status, '스카우트', copy);
+      expect(said).toMatch(/[가-힣]/);
+      expect(said).not.toMatch(/[A-Za-z]/);
+    }
   });
 });
 

@@ -382,7 +382,9 @@ class TestTheKnowledgeReadAfterARestart:
             stack = cast(Any, client.app).state.room_stack
 
             assert body["status"] == "ok", body
-            assert [s["statement"] for s in body["remembers"]] == ["Postgres is a Database"]
+            assert ("Postgres", "is_a", "Database") in {
+                (t["subject"], t["predicate"], t["object"]) for t in body["triples"]
+            }
             assert body["reason"] is None
             # The read did not build the seat to answer: no turn, no agent.
             assert stack.live_agent(room_id, session_id) is None
@@ -417,7 +419,7 @@ class TestTheKnowledgeReadAfterARestart:
             body = _knowledge(client, room_id)
 
             assert body["status"] == "unreadable", body
-            assert body["remembers"] is None
+            assert body["triples"] is None
             assert "could not be read" in body["reason"]
             _assert_plain(body["reason"], path)
             # A read changes nothing: the record is where it was, and nothing was set aside.

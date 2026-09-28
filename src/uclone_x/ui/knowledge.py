@@ -10,11 +10,11 @@ and falling back to the shared engine described nothing the seat learned.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import Any, cast
+from typing import Any
 
 from uclone_x.memory.models import MemoryFact
 
-__all__ = ["knowledge_graph", "remembered_statements", "saved_fact_statements"]
+__all__ = ["knowledge_graph", "known_facts"]
 
 
 def knowledge_graph(
@@ -199,54 +199,37 @@ def _statement(subject: str, relation: str, obj: str) -> str:
     return f"{subject} {relation.replace('_', ' ').strip()} {obj}"
 
 
-def remembered_statements(triples: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """The triples as plain statements, for a reader who is not a programmer (#1357).
+def known_facts(
+    facts: Sequence[MemoryFact], room_id: str, session_id: str | None
+) -> list[dict[str, Any]]:
+    """A clone's facts as plain statements, one clone-wide list (clone-knowledge-graph §3.8).
 
-    One sentence per triple, from the triple's own words: an `is_a` reads "X is a Y" and
-    anything else reads subject, relation and object with underscores spoken as spaces.
-    The words a surface wraps around the sentence ("Remembers that...") are the head's to
-    write; this supplies the statement and where it came from, and no tier or predicate
-    vocabulary.
+    `learned_here` is whether the fact was learned in the conversation `room_id` names.
+    A fact saved before facts recorded their conversation (#1716) has no `source_room_id`;
+    it counts as learned here when its session is this seat's session in this
+    conversation, which is how such a fact was marked before.
+
+    The field names are the store's own (`predicate`, `object_value`), not the design's
+    earlier `relation` / `value`.
     """
-    remembered: list[dict[str, Any]] = []
-    for triple in triples:
-        subject = str(triple["subject"])
-        relation = str(triple["predicate"])
-        obj = str(triple["object"])
-        statement = _statement(subject, relation, obj)
-        provenance = cast("dict[str, Any]", triple.get("provenance") or {})
-        remembered.append(
+    listed: list[dict[str, Any]] = []
+    for fact in facts:
+        if fact.source_room_id is not None:
+            here = fact.source_room_id == room_id
+        else:
+            here = session_id is not None and fact.source_session_id == session_id
+        listed.append(
             {
-                "statement": statement,
-                "subject": subject,
-                "relation": relation,
-                "object": obj,
-                # The conversation it was learned in, when the engine recorded one. `None`
-                # is "not recorded", not "nowhere".
-                "source_session_id": provenance.get("source_session"),
-                "confidence": provenance.get("confidence"),
-                "learned": provenance.get("origin") == "derived",
+                "fact_id": fact.fact_id,
+                "statement": _statement(fact.subject, fact.predicate, fact.object_value),
+                "subject": fact.subject,
+                "predicate": fact.predicate,
+                "object_value": fact.object_value,
+                "origin": fact.origin,
+                "learned_here": here,
+                "source_turn_id": fact.source_turn_id,
+                "confidence": fact.confidence,
+                "created_at": fact.created_at,
             }
         )
-    return remembered
-
-
-def saved_fact_statements(facts: Sequence[MemoryFact], session_id: str) -> list[dict[str, Any]]:
-    """A clone's saved memory facts as plain statements, in the shape of `remembered_statements` (#1401).
-
-    `saved_here` is whether the fact was saved in the conversation `session_id` names; a
-    clone's memory is its own across every conversation, so most of what it holds may have
-    been saved elsewhere.
-    """
-    return [
-        {
-            "statement": _statement(fact.subject, fact.predicate, fact.object_value),
-            "subject": fact.subject,
-            "relation": fact.predicate,
-            "object": fact.object_value,
-            "source_session_id": fact.source_session_id,
-            "saved_here": fact.source_session_id == session_id,
-            "confidence": fact.confidence,
-        }
-        for fact in facts
-    ]
+    return listed

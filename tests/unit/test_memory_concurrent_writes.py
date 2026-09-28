@@ -46,7 +46,7 @@ def test_a_fact_another_process_recorded_survives_our_save(tmp_path: Path) -> No
     which is the substitution P6 forbids. The store simply had fewer facts than the agent
     had been told, and nothing anywhere reported a loss.
 
-    Killed by: src/uclone_x/memory/store.py :: self._absorb_concurrent_writes()
+    Killed by: src/uclone_x/memory/store.py :: self._absorb_concurrent_writes()  # keep what another process saved since we loaded
     Becomes: pass
     """
     path = tmp_path / "memory.json"

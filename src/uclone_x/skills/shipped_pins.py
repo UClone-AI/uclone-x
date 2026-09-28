@@ -27,7 +27,7 @@ __all__ = ["SHIPPED_SKILL_PINS"]
 #: Skill name -> the digest `compute_skill_sha256` gives its approved package.
 SHIPPED_SKILL_PINS: Final[Mapping[str, str]] = MappingProxyType(
     {
-        "avatar": "0a2a85e5d5bd4ac8e3a2f2577818b2f0b0b5eecc390f943c609aa49367c3eb9b",
+        "avatar": "ae8503461fd0d2eec70b605723369395ba2551bf48079dfe21a672a668a69b70",
         "character-consistency": "8e25a4c8b94cb003e199e486e3e4e5a09d3e3e12f944794e8bda2f1a43666a4b",
         "media-architecture": "18b43d798492e1e2dfe957e6ea450c5cc2b04fb724197d543245d8f1c3df0cb6",
         "media-character": "1e9c5abac180f0a2af498c79e1d7026c2b85b57f48b9feef52ce61ec1f8310ea",

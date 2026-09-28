@@ -146,6 +146,8 @@ export interface PersonaInfo {
   avatar_url?: string | null;
   /** Whether the picture was chosen in this workspace, not shipped with the clone. */
   avatar_chosen?: boolean;
+  /** The id of the latest change to that picture, made anywhere; `0` before any. */
+  avatar_change_id?: number;
 }
 
 /** Which Settings model a persona's turns run on: the deep one (`inherit`) or the fast one. */
