@@ -67,16 +67,13 @@ logger = logging.getLogger(__name__)
 def _modified_arguments(modified_payload: Mapping[str, Any] | None) -> dict[str, Any] | None:
     """The call arguments a hook's `modified_payload` sets, read as execution reads them.
 
-    `{"arguments": {...}}` sets them; a payload naming neither `arguments` nor `tool_name`
-    is itself the arguments; anything else sets none.
+    `{"arguments": {...}}` sets them; anything else sets none (#1504).
     """
     if not modified_payload:
         return None
     arguments: object = modified_payload.get("arguments")
     if isinstance(arguments, Mapping):
         return cast(dict[str, Any], unwrap_immutable(cast(Mapping[str, Any], arguments)))
-    if "tool_name" not in modified_payload and "arguments" not in modified_payload:
-        return cast(dict[str, Any], unwrap_immutable(modified_payload))
     return None
 
 
@@ -237,10 +234,13 @@ class ToolCallExecutor:
         # before the hooks, so a call that will not run never asks a person to approve it.
         # A name this agent would refuse anyway -- not allowed, not registered, withheld by
         # the persona flags -- falls through to that refusal, which keeps its own words.
+        # R3 (#2190): a held catalog tool that binding missed is bound on this call and
+        # runs, through the hooks below like any other call.
         if (
             advertised is not None
             and tc.name not in advertised
             and self._tool_invoker.would_run_if_advertised(tc.name)
+            and not self._tool_invoker.bind_on_call(tc.name, tool_ctx.session_id)
         ):
             return self._refused_tool_call(
                 tc,
@@ -464,6 +464,14 @@ class ToolCallExecutor:
         # *only* refusal: a `ScopedToolRegistry`'s lookup finds a registered tool outside its
         # scope (#908) -- the scope governs what `list_tools` advertises, not what `get` finds.
         allowed_names = self._config.allowed_tools
+        if not self._tool_invoker.knows_tool(effective_tc.name):
+            # R4 (#2190): a name no tool has. Answered before the range check, in plain
+            # words with the closest tools this agent may use, so an invented name is
+            # neither told the agent's permission list nor left without a way forward.
+            did_you_mean = self._tool_invoker.unknown_tool_result(effective_tc.name, unwrapped_args)
+            return self._refused_tool_call(
+                effective_tc, did_you_mean, (asyncio.get_running_loop().time() - t_start) * 1000.0
+            )
         if not self._tool_invoker.in_tool_range(effective_tc.name):
             err_msg = (
                 f"Tool '{effective_tc.name}' is not in agent "
@@ -490,7 +498,8 @@ class ToolCallExecutor:
 
         tool_inst = self._tool_invoker.resolve(effective_tc.name)
         if tool_inst is None:
-            err_msg = f"Tool '{effective_tc.name}' not found"
+            # Registered, but only as another agent's own instance (`ToolInvoker.resolve`).
+            err_msg = self._tool_invoker.unknown_tool_result(effective_tc.name, unwrapped_args)
             duration_ms = (asyncio.get_running_loop().time() - t_start) * 1000.0
             msg = ChatMessage(
                 role=MessageRole.TOOL,
@@ -642,6 +651,9 @@ class ToolCallExecutor:
                     content=content,
                     name=effective_tc.name,
                     tool_call_id=effective_tc.id,
+                    # A picture travels beside the text, never inside it (#2107): the
+                    # text is what the event log and the stream show.
+                    images=res.images if res.success else (),
                 )
                 rec = ToolExecutionRecord(
                     tool_name=effective_tc.name,
@@ -657,6 +669,8 @@ class ToolCallExecutor:
                     spawns_subagents=tool_spawns_subagents(tool_inst),
                     # Only a call that succeeded may move the conversation's story (#1555).
                     opens_story=res.success and tool_opens_story(tool_inst),
+                    # What the tool says it produced; read through `produced_paths` (#2085).
+                    artifacts=res.artifacts if res.success else (),
                 )
             except PathTraversalError as exc:
                 duration_ms = (asyncio.get_running_loop().time() - t_start) * 1000.0

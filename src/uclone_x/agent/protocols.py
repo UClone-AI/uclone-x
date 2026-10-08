@@ -11,6 +11,7 @@ Conformance is enforced statically instead, by the bindings in
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
 from uclone_x.agent.models import (
@@ -40,13 +41,50 @@ class TurnLifecycleHookProtocol(Protocol):
     step's records and the `ToolContext` those calls ran with to every hook in order, each
     receiving what the previous one returned. A hook that has nothing to change returns
     `context` itself. The agent keeps only the returned `story_id` for the next step (the
-    open story, which `uclone_x.story`'s hook moves); a change to any other field is dropped.
+    open story, which the story extension's hook moves); a change to any other field is dropped.
     """
 
     def after_tool_step(
         self, records: Sequence[ToolExecutionRecord], context: ToolContext
     ) -> ToolContext:
         """The context the next step of this turn runs with, after `records` ran."""
+        ...
+
+
+class TurnAidProtocol(Protocol):
+    """What a `TurnAidHookProtocol` adds to one turn: a tail section, and reply lines."""
+
+    @property
+    def section(self) -> str:
+        """The `[Heading]` section sent at the tail of every request of the turn."""
+        ...
+
+    def reply_lines(self, records: Sequence[ToolExecutionRecord], *, korean: bool) -> list[str]:
+        """Lines to append to the turn's final reply, given every record the turn ran."""
+        ...
+
+
+@runtime_checkable
+class TurnAidHookProtocol(Protocol):
+    """A lifecycle hook that also works out, once at a turn's start, what to add to it.
+
+    The agent finds these among its lifecycle hooks with `isinstance`, so a host adds one
+    the way it adds any lifecycle hook, and the agent imports nothing of its domain. The
+    aid is worked out once, before the turn's first request, and kept for every step of
+    it: the turn context does not change between steps. A raise is logged and the turn
+    runs without the aid.
+    """
+
+    def turn_aid(
+        self,
+        *,
+        message: str,
+        story_id: str | None,
+        room_id: str | None,
+        workspace_root: Path | None,
+        tool_names: frozenset[str],
+    ) -> TurnAidProtocol | None:
+        """The aid for a turn answering `message`, or `None` when there is nothing to add."""
         ...
 
 
@@ -146,12 +184,14 @@ class BaseAgentProtocol(Protocol):
         room_id: str | None = None,
         story_id: str | None = None,
         person_names: tuple[str, ...] = (),
+        workspace_root: Path | None = None,
     ) -> TurnResult:
         """Execute a single reasoning turn.
 
         `room_id` and `story_id` name the conversation (room) the turn runs in and the
         story it has open, for the turn's tool calls (#1555). `person_names` are the
-        names the room's person goes by, for the same calls (#1857).
+        names the room's person goes by, for the same calls (#1857). `workspace_root`
+        is the conversation's workspace for this turn only; `None` keeps the agent's own.
 
         The `dict[str, Any]` arm is gone: the turn entry point accepted an arbitrary
         untyped payload, which is the contract shape P8 forbids (issue 2026-09-02-036).

@@ -363,8 +363,9 @@ def test_nested_payload_keys_are_redacted() -> None:
 
     Nested keys used to be checked against the credential predicate only, so the payload
     predicate never ran below the top level and the prompt was exported verbatim —
-    §7 requirements 1 and 2 of `docs/telemetry-opentelemetry.md` were both unmet on any
-    span with nested attributes, which is the common case rather than an edge one.
+    the telemetry document's first two exporter requirements (redact credential-shaped
+    values, omit payload contents by default) were both unmet on any span with nested
+    attributes, which is the common case rather than an edge one.
     """
     redacted = redact_span_attributes({"llm": {"prompt": "SECRET"}}, export_full_payloads=False)
     assert redacted["llm"]["prompt"] == REDACTED_PLACEHOLDER
@@ -960,7 +961,7 @@ def test_the_completed_span_buffer_is_bounded_and_evictions_are_counted() -> Non
         tracer.end_span(span_id=span_id)
 
     assert len(tracer.get_completed_spans()) == 64
-    assert tracer.dropped_span_count == 500 - 64
+    assert tracer.buffer_evicted_span_count == 500 - 64
     assert tracer.drop_reasons == {"buffer_overflow": 436}
 
 
@@ -983,7 +984,7 @@ def test_discarding_exported_spans_keeps_ones_completed_since_the_read() -> None
     remaining = tracer.get_completed_spans()
     assert [s.span_id for s in remaining] == [late.span_id]
     assert first.span_id not in {s.span_id for s in remaining}
-    assert tracer.dropped_span_count == 0, "consumed spans are not losses"
+    assert tracer.buffer_evicted_span_count == 0, "consumed spans are not losses"
 
 
 def test_clear_counts_what_it_throws_away() -> None:
@@ -999,7 +1000,7 @@ def test_clear_counts_what_it_throws_away() -> None:
     tracer.clear()
 
     assert tracer.get_completed_spans() == ()
-    assert tracer.dropped_span_count == 3
+    assert tracer.buffer_evicted_span_count == 3
     assert tracer.drop_reasons == {"cleared": 3}
 
 
@@ -1016,7 +1017,8 @@ async def test_a_subscriber_that_never_drains_cannot_grow_tracer_memory() -> Non
     evictions, but `stream_spans` handed each subscriber a plain `asyncio.Queue()` --
     `maxsize=0`, unbounded. Measured before the fix, with the completed-span buffer
     capped at 4 and one subscriber attached and never draining: the buffer held at 4
-    while the subscriber's queue reached 20,000 and `dropped_span_count` read 19,996.
+    while the subscriber's queue reached 20,000 and `dropped_span_count` (now
+    `buffer_evicted_span_count`) read 19,996.
     So the counter that looks like a memory bound was reporting on one of two paths.
     """
     tracer = TelemetryTracer(max_completed_spans=4, max_subscriber_queue_spans=8)
@@ -1085,7 +1087,7 @@ async def test_a_stalled_subscriber_keeps_the_newest_spans_not_the_oldest() -> N
 
 @pytest.mark.asyncio
 async def test_a_subscriber_drop_is_not_counted_as_a_buffer_drop() -> None:
-    """`undelivered_span_count` and `dropped_span_count` measure different losses (#197).
+    """`undelivered_span_count` and `buffer_evicted_span_count` measure different losses (#197).
 
     The distinction is the whole reason there are two counters: a span a subscriber never
     received is still in the completed-span buffer, still returned by
@@ -1106,7 +1108,7 @@ async def test_a_subscriber_drop_is_not_counted_as_a_buffer_drop() -> None:
         tracer.end_span(span_id=tracer.start_span(f"span_{index}"))
 
     assert tracer.undelivered_span_count == 8
-    assert tracer.dropped_span_count == 0, "nothing left the buffer; it holds 1024"
+    assert tracer.buffer_evicted_span_count == 0, "nothing left the buffer; it holds 1024"
     assert len(tracer.get_completed_spans()) == 10
 
     subscriber.cancel()
@@ -1185,7 +1187,7 @@ def test_a_span_id_this_tracer_never_held_is_unrecorded_not_dropped() -> None:
     for _ in range(10):
         tracer.end_span(span_id=tracer.start_span(FAILOVER_EVENT_SPAN_NAME))
 
-    assert tracer.dropped_span_count == 8
+    assert tracer.buffer_evicted_span_count == 8
     assert tracer.attribute_failover_span("spn_fabricated") == FailoverSpanAttribution(
         span_id="spn_fabricated",
         fate=SpanFate.UNRECORDED,
@@ -1222,7 +1224,7 @@ def test_an_exported_and_acknowledged_failover_span_stays_indistinguishable() ->
     assert exported is not None
     tracer.discard_exported((exported,))
 
-    assert tracer.dropped_span_count == 0, "consumed spans are not losses"
+    assert tracer.buffer_evicted_span_count == 0, "consumed spans are not losses"
     assert tracer.attribute_failover_span(exported.span_id).fate is SpanFate.UNRECORDED
     assert tracer.attribute_failover_span("spn_fabricated").fate is SpanFate.UNRECORDED
 
@@ -1270,7 +1272,7 @@ def test_only_failover_identities_are_retained_and_that_is_the_stated_scope() ->
     for _ in range(5):
         tracer.end_span(span_id=tracer.start_span("agent.run"))
 
-    assert tracer.dropped_span_count == 5
+    assert tracer.buffer_evicted_span_count == 5
     assert tracer.forgotten_drop_identity_count == 0, "no failover span was ever dropped"
     assert tracer.attribute_failover_span(ordinary.span_id).fate is SpanFate.UNRECORDED
 
@@ -1289,13 +1291,13 @@ def test_clear_discards_and_accounts_for_in_flight_spans() -> None:
 
     assert tracer.active_span_count == 2
     assert len(tracer.get_completed_spans()) == 1
-    assert tracer.dropped_span_count == 0
+    assert tracer.buffer_evicted_span_count == 0
 
     tracer.clear()
 
     assert tracer.active_span_count == 0
     assert len(tracer.get_completed_spans()) == 0
-    assert tracer.dropped_span_count == 3
+    assert tracer.buffer_evicted_span_count == 3
     assert tracer.drop_reasons.get("cleared") == 1
     assert tracer.drop_reasons.get("cleared_in_flight") == 2
 
@@ -1307,14 +1309,3 @@ def test_clear_discards_and_accounts_for_in_flight_spans() -> None:
 
     # Ordinary in-flight span reports UNRECORDED
     assert tracer.attribute_failover_span(ordinary_span_id).fate is SpanFate.UNRECORDED
-
-
-def test_buffer_evicted_span_count_and_dropped_span_count_alias_are_identical() -> None:
-    """`buffer_evicted_span_count` is the primary counter name and `dropped_span_count` is an alias (#206)."""
-    tracer = TelemetryTracer(max_completed_spans=2)
-    for _ in range(5):
-        tracer.end_span(span_id=tracer.start_span("agent.run"))
-
-    assert tracer.buffer_evicted_span_count == 3
-    assert tracer.dropped_span_count == 3
-    assert tracer.buffer_evicted_span_count == tracer.dropped_span_count

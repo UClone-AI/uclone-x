@@ -48,7 +48,19 @@ const NOTES: RoomTranscriptMessage[] = [
   note({ seq: 8, code: 'loop.missing_prompt' }),
   note({ seq: 9, code: 'loop.interval_too_short', params: { interval_seconds: 1 } }),
   note({ seq: 10, code: 'loop.no_interval' }),
+  note({
+    seq: 13,
+    code: 'loop.resumed',
+    params: { job_id: 'job-7', interval_seconds: 600, prompt: 'status check' },
+  }),
 ];
+
+// Its `reason` is the Core's own sentence, so it is kept out of NOTES' no-English check.
+const RUN_FAILED = note({
+  seq: 14,
+  code: 'loop.run_failed',
+  params: { job_id: 'job-7', run: 3, reason: 'Reason.', interval_seconds: 600 },
+});
 
 const REPLY: RoomTranscriptMessage = {
   seq: 11,
@@ -127,10 +139,16 @@ describe('the Core’s notes in the chosen language', () => {
   // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: <MessageBody text={noticeText(message, t)} />
   // Becomes: <MessageBody text={message.content} />
   it('words every /loop note in Korean, from its code, with the values in place', () => {
-    renderIn(['ko-KR'], NOTES);
+    renderIn(['ko-KR'], [...NOTES, RUN_FAILED]);
 
     expect(screen.getByTestId('note-3')).toHaveTextContent(
       '🔄 반복 작업을 등록했습니다 (5분마다 실행, ID: job-7): "status check"',
+    );
+    expect(screen.getByTestId('note-13')).toHaveTextContent(
+      '앱이 다시 시작되어 반복 작업을 이어서 실행합니다 (10분마다, ID: job-7)',
+    );
+    expect(screen.getByTestId('note-14')).toHaveTextContent(
+      '반복 작업 job-7의 3번째 실행이 실패했습니다: Reason. 10분 뒤에 다시 시도합니다.',
     );
     expect(screen.getByTestId('note-4')).toHaveTextContent('job-7 (45초마다)');
     expect(screen.getByTestId('note-9')).toHaveTextContent('1초에 한 번까지만');

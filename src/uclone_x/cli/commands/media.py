@@ -9,25 +9,30 @@ get an image?" has an answer that does not require reading the dispatcher's sour
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from pathlib import Path
+from typing import Annotated
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 
 from uclone_x.cli.commands.bootstrap import probe_image_engines
-from uclone_x.errors import PlainRefusalError, UCloneXError
-from uclone_x.llm.connectors.factory import create_llm_connector
+from uclone_x.errors import PlainRefusalError
+from uclone_x.llm.connectors.factory import image_engine_choice
 from uclone_x.tools.builtin.image import (
     COMFY_URL_ENV,
     DEFAULT_CHECKPOINTS,
     IMAGE_CHECKPOINT_ENV,
     ComfyUIImageEngine,
+    ImageWhere,
     LocalDiffusersImageEngine,
     diffusers_install_hint,
     expand_checkpoint_path,
     in_process_device,
 )
+from uclone_x.tools.builtin.image_status import media_status_payload, resolve_image_choice
 
 media_app = typer.Typer(
     name="media",
@@ -35,6 +40,13 @@ media_app = typer.Typer(
     no_args_is_help=True,
 )
 console = Console()
+
+#: Where a picture is drawn, in the words Settings uses (design §3.1).
+WHERE_WORDS: dict[ImageWhere, str] = {
+    "this_computer": "This computer",
+    "gpu_server": "Your GPU server",
+    "cloud": "Cloud · Google",
+}
 
 
 def human_bytes(size: int) -> str:
@@ -67,34 +79,33 @@ def local_checkpoints() -> list[tuple[str, int]]:
     return found
 
 
-def chat_provider_in_effect() -> str | None:
-    """The provider `ucx run` would chat with now, or ``None`` when none is configured.
-
-    Built by the connector factory, which sends nothing: `auto` falls back to Gemini
-    only for a Gemini chat, and this is the provider a run would have.
-    """
-    try:
-        return create_llm_connector().provider_name
-    except UCloneXError:
-        return None
-
-
-#: Why Gemini would not draw, by `ImageEngineReport.engine_states` reason code.
+#: Why the cloud would not draw, by `ImageEngineReport.engine_states` reason code.
 GEMINI_REASONS = {
-    "disabled_by_setting": "off (image_engine is local; no picture request leaves this machine)",
-    "no_key": "no Gemini API key saved or set",
-    "chat_provider_not_gemini": "used under auto only while Gemini is the chat provider",
+    "disabled_by_setting": "off (another picture model is chosen)",
+    "no_key": "no Google connection with a key",
 }
 
 
 @media_app.command("status")
-def media_status() -> None:
+def media_status(
+    as_json: Annotated[
+        bool,
+        typer.Option("--json", help="Print the status object the dashboard reads, as JSON"),
+    ] = False,
+) -> None:
     """Report which image engine would run, and what each one is missing."""
     try:
-        report = probe_image_engines(chat_provider=chat_provider_in_effect())
+        report = probe_image_engines()
     except PlainRefusalError as exc:
         console.print(f"[bold red]✖ {exc}[/bold red]")
         raise typer.Exit(code=1) from exc
+
+    if as_json:
+        # The object `/api/media/status` answers, built by the same function.
+        typer.echo(json.dumps(media_status_payload(report), indent=2))
+        if not report.ready:
+            raise typer.Exit(code=1)
+        return
 
     console.print("[bold cyan]🎨 Local image engines[/bold cyan]")
 
@@ -114,12 +125,15 @@ def media_status() -> None:
             "[bold yellow]unreachable[/bold yellow]"
         )
 
-    state = "[bold green]detected[/bold green]" if report.comfy_alive else "not running"
-    console.print(f"  2. Local ComfyUI ({report.comfy_url}): {state}")
+    if report.comfy_url is None:
+        console.print("  2. ComfyUI: [cyan]no connection[/cyan]")
+    else:
+        state = "[bold green]detected[/bold green]" if report.comfy_alive else "not running"
+        console.print(f"  2. ComfyUI ({report.comfy_url}): {state}")
     if not report.comfy_alive:
         console.print(
-            f"     [dim]Optional. Start your own ComfyUI, or set {COMFY_URL_ENV}; "
-            "UClone-X never installs or starts one.[/dim]"
+            "     [dim]Optional. Add a ComfyUI connection in Settings › Models, or set "
+            f"{COMFY_URL_ENV}; UClone-X never installs or starts one.[/dim]"
         )
 
     if report.dependencies_ok:
@@ -153,11 +167,21 @@ def media_status() -> None:
 
     gemini_reason = next(code for name, _, code in report.engine_states() if name == "gemini")
     if gemini_reason == "ready":
-        gemini_state = f"[bold green]ready[/bold green] ({report.image_model}, over the internet)"
+        gemini_state = f"[bold green]ready[/bold green] ({report.gemini_model}, over the internet)"
     else:
         gemini_state = GEMINI_REASONS.get(gemini_reason, gemini_reason)
     console.print(f"  4. Google Gemini (cloud): {gemini_state}")
-    console.print(f"     [dim]image_engine: {report.image_engine}[/dim]")
+    console.print(f"     [dim]picture model: {escape(report.setting)}[/dim]")
+
+    resolved = resolve_image_choice(report)
+    if resolved["refusal"] is not None:
+        console.print(f"  [bold yellow]![/bold yellow] {escape(resolved['refusal'])}")
+    create = resolved["create"]
+    if create is not None:
+        label = create["label"] or "model not reported"
+        console.print(
+            f"  Draws with: [cyan]{escape(label)}[/cyan] · {WHERE_WORDS[create['where']]}"
+        )
 
     if report.ready:
         console.print(f"[bold green]✔ Ready — '{report.engine}' would run.[/bold green]")
@@ -170,6 +194,7 @@ def media_status() -> None:
 def media_probe() -> None:
     """Ask the ComfyUI daemon what it is, when one answers."""
     engine = ComfyUIImageEngine()
+    engine.use_saved_address(image_engine_choice().comfyui_base_url)
     from uclone_x.tools.builtin.comfy_client import ComfyClient
 
     async def _stats() -> dict[str, object] | None:

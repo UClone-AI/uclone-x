@@ -11,5 +11,5 @@ Normative:
 
 Reference:
 
-* [docs/PRD.md](docs/PRD.md)
-* [docs/architecture-overview.md](docs/architecture-overview.md)
+* [docs/public/README.md](docs/public/README.md) — the documentation index
+* [docs/public/overview.md](docs/public/overview.md) — the architecture

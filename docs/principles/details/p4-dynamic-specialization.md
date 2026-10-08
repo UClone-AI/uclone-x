@@ -19,4 +19,4 @@
     - Knowledge induction (P7 ontology evolution) and skill synthesis (P9 dynamic skills) execute strictly off the critical response path as asynchronous background jobs.
     - User response delivery and task completion must never be blocked or delayed by post-execution learning, ontology graph updates, or skill extraction.
 * **Why**: Monolithic agents with unbounded loops and massive context windows suffer from high latency, prompt dilution, runaway token costs, and unprovable termination. Replacing unfalsifiable aspirations ("as quickly as possible") with verifiable turn limits and token budgets makes agent execution deterministically bounded. Ephemeral sub-agents provide clean parallelism and targeted reasoning, while decoupling background enrichment guarantees prompt response turnaround without compromising system self-evolution.
-* **Implementation Reference**: `docs/dynamic-persona-interface.md`, [`docs/nfr-performance-budgets.md`](../../nfr-performance-budgets.md), `docs/llm-agnostic-interface.md`
+* **Implementation Reference**: [`docs/public/overview.md`](../../public/overview.md), [`docs/public/performance.md`](../../public/performance.md)

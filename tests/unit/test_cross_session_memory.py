@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.support.memory_seed import seed_fact
 from uclone_x.agent.base import BaseAgent
 from uclone_x.agent.models import AgentConfig
 from uclone_x.core.provenance import ExecutionPath, Provenance, ServiceRef
@@ -299,7 +300,7 @@ def test_memory_section_does_not_depend_on_insertion_order() -> None:
     def section(order: list[MemoryFact]) -> str:
         memory = CrossSessionMemory()
         for fact in order:
-            memory._facts[fact.fact_id] = fact  # pyright: ignore[reportPrivateUsage]
+            seed_fact(memory, fact)
         return memory.format_prompt_section()
 
     assert section(facts) == section(list(reversed(facts)))

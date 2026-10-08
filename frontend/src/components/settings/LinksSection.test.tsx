@@ -45,8 +45,8 @@ const mockFetch = (lists: unknown[], routes: Record<string, Handler> = {}) => {
       reads += 1;
       return jsonResponse(answer);
     }
-    if (method === 'GET' && url === '/api/personas') {
-      return jsonResponse({ personas: [{ name: 'clone' }, { name: 'haru' }] });
+    if (method === 'GET' && url === '/api/clones') {
+      return jsonResponse({ clones: [{ name: 'clone' }, { name: 'haru', display_name: { en: '잠 꾸러기' } }] });
     }
     return jsonResponse({ detail: `unrouted ${method} ${url}` }, false, 599);
   });
@@ -72,6 +72,18 @@ describe('LinksSection', () => {
     expect(screen.getByTestId('settings-links-input')).toBeTruthy();
     const options = within(screen.getByTestId('settings-links-clone')).getAllByRole('option');
     await waitFor(() => expect(options.length).toBeGreaterThan(0));
+  });
+
+  // Killed by: frontend/src/components/settings/LinksSection.tsx :: {label}
+  // Becomes: {id}
+  it('names each clone in the picker by its display name, and sends its id', async () => {
+    mockFetch([listOf()]);
+    render(<LinksSection />);
+
+    const picker = await screen.findByTestId('settings-links-clone');
+    const haru = await within(picker).findByRole('option', { name: '잠 꾸러기' });
+    expect((haru as HTMLOptionElement).value).toBe('haru');
+    expect(within(picker).getByRole('option', { name: 'clone' })).toBeTruthy();
   });
 
   it('shows the clone pair and a link to the minihompy', async () => {

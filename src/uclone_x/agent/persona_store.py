@@ -6,12 +6,13 @@ import difflib
 import logging
 import os
 import tempfile
+import unicodedata
 from collections.abc import Collection, Sequence
 from pathlib import Path
 from typing import Any, Final, Literal, Protocol, cast, runtime_checkable
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from uclone_x.agent.models import (
     RETIRED_MODEL_TIERS,
@@ -21,12 +22,15 @@ from uclone_x.agent.models import (
 )
 from uclone_x.agent.prompts import compose_system_prompt, composed_default_prompts
 from uclone_x.core.agent_home import AgentHomeError, refuse_an_unusable_username
+from uclone_x.core.models import persona_model_problem
 
 logger = logging.getLogger(__name__)
 
 BUILTIN_PERSONAS_DIR = Path(__file__).resolve().parent.parent / "personas"
 DEFAULT_WORKSPACE_PERSONAS_SUBDIR = ".uclone/personas"
 DEFAULT_PERSONA_NAME: Final[str] = "clone"
+#: The longest display name, per locale, that a clone may carry. A label, not a paragraph.
+DISPLAY_NAME_MAX_LENGTH: Final[int] = 64
 
 
 class PersonaLoadError(Exception):
@@ -77,14 +81,75 @@ class PersonaDraft(BaseModel):
     system_prompt: str = Field(min_length=1)
     append_default_prompt: bool = False
     allowed_tools: list[str] = Field(default_factory=list[str])
+    #: Model refs, ``<connection id>/<model id>`` (model-gateway §3.4); ``None`` follows the
+    #: system default. The picture model may also be ``auto``.
     model_name: str | None = None
     fast_model: str | None = None
+    image_model: str | None = None
     model_tier: Literal["inherit", "fast"] = "inherit"
     temperature: float = Field(default=0.7, ge=0.0, le=2.0)
     max_tokens: int | None = Field(default=None, gt=0)
     enable_write_tools: bool = False
     enable_subagent_tools: bool = False
     a2a_peers: list[str] = Field(default_factory=list[str])
+    #: What a person reads as the clone's name, per locale; `name` stays the handle.
+    #: A clone edit that leaves the field out keeps the name the clone has (`model_fields_set`).
+    display_name: dict[str, str] = Field(default_factory=dict[str, str])
+
+    @model_validator(mode="after")
+    def _models_name_their_connection(self) -> PersonaDraft:
+        """A model that does not say its connection is refused before anything is written."""
+        refusal = persona_model_problem(self.model_name, self.fast_model, self.image_model)
+        if refusal is not None:
+            raise ValueError(refusal)
+        return self
+
+
+def _display_name_problem(raw: object) -> str | None:
+    """Why `raw` cannot be a clone's `display_name`, as one plain sentence; None when it can."""
+    if not isinstance(raw, dict):
+        return "'display_name' must map a locale to a name, like {en: Writer, ko: 작가}"
+    for locale, text in cast(dict[object, object], raw).items():
+        if not isinstance(locale, str) or not isinstance(text, str) or not text.strip():
+            return "'display_name' must map a locale to a non-empty name"
+        name = text.strip()
+        if any(unicodedata.category(ch) == "Cc" for ch in name):
+            return (
+                f"the display name for {locale!r} contains a control character, such as a "
+                f"line break or tab. Write it on one line, using visible characters only."
+            )
+        if len(name) > DISPLAY_NAME_MAX_LENGTH:
+            return (
+                f"the display name for {locale!r} is {len(name)} characters long. Shorten it "
+                f"to {DISPLAY_NAME_MAX_LENGTH} characters or fewer."
+            )
+    return None
+
+
+def display_name_from_mapping(fields: dict[str, Any], file_path: Path) -> dict[str, str]:
+    """The `display_name` a file's mapping carries, per locale; empty when it has none.
+
+    Raises:
+        PersonaLoadError: `display_name` is not a mapping of locale to text, or a name holds
+            a control character or is longer than `DISPLAY_NAME_MAX_LENGTH`.
+    """
+    raw: object = fields.get("display_name")
+    if raw is None:
+        return {}
+    problem = _display_name_problem(raw)
+    if problem is not None:
+        raise PersonaLoadError(f"{file_path}: {problem}")
+    return {
+        str(locale): str(text).strip() for locale, text in cast(dict[object, object], raw).items()
+    }
+
+
+def refuse_an_unwritable_display_name(draft: PersonaDraft) -> None:
+    """Refuse a draft's display name before anything is written, in the loader's words."""
+    problem = _display_name_problem(draft.display_name)
+    if problem is not None:
+        sentence = f"{problem[0].upper()}{problem[1:]}"
+        raise PersonaWriteRefused(sentence if sentence.endswith(".") else f"{sentence}.")
 
 
 def split_appended_default_prompt(prompt: str) -> tuple[str, bool]:
@@ -151,7 +216,12 @@ def _represent_str(dumper: yaml.SafeDumper, value: str) -> yaml.Node:
 _LiteralBlockDumper.add_representer(str, _represent_str)
 
 
-def _file_contents(draft: PersonaDraft) -> dict[str, Any]:
+def dump_persona_yaml(contents: dict[str, Any]) -> str:
+    """`contents` as a persona file's text, with multi-line prompts as `|` blocks."""
+    return yaml.dump(contents, Dumper=_LiteralBlockDumper, allow_unicode=True, sort_keys=False)
+
+
+def persona_file_contents(draft: PersonaDraft) -> dict[str, Any]:
     """The mapping a persona file holds, in the keys the loader reads."""
     llm_config: dict[str, Any] = {
         "model_tier": draft.model_tier,
@@ -161,10 +231,17 @@ def _file_contents(draft: PersonaDraft) -> dict[str, Any]:
         llm_config["model_name"] = draft.model_name
     if draft.fast_model is not None:
         llm_config["fast_model"] = draft.fast_model
+    if draft.image_model is not None:
+        llm_config["image_model"] = draft.image_model
     if draft.max_tokens is not None:
         llm_config["max_tokens"] = draft.max_tokens
-    contents: dict[str, Any] = {
-        "name": draft.name,
+    contents: dict[str, Any] = {"name": draft.name}
+    if draft.display_name:
+        # Written only when set, so a clone with no display name keeps the file it had.
+        contents["display_name"] = {
+            locale: text.strip() for locale, text in draft.display_name.items()
+        }
+    contents |= {
         "role": draft.role,
         "description": draft.description,
         "append_default_prompt": draft.append_default_prompt,
@@ -178,6 +255,100 @@ def _file_contents(draft: PersonaDraft) -> dict[str, Any]:
         # Written only when set, so a persona that calls no one keeps the file it had.
         contents["a2a_peers"] = list(draft.a2a_peers)
     return contents
+
+
+def read_persona_mapping(raw_text: str, file_path: Path) -> dict[str, Any]:
+    """The YAML mapping a persona file holds, keyed by strings.
+
+    Raises:
+        PersonaLoadError: The text is not a YAML mapping.
+    """
+    raw_obj: object = yaml.safe_load(raw_text)
+    if not isinstance(raw_obj, dict):
+        raise PersonaLoadError(
+            f"{file_path}: a persona file must be a YAML mapping, got {type(raw_obj).__name__}"
+        )
+    raw_dict = cast(dict[object, object], raw_obj)
+    return {str(k): v for k, v in raw_dict.items()}
+
+
+def persona_from_mapping(fields: dict[str, Any], file_path: Path) -> PersonaDefinition:
+    """The persona a file's mapping defines, read by the loader's rules.
+
+    Shared by the package and workspace files and by a clone's `clone.yaml`, whose own
+    keys (`handle` and `template`) are taken off first.
+
+    Raises:
+        PersonaLoadError: The mapping is not a persona this loader accepts.
+    """
+    data = dict(fields)
+    # A clone's own keys, which say who the clone is rather than how it behaves.
+    handle: object = data.pop("handle", None)
+    data.pop("template", None)
+    if not data.get("name") and isinstance(handle, str):
+        data["name"] = handle
+    # What a person reads as the persona's name: a package file carries it, so a builtin
+    # is labelled from install on, and a clone's `clone.yaml` carries it for the clone.
+    data["display_name"] = display_name_from_mapping(data, file_path)
+
+    allowed: object = data.get("allowed_tools")
+    if isinstance(allowed, (list, tuple, set)):
+        allowed_seq = cast(Sequence[object], allowed)
+        data["allowed_tools"] = tuple(str(x) for x in allowed_seq)
+    elif allowed is None:
+        data["allowed_tools"] = ()
+
+    peers: object = data.get("a2a_peers")
+    if isinstance(peers, (list, tuple)):
+        peer_seq = cast(Sequence[object], peers)
+        data["a2a_peers"] = tuple(str(x) for x in peer_seq)
+    elif peers is None:
+        data["a2a_peers"] = ()
+
+    raw_name: object = data.get("name") or data.get("id") or file_path.stem
+    persona_name = str(raw_name)
+    data["name"] = persona_name
+
+    try:
+        refuse_an_unusable_username(persona_name)
+    except AgentHomeError as exc:
+        raise PersonaLoadError(
+            f"{file_path}: persona name {persona_name!r} cannot be an agent name, and a "
+            f"persona's name is the agent id the dashboard sends: {exc}"
+        ) from exc
+
+    append_default: object = data.pop("append_default_prompt", False)
+    if not isinstance(append_default, bool):
+        raise PersonaLoadError(
+            f"{file_path}: 'append_default_prompt' must be true or false, got "
+            f"{type(append_default).__name__}"
+        )
+    if append_default and not isinstance(data.get("system_prompt"), str):
+        raise PersonaLoadError(
+            f"{file_path}: 'append_default_prompt' needs a 'system_prompt' to append to"
+        )
+
+    raw_llm: object = data.get("llm_config") or data.get("llm")
+    if isinstance(raw_llm, dict):
+        raw_llm_dict = cast(dict[object, object], raw_llm)
+        llm_dict: dict[str, Any] = {str(k): v for k, v in raw_llm_dict.items()}
+        tier: object = llm_dict.get("model_tier")
+        if isinstance(tier, str) and tier in RETIRED_MODEL_TIERS:
+            # Offered once, read by nothing: the file keeps loading, following Settings.
+            tier = ModelTier.INHERIT.value
+        if isinstance(tier, str):
+            try:
+                llm_dict["model_tier"] = ModelTier(tier)
+            except ValueError as exc:
+                raise PersonaLoadError(
+                    f"{file_path}: 'model_tier' {tier!r} is not a tier; use one of "
+                    f"{', '.join(t.value for t in ModelTier)}"
+                ) from exc
+        data["llm_config"] = AgentLLMConfig(**llm_dict)
+        data.pop("llm", None)
+
+    persona = PersonaDefinition.model_validate(data)
+    return _with_default_prompt(persona) if append_default else persona
 
 
 @runtime_checkable
@@ -264,72 +435,7 @@ class YamlFilePersonaStore:
         return persona
 
     def _parse_text(self, raw_text: str, file_path: Path) -> PersonaDefinition:
-        raw_obj: object = yaml.safe_load(raw_text)
-        if not isinstance(raw_obj, dict):
-            raise PersonaLoadError(
-                f"{file_path}: a persona file must be a YAML mapping, got {type(raw_obj).__name__}"
-            )
-        raw_dict = cast(dict[object, object], raw_obj)
-        data: dict[str, Any] = {str(k): v for k, v in raw_dict.items()}
-
-        allowed: object = data.get("allowed_tools")
-        if isinstance(allowed, (list, tuple, set)):
-            allowed_seq = cast(Sequence[object], allowed)
-            data["allowed_tools"] = tuple(str(x) for x in allowed_seq)
-        elif allowed is None:
-            data["allowed_tools"] = ()
-
-        peers: object = data.get("a2a_peers")
-        if isinstance(peers, (list, tuple)):
-            peer_seq = cast(Sequence[object], peers)
-            data["a2a_peers"] = tuple(str(x) for x in peer_seq)
-        elif peers is None:
-            data["a2a_peers"] = ()
-
-        raw_name: object = data.get("name") or data.get("id") or file_path.stem
-        persona_name = str(raw_name)
-        data["name"] = persona_name
-
-        try:
-            refuse_an_unusable_username(persona_name)
-        except AgentHomeError as exc:
-            raise PersonaLoadError(
-                f"{file_path}: persona name {persona_name!r} cannot be an agent name, and a "
-                f"persona's name is the agent id the dashboard sends: {exc}"
-            ) from exc
-
-        append_default: object = data.pop("append_default_prompt", False)
-        if not isinstance(append_default, bool):
-            raise PersonaLoadError(
-                f"{file_path}: 'append_default_prompt' must be true or false, got "
-                f"{type(append_default).__name__}"
-            )
-        if append_default and not isinstance(data.get("system_prompt"), str):
-            raise PersonaLoadError(
-                f"{file_path}: 'append_default_prompt' needs a 'system_prompt' to append to"
-            )
-
-        raw_llm: object = data.get("llm_config") or data.get("llm")
-        if isinstance(raw_llm, dict):
-            raw_llm_dict = cast(dict[object, object], raw_llm)
-            llm_dict: dict[str, Any] = {str(k): v for k, v in raw_llm_dict.items()}
-            tier: object = llm_dict.get("model_tier")
-            if isinstance(tier, str) and tier in RETIRED_MODEL_TIERS:
-                # Offered once, read by nothing: the file keeps loading, following Settings.
-                tier = ModelTier.INHERIT.value
-            if isinstance(tier, str):
-                try:
-                    llm_dict["model_tier"] = ModelTier(tier)
-                except ValueError as exc:
-                    raise PersonaLoadError(
-                        f"{file_path}: 'model_tier' {tier!r} is not a tier; use one of "
-                        f"{', '.join(t.value for t in ModelTier)}"
-                    ) from exc
-            data["llm_config"] = AgentLLMConfig(**llm_dict)
-            data.pop("llm", None)
-
-        persona = PersonaDefinition.model_validate(data)
-        return _with_default_prompt(persona) if append_default else persona
+        return persona_from_mapping(read_persona_mapping(raw_text, file_path), file_path)
 
     def _validate_tools(self, persona: PersonaDefinition, *, source: Path | str) -> None:
         if self._tool_names is None or not persona.allowed_tools:
@@ -374,6 +480,7 @@ class YamlFilePersonaStore:
         if self._read_only:
             raise PersonaWriteConflict(f"Store for directory '{self._directory}' is read-only.")
         _refuse_an_unwritable_name(draft.name)
+        refuse_an_unwritable_display_name(draft)
         if create and draft.name in self._personas:
             raise PersonaWriteConflict(
                 f"a persona named {draft.name!r} already exists. Edit it, or choose another name."
@@ -399,7 +506,10 @@ class YamlFilePersonaStore:
 
         directory.mkdir(parents=True, exist_ok=True)
         text = yaml.dump(
-            _file_contents(draft), Dumper=_LiteralBlockDumper, allow_unicode=True, sort_keys=False
+            persona_file_contents(draft),
+            Dumper=_LiteralBlockDumper,
+            allow_unicode=True,
+            sort_keys=False,
         )
         fd, temp_name = tempfile.mkstemp(dir=directory, prefix=f".{draft.name}.", suffix=".tmp")
         temp_path = Path(temp_name)
@@ -467,6 +577,7 @@ class InMemoryPersonaStore:
                 f"{draft.name!r} cannot be a persona name: {exc} The name is both the file name and "
                 f"the agent id, so choose one that fits that rule."
             ) from exc
+        refuse_an_unwritable_display_name(draft)
         if create and self.has_persona(draft.name):
             raise PersonaWriteConflict(
                 f"a persona named {draft.name!r} already exists. Edit it, or choose another name."
@@ -482,6 +593,8 @@ class InMemoryPersonaStore:
             llm_dict["model_name"] = draft.model_name
         if draft.fast_model is not None:
             llm_dict["fast_model"] = draft.fast_model
+        if draft.image_model is not None:
+            llm_dict["image_model"] = draft.image_model
         if draft.max_tokens is not None:
             llm_dict["max_tokens"] = draft.max_tokens
 
@@ -495,6 +608,7 @@ class InMemoryPersonaStore:
             enable_write_tools=draft.enable_write_tools,
             enable_subagent_tools=draft.enable_subagent_tools,
             a2a_peers=tuple(draft.a2a_peers),
+            display_name={locale: text.strip() for locale, text in draft.display_name.items()},
         )
         if draft.append_default_prompt:
             persona = _with_default_prompt(persona)
@@ -593,6 +707,9 @@ class CompositePersonaStore:
             source is not None
             and isinstance(source, Path)
             and writable_dir is not None
+            # A clone's file is `<root>/<id>/clone.yaml`, one level below the store's
+            # directory: whatever the writable store holds, it can rewrite.
+            and not self._writable_store.has_persona(draft.name)
             and source.parent not in (writable_dir, *self._overridable_dirs)
         ):
             raise PersonaWriteConflict(

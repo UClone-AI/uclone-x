@@ -13,6 +13,74 @@ names does.
 Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Each date is
 the date that version was published.
 
+## [0.4.0] - 2026-10-08
+
+### Upgrading from 0.3.1
+
+- Model and picture settings saved by 0.3.1 (provider, model, address and API keys) are
+  not carried over. After upgrading, add your connections again in Settings.
+- A clone that 0.3.1 saved with its own model may not come over as it was. After
+  upgrading, check each clone's model in Settings.
+- The `llm` extra installs nothing any more: every model connection works with the base
+  install. `uclone-x[llm]` still resolves.
+
+### Added
+
+- Model connections. Settings lists the connections models come from: local Ollama, a
+  remote GPU, vLLM, or a hosted provider. Each clone picks its model from them, and in a
+  conversation each clone answers on its own model. Image engines are connections too, so
+  each clone can have its own picture model. The remote GPU can be an Apple silicon
+  machine, and Ollama is started there if it is not running.
+- A clone that holds the `browser` tool (the Scout does) can use Chrome. Connect your own
+  Chrome under Settings › Browser with the companion extension; without it, the clone uses
+  a separate Chrome window. The clone can open pages, read them, click, type, scroll,
+  switch tabs and handle pop-ups, downloads and dialogs. The Browser tab in the dock shows
+  the page live, with each step listed. You can take over, give control back, hand it to
+  another clone or stop it at any time.
+- A clone using the browser can look at the page. Models that accept images (Anthropic
+  models and vision-capable Ollama models) receive the picture; a model that cannot see
+  gets a note instead.
+- Clones know who they are. Facts about a clone itself are kept in its knowledge list, and
+  the newest eight are recalled every turn. The Artist, and any clone whose tools include
+  `show_self`, can draw itself in a scene from those facts. Drawing aids are given to every
+  clone that holds `generate_image`, not only the Artist.
+- Every clone can set its own profile picture.
+- Each clone has its own ontology (`ontology.yaml`), which `ucx ontology` writes.
+- Each conversation can have its own workspace folder.
+- The Writer can take one request all the way to a first chapter: it proposes a genre,
+  premises and a cast, outlines the plot on a structure, plans each chapter before
+  writing it, and takes feedback at each stop. Replying "yes" alone keeps it going. The
+  story view shows the outline as a story board linked to the story's codex. Each written
+  scene proposes what it adds to the codex, and a person approves the proposals.
+- Drawn pictures appear as one card: a gallery for a batch, a larger view, and download.
+- A restart reconnects the remote-GPU tunnel that was left connected.
+- The single-agent runtime can be used as a library, without the dashboard.
+
+### Changed
+
+- The single Save & Apply button in Settings is gone: each setting saves on its own. A
+  connection's address and key are saved with that connection's Save button.
+- Every clone has one id across the API, conversations and the dashboard. Each clone has
+  its own directory, and a clone's name can be written in any script.
+- Clone knowledge is stored in a local SQLite database instead of a single JSON file. The
+  old file is imported once.
+- A clone's context window is taken from the model catalogue. vLLM models report it
+  themselves.
+- `ucx` commands write their log to `ucx.log` instead of the terminal. A notice says where
+  the log is, and says so when the log could not be written.
+- Story features are loaded as an extension of the core rather than built into it. Nothing
+  changes in how they are used.
+
+### Fixed
+
+- Generated pictures are saved in the conversation's own folder. A new picture no longer
+  overwrites an earlier one, and two drawings never run on the shared image pipeline at
+  once.
+- A `/loop` keeps running across a server restart and says when a run fails.
+- The server refuses cross-origin reads of the conversation list, folders and other data.
+- More error messages in Settings, conversations and the CLI use plain wording. The CLI
+  states a refused step in your language.
+
 ## [0.3.1] - 2026-09-28
 
 ### Added

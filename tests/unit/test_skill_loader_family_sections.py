@@ -346,14 +346,14 @@ class _FixedDispatcher(ImagePipelineDispatcher):
         super().__init__()
         self.profile = profile
 
-    def get_active_profile(self) -> ModelProfile:
+    def get_active_profile(self, own: str | None = None) -> ModelProfile:
         return self.profile
 
 
 def test_the_agent_wires_load_skill_to_the_image_tools_active_profile() -> None:
     """The agent's `load_skill` reads the profile the registered `generate_image` resolves.
 
-    Killed by: src/uclone_x/agent/base.py :: profile_provider = image_source.active_profile
+    Killed by: src/uclone_x/agent/base.py :: profile_provider = clone_profile
     Becomes: profile_provider = None
     """
     dispatcher = _FixedDispatcher(_profile(PromptFamily.NATURAL_PROSE))

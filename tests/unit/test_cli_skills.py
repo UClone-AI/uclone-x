@@ -210,6 +210,46 @@ def test_cli_skill_list_reports_a_folder_it_cannot_open_and_lists_the_rest(
     assert "No skills found" not in result.output
 
 
+_CLI_INTERNALS = re.compile(
+    r"Traceback|Error\b|Exception|\.py\b|SkillAudit|codec|byte 0x|frontmatter|YAML|"
+    r"Unknown field|Allowed fields"
+)
+
+
+@pytest.mark.parametrize(
+    ("content", "reason"),
+    [
+        (b"\xff\xfe not text", skill_cli.UNREADABLE_NOT_TEXT),
+        (b"# No header at all\n", skill_cli.UNREADABLE_NO_HEADER),
+        (b"---\nname: [unclosed\n---\n", skill_cli.UNREADABLE_NO_HEADER),
+        (b"---\ndescription: no name\n---\n", skill_cli.UNREADABLE_BAD_FIELD),
+        (b"---\nname: odd\ncolour: blue\n---\n", skill_cli.UNREADABLE_BAD_FIELD),
+    ],
+)
+def test_cli_skill_list_says_why_a_package_could_not_be_read(
+    tmp_path: Path, content: bytes, reason: str
+) -> None:
+    """An unparseable package is named with a plain reason, not skipped unsaid (#1865).
+
+    Killed by: src/uclone_x/cli/commands/skill.py :: unreadable.append((folder.name, _unreadable_reason(folder, exc)))
+    Becomes: pass
+    """
+    _pending_skill(tmp_path, "readable_skill")
+    broken = tmp_path / "broken_skill"
+    broken.mkdir()
+    (broken / "SKILL.md").write_bytes(content)
+
+    result = runner.invoke(app, ["skill", "list", "--dir", str(tmp_path)], env={"COLUMNS": "400"})
+
+    assert result.exit_code == 0 and result.exception is None
+    said = " ".join(result.output.split())
+    line = skill_cli.LIST_FOLDER_UNREADABLE.format(name="broken_skill", reason=reason)
+    assert line in said
+    assert _CLI_INTERNALS.search(said) is None, said
+    assert str(tmp_path) not in said
+    assert "readable_skill" in said
+
+
 def test_cli_skill_approve_promotes_skill(tmp_path: Path) -> None:
     skill_dir = tmp_path / "data_exporter"
     save_skill(
@@ -622,6 +662,40 @@ def test_cli_skill_synthesize_has_no_auto_approve_and_leaves_the_skill_pending(
     assert written.exit_code == 0
     assert "Skill is quarantined (pending)" in written.output
     loaded = load_skill_from_dir(tmp_path / "hash_checker")
+    assert loaded.manifest.status is SkillStatus.PENDING
+    assert loaded.manifest.approved_by is None
+
+
+def test_cli_skill_synthesize_policy_is_labelled_as_the_audit_verdict_and_approves_nothing(
+    tmp_path: Path,
+) -> None:
+    """`--policy` sets the printed audit verdict, not approval (#1865).
+
+    Even `always` leaves the package pending, so the flag is not described as auto-approval.
+    """
+    shown = runner.invoke(app, ["skill", "synthesize", "--help"], env={"COLUMNS": "200"})
+    assert shown.exit_code == 0
+    assert "Auto-approval" not in shown.output
+    assert "It approves nothing" in shown.output
+
+    written = runner.invoke(
+        app,
+        [
+            "skill",
+            "synthesize",
+            "--name",
+            "always_skill",
+            "--step",
+            "Compute the hash",
+            "--policy",
+            "always",
+            "--dir",
+            str(tmp_path),
+        ],
+        env={"COLUMNS": "200"},
+    )
+    assert written.exit_code == 0
+    loaded = load_skill_from_dir(tmp_path / "always_skill")
     assert loaded.manifest.status is SkillStatus.PENDING
     assert loaded.manifest.approved_by is None
 

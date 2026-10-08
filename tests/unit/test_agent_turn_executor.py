@@ -10,13 +10,14 @@ calls back are the agent's current ones, and what the turn writes lands on the a
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Awaitable, Callable
+from pathlib import Path
 from typing import Any
 
 import pytest
 from pydantic import BaseModel
 
 from uclone_x.agent.base import BaseAgent
-from uclone_x.agent.models import AgentConfig, AgentLLMConfig, ToolExecutionRecord
+from uclone_x.agent.models import AgentConfig, AgentContext, AgentLLMConfig, ToolExecutionRecord
 from uclone_x.core.provenance import Provenance
 from uclone_x.llm.connectors.base import BaseLLMConnector
 from uclone_x.llm.models import (
@@ -223,3 +224,42 @@ async def test_the_public_entry_point_passes_the_story_through_to_the_tools() ->
     await agent.execute_turn("use the tool", room_id="room-1", story_id="story-1")
 
     assert [(c.room_id, c.story_id) for c in probe.contexts] == [("room-1", "story-1")]
+
+
+@pytest.mark.asyncio
+async def test_a_turn_given_a_workspace_runs_its_tools_there_and_only_that_turn(
+    tmp_path: Path,
+) -> None:
+    """A conversation's workspace binds the turn's tools; the next turn without one does not.
+
+    The room passes its workspace on every turn (clone-data-scopes §3.6), so the sandbox
+    bound is the conversation's, and a turn with none falls back to the agent's own.
+
+    Killed by: src/uclone_x/agent/turn_executor.py :: self._scope.set_turn_workspace_root(workspace_root)
+    Becomes: self._scope.set_turn_workspace_root(None)
+    """
+    default, other = tmp_path / "default", tmp_path / "other"
+    default.mkdir()
+    other.mkdir()
+    probe = _ContextProbe()
+    llm = _ScriptedLLM(_call("c1"), _answer("one"), _call("c2"), _answer("two"))
+    registry = ToolRegistry()
+    registry.register(probe)
+    agent = BaseAgent(
+        config=AgentConfig(
+            agent_id="turn_executor",
+            name="Turn executor",
+            llm_config=AgentLLMConfig(model_name="scripted"),
+        ),
+        llm=llm,
+        tools=registry,
+        context=AgentContext(
+            session_id="sess_ws", agent_id="turn_executor", workspace_root=default
+        ),
+    )
+    await agent.start()
+
+    await agent.execute_turn("in the other folder", workspace_root=other)
+    await agent.execute_turn("in the default one")
+
+    assert [c.workspace_root for c in probe.contexts] == [other.resolve(), default.resolve()]

@@ -6,6 +6,7 @@ import pytest
 from uclone_x.agent.base import BaseAgent
 from uclone_x.agent.models import AgentConfig
 from uclone_x.core.provenance import Provenance
+from uclone_x.sandbox.models import WorkspaceIsolation
 from uclone_x.tools.builtin.subagent import SubagentDelegationTool
 from uclone_x.tools.models import ToolContext
 
@@ -13,7 +14,7 @@ from uclone_x.tools.models import ToolContext
 @pytest.mark.asyncio
 async def test_subagent_delegation_callable():
     # Setup mock agent
-    config = AgentConfig(agent_id="parent_agent", name="parent", role="parent", max_turns=10)
+    config = AgentConfig(agent_id="parent_agent", name="parent", role="parent", max_steps=10)
     agent = BaseAgent(config=config)
     agent._turn_counter = 0  # pyright: ignore[reportPrivateUsage]
 
@@ -40,7 +41,7 @@ async def test_subagent_delegation_callable():
     )
 
     result = await tool.execute(
-        params={"role": "researcher", "goal": "Find X", "prompt": "Search X", "max_turns": 5},
+        params={"role": "researcher", "goal": "Find X", "prompt": "Search X", "max_steps": 5},
         context=tool_ctx,
     )
 
@@ -61,12 +62,11 @@ async def test_subagent_delegation_callable():
 
     # The child's step ceiling is the one the caller asked for.
     assert subagent_mock._config.max_steps == 5  # pyright: ignore[reportPrivateUsage]
-    assert subagent_mock._config.max_turns == 5  # pyright: ignore[reportPrivateUsage]
 
 
 @pytest.mark.asyncio
 async def test_subagent_recursion_depth_capped():
-    config = AgentConfig(agent_id="parent_agent", name="parent", role="parent", max_turns=10)
+    config = AgentConfig(agent_id="parent_agent", name="parent", role="parent", max_steps=10)
     agent = BaseAgent(config=config)
     agent._context = agent._context.model_copy(update={"depth": 3})  # pyright: ignore[reportPrivateUsage]
 
@@ -117,7 +117,7 @@ async def test_subagent_budget_inherited():
 
 @pytest.mark.asyncio
 async def test_subagent_failure_surfaced():
-    config = AgentConfig(agent_id="parent_agent", name="parent", role="parent", max_turns=10)
+    config = AgentConfig(agent_id="parent_agent", name="parent", role="parent", max_steps=10)
     agent = BaseAgent(config=config)
     agent._turn_counter = 0  # pyright: ignore[reportPrivateUsage]
 
@@ -156,7 +156,8 @@ async def test_subagent_failure_surfaced():
 async def test_long_conversation_does_not_exhaust_the_delegation_budget():
     """A long conversation must not block delegation (issue 2026-09-05-001).
 
-    The budget was `config.max_turns - agent.turn_counter`: the per-run step ceiling minus
+    The budget was `config.max_turns - agent.turn_counter` (`max_turns` was the old name of
+    `max_steps`): the per-run step ceiling minus
     the lifetime interaction-turn counter. Once a session had exchanged `max_steps`
     messages, `turn_counter` alone pushed the difference to zero and every later
     delegation failed with "exhausted", no matter how few steps the current run had spent.
@@ -206,14 +207,31 @@ async def test_long_conversation_does_not_exhaust_the_delegation_budget():
 
 
 @pytest.mark.asyncio
-async def test_delegation_params_accept_the_deprecated_max_turns_spelling():
-    """A model that learned the old tool schema still lands on the canonical field."""
-    from uclone_x.tools.builtin.subagent import SubagentDelegationParams
+async def test_a_refused_delegation_says_so_in_plain_words(tmp_path: Path) -> None:
+    """The refusal reaches the model without pydantic's report around it and with what was
+    not done -- no helper started (#1570).
 
-    legacy = SubagentDelegationParams(role="r", goal="g", prompt="p", max_turns=7)
-    assert legacy.max_steps == 7
-    assert legacy.max_turns == 7
+    Killed by: src/uclone_x/tools/builtin/subagent.py :: error=describe_invalid_arguments(
+    Becomes: error=str(e) + describe_invalid_arguments(
+    """
+    context = ToolContext(
+        agent_id="agent_1",
+        session_id="s1",
+        workspace_root=tmp_path,
+        isolation=WorkspaceIsolation(),
+    )
+    result = await SubagentDelegationTool().execute(
+        params={"role": "r", "prompt": "p", "max_steps": "many"},
+        context=context,
+    )
 
-    canonical = SubagentDelegationParams(role="r", goal="g", prompt="p", max_steps=7)
-    assert canonical.max_steps == 7
-    assert canonical.max_turns == 7
+    assert result.success is False
+    assert result.error == (
+        "The call to 'delegate_subagent' was refused because its arguments did not fit: "
+        "'goal' is missing; 'max_steps' should be a whole number. No helper was started, so "
+        "nothing was done. It takes: role (required), goal (required), prompt (required), "
+        "max_steps, system_prompt, share_parent_memory. Call it again with the arguments "
+        "corrected."
+    )
+    for internal in ("pydantic", "http", "validation error", "SubagentDelegation"):
+        assert internal not in result.error

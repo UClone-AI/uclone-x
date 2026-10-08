@@ -27,8 +27,8 @@ export const PersonaDetail: React.FC<PersonaDetailProps> = ({ persona, copy }) =
       <div className="grid grid-cols-2 gap-x-3 gap-y-1.5 font-mono">
         <div>
           <div className="text-[10px] text-slate-500 uppercase font-sans">{copy.model}</div>
-          <div className="text-slate-300 truncate" title={persona.model_name}>
-            {persona.model_name || copy.notSet}
+          <div className="text-slate-300 truncate" title={persona.model_name ?? undefined}>
+            {persona.model_name || copy.systemDefault}
           </div>
         </div>
         <div>

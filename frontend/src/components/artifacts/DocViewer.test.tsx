@@ -70,9 +70,11 @@ afterEach(() => {
 const LIST_A = '/api/rooms/room-a/artifacts';
 
 describe('DocViewer, scoped to the conversation (#1354, #1356)', () => {
+  // Killed by: frontend/src/components/artifacts/DocViewer.tsx :: artifactUrlInRoom(`/api/artifacts/content?path=${encodeURIComponent(path)}`, roomId);
+  // Becomes: `/api/artifacts/content?path=${encodeURIComponent(path)}`;
   it('lists only the files this conversation wrote, read by room id', async () => {
     answers[LIST_A] = listing({ artifacts: [art({})], total: 1 });
-    answers['/api/artifacts/content?path=docs%2Freport.md'] = '# Audio Interface Report';
+    answers['/api/artifacts/content?path=docs%2Freport.md&room_id=room-a'] = '# Audio Interface Report';
     render(<DocViewer roomId="room-a" />);
 
     expect(await screen.findByText('Audio Interface Report')).toBeInTheDocument();
@@ -87,8 +89,8 @@ describe('DocViewer, scoped to the conversation (#1354, #1356)', () => {
       room_id: 'room-b',
       artifacts: [art({ path: 'b/plan.md', name: 'plan.md' })],
     });
-    answers['/api/artifacts/content?path=docs%2Freport.md'] = 'A text';
-    answers['/api/artifacts/content?path=b%2Fplan.md'] = 'B text';
+    answers['/api/artifacts/content?path=docs%2Freport.md&room_id=room-a'] = 'A text';
+    answers['/api/artifacts/content?path=b%2Fplan.md&room_id=room-b'] = 'B text';
     const { rerender } = render(<DocViewer roomId="room-a" />);
     await screen.findByText('A text');
     rerender(<DocViewer roomId="room-b" />);
@@ -129,7 +131,7 @@ describe('DocViewer, scoped to the conversation (#1354, #1356)', () => {
         '1 turn ended before its tool calls were saved',
       ],
     });
-    answers['/api/artifacts/content?path=docs%2Freport.md'] = 'text';
+    answers['/api/artifacts/content?path=docs%2Freport.md&room_id=room-a'] = 'text';
     render(<DocViewer roomId="room-a" />);
     expect(await screen.findByTestId('doc-scope-note')).toHaveTextContent(SCOPE_NOTE);
     const gaps = screen.getByTestId('doc-record-gaps');
@@ -141,7 +143,7 @@ describe('DocViewer, scoped to the conversation (#1354, #1356)', () => {
 
   it('names no gap it was not given, and says so while a turn is still running', async () => {
     answers[LIST_A] = listing({ artifacts: [art({})], turn_running: true });
-    answers['/api/artifacts/content?path=docs%2Freport.md'] = 'text';
+    answers['/api/artifacts/content?path=docs%2Freport.md&room_id=room-a'] = 'text';
     render(<DocViewer roomId="room-a" />);
     expect(await screen.findByTestId('doc-turn-running')).toHaveTextContent(
       'A turn is still running; the files it saves are listed when it finishes.',
@@ -165,8 +167,8 @@ describe('DocViewer, scoped to the conversation (#1354, #1356)', () => {
     answers[LIST_A] = listing({
       artifacts: [art({}), art({ id: 'art_2', path: 'out/plan.md', name: 'plan.md' })],
     });
-    answers['/api/artifacts/content?path=docs%2Freport.md'] = 'report body';
-    answers['/api/artifacts/content?path=out%2Fplan.md'] = 'plan body';
+    answers['/api/artifacts/content?path=docs%2Freport.md&room_id=room-a'] = 'report body';
+    answers['/api/artifacts/content?path=out%2Fplan.md&room_id=room-a'] = 'plan body';
     const { rerender } = render(<DocViewer roomId="room-a" selectedArtifactPath="out/plan.md" />);
     expect(await screen.findByText('plan body')).toBeInTheDocument();
     expect(screen.getByTestId('artifact-selector')).toHaveValue('out/plan.md');
@@ -179,8 +181,8 @@ describe('DocViewer, scoped to the conversation (#1354, #1356)', () => {
     answers[LIST_A] = listing({
       artifacts: [art({}), art({ id: 'art_2', path: 'out/plan.md', name: 'plan.md' })],
     });
-    answers['/api/artifacts/content?path=docs%2Freport.md'] = 'report body';
-    answers['/api/artifacts/content?path=out%2Fplan.md'] = 'plan body';
+    answers['/api/artifacts/content?path=docs%2Freport.md&room_id=room-a'] = 'report body';
+    answers['/api/artifacts/content?path=out%2Fplan.md&room_id=room-a'] = 'plan body';
     const onSelectArtifact = vi.fn();
     render(<DocViewer roomId="room-a" onSelectArtifact={onSelectArtifact} />);
     await screen.findByText('report body');
@@ -205,7 +207,7 @@ describe('DocViewer, scoped to the conversation (#1354, #1356)', () => {
     await screen.findByTestId('image-artifact-preview');
     expect(screen.getByRole('img')).toHaveAttribute(
       'src',
-      '/api/artifacts/content?path=artifacts%2Fimages%2Fscenic.png',
+      '/api/artifacts/content?path=artifacts%2Fimages%2Fscenic.png&room_id=room-a',
     );
     expect(screen.getByText('Open original in new tab')).toBeInTheDocument();
   });
@@ -223,7 +225,7 @@ describe('DocViewer, scoped to the conversation (#1354, #1356)', () => {
  * `Response` carrying the plain-text 500 the server sends.
  */
 describe('DocViewer: a failed read shows no transport text (#1435)', () => {
-  const CONTENT_A = '/api/artifacts/content?path=docs%2Freport.md';
+  const CONTENT_A = '/api/artifacts/content?path=docs%2Freport.md&room_id=room-a';
   const plain500 = () =>
     new Response('Internal Server Error', {
       status: 500,
@@ -320,7 +322,7 @@ describe('DocViewer: a failed read shows no transport text (#1435)', () => {
       ],
       total: 2,
     });
-    answers['/api/artifacts/content?path=artifacts%2Fimages%2Fimg_a1b2c3.json'] = {
+    answers['/api/artifacts/content?path=artifacts%2Fimages%2Fimg_a1b2c3.json&room_id=room-a'] = {
       id: 'a1b2c3',
       prompt: 'a scenic mountain at sunset',
       seed: 42,
@@ -348,7 +350,7 @@ describe('DocViewer: a failed read shows no transport text (#1435)', () => {
       ],
       total: 2,
     });
-    answers['/api/artifacts/content?path=artifacts%2Fimages%2Fimg_neg123.json'] = {
+    answers['/api/artifacts/content?path=artifacts%2Fimages%2Fimg_neg123.json&room_id=room-a'] = {
       id: 'neg123',
       prompt: 'a scenic mountain at sunset',
       negative_prompt: 'blurry, low quality, artifacts',

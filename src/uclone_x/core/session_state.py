@@ -33,7 +33,12 @@ from uclone_x.core.context_state import ContextEntry, ContextEpoch
 from uclone_x.core.immutable import unwrap_immutable
 from uclone_x.core.models import PersonaDefinition, PlanState
 from uclone_x.core.secrets import redact_credentials, redact_log_payload
-from uclone_x.core.session_log import SessionLogEntry
+from uclone_x.core.session_log import (
+    SessionLogEntry,
+    history_entry_ids,
+    is_kept_text,
+    logged_message,
+)
 from uclone_x.llm.models import ChatMessage, MessageRole, ToolCallRequest
 
 __all__ = [
@@ -42,10 +47,44 @@ __all__ = [
     "ContextSnapshot",
     "SessionState",
     "content_digest",
+    "history_entries_not_their_messages",
+    "log_position",
+    "recorded_before_history_entries",
     "redact_message",
 ]
 
 _SHA256_HEX = re.compile(r"[0-9a-f]{64}")
+
+
+def log_position(entry: str) -> int | None:
+    """The log position a `e<n>` entry id names, or `None` for anything else."""
+    digits = entry.removeprefix("e")
+    if digits == entry or not digits.isdigit():
+        return None
+    return int(digits)
+
+
+_log_position = log_position
+
+
+def _logged_entries(
+    log: Sequence[SessionLogEntry], messages: Sequence[ChatMessage]
+) -> tuple[str, ...]:
+    """The log entry of each of `messages`, by digest, or none unless `log` holds all (#1985).
+
+    A message the log cannot keep -- a form that records no source -- names none here;
+    `SessionState` refuses it in its own words.
+    """
+    if not log or not messages:
+        return ()
+    try:
+        digests = [logged_message(redact_message(message)).digest for message in messages]
+    except ValueError:
+        return ()
+    known = history_entry_ids(log, digests)
+    if None in known:
+        return ()
+    return tuple(entry for entry in known if entry is not None)
 
 
 def _now_iso() -> str:
@@ -126,6 +165,9 @@ def redact_message(message: ChatMessage) -> ChatMessage:
         tool_calls=tuple(new_tool_calls),
         compaction_ledger=message.compaction_ledger,
         form=message.form,
+        # A picture is not text and is not redacted; dropping it here lost a screenshot
+        # whose tool result happened to quote a credential shape (#2107).
+        images=message.images,
     )
 
 
@@ -231,6 +273,23 @@ class ContextSnapshot(BaseModel):
     max_tokens: int | None
     auto_compact: bool
     compaction_threshold_tokens: int
+    tools_module: str | None = Field(
+        default=None,
+        description="The tools module the request's tools layer was built under (#2188): "
+        "`pinned` or `bound`. `None` is `native`, the default, and is left out of the "
+        "record, so a default snapshot and its id are what they were before modules. Read "
+        "through `recorded_tools_module`, which refuses a name this build does not know.",
+    )
+
+    @model_serializer(mode="wrap")
+    def _omit_native_module(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
+        """Leave `tools_module` out when unset, so a default snapshot is written, and
+        hashed into its `snapshot_id`, in the shape a build from before the field reads
+        (#1844)."""
+        data: dict[str, object] = handler(self)
+        if data.get("tools_module") is None:
+            data.pop("tools_module", None)
+        return data
 
     @field_validator(
         "tools_digest", "identity_digest", "slow_context_digest", "turn_context_digest"
@@ -268,7 +327,27 @@ class SessionState(BaseModel):
     @field_validator("messages", mode="after")
     @classmethod
     def _redact_messages(cls, messages: tuple[ChatMessage, ...]) -> tuple[ChatMessage, ...]:
-        """Redact known credential shapes on write across all messages (#569)."""
+        """Redact known credential shapes on write across all messages (#569).
+
+        A tool result shown in a smaller form is held as what it records -- its form and
+        the kept result it was cut from (`ChatMessage.rendered_from`) -- and never as text:
+        its text is rendered from that result when it is shown, so a record cannot hold
+        text other than what was sent (#1848). A record written before that holds a form's
+        text, or no source for it, and is refused here rather than shown as whatever text
+        it held; the store treats a record that fails validation as absent and sets it
+        aside (#1844).
+        """
+        for position, message in enumerate(messages):
+            if message.form is not None and message.rendered_from is None:
+                raise ValueError(
+                    f"messages[{position}] is a {message.form} that records no result it "
+                    "was rendered from (#1848)"
+                )
+            if message.form is not None and message.content is not None:
+                raise ValueError(
+                    f"messages[{position}] is a {message.form} that holds text; a form is "
+                    "recorded, not written (#1848)"
+                )
         return tuple(redact_message(m) for m in messages)
 
     plan: PlanState | None = Field(
@@ -310,9 +389,7 @@ class SessionState(BaseModel):
         default=(),
         description="Every message that entered `messages`, oldest first, append-only "
         "(#1443); see `core/session_log.py`. Each entry names its message's body in the "
-        "context body store. A record written before this field reads back with none, and "
-        "loading it backfills one `migrated` entry per message. A reset clears it with the "
-        "history it describes.",
+        "context body store. A reset clears it with the history it describes.",
     )
     context_epochs: tuple[ContextEpoch, ...] = Field(
         default=(),
@@ -341,18 +418,63 @@ class SessionState(BaseModel):
         "(#1844).",
     )
 
+    history_entries: tuple[str, ...] = Field(
+        default=(),
+        description="The log entry each of `messages` is, in order (#1848): the history as "
+        "the live session derives it from its last epoch and the log, so a load adopts "
+        "the same entries by id rather than matching bodies. Every record a session "
+        "writes carries it; a stored record that has a log and messages but no entries "
+        "was written before it and is refused (`recorded_before_history_entries`), as is one "
+        "whose message is not the body of the entry it names "
+        "(`history_entries_not_their_messages`, #1985). Empty on a state built in-process "
+        "from messages alone, whose messages are then matched to the log by digest; "
+        "`with_messages` names them when its log holds every message. Left out of the "
+        "record when empty.",
+    )
+
     @model_serializer(mode="wrap")
     def _omit_empty_pending_fields(
         self, handler: SerializerFunctionWrapHandler
     ) -> dict[str, object]:
-        """Leave `compacted_entries` and `epoch_causes` out when empty, so a record without
-        them is written in the shape a build from before the fields reads (#1844)."""
+        """Leave `compacted_entries`, `epoch_causes` and `history_entries` out when empty, so
+        a record without them is written in the shape a build from before the fields reads
+        (#1844)."""
         data: dict[str, object] = handler(self)
         if not data.get("compacted_entries"):
             data.pop("compacted_entries", None)
         if not data.get("epoch_causes"):
             data.pop("epoch_causes", None)
+        if not data.get("history_entries"):
+            data.pop("history_entries", None)
+        if data.get("history_entries") and data.get("session_log"):
+            data.pop("messages", None)
         return data
+
+    @model_validator(mode="after")
+    def _history_entries_are_logged_messages(self) -> SessionState:
+        """Refuse `history_entries` that do not name one logged message per message (#1848).
+
+        Checked by structure alone -- counts and ids, no body is read or hashed -- so a
+        record build costs nothing per message here (#1974, item 11). Whether each entry's
+        body is its message is checked once, where a record is adopted (`from_state`).
+        """
+        entries = self.history_entries
+        if not entries:
+            return self
+        if self.messages and len(entries) != len(self.messages):
+            raise ValueError(
+                f"history_entries names {len(entries)} log entries for "
+                f"{len(self.messages)} messages"
+            )
+        for position, entry in enumerate(entries):
+            index = _log_position(entry)
+            if index is None or index >= len(self.session_log):
+                raise ValueError(f"history_entries[{position}] is {entry!r}, not in the log")
+            if is_kept_text(self.session_log[index]):
+                raise ValueError(
+                    f"history_entries[{position}] is {entry!r}, a kept text, not a message"
+                )
+        return self
 
     @field_validator("context_epochs", mode="after")
     @classmethod
@@ -482,6 +604,13 @@ class SessionState(BaseModel):
         match; and it is a wall-clock string rather than a counter, so two writes inside
         one clock tick are indistinguishable. `SessionStore.save` stamps it again on the
         way to disk in any case.
+
+        `history_entries` names the log entry of each new message when the log holds every
+        one of them, matched by digest as a load matches a state that names none
+        (`history_entry_ids`); otherwise none, and the live session that adopts the state
+        logs what the log lacks. Dropped whole, a state with a log would be saved naming
+        none, and the store would set it aside on the next load as a record from before
+        #1848 (#1985).
         """
         replacement = tuple(messages)
         return SessionState(
@@ -499,6 +628,7 @@ class SessionState(BaseModel):
             context_snapshots=self.context_snapshots,
             session_log=self.session_log,
             context_epochs=self.context_epochs,
+            history_entries=_logged_entries(self.session_log, replacement),
         )
 
     def with_plan(self, plan: PlanState | None) -> SessionState:
@@ -518,39 +648,48 @@ class SessionState(BaseModel):
             context_epochs=self.context_epochs,
             compacted_entries=self.compacted_entries,
             epoch_causes=self.epoch_causes,
+            history_entries=self.history_entries,
         )
 
-    def append_message(
-        self,
-        message: ChatMessage,
-        turn_counter: int | None = None,
-        updated_at: str | None = None,
-    ) -> SessionState:
-        """Return this session carrying `message` appended to its history, with credentials redacted.
 
-        Redaction on write (Option A from #569) ensures that credential shapes
-        (such as OpenAI sk-..., GitHub ghp_..., Anthropic sk-ant-..., AWS keys)
-        do not enter session state or durable persistence.
+def recorded_before_history_entries(state: SessionState) -> str | None:
+    """Why a stored record is from before its history was read from the log, or `None`.
 
-        Known limitation: Catches only known credential shapes; unrecognized or
-        unstructured secrets cannot be detected by pattern matching.
-        """
-        redacted = redact_message(message)
-        return SessionState(
-            session_id=self.session_id,
-            agent_id=self.agent_id,
-            messages=(*self.messages, redacted),
-            plan=self.plan,
-            turn_counter=self.turn_counter if turn_counter is None else turn_counter,
-            created_at=self.created_at,
-            updated_at=_now_iso() if updated_at is None else updated_at,
-            revision=self.revision,
-            # Appending cannot touch `messages[0]`, so the anchor — and what composed it —
-            # is exactly the one this stamp already describes.
-            anchor_provenance=self.anchor_provenance,
-            context_snapshots=self.context_snapshots,
-            session_log=self.session_log,
-            context_epochs=self.context_epochs,
-            compacted_entries=self.compacted_entries,
-            epoch_causes=self.epoch_causes,
+    Every record a session writes names the log entry of each message it holds
+    (`history_entries`, #1848). One with a log but no entries was written by an earlier
+    build: its messages can only be matched to the log by their text, and one from before
+    #1854 holds a compaction's stub as a whole message, which would be labelled `full`.
+    It is not converted -- there are no users to convert for -- so the store reads it as
+    unreadable and sets it aside (#1844, #1974 item 5). A record with no log is read as
+    before, its messages logged when it is adopted: with no log it keeps no full result
+    for any message to be a form of, so each message is all there is of it, and `full`
+    says so. Decided by structure alone; no message text is read, so a tool's output
+    that quotes a stub's header never trips it.
+    """
+    if state.messages and state.session_log and not state.history_entries:
+        return (
+            "its messages name no log entries: a record from before the history was "
+            "read from the log (#1848)"
         )
+    return None
+
+
+def history_entries_not_their_messages(state: SessionState) -> str | None:
+    """Why a stored record's messages are not the log entries it names, or `None` (#1985).
+
+    The model refuses entries by structure alone -- a count that does not match, an id
+    not in the log, a kept text -- and reads no message. This is the rest: each message
+    is the body of the entry the record names for it, by digest. A record that fails it
+    cannot be adopted (`_LiveSession.from_state` refuses it on every resume), so the
+    store reads it as unreadable and sets it aside like any record this build cannot
+    read (#1844), instead of failing each time the session is opened.
+
+    Each message is hashed as the record holds it, not redacted again: `SessionState`
+    redacts its messages as it is built, and redacting is most of the cost of this read,
+    which runs whenever the store reads a record (#1974 item 11).
+    """
+    for entry_id, message in zip(state.history_entries, state.messages, strict=False):
+        index = _log_position(entry_id)
+        if index is None or state.session_log[index].digest != logged_message(message).digest:
+            return f"the message recorded for log entry {entry_id} is not its body (#1985)"
+    return None

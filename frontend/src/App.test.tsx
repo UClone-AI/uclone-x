@@ -138,6 +138,8 @@ let sendFault:
 let seatsOnServer: Map<string, string[]>;
 /** The agents the room *list* names for a conversation; `champion` alone where unnamed. */
 let listedSeatsOnServer: Map<string, string[]>;
+/** Seats not reset by a clear or rewind, by room id; empty where unnamed (#1468). */
+let participantsNotResetOnServer: Map<string, string[]>;
 /** When the room list says a conversation was last updated; one shared instant where unnamed. */
 let listedUpdatedOnServer: Map<string, string>;
 /**
@@ -256,6 +258,7 @@ beforeEach(() => {
   sendFault = null;
   seatsOnServer = new Map();
   listedSeatsOnServer = new Map();
+  participantsNotResetOnServer = new Map();
   listedUpdatedOnServer = new Map();
   roomReadFault = new Map();
   routeFault = new Map();
@@ -407,7 +410,10 @@ beforeEach(() => {
         if (cleared && method === 'DELETE') {
           transcriptsOnServer.set(cleared[1], []);
           return Promise.resolve(
-            answer({ ...stateOf(cleared[1], roomsOnServer.get(cleared[1]) ?? ''), participants_not_reset: [] }),
+            answer({
+              ...stateOf(cleared[1], roomsOnServer.get(cleared[1]) ?? ''),
+              participants_not_reset: participantsNotResetOnServer.get(cleared[1]) ?? [],
+            }),
           );
         }
         const seat = /^\/api\/rooms\/([^/]+)\/participants$/.exec(path);
@@ -437,11 +443,31 @@ beforeEach(() => {
           return Promise.resolve(answer(stateOf(room[1], title)));
         }
         switch (path) {
-          case '/api/personas':
-            return Promise.resolve(answer({ personas: personasOnServer }));
+          case '/api/clones':
+            return Promise.resolve(answer({ clones: personasOnServer }));
           case '/api/models':
             return Promise.resolve(
-              answer({ current_model: currentModelOnServer, models: modelsOnServer }),
+              // The model set (model-gateway.md §3.7.1): one connection listing every model.
+              answer({
+                groups: [
+                  {
+                    connection_id: 'ollama',
+                    label: 'Ollama',
+                    kind: 'ollama',
+                    status: 'connected',
+                    detail: null,
+                    models: modelsOnServer.map((id) => ({
+                      ref: `ollama/${id}`,
+                      id,
+                      display_name: id,
+                      capabilities: ['chat'],
+                      context_window: null,
+                    })),
+                  },
+                ],
+                defaults: { deep: currentModelOnServer || null, fast: null, image: 'auto' },
+                recommended: { deep: null, fast: null },
+              }),
             );
           default:
             return Promise.resolve(answer({}, 404));
@@ -629,13 +655,13 @@ describe('App opens a conversation by itself (#1208)', () => {
     // Killed by: frontend/src/App.tsx :: if (!roomsListed || !metadataListed) return;
     // Becomes: if (!roomsListed) return;
     roomsOnServer = new Map();
-    hold('GET /api/personas');
+    hold('GET /api/clones');
     render(<App />);
     await settle();
 
     expect(sent('POST', '/api/rooms')).toHaveLength(0);
 
-    await release('GET /api/personas');
+    await release('GET /api/clones');
     await openedConversation();
     // Seated, not empty: `handleNewRoom` reads `selectedAgent`, which the persona list sets.
     expect(JSON.parse(sent('POST', '/api/rooms')[0].body ?? '{}')).toMatchObject({
@@ -671,7 +697,7 @@ describe('App opens a conversation by itself (#1208)', () => {
     // Killed by: frontend/src/App.tsx :: || createInFlightRef.current) return;
     // Becomes: ) return;
     roomsOnServer = new Map();
-    hold('GET /api/personas');
+    hold('GET /api/clones');
     hold('POST /api/rooms');
     render(<App />);
     await settle();
@@ -687,7 +713,7 @@ describe('App opens a conversation by itself (#1208)', () => {
     // two awaits later -- after the create and after the list re-read -- so for the whole
     // of the user's click the effect's own guard reads "nothing open, latch free", which
     // is the reading that starts a second conversation beside the one being made (#1288).
-    await release('GET /api/personas');
+    await release('GET /api/clones');
     await release('POST /api/rooms');
     await openedConversation();
 
@@ -708,14 +734,14 @@ describe('App opens a conversation by itself (#1208)', () => {
     // from the latch rather than being it -- the latch is spent deliberately and released
     // by a delete, and a click that produced no conversation may not spend it by accident.
     createRefusal = 'The room store is read-only.';
-    hold('GET /api/personas');
+    hold('GET /api/clones');
     hold('POST /api/rooms');
     render(<App />);
     await settle();
 
     fireEvent.click(screen.getByTestId('new-conversation-button'));
     await settle();
-    await release('GET /api/personas');
+    await release('GET /api/clones');
     // Held while the create is in flight -- the guard doing its job.
     expect(sent('GET', '/api/rooms/r1')).toHaveLength(0);
 
@@ -797,7 +823,7 @@ describe('App opens a story from Files in a new conversation (#1554)', () => {
     // the handler took must be free by the time that list lands, or the effect reads "a
     // create is in flight" for the rest of the session and nothing is ever opened.
     storyOpenRefusal = { status: 409, detail: 'That story could not be read, so it was not opened.' };
-    hold('GET /api/personas');
+    hold('GET /api/clones');
     render(<App />);
     await settle();
 
@@ -807,7 +833,7 @@ describe('App opens a story from Files in a new conversation (#1554)', () => {
     );
     expect(sent('GET', '/api/rooms/r1')).toHaveLength(0);
 
-    await release('GET /api/personas');
+    await release('GET /api/clones');
     await waitFor(() => expect(sent('GET', '/api/rooms/r1')).toHaveLength(1));
   });
 });
@@ -1036,7 +1062,7 @@ describe('App dock scope (#1356)', () => {
     fireEvent.click(await screen.findByTestId('activity-open-doc-w1'));
     expect(await screen.findByTestId('doc-viewer')).toBeInTheDocument();
     await waitFor(() =>
-      expect(requests.some((r) => r.url === '/api/artifacts/content?path=notes%2Fplan.md')).toBe(
+      expect(requests.some((r) => r.url.startsWith('/api/artifacts/content?path=notes%2Fplan.md&room_id='))).toBe(
         true,
       ),
     );
@@ -1047,7 +1073,7 @@ describe('App no default agent (#1125)', () => {
   it('adopts the first agent the server names, rather than opening on a literal name', async () => {
     // The head opened on `champion` whether or not this install had ever registered that
     // name, so a fresh install asked for a conversation addressed to nobody.
-    // Killed by: frontend/src/App.tsx :: if (loaded.length > 0) firstNamed = loaded[0].name;
+    // Killed by: frontend/src/App.tsx :: if (loaded.length > 0) firstNamed = cloneIdOf(loaded[0]);
     // Becomes: if (loaded.length > 0) firstNamed = 'champion';
     personasOnServer = [{ name: 'novelist' }];
     roomsOnServer = new Map();
@@ -2103,6 +2129,7 @@ describe('App says what it knows about a send that got no answer (#1441)', () =>
 
     await waitFor(() => expect(screen.getByTestId('room-composer')).toHaveValue(''));
     expect(screen.queryByTestId('send-error')).toBeNull();
+    expect(screen.queryByTestId('room-notice')).toBeNull();
     expect(sent('POST', '/api/rooms/r1/messages')).toHaveLength(1);
   });
 
@@ -2123,6 +2150,26 @@ describe('App says what it knows about a send that got no answer (#1441)', () =>
     expectPlain(text);
     expect(screen.queryByTestId('send-error')).toBeNull();
     expect(copiesOnServer()).toBe(1);
+  });
+
+  // Killed by: frontend/src/App.tsx :: if (storedDespite !== null && generation === roomGenerationRef.current)
+  // Becomes: if (storedDespite !== null)
+  it('does not land a stored-despite notice on a different conversation when switched mid-send', async () => {
+    render(<App />);
+    await openedConversation();
+    sendFault = 'stored-then-500';
+    hold('POST /api/rooms/r1/messages');
+    send();
+
+    // Switch conversations while the send is in flight.
+    fireEvent.click(screen.getByTestId('conversation-r2'));
+    await waitFor(() => expect(sent('GET', '/api/rooms/r2')).toHaveLength(1));
+
+    // Release the send: deliverMessage resolves with stored-despite for r1.
+    await release('POST /api/rooms/r1/messages');
+    await waitFor(() => expect(sent('GET', '/api/rooms/r1').length).toBeGreaterThanOrEqual(2));
+
+    expect(screen.queryByTestId('room-notice')).toBeNull();
   });
 
   // Killed by: frontend/src/lib/rooms.ts :: if (err.outcome === 'refused') return fmt(copy.refused, { reason });
@@ -2261,3 +2308,67 @@ describe('App restores in-flight turn on refresh (#1789)', () => {
     expect(screen.queryByTestId('send-message')).toBeNull();
   });
 });
+
+describe('App participants-not-reset warning (#1468)', () => {
+  // Killed by: frontend/src/App.tsx :: if (roomId !== currentRoomIdRef.current) {
+  // Becomes: if (true) {
+  it('leaves the warning visible when re-selecting the currently open conversation', async () => {
+    participantsNotResetOnServer.set('r1', ['scout']);
+    render(<App />);
+    await openedConversation();
+
+    fireEvent.click(screen.getByTestId('clear-history'));
+    fireEvent.click(screen.getByTestId('confirm-history-change-yes'));
+    await settle();
+
+    expect(screen.getByTestId('participants-not-reset')).toBeInTheDocument();
+
+    // Re-selecting the conversation in the rail that is already open leaves the warning visible
+    fireEvent.click(screen.getByTestId('conversation-r1'));
+    await settle();
+
+    expect(screen.getByTestId('participants-not-reset')).toBeInTheDocument();
+
+    // Switching to a different conversation clears the warning
+    fireEvent.click(screen.getByTestId('conversation-r2'));
+    await settle();
+
+    expect(screen.queryByTestId('participants-not-reset')).toBeNull();
+  });
+});
+
+describe('App auto-opens dock on browser tool use (#2104)', () => {
+  it('opens dock on browser surface on first browser tool use in room', async () => {
+    render(<App />);
+    await openedConversation();
+    const stream = SilentEventSource.current;
+    expect(stream?.onmessage).toBeDefined();
+
+    // Initially, dock is closed
+    expect(screen.queryByTestId('artifacts-dock')).toBeNull();
+
+    // A tool event for 'browser' arrives on room.r1.tool
+    await act(async () => {
+      stream!.onmessage!({
+        data: JSON.stringify({
+          event_id: 'tool-1',
+          type: 'AGENT_EVENT',
+          topic: 'room.r1.tool',
+          event_type: 'TOOL_CALL',
+          source: 'runtime',
+          payload: {
+            room_id: 'r1',
+            name: 'browser',
+          },
+        }),
+      } as MessageEvent);
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    });
+
+    // Dock is now open on the browser tab
+    expect(screen.getByTestId('artifacts-dock')).toBeInTheDocument();
+    expect(screen.getByTestId('tab-browser').className).toContain('font-semibold');
+  });
+});
+
+

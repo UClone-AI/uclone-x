@@ -5,12 +5,12 @@ import {
   RefreshCw,
   TrendingDown,
   Server,
-  ShieldCheck,
   Cpu,
   Layers,
   PieChart,
 } from 'lucide-react';
-import { BudgetData, RoomContext, RoomState, RuntimeSettings } from '../../types';
+import { BudgetData, RoomContext, RoomState } from '../../types';
+import { fetchModelSet, findModel, type ModelSet } from '../../lib/modelGateway';
 import { participantLabel } from '../../lib/rooms';
 import { Badge } from '../ui/Badge';
 import { Button } from '../ui/Button';
@@ -98,19 +98,19 @@ export const ResourceSummary: React.FC<ResourceSummaryProps> = ({
   onRefresh,
   isRefreshing,
 }) => {
-  const [settings, setSettings] = useState<RuntimeSettings | null>(null);
+  // The default conversation model and the connection it comes from (model-gateway.md
+  // §3.7.1). Nothing is filled in when there is no answer or no default: a name made up here
+  // would be read as the one in use.
+  const [modelSet, setModelSet] = useState<ModelSet | null>(null);
 
   useEffect(() => {
     let isMounted = true;
-    fetch('/api/settings')
-      .then((res) => (res.ok ? res.json() : null))
-      .then((data: RuntimeSettings | null) => {
-        if (isMounted && data) {
-          setSettings(data);
-        }
+    fetchModelSet('chat')
+      .then((data) => {
+        if (isMounted) setModelSet(data);
       })
       .catch(() => {
-        /* Ignore network errors in test environments */
+        /* No answer: the card says so rather than naming a model. */
       });
     return () => {
       isMounted = false;
@@ -164,9 +164,20 @@ export const ResourceSummary: React.FC<ResourceSummaryProps> = ({
       : 0
   );
 
-  const activeProvider = settings?.llm_provider || 'ollama';
-  const activeModel = settings?.llm_model || 'qwen2.5:latest';
-  const activeEndpoint = settings?.llm_base_url || 'http://localhost:11434';
+  const defaultRef = modelSet?.defaults.deep ?? null;
+  const defaultEntry = findModel(modelSet, defaultRef);
+  const defaultGroup = defaultRef
+    ? modelSet?.groups.find((g) => g.models.some((m) => m.ref === defaultRef)) ?? null
+    : null;
+  const activeModel =
+    modelSet === null
+      ? 'Not read yet'
+      : defaultRef === null
+        ? 'No default conversation model chosen'
+        : defaultEntry
+          ? defaultEntry.display_name || defaultEntry.id
+          : `${defaultRef} (unavailable)`;
+  const activeProvider = defaultGroup ? defaultGroup.label : defaultRef ? defaultRef.split('/')[0] : '—';
 
   return (
     <div data-testid="resource-summary" className="flex flex-col h-full space-y-4">
@@ -187,7 +198,7 @@ export const ResourceSummary: React.FC<ResourceSummaryProps> = ({
               </Badge>
             </h2>
             <p className="text-[11px] text-slate-400">
-              Live step meter, token quotas, compaction savings, and connected Ollama status
+              Live step meter, token quotas, compaction savings, and the default conversation model
             </p>
           </div>
         </div>
@@ -437,43 +448,34 @@ export const ResourceSummary: React.FC<ResourceSummaryProps> = ({
           )}
         </div>
 
-        {/* Surface Section 4: Connected Ollama Provider Status (0 Mock Leak, G1 / RFC §3.4) */}
+        {/* Surface Section 4: the default conversation model, as the model set states it (model-gateway.md §3.7.1) */}
         <div className="p-4 bg-slate-900/80 border border-slate-800 rounded-2xl shadow-md space-y-3">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2">
               <Server className="w-4 h-4 text-cyan-400" />
               <span className="text-xs font-bold text-white uppercase tracking-wider font-mono">
-                Connected Provider & Model
+                Default Conversation Model
               </span>
             </div>
+            {defaultEntry && (
             <Badge
               tone="success"
               className="flex gap-1.5 font-mono text-emerald-400 bg-emerald-950/80 border-emerald-800/60"
             >
-              <StatusDot tone="success" className="animate-pulse" />
-              <span>Active</span>
+              <StatusDot tone="success" />
+              <span>Listed</span>
             </Badge>
+            )}
           </div>
 
           <div className="p-3 rounded-xl bg-slate-950/90 border border-slate-800 space-y-2 font-mono text-xs">
             <div className="flex items-center justify-between">
-              <span className="text-slate-500">Provider:</span>
-              <span data-testid="connected-provider-name" className="text-cyan-300 font-semibold uppercase">{activeProvider}</span>
+              <span className="text-slate-500">Connection:</span>
+              <span data-testid="connected-provider-name" className="text-cyan-300 font-semibold">{activeProvider}</span>
             </div>
             <div className="flex items-center justify-between">
-              <span className="text-slate-500">Model:</span>
+              <span className="text-slate-500">Default model:</span>
               <span data-testid="connected-model-name" className="text-white font-semibold">{activeModel}</span>
-            </div>
-            <div className="flex items-center justify-between">
-              <span className="text-slate-500">Base URL:</span>
-              <span className="text-slate-400 text-[11px]">{activeEndpoint}</span>
-            </div>
-            <div className="flex items-center justify-between pt-1 border-t border-slate-800/60">
-              <span className="text-slate-500">Execution Mode:</span>
-              <span className="text-emerald-400 flex items-center gap-1 text-[11px]">
-                <ShieldCheck className="w-3.5 h-3.5" />
-                <span>100% Local / Private</span>
-              </span>
             </div>
           </div>
         </div>

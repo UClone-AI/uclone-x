@@ -352,6 +352,26 @@ async function readOrThrow<T>(res: Response): Promise<T> {
  */
 export type MemoryEditOutcome = { ok: true } | { ok: false; status: number | null };
 
+export type MemoryChangeListener = () => void;
+const memoryChangeListeners = new Set<MemoryChangeListener>();
+
+export function onMemoryChanged(listener: MemoryChangeListener): () => void {
+  memoryChangeListeners.add(listener);
+  return () => {
+    memoryChangeListeners.delete(listener);
+  };
+}
+
+export function notifyMemoryChanged(): void {
+  for (const listener of memoryChangeListeners) {
+    try {
+      listener();
+    } catch (e) {
+      console.error(e);
+    }
+  }
+}
+
 /**
  * Correct (`value` given) or Forget (`value` null) one of a clone's facts (#1638 step 3).
  * Never throws.
@@ -371,7 +391,11 @@ export async function editMemoryFact(
         };
   try {
     const res = await fetch(roomDockUrls.memoryFact(agentId, factId), init);
-    return res.ok ? { ok: true } : { ok: false, status: res.status };
+    if (res.ok) {
+      notifyMemoryChanged();
+      return { ok: true };
+    }
+    return { ok: false, status: res.status };
   } catch {
     return { ok: false, status: null };
   }

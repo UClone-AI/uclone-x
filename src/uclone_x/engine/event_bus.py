@@ -60,10 +60,6 @@ def _drop_lowest_priority_from_queue(q: asyncio.PriorityQueue[AgentEvent]) -> Ag
     return dropped
 
 
-# Backward-compatible alias for the queue eviction helper
-_drop_oldest_from_priority_queue = _drop_lowest_priority_from_queue
-
-
 class EventPriority(IntEnum):
     """Priority levels for event dispatch ordering (lower values = higher priority)."""
 
@@ -76,8 +72,8 @@ class EventPriority(IntEnum):
 class EventType(StrEnum):
     """Closed classification of events on the bus.
 
-    The first seven are the types enumerated in `docs/event-driven-agent-core.md`
-    section 3. `PROVIDER_FAILOVER` and `RETRY` are the decision-plane notices Principle 6
+    The first seven are the types enumerated in the event-driven agent core design.
+    `PROVIDER_FAILOVER` and `RETRY` are the decision-plane notices Principle 6
     requires to be first-class rather than free-form strings. `CONTEXT_COMPACTED` joins
     them on that same standard (issue #183): a compaction irreversibly changes what every
     subsequent turn of the session can see, it carries a P6-attributable result — an
@@ -111,7 +107,7 @@ class EventType(StrEnum):
 
 
 class EventSource(StrEnum):
-    """Origin of an event, per `docs/event-driven-agent-core.md` section 3."""
+    """Origin of an event, per the event-driven agent core design."""
 
     USER = "user"
     AGENT = "agent"
@@ -164,8 +160,8 @@ class AgentEvent(BaseModel):
 
     `frozen=True` blocks attribute rebinding and `payload` is validated into a read-only
     mapping, so an event delivered by reference to several subscribers cannot be mutated
-    by any of them — the immutability the fastpath is required to provide by
-    `docs/a2a-protocol-spec.md` section 10.3. `extra="forbid"` makes `schema_version`
+    by any of them — the immutability the A2A protocol specification requires of the
+    fastpath. `extra="forbid"` makes `schema_version`
     meaningful: a field this version does not declare is rejected instead of passing
     through unnoticed.
 
@@ -241,7 +237,7 @@ class AgentEvent(BaseModel):
         "which carry `None`, so `None` here means 'not stated', never 'nothing went "
         "wrong'. Option C — a validator requiring the field for result-bearing types and "
         "forbidding it elsewhere — is the intended destination but is blocked on the "
-        "event taxonomy (`docs/event-driven-agent-core.md` section 10, rows 3 and 10), "
+        "event taxonomy (the event-driven agent core design's open questions), "
         "which is still open. Do not add that validator here until the taxonomy closes.",
     )
     trace_id: str | None = Field(
@@ -506,8 +502,8 @@ class EventSubscription:
         drops that **no backpressure policy governs**. Queue pressure is a separate axis
         and does not line up with that one — `close_sentinel_eviction` is recorded only
         inside `except asyncio.QueueFull` and so cannot fire *without* a full queue,
-        while the other two fire regardless of how full the queue is (§6.6 of
-        `docs/event-driven-agent-core.md`).
+        while the other two fire regardless of how full the queue is (see the
+        event-driven agent core design).
 
         Events counted by `unmatched_delivery_count` are deliberately **not** counted
         here: such an event is mis-filed rather than dropped, and on most policies it is
@@ -1033,8 +1029,8 @@ class EventBus:
         subscription from the bus before recording anything, so the two close-path
         reasons — `subscription_closed` and `close_sentinel_eviction` — are counted on
         the subscription and can never appear here. They are not lost: each writes a
-        `logger.warning`, and the subscription object still carries them. §6.6 of
-        `docs/event-driven-agent-core.md` says which surface to read for which reason.
+        `logger.warning`, and the subscription object still carries them. The event-driven
+        agent core design says which surface to read for which reason.
         """
         sub_drops = sum(sub.dropped_event_count for sub in self._subscribers)
         return self._dropped_event_count + sub_drops

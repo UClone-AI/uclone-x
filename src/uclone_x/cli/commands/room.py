@@ -17,7 +17,7 @@ from __future__ import annotations
 import asyncio
 import os
 from pathlib import Path
-from typing import Annotated
+from typing import TYPE_CHECKING, Annotated
 
 import typer
 from pydantic import ValidationError
@@ -26,8 +26,13 @@ from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 
+# The remedies live apart from `run`, so printing one does not import the turn runner:
+# `ucx --help` does not import `run` (test_distribution_install), nor does `ucx room show`.
+from uclone_x.cli.remedies import PROVIDER_FAILURE_REMEDIES, provider_key_remedy
+from uclone_x.core.agent_home import seat_id_for
 from uclone_x.core.provenance import Provenance, ServiceRef
-from uclone_x.errors import RoomError, UCloneXError
+from uclone_x.errors import ProviderFailureKind, RoomError, UCloneXError
+from uclone_x.memory.extractor import KnowledgeExtractor
 from uclone_x.room.models import (
     ParticipantKind,
     RoomMessage,
@@ -42,6 +47,9 @@ from uclone_x.room.resolver import RoomAgentResolver
 from uclone_x.room.selectors import build_selector_chain
 from uclone_x.room.service import RoomService
 from uclone_x.room.store import RoomStore
+
+if TYPE_CHECKING:
+    from uclone_x.agent.models import ProviderFailure
 
 console = Console()
 
@@ -59,7 +67,9 @@ def build_service() -> RoomService:
     construction, so a captured instance would pin whatever the environment said at import
     time and ignore a later change.
     """
-    return RoomService(RoomStore())
+    from uclone_x.agent.session import SessionStore
+
+    return RoomService(RoomStore(), sessions=SessionStore())
 
 
 def build_orchestrator(
@@ -68,6 +78,7 @@ def build_orchestrator(
     policy: RoomPolicy,
     provider: str | None = None,
     model: str | None = None,
+    extractor: KnowledgeExtractor | None = None,
 ) -> RoomOrchestratorProtocol:
     """Assemble the orchestrator that `say` drives.
 
@@ -114,6 +125,7 @@ def build_orchestrator(
         store=store,
         selectors=build_selector_chain(policy, provider=llm),
         resolver=resolver,
+        extractor=KnowledgeExtractor() if extractor is None else extractor,
         sessions=sessions,
     )
 
@@ -213,7 +225,10 @@ def room_create(
             f"it fails on the first unaddressed message."
         )
 
-    policy = _policy(max_turns, responder or "")
+    # `--agent` names clones by handle; a seat is keyed by the clone's id (clone-data-scopes
+    # §4 step 3). A name no clone carries is seated as it is.
+    seat_of = {name: seat_id_for(name) for name in agents}
+    policy = _policy(max_turns, seat_of[responder] if responder else "")
     try:
         state = service.create(title, room_id=room_id, policy=policy)
     except UCloneXError as exc:
@@ -227,13 +242,12 @@ def room_create(
             raw_persona = personas.get(agent_id, "")
             state = service.add_participant(
                 state.room_id,
-                agent_id,
+                seat_of[agent_id],
                 kind=ParticipantKind.AGENT,
                 persona_summary=raw_persona,
                 aliases=tuple(aliases.get(agent_id, "").split(","))
                 if aliases.get(agent_id)
                 else (),
-                persona=raw_persona,
             )
     except UCloneXError as exc:
         # One command, one outcome. A seat the Core refuses — a second human, a roster
@@ -302,6 +316,7 @@ def room_responder(
         return
     else:
         seated = {p.id for p in state.participants if p.kind is ParticipantKind.AGENT}
+        agent_id = seat_id_for(agent_id)
         if agent_id not in seated:
             _fail(
                 f"{agent_id!r} is not a seated agent of this room ({', '.join(sorted(seated)) or 'none'}). "
@@ -436,18 +451,56 @@ _REFUSAL_REASONS: dict[RoomTurnRefusal, str] = {
 }
 
 
+#: What stopped a turn at the model's provider, by kind (the app's `outcome.providerCause`),
+#: each naming the provider; built from the failure's fields, never its English `message`
+#: (#2167).
+_PROVIDER_CAUSES: dict[ProviderFailureKind, str] = {
+    ProviderFailureKind.MODEL_UNAVAILABLE: "{provider} doesn't offer the model this turn asked for.",
+    ProviderFailureKind.PROVIDER_AUTH: "{provider} didn't accept the API key.",
+    ProviderFailureKind.PROVIDER_QUOTA: (
+        "The usage limit for this key at {provider} has been reached."
+    ),
+    ProviderFailureKind.PROVIDER_UNREACHABLE: "{provider} couldn't be reached.",
+    ProviderFailureKind.PROVIDER_OUTAGE: "{provider} is having trouble right now.",
+    ProviderFailureKind.PROVIDER_ERROR: "{provider} answered with an error.",
+}
+
+
+def _provider_failure_sentence(label: str, failure: ProviderFailure) -> str:
+    """The app's `providerFailureSentence`: an own-model failure names the model, and its
+    connection stands in for the provider when the Core names none."""
+    ref = failure.model_ref or ""
+    connection, slash, model = ref.partition("/")
+    own = failure.action == "use_system_default" and bool(slash) and bool(connection)
+    provider = (failure.provider or "").strip() or (connection if own else "")
+    template = _PROVIDER_CAUSES.get(failure.kind, "{provider} answered with an error.")
+    cause = template.replace("{provider}", provider or "The model's provider")
+    if own:
+        return (
+            f"{label} couldn't finish this turn: it is set to use its own model, {model}, "
+            f"and that model couldn't be used. {cause}"
+        )
+    return f"{label} couldn't finish this turn. {cause}"
+
+
 def turn_failure_sentence(message: RoomMessage) -> str:
     """What a failed row says, as the app says it (`turnFailureSentence`, #1885).
 
     Built from the row's structured fields and never from `error`: that is the raw cause
     -- an exception's text, with the paths and class names in it -- kept for the log's
-    reader, and it was printed here as it was. The provider's own message is the Core's
-    plain sentence for the person, which the app shows too. English, as the app's source
+    reader, and it was printed here as it was. A provider failure is told from its fields
+    (`_provider_failure_sentence`), as the app tells it (#2167). English, as the app's source
     copy is (author's choice): the terminal has no language setting yet.
     """
     label = message.sender_id
     if message.provider_failure is not None:
-        return f"{label} couldn't finish this turn. {message.provider_failure.message}"
+        return _provider_failure_sentence(label, message.provider_failure)
+    if message.persona_edit_dropped:
+        return (
+            f"{label} couldn't apply the changes saved to it, so it didn't answer. "
+            "It kept its previous settings in this conversation. "
+            "To use the changes here, save the clone again, then send your message again."
+        )
     if message.refusal is not None:
         reason = _REFUSAL_REASONS.get(message.refusal, "the app refused to run it")
         return f"{label} couldn't finish this turn: {reason}."
@@ -544,6 +597,8 @@ def room_add(
     ] = None,
 ) -> None:
     """Seat a participant, and record the join in the transcript."""
+    if not human:
+        participant_id = seat_id_for(participant_id)  # a handle seats its clone's id
     try:
         state = build_service().add_participant(
             room_id,
@@ -552,7 +607,6 @@ def room_add(
             display_name=display_name,
             persona_summary=persona,
             aliases=tuple(alias or ()),
-            persona=persona,
         )
     except UCloneXError as exc:
         _fail(str(exc))
@@ -572,7 +626,7 @@ def room_remove(
 ) -> None:
     """Unseat a participant, and record the departure in the transcript."""
     try:
-        state = build_service().remove_participant(room_id, participant_id)
+        state = build_service().remove_participant(room_id, seat_id_for(participant_id))
     except UCloneXError as exc:
         _fail(str(exc))
         return
@@ -707,9 +761,6 @@ def _offer_retry(state: RoomState) -> None:
     by retrying at all, so nothing is. A rejected API key is not cured by retrying either,
     but a new key is, so that is named, with the variable it is read from (#1630).
     """
-    # Deferred like `_compose`'s: `ucx --help` does not import `run` (test_distribution_install).
-    from uclone_x.cli.commands.run import PROVIDER_FAILURE_REMEDIES, provider_key_remedy
-
     last = state.last_utterance
     if last is None or last.error is None:
         return

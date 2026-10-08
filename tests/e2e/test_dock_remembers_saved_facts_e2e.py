@@ -24,6 +24,7 @@ It also fails against the bundle this change replaced, which had no `known-fact`
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Iterator
 from pathlib import Path
@@ -32,7 +33,11 @@ from typing import Any
 import pytest
 from playwright.async_api import ViewportSize, async_playwright
 
-from tests.e2e.conftest import dock_locator, running_ui
+from tests.e2e.conftest import (
+    _E2EMockLLMConnector,  # pyright: ignore[reportPrivateUsage]
+    dock_locator,
+    running_ui,
+)
 from uclone_x.llm.connectors.mock import MockLLMConnector
 from uclone_x.llm.models import ToolCallRequest
 
@@ -125,7 +130,8 @@ async def test_a_fact_saved_in_the_conversation_is_listed_on_remembers(
             await fact.first.locator("[data-testid='fact-actions']").click()
             await fact.first.locator("[data-testid='fact-forget']").click()
             confirm = await fact.first.locator("[data-testid='fact-forget-confirm']").inner_text()
-            assert confirm == "clone will stop using this. Forget it?"
+            # The clone by its display name, as the listing gives it.
+            assert confirm == "Clone will stop using this. Forget it?"
             await fact.first.locator("[data-testid='fact-forget-yes']").click()
             reason = dock.locator("[data-testid='remembers-reason']")
             await reason.get_by_text("No facts are listed for clone.").wait_for(timeout=10000)
@@ -141,3 +147,92 @@ async def test_a_fact_saved_in_the_conversation_is_listed_on_remembers(
             assert (await answer.json())["facts"] == []
         finally:
             await browser.close()
+
+
+@pytest.mark.asyncio
+async def test_tell_a_fact_see_will_remember_forget_from_row_and_see_gone_from_remembers(
+    tmp_path: Path,
+) -> None:
+    extraction_json = json.dumps(
+        [
+            {
+                "subject": "Kenny",
+                "relation": "favourite_colour",
+                "value": "teal",
+                "source": "person",
+                "durable": True,
+                "confidence": 0.8,
+                "why": "stated by user",
+            }
+        ]
+    )
+    llm = _E2EMockLLMConnector(
+        default_model="mock-gpt-4o",
+        responses=["Noted: teal."],
+    )
+    llm._learner = MockLLMConnector(  # pyright: ignore[reportPrivateUsage]
+        default_model="mock-gpt-4o",
+        responses=[extraction_json],
+    )
+    with running_ui(storage_dir=tmp_path, llm=llm) as server_url:
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page(viewport=VIEWPORT)
+                response = await page.request.post(
+                    f"{server_url}/api/rooms",
+                    data={"title": "Memory Extraction", "agent_ids": ["clone"]},
+                )
+                assert response.ok, await response.text()
+                room_id = str((await response.json())["room_id"])
+
+                await page.goto(server_url, wait_until="commit")
+                await page.click(f"[data-testid='conversation-{room_id}']", timeout=15000)
+                await page.wait_for_selector("[data-testid='room-conversation']", timeout=15000)
+                await page.fill("[data-testid='room-composer']", "My favourite colour is teal")
+                await page.click("[data-testid='send-message']")
+                await (
+                    page.locator("[data-testid='row-4']")
+                    .get_by_text("Noted: teal.")
+                    .wait_for(timeout=20000)
+                )
+
+                # Verify turn row shows "will remember"
+                learning_line = page.locator("[data-testid='row-knowledge-learned-4']")
+                await learning_line.get_by_text("will remember 1 thing from this turn.").wait_for(
+                    timeout=15000
+                )
+
+                # Verify Remembers tab lists the fact
+                dock = await dock_locator(page)
+                if not await dock.is_visible():
+                    await page.click("[data-testid='toggle-dock']")
+                await dock.wait_for(state="visible", timeout=10000)
+                await dock.locator("[data-testid='tab-remembers']").click()
+                fact = dock.locator("[data-testid='known-fact']")
+                await fact.first.wait_for(timeout=15000)
+                assert await fact.count() == 1
+                assert "Kenny favourite colour teal" in await fact.first.inner_text()
+
+                # Click Forget on the turn row
+                forget_button = page.locator("[data-testid='row-knowledge-forget-4']")
+                await forget_button.click()
+
+                # Turn row says "forgot 1 thing"
+                await learning_line.get_by_text("forgot 1 thing from this turn.").wait_for(
+                    timeout=10000
+                )
+                assert await forget_button.count() == 0
+
+                # Fact is gone from Remembers
+                reason = dock.locator("[data-testid='remembers-reason']")
+                await reason.get_by_text("No facts are listed for clone.").wait_for(timeout=10000)
+                assert await fact.count() == 0
+
+                # Memory file verifies fact is retracted
+                answer = await page.request.get(
+                    f"{server_url}/api/rooms/{room_id}/knowledge?agent_id=clone"
+                )
+                assert (await answer.json())["facts"] == []
+            finally:
+                await browser.close()

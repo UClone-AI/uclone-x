@@ -1,5 +1,5 @@
 import { createContext, useContext } from 'react';
-import type { RoomState } from '../types';
+import { cloneIdOf } from './cloneLabel';
 import { personaAvatarUrl } from './personaAvatar';
 
 /**
@@ -13,6 +13,7 @@ import { personaAvatarUrl } from './personaAvatar';
 
 /** A clone a picture can be given to, as the chooser lists it. */
 export interface AvatarTarget {
+  /** The clone's id, which a seat and every picture request name it by. */
   name: string;
   label: string;
 }
@@ -49,27 +50,16 @@ export const useAvatarChoice = () => useContext(AvatarChoiceContext);
 export const AvatarAuthorContext = createContext<string | null>(null);
 export const useAvatarAuthor = () => useContext(AvatarAuthorContext);
 
-/**
- * The clone behind a seat: its persona, not the seat's id.
- *
- * A room seat's id is the participant's, which is the persona's name for the seat a
- * conversation opens with and something else for a second seat of the same clone.
- */
-export const personaOfSeat = (room: RoomState, participantId: string): string => {
-  const seat = room.participants.find((p) => p.id === participantId);
-  return seat?.persona || participantId;
-};
-
-/** Each clone's latest picture change id, by name. */
+/** Each clone's latest picture change id, by clone id. */
 export type AvatarChangeIds = Readonly<Record<string, number>>;
 
 /** The `avatar_change_id` of every listed persona that carries one. */
 export const avatarChangeIdsOf = (
-  personas: readonly { name: string; avatar_change_id?: number }[] | undefined,
+  personas: readonly { id?: string; name: string; avatar_change_id?: number }[] | undefined,
 ): AvatarChangeIds => {
   const ids: Record<string, number> = {};
   for (const persona of personas ?? []) {
-    if (typeof persona.avatar_change_id === 'number') ids[persona.name] = persona.avatar_change_id;
+    if (typeof persona.avatar_change_id === 'number') ids[cloneIdOf(persona)] = persona.avatar_change_id;
   }
   return ids;
 };
@@ -92,7 +82,7 @@ export const undoStillOffered = (
   return known === undefined || known <= changeId;
 };
 
-/** Each clone's `avatar_url`, by name: `null` for a clone with no picture. */
+/** Each clone's `avatar_url`, by clone id -- a seat's id: `null` for a clone with no picture. */
 export type AvatarUrls = Readonly<Record<string, string | null>>;
 
 /**
@@ -100,11 +90,11 @@ export type AvatarUrls = Readonly<Record<string, string | null>>;
  * it lists nothing here, so every clone falls back to the fixed address.
  */
 export const avatarUrlsOf = (
-  personas: readonly { name: string; avatar_url?: string | null }[] | undefined,
+  personas: readonly { id?: string; name: string; avatar_url?: string | null }[] | undefined,
 ): AvatarUrls => {
   const urls: Record<string, string | null> = {};
   for (const persona of personas ?? []) {
-    if (persona.avatar_url !== undefined) urls[persona.name] = persona.avatar_url;
+    if (persona.avatar_url !== undefined) urls[cloneIdOf(persona)] = persona.avatar_url;
   }
   return urls;
 };

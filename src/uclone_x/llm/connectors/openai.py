@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import os
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from typing import Any, ClassVar, cast
 
 import httpx
@@ -24,12 +24,15 @@ from uclone_x.llm.connectors.base import (
     reported_count,
     resolve_model,
     resolve_token_counts,
+    tool_images_caption,
 )
 from uclone_x.llm.connectors.base import named_model as _named
 from uclone_x.llm.connectors.failures import failed_request, failed_status, unusable_response
 from uclone_x.llm.connectors.listing import from_unix, get_listing_page, listed_items, optional_str
 from uclone_x.llm.models import (
+    IMAGE_UNAVAILABLE_NOTE,
     FinishReason,
+    ImagePart,
     LLMRequest,
     MessageRole,
     ModelResponse,
@@ -66,6 +69,22 @@ def cached_prompt_tokens(usage: dict[str, Any] | None) -> int | None:
     if not isinstance(details, dict):
         return None
     return reported_count(cast("dict[str, Any]", details), "cached_tokens")
+
+
+def _image_parts(images: Sequence[ImagePart]) -> list[dict[str, Any]]:
+    """`images` as chat-completions content parts, each a `data:` URL (#2107).
+
+    An image whose bytes this process does not hold goes as a text part holding
+    `IMAGE_UNAVAILABLE_NOTE`, so the model is told one was there rather than sent nothing.
+    """
+    parts: list[dict[str, Any]] = []
+    for image in images:
+        if image.data is None:
+            parts.append({"type": "text", "text": IMAGE_UNAVAILABLE_NOTE})
+        else:
+            url = f"data:{image.media_type};base64,{image.data}"
+            parts.append({"type": "image_url", "image_url": {"url": url}})
+    return parts
 
 
 def named_model(request: LLMRequest) -> str | None:
@@ -169,7 +188,8 @@ class OpenAIConnector(BaseLLMConnector):
         """The models this key can use, from `GET /models` (#1631).
 
         OpenAI's listing reports an id, an owner and a publish time, and no context window;
-        whether a model can chat is read from its id (`_NOT_CHAT_FRAGMENTS`).
+        whether a model can chat is read from its id (`_NOT_CHAT_FRAGMENTS`). It does not
+        say whether a model reads images, so `accepts_images` stays `False` (#2107).
         """
         page = await get_listing_page(
             self,
@@ -265,6 +285,13 @@ class OpenAIConnector(BaseLLMConnector):
         `anthropic.py`: it is the key OpenAI correlates the result to the call by, and
         silently dropping it sent a `tool` message with no association at all.
 
+        **Images (#2107).** A `user` message with images sends a content-part list: its
+        text, then one `image_url` part per image. A `tool` message cannot carry image
+        parts, so it is sent as text as before, and after each run of consecutive `tool`
+        messages one `user` message carries their images, each tool's preceded by a line
+        naming the call they came from (`tool_images_caption`). It follows the whole run
+        because the tool messages answering one assistant turn must stay together.
+
         Raises:
             UnmappableChatMessageError: a message has no faithful OpenAI
                 representation. The offending value is named in the message.
@@ -272,11 +299,19 @@ class OpenAIConnector(BaseLLMConnector):
         refuse_response_schema(request, self.provider_name)
         model = self._resolve_request_model(request)
         messages_payload: list[dict[str, Any]] = []
+        # Image parts of the current run of tool messages, sent after the run (#2107).
+        tool_images: list[dict[str, Any]] = []
 
         for msg in request.messages:
+            if msg.role != MessageRole.TOOL and tool_images:
+                messages_payload.append({"role": "user", "content": tool_images})
+                tool_images = []
             m_dict: dict[str, Any] = {"role": msg.role.value}
             if msg.content is not None:
                 m_dict["content"] = msg.content
+            if msg.images and msg.role != MessageRole.TOOL:
+                text = [{"type": "text", "text": msg.content}] if msg.content is not None else []
+                m_dict["content"] = [*text, *_image_parts(msg.images)]
             if msg.name is not None:
                 m_dict["name"] = msg.name
             if msg.role == MessageRole.TOOL:
@@ -302,6 +337,9 @@ class OpenAIConnector(BaseLLMConnector):
                     )
                 m_dict["tool_call_id"] = msg.tool_call_id
                 m_dict["content"] = msg.content
+                if msg.images:
+                    tool_images.append({"type": "text", "text": tool_images_caption(msg)})
+                    tool_images.extend(_image_parts(msg.images))
             if msg.tool_calls:
                 m_dict["tool_calls"] = [
                     {
@@ -315,6 +353,8 @@ class OpenAIConnector(BaseLLMConnector):
                     for tc in msg.tool_calls
                 ]
             messages_payload.append(m_dict)
+        if tool_images:
+            messages_payload.append({"role": "user", "content": tool_images})
 
         payload: dict[str, Any] = {
             "model": model,

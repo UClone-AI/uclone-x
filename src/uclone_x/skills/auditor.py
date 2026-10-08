@@ -1120,7 +1120,7 @@ class FileSystemSkillStore:
         for child in sorted(target_dir.iterdir()):
             # `.pending/` holds clones' proposals, which load only once a person approves
             # them into `<name>/` (#1827); no dot-named folder is a package.
-            if not child.is_dir() or child.name.startswith("."):
+            if child.name.startswith(".") or not child.is_dir():
                 continue
             try:
                 is_package = _is_file(child / "SKILL.md")
@@ -1223,7 +1223,7 @@ class InMemorySkillStore:
 #: The runtime skill store's directory, under the repository root (PRD FR-5.1).
 #: `ucx-agent-skills`, not `skills`: the store belongs to the Runtime Layer (`ucx agent`),
 #: and under the shorter name it twice collected Builder workflow prose instead -- which
-#: surfaced as an unaudited `pending` package. Builder skills live in `swarm/skills/`.
+#: surfaced as an unaudited `pending` package. Builder skills live in `.claude/skills/`.
 #: See `ucx-agent-skills/README.md`.
 RUNTIME_SKILL_STORE_DIRNAME: Final[str] = "ucx-agent-skills"
 

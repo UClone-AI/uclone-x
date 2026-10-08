@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import os
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from typing import Any, cast
 
 import httpx
@@ -35,7 +35,9 @@ from uclone_x.llm.connectors.listing import (
     optional_str,
 )
 from uclone_x.llm.models import (
+    IMAGE_UNAVAILABLE_NOTE,
     FinishReason,
+    ImagePart,
     LLMRequest,
     MessageRole,
     ModelResponse,
@@ -61,6 +63,26 @@ def _cache_counts(usage: dict[str, Any] | None) -> tuple[int | None, int | None]
     )
 
 
+def _with_images(text: str, images: Sequence[ImagePart]) -> list[dict[str, Any]]:
+    """`text` and `images` as Anthropic content blocks, the text first (#2107).
+
+    A blank text block is left out, because Anthropic refuses a text block with no
+    non-whitespace text, and the images still carry the message. An image whose bytes this
+    process does not hold goes as `IMAGE_UNAVAILABLE_NOTE`, so the model is told one was
+    there rather than being sent nothing.
+    """
+    blocks: list[dict[str, Any]] = []
+    if text.strip():
+        blocks.append({"type": "text", "text": text})
+    for image in images:
+        if image.data is None:
+            blocks.append({"type": "text", "text": IMAGE_UNAVAILABLE_NOTE})
+        else:
+            source = {"type": "base64", "media_type": image.media_type, "data": image.data}
+            blocks.append({"type": "image", "source": source})
+    return blocks
+
+
 def _prompt_tokens(
     uncached: int | None, cache_creation: int | None, cache_read: int | None
 ) -> int | None:
@@ -73,6 +95,17 @@ def _prompt_tokens(
     if uncached is None:
         return None
     return uncached + sum(c for c in (cache_creation, cache_read) if c is not None)
+
+
+def _reads_images(item: dict[str, Any]) -> bool:
+    """Whether a listed model's `capabilities.image_input.supported` is exactly `true`."""
+    capabilities: object = item.get("capabilities")
+    if not isinstance(capabilities, dict):
+        return False
+    image_input: object = cast(dict[str, Any], capabilities).get("image_input")
+    if not isinstance(image_input, dict):
+        return False
+    return cast(dict[str, Any], image_input).get("supported") is True
 
 
 ANTHROPIC_REQUIRED_MAX_TOKENS_DEFAULT = 4096
@@ -145,7 +178,9 @@ class AnthropicConnector(BaseLLMConnector):
         """The models this key can use, from Anthropic's `GET /v1/models` (#1631).
 
         Every model Anthropic lists can chat. Newer listings report `max_input_tokens` and
-        `max_tokens`; where they are absent the window is left unknown.
+        `max_tokens`; where they are absent the window is left unknown. A model reads
+        images only when its `capabilities.image_input.supported` is `true` (#2107); a
+        listing without capabilities leaves it `False`.
         """
         entries: list[CatalogEntry] = []
         params: dict[str, str] = {"limit": "1000"}
@@ -168,6 +203,7 @@ class AnthropicConnector(BaseLLMConnector):
                         context_window=optional_int(item.get("max_input_tokens")),
                         max_output_tokens=optional_int(item.get("max_tokens")),
                         created_at=from_iso(item.get("created_at")),
+                        accepts_images=_reads_images(item),
                     )
                 )
             last_id = optional_str(page.get("last_id"))
@@ -246,6 +282,9 @@ class AnthropicConnector(BaseLLMConnector):
         model = self._requested_model(request)
         system_prompts: list[str] = []
         messages_payload: list[dict[str, Any]] = []
+        # Indices of messages built from a `USER` message. One carrying images is a block
+        # list too, and it is still never marked (#2107).
+        user_turns: set[int] = set()
 
         for msg in request.messages:
             if msg.role == MessageRole.SYSTEM:
@@ -288,7 +327,13 @@ class AnthropicConnector(BaseLLMConnector):
                             {
                                 "type": "tool_result",
                                 "tool_use_id": msg.tool_call_id,
-                                "content": msg.content,
+                                # A tool result's images go inside it, as blocks beside its
+                                # text (#2107); without images the content stays a string.
+                                "content": (
+                                    _with_images(msg.content, images=msg.images)
+                                    if msg.images
+                                    else msg.content
+                                ),
                             }
                         ],
                     }
@@ -325,7 +370,15 @@ class AnthropicConnector(BaseLLMConnector):
                         "and an empty turn are different inputs to the model and would "
                         "arrive as the same bytes (P6, #385)."
                     )
-                messages_payload.append({"role": "user", "content": msg.content})
+                user_turns.add(len(messages_payload))
+                messages_payload.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            _with_images(msg.content, msg.images) if msg.images else msg.content
+                        ),
+                    }
+                )
 
         payload: dict[str, Any] = {
             "model": model,
@@ -362,8 +415,10 @@ class AnthropicConnector(BaseLLMConnector):
 
         # Where the stable conversation prefix ends: the last message the model or a tool
         # wrote. Those carry block lists; a `USER` message, where turn context goes, is a
-        # plain string, so everything after the mark is user text.
+        # plain string, so everything after the mark is user text. A `USER` message with
+        # images is a block list as well, and is taken out by index (#2107).
         stable = [i for i, m in enumerate(messages_payload) if isinstance(m["content"], list)]
+        stable = [i for i in stable if i not in user_turns]
         if stable:
             # The last block of that message: tool_use or tool_result blocks are never
             # empty, and an assistant text block is only last when it has no tool calls.

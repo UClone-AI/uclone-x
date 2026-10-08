@@ -42,7 +42,10 @@ type AvatarStyle = (typeof STYLES)[number];
  * picture beside, it is the plain picture it was.
  */
 export const AvatarMenu: React.FC<{
+  /** The clone's id: what every request names. */
   name: string;
+  /** What a person reads as its name; absent means `name`. */
+  label?: string;
   imageSrc: string | undefined;
   /** Whether the clone has an installed definition, which is where a picture is kept. */
   installed: boolean;
@@ -51,7 +54,8 @@ export const AvatarMenu: React.FC<{
    * nothing to reset.
    */
   hasChosenPicture: boolean;
-}> = ({ name, imageSrc, installed, hasChosenPicture }) => {
+}> = ({ name, label, imageSrc, installed, hasChosenPicture }) => {
+  const shown = label ?? name;
   const choice = useAvatarChoice();
   const copy = useCopy().avatar;
   const menu = usePopover<HTMLDivElement>();
@@ -62,14 +66,14 @@ export const AvatarMenu: React.FC<{
 
   const picture = (onClick?: () => void) => (
     <Avatar
-      label={name}
+      label={shown}
       kind="agent"
       agentIcon={Bot}
       size="lg"
       imageSrc={imageSrc}
       data-testid="clone-profile-avatar"
       onClick={onClick}
-      interactiveLabel={onClick ? fmt(copy.menu.open, { name }) : undefined}
+      interactiveLabel={onClick ? fmt(copy.menu.open, { name: shown }) : undefined}
     />
   );
 
@@ -131,7 +135,7 @@ export const AvatarMenu: React.FC<{
         {menu.open && (
           <div
             role="menu"
-            aria-label={fmt(copy.menu.open, { name })}
+            aria-label={fmt(copy.menu.open, { name: shown })}
             data-testid="clone-avatar-menu-list"
             className="absolute left-1/2 top-full z-20 mt-1 w-56 -translate-x-1/2 rounded-lg border border-slate-700 bg-slate-900 py-1 shadow-lg"
           >
@@ -184,7 +188,7 @@ export const AvatarMenu: React.FC<{
               }}
             >
               <Sparkles className="h-3.5 w-3.5 text-slate-400" />
-              {fmt(copy.menu.ask, { name })}
+              {fmt(copy.menu.ask, { name: shown })}
             </button>
             <button
               type="button"
@@ -218,7 +222,7 @@ export const AvatarMenu: React.FC<{
       )}
       {!working && (outcome?.kind === 'uploaded' || outcome?.kind === 'reset') && (
         <p role="status" data-testid="clone-avatar-done" className="text-[11px] text-slate-400">
-          {fmt(outcome.kind === 'uploaded' ? copy.menu.uploaded : copy.menu.resetDone, { name })}{' '}
+          {fmt(outcome.kind === 'uploaded' ? copy.menu.uploaded : copy.menu.resetDone, { name: shown })}{' '}
           {undoStillOffered(outcome.changeId, name, choice.latestChanges) && (
             <button
               type="button"
@@ -233,12 +237,12 @@ export const AvatarMenu: React.FC<{
       )}
       {!working && outcome?.kind === 'undone' && (
         <p role="status" data-testid="clone-avatar-undone" className="text-[11px] text-slate-400">
-          {fmt(copy.card.undone, { name })}
+          {fmt(copy.card.undone, { name: shown })}
         </p>
       )}
       {!working && outcome?.kind === 'failed' && (
         <p role="alert" data-testid="clone-avatar-failed" className="text-[11px] text-rose-300">
-          {fmt(copy.failure[outcome.failure], { name })}
+          {fmt(copy.failure[outcome.failure], { name: shown })}
         </p>
       )}
       {!working && outcome?.kind === 'badFile' && (

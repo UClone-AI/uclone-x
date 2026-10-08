@@ -315,7 +315,6 @@ async def test_a_room_seat_gets_its_persona_s_derived_prompt(tmp_path: Path) -> 
         id="scout",
         kind=ParticipantKind.AGENT,
         display_name="Scout",
-        persona="scout",
         session_id="sess_room__r1__scout",
     )
 

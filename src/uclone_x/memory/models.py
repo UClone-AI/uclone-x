@@ -12,6 +12,8 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from uclone_x.core.provenance import Provenance
 from uclone_x.errors import MissingProvenanceError
+from uclone_x.knowledge.fold import fold
+from uclone_x.knowledge.policy import PERSON_ENTITY, PROJECT_ENTITY, SELF_ENTITY
 
 #: How a fact came to be known (clone-knowledge-graph design §3.2). `told`: extracted from
 #: what a person wrote. `found`: extracted from a tool result the clone received, or from
@@ -22,14 +24,42 @@ FactOrigin = Literal["told", "found", "saved", "corrected"]
 
 #: The one subject every fact about the person (the human owner) is filed under
 #: (clone-knowledge-graph design §3.3 step 5); recall always includes these (§3.5).
-PERSON_SUBJECT = "user"
+PERSON_SUBJECT = PERSON_ENTITY
 #: The subject for durable working preferences of this workspace, such as the reply
 #: language or a code style. Recall always includes a few of these, after the person's
 #: (clone-knowledge-graph design §3.5); the extractor and `record_memory_fact` name it.
-PROJECT_SUBJECT = "project"
+PROJECT_SUBJECT = PROJECT_ENTITY
 #: Words a model may use for the person. With the person's own names, all are filed under
 #: `PERSON_SUBJECT`, by the extractor and by `record_memory_fact` alike.
 PERSON_WORDS = frozenset({"user", "the user", "person", "the person", "human", "me", "i", "owner"})
+#: The subject every fact about the clone itself is filed under: its looks, age,
+#: personality, speech style, name (#2016). Recall always includes these, first, and says
+#: they override the persona description where the two disagree.
+SELF_SUBJECT = SELF_ENTITY
+#: Words a model may use for the clone itself. With the clone's own names, all are filed
+#: under `SELF_SUBJECT`. Second person means the clone because both write paths address
+#: the clone as "you": the extractor labels the clone's lines "(you)" and names the person
+#: "user", and `record_memory_fact` is called by the clone. "me" and "i" stay the person's
+#: (`PERSON_WORDS`): in the extractor they are a person line's own first person.
+SELF_WORDS = frozenset(
+    {
+        "self",
+        "itself",
+        "you",
+        "yourself",
+        "clone",
+        "the clone",
+        "assistant",
+        "the assistant",
+        "너",
+        "넌",
+        "너는",
+        "네가",
+        "니가",
+        "당신",
+        "당신은",
+    }
+)
 
 
 def fold_name(name: str) -> str:
@@ -38,7 +68,7 @@ def fold_name(name: str) -> str:
     NFC first, so a name stored decomposed ("José" as `e` and a combining accent) matches
     the composed form a model writes, and the reverse.
     """
-    return " ".join(unicodedata.normalize("NFC", name).split()).casefold()
+    return fold(name)
 
 
 def person_subject(subject: str, person_names: Iterable[str] = ()) -> str:
@@ -52,6 +82,24 @@ def person_subject(subject: str, person_names: Iterable[str] = ()) -> str:
     if fold_name(collapsed) in PERSON_WORDS | names:
         return PERSON_SUBJECT
     return collapsed
+
+
+def fact_subject(
+    subject: str, person_names: Iterable[str] = (), clone_names: Iterable[str] = ()
+) -> str:
+    """`subject` as a fact is filed: `user` for the person, `self` for the clone, else as given.
+
+    The person is checked first (`person_subject`), so a name that means both, which the
+    room already leaves out of the person's names when another participant goes by it,
+    never turns a fact about the person into one about the clone. Otherwise the subject is
+    `SELF_SUBJECT` when, folded (`fold_name`), it is one of `SELF_WORDS` or one of
+    `clone_names` (the clone's id, display name and aliases).
+    """
+    filed = person_subject(subject, person_names)
+    names = {fold_name(name) for name in clone_names if name.strip()}
+    if fold_name(filed) in SELF_WORDS | names:
+        return SELF_SUBJECT
+    return filed
 
 
 def utc_now_iso() -> str:
@@ -138,6 +186,13 @@ class MemoryFact(BaseModel):
         default=None,
         description="ID of a prior fact this fact contradicts or supersedes.",
     )
+    valid_until: str | None = Field(
+        default=None,
+        description="UTC ISO 8601 time the fact stopped holding, when the person said so "
+        '("until last year"). `None` for a fact with no stated end. A fact with an end is '
+        "history: it is listed and shown with its end, is not worked out from, and neither "
+        "supersedes nor is superseded by another fact on the same subject and predicate.",
+    )
     tags: tuple[str, ...] = Field(
         default_factory=tuple,
         description="Categorization and scoping tags for selective retrieval.",
@@ -166,6 +221,8 @@ class MemoryFact(BaseModel):
         """
         if self.retracted or other.retracted:
             return False
+        if self.valid_until is not None or other.valid_until is not None:
+            return False  # a stated end makes it history, which a current value does not replace
         if self.fact_id == other.fact_id:
             return False
 
@@ -177,7 +234,8 @@ class MemoryFact(BaseModel):
 
     def summary(self) -> str:
         """Format fact as concise readable string for progressive prompt disclosure."""
-        return f"{self.subject}: {self.predicate} -> {self.object_value}"
+        said = f"{self.subject}: {self.predicate} -> {self.object_value}"
+        return said if self.valid_until is None else f"{said} (until {self.valid_until[:10]})"
 
 
 class RetractionRecord(BaseModel):

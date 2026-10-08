@@ -175,6 +175,12 @@ class RoomAgentResolver:
         #: session id -> whether that seat's (deep, fast) model follows Settings, because
         #: its persona named none. Only those move when Settings changes.
         self._follows: dict[str, tuple[bool, bool]] = {}
+        #: session id -> the seat's model config before defaults were filled in, which the
+        #: gateway re-binds when the connections or defaults change (model-gateway §3.3).
+        self._own_llm: dict[str, AgentLLMConfig] = {}
+        #: participant id -> (the name it is shown by, its own deep model ref), for a seat
+        #: whose clone names its own model: a failure of that model names both (§3.6).
+        self._pinned: dict[str, tuple[str, str]] = {}
         #: session id -> the participant id it was issued to. The check that turns the
         #: protocol's isolation obligation into a refusal.
         self._sessions: dict[str, str] = {}
@@ -265,7 +271,6 @@ class RoomAgentResolver:
             self._app,
             clone_id=participant.id,
             session_id=participant.session_id,
-            persona=participant.persona,
             display_name=participant.display_name or participant.id,
             seat_framing=framing,
             a2a_transport=self._a2a_transport,
@@ -281,25 +286,59 @@ class RoomAgentResolver:
 
         self._agents[cache_key] = agent
         self._follows[cache_key] = follows
+        if built.own_llm_config is not None:
+            self._own_llm[cache_key] = built.own_llm_config
+        if built.pinned_ref is not None:
+            self._pinned[participant.id] = (
+                participant.display_name or participant.id,
+                built.pinned_ref,
+            )
+        else:
+            self._pinned.pop(participant.id, None)
         self._sessions[participant.session_id] = participant.id
         return agent
 
-    def replace_llm(self, llm: LLMProviderProtocol | None) -> None:
-        """Answer with `llm` from now on: in every seat already built, and in any built later.
+    def pinned_model(self, participant_id: str) -> tuple[str, str] | None:
+        """``(shown name, own model ref)`` when this seat's clone names its own model."""
+        return self._pinned.get(participant_id)
 
-        The host is held for the resolver's lifetime, so a connector replaced in Settings
-        reached neither half until the room was reopened after a restart (#1446). A seat
-        whose persona names its own model keeps it; a seat that follows Settings takes the
-        Settings model with the connector, since a connector alone would leave it asking
-        for the previous provider's model.
+    def models_changed(self) -> None:
+        """Re-bind every built seat after the connections or default models changed.
+
+        The gateway resolves each seat's own config again (its own ref, else the default
+        now in Settings) and the seat takes the connector and model ids from it at once, so
+        a model chosen in Settings reaches an open conversation (#1446). A seat whose clone
+        names its own model keeps it.
+        """
+        gateway = self._app.gateway
+        if gateway is None:
+            return
+        for cache_key, agent in self._agents.items():
+            own = self._own_llm.get(cache_key)
+            # Every agent cached here came from `compose_agent`; the protocol it is held as
+            # does not declare the reload, and a fake that is not a `BaseAgent` has no
+            # connector to swap.
+            if own is None or not isinstance(agent, BaseAgent):
+                continue
+            seat = gateway.bind(own)
+            # Exactly what the gateway resolved now, `None` included: a cleared default or one
+            # moved to another connection must not leave the old connector or fast id behind.
+            agent.rebind_llm(
+                seat.llm,
+                model_name=seat.llm_config.model_name,
+                fast_model=seat.llm_config.fast_model,
+            )
+
+    def replace_llm(self, llm: LLMProviderProtocol | None) -> None:
+        """Answer with `llm` from now on, for a resolver with no gateway (a test's host).
+
+        A seat whose persona names its own model keeps it; a seat that follows the given
+        global models takes them with the connector.
         """
         self._app = self._app.with_llm(llm)
         global_models = self._app.global_models
         deep, fast = global_models() if global_models is not None else (None, None)
         for cache_key, agent in self._agents.items():
-            # Every agent cached here came from `compose_agent`; the protocol it is held as
-            # does not declare the reload, and a fake that is not a `BaseAgent` has no
-            # connector to swap.
             if isinstance(agent, BaseAgent):
                 deep_follows, fast_follows = self._follows.get(cache_key, (False, False))
                 agent.hot_reload_llm(

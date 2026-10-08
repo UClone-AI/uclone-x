@@ -335,7 +335,7 @@ describe('RoomConversation shape', () => {
     expect(screen.getByTestId('row-3')).toHaveTextContent('Critic');
   });
 
-  // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: ? pictureOf(personaOfSeat(room, message.sender_id), avatarUrls)
+  // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: ? pictureOf(message.sender_id, avatarUrls)
   // Becomes: ? undefined
   it('draws each clone`s own picture beside its name in the transcript', () => {
     // A clone wears one picture everywhere it appears -- the rail, its profile, and here --
@@ -356,11 +356,11 @@ describe('RoomConversation shape', () => {
 
     expect(screen.getByTestId('row-1').querySelector('img')).toHaveAttribute(
       'src',
-      '/api/personas/scout/avatar',
+      '/api/clones/scout/avatar',
     );
     expect(screen.getByTestId('row-2').querySelector('img')).toHaveAttribute(
       'src',
-      '/api/personas/critic/avatar',
+      '/api/clones/critic/avatar',
     );
   });
 
@@ -1207,6 +1207,28 @@ describe('RoomConversation composer', () => {
     expect(screen.queryByTestId('mention-completion')).toBeNull();
   });
 
+  // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: const inserted = `@${mentionToken(participant)} `;
+  // Becomes: const inserted = `@${participant.id} `;
+  it('completes a clone seated by id to its handle, the name a person types (#1815)', () => {
+    renderRoom({
+      room: room({
+        participants: [
+          { id: 'user', kind: 'human', display_name: 'Kenny' },
+          { id: 'agt_1', kind: 'agent', display_name: 'Scout Prime', handle: 'scout' },
+        ],
+      }),
+    });
+
+    fireEvent.change(screen.getByTestId('room-composer'), { target: { value: 'ask @sc' } });
+    const option = screen.getByTestId('mention-option-agt_1');
+    expect(option).toHaveTextContent('@scout');
+    expect(option).toHaveTextContent('Scout Prime');
+    expect(option).not.toHaveTextContent('agt_1');
+    fireEvent.click(option);
+
+    expect(screen.getByTestId('room-composer')).toHaveValue('ask @scout ');
+  });
+
   it('closes the mention menu on Escape without sending or clearing the draft (#1036)', () => {
     renderRoom();
 
@@ -1562,29 +1584,6 @@ describe('RoomConversation stops and failures', () => {
     expect(screen.queryByTestId('row-error-1')).toBeNull();
   });
 
-  // The per-seat knowledge record is retired (clone-knowledge-graph step 6): its two row
-  // notices went with it. A row saved before carries the fields on disk still; the
-  // conversation reads neither, so an old row shows its reply and no knowledge-record line.
-  it('says nothing about the retired knowledge record on a row saved before step 6', () => {
-    renderRoom({
-      room: room({
-        transcript: [
-          {
-            ...message({ seq: 1, sender_id: 'scout', content: 'here it is' }),
-            knowledge_persist_error: 'OSError: disk full',
-            knowledge_set_aside: true,
-          } as ReturnType<typeof message>,
-        ],
-      }),
-    });
-
-    const row = screen.getByTestId('row-body-1');
-    expect(row).toHaveTextContent('here it is');
-    const page = document.body.textContent ?? '';
-    expect(page).not.toMatch(/knowledge record|what it learned in this turn|disk full/);
-    expect(screen.queryByTestId('row-unsaved-1')).toBeNull();
-  });
-
   // The speaker's own saved record of this conversation could not be opened by this version
   // and was kept aside rather than written over: said on the row of the turn that set it
   // aside, and on no other, in plain words with no internals (#1844, P6).
@@ -1616,8 +1615,8 @@ describe('RoomConversation stops and failures', () => {
   // other (#1404); the facts themselves are in Remembers.
   // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: {message.knowledge_learned && message.knowledge_learned.length > 0 ? (
   // Becomes: {false && message.knowledge_learned && message.knowledge_learned.length > 0 ? (
-  // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: {plural(t.row.knowledgeLearned, message.knowledge_learned.length, { label })}
-  // Becomes: {plural(t.row.knowledgeLearned, 1, { label })}
+  // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: : plural(t.row.knowledgeLearned, message.knowledge_learned.length, { label })}
+  // Becomes: : plural(t.row.knowledgeLearned, 1, { label })}
   it('says, under a reply, how many things the clone will remember from it', () => {
     renderRoom({
       room: room({
@@ -1639,6 +1638,92 @@ describe('RoomConversation stops and failures', () => {
     expect(screen.getByTestId('row-knowledge-learned-1')).not.toHaveTextContent(/mem_/);
     expect(screen.queryByTestId('row-knowledge-learned-3')).toBeNull();
     expect(screen.getByTestId('row-body-1')).toHaveTextContent('noted');
+  });
+
+  // Forgetting learned facts from the turn row calls editMemoryFact and updates the row (#1839).
+  // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: ? plural(t.row.knowledgeForgotten, message.knowledge_learned.length, { label })
+  // Becomes: ? plural(t.row.knowledgeLearned, message.knowledge_learned.length, { label })
+  it('forgets facts from the turn row, calling editMemoryFact and updating the row line', async () => {
+    const calls: { url: string; method: string }[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string, init?: RequestInit) => {
+        calls.push({ url, method: init?.method ?? 'GET' });
+        return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      }),
+    );
+    try {
+      renderRoom({
+        room: room({
+          transcript: [
+            message({
+              seq: 1,
+              sender_id: 'scout',
+              content: 'noted',
+              knowledge_learned: ['mem_a', 'mem_b'],
+            }),
+          ],
+        }),
+      });
+
+      const forgetButton = screen.getByTestId('row-knowledge-forget-1');
+      expect(forgetButton).toHaveTextContent('Forget');
+      expect(screen.getByTestId('row-knowledge-learned-1')).toHaveTextContent(
+        /will remember 2 things from this turn\.$/,
+      );
+
+      fireEvent.click(forgetButton);
+
+      await waitFor(() => {
+        expect(screen.getByTestId('row-knowledge-learned-1')).toHaveTextContent(
+          /forgot 2 things from this turn\.$/,
+        );
+      });
+
+      expect(screen.queryByTestId('row-knowledge-forget-1')).toBeNull();
+      expect(calls.filter((c) => c.method === 'DELETE')).toEqual([
+        { url: '/api/agents/scout/memory/mem_a', method: 'DELETE' },
+        { url: '/api/agents/scout/memory/mem_b', method: 'DELETE' },
+      ]);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  // What the image tool added to a picture's request is said under that reply, as tags, and
+  // under no other (#1865). The tool's own sentences are for the model and never shown.
+  // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: {message.image_prompt_added && message.image_prompt_added.length > 0 ? (
+  // Becomes: {false && message.image_prompt_added && message.image_prompt_added.length > 0 ? (
+  // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: {message.image_negative_added && message.image_negative_added.length > 0 ? (
+  // Becomes: {false && message.image_negative_added && message.image_negative_added.length > 0 ? (
+  // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: {fmt(t.row.imagePromptAdded, { label, tags: message.image_prompt_added.join(', ') })}
+  // Becomes: {fmt(t.row.imagePromptAdded, { label, tags: message.image_prompt_added[0] })}
+  it('says, under a picture reply, what was added to the picture request and left out', () => {
+    renderRoom({
+      room: room({
+        transcript: [
+          message({
+            seq: 1,
+            sender_id: 'scout',
+            content: 'Here it is.',
+            image_prompt_added: ['masterpiece', 'newest'],
+            image_negative_added: ['blurry'],
+          }),
+          message({ seq: 2, sender_id: 'scout', content: 'no picture', image_prompt_added: [] }),
+        ],
+      }),
+    });
+
+    const added = screen.getByTestId('row-image-prompt-added-1');
+    expect(added).toHaveTextContent(/added to the picture request: masterpiece, newest\.$/);
+    const left = screen.getByTestId('row-image-negative-added-1');
+    expect(left).toHaveTextContent(/asked the picture to leave out: blurry\.$/);
+    for (const line of [added, left]) {
+      expect(line).not.toHaveTextContent(/prompt_|negative_|quality tags|generate_image|\[|\{/i);
+    }
+    expect(screen.queryByTestId('row-image-prompt-added-2')).toBeNull();
+    expect(screen.queryByTestId('row-image-negative-added-2')).toBeNull();
+    expect(screen.getByTestId('row-body-1')).toHaveTextContent('Here it is.');
   });
 
   // Learning from a turn failed: one plain line, never the Core's sentence or a cause (#1404).
@@ -1841,8 +1926,8 @@ describe('RoomConversation stops and failures', () => {
   });
 
   it('says why a retired model stopped the turn, and offers another model instead of Retry (#1630)', () => {
-    // Killed by: frontend/src/lib/turnOutcome.ts :: if (providerFailure) return fmt(copy.providerFailed, { label, message: providerFailure.message });
-    // Becomes: if (false) return fmt(copy.providerFailed, { label, message: providerFailure.message });
+    // Killed by: frontend/src/lib/turnOutcome.ts :: if (providerFailure) return providerFailureSentence(label, providerFailure, copy);
+    // Becomes: if (false) return providerFailureSentence(label, providerFailure, copy);
     // Killed by: frontend/src/i18n/locales/en/conversation.json :: "model_unavailable": "Choose another model in Settings, then send your message again.",
     // Becomes: "model_unavailable": "Try again later.",
     const plain = 'The model gemini-1.5-pro is not available from Google. It may have been retired, or the name may be misspelled.';
@@ -1855,14 +1940,15 @@ describe('RoomConversation stops and failures', () => {
             content: '',
             error: plain,
             refusal: 'model_unavailable',
-            provider_failure: { kind: 'model_unavailable', message: plain, retryable: false },
+            provider_failure: { kind: 'model_unavailable', message: plain, retryable: false, provider: 'Google' },
           }),
         ],
       }),
     });
 
     const row = screen.getByTestId('row-error-1');
-    expect(row).toHaveTextContent(`Scout couldn't finish this turn. ${plain}`);
+    expect(row).toHaveTextContent("Scout couldn't finish this turn. Google doesn't offer the model this turn asked for.");
+    expect(row.textContent).not.toContain(plain);
     expect(screen.queryByTestId('retry-turn')).toBeNull();
     expect(screen.getByTestId('row-remedy-1')).toHaveTextContent(
       'Choose another model in Settings, then send your message again.',
@@ -1923,14 +2009,16 @@ describe('RoomConversation stops and failures', () => {
             content: '',
             error: plain,
             refusal: null,
-            provider_failure: { kind: 'provider_quota', message: plain, retryable: true },
+            provider_failure: { kind: 'provider_quota', message: plain, retryable: true, provider: 'Anthropic' },
           }),
         ],
       }),
     });
 
     const row = screen.getByTestId('row-error-1');
-    expect(row).toHaveTextContent(`Scout couldn't finish this turn. ${plain}`);
+    expect(row).toHaveTextContent(
+      "Scout couldn't finish this turn. The usage limit for this key at Anthropic has been reached.",
+    );
     expect(screen.getByTestId('retry-turn')).toBeInTheDocument();
     expect(screen.queryByTestId('row-remedy-1')).toBeNull();
     expectPlain(row.textContent);
@@ -1962,6 +2050,126 @@ describe('RoomConversation stops and failures', () => {
     expectPlain(screen.getByTestId('row-remedy-1').textContent);
   });
 
+  // #2167: a failed turn's sentence is built in the reader's language from the Core's fields
+  // (`kind`, `provider`, `model_ref`, `action`), never from its English `message`.
+  const OWN_MODEL_MESSAGE =
+    "Scout is set to use its own model, gpu-box/qwen3:14b, and it could not be used. ModelRefUnavailableError: Couldn't get an answer from http://10.0.0.5:11434/api/chat";
+
+  it("names the clone's own model and its connection when that model failed, without the Core's text", () => {
+    // Killed by: frontend/src/lib/turnOutcome.ts ::   if (own && ref) return fmt(copy.ownModelFailed, { label, model: ref.slice(slash + 1), cause });
+    // Becomes:   if (false) return fmt(copy.ownModelFailed, { label, model: ref.slice(slash + 1), cause });
+    // Killed by: frontend/src/lib/turnOutcome.ts ::     failure.provider?.trim() || (own && ref ? ref.slice(0, slash) : '') || copy.providerUnknown;
+    // Becomes:     failure.provider?.trim() || copy.providerUnknown;
+    renderRoom({
+      room: room({
+        transcript: [
+          message({
+            seq: 1,
+            sender_id: 'scout',
+            content: '',
+            error: OWN_MODEL_MESSAGE,
+            refusal: null,
+            provider_failure: {
+              kind: 'provider_unreachable',
+              message: OWN_MODEL_MESSAGE,
+              retryable: true,
+              clone: 'Scout',
+              model_ref: 'gpu-box/qwen3:14b',
+              action: 'use_system_default',
+            },
+          }),
+        ],
+      }),
+    });
+
+    const row = screen.getByTestId('row-error-1');
+    expect(row.querySelector('p')).toHaveTextContent(
+      "Scout couldn't finish this turn: it is set to use its own model, qwen3:14b, and that model couldn't be used. gpu-box couldn't be reached.",
+    );
+    for (const internal of ['ModelRefUnavailableError', 'http://', 'api/chat', 'gpu-box/qwen3']) {
+      expect(row).not.toHaveTextContent(internal);
+    }
+    expect(screen.getByTestId('row-use-default-1')).toBeInTheDocument();
+  });
+
+  it('words a failed turn in Korean from the fields, with the provider named', () => {
+    // Killed by: frontend/src/i18n/locales/ko/conversation.json ::       "provider_auth": "{provider}이(가) API 키를 받아들이지 않았습니다.",
+    // Becomes:       "provider_auth": "{provider} rejected the key.",
+    renderRoom(
+      {
+        room: room({
+          transcript: [
+            message({
+              seq: 1,
+              sender_id: 'scout',
+              content: '',
+              error: 'Google rejected the API key.',
+              refusal: 'provider_auth',
+              provider_failure: {
+                kind: 'provider_auth',
+                message: 'Google rejected the API key.',
+                retryable: false,
+                provider: 'Google',
+              },
+            }),
+          ],
+        }),
+      },
+      { korean: true },
+    );
+
+    const row = screen.getByTestId('row-error-1');
+    expect(row.querySelector('p')).toHaveTextContent(
+      'Scout이(가) 이 턴을 마치지 못했습니다. Google이(가) API 키를 받아들이지 않았습니다.',
+    );
+    expect(row.textContent).not.toContain('rejected');
+  });
+
+  it("words an own-model failure in Korean, and says the provider's name is unknown when it is", () => {
+    // Killed by: frontend/src/i18n/locales/ko/conversation.json ::     "ownModelFailed": "{label}이(가) 이 턴을 마치지 못했습니다: 자체 모델 {model}을(를) 쓰도록 설정되어 있는데, 그 모델을 사용할 수 없었습니다. {cause}",
+    // Becomes:     "ownModelFailed": "{label} couldn't finish this turn: it is set to use its own model, {model}, and that model couldn't be used. {cause}",
+    renderRoom(
+      {
+        room: room({
+          transcript: [
+            message({
+              seq: 1,
+              sender_id: 'scout',
+              content: '',
+              error: OWN_MODEL_MESSAGE,
+              refusal: 'model_unavailable',
+              provider_failure: {
+                kind: 'model_unavailable',
+                message: OWN_MODEL_MESSAGE,
+                retryable: false,
+                clone: 'Scout',
+                model_ref: 'box/own-model',
+                action: 'use_system_default',
+              },
+            }),
+            message({
+              seq: 2,
+              sender_id: 'scout',
+              content: '',
+              error: 'boom',
+              refusal: null,
+              provider_failure: { kind: 'provider_outage', message: 'Upstream 503 Service Unavailable', retryable: true },
+            }),
+          ],
+        }),
+      },
+      { korean: true },
+    );
+
+    expect(screen.getByTestId('row-error-1').querySelector('p')).toHaveTextContent(
+      'Scout이(가) 이 턴을 마치지 못했습니다: 자체 모델 own-model을(를) 쓰도록 설정되어 있는데, 그 모델을 사용할 수 없었습니다. box에서 이 턴이 요청한 모델을 제공하지 않습니다.',
+    );
+    expect(screen.getByTestId('row-error-2').querySelector('p')).toHaveTextContent(
+      'Scout이(가) 이 턴을 마치지 못했습니다. 모델 Provider에 지금 문제가 있습니다.',
+    );
+    expect(screen.getByTestId('row-error-2')).not.toHaveTextContent('503');
+  });
+
   it('keeps Retry on a failure that carries no refusal (#969)', () => {
     renderRoom({
       room: room({
@@ -1973,6 +2181,72 @@ describe('RoomConversation stops and failures', () => {
 
     expect(screen.getByTestId('retry-turn')).toBeInTheDocument();
     expect(screen.queryByTestId('row-remedy-1')).toBeNull();
+  });
+
+  // A saved persona edit the clone could not take is said as that, with what to do, and never
+  // in the row's `error`: the person who saved it has to save it again (#1904).
+  // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: ? fmt(t.outcome.personaEditDropped, { label })
+  // Becomes: ? message.error
+  // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: {message.persona_edit_dropped ? (
+  // Becomes: {false && message.persona_edit_dropped ? (
+  // Killed by: frontend/src/i18n/locales/en/conversation.json :: "personaEditDropped": "{label} couldn't apply the changes saved to it, so it didn't answer. It kept its previous settings in this conversation.",
+  // Becomes: "personaEditDropped": "{label} couldn't finish this turn.",
+  it('says a saved edit the clone could not apply was not used, and to save it again (#1904)', () => {
+    const raw = 'RuntimeError: /Users/me/.uclone/personas/scout.yaml: the epoch could not be opened';
+    renderRoom({
+      room: room({
+        transcript: [
+          message({ seq: 1, sender_id: 'scout', content: '', error: raw, persona_edit_dropped: true }),
+        ],
+      }),
+    });
+
+    const row = screen.getByTestId('row-error-1');
+    expect(row).toHaveTextContent(
+      "Scout couldn't apply the changes saved to it, so it didn't answer. It kept its previous settings in this conversation.",
+    );
+    const remedy = screen.getByTestId('row-remedy-1');
+    expect(remedy).toHaveTextContent(
+      'To use the changes here, save the clone again, then send your message again.',
+    );
+    expect(row.textContent).not.toContain('went wrong');
+    for (const internal of ['RuntimeError', 'scout.yaml', 'epoch', 'persona_edit', '/Users']) {
+      expect(row).not.toHaveTextContent(internal);
+    }
+    expectPlain(row.textContent);
+    expectPlain(remedy.textContent);
+    // A retry runs, under the settings the clone kept, so it is still offered.
+    expect(screen.getByTestId('retry-turn')).toBeInTheDocument();
+  });
+
+  // Killed by: frontend/src/i18n/locales/ko/conversation.json :: "personaEditRemedy": "여기서 변경 사항을 쓰려면 클론을 다시 저장한 뒤 메시지를 다시 보내십시오.",
+  // Becomes: "personaEditRemedy": "To use the changes here, save the clone again, then send your message again.",
+  it('words a dropped persona edit in Korean, not the stored English (#1904)', () => {
+    renderRoom(
+      {
+        room: room({
+          transcript: [
+            message({
+              seq: 1,
+              sender_id: 'scout',
+              content: '',
+              error: 'The changes saved to this clone could not be applied, so it did not answer.',
+              persona_edit_dropped: true,
+            }),
+          ],
+        }),
+      },
+      { korean: true },
+    );
+
+    const row = screen.getByTestId('row-error-1');
+    expect(row).toHaveTextContent(fmt(ko.conversation.outcome.personaEditDropped, { label: 'Scout' }));
+    expect(row).toHaveTextContent('이전 설정을 그대로 씁니다');
+    expect(row.textContent).not.toContain('could not be applied');
+    const remedy = screen.getByTestId('row-remedy-1');
+    expect(remedy).toHaveTextContent('클론을 다시 저장한 뒤 메시지를 다시 보내십시오.');
+    expect(remedy.textContent).not.toMatch(/[A-Za-z]/);
+    expectPlain(row.textContent);
   });
 
   it('offers only agents who are not already here, as a choice rather than a typed id', () => {
@@ -1996,12 +2270,11 @@ describe('RoomConversation stops and failures', () => {
 });
 
 describe('RoomConversation invite list', () => {
-  it('distinguishes "nobody is running" from "everybody is already here"', () => {
-    // The runtime reports no clones until one has been used, so a fresh install opened
-    // the invite list and was told everyone was already in the conversation.
+  it('distinguishes "none installed" from "everybody is already here"', () => {
+    // When no clones are installed, the invite list distinguishes that from everyone being seated.
     const { unmount } = renderRoom({ availableAgents: [] });
     fireEvent.click(screen.getByTestId('add-someone'));
-    expect(screen.getByTestId('invite-empty-cause')).toHaveTextContent('No clones are running yet');
+    expect(screen.getByTestId('invite-empty-cause')).toHaveTextContent('No other clones are installed yet');
     unmount();
 
     renderRoom({ availableAgents: [makeCloneChoice({ id: 'scout' })] });
@@ -3011,9 +3284,10 @@ describe('RoomConversation failure copy (#1408)', () => {
   /**
    * Rows the Core landed for real failures, written by
    * `tests/unit/test_room_failed_row_copy.py`: a raised `FileNotFoundError`, a spent budget,
-   * a provider that failed on a missing file, and a seat session that could not be written.
-   * Their `error` / `persist_error` hold class names and paths, which is what makes the
-   * "not rendered" checks below able to fail.
+   * a provider that failed on a missing file, a seat session that could not be written, and a
+   * saved persona edit that could not be applied. The first four rows' `error` /
+   * `persist_error` hold class names and paths, which is what makes the "not rendered" checks
+   * below able to fail.
    */
   const rows = failedRows.rows as Record<string, Partial<RoomTranscriptMessage>>;
   const renderRow = (name: string) =>
@@ -3021,8 +3295,8 @@ describe('RoomConversation failure copy (#1408)', () => {
       room: room({ transcript: [message(rows[name])] }),
     });
 
-  // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: {turnFailureSentence(
-  // Becomes: {((..._args: unknown[]) => message.error)(
+  // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: : turnFailureSentence(
+  // Becomes: : ((..._args: unknown[]) => message.error)(
   it.each([
     'raised',
     'provider',
@@ -3048,6 +3322,29 @@ describe('RoomConversation failure copy (#1408)', () => {
     );
     expect(line.textContent).not.toContain('limit exceeded');
     expectPlain(line.textContent);
+  });
+
+  // The row the Core lands when a saved persona edit could not be applied (#1904). Its
+  // `error` is the Core's fixed English sentence, not a raw cause; the row still names the
+  // dropped edit in the reader's copy, with what to do next.
+  // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: ? fmt(t.outcome.personaEditDropped, { label })
+  // Becomes: ? message.error
+  it('says a saved edit was not applied and how to apply it, from the row the Core lands', () => {
+    renderRow('persona_edit');
+    const seq = rows.persona_edit.seq;
+    const line = screen.getByTestId(`row-error-${seq}`);
+    expect(line).toHaveTextContent(
+      "Scout couldn't apply the changes saved to it, so it didn't answer. It kept its previous settings in this conversation.",
+    );
+    expect(line.textContent).not.toContain(rows.persona_edit.error as string);
+    expectPlain(line.textContent);
+    const remedy = screen.getByTestId(`row-remedy-${seq}`);
+    expect(remedy).toHaveTextContent('save the clone again');
+    expectPlain(remedy.textContent);
+    for (const internal of ['definition', 'epoch', 'persona_edit', 'scout.yaml']) {
+      expect(line.textContent).not.toContain(internal);
+      expect(remedy.textContent).not.toContain(internal);
+    }
   });
 
   // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: {fmt(t.row.unsaved, { label })}
@@ -3182,33 +3479,32 @@ describe('RoomConversation autonomous discussion toggle', () => {
 
 
 describe('a clone`s picture in the conversation', () => {
-  // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: imageSrc={pictureOf(personaOfSeat(room, agent.id), avatarUrls)}
-  // Becomes: imageSrc={pictureOf(agent.id, avatarUrls)}
-  it('draws the picture the listing gives, and the clone behind a second seat', () => {
-    // The listed address changes with the picture, so a new one shows here as soon as the
-    // listing is read again; a second seat of the same clone wears the clone's picture.
+  // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: ? pictureOf(message.sender_id, avatarUrls)
+  // Becomes: ? undefined
+  it('draws the picture the listing gives for the clone a seat is', () => {
+    // A seat is its clone's id (clone-data-scopes §4 step 3), and the listing keys each
+    // picture by that id, so the row and the seat strip both find it.
     renderRoom({
       room: room({
         participants: [
           { id: 'user', kind: 'human', display_name: 'Kenny' },
-          { id: 'scout-2', kind: 'agent', display_name: 'Scout', persona: 'scout' },
+          { id: 'agt_scout', kind: 'agent', display_name: 'Scout', handle: 'scout' },
           { id: 'critic', kind: 'agent', display_name: 'Critic' },
         ],
-        transcript: [message({ seq: 1, sender_id: 'scout-2', content: 'looked again' })],
+        transcript: [message({ seq: 1, sender_id: 'agt_scout', content: 'looked again' })],
       }),
-      avatarUrls: { scout: '/api/personas/scout/avatar?v=new' },
+      avatarUrls: { agt_scout: '/api/clones/agt_scout/avatar?v=new' },
     });
 
     expect(screen.getByTestId('row-1').querySelector('img')).toHaveAttribute(
       'src',
-      '/api/personas/scout/avatar?v=new',
+      '/api/clones/agt_scout/avatar?v=new',
     );
-    // The row and the seat strip both: the strip read the seat id before.
-    expect(document.querySelectorAll('img[src="/api/personas/scout/avatar?v=new"]').length).toBeGreaterThanOrEqual(2);
+    expect(document.querySelectorAll('img[src="/api/clones/agt_scout/avatar?v=new"]').length).toBeGreaterThanOrEqual(2);
   });
 
-  // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: value={isAgent ? personaOfSeat(room, message.sender_id) : null}
-  // Becomes: value={null}
+  // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: <AvatarAuthorContext.Provider value={isAgent ? message.sender_id : null}>
+  // Becomes: <AvatarAuthorContext.Provider value={null}>
   it('offers a drawn picture to the clone that wrote the message', () => {
     render(
       <AvatarChoiceContext.Provider
@@ -3299,11 +3595,9 @@ describe('a clone`s picture in the conversation', () => {
     expect(screen.getByTestId('room-composer')).toHaveValue(`hello\n\n${request}`);
   });
 
-  // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: <AvatarAuthorContext.Provider value={isAgent ? personaOfSeat(room, message.sender_id) : null}>
-  // Becomes: <AvatarAuthorContext.Provider value={isAgent ? message.sender_id : null}>
-  it('offers a picture from a second seat to the clone, not the seat (#1780)', async () => {
-    // `writer-2` is the second seat of writer; no clone is named `writer-2`, so giving
-    // the picture to the seat id would be refused as a clone that is not here.
+  it('gives a picture to the clone by the id its seat carries (#1814)', async () => {
+    // The seat is the clone's id; the picture goes to that id, which the clone keeps
+    // through a rename of its handle.
     const calls: string[] = [];
     vi.stubGlobal(
       'fetch',
@@ -3314,7 +3608,7 @@ describe('a clone`s picture in the conversation', () => {
     );
     render(
       <AvatarChoiceContext.Provider
-        value={{ clones: [{ name: 'writer', label: 'Writer' }], onChanged: vi.fn(), askFor: vi.fn() }}
+        value={{ clones: [{ name: 'agt_writer', label: 'Writer' }], onChanged: vi.fn(), askFor: vi.fn() }}
       >
         <DraftHost
           initial=""
@@ -3322,13 +3616,12 @@ describe('a clone`s picture in the conversation', () => {
             room: room({
               participants: [
                 { id: 'user', kind: 'human', display_name: 'Kenny' },
-                { id: 'writer', kind: 'agent', display_name: 'Writer', persona: 'writer' },
-                { id: 'writer-2', kind: 'agent', display_name: 'Writer', persona: 'writer' },
+                { id: 'agt_writer', kind: 'agent', display_name: 'Writer', handle: 'writer' },
               ],
               transcript: [
                 message({
                   seq: 1,
-                  sender_id: 'writer-2',
+                  sender_id: 'agt_writer',
                   content: '![me](/api/artifacts/content?path=artifacts/images/w.png)',
                 }),
               ],
@@ -3346,10 +3639,10 @@ describe('a clone`s picture in the conversation', () => {
       </AvatarChoiceContext.Provider>,
     );
 
+    expect(screen.getByTestId('use-as-avatar-btn')).toHaveAttribute('title', expect.stringContaining('Writer'));
     fireEvent.click(screen.getByTestId('use-as-avatar-btn'));
 
-    await waitFor(() => expect(calls).toContain('/api/personas/writer/avatar'));
-    expect(calls).not.toContain('/api/personas/writer-2/avatar');
+    await waitFor(() => expect(calls).toContain('/api/clones/agt_writer/avatar'));
     vi.unstubAllGlobals();
   });
 });
@@ -3424,5 +3717,86 @@ describe('RoomConversation in a room a head keeps (#1885)', () => {
 
     expect(screen.getByTestId('composer-column')).toBeInTheDocument();
     expect(screen.queryByTestId('head-room-note')).toBeNull();
+  });
+});
+
+/**
+ * The folder a conversation's clones work in, shown and changed from its head (#2128,
+ * clone-data-scopes §3.6).
+ */
+describe('the folder this conversation works in (#2128)', () => {
+  // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: {folder ? folderName(folder) : t.workspace.serverFolder}
+  // Becomes: {t.workspace.serverFolder}
+  it('names the folder the conversation works in, and the server’s when it has none', () => {
+    const { unmount } = renderRoom({
+      room: room({ workspace: '/home/k/projects/novel', default_workspace: '/srv/app' }),
+      onSetWorkspace: async () => {},
+    });
+    expect(screen.getByTestId('room-workspace')).toHaveTextContent('novel');
+    expect(screen.getByTestId('room-workspace')).toHaveAttribute(
+      'title',
+      expect.stringContaining('/home/k/projects/novel'),
+    );
+    unmount();
+
+    renderRoom({ room: room({ default_workspace: '/srv/app' }), onSetWorkspace: async () => {} });
+    expect(screen.getByTestId('room-workspace')).toHaveTextContent("the server's folder");
+    expect(screen.getByTestId('room-workspace')).toHaveAttribute('title', expect.stringContaining('/srv/app'));
+  });
+
+  // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: onSetWorkspace(chosen).then(
+  // Becomes: Promise.resolve().then(
+  // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: onSetWorkspace(null).then(
+  // Becomes: Promise.resolve().then(
+  it('sends the folder typed, and the server’s folder back as null', async () => {
+    const onSetWorkspace = vi.fn(async (_workspace: string | null) => {});
+    renderRoom({ room: room({ workspace: '/home/k/novel', default_workspace: '/srv/app' }), onSetWorkspace });
+
+    fireEvent.click(screen.getByTestId('room-workspace'));
+    fireEvent.change(screen.getByTestId('workspace-path'), { target: { value: ' /home/k/essay ' } });
+    fireEvent.click(screen.getByTestId('workspace-use'));
+    await waitFor(() => expect(onSetWorkspace).toHaveBeenCalledWith('/home/k/essay'));
+    await waitFor(() => expect(screen.queryByTestId('workspace-panel')).toBeNull());
+
+    fireEvent.click(screen.getByTestId('room-workspace'));
+    fireEvent.click(screen.getByTestId('workspace-use-server'));
+    await waitFor(() => expect(onSetWorkspace).toHaveBeenLastCalledWith(null));
+  });
+
+  // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: return refusals[err.code];
+  // Becomes: return roomFailureReason(err, words.noReason, words);
+  it('says a refusal in the reader’s language, from the code the route names', async () => {
+    const english =
+      'This conversation has a story open, and the story lives in its current workspace. Close the story first, then change the workspace.';
+    const onSetWorkspace = vi.fn(async () => {
+      throw new RoomsApiError(english, 400, english, 'story_open');
+    });
+    renderRoom({ room: room({ default_workspace: '/srv/app' }), onSetWorkspace }, { korean: true });
+
+    fireEvent.click(screen.getByTestId('room-workspace'));
+    fireEvent.change(screen.getByTestId('workspace-path'), { target: { value: '/home/k/essay' } });
+    fireEvent.click(screen.getByTestId('workspace-use'));
+    expect(await screen.findByTestId('workspace-refusal')).toHaveTextContent(
+      ko.conversation.workspace.refusals.story_open,
+    );
+    expect(screen.getByTestId('workspace-panel')).toBeInTheDocument();
+  });
+
+  // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: <ArtifactRoomContext.Provider value={room.room_id}>
+  // Becomes: <ArtifactRoomContext.Provider value={null}>
+  // Killed by: frontend/src/components/RichText.tsx :: return <RoomArtifactImageCard url={artifact.url} name={artifact.name} alt={alt} />;
+  // Becomes: return <ArtifactImageCard url={artifact.url} name={artifact.name} alt={alt} />;
+  it('draws a clone’s picture from this conversation’s folder, not the server’s', () => {
+    renderRoom({
+      room: room({
+        transcript: [
+          message({ seq: 1, sender_id: 'scout', content: '![me](/api/artifacts/content?path=artifacts/images/a.png)' }),
+        ],
+      }),
+    });
+    expect(screen.getByRole('img', { name: 'me' })).toHaveAttribute(
+      'src',
+      '/api/artifacts/content?path=artifacts%2Fimages%2Fa.png&room_id=r1',
+    );
   });
 });

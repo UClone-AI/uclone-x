@@ -3,7 +3,7 @@
 Two things only the assembled product can show.
 
 The first is the picture's whole loop: a file installed beside a clone's definition, read by
-`GET /api/personas/{name}/avatar`, addressed by the shipped bundle, and decoded by the
+`GET /api/clones/{ref}/avatar`, addressed by the shipped bundle, and decoded by the
 browser. `tests/unit/test_persona_avatar.py` pins the route and
 `frontend/src/ui-kit.avatar.test.tsx` pins the component, but jsdom loads no images at all --
 an `<img>` whose source 404s looks exactly like one that decoded, so neither end can tell a
@@ -28,7 +28,7 @@ import yaml
 from playwright.async_api import FloatRect, Page, async_playwright
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
-from tests.e2e.conftest import TWO_FRAMES, dock_locator, mock_llm, running_ui
+from tests.e2e.conftest import TWO_FRAMES, clone_id, dock_locator, mock_llm, running_ui
 
 pytestmark = pytest.mark.e2e
 
@@ -83,7 +83,9 @@ def server(tmp_path: Path, workspace: Path) -> Iterator[str]:
         yield url
 
 
-async def _pick(page: Page, clone: str) -> None:
+async def _pick(page: Page, server: str, handle: str) -> None:
+    """Open the profile of the clone installed as `handle`; the head keys both by its id."""
+    clone = await clone_id(page, server, handle)
     await page.get_by_test_id(f"clone-avatar-{clone}").click()
     await (await dock_locator(page)).wait_for(state="visible", timeout=5_000)
     await page.get_by_test_id(f"clone-profile-{clone}").wait_for(timeout=5_000)
@@ -109,13 +111,14 @@ async def test_a_picked_clone_arrives_on_the_dock_with_the_picture_installed_for
             await page.get_by_test_id("room-composer").wait_for(timeout=20_000)
 
             # The rail's own row, which is the binding this head owns.
-            row_picture = page.get_by_test_id("clone-avatar-surveyor").locator("img")
+            surveyor = await clone_id(page, server, "surveyor")
+            row_picture = page.get_by_test_id(f"clone-avatar-{surveyor}").locator("img")
             await row_picture.wait_for(timeout=10_000)
             assert await row_picture.evaluate("(el) => el.complete && el.naturalWidth > 0"), (
                 "the rail's avatar element is on screen but its picture never decoded"
             )
 
-            await _pick(page, "surveyor")
+            await _pick(page, server, "surveyor")
 
             assert await page.get_by_test_id("clone-profile-name").inner_text() == "surveyor"
             # `inner_text` is what the reader sees, and the line is drawn in small caps:
@@ -164,7 +167,7 @@ async def test_a_clone_with_no_picture_installed_shows_the_default_and_no_broken
             await page.goto(server, wait_until="networkidle")
             await page.get_by_test_id("room-composer").wait_for(timeout=20_000)
 
-            await _pick(page, "courier")
+            await _pick(page, server, "courier")
 
             avatar = page.get_by_test_id("clone-profile-avatar")
             # The element goes only once the browser's request for the picture has answered 404
@@ -218,7 +221,7 @@ async def test_studio_mode_takes_the_conversation_column_and_escape_gives_it_bac
             await page.goto(server, wait_until="networkidle")
             await page.get_by_test_id("room-composer").wait_for(timeout=20_000)
 
-            await _pick(page, "surveyor")
+            await _pick(page, server, "surveyor")
             await page.get_by_test_id("clone-profile-edit").click()
             editor = page.get_by_test_id("clone-profile-editor")
             await editor.wait_for(timeout=5_000)

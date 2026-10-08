@@ -32,10 +32,13 @@ from uclone_x.agent.prompt_assembler import (
     persisted_anchor_provenance,
     restored_anchor_provenance,
     turn_context_block,
+    undone_attempt_section,
 )
+from uclone_x.agent.request_record import LogReader
 from uclone_x.agent.session import ContextSnapshot
 from uclone_x.core.context_state import ContextEntry, ContextEpoch, ContextForm, advance
-from uclone_x.llm.models import ChatMessage, LLMRequest, MessageRole
+from uclone_x.core.session_log import SessionLogProvenance, logged_message, new_entry
+from uclone_x.llm.models import ChatMessage, LLMRequest, MessageRole, ToolCallRequest
 from uclone_x.tools.builtin.filesystem import FileReadTool
 from uclone_x.tools.protocols import ToolRegistryProtocol
 from uclone_x.tools.registry import ToolRegistry
@@ -60,6 +63,19 @@ class _Session:
 
     def logged_history(self) -> list[tuple[str, ChatMessage]]:
         return [(f"e{position}", message) for position, message in enumerate(self.history)]
+
+    def declare_new_epoch(self, cause: str) -> None:
+        del cause  # these tests open no epoch by declaration
+
+    def log_reader(self) -> LogReader:
+        """A reader over a log with one entry per history message, as `logged_history`."""
+        rendered = [logged_message(message) for message in self.history]
+        bodies = {item.digest: item.body for item in rendered}
+        log = [
+            new_entry(position, item, turn=1, provenance=SessionLogProvenance.RECORDED)
+            for position, item in enumerate(rendered)
+        ]
+        return LogReader(log, bodies.get, purpose="send")
 
     def record_shown(self, shown: list[ContextEntry], *, step: int) -> ContextEpoch:
         self.context_epochs = advance(self.context_epochs, shown, turn=1, step=step)
@@ -98,6 +114,7 @@ def _assembler(state: _State) -> PromptAssembler:
             current_plan=lambda: state.plan,
             history=lambda: state.history,
             active_session=lambda: state.session.reading(state.history),
+            log_reader=lambda: state.session.reading(state.history).log_reader(),
             turn_counter=lambda: 1,
             anchor_is_stale=lambda: False,
             system_prompt_base=lambda: "BASE",
@@ -189,48 +206,25 @@ def test_with_no_anchor_the_turn_sends_the_effective_prompt_and_the_plan_rides_a
     assert "### Active Execution Plan: Ship it" in layers.turn_context
 
 
-def test_the_forms_earlier_epochs_recorded_are_reread_once_an_epoch_is_added() -> None:
-    """The recorded forms are reused only while the epochs are the ones they were read
-    from (#1875, item 5): an entry a later epoch records as a `stub` is shown as one on the
-    next request, not as the `full` a cached read of no epochs would give.
-
-    Killed by: src/uclone_x/agent/prompt_assembler.py :: or cached[1] is not last:
-    Becomes: or False:
-    """
-    stub = ChatMessage(role=MessageRole.TOOL, content="stub text", name="t", tool_call_id="c1")
-    state = _State(config=_config(), history=[stub])
-    state.session.context_epochs = ()
-    assembler = _assembler(state)
-
-    assert [s.form for s in assembler.prepare_turn_layers().shown] == [ContextForm.FULL]
-    epochs: list[ContextEpoch] = []
-    state.session.context_epochs = epochs  # type: ignore[assignment]
-    assert [s.form for s in assembler.prepare_turn_layers().shown] == [ContextForm.FULL]
-    epochs.append(
-        ContextEpoch(
-            number=0,
-            turn=1,
-            step=1,
-            opened_by=("start",),
-            entries=(ContextEntry(entry="e0", form=ContextForm.STUB),),
-        )
-    )
-
-    assert [s.form for s in assembler.prepare_turn_layers().shown] == [ContextForm.STUB]
-
-
 def test_the_forms_a_compaction_derived_are_the_forms_the_next_request_shows() -> None:
-    """A compaction sets the new epoch's forms (#1848); the next request records them,
-    not the form read off the message.
+    """What a compaction derived (#1848) is what the next request shows and records.
 
-    Killed by: src/uclone_x/agent/prompt_assembler.py :: shown = shown_entries(logged, prior, {**renderings, **session.compacted_entries})
-    Becomes: shown = shown_entries(logged, prior, {**renderings})
+    Killed by: src/uclone_x/agent/prompt_assembler.py :: logged, opening_entries(session.context_epochs, session.compacted_entries)
+    Becomes: logged, opening_entries(session.context_epochs, {})
     """
-    stub = ChatMessage(role=MessageRole.TOOL, content="stub text", name="t", tool_call_id="c1")
-    state = _State(config=_config(), history=[stub])
-    state.session.compacted_entries = {"e0": ContextEntry(entry="e0", form=ContextForm.STUB)}
+    ask = ChatMessage(role=MessageRole.USER, content="go")
+    full = ChatMessage(role=MessageRole.TOOL, content="the result", name="t", tool_call_id="c1")
+    state = _State(config=_config(), history=[ask, full])
+    # The compaction derived that body e1 shows entry e0's content through a rendering.
+    state.session.compacted_entries = {
+        "e1": ContextEntry(entry="e0", form=ContextForm.FULL, rendering="e1")
+    }
 
-    assert [s.form for s in _assembler(state).prepare_turn_layers().shown] == [ContextForm.STUB]
+    shown = _assembler(state).prepare_turn_layers().shown
+    assert [(s.entry, s.form, s.rendering) for s in shown] == [
+        ("e0", ContextForm.FULL, None),
+        ("e0", ContextForm.FULL, "e1"),
+    ]
 
 
 def test_request_context_fields_chain_each_request_to_the_one_before() -> None:
@@ -253,8 +247,10 @@ def test_request_context_fields_chain_each_request_to_the_one_before() -> None:
 
     assert (first["request"], first["base_request"]) == (1, None)
     assert (second["request"], second["base_request"]) == (2, 1)
-    assert second["kept_message_count"] == 1
-    assert [m["content"] for m in second["appended_messages"]] == ["b"]
+    assert second["kept_entry_count"] == 1
+    # What it added is named by its log entry and form, not by its text (#2013).
+    assert [e["entry"] for e in second["appended_entries"]] == ["e1"]
+    assert "b" not in {str(v) for e in second["appended_entries"] for v in e.values()}
     assert len(state.session.context_snapshots) == 1
 
 
@@ -280,3 +276,20 @@ def test_an_agent_whose_tools_are_swapped_after_construction_is_assembled_from_t
 
     section = agent._get_workspace_prompt_section()  # pyright: ignore[reportPrivateUsage]
     assert section is not None and section.startswith("[Workspace]")
+
+
+def test_undone_attempt_section_redacts_credentials_in_tool_arguments() -> None:
+    """Tool arguments in [Undone Attempt] statement have credential patterns redacted (#1503).
+
+    Killed by: src/uclone_x/agent/prompt_assembler.py :: return redact_credentials(f"{call.name}({_clip(', '.join(parts), _UNDONE_ARGS_CHARS)})")
+    Becomes: return f"{call.name}({_clip(', '.join(parts), _UNDONE_ARGS_CHARS)})"
+    """
+    call = ToolCallRequest(
+        id="c1",
+        name="fetch_secret",
+        arguments={"token": "ghp_123456789012345678901234567890123456"},
+    )
+    summary = undone_attempt_section([call])
+    assert "[Undone Attempt]" in summary
+    assert "[REDACTED]" in summary
+    assert "ghp_" not in summary

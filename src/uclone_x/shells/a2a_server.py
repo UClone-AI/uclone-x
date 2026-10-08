@@ -36,6 +36,7 @@ from uclone_x.agent.base import BaseAgent
 from uclone_x.agent.models import TurnResult
 from uclone_x.core.immutable import unwrap_immutable
 from uclone_x.core.provenance import Provenance
+from uclone_x.core.set_aside import SESSION_SET_ASIDE_NOTICE
 from uclone_x.engine.event_bus import EventBus
 from uclone_x.errors import (
     A2AError,
@@ -63,15 +64,19 @@ class A2ATurnFailure:
 
 
 #: Records a turn a context ran, beyond the agent's own save (#1837): the CLI records it
-#: in the context's one-seat room transcript. Called with the context id, the prompt and
-#: the turn's result or an `A2ATurnFailure`. A recorder that raises is logged; the task's
+#: in the context's one-seat room transcript. Called with the context id, the prompt, the
+#: turn's result or an `A2ATurnFailure`, and whether the save after the turn kept an
+#: unreadable earlier record aside (#1921). A recorder that raises is logged; the task's
 #: outcome stands.
-A2ATurnRecorder = Callable[[str, str, "TurnResult | A2ATurnFailure"], None]
+A2ATurnRecorder = Callable[[str, str, "TurnResult | A2ATurnFailure", bool], None]
 
 #: The names the person on the other end of an A2A conversation goes by, read before each
 #: turn with the context id (#1893 item 1). The CLI reads them from the context's one-seat
 #: room, as the room orchestrator gives a seat's turn its room's. Unset, a turn is given none.
 A2APersonNames = Callable[[str], tuple[str, ...]]
+
+#: How long a cancel waits for the task to finish its own cancellation before answering.
+CANCEL_SETTLE_SECONDS: Final[float] = 5.0
 
 #: How many per-context agents a server holds at once. See `A2AServer`.
 DEFAULT_MAX_CONTEXT_AGENTS: Final[int] = 8
@@ -174,6 +179,9 @@ class ManagedTaskRecord:
         self.artifacts: list[dict[str, Any]] = []
         self.events: list[dict[str, Any]] = []
         self.error: str | None = None
+        # Words for the person beside the task's outcome, as A2A's `TaskStatus.message`
+        # carries them (#1921): set when the save after the turn kept a record aside.
+        self.status_message: str | None = None
         self.provenance: Provenance | None = None
         self.created_at = time.time()
         self.updated_at = time.time()
@@ -222,6 +230,7 @@ class ManagedTaskRecord:
             "output_data": self.output_data,
             "artifacts": self.artifacts,
             "error": self.error,
+            "status_message": self.status_message,
             "provenance": self.provenance.model_dump(mode="json") if self.provenance else None,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
@@ -546,8 +555,17 @@ class A2AServer:
                 },
             )
 
-        if record.async_task is not None and not record.async_task.done():
-            record.async_task.cancel()
+        task = record.async_task
+        if task is not None and not task.done():
+            task.cancel()
+            # The task finishes its own cancellation first: the turn's save runs there, and
+            # a `notice` that it kept a record aside reaches the listeners before the task
+            # closes them (#1921). Bounded, so a task slow to stop cannot hold the reply.
+            await asyncio.wait({task}, timeout=CANCEL_SETTLE_SECONDS)
+        if record.is_terminal:  # it ended on its own while the cancel waited
+            return JSONResponse(
+                status_code=200, content={"task_id": task_id, "status": record.status.value}
+            )
         record.status = TaskStatus.CANCELED
         await record.emit_event({"event": "canceled"})
         await record.close_listeners()
@@ -565,12 +583,15 @@ class A2AServer:
                 )
                 await record.emit_event({"event": "state", "state": "REASONING"})
                 try:
-                    answering_id, turn_result = await self._run_turn(record.context_id, prompt)
+                    answering_id, turn_result = await self._run_turn(
+                        record.context_id, prompt, on_set_aside=record
+                    )
                 except _ContextRefusedError as refused:
                     record.status = TaskStatus.FAILED
                     record.error = refused.message
                     await record.emit_event({"event": "failed", "error": record.error})
                     return
+                await self._tell_set_aside(record)  # the turn's save
                 await record.emit_event({"event": "token", "content": turn_result.content})
                 if turn_result.provenance is None:
                     # P6, and the policy this file already applies twice: an unattributed
@@ -688,6 +709,7 @@ class A2AServer:
                 )
         except asyncio.CancelledError:
             record.status = TaskStatus.CANCELED
+            await self._tell_set_aside(record)  # the cancelled turn's save
             await record.emit_event({"event": "canceled"})
         except Exception as exc:
             logger.exception("Task %s failed with unexpected exception", record.task_id)
@@ -704,16 +726,21 @@ class A2AServer:
             # The cause is logged above and kept in `processing_errors`; the caller is told
             # plainly (#1885 item 8).
             record.error, record.provenance = TURN_FAILED_MESSAGE, None
+            await self._tell_set_aside(record)  # the failed turn's save
             await record.emit_event({"event": "error", "error": record.error})
         finally:
             await record.close_listeners()
 
-    async def _run_turn(self, context_id: str, prompt: str) -> tuple[str, TurnResult]:
+    async def _run_turn(
+        self, context_id: str, prompt: str, *, on_set_aside: ManagedTaskRecord | None = None
+    ) -> tuple[str, TurnResult]:
         """Run `prompt` as `context_id`'s turn; the answering agent's id and the result.
 
         With a context factory: one turn at a time per context, then the agent's session
         is saved and the turn recorded -- a turn that raised or was cancelled is saved and
-        recorded as failed before it propagates.
+        recorded as failed before it propagates. When that save kept an unreadable earlier
+        record aside, the room row is flagged and `on_set_aside` is given the notice,
+        before the turn's result or exception reaches the caller (#1921).
 
         Raises:
             _ContextRefusedError: The context has no agent and none can be released, or
@@ -728,7 +755,7 @@ class A2AServer:
         self._context_users[context_id] = self._context_users.get(context_id, 0) + 1
         try:
             async with lock:
-                return await self._run_context_turn(context_id, prompt, factory)
+                return await self._run_context_turn(context_id, prompt, factory, on_set_aside)
         finally:
             self._release_context_lock(context_id)
 
@@ -743,31 +770,81 @@ class A2AServer:
             del self._context_locks[context_id]
 
     async def _run_context_turn(
-        self, context_id: str, prompt: str, factory: ContextAgentFactory
+        self,
+        context_id: str,
+        prompt: str,
+        factory: ContextAgentFactory,
+        on_set_aside: ManagedTaskRecord | None = None,
     ) -> tuple[str, TurnResult]:
         """`_run_turn`'s body, under `context_id`'s lock."""
         agent = self._agent_for_context(context_id, factory)
+        outcome: TurnResult | A2ATurnFailure
         try:
-            result = await agent.execute_turn(
+            outcome = await agent.execute_turn(
                 prompt, person_names=self._turn_person_names(context_id)
             )
         except asyncio.CancelledError:
-            self._save_context(context_id, agent)
-            self._record_turn(
+            self._finish_context_turn(
                 context_id,
+                agent,
                 prompt,
                 A2ATurnFailure(cause="Turn was interrupted", completed=False),
+                on_set_aside,
             )
             raise
         except Exception as exc:
-            self._save_context(context_id, agent)
-            self._record_turn(
-                context_id, prompt, A2ATurnFailure(cause=f"{type(exc).__name__}: {exc}")
+            self._finish_context_turn(
+                context_id,
+                agent,
+                prompt,
+                A2ATurnFailure(cause=f"{type(exc).__name__}: {exc}"),
+                on_set_aside,
             )
             raise
+        self._finish_context_turn(context_id, agent, prompt, outcome, on_set_aside)
+        return agent.agent_id, outcome
+
+    def _finish_context_turn(
+        self,
+        context_id: str,
+        agent: BaseAgent,
+        prompt: str,
+        outcome: TurnResult | A2ATurnFailure,
+        on_set_aside: ManagedTaskRecord | None,
+    ) -> None:
+        """Save `context_id`'s session after a turn and record the turn; never raises."""
         self._save_context(context_id, agent)
-        self._record_turn(context_id, prompt, result)
-        return agent.agent_id, result
+        set_aside = self._took_set_aside(context_id, agent)  # this turn's save
+        self._record_turn(context_id, prompt, outcome, set_aside)
+        if set_aside and on_set_aside is not None:
+            on_set_aside.status_message = SESSION_SET_ASIDE_NOTICE
+
+    @staticmethod
+    def _took_set_aside(context_id: str, agent: BaseAgent) -> bool:
+        """Whether the agent's last save kept an unreadable earlier record aside; once each.
+
+        Only a store that sets records aside can say so; any other says it did not. Never
+        raises: the task's outcome stands whatever the answer (#1921).
+        """
+        try:
+            take = getattr(agent.store, "take_set_aside", None)
+            return take is not None and take(agent.session_id) is True
+        except Exception:
+            logger.exception("Could not ask whether A2A context %s was set aside", context_id)
+            return False
+
+    @staticmethod
+    async def _tell_set_aside(record: ManagedTaskRecord) -> None:
+        """Tell the task's caller, once, in the words every head uses, that a record was kept aside.
+
+        A `notice` event carrying the task's `status_message`: plain text for the person,
+        no path and no cause (#1860, #1921). The task's result stays in its artifacts.
+        """
+        if record.status_message is None or any(
+            event.get("event") == "notice" for event in record.events
+        ):
+            return
+        await record.emit_event({"event": "notice", "message": record.status_message})
 
     def _turn_person_names(self, context_id: str) -> tuple[str, ...]:
         """The person's names for `context_id`'s next turn (`A2APersonNames`); none if unset.
@@ -822,13 +899,17 @@ class A2AServer:
         self._unsaved_contexts.discard(context_id)
 
     def _record_turn(
-        self, context_id: str, prompt: str, outcome: TurnResult | A2ATurnFailure
+        self,
+        context_id: str,
+        prompt: str,
+        outcome: TurnResult | A2ATurnFailure,
+        session_set_aside: bool = False,
     ) -> None:
         """Hand the turn to `turn_recorder`, if there is one; never raises."""
         if self._turn_recorder is None:
             return
         try:
-            self._turn_recorder(context_id, prompt, outcome)
+            self._turn_recorder(context_id, prompt, outcome, session_set_aside)
         except Exception:
             logger.exception("Could not record the turn of A2A context %s", context_id)
 

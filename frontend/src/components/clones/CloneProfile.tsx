@@ -14,9 +14,11 @@ import {
   type PersonaEditMode,
   type PersonaSaveResult,
 } from '../../lib/personaDraft';
-import { fmt, useCopy } from '../../i18n';
+import { fmt, useCopy, useLocale } from '../../i18n';
+import { cloneLabel } from '../../lib/cloneLabel';
 import { synthesizePersonaPrompt } from '../../lib/personasApi';
 import { useEscapeOwner } from '../../lib/escapePrecedence';
+import { useModelSet } from '../../lib/modelGateway';
 
 export interface CloneProfileProps {
   /** The clone the rail has selected. Empty when none is. */
@@ -33,8 +35,12 @@ export interface CloneProfileProps {
   onEdit?: (cloneId: string) => void;
   /** Available tools from runtime. */
   availableTools?: readonly string[];
-  /** Available models from runtime. */
-  availableModels?: readonly string[];
+  /** Base tools always included. */
+  baseTools?: readonly string[];
+  /** Write tools that require file-writing capability. */
+  writeTools?: readonly string[];
+  /** Developer mode: the editor offers the clone's own fast model only then. */
+  developerMode?: boolean;
   /** Existing persona names to prevent duplicate names on create. */
   existingNames?: readonly string[];
   /** Whether the workspace directory is writable. */
@@ -81,7 +87,9 @@ export const CloneProfile: React.FC<CloneProfileProps> = ({
   onModeChange,
   onEdit,
   availableTools = [],
-  availableModels = [],
+  baseTools,
+  writeTools = [],
+  developerMode = false,
   existingNames = [],
   canWrite = true,
   onSave,
@@ -89,9 +97,13 @@ export const CloneProfile: React.FC<CloneProfileProps> = ({
   onStudioChange,
 }) => {
   const copy = useCopy();
+  const { language } = useLocale();
   const t = copy.cloneProfile;
   const isCreate = mode === 'create';
   const isEdit = mode === 'edit';
+  // The model sets the editor's pickers choose from, read only while the editor is open.
+  const chatModels = useModelSet('chat', isCreate || isEdit);
+  const imageModels = useModelSet('image', isCreate || isEdit);
 
   const [draft, setDraft] = useState<PersonaDraft>(() =>
     isCreate ? emptyPersonaDraft() : persona ? safeDraftFromPersona(persona) : emptyPersonaDraft(),
@@ -194,11 +206,18 @@ export const CloneProfile: React.FC<CloneProfileProps> = ({
         mode={isCreate ? 'create' : 'edit'}
         existingNames={existingNames}
         availableTools={availableTools}
-        availableModels={availableModels}
+        baseTools={baseTools ?? persona?.base_tools ?? []}
+        writeTools={writeTools}
+        chatModels={chatModels.set}
+        imageModels={imageModels.set}
+        modelsFailed={chatModels.failed !== null || imageModels.failed !== null}
+        developerMode={developerMode}
+        modelCopy={copy.gateway}
         isBuiltin={persona?.builtin ?? false}
         saving={saving}
         error={saveError}
         copy={copy.personaEditor}
+        language={language}
         icons={EDITOR_ICONS}
         isStudio={studio}
         onToggleStudio={onStudioChange ? () => onStudioChange(!studio) : undefined}
@@ -252,21 +271,25 @@ export const CloneProfile: React.FC<CloneProfileProps> = ({
     );
   }
 
-  const name = persona?.name ?? cloneId;
+  // Its handle: what a link and a skill's `hidden_from` name it by. Every request and seat
+  // names it by `cloneId`, and a person reads `label`.
+  const handle = persona?.name ?? cloneId;
+  const label = persona ? cloneLabel(persona, language) : cloneId;
 
   return (
     <div data-testid={`clone-profile-${cloneId}`} className="space-y-4">
       <div className="flex flex-col items-center text-center gap-2">
         <AvatarMenu
-          name={name}
-          imageSrc={personaPicture(name, persona)}
+          name={cloneId}
+          label={label}
+          imageSrc={personaPicture(cloneId, persona)}
           installed={persona !== undefined}
           hasChosenPicture={persona?.avatar_chosen === true}
         />
         {/* The heading is on one line so that a mutation declaration can name it. A needle
             cannot span lines and must occur once in this file; the bare expression below
             appears in the avatar label and the button label too, so the element carries it. */}
-        <h2 data-testid="clone-profile-name" className="text-lg font-semibold text-slate-100">{name}</h2>
+        <h2 data-testid="clone-profile-name" className="text-lg font-semibold text-slate-100">{label}</h2>
         {/* The role, not the name again: for a clone the two are different facts, and the
             name is already the heading an inch above. A clone whose file sets no role says
             so, rather than leaving a gap a reader has to interpret (P6). */}
@@ -276,14 +299,14 @@ export const CloneProfile: React.FC<CloneProfileProps> = ({
         >
           {persona?.role || t.noRole}
         </p>
-        <CloneLinkLine cloneId={cloneId} />
+        <CloneLinkLine cloneId={handle} />
       </div>
 
       <div className="flex items-center gap-2">
         <button
           type="button"
           data-testid="clone-profile-start"
-          aria-label={fmt(t.startLabel, { name })}
+          aria-label={fmt(t.startLabel, { name: label })}
           onClick={() => onStartConversation(cloneId)}
           className="flex-1 flex items-center justify-center gap-2 px-3 py-2 rounded-lg border border-indigo-500/40 bg-indigo-950/40 text-sm font-medium text-indigo-200 hover:bg-indigo-900/50 transition-colors"
         >
@@ -294,11 +317,11 @@ export const CloneProfile: React.FC<CloneProfileProps> = ({
           <button
             type="button"
             data-testid="clone-profile-edit"
-            aria-label={fmt(t.editLabel, { name })}
+            aria-label={fmt(t.editLabel, { name: label })}
             disabled={!canWrite}
             onClick={handleEditClick}
             className="flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg border border-slate-700 bg-slate-800/80 text-sm font-medium text-slate-200 hover:bg-slate-700 hover:text-white transition-colors disabled:opacity-50"
-            title={canWrite ? fmt(copy.personaEditor.editTitle, { name }) : copy.personaEditor.noWorkspace}
+            title={canWrite ? fmt(copy.personaEditor.editTitle, { name: label }) : copy.personaEditor.noWorkspace}
           >
             <Pencil className="w-4 h-4" />
             {t.edit}
@@ -309,12 +332,12 @@ export const CloneProfile: React.FC<CloneProfileProps> = ({
       {persona ? (
         <>
           <PersonaDetail persona={persona} />
-          <CloneSkillNotice cloneId={cloneId} />
+          <CloneSkillNotice cloneId={handle} />
         </>
       ) : (
-        // A clone can be running with no file installed under its name -- the rail builds a
-        // row from the live instance in that case. Saying so is the point: "this clone has no
-        // settings" and "the settings did not load" are the same blank panel otherwise.
+        // A clone can have no file installed under its name -- unhomed personas registered
+        // at runtime. Saying so is the point: "this clone has no definition" and
+        // "the definition did not load" are the same blank panel otherwise.
         <p data-testid="clone-profile-no-definition" className="text-sm text-slate-400 leading-relaxed">
           {t.noDefinition}
         </p>

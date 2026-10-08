@@ -5,7 +5,8 @@
     "artifacts": "문서 및 결과물",
     "remembers": "기억",
     "activity": "활동 및 도구",
-    "resource": "리소스"
+    "resource": "리소스",
+    "browser": "브라우저"
   },
   "chrome": {
     "resize": "끌어서 작업 패널 크기 조절",
@@ -101,7 +102,8 @@
     "copyJson": "JSON 복사",
     "outputPayload": "출력 내용",
     "truncated": "이 출력은 표시를 위해 잘렸습니다. 클론은 전체를 받았습니다.",
-    "errorTrace": "실행 오류 기록"
+    "errorTrace": "실행 오류 기록",
+    "toolFailed": "도구 실행을 완료하지 못했습니다."
   },
   "docs": {
     "filesReadFailed": "이 대화의 파일 목록을 가져오지 못했습니다.",
@@ -151,8 +153,8 @@
     "callFailed": "호출 실패",
     "rowRequest": "요청:",
     "rowResponse": "응답:",
-    "rowRequestNoReason": "요청을 읽을 수 없고, 런타임이 이유를 알려 주지 않았습니다.",
-    "rowResponseNoReason": "응답을 읽을 수 없고, 런타임이 이유를 알려 주지 않았습니다.",
+    "rowRequestNoReason": "요청을 볼 수 없고, 런타임이 이유를 알려 주지 않았습니다.",
+    "rowResponseNoReason": "응답을 볼 수 없고, 런타임이 이유를 알려 주지 않았습니다.",
     "unverified": "저장된 기록으로 다시 만든 요청입니다. 자격 증명처럼 보이는 문자열을 가렸으므로 실제로 보낸 요청과 다를 수 있습니다.",
     "tabs": {
       "request": "요청",
@@ -171,8 +173,8 @@
     "noTools": "이 요청은 모델에 도구를 제공하지 않았습니다.",
     "noRequest": "런타임이 요청도, 요청이 없는 이유도 알려 주지 않았습니다.",
     "noResponse": "런타임이 응답도, 응답이 없는 이유도 알려 주지 않았습니다.",
-    "missingRequest": "요청을 읽을 수 없습니다. 런타임이 알려 준 이유:",
-    "missingResponse": "응답을 읽을 수 없습니다. 런타임이 알려 준 이유:",
+    "missingRequest": "요청을 볼 수 없습니다. 런타임이 알려 준 이유:",
+    "missingResponse": "응답을 볼 수 없습니다. 런타임이 알려 준 이유:",
     "response": {
       "content": "내용",
       "thinking": "생각",
@@ -188,6 +190,7 @@
     "toolResults": "도구 결과 전체",
     "statusNotRecorded": "상태가 기록되지 않음",
     "noOutput": "로그에 이 호출의 출력이 없습니다.",
+    "outputUnavailable": "이 호출의 출력은 더 이상 저장되어 있지 않아 보여 드릴 수 없습니다.",
     "failure": {
       "unreachable": "런타임이 응답하지 않았습니다:",
       "notJson": "런타임이 JSON이 아닌 응답을 보냈습니다.",
@@ -218,10 +221,7 @@
       },
       "details": {
         "body_missing": "기록 일부가 없습니다.",
-        "snapshot_missing": "필요한 컨텍스트 스냅샷이 없습니다.",
         "log_entry_missing": "에포크가 가리키는 항목이 세션 로그에 없습니다.",
-        "chain_broken": "바탕이 되는 이전 요청이 세션 로그에 없습니다.",
-        "before_capture": "요청 캡처가 도입되기 전(#1421)에 기록되었습니다.",
         "unreadable": "기록 일부를 읽지 못했습니다.",
         "epoch_mismatch": "에포크의 항목이 세션 로그와 맞지 않습니다."
       }
@@ -258,6 +258,7 @@
     "historyGaps": "다음 이유로 이 그래프에서 턴이 빠졌을 수 있습니다:",
     "historyComplete": "이 그래프에서 빠진 것으로 알려진 턴은 없습니다.",
     "toolCallGaps": "다음 이유로 표시된 턴에서 도구 호출이 빠졌을 수 있습니다:",
+    "unknownReason": "이 대화의 그래프를 그리지 않았습니다. 런타임이 알려 준 이유:",
     "reasons": {
       "no_seat": "이 대화에 참여 중인 에이전트가 없습니다."
     },
@@ -272,10 +273,6 @@
       "uncounted": "이 대화가 턴 시작을 세기 전에 진행된 턴이 있습니다."
     },
     "toolCallGapReasons": {
-      "saved_without_tools": {
-        "one": "턴 {count}개가 사용한 도구를 기록하지 않은 채 저장되었습니다.",
-        "other": "턴 {count}개가 사용한 도구를 기록하지 않은 채 저장되었습니다."
-      },
       "unreported": {
         "one": "턴 {count}개가 사용한 도구를 보고하기 전에 끝났습니다.",
         "other": "턴 {count}개가 사용한 도구를 보고하기 전에 끝났습니다."
@@ -302,6 +299,178 @@
       "success": "성공",
       "running": "실행 중",
       "error": "오류"
+    }
+  },
+  "story": {
+    "back": "파일로 돌아가기",
+    "refresh": "이야기 다시 읽기",
+    "loading": "이야기를 불러오는 중…",
+    "loadFailed": "이야기를 표시할 수 없습니다.",
+    "tryAgain": "다시 시도",
+    "decideFailed": "결정을 저장하지 못했습니다.",
+    "waiting": "결정을 기다리는 변경",
+    "noneWaiting": "결정을 기다리는 변경이 없습니다. 제안된 것이 없거나 모두 결정했습니다.",
+    "outline": "개요",
+    "sceneOrder": "씬 순서",
+    "readingOrder": "읽는 순서",
+    "storyOrder": "일어난 순서",
+    "codex": "설정집",
+    "noEntries": "설정집에 아직 {label} 항목이 없습니다.",
+    "looks": "외모: {looks}",
+    "unreadable": "다음 파일을 읽지 못해 표시하지 않습니다:",
+    "codexUnreadable": "다음 파일이나 폴더를 읽지 못해 표시하지 않습니다:",
+    "decided": "결정한 변경",
+    "noneDecided": "아직 결정한 변경이 없습니다.",
+    "proposedIn": "“{title}” 대화에서 제안",
+    "proposedInUnreadable": "읽을 수 없는 대화에서 제안",
+    "proposedInGone": "지금은 없는 대화에서 제안",
+    "from": "근거가 된 원고",
+    "quoteGone": "이 구절은 이제 씬에 없습니다.",
+    "quoteUnchecked": "씬에 아직 원고가 없어 이 구절을 확인할 수 없습니다.",
+    "notSet": "없음",
+    "fromStart": "처음부터",
+    "after": "“{scene}” 뒤부터",
+    "unplaced": "이 씬은 개요에 없어서, ‘지금’은 항목의 처음 상태입니다.",
+    "what": "항목",
+    "when": "시점",
+    "now": "지금",
+    "ifApproved": "승인하면",
+    "fileChange": "항목 파일: 지금과 승인했을 때",
+    "approve": "승인",
+    "reject": "거절",
+    "rejectReason": "거절 이유 (선택)",
+    "confirmReject": "이 변경 거절",
+    "keep": "계속 결정하기",
+    "openConfirmed": "확인된 창 열기",
+    "windowOpened": "브라우저에 확인된 창을 열었습니다. 그 창에서 결정해 주세요.",
+    "windowFailed": "확인된 창을 열지 못했습니다.",
+    "applied": "{name}에 대한 변경을 반영했습니다.",
+    "rejected": "{name}에 대한 변경을 거절했습니다.",
+    "appliedHere": "여기서 승인함",
+    "appliedInConversation": "대화에서 승인함",
+    "appliedElsewhere": "승인함",
+    "rejectedHere": "여기서 거절함",
+    "rejectedInConversation": "대화에서 거절함",
+    "rejectedElsewhere": "거절함",
+    "unwritten": "아직 쓰지 않음",
+    "kinds": {
+      "characters": "인물",
+      "places": "장소",
+      "items": "물건",
+      "threads": "복선"
+    },
+    "board": {
+      "written": "씀",
+      "planned": "계획",
+      "twist": "반전이 드러나는 장",
+      "climax": "갈등이 결판나는 장",
+      "functions": {
+        "setup": "도입",
+        "complication": "갈등",
+        "escalation": "고조",
+        "reversal": "반전",
+        "climax": "절정",
+        "resolution": "결말"
+      },
+      "inScene": "이 씬에 나오는 것",
+      "how": {
+        "mentioned": "언급",
+        "planted": "여기서 심음",
+        "paid_off": "여기서 회수"
+      },
+      "notInCodex": "{name} (아직 설정집에 없음)",
+      "showInCodex": "설정집에서 {name} 보기",
+      "changesHere": "이 씬에서 바뀌는 설정",
+      "looksAdded": "외모: + {looks}",
+      "looksRemoved": "외모: − {looks}",
+      "findings": "설정과 어긋나는 곳",
+      "checkedClean": "쓴 뒤 확인했습니다. 읽은 내용 가운데 설정과 어긋나는 것은 없었습니다.",
+      "unread": "쓴 뒤 확인에서 이 씬을 읽지 못했습니다.",
+      "waiting": {
+        "one": "결정을 기다리는 변경 {count}개",
+        "other": "결정을 기다리는 변경 {count}개"
+      }
+    },
+    "notes": {
+      "no_writer": "“{title}”을(를) 쓰고 있는 대화가 없어 결정을 저장할 수 없습니다. 대화에서 이야기를 연 뒤 여기서 결정해 주세요.",
+      "writer_gone": "“{title}”을(를) 쓰던 대화가 이제 없어 결정을 저장할 수 없습니다. 대화에서 이야기를 연 뒤 여기서 결정해 주세요.",
+      "start_unreadable": "이 이야기를 시작한 기록을 읽지 못해, 보드에 각 장이 하는 일과 쓴 뒤 확인한 내용을 보여 드리지 못합니다.",
+      "no_outline": "이 이야기에는 아직 개요가 없습니다.",
+      "outline_unreadable": "개요를 읽지 못했습니다."
+    },
+    "refusals": {
+      "story_gone": "이 이야기는 이제 파일에 없습니다. 파일로 돌아가 있는 이야기를 확인해 주세요.",
+      "no_writer": "이 이야기를 쓰고 있는 대화가 없어 결정을 저장하지 못했습니다. 대화에서 이야기를 연 뒤 여기서 결정해 주세요.",
+      "writer_gone": "이 이야기를 쓰던 대화가 이제 없어 결정을 저장하지 못했습니다. 대화에서 이야기를 연 뒤 여기서 결정해 주세요.",
+      "writer_busy": "이 이야기를 쓰는 대화가 지금 답하고 있어 결정을 저장하지 못했습니다. 답이 끝난 뒤 다시 시도해 주세요."
+    }
+  },
+  "browser": {
+    "title": "브라우저",
+    "noRoom": "열린 대화가 없습니다. 사이드바에서 대화를 열면 브라우저를 사용할 수 있습니다.",
+    "noTabs": "열린 탭이 없습니다",
+    "addressPlaceholder": "검색 또는 웹 주소 입력",
+    "takeOver": "제어권 가져오기",
+    "giveBack": "{name}에게 넘기기",
+    "handTo": "넘기기…",
+    "newTab": "새 탭",
+    "stop": "중지",
+    "getChrome": "Chrome 다운로드",
+    "addToChrome": "Chrome에 추가",
+    "restart": "다시 시작",
+    "lastStep": "마지막 단계: {step}",
+    "lastStepNone": "아직 수행한 작업이 없습니다",
+    "banner": {
+      "acting": "{name}이(가) 브라우저를 사용하고 있습니다",
+      "idle": "대기 중입니다 — {name}이(가) 작업을 마쳤습니다",
+      "userControl": "지금 직접 제어하고 있습니다",
+      "askedUser": "{name}이(가) {site}에 로그인을 요청했습니다",
+      "chromeMissing": "Google Chrome이 설치되어 있지 않습니다. 클론이 브라우저를 사용하려면 Chrome이 필요합니다.",
+      "extensionMissing": "내 Chrome 연결: UClone-X 확장 프로그램을 추가하십시오",
+      "crashed": "브라우저가 예기치 않게 중지되었습니다.",
+      "none": "이 대화에서 열린 브라우저가 없습니다. 클론이 웹 페이지를 열면 여기에서 볼 수 있습니다.",
+      "closed": "브라우저가 닫혔습니다. 클론이 다음에 브라우저를 사용할 때 다시 열립니다."
+    },
+    "tabsLabel": "열린 탭",
+    "tabName": "{name} · {title}",
+    "untitled": "새 탭",
+    "address": "페이지 주소",
+    "connecting": "브라우저에 연결하는 중입니다…",
+    "lost": "실시간 화면이 연결되어 있지 않습니다. 다시 연결하고 있습니다…",
+    "connect": {
+      "hint": "지금은 클론이 UClone-X가 여는 별도의 Chrome 창을 사용합니다. 내 Chrome을 사용하게 하려면 연결하십시오.",
+      "action": "내 Chrome 연결"
+    },
+    "view": {
+      "label": "{name}의 탭 실시간 화면",
+      "paused": "이 탭이 숨겨져 있는 동안에는 페이지를 표시하지 않습니다.",
+      "waiting": "페이지가 표시되기를 기다리고 있습니다…"
+    },
+    "steps": {
+      "open": "페이지를 열었습니다",
+      "snapshot": "페이지를 살펴보았습니다",
+      "read": "페이지를 읽었습니다",
+      "find": "페이지에서 찾았습니다",
+      "click": "클릭했습니다",
+      "clickOn": "\"{element}\"을(를) 클릭했습니다",
+      "type": "입력란에 입력했습니다",
+      "typeOn": "\"{element}\"에 입력했습니다",
+      "select": "옵션을 선택했습니다",
+      "selectOn": "\"{element}\"에서 옵션을 선택했습니다",
+      "check": "확인란 상태를 전환했습니다",
+      "checkOn": "\"{element}\" 상태를 전환했습니다",
+      "press": "키를 눌렀습니다",
+      "scroll": "페이지를 스크롤했습니다",
+      "upload": "파일을 선택했습니다",
+      "uploadOn": "\"{element}\"에 파일을 선택했습니다",
+      "wait": "페이지를 기다렸습니다",
+      "back": "뒤로 이동했습니다",
+      "forward": "앞으로 이동했습니다",
+      "reload": "페이지를 새로 고쳤습니다",
+      "tab": "탭을 전환했습니다",
+      "other": "브라우저를 사용했습니다",
+      "failed": "{step} — 실패했습니다",
+      "show": "브라우저 탭에서 보기"
     }
   }
 }

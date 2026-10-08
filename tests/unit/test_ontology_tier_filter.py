@@ -14,7 +14,6 @@ from uclone_x.llm.protocols import LLMProviderProtocol
 from uclone_x.ontology.engine import OntologyEngine
 from uclone_x.ontology.models import (
     OntologyAxiom,
-    OntologyInvariant,
     OntologyTier,
 )
 
@@ -90,9 +89,9 @@ def test_get_active_invariants_tier_filtering() -> None:
         domain="operations",
     )
 
-    assert isinstance(ax_core, OntologyInvariant)
-    assert isinstance(ax_domain, OntologyInvariant)
-    assert isinstance(ax_asserted, OntologyInvariant)
+    assert isinstance(ax_core, OntologyAxiom)
+    assert isinstance(ax_domain, OntologyAxiom)
+    assert isinstance(ax_asserted, OntologyAxiom)
     assert isinstance(ax_cand1, OntologyAxiom)
     assert isinstance(ax_cand2, OntologyAxiom)
 

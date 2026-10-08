@@ -29,7 +29,6 @@ import logging
 from collections import deque
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Protocol
 
 from uclone_x.agent.models import AgentConfig, AgentContext
@@ -41,13 +40,11 @@ from uclone_x.core.context_state import (
     ContextEntry,
     compacted_entries,
     derive_compacted_forms,
-    recorded_forms,
-    recorded_renderings,
+    opening_entries,
     shown_entries,
 )
-from uclone_x.core.session_log import LoggedMessage
 from uclone_x.core.session_store import SessionStoreProtocol
-from uclone_x.core.tool_results import TOOL_RESULT_READ_TOOL
+from uclone_x.core.tool_results import TOOL_RESULT_READ_TOOL, ResultBodies
 from uclone_x.engine.event_bus import AgentEvent, EventPriority, EventType
 from uclone_x.engine.protocols import PublisherHandleProtocol
 from uclone_x.llm.compactor import ContextCompactor
@@ -124,13 +121,13 @@ class CompactionScope:
     #: The per-session compactors, the dict itself.
     session_compactors: Callable[[], dict[str, ContextCompactorProtocol]]
     #: The active session's history.
-    history: Callable[[], list[ChatMessage]]
+    history: Callable[[], Sequence[ChatMessage]]
     # -- the agent's methods, as getters of the current bound method --------------
     live_session: Callable[[], Callable[[str], _LiveSession]]
     effective_session_id: Callable[[], Callable[[str | None], str]]
     refuse_session_mutation_during_turn: Callable[[], Callable[[str, str], None]]
     write_pending_bodies: Callable[[], Callable[[str], None]]
-    resolve_workspace_root: Callable[[], Callable[[], Path | None]]
+    result_bodies: Callable[[], Callable[[str], ResultBodies]]
     context_window: Callable[[], Callable[[], int | None]]
     explicit_threshold: Callable[[], Callable[[int], int | None]]
     observe_context_window: Callable[[], Callable[[], Awaitable[None]]]
@@ -197,7 +194,7 @@ class CompactionDriver:
         return self._scope.session_compactors()
 
     @property
-    def _history(self) -> list[ChatMessage]:
+    def _history(self) -> Sequence[ChatMessage]:
         return self._scope.history()
 
     # -- the agent's methods, called back through it -------------------------------
@@ -219,8 +216,8 @@ class CompactionDriver:
         return self._scope.write_pending_bodies()
 
     @property
-    def _resolve_workspace_root(self) -> Callable[[], Path | None]:
-        return self._scope.resolve_workspace_root()
+    def _result_bodies(self) -> Callable[[str], ResultBodies]:
+        return self._scope.result_bodies()
 
     @property
     def _context_window(self) -> Callable[[], int | None]:
@@ -284,10 +281,7 @@ class CompactionDriver:
             return self._injected_compactor
         compactor = self._session_compactors.get(session_id)
         if compactor is None:
-            compactor = ContextCompactor(
-                workspace_root=self._resolve_workspace_root(),
-                session_id=session_id,
-            )
+            compactor = ContextCompactor()
             self._session_compactors[session_id] = compactor
         return compactor
 
@@ -354,6 +348,9 @@ class CompactionDriver:
                     t.name == TOOL_RESULT_READ_TOOL for t in self._tool_invoker.held_tools()
                 )
             compactor.tool_result_reader = reader_offered
+            # Where a pruned result's full text is kept and a stored one is read back:
+            # this session's log, whatever the workspace (#1848).
+            compactor.result_bodies = self._result_bodies(sid)
 
         before_messages = list(live.messages)
         tokens_before = compactor.estimate_tokens(before_messages)
@@ -391,14 +388,14 @@ class CompactionDriver:
         # as the entry it replaced, under the same ids, instead of logging it as an entry
         # of its own. Those are computed on the working copy, which is put back if the
         # write fails (`_Undo`).
-        live.log_history()
         undo = _Undo.of(live)
         try:
-            # `entry_ids` and `to_state` log the compacted history: the summary enters the
-            # log at the turn it was made in, and the log's count of what the history
-            # holds drops the folded turns, so a message identical to one of them that
-            # arrives later is logged when it enters (#1443).
-            live.messages = list(compacted)
+            # The compacted history goes in through the session's one door, which logs it:
+            # a message that stayed keeps its entry, the summary enters the log at the
+            # turn it was made in, and the folded turns leave the history, so a message
+            # identical to one of them that arrives later is logged when it enters
+            # (#1443, #1848).
+            live.replace_history(compacted, cause="compaction")
             # The new epoch's entries and forms, derived from the entries the history
             # showed before the compaction: a pruned message is the entry it replaced, in
             # a smaller form, and its logged body is that form's rendering. The next
@@ -417,10 +414,10 @@ class CompactionDriver:
         except BaseException:
             undo.restore(live)
             raise
-        live.messages = list(new_state.messages)
         # The one point the tools layer may shrink (design §5.1): binding restarts from the
-        # base set and a pinned session retries.
-        live.bound_tools.clear()
+        # base set and a pinned session retries. Reseeds recent catalog tools so repeat calls
+        # on Ollama ("do it again") are not dropped without an error (#2168).
+        self._tool_invoker.reseed_bound_tools_post_compaction(live)
         live.tools_pin_all = False
         # Adopt the revision the store wrote, for the reason spelled out in
         # `persist_session`: a working copy holding a revision the record has moved past
@@ -599,9 +596,10 @@ class _Undo:
     """What a compaction changes on the working copy before its write, to put back if the
     write fails. The log only grows, so it is put back by length."""
 
-    messages: list[ChatMessage]
+    edited: list[str] | None
+    head: tuple[str, ...]
+    mark: int
     log_length: int
-    aligned: list[tuple[ChatMessage, LoggedMessage, str]] | None
     pending_bodies: dict[str, str]
     compacted_entries: dict[str, ContextEntry]
     epoch_causes: list[str]
@@ -609,18 +607,22 @@ class _Undo:
     @classmethod
     def of(cls, live: _LiveSession) -> _Undo:
         return cls(
-            messages=list(live.messages),
+            edited=None if live.edited is None else list(live.edited),
+            head=live.head,
+            mark=live.mark,
             log_length=len(live.session_log),
-            aligned=live.aligned,
             pending_bodies=dict(live.pending_bodies),
             compacted_entries=live.compacted_entries,
             epoch_causes=list(live.epoch_causes),
         )
 
     def restore(self, live: _LiveSession) -> None:
-        live.messages = self.messages
+        # The history is derived from these and the log (#1848), so they go back with it.
+        live.edited = self.edited
+        live.head = self.head
+        live.mark = self.mark
+        live.view = None
         del live.session_log[self.log_length :]
-        live.aligned = self.aligned
         live.pending_bodies = self.pending_bodies
         live.compacted_entries = self.compacted_entries
         live.epoch_causes = self.epoch_causes
@@ -635,18 +637,15 @@ def _derive_forms(
     """The entries and forms a compaction's result shows (`derive_compacted_forms`, #1848).
 
     Derived from what the history before it showed -- each message's entry and form, read
-    from the log and the epochs as a request reads them (`shown_entries`) -- not from the
-    messages the compactor wrote. `None` when the compactor did not say where its messages
+    from the log and the epoch in force as a request reads them (`opening_entries`) --
+    not from the messages the compactor wrote. `None` when the compactor did not say where its messages
     came from (an injected compactor may not), or said it inconsistently: the next request
-    then reads each message as its own entry, as it does for any history (`shown_form`).
+    then reads each message as its own entry, in the form recorded on it (`message_form`).
     """
     if not origins:
         return None
-    epochs = live.context_epochs
     showing = shown_entries(
-        live.logged_history(),
-        recorded_forms(epochs),
-        {**recorded_renderings(epochs), **live.compacted_entries},
+        live.logged_history(), opening_entries(live.context_epochs, live.compacted_entries)
     )
     try:
         return derive_compacted_forms(list(zip(showing, before, strict=True)), after, origins)

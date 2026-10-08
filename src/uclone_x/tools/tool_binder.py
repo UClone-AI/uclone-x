@@ -2,10 +2,19 @@
 
 The tools layer of a request is a pinned base set (design §5.1). On a small local model
 the rest of the tools the agent holds -- the catalog -- stay out of the request until a
-user message needs them: before the turn, the host embeds the message, and the top
-`BIND_TOP_K` catalog tools scoring at least `BIND_MIN_SCORE` are appended to the set.
-The set only grows until compaction, so the request prefix breaks at most once per user
-message and never by a tool disappearing.
+user message needs them: before the turn, the host ranks the catalog against the message
+and appends what it binds to the set. The set only grows until compaction, so the request
+prefix breaks at most once per user message and never by a tool disappearing.
+
+**How a message binds (#2190).** The message is cut into clauses at sequence markers
+(`tool_ranking.split_clauses`). The whole message and each clause are embedded in one
+call; for each, the catalog tools whose cosine similarity reaches `BIND_MIN_SCORE` are
+ranked by reciprocal-rank fusion of that similarity with BM25 over the tools' names and
+descriptions (BM25 reorders, it never makes a tool eligible). A one-clause message binds
+its top `BIND_TOP_K`. A message of several clauses binds each clause's top
+`BIND_PER_CLAUSE` and the whole message's first, interleaved, so a two-part request no
+longer lets its stronger part take every slot. Either way the result keeps one tool per
+action across servers unless the message names the server (`tool_ranking.dedupe`).
 
 This replaces the per-turn scoper, which re-chose the advertised tools on every turn. In
 the `tool_strategy` eval (#1670) that changed the tools layer on 11 of 19 request pairs,
@@ -39,6 +48,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from uclone_x.errors import PlainRefusalError
 from uclone_x.tools.base import BaseTool
+from uclone_x.tools.tool_ranking import BM25, dedupe, interleave, rrf, split_clauses
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Sequence
@@ -49,8 +59,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-#: How many catalog tools one user message may bind.
+#: How many catalog tools a one-clause user message may bind.
 BIND_TOP_K = 3
+#: How many catalog tools each clause of a several-clause message may bind; the whole
+#: message's best tool is bound beside them.
+BIND_PER_CLAUSE = 2
 #: The lowest cosine similarity that binds a tool. Calibrated in #1670 with bge-m3, where
 #: it was what kept the one task needing no tool (top score 0.34) from binding any.
 BIND_MIN_SCORE = 0.35
@@ -93,23 +106,47 @@ class ToolBinder:
         *,
         top_k: int = BIND_TOP_K,
         min_score: float = BIND_MIN_SCORE,
+        per_clause: int = BIND_PER_CLAUSE,
     ) -> None:
         self._embedder = embedder
         self._top_k = top_k
         self._min_score = min_score
+        self._per_clause = per_clause
         self._vectors: dict[str, tuple[float, ...]] = {}
+        self._lexical: tuple[tuple[str, ...], BM25] | None = None
         self._failure_logged = False
         #: Calls made to the embedder for catalog text; one per batch of new descriptions.
         self.catalog_embed_calls = 0
 
+    @property
+    def embedder(self) -> EmbedderProtocol:
+        """The embedder this binder ranks with; other host work may embed through it too."""
+        return self._embedder
+
     async def bind(self, message: str, catalog: Sequence[ToolDefinition]) -> tuple[str, ...] | None:
         """The names `message` binds from `catalog`, best first; `None` if the embedder failed.
 
-        At most `top_k` names, each scoring at least `min_score`. Ties break by name, so
-        the same message and catalog always bind the same tools. An empty message or an
-        empty catalog binds nothing and costs no embedding call.
+        Every name scores at least `min_score` against the whole message or one of its
+        clauses. A one-clause message binds at most `top_k`; a message of several clauses
+        binds at most `per_clause` per clause plus the whole message's first (module
+        docstring). The same message and catalog always bind the same tools. An empty
+        message or an empty catalog binds nothing and costs no embedding call.
         """
-        return await self._rank(message, catalog)
+        if not message.strip() or not catalog:
+            return ()
+        clauses = split_clauses(message)
+        queries = [message, *clauses] if len(clauses) > 1 else [message]
+        vectors = await self._embed_queries(queries, catalog)
+        if vectors is None:
+            return None
+        whole = self._fused(message, vectors[0], catalog)
+        if len(queries) == 1:
+            return tuple(dedupe(whole, message)[: self._top_k])
+        lists = [
+            dedupe(self._fused(clause, vector, catalog), clause)[: self._per_clause]
+            for clause, vector in zip(clauses, vectors[1:], strict=True)
+        ]
+        return tuple(dedupe(interleave([*lists, whole[:1]]), message))
 
     async def search(self, query: str, catalog: Sequence[ToolDefinition]) -> tuple[str, ...] | None:
         """The names `search_tools(query)` finds in `catalog`; `None` if the embedder failed.
@@ -121,11 +158,23 @@ class ToolBinder:
         return await self._rank(query, catalog)
 
     async def _rank(self, text: str, catalog: Sequence[ToolDefinition]) -> tuple[str, ...] | None:
+        """`search`'s ranking: the dense ranking of `text` whole, at most `top_k`."""
         if not text.strip() or not catalog:
             return ()
+        vectors = await self._embed_queries([text], catalog)
+        if vectors is None:
+            return None
+        return tuple(self._dense(vectors[0], catalog)[: self._top_k])
+
+    async def _embed_queries(
+        self, queries: Sequence[str], catalog: Sequence[ToolDefinition]
+    ) -> tuple[tuple[float, ...], ...] | None:
+        """One vector per query (one embedding call), or `None` once the embedder fails."""
         try:
             await self._embed_catalog(catalog)
-            (query,) = await self._embedder.embed([text])
+            vectors = await self._embedder.embed(list(queries))
+            if len(vectors) != len(queries):
+                raise ValueError("the embedder returned a different number of vectors than texts")
         except Exception as exc:  # any embedder failure means pin-all, never a crash
             if not self._failure_logged:
                 self._failure_logged = True
@@ -134,12 +183,32 @@ class ToolBinder:
                     type(exc).__name__,
                 )
             return None
+        return tuple(vectors)
+
+    def _dense(self, query: Sequence[float], catalog: Sequence[ToolDefinition]) -> list[str]:
+        """Every catalog tool scoring at least `min_score`, best first, ties by name."""
         scored = [
             (_cosine(query, self._vectors[_text_key(_tool_text(t))]), t.name) for t in catalog
         ]
         kept = [(score, name) for score, name in scored if score >= self._min_score]
         kept.sort(key=lambda entry: (-entry[0], entry[1]))
-        return tuple(name for _, name in kept[: self._top_k])
+        return [name for _, name in kept]
+
+    def _fused(
+        self, text: str, query: Sequence[float], catalog: Sequence[ToolDefinition]
+    ) -> list[str]:
+        """`_dense`, reordered by reciprocal-rank fusion with BM25; only dense-eligible tools."""
+        dense = self._dense(query, catalog)
+        eligible = set(dense)
+        lexical = self._bm25(catalog).ranking(text, [t.name for t in catalog])
+        return [name for name in rrf([dense, lexical]) if name in eligible]
+
+    def _bm25(self, catalog: Sequence[ToolDefinition]) -> BM25:
+        """The BM25 index of `catalog`, rebuilt only when the catalog's text changes."""
+        key = tuple(_text_key(_tool_text(t)) for t in catalog)
+        if self._lexical is None or self._lexical[0] != key:
+            self._lexical = (key, BM25([f"{t.name} {t.description}" for t in catalog]))
+        return self._lexical[1]
 
     async def _embed_catalog(self, catalog: Sequence[ToolDefinition]) -> None:
         missing: dict[str, str] = {}
@@ -231,6 +300,7 @@ def tool_binder_for(
 
 __all__ = [
     "BIND_MIN_SCORE",
+    "BIND_PER_CLAUSE",
     "BIND_TOP_K",
     "LOCAL_BINDING_PROVIDERS",
     "SEARCH_TOOLS_NAME",

@@ -1,8 +1,8 @@
 """Agent Client Protocol (ACP) subsystem.
 
 Today this package holds only the conformance registry — the single source for what we claim
-to answer, checked against `docs/acp-protocol-spec.md`. The stdio JSON-RPC shell itself is
-#649 and lands here beside it.
+to answer, checked against the ACP protocol specification (`docs/public/protocols.md`).
+The stdio JSON-RPC shell itself is #649 and lands here beside it.
 """
 
 from uclone_x.acp.conformance import (

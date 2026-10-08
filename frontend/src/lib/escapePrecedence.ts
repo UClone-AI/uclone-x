@@ -13,11 +13,15 @@ import { useEffect, useRef } from 'react';
  *
  * Every consumer registers a layer with `useEscapeOwner` instead of adding its own
  * listener. On Escape, only the highest-precedence *active* layer's handler runs. The
- * order -- recorded in `docs/ui-dashboard-architecture.md` -- is: a focus-trapped dialog
+ * order -- recorded in the dashboard architecture document -- is: a focus-trapped dialog
  * outranks a running turn, which outranks a transient overlay, which outranks the clone
  * editor's Studio mode (#1377). Studio mode is last because it is a mode rather than a
  * transient: whatever is open on top of it closes first. The dock itself claims none of
  * them; that is a decision, not an omission (see the doc).
+ */
+/**
+ * The escape layers in precedence order.
+ * Exported as the layer type parameter for `useEscapeOwner` and consumers registering escape handlers.
  */
 export type EscapeLayer = 'dialog' | 'turn' | 'overlay' | 'studio';
 
@@ -32,8 +36,8 @@ const registrations = new Map<symbol, Registration>();
 let attached = false;
 
 /**
- * Which layer wins when `activeLayers` are the ones currently registered. Exported so the
- * precedence order itself has a unit test that needs no DOM.
+ * Which layer wins when `activeLayers` are the ones currently registered.
+ * Exported so the precedence order itself has a unit test that needs no DOM (exercised by `escapePrecedence.test.tsx`).
  */
 export function pickEscapeLayer(activeLayers: readonly EscapeLayer[]): EscapeLayer | null {
   for (const layer of PRECEDENCE) {

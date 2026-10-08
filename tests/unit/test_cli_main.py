@@ -14,10 +14,22 @@ import typer
 import yaml
 from typer.testing import CliRunner
 
+from tests.support.clones import make_clones
 from uclone_x.cli import main
 from uclone_x.cli.commands import dev, llm
 from uclone_x.errors import LLMProviderNotConfiguredError
 from uclone_x.llm import create_llm_connector
+
+# The agent ids these tests run as. Each is a clone now, since a name no clone carries is
+# refused rather than given a home (clone-data-scopes §3.4); persona-less, so each speaks as
+# the prompt the test gives it.
+_RUN_CLONES = ("test_bot", "interactive_bot")
+
+
+@pytest.fixture(autouse=True)
+def _run_clones() -> None:  # pyright: ignore[reportUnusedFunction]
+    make_clones(*_RUN_CLONES)
+
 
 runner = CliRunner()
 
@@ -759,13 +771,6 @@ def test_cli_test_check(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
     assert captured["test_scope"] == "gate"
     assert captured["fail_fast"] is True
 
-    # `--all` is now a no-op synonym: the default gate already includes E2E. Kept because
-    # it appears in AGENTS.md and the review checklist, and silently removing a documented
-    # flag is worse than honouring it.
-    result_all = runner.invoke(main.app, ["test", "check", "--all"])
-    assert result_all.exit_code == 0
-    assert captured["test_scope"] == "gate"
-
     # `--fast` is the opt-out that drops the browser suite.
     result_fast = runner.invoke(main.app, ["test", "check", "--fast"])
     assert result_fast.exit_code == 0
@@ -930,15 +935,10 @@ def _flat(output: str) -> str:
     return " ".join(output.split())
 
 
-@pytest.mark.parametrize(
-    "args", [["test", "check"], ["test", "check", "--all"]], ids=["plain", "all"]
-)
 def test_a_passing_full_gate_on_a_clean_commit_records_head(
-    args: list[str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The record is written for exactly HEAD, and the run says so on one line.
-
-    `--all` is a no-op synonym for the default scope, so it records too.
 
     Killed by: src/uclone_x/cli/quality_gate.py :: record.touch()
     Becomes: pass
@@ -946,7 +946,7 @@ def test_a_passing_full_gate_on_a_clean_commit_records_head(
     repo = _committed_repo(tmp_path, monkeypatch)
     _fake_gate_verdict(monkeypatch, 0)
 
-    result = runner.invoke(main.app, args)
+    result = runner.invoke(main.app, ["test", "check"])
 
     assert result.exit_code == 0, result.output
     sha = _head_of(repo)

@@ -71,7 +71,7 @@ _MAX_ID_LENGTH = 80
 _MAX_SLUG_LENGTH = 40
 #: Files the operating system leaves in a folder it has shown, compared case-insensitively.
 #: They are not the writer's, so they are left out like hidden files (#1595).
-_SYSTEM_FILES = frozenset({"thumbs.db", "ehthumbs.db", "desktop.ini"})
+_SYSTEM_FILES = frozenset({"thumbs.db", "ehthumbs.db", "desktop.ini", "icon\r"})
 
 
 class StoryError(PlainRefusalError):
@@ -314,6 +314,14 @@ class StoryLibrary:
             return record
         raise StoryError("Could not find a free name for the new story. Try another title.")
 
+    def set_genre(self, story_id: str, holder: str, genre: str) -> StoryRecord:
+        """Record the story's genre, for the conversation that holds its lease."""
+        folder = self.root(story_id)
+        record = self._require_writer(folder, story_id, holder)
+        updated = record.model_copy(update={"genre": genre})
+        self._save(folder, updated)
+        return updated
+
     def open(self, story_id: str, conversation_id: str) -> StoryOpening:
         """Open a story in `conversation_id`: writable if the lease is free or already ours."""
         folder = self.root(story_id)
@@ -379,7 +387,7 @@ class StoryLibrary:
         """The story-relative names of the files directly in `relative_dir`, sorted.
 
         Hidden files (a leading `.`) and the files an operating system leaves behind
-        (`Thumbs.db`, `desktop.ini`) are left out; a missing directory has none.
+        (`Thumbs.db`, `desktop.ini`, `Icon\r`) are left out; a missing directory has none.
         """
         folder = self.root(story_id)
         directory = self._member(folder, relative_dir)

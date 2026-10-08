@@ -214,7 +214,7 @@ class TestOntologyIsClonesOwn:
 
         Killed by: src/uclone_x/agent/clone_builder.py :: host = dataclasses.replace(host, ontology=app.ontology_for(clone_id))
         Becomes: host = dataclasses.replace(host, ontology=app.ontology_for("clone"))
-        Killed by: src/uclone_x/agent/clone_builder.py :: engines[clone_id] = existing
+        Killed by: src/uclone_x/agent/clone_builder.py :: engines[key] = existing
         Becomes: pass
         """
         resolver = RoomAgentResolver(host, ontology_for=ontology_map())
@@ -429,21 +429,20 @@ class TestPersonaModelSelection:
                 # Deliberately not a model any default could coincide with: a real
                 # default would let this pass while resolution silently ignored the
                 # persona, which is the failure the test exists to catch.
-                llm_config=AgentLLMConfig(model_name="qwen3:32b-a-very-specific-tag"),
+                llm_config=AgentLLMConfig(model_name="ollama/qwen3:32b-a-very-specific-tag"),
             )
         )
         resolver = RoomAgentResolver(host, persona_registry=registry)
         participant = Participant(
-            id="author",
+            id="novelist",
             kind=ParticipantKind.AGENT,
             display_name="Author",
-            persona="novelist",
-            session_id="sess_room__r1__author",
+            session_id="sess_room__r1__novelist",
         )
 
         agent = await resolver.resolve(participant)
 
-        assert agent.config.llm_config.model_name == "qwen3:32b-a-very-specific-tag", (
+        assert agent.config.llm_config.model_name == "ollama/qwen3:32b-a-very-specific-tag", (
             "the seat was composed against some other model than the one its persona configures"
         )
 
@@ -465,7 +464,7 @@ class TestPersonaModelSelection:
                 role="Creative Fiction Writer",
                 description="Specialist in narrative prose.",
                 system_prompt="You are a novelist.",
-                llm_config=AgentLLMConfig(model_name="qwen3:32b-a-very-specific-tag"),
+                llm_config=AgentLLMConfig(model_name="ollama/qwen3:32b-a-very-specific-tag"),
             )
         )
         resolver = RoomAgentResolver(
@@ -474,11 +473,10 @@ class TestPersonaModelSelection:
             persona_registry=registry,
         )
         participant = Participant(
-            id="author",
+            id="novelist",
             kind=ParticipantKind.AGENT,
             display_name="Author",
-            persona="novelist",
-            session_id="sess_room__r1__author",
+            session_id="sess_room__r1__novelist",
         )
 
         agent = await resolver.resolve(participant)
@@ -513,7 +511,7 @@ class TestPersonaModelSelection:
                 role="Creative Fiction Writer",
                 description="Specialist in narrative prose.",
                 system_prompt="You are a novelist.",
-                llm_config=AgentLLMConfig(model_name="own-deep", fast_model="own-fast"),
+                llm_config=AgentLLMConfig(model_name="box/own-deep", fast_model="box/own-fast"),
             )
         )
         models: dict[str, str | None] = {"deep": "settings-deep", "fast": None}
@@ -523,23 +521,23 @@ class TestPersonaModelSelection:
             global_models=lambda: (models["deep"], models["fast"]),
         )
 
-        def seat(pid: str, persona: str) -> Participant:
+        def seat(pid: str) -> Participant:
+            # A seat is its clone: its persona is found by its id.
             return Participant(
                 id=pid,
                 kind=ParticipantKind.AGENT,
                 display_name=pid,
-                persona=persona,
                 session_id=f"sess_room__r1__{pid}",
             )
 
-        follower = cast(BaseAgent, await resolver.resolve(seat("helper", "plain")))
-        owner = cast(BaseAgent, await resolver.resolve(seat("author", "novelist")))
+        follower = cast(BaseAgent, await resolver.resolve(seat("plain")))
+        owner = cast(BaseAgent, await resolver.resolve(seat("novelist")))
 
         # Fast left empty in Settings means deep.
         assert follower.config.llm_config.model_name == "settings-deep"
         assert follower.config.llm_config.fast_model == "settings-deep"
-        assert owner.config.llm_config.model_name == "own-deep"
-        assert owner.config.llm_config.fast_model == "own-fast"
+        assert owner.config.llm_config.model_name == "box/own-deep"
+        assert owner.config.llm_config.fast_model == "box/own-fast"
 
         models.update(deep="settings-deep-2", fast="settings-fast-2")
         replacement = MockLLMConnector()
@@ -549,8 +547,8 @@ class TestPersonaModelSelection:
         assert follower.config.llm_config.model_name == "settings-deep-2"
         assert follower.config.llm_config.fast_model == "settings-fast-2"
         assert owner.llm is replacement
-        assert owner.config.llm_config.model_name == "own-deep"
-        assert owner.config.llm_config.fast_model == "own-fast"
+        assert owner.config.llm_config.model_name == "box/own-deep"
+        assert owner.config.llm_config.fast_model == "box/own-fast"
 
     @pytest.mark.asyncio
     async def test_room_agent_receives_workspace_root(
@@ -586,11 +584,10 @@ class TestPersonaModelSelection:
         )
         resolver = RoomAgentResolver(host, persona_registry=registry)
         participant = Participant(
-            id="story_writer",
+            id="novelist",
             kind=ParticipantKind.AGENT,
             display_name="Story Writer",
-            persona="novelist",
-            session_id="sess_room__r1__story_writer",
+            session_id="sess_room__r1__novelist",
         )
         agent = cast(BaseAgent, await resolver.resolve(participant))
         prompt = agent.effective_system_prompt

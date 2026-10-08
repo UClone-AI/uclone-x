@@ -19,6 +19,7 @@ import httpx
 import pytest
 
 from tests.support.app_clone import app_clone
+from tests.support.clones import make_clones
 from uclone_x.agent.base import BaseAgent
 from uclone_x.agent.composition import HostDependencies
 from uclone_x.agent.models import AgentConfig, AgentLLMConfig
@@ -41,6 +42,16 @@ from uclone_x.tools import (
     ToolResultStatus,
 )
 from uclone_x.ui.app import READ_ROOTS_ENV_VAR, AgentSessionManager, create_ui_app
+
+# The agent ids these tests run as. Each is a clone now, since a name no clone carries is
+# refused rather than given a home (clone-data-scopes §3.4); persona-less, so each speaks as
+# the prompt the test gives it.
+_ROOTS_CLONES = ("live", "fresh", "before")
+
+
+@pytest.fixture(autouse=True)
+def _roots_clones() -> None:  # pyright: ignore[reportUnusedFunction]
+    make_clones(*_ROOTS_CLONES)
 
 
 @pytest.fixture

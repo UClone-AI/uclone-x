@@ -158,6 +158,16 @@ async def test_a_person_decides_a_proposal_in_the_story_view(
             await _open_story(page, root)
             notice = page.get_by_test_id("story-view-notice")
 
+            # The board: the scene names Lord Vane, both proposals rest on it, and his
+            # name there opens his entry in the codex (§1.1 row 5).
+            gate = page.locator('[data-testid="story-scene"][data-scene="ch01.s01"]')
+            await gate.wait_for(timeout=10_000)
+            waiting = gate.get_by_test_id("story-scene-waiting")
+            assert "2 changes waiting for your decision" in await waiting.inner_text()
+            await gate.locator('[data-testid="story-scene-entry"][data-entry="vane"]').click()
+            chosen = page.locator('[data-testid="story-entry"][data-chosen="true"]')
+            await expect(chosen).to_have_attribute("data-entry", "vane", timeout=10_000)
+
             # The change as it is and as it would be, its quote, and who proposed it.
             first = page.locator('[data-testid="story-proposal"][data-proposal="p001"]')
             await first.wait_for(timeout=10_000)

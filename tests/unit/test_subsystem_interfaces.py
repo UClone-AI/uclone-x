@@ -45,9 +45,9 @@ from uclone_x.llm import (
     ToolCallRequest,
 )
 from uclone_x.ontology import (
-    EntitySchema,
-    OntologyValidationResult,
-    RelationSchema,
+    OntologyConcept,
+    OntologyRelation,
+    ValidationResult,
 )
 from uclone_x.sandbox import (
     ExecutionRequest,
@@ -343,13 +343,13 @@ def test_skills_and_ontology_models() -> None:
     with pytest.raises(ValidationError, match="cannot recommend REJECT when is_safe is True"):
         SkillAuditReport(skill_name="git-ops", is_safe=True, recommendation=AuditVerdict.REJECT)
 
-    entity = EntitySchema(name="Repository", description="Git repo")
+    entity = OntologyConcept(name="Repository", description="Git repo")
     assert entity.name == "Repository"
 
-    relation = RelationSchema(source_entity="Repository", predicate="has", target_entity="Commit")
+    relation = OntologyRelation(source_entity="Repository", predicate="has", target_entity="Commit")
     assert relation.is_directed is True
 
-    val = OntologyValidationResult(is_valid=True)
+    val = ValidationResult(is_valid=True)
     assert val.is_valid is True
 
 

@@ -31,6 +31,8 @@ logger = logging.getLogger(__name__)
 #: whatever a hook returns -- only `arguments` from a `MODIFY` reaches execution -- so a
 #: rewrite of these keys would change what later hooks judge and not what runs (#1488).
 #: `run_hooks` therefore restores them before every hook sees the payload.
+#: A hook can no longer make approval stricter by adding `writes_files: True` for a tool
+#: the agent could not resolve; fixed keys restore what the unresolvable call actually declared (#1504).
 #: `needs_approval` is among them: a call whose tool declares that it needs a person's
 #: approval (`tool_call_needs_approval`) is answered `ASK` whatever the hooks say, unless one
 #: blocks it -- with no hooks at all, too -- so no hook and no model can wave it through

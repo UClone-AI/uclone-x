@@ -53,7 +53,7 @@ async def test_subagent_delegation_bus_events_and_budget():
     tc = ToolCallRequest(
         id="call_1",
         name="delegate_subagent",
-        arguments={"role": "helper", "goal": "help", "prompt": "do it", "max_turns": 4},
+        arguments={"role": "helper", "goal": "help", "prompt": "do it", "max_steps": 4},
     )
     ctx = ToolContext(
         agent_id="test_parent", session_id="s1", workspace_root=Path("/tmp"), agent_delegate=agent
@@ -81,7 +81,7 @@ async def test_subagent_delegation_bus_events_and_budget():
     tc2 = ToolCallRequest(
         id="call_2",
         name="delegate_subagent",
-        arguments={"role": "helper", "goal": "help", "prompt": "do it", "max_turns": 4},
+        arguments={"role": "helper", "goal": "help", "prompt": "do it", "max_steps": 4},
     )
     _, rec2 = await agent._execute_single_tool(tc2, ctx)  # pyright: ignore[reportPrivateUsage]
     assert rec2.status == "error"

@@ -199,7 +199,7 @@ def client(tmp_path: Path) -> Iterator[TestClient]:
 
 class TestDeletingTheRoom:
     def test_the_story_files_stay_and_the_lease_is_given_back(self, client: TestClient) -> None:
-        """Killed by: src/uclone_x/room/service.py :: self._release_story(self._stories, story_id, room_id)
+        """Killed by: src/uclone_x/room/service.py :: self._release_story(self._stories(workspace), story_id, room_id)
         Becomes: pass
         """
         created = client.post("/api/rooms", json={"title": "Novel", "agent_ids": ["scout"]})
@@ -223,12 +223,12 @@ class TestDeletingTheRoom:
     def test_deleting_through_the_service_gives_the_lease_back(self, tmp_path: Path) -> None:
         """The Core gives the lease back, so no route has to remember to (#1565).
 
-        Killed by: src/uclone_x/room/service.py :: self._release_story(self._stories, story_id, room_id)
+        Killed by: src/uclone_x/room/service.py :: self._release_story(self._stories(workspace), story_id, room_id)
         Becomes: pass
         """
         library = StoryLibrary(tmp_path / "workspace")
         store = RoomStore(tmp_path / "rooms")
-        service = RoomService(store, stories=library)
+        service = RoomService(store, stories=lambda _workspace: library)
         room_id = service.create("Novel").room_id
         story = library.create("Tide", room_id).story_id
         store.save(service.get(room_id).model_copy(update={"story_id": story}))
@@ -277,7 +277,7 @@ class TestDeletingTheRoom:
                 raise OSError("story.yaml is gone")
 
         store = RoomStore(tmp_path / "rooms")
-        service = RoomService(store, stories=cast(Any, _Refusing()))
+        service = RoomService(store, stories=lambda _workspace: cast(Any, _Refusing()))
         room_id = service.create("Novel").room_id
         store.save(service.get(room_id).model_copy(update={"story_id": "tide"}))
 

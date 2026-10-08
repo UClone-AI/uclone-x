@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, cast
 
@@ -105,6 +105,10 @@ class HostDependencies:
     #: Domain behaviour added to every turn (#1732): the app's story hook, for one. The
     #: agent imports no domain; a head composes the hooks it wants in here.
     lifecycle_hooks: tuple[TurnLifecycleHookProtocol, ...] = ()
+    #: Whether this clone has a picture of its own, asked when `show_self` reports what it
+    #: drew from (clone-self-and-scenes §4.1). Set per clone by `build_clone`, which can
+    #: reach the avatar store; `None` when nothing looked it up.
+    avatar_present: Callable[[], bool] | None = None
 
     @property
     def capabilities(self) -> frozenset[Capability]:
@@ -125,6 +129,7 @@ SUBAGENT_EXCLUDED_HOST_FIELDS: frozenset[str] = frozenset(
         "persona_store",
         "persona_definitions",
         "a2a_transport",
+        "avatar_present",
     }
 )
 
@@ -197,4 +202,5 @@ def build_agent(
         a2a_transport=host.a2a_transport,
         approvals_answered=host.approvals_answered,
         lifecycle_hooks=host.lifecycle_hooks,
+        avatar_present=host.avatar_present,
     )

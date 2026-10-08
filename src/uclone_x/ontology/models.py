@@ -373,11 +373,3 @@ class ValidationResult(BaseModel):
     content_hash: str | None = None
     latency_ms: float = 0.0
     provenance: Provenance | None = None
-
-
-# Backward-compatibility aliases
-EntitySchema = OntologyConcept
-RelationSchema = OntologyRelation
-OntologyValidationResult = ValidationResult
-OntologyInvariant = OntologyAxiom
-InvariantSchema = OntologyAxiom

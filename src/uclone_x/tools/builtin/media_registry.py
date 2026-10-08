@@ -38,6 +38,10 @@ class PromptFamily(StrEnum):
     GENERIC = "generic"  # Universal safe fallback for unknown zero-day checkpoints
 
 
+#: The `ModelProfile.engine_type` values a ComfyUI daemon draws (`auto`: any own engine).
+COMFYUI_ENGINE_TYPES: frozenset[str] = frozenset({"comfyui", "auto"})
+
+
 class ModelProfile(BaseModel):
     """Declarative specification for an image generation model checkpoint."""
 
@@ -62,7 +66,12 @@ class ModelProfile(BaseModel):
         description="A few lines appended to whatever `load_skill` returns for an image "
         "domain skill, e.g. a Pony checkpoint's score_9 quality tags (design §3.4).",
     )
-    engine_type: Literal["comfyui", "diffusers", "mlx", "auto"] = Field(default="auto")
+    engine_type: Literal["comfyui", "diffusers", "mlx", "gemini", "auto"] = Field(default="auto")
+    capabilities: tuple[Literal["create", "edit"], ...] = Field(
+        default=("create",),
+        description="What the model can do with a picture: draw a new one (`create`) or "
+        "change one it is given (`edit`). Nothing reads `edit` yet.",
+    )
     width: int = Field(default=1024, ge=64, le=4096)
     height: int = Field(default=1024, ge=64, le=4096)
     steps: int = Field(default=20, ge=1, le=150)
@@ -82,6 +91,14 @@ class ModelProfile(BaseModel):
             return PromptFamily(v)
         return v
 
+    @field_validator("capabilities", mode="before")
+    @classmethod
+    def _validate_capabilities(cls, v: Any) -> Any:
+        # A YAML profile gives a list, which strict mode would refuse for a tuple field.
+        if isinstance(v, list):
+            return tuple(cast("list[Any]", v))
+        return v
+
 
 @runtime_checkable
 class ImageModelSource(Protocol):
@@ -91,8 +108,11 @@ class ImageModelSource(Protocol):
     tool without importing the adapter that implements it.
     """
 
-    def active_profile(self) -> ModelProfile:
-        """The profile of the checkpoint a generation would use now."""
+    def active_profile(self, image_model: str | None = None) -> ModelProfile:
+        """The profile of the model a generation would use now.
+
+        ``image_model`` is the asking clone's own picture model; `None` follows the default.
+        """
         ...
 
     def bind_skill_registry(self, registry: SkillRegistryProtocol) -> None:
@@ -289,6 +309,13 @@ class ModelRegistry:
                                 str(m_user_dict),
                                 exc,
                             )
+
+    def profiles(self) -> list[ModelProfile]:
+        """Every registered profile once, in the order the files list them."""
+        seen: dict[str, ModelProfile] = {}
+        for profile in self._profiles.values():
+            seen.setdefault(profile.model_id, profile)
+        return list(seen.values())
 
     def register(self, profile: ModelProfile) -> None:
         """Register or override a model profile in memory."""

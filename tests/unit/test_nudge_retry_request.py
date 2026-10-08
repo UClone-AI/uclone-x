@@ -24,6 +24,7 @@ things the issue asks for:
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -38,6 +39,8 @@ from uclone_x.agent.nudges import (
     GROUNDING_REQUIRED_NUDGE_PREFIX,
     is_evidence_nudge_declined,
 )
+from uclone_x.agent.request_record import rebuild_epoch_conversations, rebuild_requests
+from uclone_x.agent.session import SessionStore
 from uclone_x.core.provenance import ExecutionPath, Provenance, ServiceRef
 from uclone_x.llm.connectors.base import BaseLLMConnector
 from uclone_x.llm.models import (
@@ -50,6 +53,7 @@ from uclone_x.llm.models import (
     TokenUsage,
     ToolCallRequest,
 )
+from uclone_x.log.reader import read_session_log
 from uclone_x.memory.store import CrossSessionMemory
 from uclone_x.tools.base import BaseTool
 from uclone_x.tools.models import ToolContext
@@ -126,7 +130,9 @@ class EchoTool(BaseTool[EchoParams]):
         return {"result": params.x + 1}
 
 
-def _agent(llm: RecordingLLM, *, tail: bool = False) -> BaseAgent:
+def _agent(
+    llm: RecordingLLM, *, tail: bool = False, store: SessionStore | None = None
+) -> BaseAgent:
     """`tail` gives the turn a turn-context block (a memory fact) from its first step."""
     config = AgentConfig(
         agent_id="agent_nudge_retry",
@@ -146,7 +152,7 @@ def _agent(llm: RecordingLLM, *, tail: bool = False) -> BaseAgent:
             provenance=_PROV,
             source_session_id="earlier",
         )
-    return BaseAgent(config=config, llm=llm, tools=registry, memory=memory)
+    return BaseAgent(config=config, llm=llm, tools=registry, memory=memory, store=store)
 
 
 def _the_nudged_request(llm: RecordingLLM, marker: str) -> LLMRequest:
@@ -286,7 +292,7 @@ async def test_a_nudged_turn_persists_one_answer_the_one_it_returned(
     answered twice, as two consecutive `ASSISTANT` messages, in every later request. The
     next turn's request is checked too: that is where a left-behind answer would surface.
 
-    Killed by: src/uclone_x/agent/turn_executor.py :: self._history.pop()
+    Killed by: src/uclone_x/agent/turn_executor.py :: self._active_session.truncate(len(self._history) - 1, cause="retry")
     Becomes: pass
     """
     llm = RecordingLLM([*script, _answer("next turn")])
@@ -409,3 +415,39 @@ def test_a_first_answer_with_no_words_matches_no_retry(first: str) -> None:
     assert (
         is_evidence_nudge_declined("I could not confirm it; the tool returned 2.", first) is False
     )
+
+
+@pytest.mark.asyncio
+async def test_a_superseded_answer_leaves_a_history_the_log_rebuilds_as_sent(
+    tmp_path: Path,
+) -> None:
+    """The retry's answer takes the rejected one's place (`replace`, cause `retry`), and
+    the history is read from the log and the last epoch, with no list of its own (#1848).
+    The next turn's request is what the last epoch, rendered from the log alone, shows
+    byte for byte; the record names the entry of each message, the retry's and not the
+    rejected answer's, and a restart reads the same history back.
+    """
+    store = SessionStore(tmp_path)
+    llm = RecordingLLM([_answer(_REJECTED), _answer(_RETRIED)])
+    agent = _agent(llm, store=store)
+    await agent.start()
+    assert (await agent.execute_turn("what is the configured maximum?")).content == _RETRIED
+    llm.responses = [_answer("next turn")]
+    await agent.execute_turn("and the minimum?")
+    agent.persist_session()
+
+    state = store.load(agent.session_id)
+    assert state is not None
+    log = store.event_log_path(agent.session_id)
+    assert log is not None
+    rebuilt = rebuild_requests(store, state, [dict(e) for e in read_session_log(log)])
+    assert [r.request.messages for r in rebuilt] == [r.messages for r in llm.requests]
+    (*_, last) = [list(r.layers.conversation) for r in rebuilt if r.layers is not None]
+    assert rebuild_epoch_conversations(store, state)[-1] == last
+    answers = [
+        m.content for m in state.messages if m.role is MessageRole.ASSISTANT and not m.tool_calls
+    ]
+    assert answers == [_RETRIED, "next turn"]
+    again = _agent(RecordingLLM([_answer("x")]), store=store)
+    assert again.hydrate_session(agent.session_id) is not None
+    assert again.history == agent.history

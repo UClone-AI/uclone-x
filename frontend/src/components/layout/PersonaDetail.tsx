@@ -8,14 +8,14 @@ import { en } from '../../i18n/en';
 /**
  * Read-only detail for one persona — issue #1056, scope (a).
  *
- * `GET /api/personas` (`src/uclone_x/ui/app.py`, `list_personas`) has always returned nine
- * fields per persona. `WorkspaceSidebar`'s Agents list rendered two of them (`name`, `role`)
+ * The clone listing (`GET /api/clones`, `src/uclone_x/ui/clones.py`; `GET /api/personas`
+ * until #1814) has always returned nine fields per persona. `WorkspaceSidebar`'s Agents list rendered two of them (`name`, `role`)
  * and dropped the rest, including the two fields that are safety boundaries rather than
  * cosmetics: `enable_write_tools` and `enable_subagent_tools` say whether a persona may touch
  * the filesystem or spawn sub-agents, and neither was visible anywhere in the head.
  *
  * This is **inspection only**. Scope (b) — create and edit — shipped in #892 as a separate
- * editor: `POST /api/personas` and `PUT /api/personas/{name}`, reached from Settings
+ * editor: `POST /api/clones` and `PUT /api/clones/{clone}`, reached from Settings
  * (`components/personas/PersonaManager.tsx`), after the owner overrode the design doc's
  * deferral of the write path on 2026-09-19. This card stays read-only; the rail it sits in is
  * not where personas are edited.
@@ -30,7 +30,7 @@ import { en } from '../../i18n/en';
  * OSS split, so copying source across that boundary is a licensing question only
  * the maintainers can answer, and it imports state (`zustand` stores, a `botsApi`) and a
  * component kit that do not exist in this tree regardless. This component reimplements the
- * *idea* -- a compact read-only persona card -- from the fields `/api/personas` already
+ * *idea* -- a compact read-only persona card -- from the fields the listing already
  * returns, using only what this file itself defines.
  *
  * The markup now lives in the kit (`ui-kit/rail/PersonaDetail.tsx`, #1158), which holds no
@@ -74,6 +74,7 @@ export const personaDetailCopy = (copy: Messages['personaDetail']): PersonaDetai
   maxTokens: copy.maxTokens,
   tools: copy.tools,
   notSet: copy.notSet,
+  systemDefault: copy.systemDefault,
   noTools: copy.noTools,
   writeAccess: (enabled) => describeWriteAccess(enabled, copy),
   subagentAccess: (enabled) => describeSubagentAccess(enabled, copy),

@@ -7,7 +7,7 @@ import fnmatch
 import os
 import re
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any, ClassVar, cast
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -18,6 +18,12 @@ from uclone_x.tools.models import ToolContext
 # ======================================================================================
 # 1. FileReadTool
 # ======================================================================================
+
+
+def _named_path(output: Any) -> tuple[str, ...]:
+    """The workspace file a writing tool's result names in `path`, declared as produced."""
+    path: object = cast(dict[str, object], output).get("path") if isinstance(output, dict) else None
+    return (path,) if isinstance(path, str) and path else ()
 
 
 class FileReadParams(BaseModel):
@@ -157,6 +163,10 @@ class FileWriteTool(BaseTool[FileWriteParams]):
         "optionally creating parent directories and guarding against accidental overwrite."
     )
 
+    def produced_artifacts(self, output: Any) -> tuple[str, ...]:
+        """The file it wrote (#2085)."""
+        return _named_path(output)
+
     def run(self, params: FileWriteParams, context: ToolContext) -> dict[str, Any]:
         """Write content to file atomically."""
         workspace = context.require_workspace()
@@ -230,6 +240,10 @@ class FileEditTool(BaseTool[FileEditParams]):
         "Exact string replacement (target_content -> replacement_content) within "
         "workspace files, with unique match validation and optional line range hints."
     )
+
+    def produced_artifacts(self, output: Any) -> tuple[str, ...]:
+        """The file it edited (#2085)."""
+        return _named_path(output)
 
     def run(self, params: FileEditParams, context: ToolContext) -> dict[str, Any]:
         """Perform exact string replacement in target file."""

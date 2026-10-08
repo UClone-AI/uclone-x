@@ -122,7 +122,7 @@ export const Header: React.FC<HeaderProps> = ({
             size="icon"
             data-testid="open-settings"
             onClick={onOpenSettings}
-            title="Configure Runtime Settings & Endpoints"
+            title="Settings"
           >
             <Settings className="w-3.5 h-3.5 text-cyan-400" />
           </Button>

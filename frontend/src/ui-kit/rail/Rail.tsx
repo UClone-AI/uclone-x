@@ -223,7 +223,7 @@ export const Rail: React.FC<RailProps> = ({
    * 3. Clones without conversations fall to the bottom of their tier, sorted alphabetically.
    */
   const clones = React.useMemo(() => {
-    const base = (personas ?? []).map((p) => ({ id: p.name, label: p.name, role: p.role }));
+    const base = (personas ?? []).map((p) => ({ id: p.id ?? p.name, label: p.label ?? p.name, role: p.role }));
 
     const latestActive = new Map<string, number>();
     for (const room of rooms) {
@@ -254,6 +254,9 @@ export const Rail: React.FC<RailProps> = ({
       return cmp !== 0 ? cmp : a.id.localeCompare(b.id);
     });
   }, [personas, rooms, pinnedCloneIds]);
+
+  /** What a seat is called: its clone's label, since the seat itself is the clone's id. */
+  const agentLabel = (agentId: string) => clones.find((c) => c.id === agentId)?.label ?? agentId;
 
   /**
    * The clone currently active in the rail.
@@ -315,6 +318,7 @@ export const Rail: React.FC<RailProps> = ({
             copy={copy.conversations}
             icons={icons}
             avatarSrc={avatarSrc}
+            agentLabel={agentLabel}
             useEscape={useEscape}
           />
         </div>
@@ -687,6 +691,7 @@ export const Rail: React.FC<RailProps> = ({
         <DeleteConversationDialog
           useEscape={useEscape}
           room={deletingSession}
+          agentLabel={agentLabel}
           onConfirm={async () => {
             await onDeleteRoom(deletingSession.room_id);
             setDeletingSession(null);

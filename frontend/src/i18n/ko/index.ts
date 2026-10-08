@@ -22,8 +22,10 @@ import time from '../locales/ko/time.json';
 import toolSteps from '../locales/ko/toolSteps.json';
 import usage from '../locales/ko/usage.json';
 import avatar from '../locales/ko/avatar.json';
-import images from '../locales/ko/images.json';
+import imageCard from '../locales/ko/imageCard.json';
 import links from '../locales/ko/links.json';
+import browser from '../locales/ko/browser.json';
+import gateway from '../locales/ko/gateway.json';
 
 export const ko: Messages = {
   settings,
@@ -44,6 +46,8 @@ export const ko: Messages = {
   notices,
   usage,
   avatar,
-  images,
+  imageCard,
   links,
+  browser,
+  gateway,
 };

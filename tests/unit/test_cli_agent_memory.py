@@ -6,6 +6,7 @@ import pytest
 import typer
 from rich.console import Console
 
+from tests.support.clones import make_clone
 from uclone_x.cli import agent_memory
 from uclone_x.cli.agent_memory import memory_for_agent_id
 
@@ -40,8 +41,9 @@ def test_a_usable_agent_id_opens_its_memory(tmp_path_factory: pytest.TempPathFac
     Killed by: src/uclone_x/cli/agent_memory.py :: return default_cross_session_memory(agent_id)
     Becomes: return default_cross_session_memory("default")
     """
+    home = make_clone("shell-agent")
     memory = memory_for_agent_id("shell-agent")
 
     assert memory.storage_path is not None, "a shell agent with no file has nothing to remember"
-    assert memory.storage_path.parent.name == "shell-agent"
-    assert memory.storage_path.name == "memory.json"
+    assert memory.storage_path.parent == home.path
+    assert memory.storage_path.name == "knowledge.sqlite3"

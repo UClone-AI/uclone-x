@@ -32,6 +32,7 @@ import pytest
 from pydantic import BaseModel, Field
 
 from tests.support.app_clone import app_clone
+from tests.support.clones import make_clones
 from uclone_x.agent.base import BaseAgent
 from uclone_x.agent.composition import HostDependencies
 from uclone_x.agent.models import AgentConfig, AgentLLMConfig, PersonaDefinition
@@ -69,6 +70,17 @@ from uclone_x.telemetry.tracer import TelemetryTracer
 from uclone_x.tools.base import BaseTool
 from uclone_x.tools.models import ToolContext
 from uclone_x.tools.registry import ToolRegistry
+
+# The agent ids these tests run as. Each is a clone now, since a name no clone carries is
+# refused rather than given a home (clone-data-scopes §3.4); persona-less, so each speaks as
+# the prompt the test gives it.
+_SNAPSHOT_CLONES = ("agent-clone",)
+
+
+@pytest.fixture(autouse=True)
+def _snapshot_clones() -> None:  # pyright: ignore[reportUnusedFunction]
+    make_clones(*_SNAPSHOT_CLONES)
+
 
 _PROV = Provenance(
     path=ExecutionPath.PRIMARY,
@@ -245,11 +257,10 @@ async def test_a_room_seats_stored_anchor_is_the_identity_its_request_sends(
         bus=EventBus(), llm=llm, tools=ToolRegistry(), tracer=TelemetryTracer(), store=store
     )
     seat = Participant(
-        id="author",
+        id="novelist",
         kind=ParticipantKind.AGENT,
         display_name="Author",
-        persona="novelist",
-        session_id="sess_room__r1__author",
+        session_id="sess_room__r1__novelist",
     )
     agent = await RoomAgentResolver(host, persona_registry=registry).resolve(seat)
     assert isinstance(agent, BaseAgent)
@@ -386,8 +397,8 @@ async def test_a_turns_first_step_records_only_what_the_turn_added(tmp_path: Pat
     A turn's first step used to record its whole request, so every turn re-recorded the
     conversation so far and a long session's log grew with the square of its turns.
 
-    Killed by: src/uclone_x/agent/prompt_assembler.py :: kept, appended = request_context_delta(session.last_conversation, conversation)
-    Becomes: kept, appended = request_context_delta([] if step == 1 else session.last_conversation, conversation)
+    Killed by: src/uclone_x/agent/prompt_assembler.py :: kept, appended = request_context_delta(session.last_conversation, shown)
+    Becomes: kept, appended = request_context_delta([] if step == 1 else session.last_conversation, shown)
     """
     store = SessionStore(tmp_path)
     llm = RecordingLLM()
@@ -400,11 +411,17 @@ async def test_a_turns_first_step_records_only_what_the_turn_added(tmp_path: Pat
 
     contexts = _request_contexts(store)
     assert len(contexts) == turns
-    recorded = sum(len(e["appended_messages"]) for e in contexts)
+    recorded = sum(len(e["appended_entries"]) for e in contexts)
     assert recorded == len(_conversation(llm.requests[-1])), recorded
     # Each turn after the first adds its question and the previous turn's answer.
-    assert all(len(e["appended_messages"]) <= 2 for e in contexts)
-    assert all("system" not in json.dumps(e["appended_messages"]) for e in contexts[1:])
+    assert all(len(e["appended_entries"]) <= 2 for e in contexts)
+    # Recorded as log entries and forms, never as the messages' text (#2013).
+    assert all(
+        set(entry) <= {"entry", "form", "same_as", "rendering"}
+        for e in contexts
+        for entry in e["appended_entries"]
+    )
+    assert "message 0" not in json.dumps(contexts)
 
 
 # --------------------------------------------------------------------------------------

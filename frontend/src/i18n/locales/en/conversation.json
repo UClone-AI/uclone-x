@@ -17,7 +17,14 @@
       "one": "{label} will remember 1 thing from this turn.",
       "other": "{label} will remember {count} things from this turn."
     },
+    "knowledgeForgotten": {
+      "one": "{label} forgot 1 thing from this turn.",
+      "other": "{label} forgot {count} things from this turn."
+    },
+    "forget": "Forget",
     "knowledgeExtractFailed": "{label} could not pick up what to remember from this turn.",
+    "imagePromptAdded": "{label} added to the picture request: {tags}.",
+    "imageNegativeAdded": "{label} asked the picture to leave out: {tags}.",
     "why": "why ›",
     "servedInstead": "{served} (asked for {requested})"
   },
@@ -43,8 +50,20 @@
     "clearLabel": "Clear this conversation",
     "clear": "Clear"
   },
+  "workspace": {
+    "label": "Folder this conversation works in",
+    "serverFolder": "the server's folder",
+    "pathPlaceholder": "Full path of a folder",
+    "use": "Use this folder",
+    "useServer": "Use the server's folder",
+    "refusals": {
+      "not_a_folder": "That is not a folder on this computer. Give the full path of a folder that exists.",
+      "app_state": "That folder holds this app's own clones and conversations, so it cannot be a conversation's folder.",
+      "story_open": "This conversation has a story open, and the story lives in its current folder. Close the story first, then change the folder."
+    }
+  },
   "invite": {
-    "noClones": "No clones are running yet. Send a message in a chat first, and whoever answers can be added here.",
+    "noClones": "No other clones are installed yet.",
     "everyoneHere": "Everyone available is already in this conversation."
   },
   "empty": {
@@ -102,10 +121,23 @@
     "providerRemedy": {
       "provider_unreachable": "If you set a custom endpoint in Settings, check that address too."
     },
-    "providerFailed": "{label} couldn't finish this turn. {message}",
+    "providerFailed": "{label} couldn't finish this turn. {cause}",
+    "ownModelFailed": "{label} couldn't finish this turn: it is set to use its own model, {model}, and that model couldn't be used. {cause}",
+    "providerCause": {
+      "model_unavailable": "{provider} doesn't offer the model this turn asked for.",
+      "provider_auth": "{provider} didn't accept the API key.",
+      "provider_quota": "The usage limit for this key at {provider} has been reached.",
+      "provider_unreachable": "{provider} couldn't be reached.",
+      "provider_outage": "{provider} is having trouble right now.",
+      "provider_error": "{provider} answered with an error."
+    },
+    "providerCauseOther": "{provider} answered with an error.",
+    "providerUnknown": "The model's provider",
     "refused": "{label} couldn't finish this turn: {reason}.",
     "stopped": "{label} was stopped before finishing this turn.",
     "wentWrong": "{label} couldn't finish this turn because something went wrong while it was answering.",
+    "personaEditDropped": "{label} couldn't apply the changes saved to it, so it didn't answer. It kept its previous settings in this conversation.",
+    "personaEditRemedy": "To use the changes here, save the clone again, then send your message again.",
     "memoryNoneSaved": {
       "one": "{label} tried to save something to memory, and nothing was saved.",
       "other": "{label} tried to save {count} things to memory, and none of them were saved."

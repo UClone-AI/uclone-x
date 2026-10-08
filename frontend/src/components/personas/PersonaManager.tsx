@@ -1,6 +1,9 @@
 import React, { useState } from 'react';
 import type { PersonaInfo } from '../../types';
+import type { Messages } from '../../i18n';
+import type { ModelSet } from '../../lib/modelGateway';
 import {
+  cloneLabel,
   draftFromPersona,
   emptyPersonaDraft,
   fmt,
@@ -28,12 +31,23 @@ export interface PersonaManagerIcons extends PersonaEditorIcons {
 export interface PersonaManagerProps {
   personas: readonly PersonaInfo[];
   availableTools: readonly string[];
-  availableModels: readonly string[];
+  baseTools?: readonly string[];
+  writeTools?: readonly string[];
+  /** The model sets the editor's pickers choose from; `null` until read. */
+  chatModels: ModelSet | null;
+  imageModels: ModelSet | null;
+  modelsFailed?: boolean;
+  /** Developer mode: the editor offers the clone's own fast model only then. */
+  developerMode?: boolean;
+  /** The model pickers' words (the `gateway` catalog). */
+  modelCopy: Messages['gateway'];
   /** Where saves are written; null when the runtime has no workspace to write to. */
   personasDir: string | null;
   /** Why the catalogue could not be loaded, or null. */
   loadError: string | null;
   copy: PersonaEditorCopy;
+  /** The screen's language: which display name a row shows, and which one the editor edits. */
+  language?: string;
   icons: PersonaManagerIcons;
   onSave: (draft: PersonaDraft, mode: PersonaEditMode) => Promise<PersonaSaveResult>;
 }
@@ -47,10 +61,17 @@ interface Editing {
 export const PersonaManager: React.FC<PersonaManagerProps> = ({
   personas,
   availableTools,
-  availableModels,
+  baseTools,
+  writeTools,
+  chatModels,
+  imageModels,
+  modelsFailed = false,
+  developerMode = false,
+  modelCopy,
   personasDir,
   loadError,
   copy,
+  language = 'en',
   icons,
   onSave,
 }) => {
@@ -73,8 +94,8 @@ export const PersonaManager: React.FC<PersonaManagerProps> = ({
     setSaving(false);
     if (result.ok) {
       setNotice(result.liveAgentsUpdated > 0
-          ? plural(copy.savedWithLive, result.liveAgentsUpdated, { name: result.persona.name })
-          : fmt(copy.saved, { name: result.persona.name }));
+          ? plural(copy.savedWithLive, result.liveAgentsUpdated, { name: cloneLabel(result.persona, language) })
+          : fmt(copy.saved, { name: cloneLabel(result.persona, language) }));
       setEditing(null);
     } else {
       setError(result.message);
@@ -92,11 +113,18 @@ export const PersonaManager: React.FC<PersonaManagerProps> = ({
         mode={editing.mode}
         existingNames={personas.map((p) => p.name)}
         availableTools={availableTools}
-        availableModels={availableModels}
+        baseTools={baseTools}
+        writeTools={writeTools}
+        chatModels={chatModels}
+        imageModels={imageModels}
+        modelsFailed={modelsFailed}
+        developerMode={developerMode}
+        modelCopy={modelCopy}
         isBuiltin={editing.isBuiltin}
         saving={saving}
         error={error}
         copy={copy}
+        language={language}
         icons={icons}
         onChange={(draft) => {
           setEditing({ ...editing, draft });
@@ -147,7 +175,7 @@ export const PersonaManager: React.FC<PersonaManagerProps> = ({
             >
               <div className="min-w-0">
                 <div className="flex items-center gap-2">
-                  <span className="text-xs font-mono text-white truncate">{persona.name}</span>
+                  <span className="text-xs font-mono text-white truncate">{cloneLabel(persona, language)}</span>
                   {persona.builtin ? (
                     <span className="text-[10px] text-slate-400 border border-slate-700 rounded px-1">
                       {copy.builtinBadge}
@@ -163,7 +191,7 @@ export const PersonaManager: React.FC<PersonaManagerProps> = ({
               <button
                 type="button"
                 disabled={!canWrite}
-                aria-label={`${copy.edit} ${persona.name}`}
+                aria-label={`${copy.edit} ${cloneLabel(persona, language)}`}
                 onClick={() =>
                   open({
                     mode: 'edit',

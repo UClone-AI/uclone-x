@@ -14,15 +14,24 @@ export interface RailRoom {
   title: string;
   agent_ids: string[];
   message_count: number;
+  utterance_count?: number;
   updated_at: string;
 }
 
 export interface RailPersona {
+  /**
+   * The clone's id (`agt_…`): what a seat, a room's `agent_ids` and every request name it by.
+   * Absent from a host that has none, where `name` is the id.
+   */
+  id?: string;
+  /** Its handle: the `@mention` token, which a rename changes and the id does not. */
   name: string;
+  /** What the rail shows as its name; the host resolves it. Absent means `name`. */
+  label?: string;
   role: string;
   description: string;
   allowed_tools: string[];
-  model_name?: string;
+  model_name?: string | null;
   temperature?: number;
   max_tokens?: number;
   enable_write_tools?: boolean;
@@ -49,6 +58,8 @@ export interface PersonaDetailCopy {
   tools: string;
   /** A field the persona leaves unset. */
   notSet: string;
+  /** A model the persona leaves to the system default. */
+  systemDefault: string;
   /** An empty `allowed_tools`, as a sentence rather than a blank list. */
   noTools: string;
   /** `enable_write_tools` as a capability sentence, never a bare boolean. */

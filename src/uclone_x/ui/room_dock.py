@@ -23,11 +23,13 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import sqlite3
 import stat as stat_mode
+from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, TypedDict
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 
 from uclone_x.agent.turn_trace import (
     StepDetail,
@@ -36,7 +38,7 @@ from uclone_x.agent.turn_trace import (
     trace_step,
     trace_turn,
 )
-from uclone_x.core.agent_home import AgentHomeError
+from uclone_x.core.agent_home import AgentHomeError, seat_id_for
 from uclone_x.core.provenance import Provenance
 from uclone_x.errors import (
     LogHeaderError,
@@ -46,7 +48,7 @@ from uclone_x.errors import (
 )
 from uclone_x.log import read_session_log
 from uclone_x.memory.models import MemoryFact
-from uclone_x.memory.store import CrossSessionMemory, read_saved_facts
+from uclone_x.memory.store import CrossSessionMemory, read_saved_facts, read_saved_memory
 from uclone_x.ontology.engine import OntologyEngine
 from uclone_x.room.models import (
     Participant,
@@ -89,11 +91,6 @@ FILES_SCOPE_NOTE = (
     "by a shell command or a helper, may not appear here."
 )
 
-_NOT_RECORDED_LEGACY = (
-    "This turn was recorded before the conversation kept a record of tool use, so which "
-    "tools it used is not known."
-)
-
 
 def _turn_status(message: RoomMessage) -> str:
     if not message.completed:
@@ -107,8 +104,6 @@ def _not_recorded_reason(message: RoomMessage, partial: bool) -> str | None:
     """Why a turn's tools are not known in full; `partial` when some calls were recorded."""
     if message.tools_recorded:
         return None
-    if message.turn_id is None:
-        return _NOT_RECORDED_LEGACY
     return _NOT_RECORDED_PARTIAL if partial else _NOT_RECORDED_RAISED
 
 
@@ -160,7 +155,9 @@ def _roster_refusal(state: RoomState, participant_id: str) -> HTTPException:
 
 
 def _seat(state: RoomState, participant_id: str) -> Participant:
-    seat = next((p for p in seated_agents(state) if p.id == participant_id), None)
+    # A seat is keyed by its clone's id; the handle a reader knows it by finds it too.
+    wanted = {participant_id, seat_id_for(participant_id)}
+    seat = next((p for p in seated_agents(state) if p.id in wanted), None)
     if seat is None:
         raise _roster_refusal(state, participant_id)
     return seat
@@ -217,9 +214,7 @@ def _join(parts: list[str]) -> str:
     return ", ".join(parts[:-1]) + " and " + parts[-1]
 
 
-def _file_record_gaps(
-    file_record: RoomFileRecord, legacy_agent_turns: int, unsaved: int
-) -> list[str]:
+def _file_record_gaps(file_record: RoomFileRecord, unsaved: int) -> list[str]:
     """Each known reason the room's file list may be missing a write, in plain words.
 
     Read from the room's monotonic record, not from the rows that remain: a clear or a
@@ -228,8 +223,6 @@ def _file_record_gaps(
     gaps: list[str] = []
     if not file_record.kept_since_creation:
         gaps.append("this conversation began before files written by tools were recorded")
-    elif legacy_agent_turns:
-        gaps.append(f"{legacy_agent_turns} turn(s) were saved without a record of their tools")
     if file_record.unrecorded_turns:
         gaps.append(f"{file_record.unrecorded_turns} turn(s) ended before reporting their tools")
     unsaved_gap = _unsaved_gap(unsaved)
@@ -252,7 +245,7 @@ def _file_record_gaps(
 #: one, travels beside it. `history_gaps` stays the English clause, in the same order.
 HistoryGapCode = Literal["before_record", "cleared", "rewound", "unsaved", "uncounted"]
 #: Why a turn in the graph may show fewer tool calls than it made (#1911); as above.
-ToolCallGapCode = Literal["saved_without_tools", "unreported"]
+ToolCallGapCode = Literal["unreported"]
 #: Why the graph has no turns to show at all (#1911): only `no_seat`.
 TopologyReasonCode = Literal["no_seat"]
 
@@ -271,9 +264,7 @@ def _unsaved_gap_code(unsaved: int) -> HistoryGap | None:
     return {"code": "uncounted", "count": None} if unsaved < 0 else None
 
 
-def _tool_call_gaps(
-    record: RoomFileRecord, legacy_agent_turns: int
-) -> list[tuple[ToolCallGapCode, int, str]]:
+def _tool_call_gaps(record: RoomFileRecord) -> list[tuple[ToolCallGapCode, int, str]]:
     """Each known reason a turn in the graph may show fewer tool calls than it made (#1388 N3).
 
     Apart from `history_gaps`, which names turn rows that may be missing: every row can be
@@ -284,14 +275,6 @@ def _tool_call_gaps(
     Each gap is its code, its count and its English clause (#1911).
     """
     gaps: list[tuple[ToolCallGapCode, int, str]] = []
-    if legacy_agent_turns:
-        gaps.append(
-            (
-                "saved_without_tools",
-                legacy_agent_turns,
-                f"{legacy_agent_turns} turn(s) were saved without a record of their tools",
-            )
-        )
     if record.unrecorded_turns:
         gaps.append(
             (
@@ -301,19 +284,6 @@ def _tool_call_gaps(
             )
         )
     return gaps
-
-
-def _legacy_agent_turns(state: RoomState) -> int:
-    """Agent rows with no turn id: saved by a build that did not record tools.
-
-    Only agent rows: a human's row has no turn id either, and wrote nothing.
-    """
-    humans = {p.id for p in state.participants if p.kind is ParticipantKind.HUMAN}
-    return sum(
-        1
-        for m in state.transcript
-        if m.is_utterance and m.turn_id is None and m.sender_id not in humans
-    )
 
 
 def _no_turns_reason(state: RoomState, name: str, unsaved: int, in_progress: bool) -> str:
@@ -350,7 +320,9 @@ def _no_turns_reason(state: RoomState, name: str, unsaved: int, in_progress: boo
     return f"{name} has not taken a turn in this conversation yet."
 
 
-def _known_facts(room_id: str, seat: Participant) -> tuple[dict[str, Any], list[MemoryFact] | None]:
+def _known_facts(
+    room_id: str, seat: Participant
+) -> tuple[dict[str, Any], dict[str, tuple[str, str, str]] | None]:
     """The clone's facts, one clone-wide list, or why they cannot be listed (#1638 step 3).
 
     Read from the memory the seat's `record_memory_fact` writes: the store the room's
@@ -359,16 +331,17 @@ def _known_facts(room_id: str, seat: Participant) -> tuple[dict[str, Any], list[
     learned in this conversation (`learned_here`); the head groups by it. Read-only -- a
     GET never moves a damaged document aside, and never creates the agent's home.
 
-    Also returns the facts read, `None` when they could not be read, for what the clone's
-    rules work out from them.
+    Also returns the statements that hold now (`fact_id -> (subject, predicate, object)`, the
+    knowledge store's `facts_at` with the ids kept), `None` when the facts could not be read,
+    for what the clone's rules work out from them.
     """
     name = seat.display_name
     try:
-        facts = read_saved_facts(seat.id)
+        saved = read_saved_memory(seat.id)
     except AgentHomeError:  # no home, so nothing saved to read
         # An id that cannot name an agent home has no memory to read: `memory_for` refuses
         # it too, so no fact can have been saved under it.
-        facts = None
+        saved = None
     except MemoryStoreUnreadableError as exc:
         # The path and the parser's words go to the log; the person reading the dock can act
         # on neither.
@@ -381,10 +354,9 @@ def _known_facts(room_id: str, seat: Participant) -> tuple[dict[str, Any], list[
             "facts": None,
             "facts_reason": f"What {name} knows could not be read, so it cannot be shown.",
         }, None
-    held = list(facts or [])
-    listed = known_facts(held, room_id, seat.session_id)
-    reason = None if listed else f"No facts are listed for {name}."
-    return {"facts": listed, "facts_reason": reason}, held
+    listed = known_facts(saved.facts if saved else [], room_id, seat.session_id)
+    reason = None
+    return {"facts": listed, "facts_reason": reason}, dict(saved.statements) if saved else {}
 
 
 #: What a person is told when Correct or Forget cannot be done (#1638 step 3). Plain words
@@ -497,7 +469,12 @@ def _turn_not_linked_reason(message: RoomMessage) -> dict[str, str]:
     return _TRACE_REASONS["turn_not_saved" if unsaved else "turn_not_linked"]
 
 
-def register_room_dock_routes(app: FastAPI, stack: RoomStack) -> None:
+def register_room_dock_routes(
+    app: FastAPI,
+    stack: RoomStack,
+    *,
+    refuse_cross_origin: Callable[[Request], None],
+) -> None:
     """Mount the dock's room-scoped reads under `/api/rooms/{room_id}`."""
     service = stack.service
 
@@ -508,12 +485,13 @@ def register_room_dock_routes(app: FastAPI, stack: RoomStack) -> None:
             raise _http_error(exc) from exc
 
     @app.get("/api/rooms/{room_id}/turns/{seq}")
-    async def read_turn_summary(room_id: str, seq: int) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
+    async def read_turn_summary(room_id: str, seq: int, request: Request) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
         """Summary of what one turn did for general user inspection (#1491).
 
         Returns 200 with TurnSummary model dump.
         Raises 404 with turn_not_found if the turn seq does not exist in the room.
         """
+        refuse_cross_origin(request)  # another site must not read turn summaries (#2146)
         state = _room(room_id)
         try:
             summary = summarize_turn(state, seq)
@@ -522,7 +500,9 @@ def register_room_dock_routes(app: FastAPI, stack: RoomStack) -> None:
         return summary.model_dump(mode="json")
 
     @app.get("/api/rooms/{room_id}/seats/{participant_id}/history")
-    async def read_seat_history(room_id: str, participant_id: str) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
+    async def read_seat_history(  # pyright: ignore[reportUnusedFunction]
+        room_id: str, participant_id: str, request: Request
+    ) -> dict[str, Any]:
         """One seat's turns in this conversation, and the tools each one used (#1353).
 
         From the room's record, not the seat's session: the record is written with the
@@ -531,6 +511,7 @@ def register_room_dock_routes(app: FastAPI, stack: RoomStack) -> None:
         never `[]` -- a turn that raised has no account of its tools, and "none" would be
         a claim nobody made.
         """
+        refuse_cross_origin(request)
         state = _room(room_id)
         seat = _seat(state, participant_id)
         turns = _seat_turns(state, seat.id)
@@ -543,7 +524,7 @@ def register_room_dock_routes(app: FastAPI, stack: RoomStack) -> None:
         in_progress = stack.turn_in_flight(state.room_id) or stack.turn_unlanded(state.room_id)
         turn_rows: list[dict[str, Any]] = []
         for message in turns:
-            recorded = message.tools_recorded and message.turn_id is not None
+            recorded = message.tools_recorded
             turn_rows.append(
                 {
                     "seq": message.seq,
@@ -603,8 +584,6 @@ def register_room_dock_routes(app: FastAPI, stack: RoomStack) -> None:
         """Why this row cannot be traced before any record is read, or None."""
         if not _spoken_by_agent(state, message):
             return _TRACE_REASONS["not_an_agent_turn"]
-        if message.turn_id is None:
-            return _TRACE_REASONS["turn_not_linked"]
         return None
 
     def _read_trace_inputs(
@@ -650,17 +629,31 @@ def register_room_dock_routes(app: FastAPI, stack: RoomStack) -> None:
             logger.exception("Tracing a turn of session %s failed", session_id)
             return "reason", _TRACE_REASONS["trace_failed"]
 
+    def _turn_session_id(state: RoomState, message: RoomMessage) -> str:
+        """The session a turn ran in: the one its row recorded (clone-data-scopes §4).
+
+        A row stored before rows recorded it falls back to the speaking seat's, then to
+        the id the seat's session is derived from.
+        """
+        if message.session_id:
+            return message.session_id
+        seat = next((p for p in state.participants if p.id == message.sender_id), None)
+        if seat is not None and seat.session_id:
+            return seat.session_id
+        return participant_session_id(state.room_id, message.sender_id)
+
     @app.get("/api/rooms/{room_id}/turns/{seq}/trace")
-    async def read_turn_trace(room_id: str, seq: int) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
+    async def read_turn_trace(room_id: str, seq: int, request: Request) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
         """Full trace of one turn's model calls, requests, and tool results (#1490).
 
         Reconstructs the trace from the session log and context bodies.
         Returns 200 with the trace, or with `trace: null` and a reason (§4.4.3 of
         the turn-inspection design). Raises 404 if the turn seq does not exist.
         """
+        refuse_cross_origin(request)
         state, message = _traced_message(room_id, seq)
         participant_id = message.sender_id
-        session_id = participant_session_id(room_id, participant_id)
+        session_id = _turn_session_id(state, message)
         head: dict[str, Any] = {
             "room_id": room_id,
             "seq": seq,
@@ -672,7 +665,7 @@ def register_room_dock_routes(app: FastAPI, stack: RoomStack) -> None:
         if reason is not None:
             return {**head, "trace": None, "reason": reason}
         turn_id = message.turn_id
-        assert turn_id is not None  # _unlinked_reason refused a row without one
+        assert turn_id is not None  # `RoomState` refuses an agent's row without one
 
         def _load_and_trace() -> tuple[Literal["read", "reason"], dict[str, Any]]:
             inputs = _read_trace_inputs(message, session_id)
@@ -691,7 +684,9 @@ def register_room_dock_routes(app: FastAPI, stack: RoomStack) -> None:
         return {**head, "trace": None, "reason": outcome}
 
     @app.get("/api/rooms/{room_id}/turns/{seq}/trace/steps/{step}")
-    async def read_turn_step_detail(room_id: str, seq: int, step: int) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
+    async def read_turn_step_detail(  # pyright: ignore[reportUnusedFunction]
+        room_id: str, seq: int, step: int, request: Request
+    ) -> dict[str, Any]:
         """One step's full request and response for developer inspection (#1490).
 
         Returns 200 with {step, request, request_reason, verified, layers, response,
@@ -700,14 +695,15 @@ def register_room_dock_routes(app: FastAPI, stack: RoomStack) -> None:
         null. Raises 404 turn_not_found for an unknown seq and step_not_found for a step
         the turn does not have.
         """
+        refuse_cross_origin(request)
         state, message = _traced_message(room_id, seq)
-        session_id = participant_session_id(room_id, message.sender_id)
+        session_id = _turn_session_id(state, message)
         empty = StepDetail(step=step).model_dump(mode="json")
         reason = _unlinked_reason(state, message)
         if reason is not None:
             return {**empty, "reason": reason}
         turn_id = message.turn_id
-        assert turn_id is not None  # _unlinked_reason refused a row without one
+        assert turn_id is not None  # `RoomState` refuses an agent's row without one
 
         def _load_and_trace_step() -> tuple[Literal["read", "reason", "no_step"], dict[str, Any]]:
             inputs = _read_trace_inputs(message, session_id)
@@ -736,7 +732,7 @@ def register_room_dock_routes(app: FastAPI, stack: RoomStack) -> None:
         return {**empty, "reason": outcome}
 
     @app.get("/api/rooms/{room_id}/artifacts")
-    async def read_room_artifacts(room_id: str) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
+    async def read_room_artifacts(room_id: str, request: Request) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
         """The files this conversation's seats wrote through tools, newest write first (#1354).
 
         Exactly the paths the room recorded -- not the workspace's `artifacts/`, its
@@ -752,8 +748,10 @@ def register_room_dock_routes(app: FastAPI, stack: RoomStack) -> None:
         covers and `record_gaps` naming each known reason it may be missing a write. An
         empty `record_gaps` means no *known* gap, not a complete list.
         """
+        refuse_cross_origin(request)
         state = _room(room_id)
-        workspace = stack.session_manager().workspace_dir
+        # The room's own folder: its seats wrote these paths there (clone-data-scopes §3.6).
+        workspace = stack.workspace_of(state.room_id)
         entries: dict[str, dict[str, Any]] = {}
         for written in state.written_files:
             entry: dict[str, Any] | None = entries.get(written.path)
@@ -792,7 +790,7 @@ def register_room_dock_routes(app: FastAPI, stack: RoomStack) -> None:
         # stay on disk (#1366).
         unlanded = stack.turn_unlanded(state.room_id)
         unsaved = _unsaved_turns(record, unlanded)
-        gaps = _file_record_gaps(record, _legacy_agent_turns(state), unsaved)
+        gaps = _file_record_gaps(record, unsaved)
         # A cascade between turns, or a turn in progress -- a retry runs its turn inside
         # the request, not as a cascade, and was invisible to `turn_in_flight` alone.
         running = stack.turn_in_flight(state.room_id) or unlanded
@@ -837,7 +835,7 @@ def register_room_dock_routes(app: FastAPI, stack: RoomStack) -> None:
         }
 
     @app.get("/api/rooms/{room_id}/topology")
-    async def read_room_topology(room_id: str) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
+    async def read_room_topology(room_id: str, request: Request) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
         """The conversation as a graph: its seats, their turns, their tools, their sub-agents (#1355).
 
         `summary.tool_calls` counts the calls listed, never all calls made: `history_gaps`
@@ -847,6 +845,7 @@ def register_room_dock_routes(app: FastAPI, stack: RoomStack) -> None:
         fact about the room, and a graph that drops it reads as "no agents". A seat that
         has since left keeps its node, marked `left`, because its turns are still there.
         """
+        refuse_cross_origin(request)  # another site must not read room topology (#2146)
         state = _room(room_id)
         nodes: list[dict[str, Any]] = []
         edges: list[dict[str, Any]] = []
@@ -988,7 +987,7 @@ def register_room_dock_routes(app: FastAPI, stack: RoomStack) -> None:
         if unsaved_gap is not None and unsaved_code is not None:  # both set, or neither
             history_gaps.append(unsaved_gap)
             history_codes.append(unsaved_code)
-        tool_gaps = _tool_call_gaps(record, _legacy_agent_turns(state))
+        tool_gaps = _tool_call_gaps(record)
         reason_code: TopologyReasonCode | None = None if seated else "no_seat"
         return {
             "room_id": state.room_id,
@@ -1013,7 +1012,9 @@ def register_room_dock_routes(app: FastAPI, stack: RoomStack) -> None:
         }
 
     @app.get("/api/rooms/{room_id}/knowledge")
-    async def read_seat_knowledge(room_id: str, agent_id: str | None = None) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
+    async def read_seat_knowledge(  # pyright: ignore[reportUnusedFunction]
+        room_id: str, request: Request, agent_id: str | None = None
+    ) -> dict[str, Any]:
         """What one seat's clone knows, and what its rules work out from it (step 6).
 
         A clone has one rules engine and one memory, whichever conversation it is in
@@ -1035,6 +1036,7 @@ def register_room_dock_routes(app: FastAPI, stack: RoomStack) -> None:
         `not_recorded`, `unreadable` and `no_ontology` went with the record. Whether the
         facts could be read is `facts` / `facts_reason`, as before.
         """
+        refuse_cross_origin(request)
         state = _room(room_id)
         if not agent_id:
             seats = ", ".join(p.id for p in seated_agents(state)) or "no agents are seated"
@@ -1043,7 +1045,7 @@ def register_room_dock_routes(app: FastAPI, stack: RoomStack) -> None:
                 detail=f"Name the seat to read with agent_id (seated: {seats}).",
             )
         seat = _seat(state, agent_id)
-        known, facts = _known_facts(state.room_id, seat)
+        known, statements = _known_facts(state.room_id, seat)
         engine = stack.session_manager().ontology_for(seat.id)
         axioms = engine.list_axioms() if isinstance(engine, OntologyEngine) else []
         return {
@@ -1051,7 +1053,7 @@ def register_room_dock_routes(app: FastAPI, stack: RoomStack) -> None:
             "participant_id": seat.id,
             "session_id": seat.session_id,
             **known,
-            "worked_out": None if facts is None else worked_out_list(facts, axioms),
+            "worked_out": None if statements is None else worked_out_list(statements, axioms),
             **knowledge_graph(engine),
             "status": "ok",
             "reason": None,
@@ -1063,7 +1065,7 @@ def register_room_dock_routes(app: FastAPI, stack: RoomStack) -> None:
         Checked read-only first, so an id that names no clone, or a fact that is not there,
         is refused without creating a home or loading a store. The store returned is the
         one the clone's seats and chats write through (`memory_for`), so the edit is seen
-        by a running clone at once and is not a second whole-document writer.
+        by a running clone at once.
         """
         try:
             facts = read_saved_facts(agent_id)
@@ -1087,20 +1089,21 @@ def register_room_dock_routes(app: FastAPI, stack: RoomStack) -> None:
         except (KeyError, ValueError):
             # Gone between the check and the edit: another writer forgot or corrected it.
             raise _memory_edit_refusal(404, "fact_not_found") from None
-        except OSError as exc:
+        except (OSError, sqlite3.Error) as exc:
             logger.error("Memory edit for %r could not be saved: %s", agent_id, exc)
             raise _memory_edit_refusal(500, "save_failed") from None
         return fact
 
     @app.patch("/api/agents/{agent_id}/memory/{fact_id}")
     async def correct_memory_fact(  # pyright: ignore[reportUnusedFunction]
-        agent_id: str, fact_id: str, req: dict[str, Any]
+        agent_id: str, fact_id: str, req: dict[str, Any], request: Request
     ) -> dict[str, Any]:
         """Correct: a `corrected` fact that supersedes this one (design §3.6, §3.8).
 
         Body `{value}`. Returns the new fact. The old one stays in the file, retracted with
         the reason "corrected by the user".
         """
+        refuse_cross_origin(request)
         value = req.get("value")
         if not isinstance(value, str) or not value.strip():
             raise _memory_edit_refusal(400, "value_missing")
@@ -1109,12 +1112,15 @@ def register_room_dock_routes(app: FastAPI, stack: RoomStack) -> None:
         return {"fact": fact.model_dump(mode="json")}
 
     @app.delete("/api/agents/{agent_id}/memory/{fact_id}")
-    async def forget_memory_fact(agent_id: str, fact_id: str) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
+    async def forget_memory_fact(  # pyright: ignore[reportUnusedFunction]
+        agent_id: str, fact_id: str, request: Request
+    ) -> dict[str, Any]:
         """Forget: a retraction, never a hard delete (design §3.6, §3.8).
 
         The fact leaves every future prompt and every list; the audit record stays in the
         file with the reason "forgotten by the user". Returns the retracted fact.
         """
+        refuse_cross_origin(request)
         store = _editable_memory(agent_id, fact_id)
         fact = _edited(
             agent_id,

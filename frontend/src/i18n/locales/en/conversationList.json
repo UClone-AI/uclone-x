@@ -15,6 +15,7 @@
   "deleteDialog": {
     "heading": "Delete “{name}”?",
     "body": {
+      "zero": "Its record of who was in it ({who}) will be removed, and any reply still being written in it is stopped. This cannot be undone.",
       "one": "Its whole transcript ({count} entry) and its record of who was in it ({who}) will be removed, and any reply still being written in it is stopped. This cannot be undone.",
       "other": "Its whole transcript ({count} entries) and its record of who was in it ({who}) will be removed, and any reply still being written in it is stopped. This cannot be undone."
     },

@@ -1,10 +1,12 @@
 """Where a clone's picture is, and how it is changed.
 
-A clone's picture is a file named after it: `<name>.<ext>` in the workspace personas
-directory for one the user or the clone chose, and beside the shipped definition for a
-built-in's own. `PersonaAvatarStore` is the one place that finds it and the one place that
-writes it. The head's routes and the `set_avatar` tool both go through it, and general
-writing tools cannot reach the directory at all (`BaseTool.resolve_write_path`).
+A clone's picture is `avatar.<ext>` in its own directory under the agents root, for one
+the user or the clone chose, with the one it replaced kept as `avatar.prev.<ext>`
+(clone-data-scopes §3.2). A builtin's shipped picture stays beside its package definition
+and is found by the clone's template. `PersonaAvatarStore` is the one place that finds it
+and the one place that writes it. The head's routes and the `set_avatar` tool both go
+through it, and general writing tools cannot reach the agents root at all
+(`BaseTool.resolve_write_path`).
 """
 
 from __future__ import annotations
@@ -16,7 +18,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from uclone_x.agent.persona_registry import PersonaRegistry
-from uclone_x.agent.persona_store import BUILTIN_PERSONAS_DIR
 from uclone_x.errors import PlainRefusalError
 from uclone_x.tools.base import replace_file
 
@@ -67,8 +68,9 @@ class AvatarRefused(PlainRefusalError):
     """A picture was not set or reset, for a reason written for a person.
 
     `reason_code` names which reason, so the head can say what to do without reading the
-    sentence: `no_clone`, `not_saved`, `no_workspace`, `too_large`, `not_an_image`,
-    `no_file`, `outside_workspace`, `no_source`, `stale_change`.
+    sentence: `no_clone`, `not_saved`, `too_large`, `not_an_image`, `no_file`,
+    `outside_workspace`, `no_source`, `stale_change`. (`no_workspace` went with the
+    workspace pictures folder, 2026-09-27: a clone keeps its picture in its own directory.)
     """
 
 
@@ -132,11 +134,15 @@ def sniff_image_format(data: bytes) -> str | None:
     return None
 
 
-def avatar_url(name: str, record: AvatarRecord | None) -> str | None:
-    """The address a head shows the picture from, changing whenever the picture does."""
+def avatar_url(clone: str, record: AvatarRecord | None) -> str | None:
+    """The address a head shows the picture from, changing whenever the picture does.
+
+    `clone` is the clone's id where it has one, so the address survives a handle rename;
+    the route reads a handle as well.
+    """
     if record is None:
         return None
-    return f"/api/personas/{name}/avatar?v={record.version}"
+    return f"/api/clones/{clone}/avatar?v={record.version}"
 
 
 def _record(path: Path, mime: str) -> AvatarRecord:
@@ -147,18 +153,23 @@ def _record(path: Path, mime: str) -> AvatarRecord:
 class PersonaAvatarStore:
     """Finds, sets and resets clones' pictures for one persona registry.
 
-    A picture path is composed from a name only after `source_of(name)` confirms the name
-    is a clone loaded from a file, so `../` in a request names nothing.
+    A picture path is composed only inside the directory the registry names for a clone,
+    and never from the name itself, so `../` in a request names nothing.
     """
+
+    #: The chosen picture's stem in a clone directory, and the replaced one's.
+    _CHOSEN = "avatar"
+    _PREVIOUS = "avatar.prev"
 
     def __init__(self, registry: PersonaRegistry) -> None:
         self._registry = registry
 
-    def _custom_dir(self) -> Path | None:
-        return self._registry.writable_dir()
+    def _clone_dir(self, name: str) -> Path | None:
+        record = self._registry.clone_record(name)
+        return record.path if record is not None else None
 
-    def _custom_files(self, name: str, *, stem: str) -> list[Path]:
-        folder = self._custom_dir()
+    def _files(self, name: str, *, stem: str) -> list[Path]:
+        folder = self._clone_dir(name)
         if folder is None:
             return []
         candidates = (folder / f"{stem}{suffix}" for suffix, _ in AVATAR_FORMATS)
@@ -167,21 +178,26 @@ class PersonaAvatarStore:
     def find(self, name: str) -> AvatarRecord | None:
         """The picture in force for `name`, or `None` for a clone with none.
 
-        Looked for in this order, first hit wins: the one chosen for it in the workspace
-        personas directory; the one beside the file it was loaded from; the one beside the
-        package's own definition of that name. The last is what keeps a built-in's shipped
-        picture after its definition is edited, which moves the definition to the workspace.
+        Looked for in this order, first hit wins: the one chosen for it in its clone
+        directory; for a clone installed from the package, or one whose handle a builtin
+        carries, the shipped picture of that builtin; for a persona read from an extra
+        directory, the one beside its file.
         """
         source = self._registry.source_of(name)
         if source is None:
             return None
         folders: list[tuple[Path, str]] = []
-        custom = self._custom_dir()
-        if custom is not None:
-            folders.append((custom, name))
-        folders.append((source.parent, source.stem))
-        if self._registry.has_builtin(name):
-            folders.append((BUILTIN_PERSONAS_DIR, name))
+        record = self._registry.clone_record(name)
+        if record is not None:
+            folders.append((record.path, self._CHOSEN))
+            package = self._registry.package_dir()
+            # An imported workspace edit of a builtin has no template but keeps the
+            # shipped picture of its handle, as it did before clones were stored.
+            template = record.template or (name if self._registry.has_builtin(name) else None)
+            if template is not None and package is not None:
+                folders.append((package, template))
+        else:
+            folders.append((source.parent, source.stem))
         for folder, stem in folders:
             for suffix, mime in AVATAR_FORMATS:
                 candidate = folder / f"{stem}{suffix}"
@@ -190,36 +206,28 @@ class PersonaAvatarStore:
         return None
 
     def _require_settable(self, name: str) -> Path:
-        if self._registry.source_of(name) is None:  # only a loaded clone's name makes a path
-            if self._registry.get_persona(name) is None:
-                raise AvatarPersonaNotFound(
-                    f"There is no clone named '{name}' here, so no picture was set. "
-                    "Check the name in the clone list.",
-                    reason_code="no_clone",
-                )
-            raise AvatarRefused(
-                f"'{name}' has no saved definition, so it cannot keep a picture. "
-                "Save it from its settings first.",
-                reason_code="not_saved",
+        folder = self._clone_dir(name)
+        if folder is not None:
+            return folder
+        if self._registry.get_persona(name) is None:
+            raise AvatarPersonaNotFound(
+                f"There is no clone named '{name}' here, so no picture was set. "
+                "Check the name in the clone list.",
+                reason_code="no_clone",
             )
-        folder = self._custom_dir()
-        if folder is None:
-            raise AvatarRefused(
-                "This head has no workspace to keep pictures in, so no picture was set. "
-                "Open a workspace and try again.",
-                reason_code="no_workspace",
-            )
-        return folder
+        raise AvatarRefused(
+            f"'{name}' has no saved definition, so it cannot keep a picture. "
+            "Save it from its settings first.",
+            reason_code="not_saved",
+        )
 
     def latest_change(self, name: str) -> int:
         """The id of the latest change to `name`'s picture; `0` before any, or for no clone."""
-        if self._registry.source_of(name) is None:
-            return 0
-        folder = self._custom_dir()
-        return 0 if folder is None else _read_change(folder, name)
+        folder = self._clone_dir(name)
+        return 0 if folder is None else _read_change(folder)
 
     def set(self, name: str, data: bytes, *, undo_of: int | None = None) -> AvatarChange:
-        """Make `data` the picture for `name`, keeping the one it replaces as `<name>.prev.<ext>`.
+        """Make `data` the picture for `name`, keeping the one it replaces as `avatar.prev.<ext>`.
 
         With `undo_of`, this is the undo of that change, and it is made only while that
         change is still the latest; checked and made under one lock.
@@ -244,10 +252,10 @@ class PersonaAvatarStore:
                 "Choose a picture in one of those formats.",
                 reason_code="not_an_image",
             )
-        with _changing(folder, name, undo_of) as change_id:
-            current = self._custom_files(name, stem=name)
+        with _changing(folder, undo_of) as change_id:
+            current = self._files(name, stem=self._CHOSEN)
             replaced = self._keep_previous(name, current[0]) if current else None
-            target = folder / f"{name}{_SUFFIX_FOR_MIME[mime]}"
+            target = folder / f"{self._CHOSEN}{_SUFFIX_FOR_MIME[mime]}"
             replace_file(target, data)
             for other in current:
                 if other != target:
@@ -262,7 +270,8 @@ class PersonaAvatarStore:
             raise AvatarStaleChange()
         if not path.is_file():
             raise AvatarRefused(
-                f"There is no picture at '{path.name}', so none was set. Check the file's name.",
+                f"There is no picture at '{path.name}', so none was set. Use a path a tool "
+                "returned: draw the picture with generate_image first, or ask Artist for one.",
                 reason_code="no_file",
             )
         if path.stat().st_size > MAX_AVATAR_BYTES:
@@ -274,15 +283,15 @@ class PersonaAvatarStore:
         return self.set(name, path.read_bytes(), undo_of=undo_of)
 
     def reset(self, name: str, *, undo_of: int | None = None) -> AvatarChange:
-        """Put the chosen picture aside as `<name>.prev.<ext>`; `previous` says where it went.
+        """Put the chosen picture aside as `avatar.prev.<ext>`; `previous` says where it went.
 
         The clone then shows its shipped picture, or the head's default. `previous` is
         `None` when there was no chosen picture to put aside; the call still counts as a
         change, so an Undo offered before it no longer matches. `undo_of` is as for `set`.
         """
         folder = self._require_settable(name)
-        with _changing(folder, name, undo_of) as change_id:
-            current = self._custom_files(name, stem=name)
+        with _changing(folder, undo_of) as change_id:
+            current = self._files(name, stem=self._CHOSEN)
             if not current:
                 return AvatarChange(change_id=change_id, previous=None)
             kept = self._keep_previous(name, current[0])
@@ -291,46 +300,59 @@ class PersonaAvatarStore:
             return AvatarChange(change_id=change_id, previous=kept)
 
     def chosen(self, name: str) -> Path | None:
-        """The picture chosen for `name` in the workspace, not the shipped one, if any."""
-        if self._registry.source_of(name) is None:
-            return None
-        found = self._custom_files(name, stem=name)
+        """The picture chosen for `name` in its clone directory, not the shipped one, if any."""
+        found = self._files(name, stem=self._CHOSEN)
         return found[0] if found else None
 
     def previous(self, name: str) -> Path | None:
         """The picture most recently replaced or reset for `name`, if one is kept."""
-        if self._registry.source_of(name) is None:
-            return None
-        found = self._custom_files(name, stem=f"{name}.prev")
+        found = self._files(name, stem=self._PREVIOUS)
         return found[0] if found else None
 
+    def named_previous(self, name: str, raw: str) -> Path | None:
+        """The kept picture of `name` when `raw` names it, as `previous_path` answers it.
+
+        The kept picture lives in the clone's directory, outside the workspace, so the
+        `previous_path` a change answers with is accepted back here by what it names; any
+        other path is left to the caller's workspace rule.
+        """
+        kept = self.previous(name)
+        if kept is None:
+            return None
+        try:
+            same = Path(raw).expanduser().resolve() == kept.resolve()
+        except (OSError, RuntimeError, ValueError):
+            return None
+        return kept if same else None
+
     def _keep_previous(self, name: str, current: Path) -> Path:
-        """Copy `current` to `<name>.prev.<ext>`, dropping any older previous picture."""
-        kept = current.with_name(f"{name}.prev{current.suffix}")
+        """Copy `current` to `avatar.prev.<ext>`, dropping any older previous picture."""
+        kept = current.with_name(f"{self._PREVIOUS}{current.suffix}")
         data = current.read_bytes()
-        for older in self._custom_files(name, stem=f"{name}.prev"):
+        for older in self._files(name, stem=self._PREVIOUS):
             if older != kept:
                 older.unlink(missing_ok=True)
         replace_file(kept, data)
         return kept
 
 
-def _change_file(folder: Path, name: str) -> Path:
-    return folder / f".{name}.avatar-change"
+def _change_file(folder: Path) -> Path:
+    """The change counter of the clone whose directory is `folder`, beside its picture."""
+    return folder / ".avatar-change"
 
 
-def _read_change(folder: Path, name: str) -> int:
-    """The counted id of `name`'s latest change; `0` when none was counted or it is unreadable."""
+def _read_change(folder: Path) -> int:
+    """The counted id of the clone's latest change; `0` when none was counted or it is unreadable."""
     try:
-        text = _change_file(folder, name).read_text(encoding="ascii").strip()
+        text = _change_file(folder).read_text(encoding="ascii").strip()
     except (OSError, UnicodeDecodeError):
         return 0
     return int(text) if text.isascii() and text.isdigit() else 0
 
 
 @contextmanager
-def _changing(folder: Path, name: str, undo_of: int | None) -> Generator[int]:
-    """Hold `name`'s picture lock for one change and yield the id that change gets.
+def _changing(folder: Path, undo_of: int | None) -> Generator[int]:
+    """Hold the picture lock of the clone in `folder` for one change; yield that change's id.
 
     The id is counted on disk, beside the picture, and written before the change is made.
     A change that fails part-way then still takes its id, which only makes older Undos
@@ -346,17 +368,17 @@ def _changing(folder: Path, name: str, undo_of: int | None) -> Generator[int]:
     fd: int | None = None
     if fcntl is not None:
         try:
-            fd = os.open(folder / f".{name}.avatar-lock", os.O_RDONLY | os.O_CREAT, 0o600)
+            fd = os.open(folder / ".avatar-lock", os.O_RDONLY | os.O_CREAT, 0o600)
         except OSError:
             fd = None
     try:
         if fd is not None and fcntl is not None:
             fcntl.flock(fd, fcntl.LOCK_EX)
-        latest = _read_change(folder, name)
+        latest = _read_change(folder)
         if undo_of is not None and (undo_of < 1 or undo_of != latest):
             raise AvatarStaleChange()
         change_id = latest + 1
-        replace_file(_change_file(folder, name), f"{change_id}\n".encode("ascii"))
+        replace_file(_change_file(folder), f"{change_id}\n".encode("ascii"))
         yield change_id
     finally:
         if fd is not None:

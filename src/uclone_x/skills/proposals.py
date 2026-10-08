@@ -8,7 +8,7 @@ the same flow as `ucx skill approve` on a copy: audit, write it active, take the
 pin it in the approvals ledger. There is no path, flag or setting that approves a proposal
 without that request (owner ruling 2026-09-27).
 
-Layout (design: `docs/skill-system-architecture.md` §7.3)::
+Layout (design: the skill system architecture document)::
 
     <root>/<name>/                 the active version (+ .proposal.json when proposed)
     <root>/.pending/<name>/<v>/    a proposal
@@ -32,7 +32,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Final, cast
+from typing import Any, Final, Literal, cast, get_args
 
 from uclone_x.errors import PlainRefusalError, SkillAuditError
 from uclone_x.skills.approvals import SkillApprovalLedger, SkillPin
@@ -59,6 +59,7 @@ __all__ = [
     "PROPOSAL_FILENAME",
     "REJECTED_DIRNAME",
     "VERSIONS_DIRNAME",
+    "SkillDecisionCode",
     "SkillProposal",
     "SkillProposalChangedError",
     "SkillProposalError",
@@ -117,11 +118,47 @@ SEEN_CHANGED = (
     "This proposal changed after it was shown to you, so it was not approved. "
     "Look at it again, then approve it."
 )
+SEEN_CHANGED_TURN_DOWN = (
+    "This proposal changed after it was shown to you, so it was not turned down. "
+    "Look at it again, then decide."
+)
+EXTRA_FILES = (
+    "This proposal holds files besides its instructions, so it cannot be approved. "
+    "You can turn it down instead."
+)
 NOT_SAVED = "The skill folder could not be changed, so nothing was saved."
+
+#: Why Settings' approve, turn down or revoke was refused: a stable name the head renders in
+#: the reader's language (`skills.refusals.<code>` in each catalog, #1865). The sentence the
+#: route sends as `detail` is the English one; the code travels beside it, never inside it.
+SkillDecisionCode = Literal[
+    "shipped",
+    "has_files",
+    "extra_files",
+    "not_found",
+    "not_active",
+    "failed_check",
+    "check_not_finished",
+    "changed_meanwhile",
+    "seen_changed",
+    "not_saved",
+    # Set by the Settings routes, not the store: no skill folder, an unexpected failure, or
+    # a request that did not say which version, or which text the person saw.
+    "no_store",
+    "not_changed",
+    "no_version",
+    "not_seen",
+]
+SKILL_DECISION_CODES: Final[tuple[SkillDecisionCode, ...]] = get_args(SkillDecisionCode)
 
 
 class SkillProposalError(PlainRefusalError):
     """A proposal, approve, reject or revoke refused; the message is for a person."""
+
+    def __init__(self, message: str, *, reason_code: SkillDecisionCode | None = None) -> None:
+        super().__init__(message, reason_code=reason_code)
+        #: `reason_code`, typed as the closed set the head's catalogs cover.
+        self.decision_code: SkillDecisionCode | None = reason_code
 
 
 class SkillProposalChangedError(SkillProposalError):
@@ -183,6 +220,15 @@ def _review_text(manifest: SkillManifest, instructions: str) -> list[str]:
     ]
 
 
+def _holds_more_than_instructions(package: Path) -> bool:
+    """Whether a copied package holds any file but its top-level `SKILL.md`."""
+    return any(
+        path.relative_to(package).as_posix() != "SKILL.md"
+        for path in package.rglob("*")
+        if not path.is_dir()
+    )
+
+
 class SkillProposalStore:
     """Proposals under a skill store's root, and the person's decisions on them."""
 
@@ -234,7 +280,7 @@ class SkillProposalStore:
     def _refuse_replacing(self, name: str) -> None:
         """Refuse to replace a shipped skill, or one that holds more than its `SKILL.md`."""
         if name in SHIPPED_SKILL_PINS:
-            raise SkillProposalError(SHIPPED)
+            raise SkillProposalError(SHIPPED, reason_code="shipped")
         folder = self._root / name
         if folder.is_dir():
             extra = [
@@ -243,7 +289,7 @@ class SkillProposalStore:
                 if not child.name.startswith(".") and child.name != "SKILL.md"
             ]
             if extra:
-                raise SkillProposalError(HAS_FILES)
+                raise SkillProposalError(HAS_FILES, reason_code="has_files")
 
     def propose(
         self,
@@ -310,7 +356,7 @@ class SkillProposalStore:
             )
         except OSError as exc:
             logger.warning("A skill proposal for '%s' could not be written: %s", clean, exc)
-            raise SkillProposalError(NOT_SAVED) from exc
+            raise SkillProposalError(NOT_SAVED, reason_code="not_saved") from exc
         return self._read_proposal(clean, target)
 
     # --- listing --------------------------------------------------------------------
@@ -376,10 +422,10 @@ class SkillProposalStore:
 
     def _proposal_dir(self, name: str, version: str) -> Path:
         if not _NAME.fullmatch(name) or _version_key(version) is None:
-            raise SkillProposalError(NOT_FOUND)
+            raise SkillProposalError(NOT_FOUND, reason_code="not_found")
         folder = self._pending(name) / version
         if not (folder / "SKILL.md").is_file():
-            raise SkillProposalError(NOT_FOUND)
+            raise SkillProposalError(NOT_FOUND, reason_code="not_found")
         return folder
 
     # --- deciding -------------------------------------------------------------------
@@ -414,9 +460,16 @@ class SkillProposalStore:
                 )
             except SkillAuditError as exc:
                 logger.warning("The skill proposal '%s' could not be checked: %s", name, exc)
-                raise SkillProposalError(CHECK_NOT_FINISHED) from exc
+                raise SkillProposalError(
+                    CHECK_NOT_FINISHED, reason_code="check_not_finished"
+                ) from exc
             if report.content_sha256 != seen_digest:
-                raise SkillProposalChangedError(SEEN_CHANGED)
+                raise SkillProposalChangedError(SEEN_CHANGED, reason_code="seen_changed")
+            if _holds_more_than_instructions(checked_dir):
+                # Only `SKILL.md` is installed, so a digest over more than that would pin a
+                # package that is never on disk, and the person is shown only the
+                # instructions: approving the rest unseen is what this refuses (#1858).
+                raise SkillProposalError(EXTRA_FILES, reason_code="extra_files")
             manifest = checked.manifest
             if (
                 manifest.name != name
@@ -424,7 +477,7 @@ class SkillProposalStore:
                 or manifest.entrypoint
                 or not (report.is_safe and report.recommendation is AuditVerdict.APPROVE)
             ):
-                raise SkillProposalError(FAILED_CHECK)
+                raise SkillProposalError(FAILED_CHECK, reason_code="failed_check")
             approved_at = _now()
             active = manifest.model_copy(
                 update={
@@ -446,14 +499,16 @@ class SkillProposalStore:
                     checked.instructions_markdown,
                 )
                 if compute_skill_sha256(pending) != report.content_sha256:
-                    raise SkillProposalChangedError(CHANGED_MEANWHILE)
+                    raise SkillProposalChangedError(
+                        CHANGED_MEANWHILE, reason_code="changed_meanwhile"
+                    )
                 data = (checked_dir / "SKILL.md").read_bytes()
                 await asyncio.to_thread(
                     self._install, name, pending, data, digest, approver, approved_at, ledger
                 )
             except (SkillAuditError, OSError) as exc:
                 logger.warning("The skill proposal '%s' could not be approved: %s", name, exc)
-                raise SkillProposalError(NOT_SAVED) from exc
+                raise SkillProposalError(NOT_SAVED, reason_code="not_saved") from exc
         return digest
 
     def _install(
@@ -509,9 +564,28 @@ class SkillProposalStore:
         except OSError:
             pass
 
-    def reject(self, name: str, version: str, *, rejecter: str, reason: str | None) -> None:
-        """Move the proposal to `.rejected/`, marked rejected with who, when and why."""
+    def reject(
+        self,
+        name: str,
+        version: str,
+        *,
+        seen_digest: str,
+        rejecter: str,
+        reason: str | None,
+    ) -> None:
+        """Move the proposal to `.rejected/`, marked rejected with who, when and why.
+
+        Bound to what the person saw, as `approve` is (#1865): unless the proposal's digest
+        is still `seen_digest`, nothing moves and `SkillProposalChangedError` says so.
+        """
         pending = self._proposal_dir(name, version)
+        try:
+            current_digest = compute_skill_sha256(pending)
+        except SkillAuditError as exc:
+            logger.warning("The skill proposal '%s' could not be checked: %s", name, exc)
+            raise SkillProposalError(CHECK_NOT_FINISHED, reason_code="check_not_finished") from exc
+        if current_digest != seen_digest:
+            raise SkillProposalChangedError(SEEN_CHANGED_TURN_DOWN, reason_code="seen_changed")
         try:
             skill = load_skill_from_dir(pending)
             save_skill(
@@ -531,18 +605,18 @@ class SkillProposalStore:
             pending.rename(target)
         except (SkillAuditError, OSError) as exc:
             logger.warning("The skill proposal '%s' could not be turned down: %s", name, exc)
-            raise SkillProposalError(NOT_SAVED) from exc
+            raise SkillProposalError(NOT_SAVED, reason_code="not_saved") from exc
         self._drop_if_empty(pending.parent)
 
     def revoke(self, name: str, *, revoker: str, ledger: SkillApprovalLedger) -> None:
         """Stop an active skill: remove its pin, then mark it rejected. Its files stay."""
         if not _NAME.fullmatch(name):
-            raise SkillProposalError(NOT_ACTIVE)
+            raise SkillProposalError(NOT_ACTIVE, reason_code="not_active")
         if name in SHIPPED_SKILL_PINS:
-            raise SkillProposalError(SHIPPED)
+            raise SkillProposalError(SHIPPED, reason_code="shipped")
         current = self._current(name)
         if current is None or current.manifest.status is not SkillStatus.ACTIVE:
-            raise SkillProposalError(NOT_ACTIVE)
+            raise SkillProposalError(NOT_ACTIVE, reason_code="not_active")
         try:
             ledger.revoke(name)
             save_skill(
@@ -559,4 +633,4 @@ class SkillProposalStore:
             )
         except (SkillAuditError, OSError) as exc:
             logger.warning("The skill '%s' could not be revoked: %s", name, exc)
-            raise SkillProposalError(NOT_SAVED) from exc
+            raise SkillProposalError(NOT_SAVED, reason_code="not_saved") from exc

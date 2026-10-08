@@ -758,9 +758,10 @@ def test_default_registry_includes_web_tools() -> None:
     assert "character_sheet" in tool_names
     assert "story_library" in tool_names
     assert "muse_spark" in tool_names
+    assert "story_start" in tool_names
     assert "tool_result_read" in tool_names
     assert "set_avatar" in tool_names
-    assert len(tools) == 24
+    assert len(tools) == 26
 
     web_fetch = registry.get("web_fetch")
     assert isinstance(web_fetch, WebFetchTool)

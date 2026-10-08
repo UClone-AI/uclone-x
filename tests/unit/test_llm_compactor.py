@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import pytest
 
 from uclone_x.core.provenance import ExecutionPath, Provenance
-from uclone_x.core.tool_results import handle_in, load_tool_result, result_handle
+from uclone_x.core.tool_results import handle_in, result_handle
 from uclone_x.errors import BudgetExceededError, UnmappableChatMessageError
 from uclone_x.llm import (
     ChatMessage,
@@ -25,7 +23,6 @@ from uclone_x.llm.compactor import (
     estimate_reply_tokens,
     estimate_request_tokens,
     estimate_text_tokens,
-    resolve_model_context_limit,
 )
 from uclone_x.llm.models import CompactionOutcome, FinishReason, LedgerSource
 from uclone_x.llm.protocols import ContextCompactorProtocol, LLMProviderProtocol
@@ -463,77 +460,6 @@ def test_context_compactor_should_compact_at() -> None:
     assert compactor.should_compact_at(messages, threshold_tokens=-10) is False
 
 
-def test_resolve_model_context_limit() -> None:
-    assert resolve_model_context_limit(None) is None
-    assert resolve_model_context_limit("") is None
-    assert resolve_model_context_limit("unknown-custom-model") is None
-
-    # Gemini family
-    assert resolve_model_context_limit("gemini-1.5-flash") == 1_000_000
-    assert resolve_model_context_limit("models/gemini-2.0-flash") == 1_000_000
-    assert resolve_model_context_limit("gemini-1.5-pro") == 2_000_000
-
-    # Claude family: retired IDs a saved config may still name
-    assert resolve_model_context_limit("claude-3-5-sonnet") == 200_000
-    assert resolve_model_context_limit("claude-3-7-sonnet") == 200_000
-
-    # OpenAI family
-    assert resolve_model_context_limit("gpt-4o") == 128_000
-    assert resolve_model_context_limit("gpt-4o-mini") == 128_000
-
-    # Qwen family
-    assert resolve_model_context_limit("qwen2.5-coder:32b") == 128_000
-    assert resolve_model_context_limit("qwen2.5") == 128_000
-
-
-def test_a_current_claude_model_is_not_read_as_the_200k_family_fallback() -> None:
-    """Opus 5.5, Sonnet 5 and Fable 5.1 publish 1M windows; the bare `"claude"` key says 200K.
-
-    The lookup takes the first key contained in the name, so without their own entries
-    every current Claude model compacted at 70% of a fifth of its window.
-
-    The `-5-5` and `-5-1` declarations mutate the value, not the key: a renamed key now
-    falls through to `claude-opus-5` or `claude-fable-5` (#1917), whose window is the same.
-
-    Killed by: src/uclone_x/llm/compactor.py :: "claude-opus-5-5": 1_000_000,
-    Becomes: "claude-opus-5-5": 2_000_000,
-    Killed by: src/uclone_x/llm/compactor.py :: "claude-sonnet-5": 1_000_000,
-    Becomes: "claude-sonnet-x": 1_000_000,
-    Killed by: src/uclone_x/llm/compactor.py :: "claude-fable-5-1": 1_000_000,
-    Becomes: "claude-fable-5-1": 2_000_000,
-    """
-    assert resolve_model_context_limit("claude-opus-5-5") == 1_000_000
-    assert resolve_model_context_limit("claude-sonnet-5") == 1_000_000
-    assert resolve_model_context_limit("claude-fable-5-1") == 1_000_000
-
-
-def test_a_legacy_claude_model_still_served_has_its_published_window() -> None:
-    """Legacy models Anthropic still serves, from each model's own page on 2026-09-28 (#1917).
-
-    Without their own entries the 1M models compacted at 70% of the bare `"claude"` key's
-    200K. Opus 4.5 and Sonnet 4.5 are 200K, the same as that fallback, so their entries
-    are pinned by value rather than by key.
-
-    Killed by: src/uclone_x/llm/compactor.py :: "claude-opus-4-8": 1_000_000,
-    Becomes: "claude-opus-4-x": 1_000_000,
-    Killed by: src/uclone_x/llm/compactor.py :: "claude-fable-5": 1_000_000,
-    Becomes: "claude-fable-x": 1_000_000,
-    Killed by: src/uclone_x/llm/compactor.py :: "claude-sonnet-4-5": 200_000,
-    Becomes: "claude-sonnet-4-5": 100_000,
-    """
-    for model in (
-        "claude-fable-5",
-        "claude-opus-5",
-        "claude-opus-4-8",
-        "claude-opus-4-7",
-        "claude-opus-4-6",
-        "claude-sonnet-4-6",
-    ):
-        assert resolve_model_context_limit(model) == 1_000_000, model
-    assert resolve_model_context_limit("claude-opus-4-5-20251101") == 200_000
-    assert resolve_model_context_limit("claude-sonnet-4-5-20250929") == 200_000
-
-
 @pytest.mark.asyncio
 async def test_context_compactor_heuristic_compaction() -> None:
     compactor = ContextCompactor(threshold=0.70, keep_recent_turns=2, max_tool_output_chars=200)
@@ -595,16 +521,27 @@ async def test_context_compactor_prunes_long_tool_outputs() -> None:
     assert len(tool_msg.content or "") < 300
 
 
+class _Bodies:
+    """A session's kept bodies in memory, by handle: `ResultBodies` for the unit tests."""
+
+    def __init__(self) -> None:
+        self.held: dict[str, str] = {}
+
+    def keep(self, text: str, *, tool_name: str | None) -> str:
+        handle = result_handle(text)
+        self.held[handle] = text
+        return handle
+
+    def read(self, handle: str) -> str | None:
+        return self.held.get(handle)
+
+
 @pytest.mark.asyncio
-async def test_context_compactor_offloads_oversized_tool_output(tmp_path: Path) -> None:
-    """Oversized output goes to the session's `tr_` result store and is stubbed (#1640)."""
-    workspace_root = tmp_path / "sandbox_ws"
-    workspace_root.mkdir()
+async def test_context_compactor_offloads_oversized_tool_output() -> None:
+    """Oversized output is kept in the session's log and stubbed (#1640, #1848)."""
+    bodies = _Bodies()
     compactor = ContextCompactor(
-        keep_recent_turns=4,
-        max_tool_output_chars=100,
-        workspace_root=workspace_root,
-        session_id="sess_alpha",
+        keep_recent_turns=4, max_tool_output_chars=100, result_bodies=bodies
     )
 
     long_tool_content = "Y" * 500
@@ -627,24 +564,42 @@ async def test_context_compactor_offloads_oversized_tool_output(tmp_path: Path) 
     assert handle is not None
     assert f'tool_result_read(handle="{handle}", offset=0)' in (tool_msg.content or "")
     assert "file_read" not in (tool_msg.content or "")
-
-    artifacts = workspace_root / ".sandbox" / "tool_artifacts"
-    assert load_tool_result(artifacts, "sess_alpha", handle) == long_tool_content
+    assert bodies.read(handle) == long_tool_content
 
 
 @pytest.mark.asyncio
-async def test_a_reused_call_id_does_not_overwrite_an_earlier_offload(tmp_path: Path) -> None:
+async def test_an_offload_keeps_the_redacted_body_and_stubs_from_it() -> None:
+    """The kept body is redacted, and the stub is rendered from that same body (#1848).
+
+    Killed by: src/uclone_x/llm/compactor.py :: body = redact_credentials(msg.content)
+    Becomes: body = msg.content
+    """
+    secret = "sk-ant-api03-" + "C" * 90
+    bodies = _Bodies()
+    compactor = ContextCompactor(max_tool_output_chars=100, result_bodies=bodies)
+    content = f"key={secret}\n" + "W" * 600
+    stub = compactor.prune_tool_message(
+        ChatMessage(role=MessageRole.TOOL, name="fetch", content=content, tool_call_id="c1")
+    )
+    handle = handle_in(stub.content)
+    assert handle is not None
+    kept = bodies.held[handle]
+    assert secret not in kept and secret not in (stub.content or "")
+    assert kept.startswith((stub.content or "").split("\n", 1)[1])
+
+
+@pytest.mark.asyncio
+async def test_a_reused_call_id_does_not_overwrite_an_earlier_offload() -> None:
     """Two results under one `tool_call_id` are both kept (#1640).
 
     Ollama and Gemini number calls `call_0`, `call_1` per response, so the same id recurs
-    across steps. The store names a blob by its content, not by the call.
+    across steps. A body is named by its content, not by the call.
 
-    Killed by: src/uclone_x/llm/compactor.py :: handle = store_tool_result(artifacts_dir, session_subdir, msg.content)
-    Becomes: handle = store_tool_result(artifacts_dir, session_subdir, str(msg.tool_call_id))
+    Killed by: src/uclone_x/llm/compactor.py :: handle = bodies.keep(body, tool_name=msg.name)
+    Becomes: handle = bodies.keep(str(msg.tool_call_id), tool_name=msg.name)
     """
-    compactor = ContextCompactor(
-        max_tool_output_chars=100, workspace_root=tmp_path, session_id="sess_reuse"
-    )
+    bodies = _Bodies()
+    compactor = ContextCompactor(max_tool_output_chars=100, result_bodies=bodies)
     first, second = "first " * 100, "second " * 100
     stubs = [
         compactor.prune_tool_message(
@@ -655,12 +610,11 @@ async def test_a_reused_call_id_does_not_overwrite_an_earlier_offload(tmp_path: 
 
     handles = [handle_in(stub.content) for stub in stubs]
     assert None not in handles
-    artifacts = tmp_path / ".sandbox" / "tool_artifacts"
-    assert [load_tool_result(artifacts, "sess_reuse", str(h)) for h in handles] == [first, second]
+    assert [bodies.read(str(h)) for h in handles] == [first, second]
 
 
 @pytest.mark.asyncio
-async def test_an_offload_does_not_name_a_reader_the_agent_lacks(tmp_path: Path) -> None:
+async def test_an_offload_does_not_name_a_reader_the_agent_lacks() -> None:
     """Without `tool_result_read` the stub says the output was kept, and names no tool.
 
     It named `file_read` whether or not the agent had it (#1640).
@@ -669,10 +623,7 @@ async def test_an_offload_does_not_name_a_reader_the_agent_lacks(tmp_path: Path)
     Becomes: readable=True,
     """
     compactor = ContextCompactor(
-        max_tool_output_chars=100,
-        workspace_root=tmp_path,
-        session_id="sess_blind",
-        tool_result_reader=False,
+        max_tool_output_chars=100, result_bodies=_Bodies(), tool_result_reader=False
     )
     msg = ChatMessage(role=MessageRole.TOOL, name="fetch", content="Q" * 500, tool_call_id="c1")
 
@@ -687,76 +638,9 @@ async def test_an_offload_does_not_name_a_reader_the_agent_lacks(tmp_path: Path)
 
 
 @pytest.mark.asyncio
-async def test_context_compactor_refuses_path_traversal(tmp_path: Path) -> None:
-    from uclone_x.errors import PathTraversalError
-
-    workspace_root = tmp_path / "sandbox_ws"
-    workspace_root.mkdir()
-
-    # 1. Traversal via session_id
-    compactor_bad_session = ContextCompactor(
-        max_tool_output_chars=100,
-        workspace_root=workspace_root,
-        session_id="../../escaped_session",
-    )
-    msg = ChatMessage(role=MessageRole.TOOL, name="test_tool", content="Z" * 500, tool_call_id="c1")
-    with pytest.raises(PathTraversalError):
-        compactor_bad_session.prune_tool_message(msg)
-
-    # 2. A tool_call_id no longer names a file, so a hostile one lands inside the store.
+async def test_heuristic_ledger_includes_offloaded_artifact() -> None:
     compactor = ContextCompactor(
-        max_tool_output_chars=100,
-        workspace_root=workspace_root,
-        session_id="valid_session",
-    )
-    bad_msg = ChatMessage(
-        role=MessageRole.TOOL,
-        name="test_tool",
-        content="Z" * 500,
-        tool_call_id="../../escaped_call",
-    )
-    handle = handle_in(compactor.prune_tool_message(bad_msg).content)
-    assert handle is not None
-    stored = workspace_root / ".sandbox" / "tool_artifacts" / "valid_session" / f"{handle}.txt"
-    assert stored.is_file()
-    assert not (tmp_path / "escaped_call").exists()
-
-
-def test_an_offload_refuses_a_session_directory_symlinked_outside(tmp_path: Path) -> None:
-    """A session directory that is a symlink out of the workspace is refused, not written (P3).
-
-    The session id is lexically clean, so only resolving the path catches a planted link.
-
-    Killed by: src/uclone_x/core/tool_results.py :: _blob_path(artifacts_dir, session_id, handle), artifacts_dir
-    Becomes: _blob_path(artifacts_dir, session_id, handle), Path("/")
-    """
-    from uclone_x.errors import PathTraversalError
-
-    workspace_root = tmp_path / "ws"
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    artifacts = workspace_root / ".sandbox" / "tool_artifacts"
-    artifacts.mkdir(parents=True)
-    (artifacts / "sess").symlink_to(outside, target_is_directory=True)
-    compactor = ContextCompactor(
-        max_tool_output_chars=100, workspace_root=workspace_root, session_id="sess"
-    )
-    msg = ChatMessage(role=MessageRole.TOOL, name="fetch", content="W" * 600, tool_call_id="c1")
-
-    with pytest.raises(PathTraversalError):
-        compactor.prune_tool_message(msg)
-    assert list(outside.iterdir()) == []
-
-
-@pytest.mark.asyncio
-async def test_heuristic_ledger_includes_offloaded_artifact(tmp_path: Path) -> None:
-    workspace_root = tmp_path / "sandbox_ws"
-    workspace_root.mkdir()
-    compactor = ContextCompactor(
-        keep_recent_turns=2,
-        max_tool_output_chars=100,
-        workspace_root=workspace_root,
-        session_id="sess_ledger",
+        keep_recent_turns=2, max_tool_output_chars=100, result_bodies=_Bodies()
     )
 
     messages = [

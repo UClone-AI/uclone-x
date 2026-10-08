@@ -76,17 +76,24 @@ describe('ResourceSummary', () => {
     vi.clearAllMocks();
     vi.spyOn(globalThis, 'fetch').mockImplementation(async (url: RequestInfo | URL) => {
       const urlStr = String(url);
-      if (urlStr.includes('/api/settings')) {
+      if (urlStr.startsWith('/api/models?capability=chat')) {
         return {
           ok: true,
           json: async () => ({
-            llm_provider: 'ollama',
-            llm_model: 'qwen2.5:latest',
-            llm_base_url: 'http://127.0.0.1:11434',
-            llm_api_key_set: false,
-            llm_api_key_masked: '',
-            comfyui_base_url: 'http://127.0.0.1:8188',
-            providers_available: ['ollama'],
+            groups: [
+              {
+                connection_id: 'ollama',
+                label: 'Ollama',
+                kind: 'ollama',
+                status: 'connected',
+                detail: null,
+                models: [
+                  { ref: 'ollama/qwen2.5:latest', id: 'qwen2.5:latest', display_name: 'qwen2.5:latest', capabilities: ['chat'], context_window: null },
+                ],
+              },
+            ],
+            defaults: { deep: 'ollama/qwen2.5:latest', fast: null, image: 'auto' },
+            recommended: { deep: null, fast: null },
           }),
         } as Response;
       }
@@ -202,7 +209,7 @@ describe('ResourceSummary', () => {
     expect(row).toHaveTextContent('qwen2.5:latest');
   });
 
-  it('displays connected local Ollama provider status and verifies 0 mock leakage', async () => {
+  it('names the default conversation model and its connection from the model set, with no mock leakage', async () => {
     render(
       <ResourceSummary
         budgetData={mockBudgetData}
@@ -214,7 +221,6 @@ describe('ResourceSummary', () => {
     await waitFor(() => {
       expect(screen.getByTestId('connected-model-name').textContent).toContain('qwen2.5:latest');
       expect(screen.getByTestId('connected-provider-name').textContent?.toLowerCase()).toContain('ollama');
-      expect(screen.getByText('100% Local / Private')).toBeDefined();
     });
 
     // Invariant: absolutely zero mock LLM connector or fake benchmark leak

@@ -33,7 +33,7 @@ def test_a_home_is_located_without_creating_anything(tmp_path: Path) -> None:
     Killed by: src/uclone_x/core/agent_home.py :: return self.path / "memory.json"
     Becomes: return self.path / "cross_session.json"
     """
-    home = AgentHome.for_username("scout", root=tmp_path)
+    home = AgentHome.for_legacy_name("scout", root=tmp_path)
 
     assert home.path == tmp_path / "scout"
     assert home.id_path == tmp_path / "scout" / "id"
@@ -53,9 +53,9 @@ def test_names_that_used_to_collide_are_each_refused(tmp_path: Path) -> None:
     """
     for rejected in ("a.b", "a/b", "a b", "../escape", "Scout", "-lead", "trail_", ""):
         with pytest.raises(AgentHomeError):
-            AgentHome.for_username(rejected, root=tmp_path)
+            AgentHome.for_legacy_name(rejected, root=tmp_path)
 
-    assert AgentHome.for_username("a_b", root=tmp_path).path == tmp_path / "a_b"
+    assert AgentHome.for_legacy_name("a_b", root=tmp_path).path == tmp_path / "a_b"
 
 
 def test_a_username_longer_than_a_directory_name_is_refused(tmp_path: Path) -> None:
@@ -81,14 +81,14 @@ def test_the_id_is_minted_once_and_read_thereafter(tmp_path: Path) -> None:
     Killed by: src/uclone_x/core/agent_home.py :: settled = self._read_id_if_present()
     Becomes: settled = f"{AGENT_ID_PREFIX}{uuid.uuid4().hex}"
     """
-    home = AgentHome.for_username("archivist", root=tmp_path)
+    home = AgentHome.for_legacy_name("archivist", root=tmp_path)
 
     first = home.agent_id()
     assert first.startswith(AGENT_ID_PREFIX)
     assert home.id_path.read_text(encoding="utf-8").strip() == first
 
     assert home.agent_id() == first
-    assert AgentHome.for_username("archivist", root=tmp_path).agent_id() == first
+    assert AgentHome.for_legacy_name("archivist", root=tmp_path).agent_id() == first
 
 
 def test_two_agents_do_not_share_an_identifier(tmp_path: Path) -> None:
@@ -97,8 +97,8 @@ def test_two_agents_do_not_share_an_identifier(tmp_path: Path) -> None:
     Killed by: src/uclone_x/core/agent_home.py :: self._publish_id(f"{AGENT_ID_PREFIX}{uuid.uuid4().hex}")
     Becomes: self._publish_id(f"{AGENT_ID_PREFIX}fixed")
     """
-    one = AgentHome.for_username("one", root=tmp_path).agent_id()
-    two = AgentHome.for_username("two", root=tmp_path).agent_id()
+    one = AgentHome.for_legacy_name("one", root=tmp_path).agent_id()
+    two = AgentHome.for_legacy_name("two", root=tmp_path).agent_id()
 
     assert one != two
 
@@ -113,7 +113,7 @@ def test_an_empty_id_file_is_refused_rather_than_replaced(tmp_path: Path) -> Non
     Killed by: src/uclone_x/core/agent_home.py :: if not recorded:
     Becomes: if False:
     """
-    home = AgentHome.for_username("truncated", root=tmp_path)
+    home = AgentHome.for_legacy_name("truncated", root=tmp_path)
     home.path.mkdir(parents=True)
     home.id_path.write_text("  \n", encoding="utf-8")
 
@@ -163,7 +163,7 @@ def test_a_trailing_newline_does_not_smuggle_a_second_home_past_the_rule(tmp_pat
     """
     for smuggled in ("scout\n", "scout\r\n", "\nscout"):
         with pytest.raises(AgentHomeError):
-            AgentHome.for_username(smuggled, root=tmp_path)
+            AgentHome.for_legacy_name(smuggled, root=tmp_path)
 
 
 def test_a_windows_device_name_is_refused_on_every_platform(tmp_path: Path) -> None:
@@ -178,11 +178,11 @@ def test_a_windows_device_name_is_refused_on_every_platform(tmp_path: Path) -> N
     """
     for reserved in ("con", "nul", "aux", "prn", "com1", "lpt9"):
         with pytest.raises(AgentHomeError) as excinfo:
-            AgentHome.for_username(reserved, root=tmp_path)
+            AgentHome.for_legacy_name(reserved, root=tmp_path)
         assert "reserved device name" in str(excinfo.value)
 
-    AgentHome.for_username("console", root=tmp_path)
-    AgentHome.for_username("com10", root=tmp_path)
+    AgentHome.for_legacy_name("console", root=tmp_path)
+    AgentHome.for_legacy_name("com10", root=tmp_path)
 
 
 def test_the_id_becomes_visible_complete_or_not_at_all(tmp_path: Path) -> None:
@@ -196,7 +196,7 @@ def test_the_id_becomes_visible_complete_or_not_at_all(tmp_path: Path) -> None:
     Killed by: src/uclone_x/core/agent_home.py :: os.link(staged, self.id_path)
     Becomes: self.id_path.touch()
     """
-    home = AgentHome.for_username("stager", root=tmp_path)
+    home = AgentHome.for_legacy_name("stager", root=tmp_path)
     observed: list[str] = []
 
     real_link = os.link
@@ -219,7 +219,7 @@ def test_the_loser_of_a_mint_race_reports_the_winners_id(tmp_path: Path) -> None
     Killed by: src/uclone_x/core/agent_home.py :: except FileExistsError:
     Becomes: except ValueError:
     """
-    home = AgentHome.for_username("contended", root=tmp_path)
+    home = AgentHome.for_legacy_name("contended", root=tmp_path)
     winner = f"{AGENT_ID_PREFIX}winner"
 
     def losing_link(source: str, target: str) -> None:
@@ -246,7 +246,7 @@ def test_a_regular_file_where_a_home_belongs_is_an_agent_home_fault(tmp_path: Pa
     (tmp_path / "blocked").write_text("not a directory", encoding="utf-8")
 
     with pytest.raises(AgentHomeError) as excinfo:
-        AgentHome.for_username("blocked", root=tmp_path).agent_id()
+        AgentHome.for_legacy_name("blocked", root=tmp_path).agent_id()
 
     message = str(excinfo.value)
     assert "blocked" in message and "no usable home" in message
@@ -263,7 +263,7 @@ def test_a_root_that_cannot_hold_a_link_is_an_agent_home_fault(tmp_path: Path) -
     Killed by: src/uclone_x/core/agent_home.py :: except OSError as link_failure:
     Becomes: except InterruptedError as link_failure:
     """
-    home = AgentHome.for_username("nolinks", root=tmp_path)
+    home = AgentHome.for_legacy_name("nolinks", root=tmp_path)
 
     def unsupported_link(source: str, target: str) -> None:
         raise OSError(errno.EPERM, "Operation not permitted", target)
@@ -449,7 +449,7 @@ def test_every_refused_name_hands_a_head_the_rule_it_broke(refused: str, rule_st
 
     The empty name cannot be a directory name, so `list_agent_homes` never reaches it; it
     is reached here through `refuse_an_unusable_username` directly, which is also how
-    `AgentHome.for_username("")` reaches it, so the branch is asserted rather than excused.
+    `AgentHome.for_legacy_name("")` reaches it, so the branch is asserted rather than excused.
 
     `agent` and `username` are this module's nouns and may not cross the wire beside the
     head's word for the same object (design §3.1.1). That boundary was being enforced for

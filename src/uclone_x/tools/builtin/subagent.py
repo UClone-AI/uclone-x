@@ -1,9 +1,8 @@
 import logging
 import time
-from collections.abc import Mapping
-from typing import Any, ClassVar, cast
+from typing import Any, ClassVar
 
-from pydantic import BaseModel, Field, ValidationError, model_validator
+from pydantic import BaseModel, Field, ValidationError
 
 from uclone_x.core.provenance import Provenance, require_provenance
 from uclone_x.tools.base import BaseTool, describe_invalid_arguments
@@ -19,11 +18,6 @@ class SubagentDelegationParams(BaseModel):
     max_steps: int | None = Field(
         default=None, description="Max agent steps (tool rounds) for the subagent to run"
     )
-    max_turns: int | None = Field(
-        default=None,
-        json_schema_extra={"deprecated": True},
-        description="[Deprecated alias for max_steps; use max_steps instead] Max steps for the subagent",
-    )
     system_prompt: str | None = Field(default=None, description="System prompt for the subagent")
     share_parent_memory: bool = Field(
         default=False,
@@ -34,33 +28,6 @@ class SubagentDelegationParams(BaseModel):
             "remember."
         ),
     )
-
-    @model_validator(mode="before")
-    @classmethod
-    def _resolve_step_budget(cls, data: Any) -> Any:
-        """Accept either spelling from a model that learned the tool schema at either name."""
-        if isinstance(data, Mapping):
-            raw = dict(cast(Mapping[str, Any], data))
-            steps = raw.get("max_steps")
-            turns = raw.get("max_turns")
-            if steps is not None and turns is not None:
-                if steps != turns:  # SubagentDelegationParams budget conflict check
-                    raise ValueError(
-                        f"Conflicting values for max_steps and deprecated alias max_turns: {steps} != {turns}"
-                    )
-            elif turns is not None and steps is None:
-                raw["max_steps"] = turns
-            elif steps is not None and turns is None:
-                raw["max_turns"] = steps
-            return raw
-        if hasattr(data, "max_steps") and hasattr(data, "max_turns"):
-            steps = data.max_steps
-            turns = data.max_turns
-            if steps is not None and turns is not None and steps != turns:
-                raise ValueError(
-                    f"Conflicting values for max_steps and deprecated alias max_turns: {steps} != {turns}"
-                )
-        return data
 
 
 def _extract_child_steps(subagent: Any) -> int:
@@ -211,12 +178,8 @@ class SubagentDelegationTool(BaseTool[SubagentDelegationParams]):
             share_parent_memory=validated_params.share_parent_memory,
         )
 
-        # Override the subagent's step ceiling. `model_copy` does not run validators, so
-        # the deprecated alias is written alongside the canonical field rather than left
-        # holding the spawn-time default.
-        subagent._config = subagent._config.model_copy(
-            update={"max_steps": sub_max_steps, "max_turns": sub_max_steps}
-        )
+        # Override the subagent's step ceiling.
+        subagent._config = subagent._config.model_copy(update={"max_steps": sub_max_steps})
 
         try:
             result = await agent.delegate_task(subagent, validated_params.prompt)

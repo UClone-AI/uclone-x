@@ -35,7 +35,13 @@ from uclone_x.llm.connectors.vllm import (
     VLLMConnector,
     has_configured_vllm_endpoint,
 )
-from uclone_x.llm.providers import PROVIDERS, canonical_provider, env_key, env_model
+from uclone_x.llm.providers import (
+    IMAGE_ENGINE_KINDS,
+    PROVIDERS,
+    canonical_provider,
+    env_key,
+    env_model,
+)
 from uclone_x.llm.usage.gate import UsageGate, gate_if_paid
 
 if TYPE_CHECKING:
@@ -152,25 +158,29 @@ def resolve_deep_model(
 ) -> str | None:
     """The deep model a connector for ``provider`` is built with, or ``None``.
 
-    The argument, then the provider's model variable, then the settings file's
-    ``llm_model`` -- only when the file's provider is this one, since a saved Gemini model
-    means nothing to OpenAI. ``None`` leaves the connector with no model of its own: a
-    request that names none is then refused before the network, in plain words.
+    The argument, then the provider's model variable, then the settings file's default
+    deep model -- only when its connection is of this kind, since a saved Gemini model means
+    nothing to OpenAI. ``None`` leaves the connector with no model of its own: a request
+    that names none is then refused before the network, in plain words.
     """
+    from uclone_x.llm.connections import ModelRef, saved_connections, saved_default_models
+
     named = named_model(model)
     if named is not None:
         return named
     found = env_model(provider)
     if found is not None:
         return found[0]
-    if data is None or not same_provider(_saved_text(data, "llm_provider"), provider):
+    if data is None:
         return None
-    return _saved_text(data, "llm_model")
-
-
-def _saved_text(data: Mapping[str, Any], key: str) -> str | None:
-    value = data.get(key)
-    return value.strip() if isinstance(value, str) and value.strip() else None
+    deep = saved_default_models(data).deep
+    if deep is None:
+        return None
+    ref = ModelRef.parse(deep)
+    conn = next((c for c in saved_connections(data) if c.id == ref.connection_id), None)
+    if conn is None or not same_provider(conn.kind, provider):
+        return None
+    return ref.model
 
 
 def _connector_for_saved_choice(
@@ -193,7 +203,19 @@ def _connector_for_saved_choice(
             f"The model choice saved in {choice.path} names a provider this version does "
             f"not support: {choice.provider}. Pick a model again in the dashboard's Settings."
         )
-    return _construct(choice.provider, api_key, choice.base_url, model=model, data=data, **kwargs)
+    key = api_key
+    kind_row = choice.connection_id is None or choice.connection_id == choice.provider
+    if key is None and not (kind_row and env_key(choice.provider)):
+        # The connection's own key (S3): another row of the same kind keeps its own. A key
+        # variable overrides only the row whose id is its kind (S4).
+        key = choice.api_key
+    if key is None and not kind_row:
+        # A second row of a kind with no key of its own: refused, or built to send none,
+        # but never handed the kind row's key or the kind's variable (S3).
+        from uclone_x.llm.connections import Connection, connection_key
+
+        key = connection_key(Connection(id=str(choice.connection_id), kind=choice.provider))
+    return _construct(choice.provider, key, choice.base_url, model=model, data=data, **kwargs)
 
 
 def _construct(
@@ -216,6 +238,13 @@ def _construct(
     #533).
     """
     provider_id = canonical_provider(provider) or provider
+    if provider_id in IMAGE_ENGINE_KINDS:
+        # An image engine is a connection, but it holds no conversation: refused rather
+        # than built as anything that would answer (P6).
+        raise LLMProviderError(
+            f"{PROVIDERS[provider_id].display_name} draws pictures and cannot hold a "
+            "conversation. Choose a conversation model from another connection."
+        )
     key = resolve_api_key(provider_id, api_key, data)
     deep = resolve_deep_model(provider_id, model, data)
     if provider_id == "openai":
@@ -293,8 +322,9 @@ def _build_connector(
     4. Auto-detection from a self-hosted endpoint variable: Ollama's
        (``OLLAMA_BASE_URL``, ``OLLAMA_FAST_BASE_URL``, ``LOCAL_LLM_BASE_URL``,
        ``OLLAMA_HOST``) or vLLM's (``VLLM_BASE_URL``), or from an explicit ``base_url``.
-    5. The choice the person saved -- in the dashboard's Settings, or by ``ucx install`` /
-       ``ucx start`` on a first setup -- read from ``<session root>/settings.json``, or
+    5. The default deep model the person saved -- in the dashboard's Settings, or by
+       ``ucx install`` / ``ucx start`` on a first setup -- and the connection its ref names
+       (``default_models.deep`` and ``connections``), read from ``<session root>/settings.json``, or
        from ``saved_choice_file`` when one is given (``saved_choice.py``). Every step above outranks it, so a flag or a variable still
        wins; see ``saved_choice_in_effect``. A head that uses it says so. Its model is
        what a request naming no model gets, unless a model variable is set
@@ -306,8 +336,8 @@ def _build_connector(
 
     Whichever step names the provider, its key and model are resolved the same way: the
     key from the argument, then the provider's key variable, then the key saved *for that
-    provider* in the settings file; the deep model from ``model``, then the provider's
-    model variable, then the saved ``llm_model`` when the saved provider is this one. A
+    connection* in the settings file; the deep model from ``model``, then the provider's
+    model variable, then the saved default deep model when its connection is this kind. A
     variable outranks the file, as the dashboard has always applied it.
 
     Step 4 previously said "or the default ``http://localhost:11434``", and the code did not
@@ -412,70 +442,134 @@ def _build_connector(
     )
 
 
-def gemini_key_available(data: Mapping[str, Any]) -> bool:
-    """Whether a Gemini key is set in the environment or saved in ``data`` (the settings)."""
-    return env_key("gemini") is not None or resolve_api_key("gemini", None, data) is not None
+def cloud_image_models() -> list[str]:
+    """The cloud picture models the model registry declares, in its order (§3.5).
+
+    A registry entry is what makes a Google model a picture model; a model a listing names
+    without one is never offered or picked by `auto`.
+    """
+    from uclone_x.tools.builtin.media_registry import ModelRegistry
+
+    return [p.model_id for p in ModelRegistry().profiles() if p.engine_type == "gemini"]
 
 
 def image_engine_choice(
     settings_path: Path | None = None,
-    chat_provider: str | None = None,
+    own: str | None = None,
     *,
-    base_url: str | None = None,
     http_client: httpx.AsyncClient | None = None,
+    gpu_tunnel_comfy_port: int | None = None,
 ) -> ImageEngineChoice:
-    """The picture settings in ``settings_path`` (the session root's by default), as read now.
+    """The picture model one draw follows, read from ``settings_path`` now (model-gateway §3.5).
 
-    ``image_engine`` and ``image_model`` come from the file, validated, and a stored value
-    that is neither is refused rather than read as the default. The Gemini client is built
-    only when a Gemini key is there, with the key `resolve_api_key` gives any Gemini
-    connector, and never under `local`, which sends no picture request over the internet.
-    ``chat_provider`` is the chat provider in effect; `auto` falls back to Gemini only
-    when it is ``gemini``. ``base_url`` is the Gemini address the head's chat uses, when
-    one is set, so pictures go where the chat already goes (#1769); `None` leaves the
-    connector's own default (`GEMINI_BASE_URL`, then Google's).
+    ``own`` is the asking clone's picture model (a ref or `auto`); `None` or empty follows
+    ``default_models.image``. The image engines are the connections: the first `comfyui`
+    connection's address and the first `remote_gpu` one's are where `auto` looks, and a ref
+    names one connection. Under `auto` the cloud model is the first one the registry
+    declares, on the first Google connection that has a key of its own (S3) -- whatever
+    the default chat model is. A ref that cannot be served is carried as ``refusal``, in
+    plain words, and never replaced (G7). ``gpu_tunnel_comfy_port`` is the local port the
+    connected remote-GPU tunnel forwards to its ComfyUI; `None` for a head without one.
     """
-    from uclone_x.tools.builtin.image import (
-        IMAGE_ENGINE_KEY,
-        IMAGE_MODEL_KEY,
-        ImageEngineChoice,
-        parse_image_engine_setting,
-        parse_image_model,
-    )
+    from uclone_x.llm.connections import ModelRef, image_ref_problem, is_model_ref
+    from uclone_x.llm.gateway import connections_in_effect, default_models_in_effect
+    from uclone_x.tools.builtin.image import IMAGE_AUTO, ImageEngineChoice
+    from uclone_x.tools.builtin.media_registry import COMFYUI_ENGINE_TYPES, ModelRegistry
 
     data = settings_data(settings_path)
-    setting = parse_image_engine_setting(data.get(IMAGE_ENGINE_KEY))
-    model = parse_image_model(data.get(IMAGE_MODEL_KEY))
-    provider = canonical_provider(chat_provider)
-    if setting == "local" or not gemini_key_available(data):
-        return ImageEngineChoice(setting=setting, model=model, chat_provider=provider)
-    client = GeminiConnector(
-        api_key=resolve_api_key("gemini", None, data), base_url=base_url, http_client=http_client
+    conns = connections_in_effect(data)
+    clean_own = own.strip() if own and own.strip() else None
+    chosen = clean_own or default_models_in_effect(data, conns).image or IMAGE_AUTO
+    chosen_by: Any = "clone" if clean_own else "default"
+    comfy = next((c for c in conns if c.kind == "comfyui" and c.base_url), None)
+    remote = next((c for c in conns if c.kind == "remote_gpu" and c.base_url), None)
+    base: dict[str, Any] = {
+        "chosen": chosen,
+        "chosen_by": chosen_by,
+        "from_connections": True,
+        "gpu_tunnel_comfy_port": gpu_tunnel_comfy_port,
+    }
+    if chosen == IMAGE_AUTO:
+        cloud = next((c for c in conns if c.kind == "gemini" and c.key), None)
+        models = cloud_image_models()
+        gemini = None
+        if cloud is not None and models:
+            gemini = GeminiConnector(
+                api_key=cloud.key, base_url=cloud.base_url, http_client=http_client
+            )
+        return ImageEngineChoice(
+            **base,
+            comfyui_base_url=comfy.base_url if comfy is not None else None,
+            remote_url=remote.base_url if remote is not None else None,
+            gemini=gemini,
+            gemini_model=models[0] if gemini is not None else None,
+            gemini_connection=cloud.id if gemini is not None and cloud is not None else None,
+        )
+    if not is_model_ref(chosen):
+        # Unreachable through Settings, which refuses it; read from a hand-edited file.
+        return ImageEngineChoice(
+            **base,
+            refusal=(
+                f"The picture model {chosen!r} does not say which connection it is on. "
+                "Choose the picture model again in Settings › Models."
+            ),
+        )
+    ref = ModelRef.parse(chosen)
+    conn = next((c for c in conns if c.id == ref.connection_id), None)
+    problem = image_ref_problem(ref, conn)
+    if problem is not None or conn is None:
+        return ImageEngineChoice(**base, refusal=problem)
+    if conn.kind == "gemini":
+        if not conn.key:
+            return ImageEngineChoice(
+                **base,
+                pin="gemini",
+                refusal=(
+                    f"The picture model {ref} cannot be used: the connection {conn.id} has "
+                    f"no key. Add the key to {conn.id} in Settings › Models."
+                ),
+            )
+        client = GeminiConnector(api_key=conn.key, base_url=conn.base_url, http_client=http_client)
+        return ImageEngineChoice(
+            **base, pin="gemini", gemini=client, gemini_model=ref.model, gemini_connection=conn.id
+        )
+    if conn.kind == "remote_gpu":
+        return ImageEngineChoice(**base, pin="remote_gpu", remote_url=conn.base_url)
+    profile = ModelRegistry().resolve(ref.model)
+    if profile.model_id != ref.model or profile.engine_type not in COMFYUI_ENGINE_TYPES:
+        return ImageEngineChoice(
+            **base,
+            pin="comfyui",
+            refusal=(
+                f"The picture model {ref} cannot be used: {ref.model} is not a picture "
+                "model this version knows. Choose another picture model in Settings › Models."
+            ),
+        )
+    return ImageEngineChoice(
+        **base, pin="comfyui", pinned_profile=profile.model_id, comfyui_base_url=conn.base_url
     )
-    return ImageEngineChoice(setting=setting, model=model, chat_provider=provider, gemini=client)
 
 
 def bind_image_engine_settings(
     tool: object,
     settings_path: Path | None = None,
-    chat_provider: Callable[[], str | None] | str | None = None,
-    gemini_base_url: Callable[[], str | None] | str | None = None,
+    gpu_tunnel_comfy_port: Callable[[], int | None] | None = None,
 ) -> None:
     """Point ``tool``'s picture settings at ``settings_path``, re-read on every draw.
 
     ``tool`` is whatever a registry holds as ``generate_image``; anything else is left as
-    it is. ``chat_provider`` and ``gemini_base_url`` (the Gemini address the chat uses)
-    may be callables, for a head whose settings can change while it runs (the
-    dashboard's Settings).
+    it is. Each draw passes the asking clone's own picture model, so a clone that names one
+    draws with it and every other follows the default (§3.4). ``gpu_tunnel_comfy_port``
+    answers the local port of the remote-GPU tunnel's ComfyUI while it is connected; only
+    the dashboard has that tunnel.
     """
     from uclone_x.tools.builtin.image import GenerateImageTool
 
     if not isinstance(tool, GenerateImageTool):
         return
 
-    def current() -> ImageEngineChoice:
-        provider = chat_provider() if callable(chat_provider) else chat_provider
-        base_url = gemini_base_url() if callable(gemini_base_url) else gemini_base_url
-        return image_engine_choice(settings_path, provider, base_url=base_url)
+    def current(own: str | None) -> ImageEngineChoice:
+        tunnel_port = gpu_tunnel_comfy_port() if gpu_tunnel_comfy_port is not None else None
+        return image_engine_choice(settings_path, own, gpu_tunnel_comfy_port=tunnel_port)
 
     tool.bind_engine_settings(current)

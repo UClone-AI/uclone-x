@@ -34,6 +34,8 @@ NoticeCode = Literal[
     "loop.missing_prompt",
     "loop.interval_too_short",
     "loop.no_interval",
+    "loop.resumed",
+    "loop.run_failed",
 ]
 """Every notice the Core writes. Closed: a head renders exactly these."""
 
@@ -64,6 +66,14 @@ NOTICE_FALLBACK: Final[dict[NoticeCode, str]] = {
     ),
     "loop.interval_too_short": (
         "⚠️ A repeating task can run at most once every {interval}. Choose a longer interval."
+    ),
+    "loop.resumed": (
+        "🔄 **Repeating task continued** after the app restarted (every {interval}, ID: "
+        '`{job_id}`):\n"{prompt}"\n\n*To stop it, type `/loop stop`.*'
+    ),
+    "loop.run_failed": (
+        "⚠️ Run {run} of the repeating task `{job_id}` failed: {reason} "
+        "It will try again in {interval}."
     ),
     "loop.no_interval": (
         "⚠️ That `/loop` command has no interval. Write it as `/loop 5m <prompt>` "

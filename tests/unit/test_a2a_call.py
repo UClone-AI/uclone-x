@@ -19,8 +19,10 @@ that writes a few bytes.
 
 from __future__ import annotations
 
+import shutil
+from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from pydantic import BaseModel, Field
@@ -47,11 +49,13 @@ from uclone_x.memory.store import CrossSessionMemory
 from uclone_x.room.a2a_handlers import PersonaTaskHandler, register_persona_handlers
 from uclone_x.room.models import Participant, ParticipantKind, RoomPolicy, RoomState
 from uclone_x.story.library import StoryLibrary
+from uclone_x.story.tools import story_characters
 from uclone_x.telemetry.tracer import TelemetryTracer
-from uclone_x.tools.base import BaseTool
+from uclone_x.tools.base import BaseTool, artifact_content_url, linked_paths
 from uclone_x.tools.builtin.a2a import (
     A2A_CALL_TOOL_NAME,
     A2A_CALLER_SESSION_KEY,
+    A2A_CHARACTERS_KEY,
     A2A_DEPTH_KEY,
     A2A_ROOM_KEY,
     A2A_STORY_KEY,
@@ -87,6 +91,20 @@ class _Draw(BaseTool[_DrawParams]):
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(b"\x89PNG fake")
         return {"path": f"images/{target.name}"}
+
+
+class _DrawLikeTheImageTool(_Draw):
+    """`generate_image`'s real contract: no `writes_files` (#2079), a link-only result
+    (#2013), and the picture declared as an artifact (#2085)."""
+
+    writes_files = False
+
+    def run(self, params: _DrawParams, context: ToolContext) -> dict[str, Any]:
+        rel = super().run(params, context)["path"]
+        return {"status": "success", "relative_url": artifact_content_url(rel)}
+
+    def produced_artifacts(self, output: Any) -> tuple[str, ...]:
+        return tuple(linked_paths(output))
 
 
 class _Sketch(BaseTool[_DrawParams]):
@@ -201,6 +219,7 @@ def _writer(
     llm: MockLLMConnector | None = None,
     session_id: str = "sess_writer",
     max_steps: int | None = None,
+    a2a: A2ACallTool | None = None,
 ) -> BaseAgent:
     ceiling: dict[str, Any] = {} if max_steps is None else {"max_steps": max_steps}
     agent = BaseAgent(
@@ -212,7 +231,7 @@ def _writer(
             **ceiling,
         ),
         llm=llm or MockLLMConnector(),
-        tools=ToolRegistry([A2ACallTool()]),
+        tools=ToolRegistry([a2a or A2ACallTool()]),
         context=AgentContext(
             session_id=session_id, agent_id="writer", workspace_root=tmp_path, depth=depth
         ),
@@ -506,8 +525,8 @@ class TestTheCallersBudget:
         persona is passed on as it is (see the budget test), and one that does not name it
         -- or names only a longer word containing it -- is led by the name (#1570).
 
-        Killed by: src/uclone_x/tools/builtin/a2a.py :: error = reason if _names(reason, call.agent) else f"{lead}: {reason}"
-        Becomes: error = reason if call.agent in reason else f"{lead}: {reason}"
+        Killed by: src/uclone_x/tools/builtin/a2a.py :: result.error if _names(result.error, call.agent) else f"{lead}: {result.error}"
+        Becomes: result.error if call.agent in result.error else f"{lead}: {result.error}"
         """
         errors: list[str | None] = []
         for reason in ("it ran out of steps", "the artists' room was closed"):
@@ -578,6 +597,50 @@ class TestTheCallersBudget:
         ]
 
     @pytest.mark.asyncio
+    async def test_a2a_call_default_reasons_keep_lead_for_short_persona_names(
+        self, tmp_path: Path
+    ) -> None:
+        """Killed by: src/uclone_x/tools/builtin/a2a.py :: error = f"{lead}: {reason}"
+        Becomes: error = reason
+        """
+        writer_persona = WRITER.model_copy(update={"a2a_peers": ("it", "no")})
+
+        transport = A2AInMemoryTransport()
+        transport.register_handler(
+            "it",
+            _Recorder(
+                TaskResult(
+                    task_id="x",
+                    status=TaskStatus.INPUT_REQUIRED,
+                    output_data={"steps": 0, "paths": []},
+                    error=None,
+                    provenance=Provenance.primary(provider="mock", model="mock-model"),
+                )
+            ),
+        )
+        record_it = await _writer(tmp_path, transport, persona=writer_persona).execute_tool_call(
+            A2A_CALL_TOOL_NAME, {"agent": "it", "task": "Ask."}
+        )
+        assert record_it.error == "'it' stopped before finishing: it needed a person's approval"
+
+        transport.register_handler(
+            "no",
+            _Recorder(
+                TaskResult(
+                    task_id="y",
+                    status=TaskStatus.FAILED,
+                    output_data={"steps": 0, "paths": []},
+                    error=None,
+                    provenance=Provenance.primary(provider="mock", model="mock-model"),
+                )
+            ),
+        )
+        record_no = await _writer(tmp_path, transport, persona=writer_persona).execute_tool_call(
+            A2A_CALL_TOOL_NAME, {"agent": "no", "task": "Do."}
+        )
+        assert record_no.error == "'no' could not do the task: no reason was given"
+
+    @pytest.mark.asyncio
     async def test_the_handler_reports_the_steps_its_agent_took(self, tmp_path: Path) -> None:
         """Drawing and then answering is two steps, and the result says so.
 
@@ -598,7 +661,7 @@ class TestTheCallersBudget:
         and the caller is told it ran out of steps -- not a bare "could not finish" (#1570),
         naming the persona once.
 
-        Killed by: src/uclone_x/room/a2a_handlers.py :: update |= {"max_steps": budget, "max_turns": budget}
+        Killed by: src/uclone_x/room/a2a_handlers.py :: update |= {"max_steps": budget}
         Becomes: pass
         Killed by: src/uclone_x/room/a2a_handlers.py :: out_of_steps = turn.stop_reason == _STEP_CEILING or (
         Becomes: out_of_steps = False or (
@@ -660,6 +723,32 @@ class TestTheCalledAgent:
         assert writer.run_steps - before == 2
 
     @pytest.mark.asyncio
+    async def test_a_peers_picture_is_reported_although_its_tool_declares_no_writes(
+        self, tmp_path: Path
+    ) -> None:
+        """A peer drawing with the image tool's real contract reports the picture (#2085).
+
+        Before, the peer answered `paths: []` and `unnamed_writes: false`: the picture was
+        lost and not even counted as a possible unnamed write.
+
+        Killed by: src/uclone_x/room/a2a_handlers.py :: for path in execution.produced_paths:
+        Becomes: for path in (execution.produced_paths if execution.writes_files else ()):
+        """
+        draw = _DrawLikeTheImageTool(tmp_path)
+        transport = A2AInMemoryTransport()
+        transport.register_handler("artist", _handler(tmp_path, _draw_llm(), ToolRegistry([draw])))
+        writer = _writer(tmp_path, transport)
+
+        record = await writer.execute_tool_call(
+            A2A_CALL_TOOL_NAME, {"agent": "artist", "task": "Draw the hero."}
+        )
+
+        assert record.status is ToolResultStatus.SUCCESS, record.error
+        assert isinstance(record.output, dict)
+        assert record.output["paths"] == ["images/hero.png"]
+        assert record.output["unnamed_writes"] is False
+
+    @pytest.mark.asyncio
     async def test_a_tool_needing_approval_is_refused_and_never_runs(self, tmp_path: Path) -> None:
         """Nobody can approve during a peer call, so the task stops as INPUT_REQUIRED,
         naming the tool, and the tool does not run.
@@ -682,8 +771,8 @@ class TestTheCalledAgent:
         """The refusal reaches Writer in plain words, naming the persona once, and nothing
         is resumed.
 
-        Killed by: src/uclone_x/tools/builtin/a2a.py :: error = reason if _names(reason, call.agent) else f"{lead}: {reason}"
-        Becomes: error = f"{lead}: {reason}"
+        Killed by: src/uclone_x/tools/builtin/a2a.py :: result.error if _names(result.error, call.agent) else f"{lead}: {result.error}"
+        Becomes: f"{lead}: {result.error}"
         """
         draw = _Draw(tmp_path)
         transport = A2AInMemoryTransport()
@@ -821,7 +910,7 @@ class TestTheCalledAgent:
         """Its persona's list always carries the memory tools; the list it runs under
         does not, and has no `a2a_call` either.
 
-        Killed by: src/uclone_x/room/a2a_handlers.py :: if name not in BASE_MEMORY_TOOLS and name != A2A_CALL_TOOL_NAME
+        Killed by: src/uclone_x/room/a2a_handlers.py :: if name not in BASE_SELF_TOOLS and name != A2A_CALL_TOOL_NAME
         Becomes: if name != A2A_CALL_TOOL_NAME
         """
         persona = _artist(allowed_tools=("draw", A2A_CALL_TOOL_NAME))
@@ -832,6 +921,20 @@ class TestTheCalledAgent:
         assert "draw" in tools
         assert not set(BASE_MEMORY_TOOLS) & set(tools)
         assert A2A_CALL_TOOL_NAME not in tools
+
+    def test_the_called_artist_does_not_change_its_own_picture(self) -> None:
+        """A peer answering a request is not the clone the user is talking to (#2160).
+
+        Killed by: src/uclone_x/room/a2a_handlers.py :: if name not in BASE_SELF_TOOLS and name != A2A_CALL_TOOL_NAME
+        Becomes: if name not in BASE_SELF_TOOLS[:3] and name != A2A_CALL_TOOL_NAME
+        """
+        persona = _artist(allowed_tools=("draw",))
+        assert "set_avatar" in persona.granted_tools
+
+        tools = PersonaTaskHandler._callee_tools(persona)  # pyright: ignore[reportPrivateUsage]
+
+        assert "draw" in tools
+        assert "set_avatar" not in tools
 
 
 # --------------------------------------------------------------------------------------
@@ -1019,6 +1122,124 @@ class TestTheCallersStory:
 # --------------------------------------------------------------------------------------
 # Through a room: the picture is in the conversation's file list
 # --------------------------------------------------------------------------------------
+
+
+def _plain(value: object) -> object:
+    """A sent message's frozen JSON as plain dicts and lists, to compare."""
+    if isinstance(value, Mapping):
+        return {k: _plain(v) for k, v in cast(Mapping[str, object], value).items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain(v) for v in cast(Sequence[object], value)]
+    return value
+
+
+class TestTheCharactersTheCallNames:
+    """The open story's characters the call names go with it, as they look (#1808).
+
+    The eval's moon-seal story: 도윤 and 카엘 have `visual` blocks, 월광검 is an item.
+    """
+
+    FIXTURE = Path(__file__).resolve().parents[1] / "fixtures" / "writer"
+
+    async def _sent(
+        self,
+        tmp_path: Path,
+        arguments: dict[str, Any],
+        *,
+        story_id: str | None = "moon-seal",
+        a2a: A2ACallTool | None = None,
+    ) -> dict[str, Any]:
+        shutil.copytree(self.FIXTURE, tmp_path, dirs_exist_ok=True)
+        transport = A2AInMemoryTransport()
+        artist = _Recorder()
+        transport.register_handler("artist", artist)
+        llm = MockLLMConnector(
+            default_response="Here it is.",
+            tool_calls=[
+                ToolCallRequest(
+                    id="w1", name=A2A_CALL_TOOL_NAME, arguments={"agent": "artist", **arguments}
+                )
+            ],
+        )
+        writer = _writer(
+            tmp_path, transport, llm=llm, a2a=a2a or A2ACallTool(characters=story_characters)
+        )
+        await writer.execute_turn("Draw.", room_id="writer-eval-room", story_id=story_id)
+        (sent,) = artist.messages
+        given = _plain(sent.input_data["input"])
+        assert isinstance(given, dict)
+        return cast(dict[str, Any], given)
+
+    async def test_the_characters_named_go_with_the_call_as_they_look(self, tmp_path: Path) -> None:
+        """Killed by: src/uclone_x/tools/builtin/a2a.py :: return {**given, A2A_CHARACTERS_KEY: cast(JsonValue, found)}
+        Becomes: return given
+        Killed by: src/uclone_x/tools/builtin/a2a.py :: found = self._characters(ctx, [call.task, *_words(given)])
+        Becomes: found = self._characters(ctx, [call.task])
+        """
+        given = await self._sent(
+            tmp_path, {"task": "도윤이 활을 당기는 장면을 그려 줘.", "input": {"foe": "카엘"}}
+        )
+
+        assert given["foe"] == "카엘"
+        assert given[A2A_CHARACTERS_KEY] == [
+            {
+                "id": "doyun",
+                "name": "도윤",
+                "visual": {
+                    "tags": ["1boy", "brown_hair", "green_eyes"],
+                    "prose": "부스스한 갈색 머리에 초록 눈.",
+                    "gender": "male",
+                    "base_seed": 30551,
+                },
+            },
+            {
+                "id": "kael",
+                "name": "카엘",
+                "visual": {
+                    "tags": ["1boy", "black_hair", "yellow_eyes", "eyepatch"],
+                    "prose": "검은 머리, 노란 눈, 오른눈에 안대.",
+                    "gender": "male",
+                    "base_seed": 66013,
+                },
+            },
+        ]
+
+    async def test_characters_the_caller_sent_are_kept(self, tmp_path: Path) -> None:
+        """Killed by: src/uclone_x/tools/builtin/a2a.py :: or A2A_CHARACTERS_KEY in given:
+        Becomes: :
+        """
+        given = await self._sent(
+            tmp_path, {"task": "도윤을 그려 줘.", "input": {A2A_CHARACTERS_KEY: ["as I say"]}}
+        )
+
+        assert given == {A2A_CHARACTERS_KEY: ["as I say"]}
+
+    async def test_with_no_story_open_the_story_is_not_read(self, tmp_path: Path) -> None:
+        """Killed by: src/uclone_x/tools/builtin/a2a.py :: or ctx.story_id is None or
+        Becomes: or
+        """
+        asked: list[Sequence[str]] = []
+
+        def lookup(ctx: ToolContext, texts: Sequence[str]) -> list[dict[str, Any]]:
+            asked.append(texts)
+            return [{"id": "doyun"}]
+
+        given = await self._sent(
+            tmp_path, {"task": "도윤을 그려 줘."}, story_id=None, a2a=A2ACallTool(characters=lookup)
+        )
+
+        assert given == {}
+        assert asked == []
+
+    async def test_a_call_naming_no_character_sends_its_input_as_it_was(
+        self, tmp_path: Path
+    ) -> None:
+        """Killed by: src/uclone_x/story/tools.py :: if isinstance(item.entry, CharacterEntry) and item.entry.visual is not None
+        Becomes: if item.entry.name
+        """
+        given = await self._sent(tmp_path, {"task": "월광검을 그려 줘.", "input": {"size": 2}})
+
+        assert given == {"size": 2}
 
 
 class _Seats:

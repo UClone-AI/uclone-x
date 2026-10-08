@@ -19,14 +19,11 @@ from uclone_x.ontology.engine import (
     OntologyService,
 )
 from uclone_x.ontology.models import (
-    EntitySchema,
     EvidenceRecord,
     OntologyAxiom,
     OntologyConcept,
     OntologyRelation,
     OntologyTier,
-    OntologyValidationResult,
-    RelationSchema,
     ValidationResult,
     compute_axiom_hash,
     compute_concept_hash,
@@ -160,20 +157,6 @@ def test_ontology_models_and_hash_computation() -> None:
     assert val.is_valid is True
     assert val.errors == ()
     assert val.warnings == ()
-
-
-def test_backward_compatibility_aliases() -> None:
-    entity = EntitySchema(name="Repo", description="Git repository")
-    assert isinstance(entity, OntologyConcept)
-    assert entity.name == "Repo"
-
-    rel = RelationSchema(source_entity="Repo", predicate="has", target_entity="Branch")
-    assert isinstance(rel, OntologyRelation)
-    assert rel.predicate == "has"
-
-    val = OntologyValidationResult(is_valid=True)
-    assert isinstance(val, ValidationResult)
-    assert val.is_valid is True
 
 
 def test_ontology_engine_teaching_and_content_hash() -> None:

@@ -7,8 +7,8 @@
  * picture gets `Avatar`'s single default, so the same clone looks the same on every install
  * and a drawn face can never be mistaken for a likeness.
  *
- * The name is encoded because it lands in a path segment: a clone whose name carries a
- * space or a slash would otherwise compose a URL that addresses something else.
+ * The clone is named by its id (a handle is answered too). It is encoded because it lands in
+ * a path segment: a name carrying a space or a slash would otherwise address something else.
  */
-export const personaAvatarUrl = (name: string): string =>
-  `/api/personas/${encodeURIComponent(name)}/avatar`;
+export const personaAvatarUrl = (clone: string): string =>
+  `/api/clones/${encodeURIComponent(clone)}/avatar`;

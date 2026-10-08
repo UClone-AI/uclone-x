@@ -2,7 +2,6 @@ import { describe, it, expect, vi, afterEach } from 'vitest';
 import {
   avatarChangeIdsOf,
   avatarUrlsOf,
-  personaOfSeat,
   personaPicture,
   pictureOf,
   resetAvatar,
@@ -13,11 +12,6 @@ import {
   uploadProblem,
   MAX_UPLOAD_BYTES,
 } from './avatarChoice';
-import type { RoomState } from '../types';
-
-const room = (participants: RoomState['participants']): RoomState =>
-  ({ room_id: 'r1', title: 't', participants, transcript: [] }) as unknown as RoomState;
-
 const answer = (status: number, body: unknown = {}) =>
   new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });
 
@@ -26,47 +20,48 @@ afterEach(() => {
 });
 
 describe('whose picture a seat shows', () => {
-  // Killed by: frontend/src/lib/avatarChoice.ts :: return seat?.persona || participantId;
-  // Becomes: return participantId;
-  it('reads the clone behind a second seat, not the seat id', () => {
-    // A second seat of the same clone has an id of its own; the picture is the clone's.
-    const r = room([
-      { id: 'scout', kind: 'agent', display_name: 'Scout', persona: 'scout' },
-      { id: 'scout-2', kind: 'agent', display_name: 'Scout', persona: 'scout' },
-    ]);
-    expect(personaOfSeat(r, 'scout-2')).toBe('scout');
-    // A seat that names no clone falls back to its id, which is the clone's for the first seat.
-    expect(personaOfSeat(room([{ id: 'critic', kind: 'agent', display_name: 'Critic' }]), 'critic')).toBe(
-      'critic',
-    );
+  // Killed by: frontend/src/lib/avatarChoice.ts :: if (persona.avatar_url !== undefined) urls[cloneIdOf(persona)] = persona.avatar_url;
+  // Becomes: if (persona.avatar_url !== undefined) urls[persona.name] = persona.avatar_url;
+  it('keys each picture by the clone id a seat carries, not by its handle', () => {
+    // A seat is its clone's id (clone-data-scopes §4 step 3), so the picture is looked up by it.
+    const urls = avatarUrlsOf([{ id: 'agt_1', name: 'scout', avatar_url: '/api/clones/agt_1/avatar?v=abc' }]);
+    expect(pictureOf('agt_1', urls)).toBe('/api/clones/agt_1/avatar?v=abc');
+    // A clone defined only in memory has no id of its own and is keyed by its handle.
+    expect(pictureOf('memo', avatarUrlsOf([{ name: 'memo', avatar_url: null }]))).toBeUndefined();
+  });
+
+  // Killed by: frontend/src/lib/avatarChoice.ts :: if (typeof persona.avatar_change_id === 'number') ids[cloneIdOf(persona)] = persona.avatar_change_id;
+  // Becomes: if (typeof persona.avatar_change_id === 'number') ids[persona.name] = persona.avatar_change_id;
+  it('keys each latest change by the clone id too', () => {
+    expect(avatarChangeIdsOf([{ id: 'agt_1', name: 'scout', avatar_change_id: 4 }])).toEqual({ agt_1: 4 });
   });
 });
 
 describe('where a picture is drawn from', () => {
-  // Killed by: frontend/src/lib/avatarChoice.ts :: if (persona.avatar_url !== undefined) urls[persona.name] = persona.avatar_url;
-  // Becomes: if (false) urls[persona.name] = persona.avatar_url;
+  // Killed by: frontend/src/lib/avatarChoice.ts :: if (persona.avatar_url !== undefined) urls[cloneIdOf(persona)] = persona.avatar_url;
+  // Becomes: if (false) urls[cloneIdOf(persona)] = persona.avatar_url;
   it('uses the listed address, which changes with the picture', () => {
     const urls = avatarUrlsOf([
-      { name: 'scout', avatar_url: '/api/personas/scout/avatar?v=abc' },
+      { name: 'scout', avatar_url: '/api/clones/scout/avatar?v=abc' },
       { name: 'critic', avatar_url: null },
       { name: 'old' },
     ]);
-    expect(pictureOf('scout', urls)).toBe('/api/personas/scout/avatar?v=abc');
+    expect(pictureOf('scout', urls)).toBe('/api/clones/scout/avatar?v=abc');
     // A listed clone with no picture draws the default and asks for nothing.
     expect(pictureOf('critic', urls)).toBeUndefined();
     // A runtime too old to list the field, and a clone not listed yet, keep the fixed address.
-    expect(pictureOf('old', urls)).toBe('/api/personas/old/avatar');
-    expect(pictureOf('newcomer', urls)).toBe('/api/personas/newcomer/avatar');
+    expect(pictureOf('old', urls)).toBe('/api/clones/old/avatar');
+    expect(pictureOf('newcomer', urls)).toBe('/api/clones/newcomer/avatar');
   });
 
   // Killed by: frontend/src/lib/avatarChoice.ts :: persona && persona.avatar_url !== undefined ? (persona.avatar_url ?? undefined) : personaAvatarUrl(name);
   // Becomes: personaAvatarUrl(name);
   it('gives a profile the persona`s own address', () => {
-    expect(personaPicture('scout', { avatar_url: '/api/personas/scout/avatar?v=2' })).toBe(
-      '/api/personas/scout/avatar?v=2',
+    expect(personaPicture('scout', { avatar_url: '/api/clones/scout/avatar?v=2' })).toBe(
+      '/api/clones/scout/avatar?v=2',
     );
     expect(personaPicture('scout', { avatar_url: null })).toBeUndefined();
-    expect(personaPicture('scout', undefined)).toBe('/api/personas/scout/avatar');
+    expect(personaPicture('scout', undefined)).toBe('/api/clones/scout/avatar');
   });
 });
 
@@ -85,7 +80,7 @@ describe('changing a picture', () => {
 
     expect(result).toEqual({ ok: true, previousPath: '.uclone/personas/scout.prev.png', changeId: 4 });
     const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
-    expect(url).toBe('/api/personas/scout/avatar');
+    expect(url).toBe('/api/clones/scout/avatar');
     expect(init.method).toBe('PUT');
     expect(JSON.parse(init.body as string)).toEqual({ source_path: 'artifacts/images/a.png' });
   });
@@ -104,7 +99,7 @@ describe('changing a picture', () => {
     const [first, second] = fetchMock.mock.calls as unknown as [string, RequestInit][];
     expect(first[1].method).toBe('PUT');
     expect(JSON.parse(first[1].body as string)).toEqual({ source_path: '.uclone/personas/scout.prev.png', undo_of: 6 });
-    expect(second[0]).toBe('/api/personas/scout/avatar?undo_of=9');
+    expect(second[0]).toBe('/api/clones/scout/avatar?undo_of=9');
     expect(second[1].method).toBe('DELETE');
   });
 
@@ -120,8 +115,8 @@ describe('changing a picture', () => {
     expect(undoStillOffered(null, 'scout', undefined)).toBe(false);
   });
 
-  // Killed by: frontend/src/lib/avatarChoice.ts :: if (typeof persona.avatar_change_id === 'number') ids[persona.name] = persona.avatar_change_id;
-  // Becomes: ids[persona.name] = 0;
+  // Killed by: frontend/src/lib/avatarChoice.ts :: if (typeof persona.avatar_change_id === 'number') ids[cloneIdOf(persona)] = persona.avatar_change_id;
+  // Becomes: ids[cloneIdOf(persona)] = 0;
   it('reads each clone`s latest change from the listing', () => {
     expect(avatarChangeIdsOf([{ name: 'scout', avatar_change_id: 5 }, { name: 'critic' }])).toEqual({ scout: 5 });
     expect(avatarChangeIdsOf(undefined)).toEqual({});

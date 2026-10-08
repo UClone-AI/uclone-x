@@ -20,7 +20,7 @@ import pytest
 import yaml
 from playwright.async_api import async_playwright
 
-from tests.e2e.conftest import dock_locator, mock_llm, running_ui
+from tests.e2e.conftest import clone_id, dock_locator, mock_llm, running_ui
 from tests.support.uclone2_fake import CONNECT_URL, TOKEN, TOKEN_TAIL, FakeUclone2
 from uclone_x.link.uclone2.client import Uclone2LinkClient
 from uclone_x.link.uclone2.models import LinkRecord
@@ -124,7 +124,8 @@ async def test_a_clone_linked_in_settings_is_online_on_its_page_and_can_be_unlin
 
             # The clone's own page carries the line while the link is online.
             await page.locator("[role='dialog'] button[title='Close']").click()
-            await page.get_by_test_id("clone-avatar-haru").click()
+            haru = await clone_id(page, server, "haru")
+            await page.get_by_test_id(f"clone-avatar-{haru}").click()
             await (await dock_locator(page)).wait_for(state="visible", timeout=5_000)
             line = page.get_by_test_id("clone-link-line")
             await line.wait_for(timeout=10_000)

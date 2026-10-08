@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import logging
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Mapping, Sequence
 from typing import Any, cast
@@ -17,8 +18,10 @@ from uclone_x.errors import (
     MalformedToolCallArgumentsError,
     StructuredOutputUnsupportedError,
 )
+from uclone_x.llm.catalog import LISTED_IMAGE_INPUT, CatalogEntry
 from uclone_x.llm.compactor import estimate_reply_tokens, estimate_request_tokens
 from uclone_x.llm.models import (
+    ChatMessage,
     LLMRequest,
     ModelResponse,
     StreamChunk,
@@ -26,6 +29,8 @@ from uclone_x.llm.models import (
     ToolCallRequest,
 )
 from uclone_x.llm.protocols import LLMProviderProtocol
+
+logger = logging.getLogger(__name__)
 
 
 def refuse_response_schema(request: LLMRequest, provider: str) -> None:
@@ -171,6 +176,19 @@ def resolve_model(requested: str | None, configured: str | None, provider: str) 
     return chosen
 
 
+def tool_images_caption(msg: ChatMessage) -> str:
+    """The line that says which tool call the images after it came from (#2107).
+
+    OpenAI's and Ollama's chat formats carry no images on a tool message, so a tool
+    result's images go on a `user` message after the tool messages. Without this line the
+    model would see images arriving from the user, attributed to no call. A message with
+    neither an id nor a name (Ollama does not require them) is captioned without one,
+    rather than under an invented label.
+    """
+    said = [part for part in (msg.tool_call_id, f"({msg.name})" if msg.name else None) if part]
+    return " ".join(["Images returned by tool call", *said]) + ":"
+
+
 class BaseLLMConnector(ABC, LLMProviderProtocol):
     """Abstract base connector for foundation model providers."""
 
@@ -235,6 +253,38 @@ class BaseLLMConnector(ABC, LLMProviderProtocol):
     def stream(self, request: LLMRequest) -> AsyncIterator[StreamChunk]:
         """Stream normalized chunks carrying deltas, tool calls and usage."""
         ...
+
+    async def accepts_images(self, model: str | None = None) -> bool:
+        """Whether the provider's own listing says `model` reads images (#2107).
+
+        `model` defaults to the one a request naming none is sent to. The answer comes from
+        `LISTED_IMAGE_INPUT`, which the catalogue fills whenever Settings reads a listing;
+        when no listing of this provider was read in this process, and the connector has
+        one, it is read here once and remembered. A connector with no listing, a listing
+        that cannot be read, or a model the listing does not mark answers `False`: a turn
+        then does not offer the model a tool that returns images, which is the safe side.
+        A failed read is not remembered, so a later turn asks again. Never raises.
+        """
+        chosen = named_model(model) or named_model(
+            cast(str | None, getattr(self, "_default_model", None))
+        )
+        if chosen is None:
+            return False
+        known = LISTED_IMAGE_INPUT.get(self.provider_name, chosen)
+        if known is not None:
+            return known
+        lister = getattr(self, "list_models", None)
+        if lister is None:
+            return False
+        try:
+            listed = cast(list[CatalogEntry], await lister())
+        except Exception as exc:
+            logger.debug(
+                "Could not read %s's model listing for image input: %s", self.provider_name, exc
+            )
+            return False
+        LISTED_IMAGE_INPUT.remember(self.provider_name, listed)
+        return LISTED_IMAGE_INPUT.get(self.provider_name, chosen) is True
 
     def _get_client(self) -> httpx.AsyncClient:
         """Return the injected HTTP client or create a new client context."""

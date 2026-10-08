@@ -1426,12 +1426,18 @@ def test_setup_saves_the_model_it_made_ready(
     assert "Saved qwen3:1.7b as the default model for `ucx run`, rooms and the dashboard." in out
 
 
-def _save_settings(**values: object) -> None:
+def _save_choice(kind: str, model: str, base_url: str | None = None) -> None:
+    """A saved connection of ``kind`` (id = kind) and the default deep model on it."""
     from uclone_x.llm.connectors.saved_choice import settings_file
 
+    row = {"id": kind, "kind": kind}
+    if base_url is not None:
+        row["base_url"] = base_url
     target = settings_file()
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(json.dumps(values))
+    target.write_text(
+        json.dumps({"connections": [row], "default_models": {"deep": f"{kind}/{model}"}})
+    )
 
 
 def _setup_says(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> str:
@@ -1439,7 +1445,7 @@ def _setup_says(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[s
     _ready_llm_setup(monkeypatch)
     bootstrap.run_local_setup(image=False, interactive=False, assume_yes=True)
     out = " ".join(capsys.readouterr().out.split())
-    for internal in ("Traceback", "Error", "llm_provider", "settings.json", "None"):
+    for internal in ("Traceback", "Error", "default_models", "settings.json", "None"):
         assert internal not in out, internal
     return out
 
@@ -1452,7 +1458,7 @@ def test_setup_keeps_another_provider_already_saved_and_says_how_to_switch(
     """
     from uclone_x.llm.connectors.saved_choice import read_saved_choice
 
-    _save_settings(llm_provider="openai", llm_model="gpt-4o-mini")
+    _save_choice("openai", "gpt-4o-mini")
 
     out = _setup_says(monkeypatch, capsys)
 
@@ -1473,7 +1479,7 @@ def test_setup_names_a_different_saved_ollama_model(
     Killed by: src/uclone_x/cli/commands/bootstrap.py :: if saved.provider != "ollama" or saved.model not in (None, result.model):
     Becomes: if saved.provider != "ollama":
     """
-    _save_settings(llm_provider="ollama", llm_model="qwen3:8b")
+    _save_choice("ollama", "qwen3:8b")
 
     out = _setup_says(monkeypatch, capsys)
 
@@ -1487,9 +1493,7 @@ def test_setup_names_a_different_saved_address(
     """Killed by: src/uclone_x/cli/commands/bootstrap.py :: elif not _same_address(saved.base_url, result.endpoint):
     Becomes: elif False:
     """
-    _save_settings(
-        llm_provider="ollama", llm_model="qwen3:1.7b", llm_base_url="http://gpu-box:11434"
-    )
+    _save_choice("ollama", "qwen3:1.7b", "http://gpu-box:11434")
 
     out = _setup_says(monkeypatch, capsys)
 
@@ -1508,9 +1512,7 @@ def test_setup_says_it_kept_the_same_model_saved_by_an_earlier_install(
     Killed by: src/uclone_x/cli/commands/bootstrap.py :: console.print(f"[dim]Kept {model}, the model already saved as the default.[/dim]")
     Becomes: pass
     """
-    _save_settings(
-        llm_provider="ollama", llm_model="qwen3:1.7b", llm_base_url="http://localhost:11434/"
-    )
+    _save_choice("ollama", "qwen3:1.7b", "http://localhost:11434/")
 
     out = _setup_says(monkeypatch, capsys)
 
@@ -1535,9 +1537,7 @@ def test_a_read_only_session_directory_still_says_kept(
 
     if os.geteuid() == 0:
         pytest.skip("root writes into a read-only directory")
-    _save_settings(
-        llm_provider="ollama", llm_model="qwen3:1.7b", llm_base_url="http://localhost:11434/"
-    )
+    _save_choice("ollama", "qwen3:1.7b", "http://localhost:11434/")
     directory = settings_file().parent
     directory.chmod(0o500)
     try:
@@ -1552,14 +1552,12 @@ def test_a_read_only_session_directory_still_says_kept(
 def test_a_re_install_that_changes_nothing_does_not_touch_the_lock(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Killed by: src/uclone_x/llm/connectors/saved_choice.py :: if not pending:
+    """Killed by: src/uclone_x/llm/connectors/saved_choice.py :: if not change(_current(target)):
     Becomes: if False:
     """
     from uclone_x.llm.connectors.saved_choice import lock_file, settings_file
 
-    _save_settings(
-        llm_provider="ollama", llm_model="qwen3:1.7b", llm_base_url="http://localhost:11434/"
-    )
+    _save_choice("ollama", "qwen3:1.7b", "http://localhost:11434/")
 
     out = _setup_says(monkeypatch, capsys)
 

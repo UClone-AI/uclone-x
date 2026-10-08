@@ -17,19 +17,28 @@ import uuid
 from enum import StrEnum
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SerializerFunctionWrapHandler,
+    model_serializer,
+    model_validator,
+)
 
 from uclone_x.llm.models import TokenBudget
 
 __all__ = [
     "BASE_MEMORY_TOOLS",
     "BASE_PERSONA_TOOLS",
+    "BASE_SELF_TOOLS",
     "RETIRED_MODEL_TIERS",
     "AgentLLMConfig",
     "ModelTier",
     "PersonaDefinition",
     "PlanState",
     "PlanStep",
+    "effective_tool_scope",
 ]
 
 
@@ -59,12 +68,18 @@ class AgentLLMConfig(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
 
     model_tier: ModelTier = ModelTier.INHERIT
-    #: The agent's own deep model -- the one its turns run on. ``None`` follows Settings.
+    #: The agent's own deep model -- the one its turns run on. ``None`` follows the system
+    #: default. In a persona it is a model ref, ``<connection id>/<model id>``
+    #: (model-gateway §3.4); on a built agent it is the bare id its connector is sent.
     model_name: str | None = None
-    #: The agent's own fast model, for its auxiliary calls (routing, summaries,
-    #: compaction). ``None`` follows the fast model in Settings, which itself follows the
-    #: deep model when left empty.
+    #: The agent's own fast model, for the compaction and summaries of its *own* history.
+    #: ``None`` follows the default fast model, which itself follows the deep one when
+    #: empty. Room routing and room summaries never use it: they always run on the default
+    #: fast model (model-gateway §3.4, decision 5).
     fast_model: str | None = None
+    #: The agent's own picture model: a ref, or ``auto``. ``None`` follows the default.
+    #: Stored only; pictures read it from model-gateway step 5.
+    image_model: str | None = None
     temperature: float = 0.7
     max_tokens: int | None = None
     top_p: float | None = None
@@ -84,8 +99,9 @@ class AgentLLMConfig(BaseModel):
 #: a memory; every other persona's call to `record_memory_fact` was refused.
 #:
 #: The rule for membership: a tool belongs here only if it has no effect outside the
-#: agent's own memory. So the three memory tools (bound to the agent's own store, see
-#: `AGENT_BOUND_TOOL_TYPES`) and the three read-only workspace tools, which
+#: agent's own state. So the three memory tools (bound to the agent's own store, see
+#: `AGENT_BOUND_TOOL_TYPES`), `set_avatar` (#2160), which changes only the calling clone's
+#: own picture, and the three read-only workspace tools, which
 #: `writes_files = False` declares and the workspace boundary confines, plus
 #: `tool_result_read` (#1422), which reads back this conversation's own shortened tool
 #: results and nothing else -- without it, an excerpt would name a reader the persona
@@ -106,8 +122,16 @@ BASE_MEMORY_TOOLS: tuple[str, ...] = (
     "retract_memory_fact",
 )
 
+#: The clone's own state: its memory and its picture (#2160). `set_avatar` is here because a
+#: clone whose list was written before the tool existed -- an imported, edited copy of a
+#: built-in -- could otherwise never change its face, and the avatar skill, which requires
+#: it, was hidden from it. Like the memory tools it is not given to a sub-agent or to a peer
+#: answering an `a2a_call`: neither is the clone the user is talking to, and a sub-agent has
+#: no persona of its own.
+BASE_SELF_TOOLS: tuple[str, ...] = (*BASE_MEMORY_TOOLS, "set_avatar")
+
 BASE_PERSONA_TOOLS: tuple[str, ...] = (
-    *BASE_MEMORY_TOOLS,
+    *BASE_SELF_TOOLS,
     "file_read",
     "file_search",
     "directory_list",
@@ -116,12 +140,55 @@ BASE_PERSONA_TOOLS: tuple[str, ...] = (
 )
 
 
+#: Tools an agent composes from its own state when it is built, so they are in no shared
+#: registry when a persona file is loaded and checked. A persona may still name them in
+#: `allowed_tools`: `show_self` draws from the clone's own self facts (#2017), and an agent
+#: with no memory or no image tool simply does not have it. Names, not classes, for the
+#: reason `BASE_PERSONA_TOOLS` gives.
+AGENT_COMPOSED_TOOLS: frozenset[str] = frozenset({"show_self"})
+
+
+def persona_model_problem(
+    model_name: str | None, fast_model: str | None, image_model: str | None
+) -> str | None:
+    """Why a persona's model fields cannot be saved, as one plain sentence; ``None`` if they can.
+
+    Each must be empty or a ref, ``<connection id>/<model id>`` (split at the first ``/``);
+    the picture model may also be ``auto``. The same rule as ``uclone_x.llm.connections.
+    ModelRef``, stated here because the kernel does not import the gateway.
+    """
+    for label, value in (
+        ("model_name", model_name),
+        ("fast_model", fast_model),
+        ("image_model", image_model),
+    ):
+        if value is None:
+            continue
+        clean = value.strip()
+        if label == "image_model" and clean == "auto":
+            continue
+        head, sep, tail = clean.partition("/")
+        if not (sep and head.strip() and tail.strip()):
+            return (
+                f"{label}: the model {clean!r} does not say which connection it is on. "
+                f"Name the connection first, for example gemini/{clean or 'model-name'}."
+            )
+    return None
+
+
 class PersonaDefinition(BaseModel):
     """Configuration schema for dynamically defined sub-agent personas."""
 
     model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
 
     name: str = Field(description="Unique name identifier for the dynamic agent persona")
+    display_name: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "What a person reads as the clone's name, per locale, e.g. {'en': 'Sleepyhead'}."
+            " Free text; `name` stays the ASCII handle. Empty means label it by `name`."
+        ),
+    )
     role: str = Field(description="Human-readable role (e.g. 'Security Reviewer')")
     description: str = Field(default="", description="Description of what this persona does")
     system_prompt: str = Field(description="System instructions and persona constraints")
@@ -144,6 +211,40 @@ class PersonaDefinition(BaseModel):
             " it may call no one (#1558)."
         ),
     )
+    tools_module: str | None = Field(
+        default=None,
+        description=(
+            "How this clone's requests offer its tools (#2188): `native`, `pinned` or"
+            " `bound`. Unset follows the provider's default, which is `native` everywhere."
+            " Applied when a seat is built; a name the running version does not have is"
+            " refused then, in plain words."
+        ),
+    )
+
+    @model_serializer(mode="wrap")
+    def _omit_unset_tools_module(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
+        """Leave `tools_module` out when unset, so a persona without one -- every persona
+        before #2188, and every session record that carries one -- is written as before
+        (#1844)."""
+        data: dict[str, object] = handler(self)
+        if data.get("tools_module") is None:
+            data.pop("tools_module", None)
+        return data
+
+    @model_validator(mode="after")
+    def _models_name_their_connection(self) -> PersonaDefinition:
+        """Refuse a model that does not say which connection it is on (model-gateway §3.4).
+
+        A persona written for one provider names a bare id (``gemini-3.8-pro``); run on the
+        gateway it would go to whichever connection came first. It is refused when the
+        persona loads, naming the field and how to write it.
+        """
+        refusal = persona_model_problem(
+            self.llm_config.model_name, self.llm_config.fast_model, self.llm_config.image_model
+        )
+        if refusal is not None:
+            raise ValueError(refusal)
+        return self
 
     @property
     def granted_tools(self) -> tuple[str, ...]:
@@ -163,6 +264,23 @@ class PersonaDefinition(BaseModel):
             return ()
         own = self.allowed_tools
         return own + tuple(name for name in BASE_PERSONA_TOOLS if name not in own)
+
+
+def effective_tool_scope(
+    operator_tools: tuple[str, ...], persona: PersonaDefinition | None
+) -> tuple[str, ...]:
+    """The tools an agent may run: the operator's list if it gave one, else the persona's.
+
+    The one rule for an agent's tool scope, read by the agent itself
+    (`BaseAgent._apply_persona_tool_scope`) and by what reports that scope to a person
+    (`/api/skills` `hidden_from`, #1865), so the two cannot disagree. An empty result is no
+    restriction: every registered tool.
+    """
+    if operator_tools:
+        return operator_tools
+    if persona is not None:
+        return persona.granted_tools
+    return ()
 
 
 class PlanStep(BaseModel):

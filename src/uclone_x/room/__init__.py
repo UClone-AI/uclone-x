@@ -17,6 +17,7 @@ from uclone_x.room.protocols import (
     RoomAgentResolverProtocol,
     RoomOrchestratorProtocol,
     RoomStoreProtocol,
+    SeatSessionStoreProtocol,
     SpeakerSelectorProtocol,
 )
 from uclone_x.room.resolver import RoomAgentResolver
@@ -34,6 +35,7 @@ from uclone_x.room.service import (
     RoomService,
     RoomSummary,
     participant_session_id,
+    seat_sessions,
 )
 from uclone_x.room.store import RoomStore
 from uclone_x.room.turn_summary import (
@@ -64,7 +66,9 @@ __all__ = [
     "RoomSummary",
     "SESSION_ID_PREFIX",
     "SESSION_ID_SEPARATOR",
+    "SeatSessionStoreProtocol",
     "participant_session_id",
+    "seat_sessions",
     "SelectionVerdict",
     "SpeakerDecision",
     "SpeakerRequest",

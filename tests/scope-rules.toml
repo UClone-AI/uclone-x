@@ -52,7 +52,7 @@ prefixes = ["frontend/", "src/uclone_x/ui_static/"]
 
 # A governance document is judged by the fitness functions (testing principles R3).
 [fitness]
-prefixes = [".claude/", "docs/", "swarm/skills/"]
+prefixes = [".claude/", "docs/"]
 suffixes = [".md"]
 tests = "tests/fitness/"
 

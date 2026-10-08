@@ -19,14 +19,20 @@
 
 import { en, type Messages } from '../i18n/en';
 
-/** No model is configured: the setting exists and holds nothing. English; `emptyStates.noModel`. */
-export const NO_MODEL_CAUSE = en.emptyStates.noModel;
+/**
+ * Internal constants capturing the default English causes.
+ * Consumers read causes via `emptyCause(modelConfigured, agentCount, copy)` rather than
+ * importing English strings directly, ensuring caller localization is respected (#1295).
+ */
+const NO_MODEL_CAUSE = en.emptyStates.noModel;
+const NO_AGENTS_CAUSE = en.emptyStates.noAgents;
+const NO_CONVERSATIONS_CAUSE = en.emptyStates.noConversations;
 
-/** A model is configured, but the runtime offers no clone to send a message to. */
-export const NO_AGENTS_CAUSE = en.emptyStates.noAgents;
-
-/** Model and clones are both present; the user simply has not started anything. */
-export const NO_CONVERSATIONS_CAUSE = en.emptyStates.noConversations;
+const DEFAULT_EMPTY_STATES: Messages['emptyStates'] = {
+  noModel: NO_MODEL_CAUSE,
+  noAgents: NO_AGENTS_CAUSE,
+  noConversations: NO_CONVERSATIONS_CAUSE,
+};
 
 /**
  * Why this region is empty, in one sentence naming a cause and a remedy.
@@ -41,6 +47,6 @@ export const NO_CONVERSATIONS_CAUSE = en.emptyStates.noConversations;
 export const emptyCause = (
   modelConfigured: boolean | null,
   agentCount: number,
-  copy: Messages['emptyStates'] = en.emptyStates,
+  copy: Messages['emptyStates'] = DEFAULT_EMPTY_STATES,
 ): string =>
   modelConfigured === false ? copy.noModel : agentCount === 0 ? copy.noAgents : copy.noConversations;

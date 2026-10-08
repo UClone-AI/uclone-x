@@ -662,7 +662,37 @@ describe('WorkspaceSidebar uclone2-style group chats and clone smart accordion s
 
     const row = within(screen.getByTestId('conversation-list')).getByTestId('conversation-r-pair');
     const sources = Array.from(row.querySelectorAll('img')).map((img) => img.getAttribute('src'));
-    expect(sources).toEqual(['/api/personas/scout/avatar', '/api/personas/critic/avatar']);
+    expect(sources).toEqual(['/api/clones/scout/avatar', '/api/clones/critic/avatar']);
+  });
+
+  // Killed by: frontend/src/ui-kit/rail/Rail.tsx :: const agentLabel = (agentId: string) => clones.find((c) => c.id === agentId)?.label ?? agentId;
+  // Becomes: const agentLabel = (agentId: string) => agentId;
+  // Killed by: frontend/src/ui-kit/rail/Rail.tsx :: const base = (personas ?? []).map((p) => ({ id: p.id ?? p.name, label: p.label ?? p.name, role: p.role }));
+  // Becomes: const base = (personas ?? []).map((p) => ({ id: p.name, label: p.label ?? p.name, role: p.role }));
+  it('names a conversation`s clones by display name, and picks a clone by its id (#1814)', () => {
+    // A room's `agent_ids` are clone ids since #1815; a raw `agt_…` is not a name anybody reads.
+    const onSelectAgent = vi.fn();
+    const rooms: RoomSummary[] = [
+      {
+        room_id: 'r-pair',
+        title: 'Pair',
+        agent_ids: ['agt_scout', 'agt_gone'],
+        human_ids: ['user'],
+        message_count: 1,
+        updated_at: '2026-09-22T10:00:00Z',
+      },
+    ];
+    renderSidebar({
+      personas: [makePersonaInfo({ id: 'agt_scout', name: 'scout', display_name: { en: 'Scout Prime' } })],
+      rooms,
+      onSelectAgent,
+    });
+
+    const row = within(screen.getByTestId('conversation-list')).getByTestId('conversation-r-pair');
+    // A clone the listing no longer names keeps its id: there is nothing better to show.
+    expect(row).toHaveTextContent('Scout Prime, agt_gone');
+    fireEvent.click(screen.getByTestId('clone-new-thread-agt_scout'));
+    expect(onSelectAgent).toHaveBeenCalledWith('agt_scout');
   });
 });
 
@@ -855,3 +885,17 @@ describe('WorkspaceSidebar clone selection exclusivity', () => {
   });
 });
 
+
+describe('WorkspaceSidebar clone labels', () => {
+  // Killed by: frontend/src/components/layout/WorkspaceSidebar.tsx :: personas={labelled}
+  // Becomes: personas={personas}
+  it('lists a clone by its display name, not by its id', () => {
+    renderSidebar({
+      personas: [makePersonaInfo({ name: 'sleepy', display_name: { en: '잠 꾸러기' } })],
+      selectedAgent: 'sleepy',
+    });
+
+    expect(screen.getByText('잠 꾸러기')).toBeInTheDocument();
+    expect(screen.queryByText('sleepy')).not.toBeInTheDocument();
+  });
+});

@@ -12,9 +12,10 @@ from pydantic import BaseModel
 from uclone_x.agent import session_lifecycle
 from uclone_x.agent.base import BaseAgent
 from uclone_x.agent.composition import HostDependencies
-from uclone_x.agent.models import BASE_PERSONA_TOOLS, PersonaDefinition
+from uclone_x.agent.models import BASE_PERSONA_TOOLS, PersonaDefinition, TurnResult
 from uclone_x.agent.persona_registry import PersonaRegistry
 from uclone_x.agent.session import SessionStore
+from uclone_x.agent.turn_executor import PERSONA_EDIT_NOT_APPLIED
 from uclone_x.agent.turn_trace import trace_turn
 from uclone_x.core.context_state import EPOCH_PERSONA_EDITED
 from uclone_x.engine.event_bus import EventBus
@@ -108,6 +109,14 @@ class _HeldConnector(_RecordingConnector):
         return await super().generate(request)
 
 
+def _assert_told_plainly(failed: TurnResult, cause: str) -> None:
+    """The failed turn names a dropped edit, in the fixed sentence and never the cause (#1904)."""
+    assert failed.stop_reason == "persona_edit_failed"
+    assert failed.error == PERSONA_EDIT_NOT_APPLIED
+    assert cause not in (failed.error or "")
+    assert "RuntimeError" not in (failed.error or "")
+
+
 def _own_tools_offered(llm: _RecordingConnector) -> set[str]:
     """The tools the latest request offered, less the base set every persona is given."""
     assert llm.requests, "no request reached the model"
@@ -142,11 +151,10 @@ class TestRoomPersonaResolution:
     ) -> None:
         resolver = RoomAgentResolver(host, persona_registry=persona_registry)
         participant = Participant(
-            id="author",
+            id="novelist",
             kind=ParticipantKind.AGENT,
             display_name="Author",
-            persona="novelist",
-            session_id="sess_room__r1__author",
+            session_id="sess_room__r1__novelist",
         )
 
         agent = await resolver.resolve(participant)
@@ -154,7 +162,7 @@ class TestRoomPersonaResolution:
         assert isinstance(agent, BaseAgent)
         prompt = agent.effective_system_prompt
         assert (
-            "You are Author (author), one participant in a shared multi-agent conversation."
+            "You are Author (novelist), one participant in a shared multi-agent conversation."
             in prompt
         )
         assert "[Persona Instructions: Creative Fiction Writer]" in prompt
@@ -176,11 +184,10 @@ class TestRoomPersonaResolution:
         """
         resolver = RoomAgentResolver(host, persona_registry=persona_registry)
         participant = Participant(
-            id="author",
+            id="novelist",
             kind=ParticipantKind.AGENT,
             display_name="Author",
-            persona="novelist",
-            session_id="sess_room__r1__author",
+            session_id="sess_room__r1__novelist",
         )
 
         agent = await resolver.resolve(participant)
@@ -197,10 +204,13 @@ class TestRoomPersonaResolution:
         assert agent.config.allowed_tools == ("draft_chapter", "read_outline", *BASE_PERSONA_TOOLS)
 
     @pytest.mark.asyncio
-    async def test_fallback_to_participant_id_when_persona_field_empty(
+    async def test_a_seat_finds_its_persona_by_its_id(
         self, host: HostDependencies, persona_registry: PersonaRegistry
     ) -> None:
-        """A persona found through the participant id carries its allowlist into the seat.
+        """A persona found through the seat's id carries its allowlist into the seat.
+
+        A seat names no persona of its own: it is its clone, and the persona is looked up
+        by the seat id (clone-data-scopes §4 step 3).
 
         Pinned through `granted_tools`, for the reason given on the test above.
 
@@ -212,7 +222,6 @@ class TestRoomPersonaResolution:
             id="critic",
             kind=ParticipantKind.AGENT,
             display_name="Reviewer",
-            persona="",
             session_id="sess_room__r1__critic",
         )
 
@@ -288,11 +297,10 @@ class TestRoomPersonaResolution:
         )
         resolver = RoomAgentResolver(host, persona_registry=registry)
         participant = Participant(
-            id="scribe",
+            id=persona_name,
             kind=ParticipantKind.AGENT,
             display_name="Scribe",
-            persona=persona_name,
-            session_id="sess_room__r1__scribe",
+            session_id=f"sess_room__r1__{persona_name}",
         )
 
         agent = await resolver.resolve(participant)
@@ -330,11 +338,10 @@ class TestAPersonaEditReachesARoomSeat:
         llm = cast("_RecordingConnector", host.llm)
         resolver = RoomAgentResolver(host, persona_registry=persona_registry)
         participant = Participant(
-            id="author",
+            id="novelist",
             kind=ParticipantKind.AGENT,
             display_name="Author",
-            persona="novelist",
-            session_id="sess_room__r1__author",
+            session_id="sess_room__r1__novelist",
         )
         agent = await resolver.resolve(participant)
         assert isinstance(agent, BaseAgent)
@@ -369,11 +376,10 @@ class TestAPersonaEditReachesARoomSeat:
         llm = cast("_RecordingConnector", host.llm)
         resolver = RoomAgentResolver(host, persona_registry=persona_registry)
         participant = Participant(
-            id="author",
+            id="novelist",
             kind=ParticipantKind.AGENT,
             display_name="Author",
-            persona="novelist",
-            session_id="sess_room__r1__author",
+            session_id="sess_room__r1__novelist",
         )
         agent = await resolver.resolve(participant)
         assert isinstance(agent, BaseAgent)
@@ -423,11 +429,10 @@ class TestAPersonaEditReachesARoomSeat:
         store = cast("SessionStore", host.store)
         resolver = RoomAgentResolver(host, persona_registry=persona_registry)
         participant = Participant(
-            id="author",
+            id="novelist",
             kind=ParticipantKind.AGENT,
             display_name="Author",
-            persona="novelist",
-            session_id="sess_room__r1__author",
+            session_id="sess_room__r1__novelist",
         )
         agent = await resolver.resolve(participant)
         assert isinstance(agent, BaseAgent)
@@ -465,7 +470,8 @@ class TestAPersonaEditReachesARoomSeat:
     ) -> None:
         """An edit saved while a seat's turn runs, and a compaction resolve, change nothing yet.
 
-        Two seats speak as one persona. Seat B's turn is held at its first request; the
+        Two seats speak as one persona -- the one clone seated in two rooms, since a seat
+        is its clone's id. Seat B's turn is held at its first request; the
         persona is saved and both seats are resolved, as `/compact` resolves the seat it
         summarizes while another seat's turn runs (#1899 review). B's in-flight turn
         finishes under the persona it began with -- its second step offers the old tools --
@@ -479,13 +485,12 @@ class TestAPersonaEditReachesARoomSeat:
         resolver = RoomAgentResolver(_host(tmp_path, llm), persona_registry=persona_registry)
         seat_a, seat_b = (
             Participant(
-                id=name,
+                id="novelist",
                 kind=ParticipantKind.AGENT,
                 display_name=name.title(),
-                persona="novelist",
-                session_id=f"sess_room__r1__{name}",
+                session_id=f"sess_room__{room}__novelist",
             )
-            for name in ("ann", "ben")
+            for name, room in (("ann", "r1"), ("ben", "r2"))
         )
         a = await resolver.resolve(seat_a)
         b = await resolver.resolve(seat_b)
@@ -524,6 +529,7 @@ class TestAPersonaEditReachesARoomSeat:
         host: HostDependencies,
         persona_registry: PersonaRegistry,
         monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
         """A staged edit whose apply raises ends that turn as a failed result (#1904).
 
@@ -537,14 +543,22 @@ class TestAPersonaEditReachesARoomSeat:
 
         Killed by: src/uclone_x/agent/turn_executor.py :: self._turn_counter += 1
         Becomes: self._take_staged_persona(); self._turn_counter += 1
+
+        The failure is named `persona_edit_failed` and says so in a fixed sentence, so the
+        person who saved the edit is told it was dropped; the cause goes to the log only.
+        The mutations below re-raise the cause as it was, or stop naming it.
+
+        Killed by: src/uclone_x/agent/turn_executor.py :: raise _PersonaEditNotApplied from exc
+        Becomes: raise
+        Killed by: src/uclone_x/agent/turn_executor.py :: if isinstance(exc, _PersonaEditNotApplied):
+        Becomes: if False:
         """
         resolver = RoomAgentResolver(host, persona_registry=persona_registry)
         participant = Participant(
-            id="author",
+            id="novelist",
             kind=ParticipantKind.AGENT,
             display_name="Author",
-            persona="novelist",
-            session_id="sess_room__r1__author",
+            session_id="sess_room__r1__novelist",
         )
         agent = await resolver.resolve(participant)
         assert isinstance(agent, BaseAgent)
@@ -562,7 +576,8 @@ class TestAPersonaEditReachesARoomSeat:
         failed = await agent.execute_turn("Again")
 
         assert not failed.is_completed
-        assert failed.error == "the edit could not be applied"
+        _assert_told_plainly(failed, "the edit could not be applied")
+        assert "the edit could not be applied" in caplog.text, "the cause was not logged"
         monkeypatch.undo()
         assert (await agent.execute_turn("Once more")).is_completed
         assert agent.persona_definition == before
@@ -573,11 +588,10 @@ class TestAPersonaEditReachesARoomSeat:
         """A seat after one turn, with an edit to its prompt and tools staged but not taken."""
         resolver = RoomAgentResolver(host, persona_registry=persona_registry)
         participant = Participant(
-            id="author",
+            id="novelist",
             kind=ParticipantKind.AGENT,
             display_name="Author",
-            persona="novelist",
-            session_id="sess_room__r1__author",
+            session_id="sess_room__r1__novelist",
         )
         agent = await resolver.resolve(participant)
         assert isinstance(agent, BaseAgent)
@@ -639,7 +653,7 @@ class TestAPersonaEditReachesARoomSeat:
         monkeypatch.undo()
 
         assert not failed.is_completed
-        assert failed.error == "the tool scope could not be resolved"
+        _assert_told_plainly(failed, "the tool scope could not be resolved")
         await self._assert_wholly_on_the_old_definition(host, agent, before, tools_before)
 
     @pytest.mark.asyncio
@@ -675,7 +689,7 @@ class TestAPersonaEditReachesARoomSeat:
         monkeypatch.undo()
 
         assert not failed.is_completed
-        assert failed.error == "the epoch could not be opened"
+        _assert_told_plainly(failed, "the epoch could not be opened")
         await self._assert_wholly_on_the_old_definition(host, agent, before, tools_before)
 
     @pytest.mark.asyncio
@@ -696,26 +710,26 @@ class TestAPersonaEditReachesARoomSeat:
         original = persona_registry.get_persona("novelist")
         assert original is not None
 
-        def _seat(name: str) -> Participant:
+        def _seat(room: str) -> Participant:
+            # The one clone seated in another room: a seat is its clone's id.
             return Participant(
-                id=name,
+                id="novelist",
                 kind=ParticipantKind.AGENT,
-                display_name=name.title(),
-                persona="novelist",
-                session_id=f"sess_room__r1__{name}",
+                display_name="Novelist",
+                session_id=f"sess_room__{room}__novelist",
             )
 
         # Saved where this resolver's registry does not see it: a seat built now takes it.
         saved = original.model_copy(update={"system_prompt": "You are a poet."})
         assert resolver.persona_edited(saved) == 0
-        first = await resolver.resolve(_seat("ann"))
+        first = await resolver.resolve(_seat("r1"))
         assert isinstance(first, BaseAgent)
         assert first.persona_definition == saved
 
         # The registry then moves on by another path: the held copy is older than it.
         later = original.model_copy(update={"system_prompt": "You are an essayist."})
         persona_registry.register_persona(later)
-        second = await resolver.resolve(_seat("ben"))
+        second = await resolver.resolve(_seat("r2"))
         assert isinstance(second, BaseAgent)
         assert second.persona_definition == later
 
@@ -728,14 +742,9 @@ class TestRoomServicePersonaAutoHydration:
         service = RoomService(store)
         service.create("Novel Collab", room_id="collab_1")
 
-        state = service.add_participant(
-            "collab_1",
-            "writer",
-            persona="writer",
-        )
+        state = service.add_participant("collab_1", "writer")
 
         writer = next(p for p in state.participants if p.id == "writer")
-        assert writer.persona == "writer"
         assert (
             "prose" in writer.persona_summary.lower()
             or "narrative" in writer.persona_summary.lower()
@@ -752,8 +761,8 @@ class TestRoomPersonaCollaborationOrchestration:
         service.create("Story Room", room_id="room_story")
 
         service.add_participant("room_story", "human_user", kind=ParticipantKind.HUMAN)
-        service.add_participant("room_story", "writer", persona="novelist")
-        service.add_participant("room_story", "editor", persona="critic", aliases=("reviewer",))
+        service.add_participant("room_story", "novelist")
+        service.add_participant("room_story", "critic", aliases=("reviewer",))
 
         state = service.get("room_story")
         assert len(state.participants) == 3
@@ -769,10 +778,10 @@ class TestRoomPersonaCollaborationOrchestration:
         post_state = await orchestrator.post(
             room_id="room_story",
             sender_id="human_user",
-            content="Hello @writer, please draft the opening scene!",
+            content="Hello @novelist, please draft the opening scene!",
         )
 
         utterances = [m for m in post_state.transcript if m.is_utterance]
         assert len(utterances) == 2
         assert utterances[0].sender_id == "human_user"
-        assert utterances[1].sender_id == "writer"
+        assert utterances[1].sender_id == "novelist"

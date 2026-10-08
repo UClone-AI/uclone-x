@@ -110,6 +110,36 @@ describe('the conversation in the chosen language', () => {
     expect(screen.getByLabelText('Send (Enter)')).toBeInTheDocument();
   });
 
+  // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: {fmt(t.row.imageNegativeAdded, { label, tags: message.image_negative_added.join(', ') })}
+  // Becomes: {fmt(en.conversation.row.imageNegativeAdded, { label, tags: message.image_negative_added.join(', ') })}
+  it('says in Korean what was added to a picture request (#1865)', () => {
+    render(
+      <Host
+        hints={['ko-KR']}
+        over={{
+          room: room({
+            transcript: [
+              message({
+                seq: 1,
+                sender_id: 'scout',
+                content: '그렸습니다.',
+                image_prompt_added: ['masterpiece'],
+                image_negative_added: ['blurry', 'text'],
+              }),
+            ],
+          }),
+        }}
+      />,
+    );
+
+    expect(screen.getByTestId('row-image-prompt-added-1')).toHaveTextContent(
+      fmt(ko.conversation.row.imagePromptAdded, { label: 'Scout', tags: 'masterpiece' }),
+    );
+    const left = screen.getByTestId('row-image-negative-added-1');
+    expect(left).toHaveTextContent('Scout이(가) 그림에서 빼도록 요청했습니다: blurry, text.');
+    expect(left).not.toHaveTextContent(/asked|leave out/);
+  });
+
   // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: {refusalRemedy(message.refusal, t.outcome)}
   // Becomes: {refusalRemedy(message.refusal)}
   it('says a refused turn and its remedy in Korean, with the clone named', () => {

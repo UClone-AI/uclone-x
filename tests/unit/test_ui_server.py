@@ -12,14 +12,16 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 from fastapi.testclient import TestClient
+from starlette.datastructures import Headers
 from typer.testing import CliRunner
 
 from tests.support.app_clone import app_clone
+from tests.support.clones import make_clones
 from tests.support.vite_diagnosis import answering_as, one_line
 from uclone_x import __version__
 from uclone_x.agent.base import BaseAgent
 from uclone_x.cli import main
-from uclone_x.core.agent_home import AgentHome
+from uclone_x.core.agent_home import seat_id_for
 from uclone_x.core.immutable import unwrap_immutable
 from uclone_x.core.provenance import (
     AttemptRecord,
@@ -29,14 +31,12 @@ from uclone_x.core.provenance import (
 )
 from uclone_x.engine.event_bus import EventBus, EventType
 from uclone_x.errors import (
-    LLMCredentialsNotConfiguredError,
     LLMProviderError,
     LLMTimeoutError,
 )
 from uclone_x.llm import MockLLMConnector, create_llm_connector
 from uclone_x.llm.budget import TokenBudgetManager
 from uclone_x.llm.connectors.ollama import OllamaConnector
-from uclone_x.llm.connectors.vllm import VLLMConnector
 from uclone_x.llm.models import (
     LLMRequest,
     MessageRole,
@@ -74,6 +74,37 @@ from uclone_x.ui.app import (
 from uclone_x.ui.server import VITE_IDENTITY_MARKER, start_ui_server
 
 runner = CliRunner()
+
+# The agent ids these tests chat as. Each is a clone now, since a name no clone carries is
+# refused rather than given a home (clone-data-scopes §3.4); persona-less, so each still
+# speaks as the fallback prompt the test was written against.
+_CHAT_CLONES = (
+    "agent-clear-test",
+    "agent-tool-err",
+    "agent-tool-user",
+    "champion",
+    "custom-budget-agent",
+    "default-agent",
+    "failover-agent",
+    "follower",
+    "generic_custom_agent",
+    "mock-agent",
+    "overlap-a",
+    "overlap-b",
+    "prov-agent",
+    "stream-agent",
+    "test-agent",
+    "test-agent-1",
+    "test-agent-2",
+    "test-agent-3",
+    "test_agent",
+    "unconfigured-agent",
+)
+
+
+@pytest.fixture(autouse=True)
+def _chat_clones() -> None:  # pyright: ignore[reportUnusedFunction]
+    make_clones(*_CHAT_CLONES)
 
 
 def stubbed_ollama_connector(reply: str = "Stubbed connector reply.") -> OllamaConnector:
@@ -154,8 +185,8 @@ def test_ui_diagnostics_endpoint(test_client: TestClient) -> None:
 
 
 @pytest.mark.asyncio
-async def test_ui_chat_custom_agent_max_turns_budget() -> None:
-    """A custom `AgentConfig.max_turns` bounds a run of steps, not a conversation.
+async def test_ui_chat_custom_agent_max_steps_budget() -> None:
+    """A custom `AgentConfig.max_steps` bounds a run of steps, not a conversation.
 
     Driven through `/api/turn` until that route was retired (every conversation is a
     room); the budget is the agent's own, so it is read off the agent directly. Each
@@ -166,12 +197,12 @@ async def test_ui_chat_custom_agent_max_turns_budget() -> None:
     custom_cfg = AgentConfig(
         agent_id="custom-budget-agent",
         name="Custom Budget Agent",
-        max_turns=3,
+        max_steps=3,
         llm_config=AgentLLMConfig(model_name="mock-model"),
     )
     agent = BaseAgent(config=custom_cfg, llm=MockLLMConnector())
 
-    # Turn 4 is past the ceiling in message count, and NOT refused. `max_turns` bounds a
+    # Turn 4 is past the ceiling in message count, and NOT refused. `max_steps` bounds a
     # self-driven run, not a conversation -- the defect this replaces rejected a person's
     # fourth message with "Turn budget exceeded".
     for n in range(1, 5):
@@ -282,7 +313,9 @@ async def test_agent_session_manager() -> None:
     # built from is pinned where one is built (`test_one_clone_builder.py`).
     assert manager.bus is bus
     assert manager.tools is tools
-    assert manager.llm is mock_llm
+    # A connector handed in answers every clone that follows the system default.
+    binding = manager.gateway.default_binding
+    assert binding is not None and binding.connector is mock_llm
     # Test global singleton accessor
     global_mgr = get_ui_session_manager()
     assert global_mgr is not None
@@ -484,8 +517,7 @@ def test_ui_dispatch_endpoint(test_client: TestClient) -> None:
 
 def _install_clone(*names: str) -> None:
     """Give each named clone a home, so the listing a developer-graph read checks has it."""
-    for name in names:
-        assert AgentHome.for_username(name).agent_id()
+    make_clones(*names)
 
 
 def test_ui_ontology_endpoint_empty(test_client: TestClient) -> None:
@@ -798,7 +830,9 @@ async def test_ui_stream_receives_chat_turn_events(tmp_path: Path) -> None:
     reply = finals[0]
     assert reply["topic"] == f"room.{room_id}"
     assert reply["provenance"]["component"] == "uclone_x.engine.event_bus"
-    assert reply["provenance"]["producer"] == "stream-agent"
+    # The seat is keyed by the clone's id, which the room resolved the handle to.
+    assert seat_id_for("stream-agent").startswith("agt_")
+    assert reply["provenance"]["producer"] == seat_id_for("stream-agent")
     assert reply["provenance"]["path"] == "primary"
 
 
@@ -1053,6 +1087,8 @@ async def test_ui_stream_generator_terminates_on_shutdown_event(tmp_path: Path) 
     route = next(r for r in app.routes if isinstance(r, APIRoute) and r.path == "/api/stream")
     mock_request = MagicMock(spec=Request)
     mock_request.app = app
+    # A real request's headers: none, as from the CLI. `/api/stream` reads `Origin` (#2146).
+    mock_request.headers = Headers()
     mock_request.app.state.shutdown_event = shutdown_event
     mock_request.is_disconnected = AsyncMock(return_value=False)
 
@@ -1380,17 +1416,21 @@ async def test_ui_chat_tool_execution_error_records(tmp_path: Path) -> None:
     assert te1.output is None
     assert te1.duration_ms == 12.5
 
-    # Second tool: not found error
+    # Second tool: no tool has that name, answered in plain words (#2190)
     te2 = result.tool_executions[1]
     assert te2.tool_name == "nonexistent_tool"
     assert te2.tool_call_id == "tc_not_found"
     assert te2.status == "error"
-    assert "not found" in str(te2.error)
+    assert "There is no tool named 'nonexistent_tool'" in str(te2.error)
 
 
 @pytest.mark.asyncio
 async def test_get_settings_endpoint(tmp_path: Path) -> None:
-    """GET /api/settings returns active endpoints and masked credentials (#350)."""
+    """GET /api/settings carries the defaults and the other settings, and no `llm_*` field.
+
+    The connections and models have their own routes (model-gateway §3.7.1); the
+    pre-gateway fields are deleted, not left empty (step 3).
+    """
     mock_llm = MockLLMConnector(api_key="sk-abcdef123456", base_url="http://mock-llm.invalid:8000")
     app = create_ui_app(static_dir=tmp_path, llm=mock_llm, storage_dir=tmp_path)
 
@@ -1401,23 +1441,22 @@ async def test_get_settings_endpoint(tmp_path: Path) -> None:
 
     assert res.status_code == 200
     data = cast(dict[str, Any], res.json())
-    assert data["llm_provider"] == "mock"
-    assert data["llm_base_url"] == "http://mock-llm.invalid:8000"
-    assert data["llm_api_key_set"] is True
-    assert data["llm_api_key_masked"] == "sk-...3456"
+    assert data["default_models"] == {"deep": None, "fast": None, "image": "auto"}
+    # The picture settings went with model-gateway step 5: a ComfyUI is a connection, and
+    # the picture model is `default_models.image`.
+    assert not {"comfyui_base_url", "image_engine", "image_model"} & set(data)
+    assert not [key for key in data if key.startswith("llm_")]
+    assert "providers" not in data and "available_models" not in data
     assert "sk-abcdef123456" not in json.dumps(data)
-    assert "comfyui_base_url" in data
-    assert "providers_available" in data
-    assert "mock" in data["providers_available"]
-    assert "available_models" in data
-    assert "mock-llm" in data["available_models"]
 
 
 @pytest.mark.asyncio
 async def test_get_models_endpoint(tmp_path: Path) -> None:
-    """GET /api/models returns enumerated models for active provider (P0/Recognition over Recall)."""
-    mock_llm = MockLLMConnector()
-    app = create_ui_app(static_dir=tmp_path, llm=mock_llm, storage_dir=tmp_path)
+    """GET /api/models answers the model set grouped by connection (model-gateway §3.7.1)."""
+    (tmp_path / "settings.json").write_text(
+        json.dumps({"connections": [{"id": "mock", "kind": "mock"}]}), encoding="utf-8"
+    )
+    app = create_ui_app(static_dir=tmp_path, llm=MockLLMConnector(), storage_dir=tmp_path)
 
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
@@ -1426,10 +1465,10 @@ async def test_get_models_endpoint(tmp_path: Path) -> None:
 
     assert res.status_code == 200
     data = cast(dict[str, Any], res.json())
-    assert data["provider"] == "mock"
-    assert "models" in data
-    assert "mock-llm" in data["models"]
-    assert "current_model" in data
+    assert set(data) == {"groups", "defaults", "recommended"}
+    (group,) = data["groups"]
+    assert group["connection_id"] == "mock"
+    assert "mock/mock-llm" in [m["ref"] for m in group["models"]]
 
 
 @pytest.mark.asyncio
@@ -1470,7 +1509,11 @@ async def test_pull_model_endpoint_requires_model_name(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_pull_model_endpoint_reports_provider_error_as_502(tmp_path: Path) -> None:
-    """POST /api/models/pull surfaces an LLMProviderError as a 502 with its message (P6)."""
+    """POST /api/models/pull surfaces an LLMProviderError as a 502 with plain words (#1460).
+
+    Killed by: src/uclone_x/ui/app.py :: status_code=502, detail=f"Could not pull {model} from Ollama."
+    Becomes: status_code=502, detail=str(exc)
+    """
     mock_llm = MockLLMConnector()
     app = create_ui_app(static_dir=tmp_path, llm=mock_llm, storage_dir=tmp_path)
 
@@ -1482,7 +1525,9 @@ async def test_pull_model_endpoint_reports_provider_error_as_502(tmp_path: Path)
             res = await client.post("/api/models/pull", json={"model": "llama3.2:1b"})
 
     assert res.status_code == 502
-    assert "Failed to connect to Ollama" in res.json()["detail"]
+    assert res.json()["detail"] == "Could not pull llama3.2:1b from Ollama."
+    assert "Failed to connect to Ollama" not in res.json()["detail"]
+    assert "LLMProviderError" not in res.json()["detail"]
 
 
 async def _yield_until(predicate: Callable[[], bool], *, yields: int = 2000) -> None:
@@ -1673,7 +1718,11 @@ async def test_delete_model_endpoint_requires_model_name(tmp_path: Path) -> None
 
 @pytest.mark.asyncio
 async def test_delete_model_endpoint_reports_provider_error_as_502(tmp_path: Path) -> None:
-    """POST /api/models/delete surfaces an LLMProviderError as a 502 with its message (P6)."""
+    """POST /api/models/delete surfaces an LLMProviderError as a 502 with plain words (#1460).
+
+    Killed by: src/uclone_x/ui/app.py :: status_code=502, detail=f"Could not delete {model} from Ollama."
+    Becomes: status_code=502, detail=str(exc)
+    """
     mock_llm = MockLLMConnector()
     app = create_ui_app(static_dir=tmp_path, llm=mock_llm, storage_dir=tmp_path)
 
@@ -1687,7 +1736,9 @@ async def test_delete_model_endpoint_reports_provider_error_as_502(tmp_path: Pat
             res = await client.post("/api/models/delete", json={"model": "llama3.2:1b"})
 
     assert res.status_code == 502
-    assert "status 404" in res.json()["detail"]
+    assert res.json()["detail"] == "Could not delete llama3.2:1b from Ollama."
+    assert "status 404" not in res.json()["detail"]
+    assert "LLMProviderError" not in res.json()["detail"]
 
 
 @pytest.mark.asyncio
@@ -1789,180 +1840,119 @@ async def test_model_routes_admit_the_dashboards_own_dev_server(tmp_path: Path) 
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("builtin_personas_absent")
 async def test_update_settings_hot_reloads_runtime_and_publishes_event(tmp_path: Path) -> None:
-    """POST /api/settings hot-reloads the LLM and ComfyUI and broadcasts an event (#350).
+    """POST /api/settings saves the default model and broadcasts an event (#350).
 
-    A clone built after the save answers on the new connector and model. A room seat
-    built before it is moved over by its resolver (`test_room_llm_replaced.py`).
+    A clone built after the save answers on the saved default's connection and model. A
+    room seat built before it is re-bound by its resolver (`test_room_llm_replaced.py`).
     """
-    from uclone_x.tools.builtin.comfy_image_tool import ComfyImageGenTool
+    from uclone_x.llm.connections import ModelRef
 
     event_bus = EventBus()
     sub = event_bus.subscribe("settings")
 
-    tool = ComfyImageGenTool(base_url="http://127.0.0.1:8188")
-    registry = ToolRegistry(tools=[tool])
-    initial_llm = MockLLMConnector(responses=["Initial reply"])
-
-    app = create_ui_app(
-        static_dir=tmp_path,
-        bus=event_bus,
-        llm=initial_llm,
-        tools=registry,
-        storage_dir=tmp_path,
-        fallback_to_mock=True,
+    registry = ToolRegistry(tools=[])
+    (tmp_path / "settings.json").write_text(
+        json.dumps({"connections": [{"id": "mock", "kind": "mock"}]}), encoding="utf-8"
     )
+    app = create_ui_app(static_dir=tmp_path, bus=event_bus, tools=registry, storage_dir=tmp_path)
 
     session_mgr: AgentSessionManager = app.state.session_manager
-    assert app_clone(session_mgr, "test-agent", "sess_before").llm is initial_llm
 
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
     ) as client:
         res = await client.post(
             "/api/settings",
-            json={
-                "llm_provider": "mock",
-                "llm_base_url": "http://updated-mock:9000",
-                "llm_model": "test-model-reload",
-                "llm_api_key": "sk-new-super-secret-key",
-                "comfyui_base_url": "http://comfy-gpu:8188",
-            },
+            json={"default_models": {"deep": "mock/mock-llm"}},
         )
 
     assert res.status_code == 200
     updated = cast(dict[str, Any], res.json())
-    assert updated["llm_provider"] == "mock"
-    assert updated["llm_base_url"] == "http://updated-mock:9000"
-    assert updated["llm_model"] == "test-model-reload"
-    assert updated["comfyui_base_url"] == "http://comfy-gpu:8188"
-    assert updated["llm_api_key_set"] is True
+    assert updated["default_models"]["deep"] == "mock/mock-llm"
 
-    # 1. Hot-reload verified: the connector was swapped without a restart
+    # 1. The default reaches a clone built now, on its connection's connector.
     agent = app_clone(session_mgr, "test-agent", "sess_test")
-    assert agent.llm is not initial_llm
-    assert agent.llm is session_mgr.llm
-    assert agent.config.llm_config.model_name == "test-model-reload"
-
-    # 2. Tool hot-reload verified: ComfyUI base_url updated
-    assert tool.base_url == "http://comfy-gpu:8188"
+    assert agent.llm is session_mgr.gateway.connector_for(ModelRef.parse("mock/mock-llm"))
+    assert agent.config.llm_config.model_name == "mock-llm"
 
     # 3. Event broadcast verified: settings.updated received on event bus
     event = await asyncio.wait_for(sub.get(), timeout=2.0)
     assert event.type is EventType.SETTINGS_UPDATED
     assert event.topic == "settings"
-    assert event.payload["llm_model"] == "test-model-reload"
-    assert event.payload["comfyui_base_url"] == "http://comfy-gpu:8188"
+    defaults = cast(dict[str, Any], event.payload["default_models"])
+    assert defaults["deep"] == "mock/mock-llm"
 
 
 @pytest.mark.asyncio
 async def test_update_settings_invalid_provider_returns_400(tmp_path: Path) -> None:
-    """POST /api/settings with unsupported provider returns 400."""
+    """A default model that is not a ref is refused in plain words, and nothing is saved.
+
+    Killed by: src/uclone_x/ui/app.py :: refusal = await _refuse_unlisted_defaults(defaults)
+    Becomes: refusal = None
+    """
     app = create_ui_app(static_dir=tmp_path, fallback_to_mock=False, storage_dir=tmp_path)
 
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
     ) as client:
-        res = await client.post(
-            "/api/settings",
-            json={"llm_provider": "unsupported-cloud-unknown"},
-        )
+        res = await client.post("/api/settings", json={"default_models": {"deep": "gpt-5"}})
     assert res.status_code == 400
-    data = cast(dict[str, Any], res.json())
-    assert "Unsupported LLM provider" in data["detail"]
-
-
-def test_update_settings_failed_connector_does_not_poison_environment(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """If connector creation fails during update_settings, os.environ['LLM_PROVIDER'] is not modified (#402, #410).
-
-    Mutation this exists to catch:
-        -   new_llm = create_llm_connector(...)
-        -   for k, v in env_updates.items():
-        -       os.environ[k] = v
-        +   for k, v in env_updates.items():
-        +       os.environ[k] = v
-        +   new_llm = create_llm_connector(...)
-    """
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    monkeypatch.delenv("LLM_PROVIDER", raising=False)
-
-    mgr = AgentSessionManager(storage_dir=tmp_path, fallback_to_mock=False)
-    assert os.getenv("LLM_PROVIDER") is None
-
-    with pytest.raises(LLMCredentialsNotConfiguredError):
-        mgr.update_settings(llm_provider="openai")
-
-    assert os.getenv("LLM_PROVIDER") is None
-    assert mgr._configured_provider != "openai"
-
-    # A pre-existing LLM_PROVIDER is never overwritten by a save. It also wins over the
-    # provider saved, so the connector stays the one it names while the file records the
-    # choice for when the variable is removed.
-    monkeypatch.setenv("LLM_PROVIDER", "mock")
-    mgr2 = AgentSessionManager(storage_dir=tmp_path, fallback_to_mock=False)
-    assert os.getenv("LLM_PROVIDER") == "mock"
-
-    answer = mgr2.update_settings(llm_provider="openai")
-
-    assert os.getenv("LLM_PROVIDER") == "mock"
-    assert answer["llm_provider"] == "mock" and answer["llm_provider_source"] == "env"
-    assert getattr(mgr2.default_llm, "provider_name", None) == "mock"
-    stored = json.loads((tmp_path / "settings.json").read_text(encoding="utf-8"))
-    assert stored["llm_provider"] == "openai"
+    detail = cast(dict[str, Any], res.json())["detail"]
+    assert "which connection" in detail
+    assert "Error" not in detail
+    assert not (tmp_path / "settings.json").exists()
 
 
 def test_llm_provider_alone_gives_conversations_a_model_with_no_settings_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """`LLM_PROVIDER` with no settings file is the provider conversations use (#1899).
+    """The environment overrides the file and does not need one (S4, #1899).
 
-    The environment overrides the file and does not need one (settings-single-source S4),
-    and Settings already reported the variable's provider. Only a saved file built the
-    connector, so every conversation had no model while Settings named one.
+    `LLM_PROVIDER` makes an ephemeral connection and the provider's model variable names the
+    default deep model as `<kind>/<id>` (model-gateway §3.2), so conversations have a model
+    with no settings file at all.
 
-    Killed by: src/uclone_x/ui/app.py :: if not (self.provider_in_effect or self._configured_base_url):
-    Becomes: if not (self._configured_provider or self._configured_base_url):
+    Killed by: src/uclone_x/llm/gateway.py :: return replace(saved, deep=f"{kind}/{model}", env_vars={"deep": variable})
+    Becomes: return saved
     """
-    monkeypatch.setenv("LLM_PROVIDER", "mock")
+    monkeypatch.setenv("LLM_PROVIDER", "ollama")
+    monkeypatch.setenv("OLLAMA_MODEL", "qwen3:8b")
     mgr = AgentSessionManager(storage_dir=tmp_path, fallback_to_mock=False)
 
     assert not (tmp_path / "settings.json").exists(), "the case is the one with no file"
-    assert mgr.get_settings()["llm_provider_source"] == "env"
-    assert getattr(mgr.llm, "provider_name", None) == "mock"
-    # What a conversation seat is built from, 1:1 or not.
-    assert mgr.app_scope().host.llm is mgr.llm
+    (conn,) = mgr.gateway.connections()
+    assert (conn.id, conn.source, conn.env_var) == ("ollama", "env", "LLM_PROVIDER")
+    assert mgr.get_settings()["default_models"]["deep"] == "ollama/qwen3:8b"
+    agent = app_clone(mgr, "scout", "sess_env")
+    assert getattr(agent.llm, "provider_name", None) == "ollama"
+    assert agent.config.llm_config.model_name == "qwen3:8b"
 
 
 @pytest.mark.asyncio
 async def test_settings_persistence_across_manager_instances(tmp_path: Path) -> None:
     """Settings saved in one session manager instance persist to disk and rehydrate in another (#350)."""
-    mgr1 = AgentSessionManager(storage_dir=tmp_path, fallback_to_mock=True)
-    mgr1.update_settings(
-        llm_provider="mock",
-        llm_base_url="http://persisted-mock:8888",
-        llm_model="persisted-model-v1",
-        comfyui_base_url="http://persisted-comfy:8188",
+    (tmp_path / "settings.json").write_text(
+        json.dumps({"connections": [{"id": "mock", "kind": "mock"}]}), encoding="utf-8"
     )
+    mgr1 = AgentSessionManager(storage_dir=tmp_path, fallback_to_mock=True)
+    mgr1.update_settings(default_models={"deep": "mock/persisted-model-v1"}, ui_language="ko")
 
     # Instantiate fresh AgentSessionManager with the same storage directory
     mgr2 = AgentSessionManager(storage_dir=tmp_path, fallback_to_mock=True)
     settings2 = mgr2.get_settings()
-    assert settings2["llm_provider"] == "mock"
-    assert settings2["llm_base_url"] == "http://persisted-mock:8888"
-    assert settings2["llm_model"] == "persisted-model-v1"
-    assert settings2["comfyui_base_url"] == "http://persisted-comfy:8188"
+    assert settings2["default_models"]["deep"] == "mock/persisted-model-v1"
+    assert settings2["ui_language"] == "ko"
+    assert [c.id for c in mgr2.gateway.connections()] == ["mock"]
 
 
 @pytest.mark.asyncio
 async def test_persisted_settings_initializes_active_llm_connector_on_startup(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """AgentSessionManager initializes the active LLM connector from settings.json (#891).
+    """A clone answers on the saved default's connection from startup (#891, model-gateway §3.3).
 
     From explicit arguments: the file's values are not copied into the environment.
     """
-    # Ensure no ambient LLM env vars
     for k in ("LLM_PROVIDER", "OLLAMA_BASE_URL", "OLLAMA_MODEL", "OPENAI_API_KEY"):
         monkeypatch.delenv(k, raising=False)
 
@@ -1970,59 +1960,29 @@ async def test_persisted_settings_initializes_active_llm_connector_on_startup(
     settings_file.write_text(
         json.dumps(
             {
-                "llm_provider": "ollama",
-                "llm_base_url": "http://127.0.0.1:11434",
-                "llm_model": "hermes3:8b",
+                "connections": [
+                    {"id": "ollama", "kind": "ollama", "base_url": "http://127.0.0.1:11434"}
+                ],
+                "default_models": {"deep": "ollama/hermes3:8b"},
             }
         ),
         encoding="utf-8",
     )
 
-    # Initialize manager without explicit LLM or fallback_to_mock
     mgr = AgentSessionManager(storage_dir=tmp_path, fallback_to_mock=False)
 
-    # Active LLM connector should be initialized from settings.json
-    assert mgr.default_llm is not None
-    assert getattr(mgr.default_llm, "provider_name", "") == "ollama"
-    assert getattr(mgr.default_llm, "base_url", "") == "http://127.0.0.1:11434"
+    llm, model = mgr.gateway.default_deep()
+    assert getattr(llm, "provider_name", "") == "ollama"
+    assert getattr(llm, "base_url", "") == "http://127.0.0.1:11434"
+    assert model == "hermes3:8b"
     assert os.getenv("LLM_PROVIDER") is None
     assert os.getenv("OLLAMA_BASE_URL") is None
     assert os.getenv("OLLAMA_MODEL") is None
 
-    # A clone built from the app scope answers on that connector: no LLMProviderNotConfiguredError.
     agent = app_clone(mgr, "scout", "test-session-891")
-    assert agent is not None
-    assert agent.llm == mgr.default_llm
+    assert agent.llm is llm
     # The saved model reaches the agent explicitly, not through `OLLAMA_MODEL`.
     assert agent.config.llm_config.model_name == "hermes3:8b"
-
-
-@pytest.mark.asyncio
-async def test_test_endpoint_connection(tmp_path: Path) -> None:
-    """POST /api/settings/test verifies mock and ComfyUI connectivity diagnostics (#350)."""
-    app = create_ui_app(static_dir=tmp_path, fallback_to_mock=True, storage_dir=tmp_path)
-
-    async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
-    ) as client:
-        # Test mock LLM connection
-        res_llm = await client.post(
-            "/api/settings/test",
-            json={"target": "llm", "llm_provider": "mock"},
-        )
-        assert res_llm.status_code == 200
-        data_llm = cast(dict[str, Any], res_llm.json())
-        assert data_llm["status"] == "ok"
-        assert data_llm["results"]["llm"]["status"] == "ok"
-
-        # Test ComfyUI connection (unreachable port)
-        res_comfy = await client.post(
-            "/api/settings/test",
-            json={"target": "comfyui", "comfyui_base_url": "http://127.0.0.1:59999"},
-        )
-        assert res_comfy.status_code == 200
-        data_comfy = cast(dict[str, Any], res_comfy.json())
-        assert data_comfy["results"]["comfyui"]["online"] is False
 
 
 def test_diagnose_vite_accepts_our_own_dev_server(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2101,10 +2061,15 @@ def test_ui_artifacts_endpoints(tmp_path: Path) -> None:
     readme_file.write_text("# Project UClone-X\n\nREADME text.\n", encoding="utf-8")
 
     # Session-specific artifact
-    session_tool_dir = tmp_path / ".sandbox" / "tool_artifacts" / "sess_test_1"
-    session_tool_dir.mkdir(parents=True, exist_ok=True)
-    tool_art = session_tool_dir / "output.md"
-    tool_art.write_text("# Tool Output Analysis\n\nTool run results.\n", encoding="utf-8")
+    session_dir = tmp_path / "artifacts" / "sess_test_1"
+    session_dir.mkdir(parents=True, exist_ok=True)
+    (session_dir / "output.md").write_text(
+        "# Tool Output Analysis\n\nTool run results.\n", encoding="utf-8"
+    )
+    # A file where tool results were kept before #1848 is not a clone's document.
+    old_store = tmp_path / ".sandbox" / "tool_artifacts" / "sess_test_1"
+    old_store.mkdir(parents=True, exist_ok=True)
+    (old_store / "legacy.md").write_text("# Legacy\n\nOld result.\n", encoding="utf-8")
 
     mgr = AgentSessionManager(storage_dir=tmp_path / "sessions", workspace_dir=tmp_path)
     app = create_ui_app(session_manager=mgr)
@@ -2135,12 +2100,11 @@ def test_ui_artifacts_endpoints(tmp_path: Path) -> None:
     assert res_sess.status_code == 200
     data_sess = cast(dict[str, Any], res_sess.json())
     sess_paths = {a["path"] for a in data_sess["artifacts"]}
-    assert ".sandbox/tool_artifacts/sess_test_1/output.md" in sess_paths
+    assert "artifacts/sess_test_1/output.md" in sess_paths
+    assert ".sandbox/tool_artifacts/sess_test_1/legacy.md" not in sess_paths
     assert "docs/design/rfc.md" not in sess_paths
     tool_item = next(
-        a
-        for a in data_sess["artifacts"]
-        if a["path"] == ".sandbox/tool_artifacts/sess_test_1/output.md"
+        a for a in data_sess["artifacts"] if a["path"] == "artifacts/sess_test_1/output.md"
     )
     assert tool_item["title"] == "Tool Output Analysis"
 
@@ -2173,7 +2137,7 @@ def test_ui_artifacts_endpoints(tmp_path: Path) -> None:
 def test_ui_artifacts_path_traversal_rejection(tmp_path: Path) -> None:
     """Assert /api/artifacts/content strictly rejects path traversal (P6 security invariant).
 
-    Killed by: src/uclone_x/ui/app.py :: resolved = validator.resolve_safe_path(Path(clean_path), self._workspace_dir)
+    Killed by: src/uclone_x/ui/app.py :: resolved = validator.resolve_safe_path(Path(clean_path), root or self._workspace_dir)
     Becomes: resolved = Path(clean_path).resolve()
     """
     mgr = AgentSessionManager(storage_dir=tmp_path / "sessions", workspace_dir=tmp_path)
@@ -2350,8 +2314,8 @@ def test_a_developer_graph_read_of_an_unknown_clone_is_refused_and_makes_no_engi
     Before, the name check alone let `nosuchclone0` through: 200 with an empty graph, and
     an empty engine left in the manager's map for the app's lifetime.
 
-    Killed by: src/uclone_x/ui/app.py :: if agent_id not in readable:
-    Becomes: if False:
+    Killed by: src/uclone_x/ui/app.py :: if agent_id in (clone.id, clone.name):
+    Becomes: if True:
     """
     _install_clone("scout")
     app = create_ui_app(static_dir=tmp_path)
@@ -2372,8 +2336,10 @@ def test_a_developer_graph_read_of_an_unknown_clone_is_refused_and_makes_no_engi
     assert "nosuchclone0" not in engines_made_for
 
     # The recorder sees the route's reads: an installed clone's read goes through it.
+    # Engines are keyed by clone id; the handle is resolved to it first.
     assert client.get(route, params={"agent_id": "scout"}).status_code == 200
-    assert engines_made_for == ["scout"]
+    assert seat_id_for("scout").startswith("agt_")
+    assert engines_made_for == [seat_id_for("scout")]
 
 
 @pytest.mark.parametrize("route", ["/api/ontology", "/api/knowledge-graph"])
@@ -2386,8 +2352,8 @@ def test_a_developer_graph_read_of_an_unreadable_clone_folder_is_refused(
     hidden, but no clone can have that name. Before #1879 the route found the name in the
     listing, answered 200 and kept an engine for it.
 
-    Killed by: src/uclone_x/ui/app.py :: if clone.status is not CloneStatus.UNREADABLE
-    Becomes: if clone.status is not None
+    Killed by: src/uclone_x/ui/app.py :: if clone.status is CloneStatus.UNREADABLE:
+    Becomes: if clone.status is None:
     """
     from uclone_x.core.agent_home import list_agent_homes
 
@@ -2493,6 +2459,8 @@ async def test_ui_stream_ends_cleanly_when_its_subscription_closes(tmp_path: Pat
     route = next(r for r in app.routes if isinstance(r, APIRoute) and r.path == "/api/stream")
     mock_request = MagicMock(spec=Request)
     mock_request.app = app
+    # A real request's headers: none, as from the CLI. `/api/stream` reads `Origin` (#2146).
+    mock_request.headers = Headers()
     mock_request.is_disconnected = AsyncMock(return_value=False)
 
     response = await route.endpoint(request=mock_request)
@@ -2654,6 +2622,8 @@ async def test_ui_stream_yields_event_when_shutdown_fires_in_same_window(tmp_pat
     route = next(r for r in app.routes if isinstance(r, APIRoute) and r.path == "/api/stream")
     mock_request = MagicMock(spec=Request)
     mock_request.app = app
+    # A real request's headers: none, as from the CLI. `/api/stream` reads `Origin` (#2146).
+    mock_request.headers = Headers()
     mock_request.is_disconnected = AsyncMock(return_value=False)
 
     response = await route.endpoint(request=mock_request)
@@ -2704,6 +2674,8 @@ async def test_ui_stream_cancelled_mid_wait_reads_its_abandoned_waiter(tmp_path:
     route = next(r for r in app.routes if isinstance(r, APIRoute) and r.path == "/api/stream")
     mock_request = MagicMock(spec=Request)
     mock_request.app = app
+    # A real request's headers: none, as from the CLI. `/api/stream` reads `Origin` (#2146).
+    mock_request.headers = Headers()
     mock_request.is_disconnected = AsyncMock(return_value=False)
 
     response = await route.endpoint(request=mock_request)
@@ -2754,78 +2726,6 @@ _VLLM_MODELS_PAYLOAD = {
 """What a vLLM server answers at `/v1/models`: one entry, the model it was started with."""
 
 
-def test_choosing_vllm_hands_vllm_its_own_values_and_writes_no_variable(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Saving a vLLM configuration builds vLLM's connector from the saved values, explicitly.
-
-    The endpoint, model and key are passed to the connector as arguments; none is exported
-    into the environment, where it would outlive the save and be read by every other
-    connector in the process (an endpoint under `OPENAI_BASE_URL` once pointed OpenAI's
-    connector, and OpenAI's key, at a local server).
-    """
-    for name in ("VLLM_BASE_URL", "VLLM_MODEL", "VLLM_API_KEY", "OPENAI_BASE_URL"):
-        monkeypatch.delenv(name, raising=False)
-    app = create_ui_app(static_dir=tmp_path, fallback_to_mock=False, storage_dir=tmp_path)
-    session_mgr: AgentSessionManager = app.state.session_manager
-    built: list[dict[str, Any]] = []
-    real_build = session_mgr.build_llm
-
-    def spy(**kwargs: Any) -> Any:
-        built.append(kwargs)
-        return real_build(**kwargs)
-
-    monkeypatch.setattr(session_mgr, "build_llm", spy)
-    environ_before = dict(os.environ)
-
-    session_mgr.update_settings(
-        llm_provider="vllm",
-        llm_base_url="http://gpu-box.invalid:8000",
-        llm_model="qwen2.5-coder-32b-instruct",
-        llm_api_key="served-with-a-key",
-    )
-
-    assert dict(os.environ) == environ_before
-    assert built[-1]["provider"] == "vllm"
-    assert built[-1]["base_url"] == "http://gpu-box.invalid:8000"
-    assert built[-1]["model"] == "qwen2.5-coder-32b-instruct"
-    assert built[-1]["api_key"] == "served-with-a-key"
-    assert isinstance(session_mgr.llm, VLLMConnector)
-    assert session_mgr.llm.provider_name == "vllm"
-
-
-@pytest.mark.asyncio
-async def test_vllm_is_offered_as_a_provider_and_accepted_when_selected(tmp_path: Path) -> None:
-    """`providers_available` names vllm, and a save naming vllm is not a 400.
-
-    Two separately maintained lists -- one advertises providers to the panel, the other
-    admits them -- and a provider in the second but not the first is one nobody can reach
-    from the UI, while the reverse is a card that saves to an error. The pair is the
-    contract, so both directions are asserted here.
-
-    Killed by: src/uclone_x/ui/app.py :: available_providers = [pid for pid in PROVIDERS if pid != "mock"]
-    Becomes: available_providers = [pid for pid in PROVIDERS if pid not in ("mock", "vllm")]
-
-    Killed by: src/uclone_x/ui/app.py :: if prov_clean is None:
-    Becomes: if prov_clean is None or prov_clean == "vllm":
-    """
-    app = create_ui_app(static_dir=tmp_path, fallback_to_mock=False, storage_dir=tmp_path)
-    session_mgr: AgentSessionManager = app.state.session_manager
-
-    assert "vllm" in session_mgr.get_settings()["providers_available"]
-
-    async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
-    ) as client:
-        res = await client.post(
-            "/api/settings",
-            json={"llm_provider": "vllm", "llm_base_url": "http://gpu-box.invalid:8000"},
-        )
-
-    assert res.status_code == 200
-    assert cast(dict[str, Any], res.json())["llm_provider"] == "vllm"
-
-
 @pytest.mark.asyncio
 async def test_the_model_list_reports_the_model_the_vllm_server_is_serving(
     monkeypatch: pytest.MonkeyPatch,
@@ -2837,10 +2737,10 @@ async def test_the_model_list_reports_the_model_the_vllm_server_is_serving(
     answer to "what did I start?". It is also the only place the operator can read the exact
     string `--model` was given, which is what has to go in `VLLM_MODEL` for a turn to work.
 
-    Killed by: src/uclone_x/ui/app.py :: return vllm_model_ids(resp.json())
+    Killed by: src/uclone_x/llm/model_listing.py :: return vllm_model_ids(resp.json())
     Becomes: return []
 
-    Killed by: src/uclone_x/ui/app.py :: listing_url = f"{vllm_url.rstrip('/')}/models"
+    Killed by: src/uclone_x/llm/model_listing.py :: listing_url = f"{vllm_url.rstrip('/')}/models"
     Becomes: listing_url = f"{vllm_url.rstrip('/')}/api/tags"
     """
     monkeypatch.setenv("VLLM_BASE_URL", "http://gpu-box.invalid:8000")
@@ -2851,7 +2751,7 @@ async def test_the_model_list_reports_the_model_the_vllm_server_is_serving(
         return httpx.Response(200, json=_VLLM_MODELS_PAYLOAD)
 
     stub_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    with patch("uclone_x.ui.app.httpx.AsyncClient", return_value=stub_client):
+    with patch("uclone_x.llm.model_listing.httpx.AsyncClient", return_value=stub_client):
         models = await fetch_available_models(provider="vllm")
 
     assert models == ["qwen2.5-coder-32b-instruct"]
@@ -2867,87 +2767,14 @@ async def test_an_unconfigured_vllm_endpoint_is_not_probed_for_models() -> None:
     dashboard, authorised by nothing the operator said. That the refused connection would
     then be reported as "no models available" is the second defect, not the first (P6).
 
-    Killed by: src/uclone_x/ui/app.py :: if not has_configured_vllm_endpoint(base_url):
+    Killed by: src/uclone_x/llm/model_listing.py :: if not has_configured_vllm_endpoint(base_url):
     Becomes: if False:
     """
-    with patch("uclone_x.ui.app.httpx.AsyncClient") as client_cls:
+    with patch("uclone_x.llm.model_listing.httpx.AsyncClient") as client_cls:
         models = await fetch_available_models(provider="vllm")
 
     assert models == []
     client_cls.assert_not_called()
-
-
-def test_the_connectivity_test_reads_the_models_a_vllm_endpoint_serves(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """ "Test connection" against vLLM asks `/v1/models` and reports the model it names.
-
-    The button exists to answer "is the thing I configured actually there?" before a turn
-    depends on it. For vLLM the useful answer includes *which* model, because an endpoint
-    answering with a different one than the operator typed is the failure most likely to be
-    waiting -- and it is invisible in a bare ok/unreachable verdict.
-
-    Killed by: src/uclone_x/ui/app.py :: "models": vllm_model_ids(resp.json()),
-    Becomes: "models": [],
-    """
-    monkeypatch.setenv("VLLM_BASE_URL", "http://gpu-box.invalid:8000")
-    app = create_ui_app(static_dir=tmp_path, fallback_to_mock=False, storage_dir=tmp_path)
-    client = TestClient(app)
-    paths: list[str] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        paths.append(request.url.path)
-        return httpx.Response(200, json=_VLLM_MODELS_PAYLOAD)
-
-    stub_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    with patch("uclone_x.ui.app.httpx.AsyncClient", return_value=stub_client):
-        res = client.post("/api/settings/test", json={"target": "llm", "llm_provider": "vllm"})
-
-    assert res.status_code == 200
-    llm_result = cast(dict[str, Any], res.json())["results"]["llm"]
-    assert llm_result["status"] == "ok"
-    assert llm_result["provider"] == "vllm"
-    assert llm_result["models"] == ["qwen2.5-coder-32b-instruct"]
-    assert paths == ["/v1/models"]
-
-
-@pytest.mark.asyncio
-async def test_the_connectivity_test_names_the_variable_when_no_vllm_endpoint_is_set(
-    tmp_path: Path,
-) -> None:
-    """Unconfigured is reported as unconfigured, in the terms the panel can act on.
-
-    Every other provider's test either reaches something or checks for a key. vLLM is the
-    one that can fail before any request is made, and the operator who pressed the button
-    needs the reason to be the missing endpoint rather than a socket error against a port
-    this code picked for them (P6).
-
-    The phrase asserted on is the load-bearing part, and the reason is worth stating.
-    Without the check, `resolve_vllm_base_url` raises and the route's own `except` puts
-    *its* message in the same field -- which also names `VLLM_BASE_URL`, so a test looking
-    only for the variable cannot tell the two apart and passes either way (measured: the
-    declaration below escaped until this assertion was added). What only the branch under
-    test says is the other way to fix it: the field on the panel the operator is already
-    looking at. A dashboard whose remediation is "set an environment variable" for a value
-    it has an input box for is the defect being pinned.
-
-    Killed by: src/uclone_x/ui/app.py :: if not has_configured_vllm_endpoint(eff_base):
-    Becomes: if False:
-    """
-    app = create_ui_app(static_dir=tmp_path, fallback_to_mock=False, storage_dir=tmp_path)
-
-    async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
-    ) as client:
-        res = await client.post(
-            "/api/settings/test", json={"target": "llm", "llm_provider": "vllm"}
-        )
-
-    assert res.status_code == 200
-    llm_result = cast(dict[str, Any], res.json())["results"]["llm"]
-    assert llm_result["status"] == "error"
-    assert "VLLM_BASE_URL" in llm_result["error"]
-    assert "enter the endpoint above" in llm_result["error"]
 
 
 def test_a_vllm_endpoint_is_sent_a_bearer_token_only_when_one_is_configured(
@@ -2959,7 +2786,7 @@ def test_a_vllm_endpoint_is_sent_a_bearer_token_only_when_one_is_configured(
     `--api-key` ignores both, but a gateway in front of one reads the empty credential and
     answers 401 about something nobody configured (#385).
 
-    Killed by: src/uclone_x/ui/app.py :: return {"Authorization": f"Bearer {key}"} if key else {}
+    Killed by: src/uclone_x/llm/model_listing.py :: return {"Authorization": f"Bearer {key}"} if key else {}
     Becomes: return {"Authorization": f"Bearer {key}"}
     """
     assert vllm_request_headers() == {}
@@ -2967,42 +2794,6 @@ def test_a_vllm_endpoint_is_sent_a_bearer_token_only_when_one_is_configured(
 
     monkeypatch.setenv("VLLM_API_KEY", "from-the-environment")
     assert vllm_request_headers() == {"Authorization": "Bearer from-the-environment"}
-
-
-def test_a_saved_vllm_model_is_still_configured_after_a_restart(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The model saved in the panel reaches the connector again when settings are reloaded.
-
-    `VLLMConnector` refuses a request that names no model. A manager that restored the
-    provider and the endpoint but not the model would come back from a restart holding a
-    configuration the operator completed, and refuse the first turn for lacking the very
-    part they filled in. The model is handed over as an argument, not exported.
-    """
-    for name in ("VLLM_BASE_URL", "VLLM_MODEL"):
-        monkeypatch.delenv(name, raising=False)
-    (tmp_path / "settings.json").write_text(
-        json.dumps(
-            {
-                "llm_provider": "vllm",
-                "llm_base_url": "http://gpu-box.invalid:8000/v1",
-                "llm_model": "qwen2.5-coder-32b-instruct",
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    app = create_ui_app(static_dir=tmp_path, fallback_to_mock=False, storage_dir=tmp_path)
-    session_mgr: AgentSessionManager = app.state.session_manager
-
-    assert "VLLM_MODEL" not in os.environ
-    assert "VLLM_BASE_URL" not in os.environ
-    assert isinstance(session_mgr.llm, VLLMConnector)
-    assert session_mgr.deep_model == "qwen2.5-coder-32b-instruct"
-    settings = session_mgr.get_settings()
-    assert settings["llm_provider"] == "vllm"
-    assert settings["llm_model"] == "qwen2.5-coder-32b-instruct"
-    assert settings["llm_base_url"] == "http://gpu-box.invalid:8000/v1"
 
 
 async def test_ui_language_defaults_to_system_and_round_trips(tmp_path: Path) -> None:
@@ -3024,24 +2815,48 @@ async def test_ui_language_defaults_to_system_and_round_trips(tmp_path: Path) ->
 
 
 async def test_a_language_save_leaves_the_model_connector_alone(tmp_path: Path) -> None:
-    """Switching the language rebuilds no LLM connector, so a broken provider cannot refuse it."""
+    """Switching the language changes no model: no open conversation is re-bound.
+
+    Killed by: src/uclone_x/ui/app.py :: if default_models is not None:
+    Becomes: if True:
+    """
     app = create_ui_app(static_dir=tmp_path, fallback_to_mock=True, storage_dir=tmp_path)
     session_mgr: AgentSessionManager = app.state.session_manager
-    session_mgr.get_settings()
-    before = session_mgr._llm  # pyright: ignore[reportPrivateUsage]
+    rebound: list[None] = []
+    session_mgr.on_models_changed(lambda: rebound.append(None))
 
-    def unreachable(**_kwargs: Any) -> LLMProviderProtocol:
-        raise RuntimeError("provider probe failed")
-
-    with patch("uclone_x.ui.app.create_llm_connector", side_effect=unreachable):
-        async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
-        ) as client:
-            saved = await client.post("/api/settings", json={"ui_language": "ko"})
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
+    ) as client:
+        saved = await client.post("/api/settings", json={"ui_language": "ko"})
 
     assert saved.status_code == 200
     assert cast(dict[str, Any], saved.json())["ui_language"] == "ko"
-    assert session_mgr._llm is before  # pyright: ignore[reportPrivateUsage]
+    assert rebound == []
+
+
+@pytest.mark.parametrize("field", ["read_roots"])
+async def test_a_save_of_one_other_field_leaves_the_model_connector_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, field: str
+) -> None:
+    """Settings saves each field on its own; a folder or picture-service save moves no model."""
+    monkeypatch.delenv("UCLONE_READ_ROOTS", raising=False)
+    papers = tmp_path / "papers"
+    papers.mkdir()
+    body: dict[str, Any] = {field: [str(papers)]}
+    app = create_ui_app(static_dir=tmp_path, fallback_to_mock=True, storage_dir=tmp_path / "store")
+    session_mgr: AgentSessionManager = app.state.session_manager
+    rebound: list[None] = []
+    session_mgr.on_models_changed(lambda: rebound.append(None))
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
+    ) as client:
+        saved = await client.post("/api/settings", json=body)
+
+    assert saved.status_code == 200
+    assert cast(dict[str, Any], saved.json())[field] == body[field]
+    assert rebound == []
 
 
 async def test_an_unknown_ui_language_is_refused_and_not_saved(tmp_path: Path) -> None:
@@ -3055,7 +2870,10 @@ async def test_an_unknown_ui_language_is_refused_and_not_saved(tmp_path: Path) -
         res = await client.post("/api/settings", json={"ui_language": "fr"})
 
     assert res.status_code == 400
-    assert "ui_language" in cast(dict[str, Any], res.json())["detail"]
+    assert (
+        cast(dict[str, Any], res.json())["detail"]
+        == "The settings could not be saved because the configuration is invalid."
+    )
     reloaded = AgentSessionManager(storage_dir=tmp_path, fallback_to_mock=True)
     assert reloaded.get_settings()["ui_language"] == "en"
 
@@ -3070,297 +2888,3 @@ _KEY_VARS = (
     "GEMINI_MODEL",
     "OPENAI_MODEL",
 )
-
-
-def _provider_row(settings: dict[str, Any], provider: str) -> dict[str, Any]:
-    rows = cast(list[dict[str, Any]], settings["providers"])
-    return next(row for row in rows if row["id"] == provider)
-
-
-class TestEveryProviderKeepsItsOwnKey:
-    """Settings reports each provider's key, whichever provider is active.
-
-    It used to report the active provider's key only, so a Gemini key looked gone the
-    moment the provider moved to Ollama -- and a key saved for another provider overwrote
-    it for real.
-    """
-
-    def _manager(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> AgentSessionManager:
-        for name in _KEY_VARS:
-            monkeypatch.delenv(name, raising=False)
-        app = create_ui_app(static_dir=tmp_path, fallback_to_mock=True, storage_dir=tmp_path)
-        return cast(AgentSessionManager, app.state.session_manager)
-
-    def test_a_gemini_key_and_an_openai_key_are_both_reported(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        mgr = self._manager(tmp_path, monkeypatch)
-
-        mgr.update_settings(llm_provider="gemini", llm_model="g-deep", llm_api_key="AQ.gemini-0001")
-        mgr.update_settings(llm_provider="openai", llm_model="o-deep", llm_api_key="sk-openai-0002")
-        settings = mgr.get_settings()
-
-        gemini, openai = _provider_row(settings, "gemini"), _provider_row(settings, "openai")
-        assert gemini["key_set"] is True and gemini["key_source"] == "settings"
-        assert gemini["key_masked"].endswith("0001")
-        assert openai["key_set"] is True and openai["key_source"] == "settings"
-        assert openai["key_masked"].endswith("0002")
-        assert _provider_row(settings, "anthropic")["key_set"] is False
-        stored = json.loads((tmp_path / "settings.json").read_text(encoding="utf-8"))
-        assert stored["llm_api_keys"] == {"gemini": "AQ.gemini-0001", "openai": "sk-openai-0002"}
-
-    def test_switching_provider_without_a_key_still_reports_the_other_key(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        mgr = self._manager(tmp_path, monkeypatch)
-        mgr.update_settings(llm_provider="gemini", llm_model="g-deep", llm_api_key="AQ.gemini-0001")
-
-        mgr.update_settings(llm_provider="ollama", llm_model="hermes3:8b")
-        settings = mgr.get_settings()
-
-        assert settings["llm_provider"] == "ollama"
-        assert _provider_row(settings, "gemini")["key_set"] is True
-        assert _provider_row(settings, "gemini")["key_masked"].endswith("0001")
-
-    def test_a_key_saved_for_a_named_provider_is_filed_under_that_provider(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        mgr = self._manager(tmp_path, monkeypatch)
-        mgr.update_settings(llm_provider="gemini", llm_model="g-deep", llm_api_key="AQ.gemini-0001")
-
-        mgr.update_settings(llm_api_key="sk-ant-0003", llm_api_key_provider="anthropic")
-        settings = mgr.get_settings()
-
-        assert settings["llm_provider"] == "gemini"
-        assert _provider_row(settings, "anthropic")["key_masked"].endswith("0003")
-        assert _provider_row(settings, "gemini")["key_masked"].endswith("0001")
-
-    def test_an_environment_key_is_reported_with_the_variable_that_carries_it(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        mgr = self._manager(tmp_path, monkeypatch)
-        mgr.update_settings(llm_provider="gemini", llm_model="g-deep", llm_api_key="AQ.saved-0001")
-        monkeypatch.setenv("GEMINI_API_KEY", "AQ.from-env-9999")
-
-        row = _provider_row(mgr.get_settings(), "gemini")
-
-        assert row["key_source"] == "env"
-        assert row["key_env_var"] == "GEMINI_API_KEY"
-        assert row["key_masked"].endswith("9999")
-
-    def test_a_settings_save_never_writes_the_environment(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        mgr = self._manager(tmp_path, monkeypatch)
-        before = dict(os.environ)
-
-        mgr.update_settings(
-            llm_provider="gemini",
-            llm_model="g-deep",
-            llm_model_fast="g-fast",
-            llm_api_key="AQ.gemini-0001",
-            comfyui_base_url="http://127.0.0.1:8188",
-        )
-        mgr.update_settings(llm_provider="openai", llm_model="o-deep", llm_api_key="sk-openai-02")
-
-        assert dict(os.environ) == before
-
-    @pytest.mark.asyncio
-    async def test_one_key_is_removed_and_the_one_in_use_is_refused(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        mgr = self._manager(tmp_path, monkeypatch)
-        mgr.update_settings(llm_provider="openai", llm_model="o-deep", llm_api_key="sk-openai-0002")
-        mgr.update_settings(llm_provider="gemini", llm_model="g-deep", llm_api_key="AQ.gemini-0001")
-        # A fresh server over the same file: the routes read what the saves above wrote.
-        transport_app = create_ui_app(
-            static_dir=tmp_path, fallback_to_mock=True, storage_dir=tmp_path
-        )
-
-        async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=transport_app), base_url="http://127.0.0.1"
-        ) as client:
-            removed = await client.delete("/api/settings/api-keys/openai")
-            refused = await client.delete("/api/settings/api-keys/gemini")
-
-        assert removed.status_code == 200, removed.text
-        assert _provider_row(removed.json(), "openai")["key_set"] is False
-        assert _provider_row(removed.json(), "gemini")["key_set"] is True
-        assert refused.status_code == 400
-        assert "Switch to another provider" in refused.json()["detail"]
-        # A stable code, so the screen can say it in the reader's language.
-        assert refused.json()["code"] == "key_in_use"
-        assert "Error" not in refused.text
-
-
-class TestTheEnvironmentWinsOverTheFile:
-    """An argument, then the environment, then the file -- for provider, model and endpoint.
-
-    As for keys: a variable the operator set is what the turns use, and Settings says so
-    rather than showing the saved choice as if it were in effect.
-    """
-
-    def _manager(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> AgentSessionManager:
-        for name in _KEY_VARS:
-            monkeypatch.delenv(name, raising=False)
-        app = create_ui_app(static_dir=tmp_path, fallback_to_mock=True, storage_dir=tmp_path)
-        return cast(AgentSessionManager, app.state.session_manager)
-
-    def test_the_saved_choice_is_reported_as_the_files_when_nothing_overrides_it(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        mgr = self._manager(tmp_path, monkeypatch)
-        mgr.update_settings(llm_provider="openai", llm_model="o-deep", llm_api_key="sk-openai-0002")
-
-        settings = mgr.get_settings()
-
-        assert settings["llm_provider_source"] == "settings"
-        assert settings["llm_provider_env_var"] == ""
-        assert settings["llm_model_source"] == "settings"
-        assert settings["env_overrides"] == []
-
-    def test_llm_provider_wins_and_a_save_still_writes_the_file(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        mgr = self._manager(tmp_path, monkeypatch)
-        mgr.update_settings(llm_provider="gemini", llm_model="g-deep", llm_api_key="AQ.gemini-0001")
-        monkeypatch.setenv("LLM_PROVIDER", "mock")
-
-        answer = mgr.update_settings(
-            llm_provider="openai", llm_model="o-deep", llm_api_key="sk-openai-0002"
-        )
-
-        stored = json.loads((tmp_path / "settings.json").read_text(encoding="utf-8"))
-        assert stored["llm_provider"] == "openai" and stored["llm_model"] == "o-deep"
-        assert answer["llm_provider"] == "mock"
-        assert answer["llm_provider_source"] == "env"
-        assert answer["llm_provider_env_var"] == "LLM_PROVIDER"
-        assert getattr(mgr.default_llm, "provider_name", None) == "mock"
-        # The model saved for openai is not carried over to the provider the variable names.
-        assert mgr.deep_model is None
-        (notice,) = answer["env_overrides"]
-        assert notice["field"] == "llm_provider" and notice["env_var"] == "LLM_PROVIDER"
-        assert "environment variable LLM_PROVIDER is set" in notice["message"]
-        assert "Error" not in notice["message"]
-
-    def test_the_providers_model_variable_wins_over_the_saved_model(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        mgr = self._manager(tmp_path, monkeypatch)
-        mgr.update_settings(
-            llm_provider="openai",
-            llm_model="o-saved",
-            llm_model_fast="o-fast",
-            llm_api_key="sk-openai-0002",
-        )
-        monkeypatch.setenv("OPENAI_MODEL", "o-from-env")
-
-        settings = mgr.get_settings()
-
-        assert settings["llm_model"] == "o-from-env"
-        assert settings["llm_model_source"] == "env"
-        assert settings["llm_model_env_var"] == "OPENAI_MODEL"
-        assert settings["llm_provider_source"] == "settings"
-        assert mgr.global_models() == ("o-from-env", "o-fast")
-        assert [o["env_var"] for o in settings["env_overrides"]] == ["OPENAI_MODEL"]
-
-    def test_the_providers_endpoint_variable_wins_over_the_saved_endpoint(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        mgr = self._manager(tmp_path, monkeypatch)
-        monkeypatch.setenv("OPENAI_BASE_URL", "http://127.0.0.1:9/from-env/v1")
-
-        answer = mgr.update_settings(
-            llm_provider="openai",
-            llm_model="o-deep",
-            llm_base_url="http://127.0.0.1:9/saved/v1",
-            llm_api_key="sk-openai-0002",
-        )
-
-        stored = json.loads((tmp_path / "settings.json").read_text(encoding="utf-8"))
-        assert stored["llm_base_url"] == "http://127.0.0.1:9/saved/v1"
-        assert answer["llm_base_url"] == "http://127.0.0.1:9/from-env/v1"
-        assert answer["llm_base_url_source"] == "env"
-        assert answer["llm_base_url_env_var"] == "OPENAI_BASE_URL"
-        assert "from-env" in str(getattr(mgr.default_llm, "base_url", ""))
-
-
-class TestTheTwoSettingsModels:
-    """Deep answers turns; fast serves auxiliary calls and follows deep when left empty."""
-
-    def _manager(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> AgentSessionManager:
-        for name in _KEY_VARS:
-            monkeypatch.delenv(name, raising=False)
-        app = create_ui_app(static_dir=tmp_path, fallback_to_mock=True, storage_dir=tmp_path)
-        return cast(AgentSessionManager, app.state.session_manager)
-
-    def test_fast_is_saved_and_reported_and_empty_fast_means_deep(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        mgr = self._manager(tmp_path, monkeypatch)
-
-        mgr.update_settings(llm_provider="mock", llm_model="deep-1", llm_model_fast="fast-1")
-        assert mgr.get_settings()["llm_model_fast"] == "fast-1"
-        assert mgr.global_models() == ("deep-1", "fast-1")
-        stored = json.loads((tmp_path / "settings.json").read_text(encoding="utf-8"))
-        assert stored["llm_model_fast"] == "fast-1"
-
-        mgr.update_settings(llm_model_fast="")
-        assert mgr.get_settings()["llm_model_fast"] in (None, "")
-        assert mgr.fast_model == "deep-1"
-
-    @pytest.mark.asyncio
-    async def test_a_save_moves_following_seats_and_keeps_a_personas_own_model(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Seats already speaking in a conversation take the saved models, except the slot
-        their persona fills itself (#1893: was pinned on the retired chat-agent cache).
-
-        Killed by: src/uclone_x/room/resolver.py :: model_name=deep if deep_follows else None,
-        Becomes: model_name=deep,
-        """
-        from uclone_x.room.models import ParticipantKind
-        from uclone_x.ui.rooms import RoomStack
-
-        for name in _KEY_VARS:
-            monkeypatch.delenv(name, raising=False)
-        workspace = tmp_path / "workspace"
-        personas = workspace / ".uclone" / "personas"
-        personas.mkdir(parents=True)
-        (personas / "own.yaml").write_text(
-            "name: own\n"
-            "role: Tester\n"
-            "description: Names its own deep model.\n"
-            "system_prompt: You are Own.\n"
-            "llm_config:\n"
-            "  model_name: its-own-model\n",
-            encoding="utf-8",
-        )
-        app = create_ui_app(
-            static_dir=tmp_path,
-            fallback_to_mock=True,
-            storage_dir=tmp_path / "sessions",
-            workspace_dir=workspace,
-        )
-        mgr = cast(AgentSessionManager, app.state.session_manager)
-        stack = cast(RoomStack, app.state.room_stack)
-        mgr.update_settings(llm_provider="mock", llm_model="deep-1", llm_model_fast="fast-1")
-        room_id = stack.service.create("Two models").room_id
-        stack.service.add_participant(room_id, "user", kind=ParticipantKind.HUMAN)
-        stack.service.add_participant(room_id, "scout")
-        stack.service.add_participant(room_id, "own")
-        state = stack.store.load(room_id)
-        assert state is not None
-        seats = {p.id: p for p in state.participants}
-        follower = await stack.resolve_agent(state, seats["scout"])
-        own = await stack.resolve_agent(state, seats["own"])
-        assert follower.config.llm_config.model_name == "deep-1"
-        assert follower.config.llm_config.fast_model == "fast-1"
-        assert own.config.llm_config.model_name == "its-own-model"
-
-        mgr.update_settings(llm_model="deep-2", llm_model_fast="fast-2")
-
-        assert follower.config.llm_config.model_name == "deep-2"
-        assert follower.config.llm_config.fast_model == "fast-2"
-        assert own.config.llm_config.model_name == "its-own-model"
-        assert own.config.llm_config.fast_model == "fast-2"

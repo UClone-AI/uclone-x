@@ -171,7 +171,7 @@ async def test_execute_turn_step_budget_refusal_propagates_skills() -> None:
         config=AgentConfig(
             agent_id="agent-step-budget",
             name="StepBudgetAgent",
-            max_turns=3,
+            max_steps=3,
             llm_config=AgentLLMConfig(model_name="mock-model"),
         ),
         llm=_AlwaysToolCallsConnector(),

@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { render, screen, fireEvent } from '@testing-library/react';
-import { Rail } from './ui-kit';
+import { Button, Rail } from './ui-kit';
 import type { KitIcon, RailCopy, RailIcons, RailProps } from './ui-kit';
 import { RAIL_COPY, RAIL_ICONS } from './components/layout/WorkspaceSidebar';
 
@@ -186,5 +186,101 @@ describe('the kit rail holds no words of its own (#1158)', () => {
 
     // Preserves untruncated child span so exact matchers work
     expect(screen.getByText('r1')).toBeInTheDocument();
+  });
+});
+
+describe('the rail`s delete dialog names who was in the conversation (#1814)', () => {
+  // A room's `agent_ids` are clone ids; an `agt_…` is not a name anybody reads. The rail opens
+  // the dialog from two places, the Group Chats list and a clone's own 1:1 sessions, so both
+  // are checked.
+  // Killed by: frontend/src/ui-kit/rail/DeleteConversationDialog.tsx :: .map((id) => agentLabel?.(id) ?? id)
+  // Becomes: .map((id) => id)
+  it('shows each clone`s label, not its id, from both places it is opened', () => {
+    const persona = baseProps.personas![0];
+    const props: RailProps = {
+      ...baseProps,
+      personas: [
+        { ...persona, id: 'agt_scout', name: 'scout', label: 'Scout' },
+        { ...persona, id: 'agt_critic', name: 'critic', label: 'Critic' },
+      ],
+      selectedAgent: 'agt_scout',
+      rooms: [
+        {
+          room_id: 'room_pair',
+          title: '',
+          agent_ids: ['agt_scout', 'agt_critic'],
+          message_count: 1,
+          updated_at: '2026-01-01T00:00:00Z',
+        },
+        {
+          room_id: 'room_solo',
+          title: '',
+          agent_ids: ['agt_scout'],
+          message_count: 2,
+          updated_at: '2026-01-01T00:00:00Z',
+        },
+      ],
+    };
+
+    const group = render(<Rail {...props} />);
+    fireEvent.click(screen.getByTestId('delete-conversation-room_pair'));
+    expect(readable(document.body)).toContain('«conversations.deleteDialog.body(1,Scout, Critic)»');
+    expect(readable(document.body)).not.toContain('agt_');
+    group.unmount();
+
+    render(<Rail {...props} />);
+    fireEvent.click(screen.getByTestId('delete-conversation-room_solo'));
+    expect(readable(document.body)).toContain('«conversations.deleteDialog.body(2,Scout)»');
+    expect(readable(document.body)).not.toContain('agt_');
+  });
+});
+
+describe('DeleteConversationDialog focus trap', () => {
+  // Shift+Tab on first button (Cancel) wraps focus to last button (Delete).
+  // Killed by: frontend/src/ui-kit/rail/DeleteConversationDialog.tsx :: if (event.shiftKey && document.activeElement === first) {
+  // Becomes: if (false) {
+  it('wraps focus backward from first button to last button on Shift+Tab', () => {
+    render(<Rail {...baseProps} />);
+    fireEvent.click(screen.getByTestId('delete-conversation-room_a'));
+
+    const dialog = screen.getByTestId('delete-conversation-dialog');
+    const buttons = dialog.querySelectorAll('button:not([disabled])');
+    const first = buttons[0] as HTMLButtonElement;
+    const last = buttons[buttons.length - 1] as HTMLButtonElement;
+
+    expect(document.activeElement).toBe(first);
+
+    fireEvent.keyDown(dialog, { key: 'Tab', shiftKey: true });
+    expect(document.activeElement).toBe(last);
+  });
+
+  // Tab on last button (Delete) wraps focus to first button (Cancel).
+  // Killed by: frontend/src/ui-kit/rail/DeleteConversationDialog.tsx :: } else if (!event.shiftKey && document.activeElement === last) {
+  // Becomes: } else if (false) {
+  it('wraps focus forward from last button to first button on Tab', () => {
+    render(<Rail {...baseProps} />);
+    fireEvent.click(screen.getByTestId('delete-conversation-room_a'));
+
+    const dialog = screen.getByTestId('delete-conversation-dialog');
+    const buttons = dialog.querySelectorAll('button:not([disabled])');
+    const first = buttons[0] as HTMLButtonElement;
+    const last = buttons[buttons.length - 1] as HTMLButtonElement;
+
+    last.focus();
+    expect(document.activeElement).toBe(last);
+
+    fireEvent.keyDown(dialog, { key: 'Tab', shiftKey: false });
+    expect(document.activeElement).toBe(first);
+  });
+});
+
+describe('compact button target size (WCAG 2.5.8)', () => {
+  // Killed by: frontend/src/ui-kit/primitives/Button.tsx :: compact: 'min-w-6 min-h-6 p-1.5',
+  // Becomes: compact: 'p-1',
+  it('renders compact buttons with 24x24 px target size classes', () => {
+    render(<Button size="compact">action</Button>);
+    const button = screen.getByRole('button', { name: 'action' });
+    expect(button.className).toContain('min-w-6');
+    expect(button.className).toContain('min-h-6');
   });
 });

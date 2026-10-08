@@ -13,7 +13,6 @@ from uclone_x.llm.protocols import TokenBudgetManagerProtocol
 
 __all__ = [
     "TokenBudgetManager",
-    "TokenBudgetTracker",
 ]
 
 
@@ -297,7 +296,3 @@ class TokenBudgetManager(TokenBudgetManagerProtocol):
                 "roles": roles,
                 "compaction_history": compactions,
             }
-
-
-# Backward-compatibility alias
-TokenBudgetTracker = TokenBudgetManager

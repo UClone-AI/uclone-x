@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { ExternalLink, Link2 } from 'lucide-react';
-import { fmt, useCopy } from '../../i18n';
+import { fmt, useCopy, useLocale } from '../../i18n';
+import { cloneLabel, type Labelled } from '../../lib/cloneLabel';
 import { useApiRead } from '../../lib/useApiRead';
 import {
   connectUclone2,
@@ -56,8 +57,8 @@ const toggleFor = (state: LinkState): 'offline' | 'online' | null => {
   return 'online';
 };
 
-interface PersonaList {
-  personas?: { name: string }[];
+interface CloneList {
+  clones?: Labelled[];
 }
 
 /**
@@ -71,14 +72,16 @@ interface PersonaList {
  */
 export const LinksSection: React.FC<{ pollMs?: number }> = ({ pollMs = TRANSIENT_POLL_MS }) => {
   const allCopy = useCopy();
+  const { language } = useLocale();
   const copy = allCopy.links;
   const read = useApiRead<unknown>('/api/links');
   const { loading, reload } = read;
   const list = read.data !== null && isLinkList(read.data) ? read.data : null;
   const fault =
     read.fault ?? (read.data !== null && list === null ? { kind: 'unreadable' as const, detail: null } : null);
-  const personas = useApiRead<PersonaList>('/api/personas');
-  const names = (personas.data?.personas ?? []).map((p) => p.name);
+  const clones = useApiRead<CloneList>('/api/clones');
+  // A link names its local clone by handle (`local_clone_names` in `ui/links.py`).
+  const names = (clones.data?.clones ?? []).map((p) => ({ id: p.name, label: cloneLabel(p, language) }));
 
   const transient = list?.links.some((l) => TRANSIENT.has(l.state)) ?? false;
   useEffect(() => {
@@ -263,7 +266,7 @@ const LinkCardRow: React.FC<{ link: LinkCard; onChanged: () => void }> = ({ link
   );
 };
 
-const ConnectForm: React.FC<{ names: string[]; onLinked: () => void }> = ({ names, onLinked }) => {
+const ConnectForm: React.FC<{ names: { id: string; label: string }[]; onLinked: () => void }> = ({ names, onLinked }) => {
   const copy = useCopy().links;
   const [pasted, setPasted] = useState('');
   const [clone, setClone] = useState('');
@@ -328,9 +331,9 @@ const ConnectForm: React.FC<{ names: string[]; onLinked: () => void }> = ({ name
           className="w-full bg-slate-950 border border-slate-800 rounded-lg px-2 py-1.5 text-xs text-slate-200"
         >
           <option value="">{copy.connect.sameName}</option>
-          {names.map((name) => (
-            <option key={name} value={name}>
-              {name}
+          {names.map(({ id, label }) => (
+            <option key={id} value={id}>
+              {label}
             </option>
           ))}
         </select>

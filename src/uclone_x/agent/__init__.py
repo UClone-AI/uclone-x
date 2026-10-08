@@ -1,6 +1,7 @@
 """Agent subsystem: BaseAgent, reactive state machine, and subagent swarm management."""
 
 from uclone_x.agent.base import VALID_TRANSITIONS, BaseAgent
+from uclone_x.agent.composition import HostDependencies, MissingCapabilityError, compose_agent
 from uclone_x.agent.hooks import (
     BaseHook,
     FailurePolicy,
@@ -43,7 +44,7 @@ from uclone_x.agent.session import (
     validate_session_id,
     verify_record_identity,
 )
-from uclone_x.errors import StepBudgetExceededError, TurnBudgetExceededError
+from uclone_x.errors import StepBudgetExceededError
 
 __all__ = [
     "AgentConfig",
@@ -53,6 +54,7 @@ __all__ = [
     "BaseAgent",
     "BaseAgentProtocol",
     "BaseHook",
+    "compose_agent",
     "CompactionResult",
     "DEFAULT_SESSION_STORAGE_DIR",
     "FailurePolicy",
@@ -62,6 +64,8 @@ __all__ = [
     "HookDecision",
     "HookEvent",
     "HookRunner",
+    "HostDependencies",
+    "MissingCapabilityError",
     "ModelTier",
     "PersonaDefinition",
     "PersonaRegistry",
@@ -76,7 +80,6 @@ __all__ = [
     "SubAgentSupervisorProtocol",
     "ToolExecutionRecord",
     "StepBudgetExceededError",
-    "TurnBudgetExceededError",
     "TurnResult",
     "VALID_TRANSITIONS",
     "validate_session_id",

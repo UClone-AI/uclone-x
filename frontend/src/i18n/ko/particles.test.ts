@@ -52,8 +52,10 @@ describe('fmt with a Korean paired particle', () => {
   it('settles the particle from the value it follows, through a closing quote too', () => {
     expect(fmt(ko.conversation.membership.joined, { name: '민지' })).toBe('민지가 이 대화에 참여했습니다');
     expect(fmt(ko.conversation.membership.left, { name: '지훈' })).toBe('지훈이 이 대화에서 나갔습니다');
-    expect(fmt(ko.settings.feedback.deleted, { model: '라마' })).toBe('모델 "라마"를 삭제했습니다.');
-    expect(fmt(ko.images.now.drawing, { engine: '서울' })).toBe('지금은 서울로 그림을 그립니다.');
+    expect(fmt(ko.gateway.remove.removed, { name: '라마' })).toBe('"라마"를 제거했습니다.');
+    expect(fmt(ko.gateway.connections.fromEnv, { variable: '서울' })).toBe(
+      '환경 변수 서울로 설정되었습니다. 그곳에서 바꾸십시오. 여기서는 바꾸거나 제거할 수 없습니다.',
+    );
   });
 
   it('leaves the pair after a value that does not end in Hangul, and touches no English', () => {

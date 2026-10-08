@@ -8,7 +8,7 @@ clone learned.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
 from uclone_x.memory.models import MemoryFact
@@ -237,15 +237,16 @@ def known_facts(
 
 
 def worked_out_list(
-    facts: Sequence[MemoryFact], axioms: Iterable[OntologyAxiom]
+    statements: Mapping[str, tuple[str, str, str]], axioms: Iterable[OntologyAxiom]
 ) -> list[dict[str, Any]]:
     """What a clone's rules work out from its facts, each with the facts it rests on (step 6).
 
-    Computed on every read and never saved (clone-knowledge-graph §3.1), so a fact
+    `statements` is `fact_id -> (subject, predicate, object)` of the facts that hold now
+    (`CrossSessionMemory.statements_now`, the knowledge store's `facts_at` with the ids
+    kept). Computed on every read and never saved (clone-knowledge-graph §3.1), so a fact
     corrected or forgotten takes what followed from it with it. `because` holds the
-    `fact_id`s of the facts in `facts` the statement rests on.
+    `fact_id`s of the statements the answer rests on.
     """
-    statements = {f.fact_id: (f.subject, f.predicate, f.object_value) for f in facts}
     return [
         {
             "statement": _statement(w.subject, w.predicate, w.object),

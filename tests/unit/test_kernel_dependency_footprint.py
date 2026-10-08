@@ -82,7 +82,6 @@ def test_kernel_core_packages_importable_without_optional_frameworks() -> None:
         "sys.modules['typer'] = None\n"
         "sys.modules['rich'] = None\n"
         "sys.modules['tree_sitter'] = None\n"
-        "sys.modules['tree_sitter_languages'] = None\n"
         "sys.modules['tree_sitter_language_pack'] = None\n"
         "sys.modules['opentelemetry'] = None\n"
         "import uclone_x.core\n"
@@ -311,7 +310,6 @@ def test_code_intel_tree_sitter_raises_named_error_when_missing() -> None:
     script = (
         "import sys\n"
         "sys.modules['tree_sitter'] = None\n"
-        "sys.modules['tree_sitter_languages'] = None\n"
         "sys.modules['tree_sitter_language_pack'] = None\n"
         "from uclone_x.code_intel.ast_parser import ASTParser\n"
         "from uclone_x.errors import MissingDependencyError\n"

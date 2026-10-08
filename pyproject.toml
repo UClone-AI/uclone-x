@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "uclone-x"
-version = "0.3.1"
+version = "0.4.0"
 description = "Local AI clones with memory, tools and group chat, on an event-driven agent runtime"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -14,26 +14,38 @@ authors = [
 ]
 keywords = [
     "ai",
+    "ai-agents",
     "agents",
     "multi-agent",
+    "llm",
+    "local-llm",
+    "ollama",
+    "self-hosted",
+    "ai-assistant",
+    "chatbot",
+    "mcp",
     "a2a",
-    "google-a2a",
     "ontology",
     "knowledge-graph",
-    "llm",
     "event-driven",
     "opentelemetry"
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
+    "Environment :: Web Environment",
     "Intended Audience :: Developers",
+    "Intended Audience :: End Users/Desktop",
     "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Topic :: Communications :: Chat",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Topic :: Software Development :: Libraries :: Application Frameworks",
+    "Typing :: Typed",
 ]
 
 dependencies = [
@@ -81,12 +93,12 @@ telemetry = [
     "opentelemetry-sdk>=1.24.0",
     "opentelemetry-exporter-otlp>=1.24.0",
 ]
-# LLM Providers
-llm = [
-    "google-genai>=0.1.0",
-    "anthropic>=0.25.0",
-    "openai>=1.25.0",
-]
+# Kept, empty, so `uclone-x[llm]` and `install_package(package="llm")` still resolve. It
+# used to install the Gemini, Claude and OpenAI SDKs, but no module imports any of them:
+# every connector under `llm/connectors/` speaks HTTP through `httpx`, a base dependency.
+# google-genai's one consumer is the test that checks the uClone2 ADK mirror against the
+# real SDK, so it is in `dev` (#2011).
+llm = []
 # Knowledge Graph & Ontology
 ontology = [
     "linkml-runtime>=1.6.0",
@@ -129,6 +141,9 @@ dev = [
     # Validates the fake uClone2's answers against the link contract's schemas. Already in
     # the venv transitively; declared so a from-scratch sync has it too.
     "jsonschema>=4.18.0",
+    # The real SDK `tests/unit/test_adapters_uclone2_adk_content.py` checks the uClone2 ADK
+    # mirror against. Nothing under `src/` imports it (#2011).
+    "google-genai>=0.1.0",
     "pytest>=8.1.0",
     "pytest-asyncio>=0.23.0",
     "pytest-cov>=5.0.0",
@@ -151,8 +166,8 @@ all = [
 
 
 [project.urls]
-Homepage = "https://github.com/UClone-AI/uclone-x"
-Documentation = "https://github.com/UClone-AI/uclone-x#readme"
+Homepage = "https://about.uclone.net/#uclone-x"
+Documentation = "https://github.com/UClone-AI/uclone-x/blob/main/docs/public/README.md"
 Source = "https://github.com/UClone-AI/uclone-x"
 Issues = "https://github.com/UClone-AI/uclone-x/issues"
 Changelog = "https://github.com/UClone-AI/uclone-x/blob/main/CHANGELOG.md"
@@ -197,7 +212,7 @@ ignore = ["E501"]
 
 [tool.pyright]
 # Policy: All top-level directories containing Python code (src, tests,
-# src, tests) are subject to strict type checking.
+# scripts, evals, oss) are subject to strict type checking.
 # The publication export narrows this list to the published directories when it
 # builds the public tree, since pyright errors on an include path that is
 # not there. Non-Python or

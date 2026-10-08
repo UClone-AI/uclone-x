@@ -49,7 +49,7 @@ async def test_cross_session_memory_survives_across_distinct_sessions_and_retrac
     3. Session 2 retracts the fact via retract_memory_fact tool.
     4. Distinct Session 3 starts; system prompt confirms the retracted fact is omitted.
 
-    Killed by: src/uclone_x/memory/store.py :: self._facts[fact_id] = retracted
+    Killed by: src/uclone_x/memory/store.py :: retract_edge(tx, fact_id, reason=clean_reason, at=now, updated_at=now)
     Becomes: pass
     """
     bus = EventBus(maxsize=100)

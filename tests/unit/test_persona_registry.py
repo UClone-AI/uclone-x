@@ -23,7 +23,9 @@ from uclone_x.agent.persona_registry import (
     PersonaRegistry,
     get_default_persona_registry,
 )
+from uclone_x.agent.persona_store import YamlFilePersonaStore
 from uclone_x.agent.prompts import compose_system_prompt
+from uclone_x.core.models import AGENT_COMPOSED_TOOLS
 from uclone_x.tools import ToolRegistry
 
 
@@ -99,7 +101,7 @@ allowed_tools:
   - write_to_file
   - custom_tool
 llm:
-  model_name: custom-model
+  model_name: ollama/custom-model
   temperature: 0.9
 enable_write_tools: true
 """,
@@ -112,7 +114,7 @@ enable_write_tools: true
     assert writer.role == "Custom Workspace Writer"
     assert writer.system_prompt == "Custom prompt for workspace writer."
     assert "custom_tool" in writer.allowed_tools
-    assert writer.llm_config.model_name == "custom-model"
+    assert writer.llm_config.model_name == "ollama/custom-model"
 
 
 def test_workspace_new_custom_persona(tmp_path: Path) -> None:
@@ -165,6 +167,11 @@ def test_unloadable_persona_file_raises_naming_the_file(tmp_path: Path) -> None:
     runtime missing one agent and a log line nobody reads, which looks exactly like
     having written no file at all.
 
+    The launch workspace's personas are imported into clones at start since 2026-09-27
+    (clone-data-scopes §3.8), and a file the import cannot read is reported there
+    (`test_clone_store`); this loader still reads every other personas directory a
+    registry is given, so the refusal is pinned on it.
+
     Killed by: src/uclone_x/agent/persona_store.py :: raise PersonaLoadError(f"{file_path}: {exc}") from exc
     Becomes: logger.warning("skipped %s: %s", file_path, exc)
     """
@@ -173,7 +180,7 @@ def test_unloadable_persona_file_raises_naming_the_file(tmp_path: Path) -> None:
     (ws_personas / "corrupt.yaml").write_text("invalid: [yaml: unclosed", encoding="utf-8")
 
     with pytest.raises(PersonaLoadError) as excinfo:
-        PersonaRegistry(workspace_root=tmp_path)
+        YamlFilePersonaStore(ws_personas)
 
     assert "corrupt.yaml" in str(excinfo.value)
 
@@ -183,6 +190,11 @@ def test_append_default_prompt_must_be_a_boolean(tmp_path: Path) -> None:
 
     `"no"` and `"false"` are both true as strings. Coercing here would hand the author the
     opposite of what their file says, with nothing reported -- the P6 substitution.
+
+    The launch workspace's personas are imported into clones at start since 2026-09-27
+    (clone-data-scopes §3.8), and a file the import cannot read is reported there
+    (`test_clone_store`); this loader still reads every other personas directory a
+    registry is given, so the refusal is pinned on it.
 
     Killed by: src/uclone_x/agent/persona_store.py :: if not isinstance(append_default, bool):
     Becomes: if False:
@@ -195,7 +207,7 @@ def test_append_default_prompt_must_be_a_boolean(tmp_path: Path) -> None:
     )
 
     with pytest.raises(PersonaLoadError) as excinfo:
-        PersonaRegistry(workspace_root=tmp_path)
+        YamlFilePersonaStore(ws_personas)
 
     assert "append_default_prompt" in str(excinfo.value)
     assert "maybe.yaml" in str(excinfo.value)
@@ -243,6 +255,11 @@ def test_persona_naming_an_unregistered_tool_is_refused(tmp_path: Path) -> None:
     invisible: the agent advertises fewer tools than its file declares and nothing says
     so. This is the only place that still knows which file the name came from.
 
+    The launch workspace's personas are imported into clones at start since 2026-09-27
+    (clone-data-scopes §3.8), and a file the import cannot read is reported there
+    (`test_clone_store`); this loader still reads every other personas directory a
+    registry is given, so the refusal is pinned on it.
+
     Killed by: src/uclone_x/agent/persona_store.py :: self._validate_tools(persona, source=source)
     Becomes:
     """
@@ -258,7 +275,7 @@ def test_persona_naming_an_unregistered_tool_is_refused(tmp_path: Path) -> None:
     inventory = [tool.name for tool in ToolRegistry.with_builtins(enable_mcp=False).list_tools()]
 
     with pytest.raises(PersonaLoadError) as excinfo:
-        PersonaRegistry(workspace_root=tmp_path, tool_names=inventory)
+        YamlFilePersonaStore(ws_personas, tool_names=inventory)
 
     message = str(excinfo.value)
     assert "typo.yaml" in message
@@ -296,7 +313,11 @@ def test_every_shipped_persona_resolves_against_the_default_registry() -> None:
     Killed by: src/uclone_x/personas/scout.yaml :: - directory_list
     Becomes: - grep_search
     """
-    registered = {tool.name for tool in ToolRegistry.with_builtins(enable_mcp=False).list_tools()}
+    # A tool the agent composes for itself (`show_self`, #2017) is not in the registry
+    # until an agent is built, and is honoured all the same.
+    registered = {
+        tool.name for tool in ToolRegistry.with_builtins(enable_mcp=False).list_tools()
+    } | AGENT_COMPOSED_TOOLS
     registry = PersonaRegistry()
 
     unresolved = {
@@ -461,6 +482,11 @@ def test_a_persona_name_no_directory_can_carry_is_refused_at_its_file(tmp_path: 
     failed on its first message -- with a refusal naming a rule this loader never applied
     and no file at all. This is the only place that still knows which YAML to change.
 
+    The launch workspace's personas are imported into clones at start since 2026-09-27
+    (clone-data-scopes §3.8), and a file the import cannot read is reported there
+    (`test_clone_store`); this loader still reads every other personas directory a
+    registry is given, so the refusal is pinned on it.
+
     Killed by: src/uclone_x/agent/persona_store.py :: refuse_an_unusable_username(persona_name)
     Becomes: pass
     """
@@ -471,7 +497,7 @@ def test_a_persona_name_no_directory_can_carry_is_refused_at_its_file(tmp_path: 
     )
 
     with pytest.raises(PersonaLoadError) as excinfo:
-        PersonaRegistry(workspace_root=tmp_path)
+        YamlFilePersonaStore(ws_personas)
 
     message = str(excinfo.value)
     assert "reviewer.yaml" in message, "the error must name the file that has to change"

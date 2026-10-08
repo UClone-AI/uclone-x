@@ -48,6 +48,34 @@ export const providerFailureRemedy = (
 ): string | null => (copy.providerRemedy as Partial<Record<string, string>>)[kind] ?? null;
 
 /**
+ * The sentence for a turn that failed at the model's provider, from the Core's structured
+ * fields alone (#2167): the failure `kind`, the `provider`'s display name, and, when the
+ * clone's own model was the cause (model-gateway.md §3.6), the `model_ref` it names.
+ *
+ * Never `message`: that is the Core's English sentence, and on an own-model failure it is
+ * the clone's name and ref spliced into the provider's text. A ref is split at its first
+ * `/` (model-gateway.md §3.1): the model is named, and its connection stands in for the
+ * provider when the Core names none.
+ */
+export const providerFailureSentence = (
+  label: string,
+  failure: RoomProviderFailure,
+  copy: OutcomeCopy = ENGLISH,
+): string => {
+  const ref = failure.model_ref ?? null;
+  const slash = ref ? ref.indexOf('/') : -1;
+  const own = failure.action === 'use_system_default' && ref !== null && slash > 0;
+  const provider =
+    failure.provider?.trim() || (own && ref ? ref.slice(0, slash) : '') || copy.providerUnknown;
+  const template =
+    (copy.providerCause as Partial<Record<string, string>>)[failure.kind] ??
+    copy.providerCauseOther;
+  const cause = fmt(template, { provider });
+  if (own && ref) return fmt(copy.ownModelFailed, { label, model: ref.slice(slash + 1), cause });
+  return fmt(copy.providerFailed, { label, cause });
+};
+
+/**
  * What a failed turn's row says happened (#1408).
  *
  * Never the row's `error` field: the Core writes it as `"<ExceptionClass>: <message>"`
@@ -57,10 +85,10 @@ export const providerFailureRemedy = (
  * model's provider, it was refused, it was stopped before it finished (`completed: false`),
  * or something went wrong while it answered.
  *
- * A provider failure is told in the Core's own sentence (#1630). It is the one failure a
- * beginner cannot place without it: "something went wrong" over a retired model or a
- * rejected key reads as a fault in the app, and sends them looking in the wrong place. That
- * sentence is the Core's and is in English until step 5 of `multilingual-ui.md`.
+ * A provider failure says what stopped and whose side it is on (#1630): "something went
+ * wrong" over a retired model or a rejected key reads as a fault in the app. It is built
+ * here, in the reader's language, from the fields the Core states (`providerFailureSentence`),
+ * never from the Core's English `message` (#2167).
  */
 export const turnFailureSentence = (
   label: string,
@@ -69,7 +97,7 @@ export const turnFailureSentence = (
   providerFailure?: RoomProviderFailure | null,
   copy: OutcomeCopy = ENGLISH,
 ): string => {
-  if (providerFailure) return fmt(copy.providerFailed, { label, message: providerFailure.message });
+  if (providerFailure) return providerFailureSentence(label, providerFailure, copy);
   if (refusal) {
     const reason =
       (copy.refusalReason as Partial<Record<string, string>>)[refusal] ?? copy.refusalReasonOther;

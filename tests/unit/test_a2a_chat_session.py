@@ -134,7 +134,7 @@ async def test_a_chat_writers_call_is_done_by_the_artist(tmp_path: Path) -> None
     """Acceptance (#1659): the call is dispatched and executed, not left as a promise --
     the Artist's own tool runs once and the file comes back in the Writer's tool result.
 
-    Killed by: src/uclone_x/agent/clone_builder.py :: personas=persona.a2a_peers,
+    Killed by: src/uclone_x/agent/clone_builder.py :: personas=peer_handles(persona.a2a_peers),
     Becomes: personas=(),
     """
     llm = _ByOfferedTool()
@@ -158,11 +158,13 @@ def test_clone_may_ask_every_other_built_in_persona() -> None:
     persona, so a persona added later without a line there is caught here."""
     from uclone_x.agent.persona_registry import PersonaRegistry
 
-    builtin = {p.name for p in PersonaRegistry(include_defaults=True).list_personas()}
-    clone = PersonaRegistry(include_defaults=True).get_persona("clone")
+    registry = PersonaRegistry(include_defaults=True)
+    builtin = {p.name for p in registry.list_personas()}
+    clone = registry.get_persona("clone")
 
     assert clone is not None
-    assert set(clone.a2a_peers) == builtin - {"clone"}
+    # Stored by id since 2026-09-27 (clone-data-scopes §3.8 step 2b); read back by handle.
+    assert {registry.handle_for(peer) for peer in clone.a2a_peers} == builtin - {"clone"}
 
 
 @pytest.mark.asyncio
@@ -217,8 +219,8 @@ async def test_a_chat_writers_callee_refuses_an_approval_call_at_once(
     """The Artist a chat Writer calls is built from the desktop's host, which says nobody
     answers an approval request (owner decision 2026-09-26), so it refuses at once.
 
-    Killed by: src/uclone_x/ui/app.py :: scope, live_host=lambda: dataclasses.replace(scope.host, llm=self._llm or llm)
-    Becomes: scope, live_host=lambda: dataclasses.replace(scope.host, llm=self._llm or llm, approvals_answered=True)
+    Killed by: src/uclone_x/ui/app.py :: scope, live_host=lambda: dataclasses.replace(scope.host, llm=default_llm())
+    Becomes: scope, live_host=lambda: dataclasses.replace(scope.host, llm=default_llm(), approvals_answered=True)
     """
     from uclone_x.room.a2a_handlers import PersonaTaskHandler
 

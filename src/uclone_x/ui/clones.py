@@ -29,11 +29,12 @@ the name stays taken either way.
 
 from __future__ import annotations
 
+from collections.abc import Callable, Iterable
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from pydantic import BaseModel, ConfigDict
 
 from uclone_x.core.agent_home import (
@@ -48,7 +49,15 @@ if TYPE_CHECKING:  # pragma: no cover - import cycle; the app imports this modul
     from uclone_x.ui.app import AgentSessionManager
     from uclone_x.ui.rooms import RoomStack
 
-__all__ = ["CloneListing", "CloneRootState", "CloneStatus", "CloneSummary", "register_clone_routes"]
+__all__ = [
+    "CloneCatalog",
+    "CloneListing",
+    "CloneRootState",
+    "CloneStatus",
+    "CloneSummary",
+    "merged_listing",
+    "register_clone_routes",
+]
 
 
 class CloneStatus(StrEnum):
@@ -191,6 +200,17 @@ def _damage_reason(entry: AgentHomeEntry) -> str:
             f"replacement is not invented -- restore the file, or remove the clone and "
             f"set it up again."
         )
+    if entry.fault is AgentHomeFault.UNREADABLE_CLONE_FILE:
+        return (
+            "This clone cannot be started: its settings file is missing or could not be "
+            "read, so it has no name to be called by. Restore the file from a backup, or "
+            "remove the clone and set it up again."
+        )
+    if entry.fault is AgentHomeFault.DUPLICATE_HANDLE:
+        return (
+            f"This clone cannot be started: another clone is also called "
+            f"'{entry.username}', so that name reaches neither of them. Rename one of them."
+        )
     # `UNREADABLE_ID`, and the `None` that `state is UNREADABLE` makes unreachable. Left
     # as the fallback rather than a raise so that every branch here is one a test reaches.
     return (
@@ -208,7 +228,9 @@ def _clone_from_home(entry: AgentHomeEntry, running: frozenset[str]) -> CloneSum
             status=CloneStatus.UNREADABLE,
             reason=_damage_reason(entry),
         )
-    if entry.username in running:
+    # Seats are keyed by clone id (clone-data-scopes §4 step 3); a seat of a name that is no
+    # clone is keyed by that name, which is why both are looked for.
+    if entry.agent_id in running or entry.username in running:
         return CloneSummary(
             name=entry.username,
             id=entry.agent_id,
@@ -251,7 +273,12 @@ def _running_clone_names(session_mgr: AgentSessionManager, room_stack: RoomStack
     return room_stack.seated_agent_ids()
 
 
-def clone_listing(session_mgr: AgentSessionManager, room_stack: RoomStack) -> CloneListing:
+def clone_listing(
+    session_mgr: AgentSessionManager,
+    room_stack: RoomStack,
+    *,
+    unhomed: Iterable[str] = (),
+) -> CloneListing:
     """Every installed clone, with the running ones marked as running.
 
     Public, and separate from the route, because the join is the part worth a test of its
@@ -261,12 +288,33 @@ def clone_listing(session_mgr: AgentSessionManager, room_stack: RoomStack) -> Cl
     `room_stack` is required rather than optional. It is the seat the default path uses,
     so a caller allowed to omit it would get a listing that is wrong in exactly the
     ordinary case, and silently.
+
+    `unhomed` names clones the persona catalog holds with no folder behind them (one
+    registered while the app runs). Each is a row, counted by the sentence above the list.
     """
     listing = list_agent_homes()
     running = _running_clone_names(session_mgr, room_stack)
-    on_disk = frozenset(entry.username for entry in listing.homes)
+    on_disk = frozenset(entry.username for entry in listing.homes) | frozenset(
+        entry.agent_id for entry in listing.homes if entry.agent_id is not None
+    )
 
     clones = [_clone_from_home(entry, running) for entry in listing.homes]
+    for name in unhomed:
+        if name in on_disk:
+            continue
+        clones.append(
+            CloneSummary(
+                name=name,
+                # Addressed by its handle: it has no directory, so it was never given an id.
+                id=name,
+                status=CloneStatus.LIVE if name in running else CloneStatus.DORMANT,
+                reason=(
+                    "Defined only while this app runs, with no files of its own. Nothing "
+                    "it learns will be kept after it stops."
+                ),
+            )
+        )
+    on_disk |= frozenset(unhomed)
     # A clone the user is talking to must not be missing from the list of clones. The
     # home is minted on bring-up, so this is the case where it was removed underneath a
     # running instance -- rare, and silent in a listing that reported only the disk.
@@ -292,10 +340,50 @@ def clone_listing(session_mgr: AgentSessionManager, room_stack: RoomStack) -> Cl
     )
 
 
+#: The persona side of a clone entry, as the head's persona payload writes it: a list of
+#: entries each carrying `id` and `handle`, and the fields that go beside the list (the
+#: tools an editor offers, where a save lands).
+CloneCatalog = tuple[list[dict[str, Any]], dict[str, Any]]
+
+
+def merged_listing(listing: CloneListing, entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Each row of `listing` with its persona entry's fields beside its status.
+
+    `/api/clones` is the one clone resource (clone-data-scopes §3.7): every row carries
+    `id`, `handle` and `display_name`, and the persona fields where the clone has a
+    readable definition. A row joins its entry by id, else by handle; an unreadable row
+    joins none, since its definition is exactly what could not be read.
+    """
+    by_id = {str(entry["id"]): entry for entry in entries}
+    by_handle = {str(entry["handle"]): entry for entry in entries}
+    rows: list[dict[str, Any]] = []
+    for clone in listing.clones:
+        row: dict[str, Any] = {"handle": clone.name, "display_name": {}}
+        entry = None
+        if clone.status is not CloneStatus.UNREADABLE:
+            entry = by_id.get(clone.id) if clone.id is not None else None
+            entry = entry if entry is not None else by_handle.get(clone.name)
+        if entry is not None:
+            row.update(entry)
+        # The row's own facts win: they are what the disk held when it was listed, and the
+        # sentence above the list was written from them.
+        row.update(name=clone.name, id=clone.id, status=clone.status.value, reason=clone.reason)
+        rows.append(row)
+    return rows
+
+
 def register_clone_routes(
-    app: FastAPI, session_mgr: AgentSessionManager, room_stack: RoomStack
+    app: FastAPI,
+    session_mgr: AgentSessionManager,
+    room_stack: RoomStack,
+    catalog: Callable[[], CloneCatalog] | None = None,
+    *,
+    refuse_cross_origin: Callable[[Request], None],
 ) -> None:
     """Mount `GET /api/clones` on `app`.
+
+    With a `catalog`, each row also carries the clone's persona fields and the answer the
+    catalog's extra fields, which is what the head reads; without one, the bare listing.
 
     Answers 200 for every state it can describe, including the ones that hold no clones:
     a root that cannot be read is a fact about the installation, not a failure of the
@@ -305,6 +393,26 @@ def register_clone_routes(
     """
 
     @app.get("/api/clones")
-    async def list_clones() -> CloneListing:  # pyright: ignore[reportUnusedFunction]
-        """List the clones installed here, running or not."""
-        return clone_listing(session_mgr, room_stack)
+    async def list_clones(request: Request) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
+        """List the clones installed here, running or not, with what each is."""
+        refuse_cross_origin(request)  # another site must not list clones (#2146)
+        if catalog is None:
+            return clone_listing(session_mgr, room_stack).model_dump(mode="json")
+        # The disk is read before the catalog: loading the catalog installs and migrates
+        # clones (clone-data-scopes §3.8), and the listing reports what it found, not what
+        # its own read made.
+        listing = clone_listing(session_mgr, room_stack)
+        entries, extras = catalog()
+        unhomed = [str(entry["handle"]) for entry in entries if entry["id"] == entry["handle"]]
+        if unhomed:
+            listing = clone_listing(session_mgr, room_stack, unhomed=unhomed)
+        rows = merged_listing(listing, entries)
+        return {
+            **extras,
+            "status": "ok",
+            "clones": rows,
+            "count": len(rows),
+            "root": listing.root,
+            "root_state": listing.root_state.value,
+            "reason": listing.reason,
+        }

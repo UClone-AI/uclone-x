@@ -537,7 +537,7 @@ def test_the_provenance_sweep_detects_each_defaulting_shape(source: str) -> None
 def test_the_sweep_s_known_blind_spots_are_recorded_not_claimed(source: str) -> None:
     """Pins what the sweep does **not** catch, so the gap cannot be quietly assumed away.
 
-    A syntactic sweep can never be complete, and `docs/a2a-protocol-spec.md` briefly
+    A syntactic sweep can never be complete, and the A2A protocol specification briefly
     claimed it caught the defect "in any of its syntactic forms" — false, and false in
     the one place a future reader checks instead of testing (#157 review). The remedy is
     not a wider claim but a recorded boundary.

@@ -1,13 +1,16 @@
 name: scout
+display_name:
+  en: Scout
+  ko: 탐색가
 role: Research & Search Specialist
 description: Neutral, fact-focused research specialist and intelligence gatherer.
 allowed_tools:
-  - set_avatar
   - web_search
   - web_fetch
   - file_read
   - file_search
   - directory_list
+  - browser
 enable_write_tools: false
 enable_subagent_tools: false
 append_default_prompt: true

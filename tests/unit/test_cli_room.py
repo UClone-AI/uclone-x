@@ -12,12 +12,14 @@ and renders what came back.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any, cast
 
 import pytest
 from typer.testing import CliRunner
 
+from tests.support.clones import make_clones
 from uclone_x.cli.commands import room as room_cmd
 from uclone_x.room.models import ParticipantKind, RoomMessageKind, RoomState
 from uclone_x.room.store import RoomStore
@@ -169,6 +171,7 @@ class TestShowMakesTheRecordedOutcomesVisible:
             RoomMessage(
                 seq=2,
                 sender_id="scout",
+                turn_id="t1",
                 content="TTL is simplest",
                 provenance=_provenance("claude-3-haiku", requested="claude-3-opus"),
             ),
@@ -190,6 +193,7 @@ class TestShowMakesTheRecordedOutcomesVisible:
             RoomMessage(
                 seq=2,
                 sender_id="scout",
+                turn_id="t2",
                 content="TTL is simplest",
                 decision=SpeakerDecision(
                     verdict=SelectionVerdict.SPEAK,
@@ -251,7 +255,9 @@ class TestShowMakesTheRecordedOutcomesVisible:
             rooms,
             "room_fail",
             RoomMessage(seq=1, sender_id="alice", content="caching?"),
-            RoomMessage(seq=2, sender_id="scout", content="", error="RuntimeError: boom"),
+            RoomMessage(
+                seq=2, sender_id="scout", turn_id="t3", content="", error="RuntimeError: boom"
+            ),
         )
 
         result = _run("show", "room_fail")
@@ -287,6 +293,7 @@ class TestShowMakesTheRecordedOutcomesVisible:
             RoomMessage(
                 seq=2,
                 sender_id="scout",
+                turn_id="t4",
                 content="",
                 error=str(ModelLacksToolSupportError("deepseek-r1:14b")),
                 refusal=RoomTurnRefusal.MODEL_WITHOUT_TOOLS,
@@ -323,6 +330,7 @@ class TestShowMakesTheRecordedOutcomesVisible:
             RoomMessage(
                 seq=2,
                 sender_id="scout",
+                turn_id="t5",
                 content="",
                 error=str(ModelNotAvailableError(provider="Google", model="gemini-1.5-pro")),
                 refusal=RoomTurnRefusal.MODEL_UNAVAILABLE,
@@ -362,6 +370,7 @@ class TestShowMakesTheRecordedOutcomesVisible:
             RoomMessage(
                 seq=2,
                 sender_id="scout",
+                turn_id="t6",
                 content="",
                 error=str(exc),
                 refusal=RoomTurnRefusal.PROVIDER_AUTH,
@@ -373,7 +382,7 @@ class TestShowMakesTheRecordedOutcomesVisible:
 
         assert result.exit_code == 0, result.output
         output = " ".join(result.output.split())
-        assert "Anthropic did not accept the API key." in output
+        assert "Anthropic didn't accept the API key." in output  # the app's words (#2167)
         assert "Save a new key with `ucx key set anthropic`." in output
         assert "ucx room retry" not in output
 
@@ -397,6 +406,7 @@ class TestShowMakesTheRecordedOutcomesVisible:
             RoomMessage(
                 seq=2,
                 sender_id="scout",
+                turn_id="t7",
                 content="",
                 error=str(exc),
                 provider_failure=ProviderFailure.of(exc),
@@ -409,6 +419,71 @@ class TestShowMakesTheRecordedOutcomesVisible:
         output = " ".join(result.output.split())
         assert "If you set a custom endpoint, check that address too." in output
         assert "retry that turn with: ucx room retry room_pu" in output
+
+    def test_showing_a_failure_does_not_import_the_turn_runner(self, tmp_path: Path) -> None:
+        """`ucx room show` prints a stored failure's remedy without loading `ucx run` (#1648).
+
+        The remedies used to live in `cli/commands/run.py`, so naming one imported the turn
+        runner and with it the tool registry, telemetry and the sandbox -- to print a line.
+        Measured in a fresh interpreter, because this process has long since imported `run`.
+
+        Killed by: src/uclone_x/cli/commands/room.py :: from uclone_x.cli.remedies import PROVIDER_FAILURE_REMEDIES, provider_key_remedy
+        Becomes: from uclone_x.cli.commands.run import PROVIDER_FAILURE_REMEDIES, provider_key_remedy
+        """
+        import subprocess
+        import sys
+
+        script = """
+import sys
+from pathlib import Path
+from typer.testing import CliRunner
+from uclone_x.agent.models import ProviderFailure
+from uclone_x.cli.commands import room as room_cmd
+from uclone_x.errors import ProviderAuthError
+from uclone_x.room.models import (
+    Participant, ParticipantKind, RoomMessage, RoomState, RoomTurnRefusal,
+)
+from uclone_x.room.store import RoomStore
+
+exc = ProviderAuthError(provider="Anthropic", model="claude-sonnet-4-5")
+RoomStore(Path(sys.argv[1])).save(RoomState(
+    room_id="room_pa",
+    title="Cache strategy",
+    participants=(
+        Participant(id="alice", kind=ParticipantKind.HUMAN, display_name="Alice"),
+        Participant(id="scout", kind=ParticipantKind.AGENT, display_name="Scout"),
+    ),
+    transcript=(
+        RoomMessage(seq=1, sender_id="alice", content="caching?"),
+        RoomMessage(seq=2, sender_id="scout", turn_id="t_pa", content="", error=str(exc),
+                    refusal=RoomTurnRefusal.PROVIDER_AUTH,
+                    provider_failure=ProviderFailure.of(exc)),
+    ),
+))
+result = CliRunner().invoke(room_cmd.room_app, ["show", "room_pa"])
+print(" ".join(result.output.split()))
+print("RUN-IMPORTED" if "uclone_x.cli.commands.run" in sys.modules else "RUN-ABSENT")
+"""
+        from uclone_x.cli.environment_provenance import repo_subprocess_env
+
+        repo_root = Path(__file__).resolve().parents[2]
+        env = repo_subprocess_env(
+            repo_root,
+            base={k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"},
+        )
+        env["UCLONE_ROOM_DIR"] = str(tmp_path / "rooms")
+        done = subprocess.run(
+            [sys.executable, "-c", script, str(tmp_path / "rooms")],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120,
+            check=False,
+        )
+
+        assert done.returncode == 0, done.stderr[-2000:]
+        assert "Save a new key with `ucx key set anthropic`." in done.stdout
+        assert done.stdout.rstrip().endswith("RUN-ABSENT"), done.stdout[-500:]
 
     def test_a_spent_budget_is_offered_no_retry(self, rooms: RoomStore) -> None:
         """A retry of a turn refused for its usage budget is refused the same way.
@@ -425,6 +500,7 @@ class TestShowMakesTheRecordedOutcomesVisible:
             RoomMessage(
                 seq=2,
                 sender_id="scout",
+                turn_id="t8",
                 content="",
                 error="The usage limit for this clone is spent.",
                 refusal=RoomTurnRefusal.BUDGET_EXCEEDED,
@@ -444,7 +520,7 @@ class TestShowMakesTheRecordedOutcomesVisible:
             rooms,
             "room_ok",
             RoomMessage(seq=1, sender_id="alice", content="caching?"),
-            RoomMessage(seq=2, sender_id="scout", content="TTL is simplest"),
+            RoomMessage(seq=2, sender_id="scout", turn_id="t9", content="TTL is simplest"),
         )
 
         result = _run("show", "room_ok")
@@ -475,7 +551,9 @@ class TestAFailedRowIsShownInPlainWords:
         from uclone_x.room.models import RoomMessage
 
         rows = json.loads(_FAILED_ROWS.read_text(encoding="utf-8"))["rows"]
-        return RoomMessage.model_validate_json(json.dumps(rows[name]))
+        row = RoomMessage.model_validate_json(json.dumps(rows[name]))
+        # The fixture keeps the fields the copy reads; a stored agent row also has its id.
+        return row.model_copy(update={"turn_id": f"t{row.seq}"})
 
     @pytest.mark.parametrize(
         ("name", "sentence"),
@@ -495,6 +573,12 @@ class TestAFailedRowIsShownInPlainWords:
                 "scout couldn't finish this turn: it has used all the tokens this conversation "
                 "allows.",
             ),
+            (
+                "persona_edit",
+                "scout couldn't apply the changes saved to it, so it didn't answer. It kept its "
+                "previous settings in this conversation. To use the changes here, save the "
+                "clone again, then send your message again.",
+            ),
         ],
     )
     def test_a_real_failure_reads_as_the_app_reads_it_and_leaks_nothing(
@@ -502,8 +586,14 @@ class TestAFailedRowIsShownInPlainWords:
     ) -> None:
         """The raw cause is replaced by the app's sentence, and nothing of it is left.
 
+        The dropped persona edit's row (#1904) is held to the same: its `error` is the Core's
+        fixed sentence, and the terminal still says the app's words, not that.
+
         Killed by: src/uclone_x/cli/commands/room.py :: f"[red]{escape(turn_failure_sentence(message))}[/red]"
         Becomes: f"[red]turn failed: {escape(message.error)}[/red]"
+
+        Killed by: src/uclone_x/cli/commands/room.py :: if message.persona_edit_dropped:
+        Becomes: if False:
         """
         from uclone_x.room.models import RoomMessage
 
@@ -517,7 +607,17 @@ class TestAFailedRowIsShownInPlainWords:
         output = " ".join(result.output.split())
         assert sentence in output
         assert row.error not in output
-        for internal in ("/home/reader", ".uclone", "Errno", "Error", "turn failed", "0/0"):
+        for internal in (
+            "/home/reader",
+            ".uclone",
+            "Errno",
+            "Error",
+            "turn failed",
+            "0/0",
+            "persona_edit",
+            "definition",
+            "epoch",
+        ):
             assert internal not in output, internal
 
     def test_a_stopped_turn_says_it_was_stopped(self) -> None:
@@ -528,7 +628,9 @@ class TestAFailedRowIsShownInPlainWords:
         """
         from uclone_x.room.models import RoomMessage
 
-        row = RoomMessage(seq=2, sender_id="scout", content="", error="cancelled", completed=False)
+        row = RoomMessage(
+            seq=2, sender_id="scout", turn_id="t10", content="", error="cancelled", completed=False
+        )
 
         assert room_cmd.turn_failure_sentence(row) == (
             "scout was stopped before finishing this turn."
@@ -539,11 +641,14 @@ class TestAFailedRowIsShownInPlainWords:
 
         Read from the app's locale file rather than restated: a copy edit there fails here
         until the terminal says the same.
+
+        Killed by: src/uclone_x/cli/commands/room.py :: return _provider_failure_sentence(label, message.provider_failure)
+        Becomes: return f"{label} couldn't finish this turn. {message.provider_failure.message}"
         """
         import json
 
         from uclone_x.agent.models import ProviderFailure
-        from uclone_x.errors import ProviderAuthError
+        from uclone_x.errors import ProviderAuthError, ProviderFailureKind
         from uclone_x.room.models import RoomMessage, RoomTurnRefusal
 
         copy = json.loads(_EN_CONVERSATION.read_text(encoding="utf-8"))
@@ -568,22 +673,73 @@ class TestAFailedRowIsShownInPlainWords:
             return template
 
         for refusal in RoomTurnRefusal:
-            row = RoomMessage(seq=2, sender_id="scout", content="", error="raw", refusal=refusal)
+            row = RoomMessage(
+                seq=2, sender_id="scout", turn_id="t11", content="", error="raw", refusal=refusal
+            )
             reason = outcome["refusalReason"].get(refusal.value, outcome["refusalReasonOther"])
             assert room_cmd.turn_failure_sentence(row) == fill(
                 outcome["refused"], label="scout", reason=reason
             ), refusal
         failure = ProviderFailure.of(ProviderAuthError(provider="Anthropic", model="m"))
         row = RoomMessage(
-            seq=2, sender_id="scout", content="", error="raw", provider_failure=failure
+            seq=2,
+            sender_id="scout",
+            turn_id="t12",
+            content="",
+            error="raw",
+            provider_failure=failure,
         )
+        # Built from the failure's kind and provider, as the app builds it (#2167).
+        cause = fill(outcome["providerCause"]["provider_auth"], provider="Anthropic")
         assert room_cmd.turn_failure_sentence(row) == fill(
-            outcome["providerFailed"], label="scout", message=failure.message
+            outcome["providerFailed"], label="scout", cause=cause
         )
-        stopped = RoomMessage(seq=2, sender_id="scout", content="", error="x", completed=False)
+        for kind in ProviderFailureKind:
+            assert kind.value in outcome["providerCause"], kind
+            kinded = row.model_copy(
+                update={"provider_failure": failure.model_copy(update={"kind": kind})}
+            )
+            assert room_cmd.turn_failure_sentence(kinded) == fill(
+                outcome["providerFailed"],
+                label="scout",
+                cause=fill(outcome["providerCause"][kind.value], provider="Anthropic"),
+            ), kind
+        own = row.model_copy(
+            update={
+                "provider_failure": failure.model_copy(
+                    update={
+                        "kind": ProviderFailureKind.PROVIDER_UNREACHABLE,
+                        "provider": None,
+                        "clone": "scout",
+                        "model_ref": "gpu-box/qwen3:14b",
+                        "action": "use_system_default",
+                    }
+                )
+            }
+        )
+        assert room_cmd.turn_failure_sentence(own) == fill(
+            outcome["ownModelFailed"],
+            label="scout",
+            model="qwen3:14b",
+            cause=fill(outcome["providerCause"]["provider_unreachable"], provider="gpu-box"),
+        )
+        stopped = RoomMessage(
+            seq=2, sender_id="scout", turn_id="t13", content="", error="x", completed=False
+        )
         assert room_cmd.turn_failure_sentence(stopped) == fill(outcome["stopped"], label="scout")
-        wrong = RoomMessage(seq=2, sender_id="scout", content="", error="x")
+        wrong = RoomMessage(seq=2, sender_id="scout", turn_id="t14", content="", error="x")
         assert room_cmd.turn_failure_sentence(wrong) == fill(outcome["wentWrong"], label="scout")
+        dropped = RoomMessage(
+            seq=2,
+            sender_id="scout",
+            turn_id="t15",
+            content="",
+            error="x",
+            persona_edit_dropped=True,
+        )
+        assert room_cmd.turn_failure_sentence(dropped) == " ".join(
+            (fill(outcome["personaEditDropped"], label="scout"), outcome["personaEditRemedy"])
+        )
 
 
 class TestRetryCommand:
@@ -601,7 +757,9 @@ class TestRetryCommand:
             rooms,
             "room_r",
             RoomMessage(seq=1, sender_id="alice", content="caching?"),
-            RoomMessage(seq=2, sender_id="scout", content="", error="RuntimeError: boom"),
+            RoomMessage(
+                seq=2, sender_id="scout", turn_id="t16", content="", error="RuntimeError: boom"
+            ),
         )
         retried: list[str] = []
 
@@ -613,7 +771,9 @@ class TestRetryCommand:
                     update={
                         "transcript": (
                             *state.transcript,
-                            RoomMessage(seq=3, sender_id="scout", content="TTL is simplest"),
+                            RoomMessage(
+                                seq=3, sender_id="scout", turn_id="t17", content="TTL is simplest"
+                            ),
                         )
                     }
                 )
@@ -693,12 +853,17 @@ class TestAHeadRoomIsNotRearrangedHere:
 
     @staticmethod
     def _head_room(rooms: RoomStore, room_id: str) -> RoomState:
+        from uclone_x.agent.persona_registry import get_default_persona_registry
+        from uclone_x.core.agent_home import seat_id_for
         from uclone_x.room.one_seat import HeadTurn, record_head_turn
 
+        # A head seats the clone's id, which `remove`/`responder scout` resolve to (§4 step
+        # 3); the built-in `scout` has a clone once the registry has brought them up (§3.8).
+        get_default_persona_registry()
         return record_head_turn(
             rooms,
             room_id=room_id,
-            clone_id="scout",
+            clone_id=seat_id_for("scout"),
             turn=HeadTurn(prompt="what is in the index?", content="three tables"),
             head="loop",
         )
@@ -718,7 +883,7 @@ class TestAHeadRoomIsNotRearrangedHere:
     ) -> None:
         """Left alone, each command seats, unseats or re-points the head's one-seat room.
 
-        Killed by: src/uclone_x/room/service.py :: head = room_head(state)
+        Killed by: src/uclone_x/room/service.py :: head = state.head
         Becomes: head = None
         """
         room_id = self._head_room(rooms, "room_head_cli").room_id
@@ -762,6 +927,7 @@ class TestSay:
                             RoomMessage(
                                 seq=len(message) + 2,
                                 sender_id="scout",
+                                turn_id="t18",
                                 content="TTL is simplest",
                             ),
                         )
@@ -918,7 +1084,7 @@ class TestRoomCommandsSpeakOfRooms:
         result = _run("show", "")
         assert result.exit_code != 0
         assert "session" not in result.output.lower(), result.output
-        assert "room" in result.output.lower()
+        assert "conversation" in result.output.lower()
 
 
 class TestUserTextIsRenderedNotInterpreted:
@@ -948,7 +1114,7 @@ class TestUserTextIsRenderedNotInterpreted:
             rooms,
             "room_markup",
             RoomMessage(seq=1, sender_id="alice", content="use [/] to close"),
-            RoomMessage(seq=2, sender_id="scout", content="call [bold]now[/bold]"),
+            RoomMessage(seq=2, sender_id="scout", turn_id="t19", content="call [bold]now[/bold]"),
         )
 
         result = _run("show", "room_markup")
@@ -1172,14 +1338,14 @@ class TestTheRoomIsDescribedInItsUsersVocabulary:
     def test_show_traversal_explains_itself_in_room_vocabulary(self, rooms: RoomStore) -> None:
         """`ucx room show 'a/b'` must explain itself in room vocabulary, not session vocabulary.
 
-        Killed by: src/uclone_x/room/store.py :: .replace("session ID", "room id")
-        Becomes:
+        Killed by: src/uclone_x/room/store.py :: "The conversation identifier is not valid: it must not contain path separators."
+        Becomes: "The session ID is not valid: it must not contain path separators."
         """
         result = _run("show", "a/b")
 
         assert result.exit_code == 1
         assert "session" not in result.output.lower()
-        assert "room id" in result.output.lower()
+        assert "conversation identifier" in result.output.lower()
 
 
 class TestTheCliSeatsAgentsWithMemory:
@@ -1202,6 +1368,7 @@ class TestTheCliSeatsAgentsWithMemory:
         from uclone_x.room.store import RoomStore
 
         monkeypatch.setenv(AGENTS_DIR_ENV_VAR, str(tmp_path / "agents"))
+        make_clones("alpha", "beta")
         orchestrator = build_orchestrator(
             store=RoomStore(tmp_path / "rooms"), policy=RoomPolicy(), provider="mock"
         )
@@ -1218,6 +1385,30 @@ class TestTheCliSeatsAgentsWithMemory:
         assert alpha.storage_path != beta.storage_path
         assert alpha.storage_path is not None
         assert str(tmp_path) in str(alpha.storage_path)
+
+    def test_build_orchestrator_gives_orchestrator_a_knowledge_extractor(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """`ucx room` builds the orchestrator with a KnowledgeExtractor (#1841).
+
+        Killed by: src/uclone_x/cli/commands/room.py :: extractor=KnowledgeExtractor() if extractor is None else extractor,
+        Becomes: extractor=extractor,
+        """
+        from uclone_x.cli.commands.room import build_orchestrator
+        from uclone_x.core.agent_home import AGENTS_DIR_ENV_VAR
+        from uclone_x.memory.extractor import KnowledgeExtractor
+        from uclone_x.room.models import RoomPolicy
+        from uclone_x.room.store import RoomStore
+
+        monkeypatch.setenv(AGENTS_DIR_ENV_VAR, str(tmp_path / "agents"))
+        make_clones("alpha")
+        orchestrator = build_orchestrator(
+            store=RoomStore(tmp_path / "rooms"), policy=RoomPolicy(), provider="mock"
+        )
+        assert isinstance(
+            orchestrator._extractor,  # pyright: ignore[reportPrivateUsage, reportAttributeAccessIssue, reportUnknownMemberType]
+            KnowledgeExtractor,
+        )
 
 
 class TestARowSaysAnEarlierConversationWasKept:
@@ -1237,7 +1428,13 @@ class TestARowSaysAnEarlierConversationWasKept:
             room_id="room_kept",
             title="t",
             transcript=(
-                RoomMessage(seq=1, sender_id="scout", content="hi", session_set_aside=set_aside),
+                RoomMessage(
+                    seq=1,
+                    sender_id="scout",
+                    turn_id="t20",
+                    content="hi",
+                    session_set_aside=set_aside,
+                ),
             ),
         )
         room_cmd._render_new_rows(before, after)  # pyright: ignore[reportPrivateUsage]

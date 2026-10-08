@@ -244,7 +244,9 @@ class OntologyEngine:
 
     def __init__(
         self,
-        agent_id: str = "default",
+        # The builtin clone's handle, as every other default agent (clone-data-scopes §3.4);
+        # a clone's own engine is built with its id (`agent.clone_builder.clone_ontology`).
+        agent_id: str = "clone",
         namespace_iri: str = "https://uclone-x.ai/ontology/default",
         version: int = 1,
     ) -> None:

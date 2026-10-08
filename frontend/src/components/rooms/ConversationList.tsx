@@ -95,7 +95,7 @@ interface ConversationListProps {
    * Three-valued, and it has to be: `null` is "the runtime has not answered yet", and
    * collapsing it onto `false` puts "No model is configured" on screen for the moment
    * before the first `/api/models` reply — a wrong cause is worse than no cause. The
-   * signal is `/api/models`'s `current_model`, which is `settings["llm_model"]`. It used
+   * signal is `/api/models`'s `defaults.deep`, the default conversation model. It used
    * to be `agents.length > 0`, which made this condition and `agentCount === 0` the same
    * one, so the no-agents sentence below could never be reached.
    */

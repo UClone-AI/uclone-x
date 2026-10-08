@@ -387,7 +387,7 @@ async def test_long_path_stage_1_plan_tool_persist_compact(tmp_path: Path) -> No
                 "role": "researcher",
                 "goal": "Find XYZ",
                 "prompt": "Search XYZ",
-                "max_turns": 2,
+                "max_steps": 2,
             },
         )
         stage4_llm = MockLLMConnector(
@@ -398,7 +398,7 @@ async def test_long_path_stage_1_plan_tool_persist_compact(tmp_path: Path) -> No
             config=AgentConfig(
                 agent_id="sc_agent_4",
                 name="sc_agent_4",
-                max_turns=10,
+                max_steps=10,
             ),
             bus=bus,
             llm=stage4_llm,
@@ -446,11 +446,10 @@ async def test_long_path_stage_1_plan_tool_persist_compact(tmp_path: Path) -> No
             await stage4_agent.stop()
             stage4_sub.close()
 
-        # Stage 5: Oversized tool output offloaded to sandbox filesystem and recovered
-        from uclone_x.tools.builtin.filesystem import FileReadParams, FileReadTool
+        # Stage 5: Oversized tool output offloaded to the session store and recovered
+        from uclone_x.tools.builtin.filesystem import FileReadTool
 
-        read_tool = FileReadTool()
-        tools.register(read_tool)
+        tools.register(FileReadTool())
 
         stage5_ws = tmp_path / "stage5_ws"
         stage5_ws.mkdir()
@@ -543,17 +542,13 @@ async def test_long_path_stage_1_plan_tool_persist_compact(tmp_path: Path) -> No
             handle = handle_in(tool_msg.content)
             assert handle is not None
 
-            # Read the stored blob back using FileReadTool
-            artifact_rel_path = f".sandbox/tool_artifacts/{stage5_agent.session_id}/{handle}.txt"
-
-            tool_ctx = ToolContext(
-                agent_id=stage5_agent.agent_id,
-                workspace_root=stage5_ws,
-                session_id=stage5_agent.session_id,
-            )
-            read_res = read_tool.run(FileReadParams(path=artifact_rel_path), tool_ctx)
-            assert read_res["content"] == large_output
-            assert "CRITICAL_KEY_#472" in read_res["content"]
+            # The session keeps the whole output as a context body (#1848)
+            bodies = stage5_agent._result_bodies(stage5_agent.session_id)  # pyright: ignore[reportPrivateUsage]
+            stored = bodies.read(handle)
+            assert stored is not None
+            assert stored == large_output
+            assert "CRITICAL_KEY_#472" in stored
+            assert not (stage5_ws / ".sandbox" / "tool_artifacts").exists()
         finally:
             await stage5_agent.stop()
             stage5_sub.close()

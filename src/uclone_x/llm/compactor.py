@@ -4,30 +4,32 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 from collections.abc import Mapping, Sequence
-from pathlib import Path
 
 from uclone_x.core.immutable import unwrap_immutable
 from uclone_x.core.provenance import ExecutionPath, Provenance, ServiceRef
 from uclone_x.core.secrets import redact_credentials
 from uclone_x.core.tool_results import (
+    ResultBodies,
     handle_in,
-    store_tool_result,
     stored_result_stub,
-    stub_tool_result,
 )
-from uclone_x.errors import PathTraversalError, UnmappableChatMessageError
+from uclone_x.errors import UnmappableChatMessageError
 from uclone_x.llm.models import (
+    IMAGE_TOKEN_ESTIMATE,
     ChatMessage,
     CompactionOutcome,
     LedgerSource,
     LLMRequest,
     MessageRole,
+    RenderedFrom,
     ToolCallRequest,
 )
-from uclone_x.llm.protocols import ContextCompactorProtocol, LLMProviderProtocol
-from uclone_x.sandbox.path_validator import PathValidator
+from uclone_x.llm.protocols import (
+    ContextCompactorProtocol,
+    LLMProviderProtocol,
+    request_for_model,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -112,10 +114,14 @@ def _tool_call_tokens(tool_call: ToolCallRequest) -> int:
 
 
 def estimate_message_tokens(messages: Sequence[ChatMessage]) -> int:
-    """Estimate a message sequence: four tokens of framing per message, plus its text."""
+    """Estimate a message sequence: four tokens of framing per message, plus its text.
+
+    An image counts `IMAGE_TOKEN_ESTIMATE` whatever its size: providers price a picture by
+    its pixels, not its bytes, and the figure is the order of one ~1.2 MP screenshot.
+    """
     total = 0
     for msg in messages:
-        total += 4
+        total += 4 + IMAGE_TOKEN_ESTIMATE * len(msg.images)
         if msg.content:
             total += estimate_text_tokens(msg.content)
         if msg.name:
@@ -206,84 +212,6 @@ def _local_provenance(model: str) -> Provenance:
     return Provenance(path=ExecutionPath.PRIMARY, requested=ref, served_by=ref)
 
 
-# Well-known model context window limits in tokens (used for dynamic 70% threshold)
-MODEL_CONTEXT_WINDOWS: dict[str, int] = {
-    # Gemini family (1M ~ 2M)
-    "gemini-1.5-pro": 2_000_000,
-    "gemini-2.0-pro": 2_000_000,
-    "gemini-1.5-flash": 1_000_000,
-    "gemini-2.0-flash": 1_000_000,
-    "gemini": 1_000_000,
-    # Claude family. Current models first (Anthropic's models overview, 2026-09-28): the
-    # lookup below takes the first key contained in the name, so a specific key must sit
-    # above the bare `"claude"` fallback.
-    "claude-fable-5-1": 1_000_000,
-    "claude-opus-5-5": 1_000_000,
-    "claude-sonnet-5": 1_000_000,
-    "claude-haiku-4-5": 200_000,
-    # Legacy but still served (each model's own page, 2026-09-28). A key that is a
-    # substring of another must sit below it: `claude-opus-5` is contained in
-    # `claude-opus-5-5`, and `claude-fable-5` in `claude-fable-5-1`.
-    "claude-fable-5": 1_000_000,
-    "claude-opus-5": 1_000_000,
-    "claude-opus-4-8": 1_000_000,
-    "claude-opus-4-7": 1_000_000,
-    "claude-opus-4-6": 1_000_000,
-    "claude-opus-4-5": 200_000,
-    "claude-sonnet-4-6": 1_000_000,
-    "claude-sonnet-4-5": 200_000,
-    # Retired `claude-3-*` IDs, kept so a saved config naming one still resolves.
-    "claude-3-5-sonnet": 200_000,
-    "claude-3-7-sonnet": 200_000,
-    "claude-3-opus": 200_000,
-    "claude-3-haiku": 200_000,
-    "claude": 200_000,
-    # OpenAI family (128K)
-    "gpt-4o": 128_000,
-    "gpt-4o-mini": 128_000,
-    "gpt-4-turbo": 128_000,
-    "gpt-4": 8_192,
-    "gpt-3.5-turbo": 16_385,
-    "o1": 200_000,
-    "o3-mini": 200_000,
-    # Qwen family (32K ~ 128K)
-    "qwen2.5": 128_000,
-    "qwen2.5-coder": 128_000,
-    "qwen": 32_768,
-    # Llama family
-    "llama3": 128_000,
-    "llama3.1": 128_000,
-    "llama3.2": 128_000,
-    "llama3.3": 128_000,
-    "llama": 8_192,
-}
-
-
-def resolve_model_context_limit(model_name: str | None) -> int | None:
-    """Resolve the maximum context window tokens for a known model name.
-
-    Returns the token count if recognized, otherwise `None`.
-    """
-    if not model_name:
-        return None
-    name = model_name.strip().lower()
-    if "/" in name:
-        name = name.split("/")[-1]
-    if ":" in name:
-        if name in MODEL_CONTEXT_WINDOWS:
-            return MODEL_CONTEXT_WINDOWS[name]
-        name = name.split(":")[0]
-
-    if name in MODEL_CONTEXT_WINDOWS:
-        return MODEL_CONTEXT_WINDOWS[name]
-
-    for key, limit in MODEL_CONTEXT_WINDOWS.items():
-        if key in name:
-            return limit
-
-    return None
-
-
 # The one reason a ledger currently stops being carried forward. Kept as a reason-keyed
 # mapping rather than a bare counter, following `TelemetryTracer.drop_reasons` (#192):
 # a second cause can be added without changing what a caller reads.
@@ -333,9 +261,7 @@ class ContextCompactor(ContextCompactorProtocol):
         max_tool_output_chars: int = 500,
         summarizer: LLMProviderProtocol | None = None,
         max_ledgers: int = DEFAULT_MAX_LEDGERS,
-        workspace_root: Path | None = None,
-        session_id: str | None = None,
-        artifact_subdir: str = ".sandbox/tool_artifacts",
+        result_bodies: ResultBodies | None = None,
         tool_result_reader: bool = True,
     ) -> None:
         if not (1 <= max_ledgers <= MAX_PERMITTED_LEDGERS):
@@ -350,9 +276,11 @@ class ContextCompactor(ContextCompactorProtocol):
         self.max_tool_output_chars = max_tool_output_chars
         self.summarizer = summarizer
         self.max_ledgers = max_ledgers
-        self.workspace_root = workspace_root.resolve() if workspace_root is not None else None
-        self.session_id = session_id
-        self.artifact_subdir = artifact_subdir
+        # The session's full tool-result bodies (#1848): where a pruned output is kept in
+        # full and a stored result is read back to stub it. The agent sets it per pass
+        # (`CompactionDriver`); without it, an output is truncated and a stored result
+        # is left as it is.
+        self.result_bodies = result_bodies
         # Whether the agent this compactor serves can call `tool_result_read`. The short
         # form of a stored result names that tool, so it is used only when the tool can
         # be called; otherwise the result is pruned like any output (#1422, P6).
@@ -460,54 +388,34 @@ class ContextCompactor(ContextCompactorProtocol):
     def prune_tool_message(self, msg: ChatMessage) -> ChatMessage:
         """Prune or offload long tool output message if it exceeds char limit.
 
-        An excerpt or page of a stored result (#1422) is not offloaded a second time: its
-        full text is already stored, so it drops to a stub -- its handle and the start of
-        the stored text. Only when the handle resolves in this session; otherwise it is
-        pruned like any output. The stub names `tool_result_read` only when the agent can
-        call it.
+        An excerpt or stub of a kept result (#1422) is not offloaded a second time: its
+        full text is already kept, so it drops to a stub -- its handle and the start of
+        the kept text. The handle is the one the message records (`rendered_from`), never
+        one read out of its text (#1848): a page of `tool_result_read` names a handle in
+        its header, but it is a full result, and is pruned like any output. A form whose
+        kept result this session cannot read is left as it is: there is nothing to render
+        a smaller form from, and its text is not a result to keep. The stub names
+        `tool_result_read` only when the agent can call it.
         """
         if msg.role != MessageRole.TOOL or not msg.content:
             return msg
-        artifacts_dir = self._contained_artifacts_dir()
-        if artifacts_dir is not None and self.session_id is not None:
-            stub = stub_tool_result(
-                msg.content,
-                artifacts_dir,
-                self.session_id,
-                keep_chars=self.max_tool_output_chars // 2,
-                readable=self.tool_result_reader,
-            )
-            if stub is not None:
-                if stub == msg.content and msg.form is None:
-                    # A stub written before forms were recorded on messages (#1854): the
-                    # stored body renders to exactly this text, so it is one, and it is
-                    # recorded as one here rather than read as `full` forever (#1866).
-                    return msg.model_copy(update={"form": "stub"})
-                if len(stub) >= len(msg.content):
-                    return msg
-                return ChatMessage(
-                    role=msg.role,
-                    content=stub,
-                    name=msg.name,
-                    tool_call_id=msg.tool_call_id,
-                    tool_calls=msg.tool_calls,
-                    form="stub",
-                )
-        if msg.content.startswith("[Tool Output Offloaded") or msg.content.startswith(
-            "[Tool Output Truncated"
-        ):
+        kept = msg.rendered_from.handle if msg.rendered_from is not None else None
+        if kept is not None:
+            return self._restub_form(msg, kept)
+        if msg.content.startswith("[Tool Output Truncated"):
             return msg
         if len(msg.content) <= self.max_tool_output_chars:
             return msg
 
         head_len = self.max_tool_output_chars // 2
 
-        # Offloading needs a session: the reader looks only in the session's own
-        # directory, so a blob stored for no session could never be read back, and its
-        # stub would name a handle nothing resolves -- and, not recognised as stored, be
-        # offloaded again under a small cap (#1653). Without one it is truncated.
-        if self.workspace_root is not None and self.session_id is not None:
-            return self._offload_tool_message(msg, head_len)
+        # Offloading needs a session: the reader resolves a handle only among the
+        # session's own log entries, so a body kept for no session could never be read
+        # back, and its stub would name a handle nothing resolves -- and, not recognised
+        # as stored, be offloaded again under a small cap (#1653). Without one it is
+        # truncated.
+        if self.result_bodies is not None:
+            return self._offload_tool_message(msg, self.result_bodies, head_len)
 
         redacted_full = redact_credentials(msg.content)
         tail_len = self.max_tool_output_chars // 4
@@ -526,51 +434,48 @@ class ContextCompactor(ContextCompactorProtocol):
             form="excerpt",
         )
 
+    def _restub_form(self, msg: ChatMessage, handle: str) -> ChatMessage:
+        """`msg`, a form of the kept result `handle`, as a stub when that is smaller."""
+        body = None if self.result_bodies is None else self.result_bodies.read(handle)
+        if body is None or msg.content is None:
+            return msg
+        keep = self.max_tool_output_chars // 2
+        stub = stored_result_stub(handle, body, keep_chars=keep, readable=self.tool_result_reader)
+        if len(stub) >= len(msg.content):
+            return msg
+        return ChatMessage(
+            role=msg.role,
+            content=stub,
+            name=msg.name,
+            tool_call_id=msg.tool_call_id,
+            tool_calls=msg.tool_calls,
+            form="stub",
+            rendered_from=RenderedFrom(handle=handle, limit=keep, readable=self.tool_result_reader),
+        )
+
     def _prune_tool_message(self, msg: ChatMessage) -> ChatMessage:
         return self.prune_tool_message(msg)
 
-    def _contained_artifacts_dir(self) -> Path | None:
-        """The artifact directory, resolved inside the workspace; `None` when it is not (P3)."""
-        if self.workspace_root is None:
-            return None
-        try:
-            return PathValidator().resolve_safe_path(
-                Path(self.artifact_subdir), self.workspace_root
-            )
-        except PathTraversalError:
-            return None
+    def _offload_tool_message(
+        self, msg: ChatMessage, bodies: ResultBodies, head_len: int
+    ) -> ChatMessage:
+        """Keep oversized tool output in full in the session and stub it.
 
-    def _offload_tool_message(self, msg: ChatMessage, head_len: int) -> ChatMessage:
-        """Store oversized tool output in the session's result store and stub it.
-
-        The store is the one ingest uses (#1422): the blob is named by its content's
-        handle, so a reused `tool_call_id` cannot overwrite another result, and the stub
-        is the form compaction gives a stored excerpt, naming `tool_result_read` only when
-        the agent can call it (#1640).
+        The body is kept where ingest keeps one (#1422, #1848): an entry of the session's
+        own log named by its content's handle, so a reused `tool_call_id` cannot replace
+        another result. The stub is rendered from that same redacted body, in the form
+        compaction gives a stored excerpt, naming `tool_result_read` only when the agent
+        can call it (#1640).
         """
-        assert self.workspace_root is not None
-        assert self.session_id is not None
         assert msg.content is not None
-
-        session_subdir = self.session_id
-        if any(bad in session_subdir for bad in ("..", "/", "\\", "\x00")):
-            raise PathTraversalError(
-                f"Session ID '{session_subdir}' contains forbidden path traversal sequence"
-            )
-
-        # The sandbox boundary (P3) is checked in two parts. Here, the artifact directory
-        # must resolve inside the workspace. `store_tool_result` then refuses a session
-        # directory or blob that resolves outside that directory, as through a symlink.
-        artifacts_dir = PathValidator().resolve_safe_path(
-            Path(self.artifact_subdir), self.workspace_root
-        )
-        # Redacted before it is hashed or written (#569), inside `store_tool_result`; the
-        # stub's start is taken from the same redacted text.
-        handle = store_tool_result(artifacts_dir, session_subdir, msg.content)
+        # Redacted before it is hashed or kept (#569); the stub's start is taken from the
+        # same redacted text.
+        body = redact_credentials(msg.content)
+        handle = bodies.keep(body, tool_name=msg.name)
         reader_offered = self.tool_result_reader
         stub = stored_result_stub(
             handle,
-            redact_credentials(msg.content),
+            body,
             keep_chars=head_len,
             readable=reader_offered,
         )
@@ -581,6 +486,7 @@ class ContextCompactor(ContextCompactorProtocol):
             tool_call_id=msg.tool_call_id,
             tool_calls=msg.tool_calls,
             form="stub",
+            rendered_from=RenderedFrom(handle=handle, limit=head_len, readable=reader_offered),
         )
 
     def _build_heuristic_ledger(self, middle_messages: Sequence[ChatMessage]) -> str:
@@ -652,17 +558,15 @@ class ContextCompactor(ContextCompactorProtocol):
                         "tool that never ran, under a name indistinguishable from a real "
                         "one (P6, #385)."
                     )
-                handle = handle_in(msg.content)
-                # A record written before #1640 names the file it offloaded to.
-                match = re.search(r"Full output saved to '([^']+)'", msg.content or "")
+                # The kept result a form records; else a page's, whose header names it.
+                handle = (
+                    msg.rendered_from.handle
+                    if msg.rendered_from is not None
+                    else handle_in(msg.content)
+                )
                 if handle is not None:
                     bullets.append(
                         f"• Tool Result (turn {i}, {msg.name}): completed execution (stored result: {handle})"
-                    )
-                elif match:
-                    artifact_path = match.group(1)
-                    bullets.append(
-                        f"• Tool Result (turn {i}, {msg.name}): completed execution (artifact: '{artifact_path}')"
                     )
                 else:
                     bullets.append(f"• Tool Result (turn {i}, {msg.name}): completed execution")
@@ -721,6 +625,8 @@ class ContextCompactor(ContextCompactorProtocol):
             max_tokens=500,
             auto_compact=False,
         )
+        # The turns summarised can hold images the summarizer's model cannot see (#2123).
+        summary_request = await request_for_model(self.summarizer, summary_request)
         response = await self.summarizer.generate(summary_request)
         if response.content:
             return (

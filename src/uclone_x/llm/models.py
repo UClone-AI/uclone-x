@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
 from collections.abc import Sequence
 from enum import StrEnum
-from typing import Literal, Self
+from typing import Final, Literal, Self
 
 from pydantic import (
     BaseModel,
@@ -83,6 +85,114 @@ class ToolCallRequest(BaseModel):
     arguments: ImmutableJsonMapping = Field(default_factory=dict)
 
 
+class RenderedFrom(BaseModel):
+    """What a shortened tool result was rendered from, so it can be rendered again (#1848).
+
+    `handle` names the full, redacted result the session log keeps (`tr_` and 16 hex
+    digits). `limit` is the one size the form was cut to: for an `excerpt`, the cap in
+    UTF-8 bytes (`excerpt_tool_result`'s `cap_bytes`); for a `stub`, the characters of the
+    result's start it keeps (`stored_result_stub`'s `keep_chars`). `readable` says whether
+    the text names `tool_result_read`. With these and the body, the form's text is a pure
+    function (`core/context_state.render_form`), so a rebuild from the log needs no copy of
+    the text as it was shown.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
+
+    handle: str
+    limit: int
+    readable: bool
+
+
+ImageMediaType = Literal["image/png", "image/jpeg", "image/webp", "image/gif"]
+"""The image formats every connector that sends images can send (#2107)."""
+
+IMAGE_TOKEN_ESTIMATE: Final = 1_600
+"""What one image is counted as when a request's tokens are estimated (#2107).
+
+An image is billed by its pixels, not its bytes, so the byte estimator would count a
+screenshot's base64 as a hundred thousand tokens. 1,600 is about what Anthropic bills an
+image at its default size limit (pixels / 750, long edge 1,568), which is the largest of
+the four providers' figures for a screenshot of that size, so the estimate does not run
+low. A point estimate, like the text estimator.
+"""
+
+IMAGE_UNAVAILABLE_NOTE: Final = "[An image was here, but it is no longer available.]"
+"""What a connector sends in place of an image whose bytes this process does not hold.
+
+A message read back from a record keeps each image's digest, not its bytes; the bytes are
+put back from the session's body store (`core/session_log.with_image_data`). When they
+cannot be, the model is told an image was there rather than being sent nothing.
+"""
+
+
+CANNOT_SEE_PICTURES: Final = "This model cannot see pictures"
+"""The words every note uses for a model that does not read images (#2107, #2123)."""
+
+IMAGE_NOT_SEEN_NOTE: Final = f"[An image was here. {CANNOT_SEE_PICTURES}, so it was left out.]"
+"""What a request to a model that does not read images says in place of each image (#2123).
+
+A conversation can move to such a model after an earlier one was shown pictures. The
+stored history keeps its images; only the request sent to this model carries this note
+instead (`request_without_images`), so the provider is not sent input it would refuse.
+"""
+
+
+class ImagePart(BaseModel):
+    """One image a message carries, beside its text (#2107, design `browser-agent.md` §3.2).
+
+    `data` is the image as base64 and is never dumped: a session log body, a saved record
+    and a request record keep the image's `digest` only, and the bytes are kept once, as a
+    body of the session's context body store named by that digest, the way a full tool
+    result is (#1848). In memory a part read back from a record has `data=None` until the
+    bytes are put back; a connector sends `IMAGE_UNAVAILABLE_NOTE` for one that has none.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
+
+    media_type: ImageMediaType
+    digest: str = Field(
+        description="SHA-256 of `data`, 64 lowercase hex characters: the name the bytes are "
+        "kept under in the session's context body store."
+    )
+    data: str | None = Field(
+        default=None,
+        exclude=True,
+        repr=False,
+        description="The image, base64-encoded. Excluded from every dump.",
+    )
+    width: int | None = Field(default=None, description="Pixels, when the producer knows.")
+    height: int | None = Field(default=None, description="Pixels, when the producer knows.")
+
+    @model_validator(mode="after")
+    def _digest_names_data(self) -> Self:
+        if len(self.digest) != 64 or any(c not in "0123456789abcdef" for c in self.digest):
+            raise ValueError("An image's digest is 64 lowercase hex characters (SHA-256).")
+        if self.data is not None and image_digest(self.data) != self.digest:
+            raise ValueError("An image's digest is not the SHA-256 of its data.")
+        return self
+
+    @classmethod
+    def from_bytes(
+        cls,
+        raw: bytes,
+        media_type: ImageMediaType,
+        *,
+        width: int | None = None,
+        height: int | None = None,
+    ) -> ImagePart:
+        """An image part holding `raw`, encoded and named by its digest."""
+        data = base64.b64encode(raw).decode("ascii")
+        return cls(
+            media_type=media_type, digest=image_digest(data), data=data, width=width, height=height
+        )
+
+
+def image_digest(data: str) -> str:
+    """The name an image's base64 `data` is kept under: its SHA-256, as a body is named."""
+    return hashlib.sha256(data.encode("utf-8")).hexdigest()
+
+
 class ChatMessage(BaseModel):
     """Unified message envelope across Gemini, Claude, and OpenAI."""
 
@@ -93,6 +203,15 @@ class ChatMessage(BaseModel):
     name: str | None = None
     tool_call_id: str | None = None
     tool_calls: tuple[ToolCallRequest, ...] = Field(default_factory=tuple)
+    images: tuple[ImagePart, ...] = Field(
+        default_factory=tuple,
+        exclude_if=lambda value: not value,
+        description="Images sent with the text, on a `USER` or `TOOL` message (#2107): a "
+        "tool result's screenshot, say. Each is sent to the model as an image by the "
+        "connectors that can (Anthropic, OpenAI, Gemini, Ollama); a dump keeps each one's "
+        "digest and not its bytes (`ImagePart.data`). Left out of a dump when empty, so a "
+        "message with no images serialises as it did before the field existed.",
+    )
     compaction_ledger: bool = Field(
         default=False,
         description="True on a Session Progress Ledger emitted by `ContextCompactor` "
@@ -122,12 +241,34 @@ class ChatMessage(BaseModel):
         "message.",
     )
 
+    rendered_from: RenderedFrom | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+        description="For a `TOOL` message whose `form` was rendered from a result the "
+        "session log keeps in full: that result's handle and the size it was cut to, set "
+        "where the form is decided (ingest, the step budget, the compactor). The session "
+        "log keeps a form as this record and no text, and every reader renders the text "
+        "from the kept body (#1848). `None` for a whole result; a form with none -- a "
+        "truncation with no session -- is never logged. Left out of a dump when `None`. "
+        "Not sent to a provider.",
+    )
+
     @model_validator(mode="after")
     def _validate_compaction_ledger_role(self) -> Self:
         if self.compaction_ledger and self.role != MessageRole.SYSTEM:
             raise ValueError(
                 "compaction_ledger=True is only meaningful and permitted on MessageRole.SYSTEM "
                 f"messages (got role={self.role.value!r}) (#204)"
+            )
+        if self.rendered_from is not None and self.form is None:
+            raise ValueError(
+                "rendered_from is only meaningful and permitted on a TOOL message that "
+                "carries a form (#1848)"
+            )
+        if self.images and self.role not in (MessageRole.USER, MessageRole.TOOL):
+            raise ValueError(
+                f"images are only permitted on USER and TOOL messages "
+                f"(got role={self.role.value!r}) (#2107)"
             )
         if self.form is not None and self.role != MessageRole.TOOL:
             raise ValueError(
@@ -333,6 +474,26 @@ class LLMRequest(BaseModel):
         "Ollama sends it as `format`. A connector with no faithful mapping raises "
         "`StructuredOutputUnsupportedError` rather than dropping it (P6).",
     )
+
+
+def request_without_images(request: LLMRequest) -> LLMRequest:
+    """`request` with each image replaced by `IMAGE_NOT_SEEN_NOTE` in its message's text (#2123).
+
+    For a model that does not read images. The note follows the message's text, one per
+    image, as a connector adds `IMAGE_UNAVAILABLE_NOTE`; a message that had only images
+    carries only the notes. Messages without images, and `request` itself, are unchanged.
+    """
+    if not any(message.images for message in request.messages):
+        return request
+    messages: list[ChatMessage] = []
+    for message in request.messages:
+        if not message.images:
+            messages.append(message)
+            continue
+        text = [message.content] if message.content else []
+        text.extend(IMAGE_NOT_SEEN_NOTE for _ in message.images)
+        messages.append(message.model_copy(update={"content": "\n\n".join(text), "images": ()}))
+    return request.model_copy(update={"messages": tuple(messages)})
 
 
 class LedgerSource(StrEnum):

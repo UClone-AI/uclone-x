@@ -26,6 +26,7 @@ import logging
 import re
 import time
 from collections.abc import Iterator
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
 
@@ -35,15 +36,28 @@ from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 from tests.support.app_clone import app_clone
+from tests.support.clones import make_clones
+from tests.support.repo import REPO_ROOT
 from uclone_x.agent.base import BaseAgent
+from uclone_x.core.agent_home import seat_id_for
 from uclone_x.llm import MockLLMConnector
 from uclone_x.llm.context_window import OllamaContextWindows
 from uclone_x.llm.models import LLMRequest, ModelResponse, TokenUsage
-from uclone_x.room.models import Participant, ParticipantKind, RoomPolicy, RoomState
+from uclone_x.room.models import Participant, ParticipantKind, RoomLoop, RoomPolicy, RoomState
 from uclone_x.room.service import RoomService
+from uclone_x.room.store import RoomStore, room_storage_dir_under
 from uclone_x.ui import rooms as rooms_module
 from uclone_x.ui.app import create_ui_app
 from uclone_x.ui.rooms import RoomStack, seated_agents
+
+# The seats and agent ids these tests use. Each is a clone now, since a name no clone
+# carries is refused memory rather than given a home (clone-data-scopes §3.4).
+_TEST_CLONES = ("alpha", "beta", "bob", "champion", "critic", "dba")
+
+
+@pytest.fixture(autouse=True)
+def _test_clones() -> None:  # pyright: ignore[reportUnusedFunction]
+    make_clones(*_TEST_CLONES)
 
 
 @pytest.fixture
@@ -101,6 +115,10 @@ def _create(client: TestClient, **kwargs: Any) -> Any:
     return client.post("/api/rooms", json=payload)
 
 
+def _stack(client: TestClient) -> RoomStack:
+    return cast(RoomStack, cast(Any, client.app).state.room_stack)
+
+
 def _wait_for_transcript(client: TestClient, room_id: str, rows: int) -> dict[str, Any]:
     """Poll the room until the cascade has written `rows`, or give up loudly.
 
@@ -115,6 +133,22 @@ def _wait_for_transcript(client: TestClient, room_id: str, rows: int) -> dict[st
             return latest
         time.sleep(0.05)
     raise AssertionError(f"room never reached {rows} rows; last was {latest}")
+
+
+def _wait_for_loop(
+    client: TestClient, room_id: str, *, runs: int, failed: bool = False
+) -> dict[str, Any]:
+    """Poll the room until its saved loop has started `runs` runs (and, if `failed`, has
+    recorded an error), or give up loudly. A run is a background task, like a cascade."""
+    deadline = time.monotonic() + 10.0
+    latest: dict[str, Any] = {}
+    while time.monotonic() < deadline:
+        latest = client.get(f"/api/rooms/{room_id}").json()
+        loop = latest.get("loop")
+        if loop and loop["runs"] >= runs and (not failed or loop.get("last_error")):
+            return loop
+        time.sleep(0.05)
+    raise AssertionError(f"the room's loop never reached {runs} run(s); last was {latest}")
 
 
 def _wait_for_cascade_to_settle(stack: RoomStack, room_id: str) -> None:
@@ -168,12 +202,15 @@ class TestCreateAndList:
 
         assert created.status_code == 201, created.text
         room_id = created.json()["room_id"]
-        assert [p["id"] for p in created.json()["participants"]] == ["user", "scout", "critic"]
+        # A handle is seated by its clone's id (clone-data-scopes §4 step 3).
+        seats = [seat_id_for("scout"), seat_id_for("critic")]
+        assert all(seat.startswith("agt_") for seat in seats)
+        assert [p["id"] for p in created.json()["participants"]] == ["user", *seats]
 
         listed = client.get("/api/rooms").json()["rooms"]
         assert [r["room_id"] for r in listed] == [room_id]
         assert listed[0]["title"] == "Index tuning"
-        assert listed[0]["agent_ids"] == ["scout", "critic"]
+        assert listed[0]["agent_ids"] == seats
         assert listed[0]["human_ids"] == ["user"]
 
     def test_a_room_that_cannot_be_seated_is_not_left_behind(self, client: TestClient) -> None:
@@ -311,7 +348,7 @@ class TestARoomWhoseRecordWillNotLoad:
     ) -> None:
         """Killed by: src/uclone_x/ui/rooms.py :: if isinstance(exc, UnreadableRoomRecordError):
         Becomes: if False:
-        Killed by: src/uclone_x/room/store.py :: raise UnreadableRoomRecordError(room_id) from exc
+        Killed by: src/uclone_x/room/store.py :: raise UnreadableRoomRecordError(room_id) from rewritten
         Becomes: raise
         """
         room_id, room_file = self._break(answering_client, how)
@@ -404,7 +441,11 @@ class TestParticipants:
         added = client.post(f"/api/rooms/{room_id}/participants", json={"agent_id": "dba"})
 
         assert added.status_code == 200, added.text
-        assert [p["id"] for p in added.json()["participants"]] == ["user", "scout", "dba"]
+        assert [p["id"] for p in added.json()["participants"]] == [
+            "user",
+            seat_id_for("scout"),
+            seat_id_for("dba"),
+        ]
 
     def test_a_second_human_is_refused_and_says_why(self, client: TestClient) -> None:
         room_id = _create(client).json()["room_id"]
@@ -419,10 +460,11 @@ class TestParticipants:
     def test_an_agent_can_leave(self, client: TestClient) -> None:
         room_id = _create(client, agent_ids=["scout", "critic"]).json()["room_id"]
 
+        # By handle: the route resolves it to the seat, which is keyed by the clone's id.
         left = client.delete(f"/api/rooms/{room_id}/participants/critic")
 
         assert left.status_code == 200, left.text
-        assert [p["id"] for p in left.json()["participants"]] == ["user", "scout"]
+        assert [p["id"] for p in left.json()["participants"]] == ["user", seat_id_for("scout")]
 
 
 class TestSending:
@@ -441,12 +483,8 @@ class TestSending:
         assert sent.json() == {"room_id": room_id, "seq": 3}
 
         landed = _wait_for_transcript(client, room_id, rows=4)
-        assert [m["sender_id"] for m in landed["transcript"]] == [
-            "user",
-            "scout",
-            "user",
-            "scout",
-        ]
+        scout = seat_id_for("scout")
+        assert [m["sender_id"] for m in landed["transcript"]] == ["user", scout, "user", scout]
         assert landed["transcript"][3]["content"]
 
     def test_the_human_utterance_is_recorded_before_the_route_answers(
@@ -566,7 +604,7 @@ class TestStopAndTypingDoSomething:
     """
 
     def test_stop_signals_the_interrupt_the_room_will_read(self, client: TestClient) -> None:
-        """Killed by: src/uclone_x/ui/rooms.py :: await stack.orchestrator(state).interrupt(room_id)
+        """Killed by: src/uclone_x/ui/rooms.py :: await self.orchestrator(state).interrupt(room_id)
         Becomes: pass
         """
         room_id = _create(client).json()["room_id"]
@@ -578,6 +616,11 @@ class TestStopAndTypingDoSomething:
         assert room_id in orch._interrupted_rooms, (  # noqa: SLF001
             "Stop answered 200 without signalling anything the turn loop reads"
         )
+
+    def test_stop_refuses_invalid_room_id_with_400(self, answering_client: TestClient) -> None:
+        """POST /api/rooms/bad..id/stop returns 400 (bad request), not 500 (#1996)."""
+        refused = answering_client.post("/api/rooms/bad..id/stop")
+        assert refused.status_code == 400
 
     def test_typing_advances_the_activity_mark_a_hesitating_room_reads(
         self, client: TestClient
@@ -610,6 +653,26 @@ class TestRetryAndDelete:
 
         assert client.get("/api/rooms").json()["rooms"] == []
         assert client.get(f"/api/rooms/{room_id}").status_code == 404
+
+    def test_deleting_a_room_removes_seat_sessions_from_session_store(
+        self, client: TestClient
+    ) -> None:
+        from uclone_x.agent.session import SessionState
+
+        created = _create(client, agent_ids=["scout"]).json()
+        room_id = created["room_id"]
+        agent_participant = next(p for p in created["participants"] if p["kind"] == "agent")
+        seat_session_id = agent_participant["session_id"]
+
+        stack = _stack(client)
+        core_store = stack._session_mgr.core_store  # pyright: ignore[reportPrivateUsage]
+        core_store.save(SessionState(session_id=seat_session_id, agent_id=agent_participant["id"]))
+        session_file = core_store.session_path(seat_session_id)
+        assert session_file.exists()
+
+        res = client.delete(f"/api/rooms/{room_id}")
+        assert res.status_code == 204, res.text
+        assert not session_file.exists()
 
 
 class TestTheHeadDoesNotSubstituteValuesTheCoreWouldRefuse:
@@ -769,7 +832,7 @@ class TestACascadeFailureIsAnnouncedWithoutLeaking:
                     storage_dir=tmp_path,
                     workspace_dir=tmp_path / "workspace",
                     bus=DownBus(),
-                    on_llm_replaced=ignore_llm,
+                    on_models_changed=ignore_llm,
                 ),
             )
         )
@@ -788,6 +851,110 @@ class TestACascadeFailureIsAnnouncedWithoutLeaking:
             (r.levelname, r.getMessage()) for r in lost
         ]
         assert lost[0].exc_info is not None, "the reason the notice was lost must be logged too"
+
+
+class TestTheCoreRefusalSentenceBelongsToTheReader:
+    """A Core refusal reaches the reader either through reader_facing_reason or _http_error.
+
+    Every reachable RoomError must be written for a non-expert reader, without developer
+    jargon, path separators, or exception class names (#1438).
+    """
+
+    def test_all_reachable_room_errors_produce_plain_reader_facing_reasons_and_route_details(
+        self, tmp_path: Path
+    ) -> None:
+        """Killed by: src/uclone_x/room/store.py :: f"The conversation {state.room_id!r} could not be saved because it was changed by another action. Refresh and try again."
+        Becomes: f"The conversation {state.room_id!r} could not be saved: held revision conflict with orchestrator."
+        Killed by: src/uclone_x/room/store.py :: "The conversation identifier is not valid: it must not contain path separators."
+        Becomes: "The conversation identifier is not valid: path/traversal error."
+        Killed by: src/uclone_x/ui/rooms.py :: return "The next speaker could not be chosen. Try sending your message again."
+        Becomes: return "SpeakerSelectionError: could not choose next speaker"
+        """
+        from uclone_x.errors import (
+            HeadRoomWriteError,
+            NothingToRetryError,
+            ParticipantNotResolvableError,
+            RoomAlreadyExistsError,
+            RoomError,
+            RoomIdError,
+            RoomNotFoundError,
+            RoomWorkspaceRefusedError,
+            SecondHumanInRoomError,
+            SpeakerSelectionError,
+            StaleRoomWriteError,
+            TurnNotLandedError,
+            TurnNotStartedError,
+            UnknownRoomParticipantError,
+        )
+        from uclone_x.room.turn_summary import TurnNotFoundError
+        from uclone_x.ui.rooms import (
+            _http_error,  # pyright: ignore[reportPrivateUsage]
+            reader_facing_reason,
+        )
+
+        store = RoomStore(tmp_path / "rooms")
+        state = RoomState(room_id="r1", revision=0, participants=())
+        store.save(state)
+        stale_err: StaleRoomWriteError | None = None
+        room_id_err: RoomIdError | None = None
+        try:
+            store.save(state)
+        except StaleRoomWriteError as exc:
+            stale_err = exc
+        try:
+            store.room_path("..")
+        except RoomIdError as exc:
+            room_id_err = exc
+
+        assert stale_err is not None
+        assert room_id_err is not None
+
+        sample_errors: list[RoomError] = [
+            stale_err,
+            room_id_err,
+            RoomNotFoundError("No room 'r1' in the store."),
+            RoomAlreadyExistsError(
+                "Room 'r1' already exists; refusing to overwrite its conversation."
+            ),
+            SecondHumanInRoomError(
+                "Room 'r1' already seats a human, so 'user2' cannot join: a room serves one human."
+            ),
+            NothingToRetryError(
+                "The last thing said in room 'r1' did not fail. A retry re-runs a failed turn; there is none to re-run."
+            ),
+            HeadRoomWriteError("This conversation is managed by another process."),
+            TurnNotStartedError(
+                "The turn was not started, because the conversation could not save that it was starting."
+            ),
+            TurnNotLandedError(
+                "The reply could not be saved to this conversation, so it was not kept."
+            ),
+            UnknownRoomParticipantError("'phantm' is not a participant of room 'r1'"),
+            ParticipantNotResolvableError("No live agent can be produced for 'bot'"),
+            SpeakerSelectionError("The next speaker could not be chosen."),
+            TurnNotFoundError("r1", 1),
+            RoomWorkspaceRefusedError(
+                "That is not an existing folder given by its full path, so the "
+                "conversation's workspace was not changed.",
+                "not_a_folder",
+            ),
+        ]
+
+        assert {type(err) for err in sample_errors} == set(RoomError.__subclasses__())
+
+        for err in sample_errors:
+            reason = reader_facing_reason(err)
+            detail = _http_error(err).detail
+            assert isinstance(detail, str), f"detail is not a str for {type(err).__name__}"
+            for text in (reason, detail):
+                assert text, f"empty text for {type(err).__name__}"
+                assert "/" not in text and "\\" not in text, f"separator in {text!r}"
+                assert not re.search(r"[A-Za-z]*(Error|Exception)\b", text), (
+                    f"error class in {text!r}"
+                )
+                assert "Errno" not in text, f"Errno in {text!r}"
+                assert "held revision" not in text, f"held revision in {text!r}"
+                assert "orchestrator" not in text, f"orchestrator in {text!r}"
 
 
 class TestTheDesktopSaysNobodyAnswersApprovals:
@@ -810,6 +977,7 @@ class TestTheDesktopSaysNobodyAnswersApprovals:
 
         with pytest.MonkeyPatch.context() as mp:
             mp.setenv(AGENTS_DIR_ENV_VAR, str(tmp_path / "agents"))
+            make_clones(*_TEST_CLONES)
             mgr = AgentSessionManager(storage_dir=tmp_path / "sessions", llm=MockLLMConnector())
             chat = app_clone(mgr, "writer")
             stack = RoomStack(mgr)
@@ -843,7 +1011,7 @@ class TestRoomMemoryIsHeldPerAgent:
     def test_a_room_seat_and_a_chat_session_share_one_store(self, tmp_path: Path) -> None:
         """The room must reach the session manager's map, not keep one of its own.
 
-        Killed by: src/uclone_x/ui/app.py :: existing = self._agent_memories.get(agent_id)
+        Killed by: src/uclone_x/ui/app.py :: existing = self._agent_memories.get(key)
         Becomes: existing = None
         """
         from uclone_x.core.agent_home import AGENTS_DIR_ENV_VAR
@@ -852,21 +1020,26 @@ class TestRoomMemoryIsHeldPerAgent:
 
         with pytest.MonkeyPatch.context() as mp:
             mp.setenv(AGENTS_DIR_ENV_VAR, str(tmp_path / "agents"))
+            make_clones(*_TEST_CLONES)
             mgr = AgentSessionManager(storage_dir=tmp_path / "sessions", llm=MockLLMConnector())
             stack = RoomStack(mgr)
             state = stack.service.create(title="Design review")
+            # A seat is keyed by its clone's id; the service seats whatever id it is given.
+            champion = seat_id_for("champion")
             stack.service.add_participant(
-                state.room_id, participant_id="champion", kind=ParticipantKind.AGENT
+                state.room_id, participant_id=champion, kind=ParticipantKind.AGENT
             )
             seated = stack.store.load(state.room_id)
             assert seated is not None
             resolver = stack.orchestrator(seated)._resolver  # pyright: ignore[reportPrivateUsage]
-            participant = next(p for p in seated.participants if p.id == "champion")
+            participant = next(p for p in seated.participants if p.id == champion)
             agent = cast("BaseAgent", asyncio.run(resolver.resolve(participant)))
+            by_handle = mgr.memory_for("champion")
 
         # The same object the chat surface would hand `champion`, not merely one over the
         # same path: two objects would each hold the whole fact set and clobber the other.
-        assert agent.memory is mgr.memory_for("champion")
+        assert agent.memory is mgr.memory_for(champion)
+        assert by_handle is agent.memory, "a handle reaches its clone's one store"
 
     def test_two_seats_in_one_room_do_not_share_a_store(self, tmp_path: Path) -> None:
         """Sharing one store across seats is the opposite failure: recollection bleed.
@@ -880,10 +1053,13 @@ class TestRoomMemoryIsHeldPerAgent:
 
         with pytest.MonkeyPatch.context() as mp:
             mp.setenv(AGENTS_DIR_ENV_VAR, str(tmp_path / "agents"))
+            make_clones(*_TEST_CLONES)
             mgr = AgentSessionManager(storage_dir=tmp_path / "sessions", llm=MockLLMConnector())
             stack = RoomStack(mgr)
             state = stack.service.create(title="Design review")
-            for participant_id in ("alpha", "beta"):
+            # Seats are keyed by clone id; the service seats whatever id it is given.
+            alpha, beta = seat_id_for("alpha"), seat_id_for("beta")
+            for participant_id in (alpha, beta):
                 stack.service.add_participant(
                     state.room_id, participant_id=participant_id, kind=ParticipantKind.AGENT
                 )
@@ -893,13 +1069,13 @@ class TestRoomMemoryIsHeldPerAgent:
             agents = {
                 p.id: cast("BaseAgent", asyncio.run(resolver.resolve(p)))
                 for p in seated.participants
-                if p.id in {"alpha", "beta"}
+                if p.id in {alpha, beta}
             }
 
-        assert agents["alpha"].memory is not None
-        assert agents["alpha"].memory is not agents["beta"].memory
-        assert agents["alpha"].memory is mgr.memory_for("alpha")
-        assert agents["beta"].memory is mgr.memory_for("beta")
+        assert agents[alpha].memory is not None
+        assert agents[alpha].memory is not agents[beta].memory
+        assert agents[alpha].memory is mgr.memory_for(alpha)
+        assert agents[beta].memory is mgr.memory_for(beta)
 
     def test_a_seated_agent_can_record_into_its_own_store(self, tmp_path: Path) -> None:
         """The wiring, end to end: the head's resolver hands each seat a store at all.
@@ -917,6 +1093,7 @@ class TestRoomMemoryIsHeldPerAgent:
 
         with pytest.MonkeyPatch.context() as mp:
             mp.setenv(AGENTS_DIR_ENV_VAR, str(tmp_path / "agents"))
+            make_clones(*_TEST_CLONES)
             mgr = AgentSessionManager(storage_dir=tmp_path / "sessions", llm=MockLLMConnector())
             stack = RoomStack(mgr)
             state = stack.service.create(title="Design review")
@@ -931,7 +1108,7 @@ class TestRoomMemoryIsHeldPerAgent:
             record = asyncio.run(
                 agent.execute_tool_call(
                     "record_memory_fact",
-                    {"subject": "alpha", "predicate": "sat in", "object_value": "a room"},
+                    {"subject": "Design review", "predicate": "held in", "object_value": "a room"},
                 )
             )
             # Read back inside the context: with `MEMORY_STORAGE_DIR` restored, a
@@ -940,7 +1117,7 @@ class TestRoomMemoryIsHeldPerAgent:
             recorded = [fact.subject for fact in mgr.memory_for("alpha").list_facts()]
 
         assert record.status == "success", record.error
-        assert recorded == ["alpha"]
+        assert recorded == ["Design review"]
         assert isinstance(seated.policy, RoomPolicy)
 
 
@@ -996,6 +1173,22 @@ def _seated_room(stack: RoomStack) -> str:
     return room_id
 
 
+def _default_model(mgr: Any, kind: str, model: str, *, base_url: str | None = None) -> None:
+    """Save one connection of ``kind`` and make ``model`` on it the default deep (§3.2)."""
+    row: dict[str, str] = {"id": kind, "kind": kind}
+    if base_url is not None:
+        row["base_url"] = base_url
+    if kind == "anthropic":
+        row["key"] = "sk-ant-test"
+    mgr.settings_file.write_text(
+        json.dumps({"connections": [row], "default_models": {"deep": f"{kind}/{model}"}}),
+        encoding="utf-8",
+    )
+    # The fixture's app was handed a mock for every clone that follows the default; this
+    # readout is about the saved default, so the gateway answers from the file instead.
+    mgr.gateway.set_default_binding(None)
+
+
 class TestConversationContextReadout:
     def test_a_fresh_conversation_reports_a_seat_nobody_has_spoken_in(
         self, client: TestClient
@@ -1009,11 +1202,12 @@ class TestConversationContextReadout:
         room_id = _create(client, agent_ids=["scout"]).json()["room_id"]
 
         body = client.get(f"/api/rooms/{room_id}/context").json()
+        scout = seat_id_for("scout")  # a handle is seated by its clone's id
 
         assert body["seats"] == [
             {
-                "participant_id": "scout",
-                "session_id": f"sess_room__{room_id}__scout",
+                "participant_id": scout,
+                "session_id": f"sess_room__{room_id}__{scout}",
                 "active_turns": 0,
                 "is_saturated": False,
                 # `None`, not `0`: nothing has been booked against this session in this
@@ -1047,7 +1241,7 @@ class TestConversationContextReadout:
         Becomes: booked = mgr.budget_tracker._get_or_create_budget(participant.session_id)  # pyright: ignore[reportPrivateUsage]
         """
         room_id = _create(client, agent_ids=["scout"]).json()["room_id"]
-        session_id = f"sess_room__{room_id}__scout"
+        session_id = f"sess_room__{room_id}__{seat_id_for('scout')}"
 
         assert client.get(f"/api/rooms/{room_id}/context").json()["seats"][0]["used_tokens"] is None
 
@@ -1072,7 +1266,7 @@ class TestConversationContextReadout:
 
         body = client.get(f"/api/rooms/{room_id}/context").json()
 
-        assert [seat["participant_id"] for seat in body["seats"]] == ["scout"]
+        assert [seat["participant_id"] for seat in body["seats"]] == [seat_id_for("scout")]
 
     def test_a_refusal_about_a_seats_record_arrives_in_the_cores_own_words(
         self, answering_client: TestClient
@@ -1109,12 +1303,13 @@ class TestConversationContextReadout:
 
         room_id = _create(answering_client, agent_ids=["scout"]).json()["room_id"]
         manager = cast(AgentSessionManager, cast(Any, answering_client.app).state.session_manager)
-        asked = f"sess_room__{room_id}__scout"
+        scout = seat_id_for("scout")
+        asked = f"sess_room__{room_id}__{scout}"
         squatter = asked.upper()
         record = manager.core_store.session_path(asked)
         record.parent.mkdir(parents=True, exist_ok=True)
         record.write_text(
-            SessionState(session_id=squatter, agent_id="scout").model_dump_json(),
+            SessionState(session_id=squatter, agent_id=scout).model_dump_json(),
             encoding="utf-8",
         )
 
@@ -1138,16 +1333,15 @@ class TestConversationContextReadout:
         runtime. A hosted provider's window is a published figure its API enforces, so for
         those the table *is* the measurement and the seat reports it.
 
-        The settings are poked rather than posted because a save rebuilds the connector,
-        which is not part of what is being checked here.
+        The default model is written to the settings file the gateway reads
+        (model-gateway §3.2); no seat has spoken, so the readout uses the default deep.
 
         Killed by: src/uclone_x/ui/rooms.py :: window_tokens, window_source = declared, "published"
         Becomes: window_tokens, window_source = declared, "loaded"
         """
         room_id = _create(client, agent_ids=["scout"]).json()["room_id"]
         mgr = cast(Any, client.app).state.room_stack.session_manager()
-        monkeypatch.setattr(mgr, "_configured_provider", "anthropic", raising=False)
-        monkeypatch.setattr(mgr, "_configured_model", "claude-3-5-sonnet-20241022", raising=False)
+        _default_model(mgr, "anthropic", "claude-3-5-sonnet-20241022")
 
         seat = client.get(f"/api/rooms/{room_id}/context").json()["seats"][0]
 
@@ -1168,8 +1362,7 @@ class TestConversationContextReadout:
         """
         room_id = _create(client, agent_ids=["scout"]).json()["room_id"]
         mgr = cast(Any, client.app).state.room_stack.session_manager()
-        monkeypatch.setattr(mgr, "_configured_provider", "anthropic", raising=False)
-        monkeypatch.setattr(mgr, "_configured_model", "claude-9-unreleased", raising=False)
+        _default_model(mgr, "anthropic", "claude-9-unreleased")
 
         seat = client.get(f"/api/rooms/{room_id}/context").json()["seats"][0]
 
@@ -1192,11 +1385,9 @@ class TestConversationContextReadout:
         """
         room_id = _create(client, agent_ids=["scout"]).json()["room_id"]
         mgr = cast(Any, client.app).state.room_stack.session_manager()
-        monkeypatch.setattr(mgr, "_configured_provider", "ollama", raising=False)
         # A port nothing listens on, so `refresh` is refused instantly and the only
         # figure in the store is the seeded observation this test is about.
-        monkeypatch.setattr(mgr, "_configured_base_url", "http://127.0.0.1:1", raising=False)
-        monkeypatch.setattr(mgr, "_configured_model", "qwen3:8b", raising=False)
+        _default_model(mgr, "ollama", "qwen3:8b", base_url="http://127.0.0.1:1")
         store = OllamaContextWindows()
         store.remember("http://127.0.0.1:1", "qwen3:8b", 40_960)
         monkeypatch.setattr(rooms_module, "OLLAMA_CONTEXT_WINDOWS", store)
@@ -1227,40 +1418,48 @@ class TestASeatRunsOnTheSettingsModel:
     """
 
     def test_a_seat_sends_the_settings_model_and_the_new_one_after_a_save(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self, tmp_path: Path
     ) -> None:
-        """Killed by: src/uclone_x/ui/app.py :: global_models=self.global_models,
-        Becomes: global_models=None,
+        """The default deep ref's connection answers, and a saved default reaches the seat.
+
+        Killed by: src/uclone_x/ui/app.py :: gateway=self._gateway,
+        Becomes: gateway=None,
         """
         sessions = tmp_path / "sessions"
         sessions.mkdir()
         (sessions / "settings.json").write_text(
-            json.dumps({"llm_provider": "mock", "llm_model": "deep-before"}), encoding="utf-8"
+            json.dumps(
+                {
+                    "connections": [{"id": "mock", "kind": "mock"}],
+                    "default_models": {"deep": "mock/mock-gpt-4o"},
+                }
+            ),
+            encoding="utf-8",
         )
-        first = _ModelRecorder()
-        app = create_ui_app(static_dir=tmp_path, storage_dir=sessions, llm=first)
+        app = create_ui_app(static_dir=tmp_path, storage_dir=sessions)
+        mgr = cast(Any, app).state.session_manager
+        recorders: dict[str, _ModelRecorder] = {}
+
+        def build(**kwargs: Any) -> _ModelRecorder:
+            return recorders.setdefault(str(kwargs["model"]), _ModelRecorder())
+
+        mgr.gateway._factory = build  # pyright: ignore[reportPrivateUsage]
         with TestClient(app) as client:
             room_id = _create(client).json()["room_id"]
             client.post(f"/api/rooms/{room_id}/messages", json={"content": "hello"})
             _wait_for_transcript(client, room_id, rows=4)
 
-            assert "deep-before" in first.models, first.models
+            assert "mock-gpt-4o" in recorders["mock-gpt-4o"].models
 
-            second = _ModelRecorder()
-            mgr = cast(Any, app).state.session_manager
-
-            def build_second(**_: Any) -> _ModelRecorder:
-                return second
-
-            monkeypatch.setattr(mgr, "build_llm", build_second)
-            saved = client.post("/api/settings", json={"llm_model": "deep-after"})
+            saved = client.post("/api/settings", json={"default_models": {"deep": "mock/mock-llm"}})
             assert saved.status_code == 200, saved.text
 
             client.post(f"/api/rooms/{room_id}/messages", json={"content": "again"})
             _wait_for_transcript(client, room_id, rows=6)
 
-            assert second.models, "the seat never reached the connector Settings installed"
-            assert set(second.models) == {"deep-after"}, second.models
+            second = recorders.get("mock-llm")
+            assert second is not None and second.models, "the seat never moved to the new default"
+            assert set(second.models) == {"mock-llm"}, second.models
 
 
 class TestWhichSeatsAHistoryControlActsOn:
@@ -1382,7 +1581,7 @@ class TestASeatThatWouldNotReset:
         body = client.delete(f"/api/rooms/{room_id}/history").json()
 
         assert body["transcript"] == []
-        assert body["participants_not_reset"] == ["scout"]
+        assert body["participants_not_reset"] == [seat_id_for("scout")]
 
     def test_a_reset_that_worked_says_so_rather_than_omitting_the_key(
         self, client: TestClient
@@ -1415,7 +1614,7 @@ class TestClearingAConversation:
 
         assert body["transcript"] == []
         assert body["title"] == "Keep me"
-        assert [p["id"] for p in body["participants"]] == ["user", "scout"]
+        assert [p["id"] for p in body["participants"]] == ["user", seat_id_for("scout")]
         assert [r["room_id"] for r in client.get("/api/rooms").json()["rooms"]] == [room_id]
 
     def test_the_live_agent_forgets_what_the_record_no_longer_holds(
@@ -1438,9 +1637,10 @@ class TestClearingAConversation:
         room_id = _create(client, agent_ids=["scout"]).json()["room_id"]
         client.post(f"/api/rooms/{room_id}/messages", json={"content": "hello"})
         _wait_for_transcript(client, room_id, rows=4)
-        agent = _live_seat_agent(client, room_id, "scout")
+        scout = seat_id_for("scout")
+        agent = _live_seat_agent(client, room_id, scout)
         assert agent is not None, "the cascade should have built the seat's agent"
-        session_id = f"sess_room__{room_id}__scout"
+        session_id = f"sess_room__{room_id}__{scout}"
         assert [m.role.value for m in agent.get_session(session_id).messages] != ["system"]
 
         client.delete(f"/api/rooms/{room_id}/history")
@@ -1478,12 +1678,13 @@ class TestRewindingAConversation:
         room_id = _create(client, agent_ids=["scout"]).json()["room_id"]
         client.post(f"/api/rooms/{room_id}/messages", json={"content": "hello"})
         _wait_for_transcript(client, room_id, rows=4)
-        agent = _live_seat_agent(client, room_id, "scout")
+        scout = seat_id_for("scout")
+        agent = _live_seat_agent(client, room_id, scout)
         assert agent is not None
 
         client.post(f"/api/rooms/{room_id}/history/truncate", json={"seq": 3})
 
-        session_id = f"sess_room__{room_id}__scout"
+        session_id = f"sess_room__{room_id}__{scout}"
         assert [m.role.value for m in agent.get_session(session_id).messages] == ["system"]
 
     def test_a_seq_the_conversation_does_not_hold_keeps_the_cores_sentence(
@@ -1531,16 +1732,29 @@ class TestCompactingAConversation:
 
         assert body.status_code == 200, body.text
         results = body.json()["results"]
-        assert [r["participant_id"] for r in results] == ["scout", "critic"]
+        assert [r["participant_id"] for r in results] == [
+            seat_id_for("scout"),
+            seat_id_for("critic"),
+        ]
         assert all("provenance" in r for r in results)
 
     def test_one_seat_can_be_named(self, client: TestClient) -> None:
-        """U0 asks for the conversation and U1 refines to a seat, one argument away."""
+        """U0 asks for the conversation and U1 refines to a seat, one argument away.
+
+        The seat is its clone's id, and the handle a person types names it too, as the
+        dock routes and removing a seat already accept.
+
+        Killed by: src/uclone_x/ui/rooms.py :: seat = seat_id_for(raw)  # a handle names its clone's seat
+        Becomes: seat = raw
+        """
         room_id = _create(client, agent_ids=["scout", "critic"]).json()["room_id"]
 
-        body = client.post(f"/api/rooms/{room_id}/compact", json={"participant_id": "critic"})
+        critic = seat_id_for("critic")  # a seat is named by its clone's id
+        for named in (critic, "critic"):
+            body = client.post(f"/api/rooms/{room_id}/compact", json={"participant_id": named})
 
-        assert [r["participant_id"] for r in body.json()["results"]] == ["critic"]
+            assert body.status_code == 200, body.text
+            assert [r["participant_id"] for r in body.json()["results"]] == [critic]
 
     def test_a_seat_that_is_not_in_the_conversation_is_refused_with_its_reason(
         self, client: TestClient
@@ -1757,6 +1971,8 @@ class TestHistoryIsRefusedWhileSomebodyIsAnswering:
         assert seat.session_id in detail, detail
         await stack.close()
 
+
+class TestRoomLoop:
     def test_room_slash_loop_help(self, client: TestClient, tmp_path: Path) -> None:
         """Sending /loop or /loop help records help text in transcript without agent cascade.
 
@@ -1765,8 +1981,8 @@ class TestHistoryIsRefusedWhileSomebodyIsAnswering:
 
         Killed by: src/uclone_x/ui/rooms.py :: return _notice("loop.help")
         Becomes: return _notice("loop.no_interval")
-        Killed by: src/uclone_x/ui/rooms.py :: state = await orch.accept_command(room_id, sender_id, content)
-        Becomes: state = await orch.accept(room_id, sender_id, content)
+        Killed by: src/uclone_x/ui/rooms.py :: await orch.accept_command(room_id, sender_id, content)
+        Becomes: await orch.accept(room_id, sender_id, content)
         """
         room_id = _create(client).json()["room_id"]
         res = client.post(f"/api/rooms/{room_id}/messages", json={"content": "/loop help"})
@@ -1847,6 +2063,7 @@ class TestHistoryIsRefusedWhileSomebodyIsAnswering:
             "job_id": job_id,
             "interval_seconds": 10.0,
             "prompt": "status check",
+            "runs": 1,
         }
 
         client.post(f"/api/rooms/{room_id}/messages", json={"content": "/loop stop"})
@@ -1912,6 +2129,175 @@ class TestHistoryIsRefusedWhileSomebodyIsAnswering:
         assert notes[-1]["code"] == "loop.none_active"
         assert "params" not in notes[-1]  # left out while unset (#1885)
 
+    def test_a_loop_is_on_the_room_record_until_it_is_stopped(self, client: TestClient) -> None:
+        """The loop is read from the room, not typed for: it lived only in memory (#1936).
+
+        Killed by: src/uclone_x/ui/rooms.py :: self.store.save(state.model_copy(update={"loop": loop}))
+        Becomes: pass
+        Killed by: src/uclone_x/ui/rooms.py :: self.store.save(state.model_copy(update={"loop": None}))
+        Becomes: pass
+        """
+        room_id = _create(client).json()["room_id"]
+        client.post(f"/api/rooms/{room_id}/messages", json={"content": "/loop 60s status check"})
+        loop = _wait_for_loop(client, room_id, runs=1)
+        assert loop["interval_seconds"] == 60.0
+        assert loop["prompt"] == "status check"
+        assert loop["job_id"] == _notes(client, room_id)[0]["params"]["job_id"]
+        assert loop["next_run_at"] is not None
+
+        client.post(f"/api/rooms/{room_id}/messages", json={"content": "/loop stop"})
+        assert "loop" not in client.get(f"/api/rooms/{room_id}").json()
+
+    def test_a_restarted_app_continues_the_loop_and_says_so(self, tmp_path: Path) -> None:
+        """`ucx ui --dev` reloads on a `git pull`, and the loop ended without a word (#1936).
+
+        Killed by: src/uclone_x/ui/app.py :: resumed = loop_stack.resume_room_loops()
+        Becomes: resumed = 0
+        """
+
+        def _app() -> Any:
+            return create_ui_app(
+                static_dir=tmp_path, storage_dir=tmp_path / "sessions", llm=MockLLMConnector()
+            )
+
+        with TestClient(_app()) as first:
+            room_id = _create(first).json()["room_id"]
+            first.post(f"/api/rooms/{room_id}/messages", json={"content": "/loop 60s status check"})
+            _wait_for_loop(first, room_id, runs=1)
+            _wait_for_cascade_to_settle(cast(Any, first.app).state.room_stack, room_id)
+
+        store = RoomStore(room_storage_dir_under(tmp_path / "sessions"))
+        state = store.load(room_id)
+        assert state is not None and state.loop is not None, "shutting down took the loop off"
+        store.save(
+            state.model_copy(
+                update={
+                    "loop": state.loop.model_copy(
+                        update={"next_run_at": "2020-01-01T00:00:00+00:00"}
+                    )
+                }
+            )
+        )
+
+        with TestClient(_app()) as second:
+            loop = _wait_for_loop(second, room_id, runs=2)
+            assert loop["job_id"] == state.loop.job_id
+            resumed = [n for n in _notes(second, room_id) if n["code"] == "loop.resumed"]
+            assert len(resumed) == 1
+            assert resumed[0]["params"]["prompt"] == "status check"
+            prompts = [
+                m
+                for m in second.get(f"/api/rooms/{room_id}").json()["transcript"]
+                if m.get("kind") == "utterance" and m["content"] == "status check"
+            ]
+            assert len(prompts) == 2
+            _wait_for_cascade_to_settle(cast(Any, second.app).state.room_stack, room_id)
+
+    def test_a_restarted_app_waits_for_future_next_run_at(self, tmp_path: Path) -> None:
+        """A future next_run_at is honored across restart so reloads do not re-run all loops (#1996).
+
+        Killed by: src/uclone_x/ui/rooms.py :: delay = max(0.0, (due - datetime.now(UTC)).total_seconds())
+        Becomes: delay = 0.0
+        """
+
+        def _app() -> Any:
+            return create_ui_app(
+                static_dir=tmp_path, storage_dir=tmp_path / "sessions", llm=MockLLMConnector()
+            )
+
+        with TestClient(_app()) as first:
+            room_id = _create(first).json()["room_id"]
+            first.post(f"/api/rooms/{room_id}/messages", json={"content": "/loop 60s status check"})
+            _wait_for_loop(first, room_id, runs=1)
+            _wait_for_cascade_to_settle(cast(Any, first.app).state.room_stack, room_id)
+
+        store = RoomStore(room_storage_dir_under(tmp_path / "sessions"))
+        state = store.load(room_id)
+        assert state is not None and state.loop is not None
+        future = (datetime.now(UTC) + timedelta(hours=1)).isoformat()
+        store.save(
+            state.model_copy(update={"loop": state.loop.model_copy(update={"next_run_at": future})})
+        )
+
+        with TestClient(_app()) as second:
+            stack: Any = cast(Any, second.app).state.room_stack
+            assert room_id in stack._room_loops
+            job_id, _ = stack._room_loops[room_id]
+            assert job_id == state.loop.job_id
+
+            resumed = [n for n in _notes(second, room_id) if n["code"] == "loop.resumed"]
+            assert len(resumed) == 1
+            assert resumed[0]["params"]["prompt"] == "status check"
+
+            time.sleep(0.05)
+
+            room_data = second.get(f"/api/rooms/{room_id}").json()
+            assert room_data["loop"]["runs"] == 1
+            prompts = [
+                m
+                for m in room_data["transcript"]
+                if m.get("kind") == "utterance" and m["content"] == "status check"
+            ]
+            assert len(prompts) == 1
+            _wait_for_cascade_to_settle(stack, room_id)
+
+    def test_a_failed_run_is_said_in_the_conversation_and_kept(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A failed run was a log line on a terminal nobody reads; now the room shows it.
+
+        Killed by: src/uclone_x/ui/rooms.py :: last_error=error,
+        Becomes: last_error=None,
+        Killed by: src/uclone_x/ui/rooms.py :: "loop.run_failed",
+        Becomes: "loop.stopped",
+        Killed by: src/uclone_x/ui/rooms.py :: exc, context={"surface": "ui.room_loop", "room_id": room_id, "run": run}
+        Becomes: exc, context={}
+        """
+        journaled: list[dict[str, object]] = []
+
+        def _journal(error: BaseException, *, context: dict[str, object] | None = None) -> None:
+            journaled.append(dict(context or {}))
+
+        monkeypatch.setattr(rooms_module, "record_failure", _journal)
+        sessions = tmp_path / "sessions"
+        with TestClient(
+            create_ui_app(static_dir=tmp_path, storage_dir=sessions, llm=MockLLMConnector())
+        ) as setup:
+            room_id = _create(setup).json()["room_id"]
+        store = RoomStore(room_storage_dir_under(sessions))
+        state = store.load(room_id)
+        assert state is not None
+        ghost = RoomLoop(job_id="loop-ghost", sender_id="ghost", interval_seconds=60.0, prompt="hi")
+        store.save(state.model_copy(update={"loop": ghost}))
+
+        with TestClient(
+            create_ui_app(static_dir=tmp_path, storage_dir=sessions, llm=MockLLMConnector())
+        ) as client:
+            loop = _wait_for_loop(client, room_id, runs=1, failed=True)
+            assert loop["last_error"], loop
+            failed = [n for n in _notes(client, room_id) if n["code"] == "loop.run_failed"]
+            assert len(failed) == 1
+            assert failed[0]["params"]["run"] == 1
+            assert "ghost" in failed[0]["params"]["reason"]
+        assert journaled == [{"surface": "ui.room_loop", "room_id": room_id, "run": 1}]
+
+    def test_the_stop_button_says_it_stopped_a_loop(self, client: TestClient) -> None:
+        """Stop ends the loop and says so; with none running it adds nothing (#1936).
+
+        Killed by: src/uclone_x/ui/rooms.py :: if self.cancel_room_loop(room_id):
+        Becomes: if self.cancel_room_loop(room_id) or True:
+        """
+        room_id = _create(client).json()["room_id"]
+        client.post(f"/api/rooms/{room_id}/messages", json={"content": "/loop 60s status check"})
+        _wait_for_loop(client, room_id, runs=1)
+        client.post(f"/api/rooms/{room_id}/stop")
+        client.post(f"/api/rooms/{room_id}/stop")
+        codes = [n["code"] for n in _notes(client, room_id)]
+        assert codes == ["loop.registered", "loop.stopped"]
+        assert "loop" not in client.get(f"/api/rooms/{room_id}").json()
+
+
+class TestAutonomousAndPresence:
     def test_room_toggle_autonomous_and_presence(self, client: TestClient) -> None:
         """POST /api/rooms/{id}/autonomous toggles policy, /presence updates presence."""
         room_id = _create(client).json()["room_id"]
@@ -2077,7 +2463,7 @@ class TestHistoryIsRefusedWhileSomebodyIsAnswering:
             active = client.get(f"/api/rooms/{room_id}").json()["active_turn"]
             assert active is not None
             assert active["in_flight"] is True
-            assert active["agent_id"] == "scout"
+            assert active["agent_id"] == seat_id_for("scout")
         finally:
             ev.set()
             for _ in range(50):
@@ -2191,83 +2577,6 @@ class TestAHeadRoomInTheApp:
             )
             assert stack.service.get(room_id) == before, (method, path)
 
-    @pytest.mark.parametrize(
-        ("head", "keeper"),
-        [("acp", "the editor that opened it"), ("a2a", "the agent that called this clone")],
-    )
-    def test_an_editor_or_agent_room_from_before_the_mark_is_the_head_s(
-        self, answering_client: TestClient, head: str, keeper: str
-    ) -> None:
-        """An ACP or A2A room's id says whose it is, so it is refused though it has no mark.
-
-        Unlike `run`/`loop`, whose ids are the app's own `room_` shape, these ids are made
-        only by their head (`conversation_room_id`). Author's choice (#1885): they are
-        read as the head's, and `GET` reports the head so the app shows them read-only.
-
-        Killed by: src/uclone_x/ui/rooms.py :: return {**state.model_dump(mode="json"), "head": room_head(state), "active_turn": active}
-        Becomes: return {**state.model_dump(mode="json"), "active_turn": active}
-        Killed by: src/uclone_x/room/models.py :: return unmarked.group(1) if unmarked is not None else None
-        Becomes: return None
-        """
-        from uclone_x.room.one_seat import HeadTurn, conversation_room_id, record_head_turn
-
-        stack = cast(Any, answering_client.app).state.room_stack
-        state = record_head_turn(
-            stack.store,
-            room_id=conversation_room_id(head, "scout", "c1"),
-            clone_id="scout",
-            turn=HeadTurn(prompt="what is in the index?", content="three tables"),
-            head=head,
-        )
-        state = stack.store.save(state.model_copy(update={"head": None}))
-        before = answering_client.get(f"/api/rooms/{state.room_id}").json()
-        assert before["head"] == head
-
-        refused = answering_client.post(
-            f"/api/rooms/{state.room_id}/messages", json={"content": "hello from the app"}
-        )
-
-        assert refused.status_code == 409, refused.text
-        assert refused.json()["detail"] == (
-            f"This conversation belongs to {keeper}, so only {keeper} can continue it. "
-            "You can read it here."
-        )
-        assert answering_client.get(f"/api/rooms/{state.room_id}").json() == before
-        assert stack.store.load(state.room_id).head is None, "the record is read, not rewritten"
-
-    def test_a_head_room_from_before_the_mark_is_served_as_before(self, client: TestClient) -> None:
-        """An unmarked run room stays the app's: it takes a post, and `ucx run` is refused.
-
-        An unmarked room written by `ucx run` before rooms were marked cannot be told from
-        one the app made -- both seat `user` and one clone -- so it has a single owner only
-        if one side gives it up. Author's choice (#1885): the app keeps it, because marking
-        it later would change, under the person, what the app lets them do in a room it
-        already shows, and a refused `--session-id` says plainly where to continue.
-
-        Killed by: src/uclone_x/room/one_seat.py :: if state.head != head and not _unmarked_server_room(state, room_id, head):
-        Becomes: if False:
-        """
-        from uclone_x.errors import RoomError
-        from uclone_x.room.one_seat import ONE_SEAT_HUMAN_ID, HeadTurn, record_head_turn
-
-        stack = cast(Any, client.app).state.room_stack
-        room_id = stack.service.create("scout", room_id="room_before_the_mark").room_id
-        stack.service.add_participant(room_id, ONE_SEAT_HUMAN_ID, kind=ParticipantKind.HUMAN)
-        stack.service.add_participant(room_id, "scout", kind=ParticipantKind.AGENT)
-
-        with pytest.raises(RoomError, match="belongs to the app"):
-            record_head_turn(
-                stack.store,
-                room_id=room_id,
-                clone_id="scout",
-                turn=HeadTurn(prompt="and now?", content="still here"),
-                head="run",
-            )
-        sent = client.post(f"/api/rooms/{room_id}/messages", json={"content": "from the app"})
-
-        assert stack.service.get(room_id).head is None
-        assert sent.status_code == 202, sent.text
-
 
 class TestTheAppAndTheCliShareOneRoomStore:
     """`RoomStack` resolves the room folder as the CLI does (#1885)."""
@@ -2302,3 +2611,83 @@ class TestTheAppAndTheCliShareOneRoomStore:
         stack = cast(Any, app).state.room_stack
 
         assert stack.store.storage_dir == (tmp_path / "sessions").resolve() / "rooms"
+
+
+def test_a_workspace_switch_is_saved_and_imports_that_folders_personas(
+    client: TestClient, tmp_path: Path
+) -> None:
+    """The room keeps the folder's full path; its personas become clones (§3.8 step 2).
+
+    Killed by: src/uclone_x/ui/rooms.py :: ensure_clone_store(workspace, builtin_dir=None, install=False)
+    Becomes: None
+    """
+    from uclone_x.agent.clone_store import clone_handles
+    from uclone_x.core.agent_home import default_agents_root
+
+    project = tmp_path / "project"
+    folder = project / ".uclone" / "personas"
+    folder.mkdir(parents=True)
+    (folder / "elsewhere.yaml").write_text(
+        "name: elsewhere\nrole: Helper\nsystem_prompt: I am elsewhere.\n", encoding="utf-8"
+    )
+    room_id = _create(client).json()["room_id"]
+
+    switched = client.patch(f"/api/rooms/{room_id}/workspace", json={"workspace": str(project)})
+
+    assert switched.status_code == 200
+    assert client.get(f"/api/rooms/{room_id}").json()["workspace"] == str(project.resolve())
+    assert "elsewhere" in clone_handles(default_agents_root())
+
+
+def test_a_refused_workspace_says_which_refusal_it_is(client: TestClient, tmp_path: Path) -> None:
+    """The head words a refusal from its `code`; the English sentence is the fallback.
+
+    Killed by: src/uclone_x/ui/rooms.py :: return JSONResponse({"detail": str(exc), "code": exc.code}, status_code=400)
+    Becomes: raise _http_error(exc) from exc
+    """
+    room_id = _create(client).json()["room_id"]
+
+    refused = client.patch(
+        f"/api/rooms/{room_id}/workspace", json={"workspace": str(tmp_path / "missing")}
+    )
+
+    assert refused.status_code == 400
+    assert refused.json()["code"] == "not_a_folder"
+    assert "is not an existing folder" in refused.json()["detail"]
+
+
+def test_every_workspace_refusal_has_words_in_the_head() -> None:
+    """A code the Core can send and the head cannot word would show English on a Korean
+    screen, or nothing; each code is a key of `conversation.workspace.refusals`."""
+    import json
+    from typing import get_args
+
+    from uclone_x.errors import WorkspaceRefusalCode
+
+    for locale in ("en", "ko"):
+        copy = json.loads(
+            (
+                REPO_ROOT / "frontend" / "src" / "i18n" / "locales" / locale / "conversation.json"
+            ).read_text(encoding="utf-8")
+        )
+        assert set(copy["workspace"]["refusals"]) == set(get_args(WorkspaceRefusalCode)), locale
+
+
+def test_another_sites_page_cannot_move_a_rooms_workspace(
+    client: TestClient, tmp_path: Path
+) -> None:
+    """It moves the file tools' write bound, so a cross-origin request is refused.
+
+    Killed by: src/uclone_x/ui/rooms.py :: refuse_cross_origin(request)  # another tab must not move the file tools' write bound
+    Becomes: pass
+    """
+    room_id = _create(client).json()["room_id"]
+
+    moved = client.patch(
+        f"/api/rooms/{room_id}/workspace",
+        json={"workspace": str(tmp_path)},
+        headers={"origin": "https://evil.example"},
+    )
+
+    assert moved.status_code == 403
+    assert client.get(f"/api/rooms/{room_id}").json()["workspace"] is None

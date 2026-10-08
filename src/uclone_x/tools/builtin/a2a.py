@@ -19,6 +19,12 @@ What the tool enforces, in the order it checks:
   folder, and a story write it makes is checked against the lease as the caller
   conversation's -- so a peer asked from a conversation that is not writing the story is
   refused as that conversation would be.
+* **The story's characters as they look (#1808).** With a story open, the characters the
+  task and input name are looked up in its codex and their `visual` blocks go with the
+  call under `input["characters"]` -- unless the caller sent that key itself. The Artist
+  never read the codex on its own (0 of 30 on qwen3:8b) and drew from the sheet when it
+  was handed over (29 of 30). The lookup is given to the tool (`CharacterLookup`), so this
+  module does not read a story.
 * **No borrowed result (P6).** A peer that could not do the work -- refused, failed, or
   stopped at a tool that needs a person's approval -- is a failed call that says so. The
   caller is not handed a result nobody produced.
@@ -30,15 +36,16 @@ import logging
 import re
 import time
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any, ClassVar, cast
 
 from pydantic import BaseModel, Field, JsonValue, ValidationError
 
 from uclone_x.a2a.models import TaskMessage, TaskStatus
+from uclone_x.core.agent_home import peer_handles
 from uclone_x.core.immutable import unwrap_immutable
 from uclone_x.core.provenance import Provenance
-from uclone_x.errors import MissingProvenanceError, TaskNotFoundError
+from uclone_x.errors import MissingProvenanceError, PlainRefusalError, TaskNotFoundError
 from uclone_x.tools.base import BaseTool, describe_invalid_arguments
 from uclone_x.tools.models import ToolContext, ToolResult
 
@@ -51,8 +58,10 @@ __all__ = [
     "A2A_ROOM_KEY",
     "A2A_STEP_BUDGET_KEY",
     "A2A_STORY_KEY",
+    "A2A_CHARACTERS_KEY",
     "A2ACallParams",
     "A2ACallTool",
+    "CharacterLookup",
 ]
 
 A2A_CALL_TOOL_NAME = "a2a_call"
@@ -70,6 +79,13 @@ A2A_ROOM_KEY = "room_id"
 #: `TaskMessage.metadata` key: the story the caller's conversation has open
 #: (`ToolContext.story_id`), sent only when one is open.
 A2A_STORY_KEY = "story_id"
+#: `input` key: the open story's characters the call names, each with its `visual` block.
+A2A_CHARACTERS_KEY = "characters"
+
+#: Given the call's context (with a story open) and the words of its task and input, the
+#: story's characters those words name, each as `{"id", "name", "visual"}`. Raises a
+#: `PlainRefusalError` when the story cannot be read.
+CharacterLookup = Callable[[ToolContext, Sequence[str]], list[dict[str, Any]]]
 
 
 class A2ACallParams(BaseModel):
@@ -102,6 +118,17 @@ def _names(text: str, persona: str) -> bool:
     return re.match(rf"{name}(?![\w-])", text) is not None or f"'{persona}'" in text
 
 
+def _words(value: JsonValue) -> list[str]:
+    """Every string in a JSON value, keys included, for finding the names it holds."""
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list):
+        return [word for item in value for word in _words(item)]
+    if isinstance(value, dict):
+        return [word for key, item in value.items() for word in (key, *_words(item))]
+    return []
+
+
 def _reported_steps(output: Mapping[str, Any]) -> int:
     steps = output.get("steps")
     return steps if isinstance(steps, int) and not isinstance(steps, bool) and steps > 0 else 0
@@ -132,6 +159,29 @@ class A2ACallTool(BaseTool[A2ACallParams]):
     )
     params_type = A2ACallParams
     not_run_note: ClassVar[str] = "Nothing was asked of another persona."
+
+    def __init__(self, characters: CharacterLookup | None = None) -> None:
+        super().__init__()
+        self._characters = characters
+
+    def _with_characters(self, call: A2ACallParams, ctx: ToolContext) -> dict[str, JsonValue]:
+        """`call.input`, with the open story's characters it names added (#1808).
+
+        Nothing is added without a story, without a lookup, when the caller sent the key
+        itself, or when no character is named. A story that cannot be read sends the call
+        as it was: the peer can still read the codex with its own tools.
+        """
+        given = call.input
+        if self._characters is None or ctx.story_id is None or A2A_CHARACTERS_KEY in given:
+            return given
+        try:
+            found = self._characters(ctx, [call.task, *_words(given)])
+        except PlainRefusalError:
+            logger.warning("a2a_call: the story's characters could not be read", exc_info=True)
+            return given
+        if not found:
+            return given
+        return {**given, A2A_CHARACTERS_KEY: cast(JsonValue, found)}
 
     async def execute(
         self,
@@ -183,7 +233,8 @@ class A2ACallTool(BaseTool[A2ACallParams]):
                 tool,
             )
         persona = agent.persona_definition
-        peers: tuple[str, ...] = persona.a2a_peers if persona is not None else ()
+        # Stored as clone ids, called by handle (clone-data-scopes §3.3).
+        peers: tuple[str, ...] = peer_handles(persona.a2a_peers) if persona is not None else ()
         if call.agent not in peers:
             allowed = ", ".join(peers) if peers else "no one"
             return _refusal(
@@ -214,7 +265,7 @@ class A2ACallTool(BaseTool[A2ACallParams]):
         message = TaskMessage(
             task_id=f"a2a_{uuid.uuid4().hex[:12]}",
             session_id=ctx.session_id,
-            input_data={"task": call.task, "input": call.input},
+            input_data={"task": call.task, "input": self._with_characters(call, ctx)},
             sender_agent_id=ctx.agent_id,
             target_agent_id=call.agent,
             metadata=metadata,
@@ -238,15 +289,24 @@ class A2ACallTool(BaseTool[A2ACallParams]):
 
         elapsed = (time.perf_counter() - start) * 1000.0
         if result.status is not TaskStatus.COMPLETED:
-            if result.status is TaskStatus.INPUT_REQUIRED:
-                reason = result.error or "it needed a person's approval"
-                lead = f"'{call.agent}' stopped before finishing"
+            lead = (
+                f"'{call.agent}' stopped before finishing"
+                if result.status is TaskStatus.INPUT_REQUIRED
+                else f"'{call.agent}' could not do the task"
+            )
+            if result.error:
+                # A reason that already names the persona is a whole sentence about it; a lead
+                # naming it again would read "'artist' could not do the task: artist stopped".
+                error = (
+                    result.error if _names(result.error, call.agent) else f"{lead}: {result.error}"
+                )
             else:
-                reason = result.error or "no reason was given"
-                lead = f"'{call.agent}' could not do the task"
-            # A reason that already names the persona is a whole sentence about it; a lead
-            # naming it again would read "'artist' could not do the task: artist stopped".
-            error = reason if _names(reason, call.agent) else f"{lead}: {reason}"
+                reason = (
+                    "it needed a person's approval"
+                    if result.status is TaskStatus.INPUT_REQUIRED
+                    else "no reason was given"
+                )
+                error = f"{lead}: {reason}"
             return ToolResult(
                 success=False,
                 error=error,

@@ -362,13 +362,15 @@ def test_is_local_endpoint(url: str | None, local: bool) -> None:
 
 # --- no budget field on clone / persona config (G4) ---------------------------------------
 
-#: `AgentLLMConfig`'s fields on origin/main when the usage limits were added.
+#: `AgentLLMConfig`'s fields on origin/main when the usage limits were added, plus the
+#: picture model ref (model-gateway §3.4), which is not a limit.
 _AGENT_LLM_CONFIG_FIELDS = {
     "auto_compact",
     "compaction_threshold_tokens",
     "context_limit",
     "fast_model",
     "max_tokens",
+    "image_model",
     "model_name",
     "model_tier",
     "temperature",

@@ -14,7 +14,7 @@ export type McpResult<T> = { ok: true; value: T } | { ok: false; message: string
 export const MCP_NAME_PATTERN = /^[A-Za-z0-9_-]{1,32}$/;
 
 /** The server's `detail`, in words: a string as is, FastAPI's validation list joined. */
-export const describeDetail = (detail: unknown, status: number): string => {
+export const describeDetail = (detail: unknown, _status?: number): string => {
   if (typeof detail === 'string' && detail.trim()) return detail;
   if (Array.isArray(detail)) {
     const parts = detail
@@ -22,7 +22,7 @@ export const describeDetail = (detail: unknown, status: number): string => {
       .filter(Boolean);
     if (parts.length) return parts.join('; ');
   }
-  return `The server refused the request (HTTP ${status}).`;
+  return 'The server refused the request.';
 };
 
 const send = async <T>(url: string, method: string, body?: unknown): Promise<McpResult<T>> => {
@@ -33,8 +33,8 @@ const send = async <T>(url: string, method: string, body?: unknown): Promise<Mcp
       headers: body === undefined ? undefined : { 'Content-Type': 'application/json' },
       body: body === undefined ? undefined : JSON.stringify(body),
     });
-  } catch (err) {
-    return { ok: false, message: `The app could not be reached: ${String(err)}` };
+  } catch (_err) {
+    return { ok: false, message: 'The app could not be reached.' };
   }
   const data = (await res.json().catch(() => ({}))) as unknown;
   if (!res.ok) {

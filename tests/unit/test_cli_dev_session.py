@@ -13,7 +13,7 @@ from typer.testing import CliRunner
 from uclone_x.agent.models import PlanState, PlanStep
 from uclone_x.agent.session import SessionState, SessionStore
 from uclone_x.cli import main
-from uclone_x.llm.models import ChatMessage, MessageRole, ToolCallRequest
+from uclone_x.llm.models import ChatMessage, MessageRole, RenderedFrom, ToolCallRequest
 
 runner = CliRunner()
 
@@ -268,10 +268,15 @@ def test_cli_dev_session_show_renders_nested_tool_arguments(
 
 
 def test_cli_dev_session_show_marks_a_stored_tool_result(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A `tr_` excerpt or stub is marked as stored, as the legacy offload form was (#1653).
+    """A `tr_` excerpt or stub is marked as stored, by the result it records (#1653, #1848).
 
-    Killed by: src/uclone_x/cli/commands/session_dev.py :: if handle_in(msg.content) is not None:
-    Becomes: if False:
+    A form is saved with no text, only what it records (#1848): it is marked by that record,
+    and previewed as the form it is rather than as an empty message.
+
+    Killed by: src/uclone_x/cli/commands/session_dev.py :: stored = msg.rendered_from is not None
+    Becomes: stored = False
+    Killed by: src/uclone_x/cli/commands/session_dev.py :: content_preview = f"[dim italic]({msg.form} of a stored result)[/dim italic]"
+    Becomes: content_preview = ""
     """
     with TemporaryDirectory() as tmp:
         monkeypatch.setenv("UCLONE_SESSION_DIR", tmp)
@@ -282,12 +287,23 @@ def test_cli_dev_session_show_marks_a_stored_tool_result(monkeypatch: pytest.Mon
                 ChatMessage(
                     role=MessageRole.ASSISTANT,
                     content="",
-                    tool_calls=(ToolCallRequest(id="c1", name="dump", arguments={}),),
+                    tool_calls=(
+                        ToolCallRequest(id="c1", name="dump", arguments={}),
+                        ToolCallRequest(id="c2", name="dump", arguments={}),
+                    ),
                 ),
                 ChatMessage(
                     role=MessageRole.TOOL,
                     content="[Stored tool result tr_0123456789abcdef: 9,000 characters]\nx",
                     tool_call_id="c1",
+                ),
+                ChatMessage(
+                    role=MessageRole.TOOL,
+                    tool_call_id="c2",
+                    form="excerpt",
+                    rendered_from=RenderedFrom(
+                        handle="tr_00000000000000aa", limit=100, readable=True
+                    ),
                 ),
             ),
             turn_counter=1,
@@ -295,4 +311,7 @@ def test_cli_dev_session_show_marks_a_stored_tool_result(monkeypatch: pytest.Mon
         store.save(state)
         res = runner.invoke(main.app, ["dev", "session", "show", "sess_stored"])
         assert res.exit_code == 0
-        assert "(stored)" in res.output
+        # Only the form: output that quotes a stored-result header is its own text, not
+        # a stored result (#1974, item 8).
+        assert res.output.count("(stored)") == 1
+        assert "excerpt of a stored result" in " ".join(res.output.split())

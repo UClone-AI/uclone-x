@@ -11,10 +11,8 @@ from uclone_x.agent.base import BaseAgent
 from uclone_x.agent.models import AgentConfig, AgentLLMConfig
 from uclone_x.agent.session import SessionStore
 from uclone_x.core.provenance import Provenance
-from uclone_x.core.tool_results import artifacts_dir_for, handle_in, load_tool_result
+from uclone_x.core.tool_results import handle_in
 from uclone_x.engine.event_bus import AgentEvent, EventBus, EventType
-from uclone_x.errors import PathTraversalError
-from uclone_x.llm.compactor import ContextCompactor
 from uclone_x.llm.connectors.mock import MockLLMConnector
 from uclone_x.llm.models import ChatMessage, MessageRole, ToolCallRequest
 from uclone_x.tools.builtin.filesystem import FileReadTool
@@ -27,9 +25,9 @@ async def test_tool_output_offload_recovery_and_cleanup(tmp_path: Path) -> None:
     """L2 integration test:
     1. Tool produces oversized output exceeding max_tool_output_chars.
     2. Context compactor offloads to the session's result store instead of truncating.
-    3. The stored body holds the full content, including the middle section.
-    4. Path traversal attempt during offload is refused.
-    5. Session deletion cleans up tool artifacts from disk.
+    3. The stored body holds the full content, including the middle section, and it
+       is kept in the session store, not the workspace (#1848).
+    4. Session deletion removes the kept body from disk.
     """
     ws = tmp_path / "workspace"
     ws.mkdir()
@@ -38,7 +36,7 @@ async def test_tool_output_offload_recovery_and_cleanup(tmp_path: Path) -> None:
     bus = EventBus(maxsize=100)
     await bus.start()
 
-    store = SessionStore(storage_dir=sessions_dir, workspace_root=ws)
+    store = SessionStore(storage_dir=sessions_dir)
     tools = ToolRegistry()
 
     # Register FileReadTool
@@ -135,39 +133,36 @@ async def test_tool_output_offload_recovery_and_cleanup(tmp_path: Path) -> None:
         assert "file_read" not in tool_msg.content
         assert "tool_result_read" not in tool_msg.content
 
-        # 3. The stored body is the whole output, middle section included
-        artifacts = artifacts_dir_for(ws)
-        stored = load_tool_result(artifacts, agent.session_id, handle)
+        # 3. The stored body is the whole output, middle section included, and it is
+        # kept among the session's context bodies rather than under the workspace.
+        agent.persist_session()
+        bodies = agent._result_bodies(agent.session_id)  # pyright: ignore[reportPrivateUsage]
+        stored = bodies.read(handle)
+        assert stored is not None
         assert stored == large_payload
         assert "RECOVERABLE_KEY_#472" in stored
-        artifact_rel_path = f".sandbox/tool_artifacts/{agent.session_id}/{handle}.txt"
+        # Stored once (#2013): the result fit the history whole, so the body that holds it
+        # is its message's entry, and compaction names that entry instead of writing the
+        # text again as a body of its own.
+        body_dir = store.context_body_dir(agent.session_id)
+        files = list(body_dir.iterdir())
+        assert all(f.read_text(encoding="utf-8") != large_payload for f in files)
+        kept = [
+            f
+            for f in files
+            if f.read_text(encoding="utf-8").startswith("{")
+            and (m := ChatMessage.model_validate_json(f.read_text(encoding="utf-8"))).role
+            == MessageRole.TOOL
+            and m.content == large_payload
+        ]
+        assert len(kept) == 1
+        assert not (ws / ".sandbox" / "tool_artifacts").exists()
 
-        # 4. Assert traversal refusal
-        compactor_bad = ContextCompactor(
-            workspace_root=ws,
-            session_id="../../escaped",
-            max_tool_output_chars=100,
-        )
-        oversized_msg = ChatMessage(
-            role=MessageRole.TOOL,
-            name="evil_tool",
-            content="E" * 500,
-            tool_call_id="call_evil",
-        )
-        with pytest.raises(PathTraversalError):
-            compactor_bad.prune_tool_message(oversized_msg)
-
-        # 5. Verify session artifact cleanup
-        artifact_file = ws / artifact_rel_path
-        assert artifact_file.is_file()
-
-        # Delete session
+        # 4. Deleting the session removes the kept body
         deleted = agent.delete_session()
         assert deleted is True
-
-        # Artifact file and session directory should now be removed
-        assert not artifact_file.exists()
-        assert not artifact_file.parent.exists()
+        assert not kept[0].exists()
+        assert not body_dir.exists()
 
     finally:
         sub.close()

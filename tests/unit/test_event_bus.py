@@ -31,7 +31,6 @@ from uclone_x.engine.event_bus import (
     UnauthorizedPublishError,
     UnauthorizedSubscriptionError,
     _drop_lowest_priority_from_queue,  # pyright: ignore[reportPrivateUsage]
-    _drop_oldest_from_priority_queue,  # pyright: ignore[reportPrivateUsage]
 )
 
 # ==============================================================================
@@ -709,14 +708,6 @@ def test_drop_lowest_priority_from_queue_heap_eviction() -> None:
     remaining = q.get_nowait()
     assert remaining.event_id == "e_crit"
     assert q.empty()
-
-
-def test_backpressure_policy_backward_compatibility() -> None:
-    """Verify DROP_OLDEST is a backward-compatible alias of DROP_LOWEST_PRIORITY."""
-    assert BackpressurePolicy.DROP_OLDEST == BackpressurePolicy.DROP_LOWEST_PRIORITY
-    assert BackpressurePolicy("drop_oldest") is BackpressurePolicy.DROP_LOWEST_PRIORITY
-    assert BackpressurePolicy("drop_lowest_priority") is BackpressurePolicy.DROP_LOWEST_PRIORITY
-    assert _drop_oldest_from_priority_queue is _drop_lowest_priority_from_queue
 
 
 @pytest.mark.asyncio

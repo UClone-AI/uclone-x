@@ -444,9 +444,11 @@ const ToolResultView: React.FC<{ result: TraceToolResult }> = ({ result }) => {
         ) : null}
       </div>
       <Pre tone={failed ? 'error' : 'plain'}>
-        {result.output === null || result.output === undefined
-          ? t.noOutput
-          : asText(result.output)}
+        {result.output_unavailable
+          ? t.outputUnavailable
+          : result.output === null || result.output === undefined
+            ? t.noOutput
+            : asText(result.output)}
       </Pre>
     </li>
   );

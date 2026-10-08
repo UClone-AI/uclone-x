@@ -33,9 +33,10 @@ pytestmark = pytest.mark.e2e
 VIEWPORT: ViewportSize = {"width": 1280, "height": 900}
 ROOM_ID = "room_from_the_terminal"
 MEMBERSHIP_ROWS = {
-    "en-US": ["You joined this conversation", "scout joined this conversation"],
-    # A Latin name keeps the paired particle (author's choice, #1900).
-    "ko-KR": ["이 대화에 참여했습니다", "scout이(가) 이 대화에 참여했습니다"],
+    # The head's row names the clone as the listing does, in the screen's language: its
+    # display name, not its id. A Latin name's paired particle is pinned in `particles.test.ts`.
+    "en-US": ["You joined this conversation", "Scout joined this conversation"],
+    "ko-KR": ["이 대화에 참여했습니다", "탐색가가 이 대화에 참여했습니다"],
 }
 NOTE = {
     "en-US": "This conversation continues in ucx run, in the terminal. "
@@ -47,6 +48,7 @@ NOTE = {
 @pytest.fixture
 def head_room_ui(tmp_path: Path) -> Iterator[str]:
     """The app over a storage folder holding one room `ucx run` wrote."""
+    from uclone_x.core.agent_home import seat_id_for
     from uclone_x.room.one_seat import HeadTurn, record_head_turn
     from uclone_x.room.store import RoomStore
 
@@ -54,7 +56,8 @@ def head_room_ui(tmp_path: Path) -> Iterator[str]:
     record_head_turn(
         RoomStore(storage_dir / "rooms"),
         room_id=ROOM_ID,
-        clone_id="scout",
+        # `ucx run` seats the clone by its id, resolved from the handle it was given.
+        clone_id=seat_id_for("scout"),
         turn=HeadTurn(prompt="what is in the index?", content="three tables"),
         head="run",
     )

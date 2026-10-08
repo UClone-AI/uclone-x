@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { SettingsModal } from './SettingsModal';
-import type { CatalogResult, RuntimeSettings } from '../types';
+import type { RuntimeSettings } from '../types';
 import { expectPlain } from '../test/plainCopy';
 import { en } from '../i18n/en';
 import { fmt, plural } from '../i18n/format';
@@ -11,21 +11,14 @@ import { LocaleProvider } from '../i18n';
 const SETTINGS_FAILURE = en.settings.failure;
 const PERSONA_EDITOR_COPY = en.personaEditor;
 
-/**
- * Covers the Ollama install/delete controls added to the model management
- * section: loading state, success refresh, error surfacing, and the
- * `window.confirm` cancel path for delete (#1163-adjacent Ollama lifecycle work).
- */
-
 const baseSettings: RuntimeSettings = {
-  llm_provider: 'ollama',
-  llm_base_url: 'http://localhost:11434',
-  llm_model: 'qwen3:8b',
-  llm_api_key_set: false,
-  llm_api_key_masked: '',
-  comfyui_base_url: 'http://127.0.0.1:8188',
-  providers_available: ['ollama'],
-  available_models: ['qwen3:8b', 'llama3.2:1b'],
+};
+
+/** `GET /api/models`: no connection lists anything, and nothing is chosen. */
+const emptyModelSet = {
+  groups: [],
+  defaults: { deep: null, fast: null, image: 'auto' },
+  recommended: { deep: null, fast: null },
 };
 
 const consentPayload = {
@@ -48,7 +41,7 @@ const reportPayload = {
   search_url: null,
 };
 
-const personasPayload = { personas: [], available_tools: [], personas_dir: null };
+const personasPayload = { clones: [], available_tools: [], personas_dir: null };
 
 /** Developer mode is a required prop; the cases that are not about it render it off, its default. */
 const devModeOff = { developerMode: false, onDeveloperModeChange: () => {} };
@@ -74,8 +67,11 @@ const mockFetch = (overrides: Record<string, Handler> = {}) => {
       if (url.includes(pattern)) return handler(url, init);
     }
     if (url.includes('/api/settings/remote-gpu/status')) return jsonResponse({ host: '', connected: false });
+    if (url.includes('/api/settings/remote-gpu/hosts')) return jsonResponse({ hosts: ['macmini', 'dell'] });
     if (url.includes('/api/settings')) return jsonResponse(baseSettings);
-    if (url.includes('/api/personas')) return jsonResponse(personasPayload);
+    if (url.includes('/api/connections')) return jsonResponse({ connections: [], kinds: [] });
+    if (url.includes('/api/models')) return jsonResponse(emptyModelSet);
+    if (url.includes('/api/clones')) return jsonResponse(personasPayload);
     if (url.includes('/api/diagnostics/consent')) return jsonResponse(consentPayload);
     if (url.includes('/api/diagnostics/report')) return jsonResponse(reportPayload);
     return jsonResponse({});
@@ -84,350 +80,13 @@ const mockFetch = (overrides: Record<string, Handler> = {}) => {
   return calls;
 };
 
-describe('SettingsModal Ollama model management', () => {
-  beforeEach(() => vi.restoreAllMocks());
-  afterEach(() => vi.unstubAllGlobals());
-
-  it('installs a model and refreshes the list on success', async () => {
-    const calls = mockFetch({
-      '/api/models/pull': () => jsonResponse({ status: 'ok', model: 'llama3.2:3b' }),
-    });
-
-    render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
-
-    const input = await screen.findByLabelText(/model to install/i);
-    fireEvent.change(input, { target: { value: 'llama3.2:3b' } });
-    fireEvent.click(screen.getByRole('button', { name: /install/i }));
-
-    await waitFor(() => {
-      expect(calls.some((c) => c.method === 'POST' && c.url.includes('/api/models/pull'))).toBe(
-        true,
-      );
-    });
-    const pullCall = calls.find((c) => c.url.includes('/api/models/pull'));
-    expect(pullCall?.body).toEqual({ model: 'llama3.2:3b' });
-
-    expect(await screen.findByText(/installed model/i)).toBeTruthy();
-    // Success clears the input and refetches /api/settings to pick up the new model.
-    expect((input as HTMLInputElement).value).toBe('');
-    expect(calls.filter((c) => c.method === 'GET' && c.url === '/api/settings').length).toBe(
-      2,
-    );
-  });
-
-  it('shows a spinner and disables the input while installing', async () => {
-    let resolvePull: (() => void) | undefined;
-    mockFetch({
-      '/api/models/pull': () =>
-        new Promise((resolve) => {
-          resolvePull = () => resolve(jsonResponse({ status: 'ok', model: 'llama3.2:3b' }));
-        }),
-    });
-
-    render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
-
-    const input = await screen.findByLabelText(/model to install/i);
-    fireEvent.change(input, { target: { value: 'llama3.2:3b' } });
-    fireEvent.click(screen.getByRole('button', { name: /install/i }));
-
-    await waitFor(() => expect((input as HTMLInputElement).disabled).toBe(true));
-
-    resolvePull?.();
-    await waitFor(() => expect((input as HTMLInputElement).disabled).toBe(false));
-  });
-
-  it('shows the provider-reported error when install fails', async () => {
-    mockFetch({
-      '/api/models/pull': () =>
-        jsonResponse({ detail: 'Ollama provider returned status 404: not found' }, false, 502),
-    });
-
-    render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
-
-    const input = await screen.findByLabelText(/model to install/i);
-    fireEvent.change(input, { target: { value: 'no-such-model' } });
-    fireEvent.click(screen.getByRole('button', { name: /install/i }));
-
-    expect(await screen.findByText(/status 404/i)).toBeTruthy();
-  });
-
-  it('asks before deleting, and sends nothing when cancelled', async () => {
-    const calls = mockFetch();
-    vi.stubGlobal('confirm', vi.fn(() => false));
-
-    render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
-
-    const deleteButton = await screen.findByRole('button', { name: /delete llama3\.2:1b/i });
-    fireEvent.click(deleteButton);
-
-    expect(calls.some((c) => c.url.includes('/api/models/delete'))).toBe(false);
-  });
-
-  it('deletes a model after confirmation and refreshes the list', async () => {
-    const calls = mockFetch({
-      '/api/models/delete': () => jsonResponse({ status: 'ok', model: 'llama3.2:1b' }),
-    });
-    vi.stubGlobal('confirm', vi.fn(() => true));
-
-    render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
-
-    const deleteButton = await screen.findByRole('button', { name: /delete llama3\.2:1b/i });
-    fireEvent.click(deleteButton);
-
-    await waitFor(() => {
-      expect(calls.some((c) => c.method === 'POST' && c.url.includes('/api/models/delete'))).toBe(
-        true,
-      );
-    });
-    const deleteCall = calls.find((c) => c.url.includes('/api/models/delete'));
-    expect(deleteCall?.body).toEqual({ model: 'llama3.2:1b' });
-    expect(await screen.findByText(/deleted model/i)).toBeTruthy();
-  });
-
-  it('shows the provider-reported error when delete fails', async () => {
-    mockFetch({
-      '/api/models/delete': () =>
-        jsonResponse({ detail: 'Ollama provider returned status 404: not found' }, false, 502),
-    });
-    vi.stubGlobal('confirm', vi.fn(() => true));
-
-    render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
-
-    const deleteButton = await screen.findByRole('button', { name: /delete llama3\.2:1b/i });
-    fireEvent.click(deleteButton);
-
-    expect(await screen.findByText(/status 404/i)).toBeTruthy();
-  });
-
-  it('does not show model management controls for a non-Ollama provider', async () => {
-    mockFetch({
-      '/api/settings': () => jsonResponse({ ...baseSettings, llm_provider: 'openai' }),
-    });
-
-    render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
-
-    await screen.findByText(/Endpoint Base URL/i);
-    expect(screen.queryByTestId('ollama-model-management')).toBeNull();
-  });
-});
-
-/**
- * The Ollama picker lists what the server on the form answers (#1666). The saved list is empty
- * when the saved address stopped answering (a remote-GPU tunnel that went away), and `[]` is
- * truthy: it used to hide every other source, so the picker vanished with no word why.
- */
-describe('SettingsModal local model list (#1666)', () => {
-  beforeEach(() => vi.restoreAllMocks());
-  afterEach(() => vi.unstubAllGlobals());
-
-  const deadTunnel: RuntimeSettings = {
-    ...baseSettings,
-    llm_base_url: 'http://127.0.0.1:11435',
-    available_models: [],
-  };
-  const listing = (models: string[], reachable: boolean) => () =>
-    jsonResponse({ provider: 'ollama', models, reachable, catalog: null });
-  const catalogCalls = (calls: ReturnType<typeof mockFetch>) =>
-    calls.filter((c) => c.method === 'POST' && c.url.includes('/api/models/catalog'));
-
-  // Killed by: frontend/src/components/SettingsModal.tsx :: const localNotAnswering = needsLocalListing && localMatches
-  // Becomes: const localNotAnswering = false && needsLocalListing && localMatches
-  it('says nothing answered at a saved address that is dead, instead of an empty field', async () => {
-    const calls = mockFetch({
-      '/api/settings': () => jsonResponse(deadTunnel),
-      '/api/models/catalog': listing([], false),
-    });
-    render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
-
-    const note = await screen.findByTestId('settings-local-not-answering');
-    expect(note.textContent).toBe(
-      fmt(en.settings.llm.ollamaNotAnswering, { endpoint: 'http://127.0.0.1:11435' }),
-    );
-    expect(catalogCalls(calls)[0]?.body).toEqual({ provider: 'ollama', base_url: 'http://127.0.0.1:11435' });
-    expect(screen.queryByTestId('settings-model-select')).toBeNull();
-  });
-
-  // Killed by: frontend/src/components/SettingsModal.tsx :: : localMatches && localListing.models.length > 0
-  // Becomes: : false && localMatches && localListing.models.length > 0
-  it('lists the models at an address typed on the form, before it is saved', async () => {
-    const calls = mockFetch({
-      '/api/settings': () => jsonResponse(deadTunnel),
-      '/api/models/catalog': (_url, init) => {
-        const asked = JSON.parse(init?.body as string) as { base_url?: string };
-        return asked.base_url === 'http://localhost:11434'
-          ? listing(['qwen3:8b', 'gemma3:4b'], true)()
-          : listing([], false)();
-      },
-    });
-    render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
-    await screen.findByTestId('settings-local-not-answering');
-
-    const endpoint = screen.getByPlaceholderText('http://localhost:11434') as HTMLInputElement;
-    fireEvent.change(endpoint, { target: { value: 'http://localhost:11434' } });
-
-    const select = (await screen.findByTestId('settings-model-select', {}, { timeout: 2000 })) as HTMLSelectElement;
-    const options = within(select).getAllByRole('option').map((o) => (o as HTMLOptionElement).value);
-    expect(options).toEqual(['qwen3:8b', 'gemma3:4b', '__custom__']);
-    expect(screen.queryByTestId('settings-local-not-answering')).toBeNull();
-    expect(calls.some((c) => c.method === 'POST' && c.url === '/api/settings')).toBe(false);
-  });
-
-  // Killed by: frontend/src/components/SettingsModal.tsx :: : testResults?.llm?.models ?? [];
-  // Becomes: : [];
-  it('shows the models a connection check found when the saved list is empty', async () => {
-    mockFetch({
-      '/api/settings/test': () =>
-        jsonResponse({ results: { llm: { status: 'ok', provider: 'ollama', models: ['hermes3:8b'] } } }),
-      '/api/settings': () => jsonResponse(deadTunnel),
-      '/api/models/catalog': listing([], false),
-    });
-    render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
-    await screen.findByTestId('settings-local-not-answering');
-
-    fireEvent.click(screen.getByRole('button', { name: /check connection/i }));
-
-    const select = (await screen.findByTestId('settings-model-select')) as HTMLSelectElement;
-    expect(within(select).getAllByRole('option').map((o) => (o as HTMLOptionElement).value)).toEqual([
-      'hermes3:8b',
-      '__custom__',
-    ]);
-  });
-
-  // Killed by: frontend/src/components/SettingsModal.tsx :: llmProvider === 'ollama' && needsLocalListing && localMatches && localListing.reachable
-  // Becomes: false && needsLocalListing && localMatches && localListing.reachable
-  it('tells a running Ollama with nothing installed apart from a stopped one', async () => {
-    mockFetch({
-      '/api/settings': () => jsonResponse({ ...baseSettings, available_models: [] }),
-      '/api/models/catalog': listing([], true),
-    });
-    render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
-
-    const note = await screen.findByTestId('settings-ollama-no-models');
-    expect(note.textContent).toBe(en.settings.llm.ollamaNoModels);
-    expect(screen.queryByTestId('settings-local-not-answering')).toBeNull();
-  });
-
-  // Killed by: frontend/src/components/SettingsModal.tsx :: disabled={installing || !pullModelInput.trim() || !onSavedServer}
-  // Becomes: disabled={installing || !pullModelInput.trim()}
-  it('installs and removes only at the saved address, which is where those requests go', async () => {
-    mockFetch({ '/api/models/catalog': listing(['other:1b'], true) });
-    render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
-    await screen.findByRole('button', { name: /delete llama3\.2:1b/i });
-
-    const endpoint = screen.getByPlaceholderText('http://localhost:11434') as HTMLInputElement;
-    fireEvent.change(endpoint, { target: { value: 'http://gpu-box:11434' } });
-    fireEvent.change(screen.getByLabelText(/model to install/i), { target: { value: 'llama3.2:3b' } });
-
-    expect(screen.getByTestId('settings-models-save-first').textContent).toBe(en.settings.models.saveToManage);
-    expect(screen.queryByRole('button', { name: /delete llama3\.2:1b/i })).toBeNull();
-    expect((screen.getByRole('button', { name: /^install$/i }) as HTMLButtonElement).disabled).toBe(true);
-  });
-
-  // Killed by: frontend/src/components/SettingsModal.tsx :: savedModels.length === 0 &&
-  // Becomes: true &&
-  it('does not ask again when the saved address already listed its models', async () => {
-    const calls = mockFetch();
-    render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
-    await screen.findByTestId('settings-model-select');
-    await new Promise((r) => setTimeout(r, 50));
-    expect(catalogCalls(calls)).toEqual([]);
-  });
-
-  // Killed by: frontend/src/components/SettingsModal.tsx :: sameEndpoint(currentSettings.llm_base_url ?? '', formEndpoint);
-  // Becomes: (currentSettings.llm_base_url ?? '').trim() === formEndpoint;
-  it('treats localhost and 127.0.0.1 on the saved port as the saved server', async () => {
-    const calls = mockFetch({
-      '/api/settings': () => jsonResponse({ ...baseSettings, llm_base_url: 'http://127.0.0.1:11434' }),
-      '/api/models/catalog': listing([], false),
-    });
-    render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
-    await screen.findByRole('button', { name: /delete llama3\.2:1b/i });
-
-    const endpoint = screen.getByPlaceholderText('http://localhost:11434') as HTMLInputElement;
-    fireEvent.change(endpoint, { target: { value: 'http://localhost:11434/' } });
-    fireEvent.change(screen.getByLabelText(/model to install/i), { target: { value: 'llama3.2:3b' } });
-    await new Promise((r) => setTimeout(r, 600));
-
-    expect(screen.queryByTestId('settings-models-save-first')).toBeNull();
-    expect((screen.getByRole('button', { name: /^install$/i }) as HTMLButtonElement).disabled).toBe(false);
-    expect(screen.getByRole('button', { name: /delete llama3\.2:1b/i })).toBeTruthy();
-    const select = screen.getByTestId('settings-model-select') as HTMLSelectElement;
-    expect(within(select).getAllByRole('option').map((o) => (o as HTMLOptionElement).value)).toEqual([
-      'qwen3:8b',
-      'llama3.2:1b',
-      '__custom__',
-    ]);
-    // The saved list answered; the typed spelling is not asked about as a new server.
-    expect(catalogCalls(calls)).toEqual([]);
-    expect(screen.getByTestId('settings-llm-connected').textContent).toBe(
-      plural(en.settings.llm.localConnected, 2),
-    );
-  });
-
-  // Killed by: frontend/src/components/SettingsModal.tsx :: {localConnectedCount !== null &&
-  // Becomes: {false && localConnectedCount !== null &&
-  it('says the local server is connected, and how many models it has, before saving', async () => {
-    mockFetch({
-      '/api/settings': () => jsonResponse(deadTunnel),
-      '/api/models/catalog': (_url, init) => {
-        const asked = JSON.parse(init?.body as string) as { base_url?: string };
-        return asked.base_url === 'http://localhost:11434'
-          ? listing(['qwen3:8b', 'gemma3:4b', 'phi4:14b'], true)()
-          : listing([], false)();
-      },
-    });
-    render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
-    await screen.findByTestId('settings-local-not-answering');
-    expect(screen.queryByTestId('settings-llm-connected')).toBeNull();
-
-    const endpoint = screen.getByPlaceholderText('http://localhost:11434') as HTMLInputElement;
-    fireEvent.change(endpoint, { target: { value: 'http://localhost:11434' } });
-
-    const line = await screen.findByTestId('settings-llm-connected', {}, { timeout: 2000 });
-    expect(line.textContent).toBe(plural(en.settings.llm.localConnected, 3));
-    expect(screen.queryByTestId('settings-local-not-answering')).toBeNull();
-  });
-
-  // Killed by: frontend/src/components/SettingsModal.tsx :: : needsLocalListing && localMatches && localListing.reachable
-  // Becomes: : needsLocalListing && localMatches
-  it('does not say connected when the local server did not answer', async () => {
-    mockFetch({
-      '/api/settings': () => jsonResponse(deadTunnel),
-      '/api/models/catalog': listing([], false),
-    });
-    render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
-    await screen.findByTestId('settings-local-not-answering');
-    expect(screen.queryByTestId('settings-llm-connected')).toBeNull();
-  });
-
-  it('says it in Korean too', async () => {
-    mockFetch({
-      '/api/settings': () => jsonResponse(deadTunnel),
-      '/api/models/catalog': listing([], false),
-    });
-    render(
-      <LocaleProvider hints={["ko-KR"]}>
-        <SettingsModal {...devModeOff} isOpen onClose={() => {}} />
-      </LocaleProvider>,
-    );
-    const note = await screen.findByTestId('settings-local-not-answering');
-    expect(note.textContent).toBe(fmt(ko.settings.llm.ollamaNotAnswering, { endpoint: 'http://127.0.0.1:11435' }));
-  });
-});
-
-/**
- * Escape closing the modal used to be the modal's own `window.addEventListener` (#1036).
- * It now goes through the shared owner in `lib/escapePrecedence.ts`, so what is worth
- * pinning here is that this surface still claims the `'dialog'` layer while open, and
- * gives it up once closed.
- */
 describe('SettingsModal Escape (#1036)', () => {
   beforeEach(() => {
     vi.stubGlobal(
       'fetch',
       vi.fn(async (url: string) => {
-        if (url.includes('/api/personas')) {
-          return { ok: true, json: async () => ({ personas: [], personas_dir: '' }) } as Response;
+        if (url.includes('/api/clones')) {
+          return { ok: true, json: async () => ({ clones: [], personas_dir: '' }) } as Response;
         }
         if (url.includes('/api/diagnostics/consent')) {
           return {
@@ -454,8 +113,8 @@ describe('SettingsModal Escape (#1036)', () => {
     const onClose = vi.fn();
     render(<SettingsModal {...devModeOff} isOpen={false} onClose={onClose} />);
 
-    // Killed by: frontend/src/components/SettingsModal.tsx :: useEscapeOwner('dialog', isOpen, onClose);
-    // Becomes: useEscapeOwner('dialog', true, onClose);
+    // Killed by: frontend/src/components/SettingsModal.tsx :: useEscapeOwner('dialog', isOpen, handleClose);
+    // Becomes: useEscapeOwner('dialog', true, handleClose);
     fireEvent.keyDown(window, { key: 'Escape' });
 
     expect(onClose).not.toHaveBeenCalled();
@@ -480,267 +139,6 @@ describe('SettingsModal Escape (#1036)', () => {
  * signal leaves the promise unresolved and the assertion fails within the
  * `waitFor` budget instead of passing because the request happened to be quick.
  */
-describe('SettingsModal install cancellation (#1233)', () => {
-  /** A fetch whose `/api/models/pull` never settles until the caller's signal aborts. */
-  const mockHeldPull = () => {
-    const seen: { signal?: AbortSignal | null } = {};
-    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
-      if (url.includes('/api/models/pull')) {
-        seen.signal = init?.signal;
-        return new Promise<RouteResponse>((_resolve, reject) => {
-          init?.signal?.addEventListener('abort', () => {
-            // What a real `fetch` rejects with. Detected by `name`, since jsdom's
-            // DOMException is not the one a bundled `instanceof` would match.
-            const err = new Error('The operation was aborted.');
-            err.name = 'AbortError';
-            reject(err);
-          });
-        });
-      }
-      if (url.includes('/api/settings/remote-gpu/status')) return jsonResponse({ host: '', connected: false });
-      if (url.includes('/api/settings')) return jsonResponse(baseSettings);
-      if (url.includes('/api/personas')) return jsonResponse(personasPayload);
-      if (url.includes('/api/diagnostics/consent')) return jsonResponse(consentPayload);
-      if (url.includes('/api/diagnostics/report')) return jsonResponse(reportPayload);
-      return jsonResponse({});
-    });
-    vi.stubGlobal('fetch', fetchMock);
-    return seen;
-  };
-
-  const startAnInstall = async () => {
-    const input = await screen.findByLabelText(/model to install/i);
-    fireEvent.change(input, { target: { value: 'qwen3:8b' } });
-    fireEvent.click(screen.getByRole('button', { name: /^install$/i }));
-    return input as HTMLInputElement;
-  };
-
-  beforeEach(() => vi.restoreAllMocks());
-  afterEach(() => vi.unstubAllGlobals());
-
-  it('gives the install request a signal that the Cancel button aborts', async () => {
-    // Killed by: frontend/src/components/SettingsModal.tsx :: pullAbortRef.current = controller;
-    // Becomes: pullAbortRef.current = null;
-    const seen = mockHeldPull();
-
-    render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
-    await startAnInstall();
-
-    await waitFor(() => expect(seen.signal).toBeTruthy());
-    expect(seen.signal?.aborted).toBe(false);
-
-    fireEvent.click(await screen.findByRole('button', { name: /cancel install/i }));
-
-    await waitFor(() => expect(seen.signal?.aborted).toBe(true));
-  });
-
-  it('reports a cancelled install as stopped waiting, not as a failure', async () => {
-    // Killed by: frontend/src/components/SettingsModal.tsx :: name === 'AbortError';
-    // Becomes: name === 'NotTheNameFetchUses';
-    mockHeldPull();
-
-    render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
-    const input = await startAnInstall();
-
-    fireEvent.click(await screen.findByRole('button', { name: /cancel install/i }));
-
-    // The user chose this. Ollama keeps its partial blobs and may well finish, so
-    // "Failed to install" would report a defeat that did not happen.
-    expect(await screen.findByText(/stopped waiting/i)).toBeTruthy();
-    expect(screen.queryByText(/failed to install/i)).toBeNull();
-    // Back to a state the user can act from, rather than stuck spinning.
-    await waitFor(() => expect(input.disabled).toBe(false));
-  });
-
-  it('aborts the in-flight install when the modal is closed', async () => {
-    // `isOpen={false}` returns null without unmounting, so closing Settings is not
-    // an unmount and an unmount-only cleanup would miss it entirely — which is the
-    // most likely way for this to be left running.
-    //
-    // Killed by: frontend/src/components/SettingsModal.tsx :: if (!isOpen) abortModelRequests();
-    // Becomes: if (isOpen) return;
-    const seen = mockHeldPull();
-
-    const { rerender } = render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
-    await startAnInstall();
-    await waitFor(() => expect(seen.signal).toBeTruthy());
-
-    rerender(<SettingsModal {...devModeOff} isOpen={false} onClose={() => {}} />);
-
-    await waitFor(() => expect(seen.signal?.aborted).toBe(true));
-  });
-
-  it('says so when the server joined this install to one already running', async () => {
-    // Killed by: frontend/src/components/SettingsModal.tsx :: text: fmt(data.joined ?
-    // Becomes: text: fmt(false ?
-    mockFetch({
-      '/api/models/pull': () =>
-        jsonResponse({ status: 'ok', model: 'qwen3:8b', joined: true }),
-    });
-
-    render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
-    await startAnInstall();
-
-    // Two clicks cost one download; a plain "Installed" would hide that and teach
-    // the user that clicking again is how you make it go faster.
-    expect(await screen.findByText(/already running/i)).toBeTruthy();
-  });
-});
-
-/**
- * vLLM as a selectable provider (#1304).
- *
- * The one provider on this panel with no default endpoint and no default model: a vLLM
- * server is launched per model on a port chosen at the command line, so anything this
- * modal pre-filled would be a guess at somebody else's `vllm serve` arguments. What the
- * card must therefore do is the opposite of the Ollama card — clear, not fill.
- */
-describe('SettingsModal vLLM provider (#1304)', () => {
-  const openAiSettings: RuntimeSettings = {
-    ...baseSettings,
-    llm_provider: 'openai',
-    llm_base_url: 'https://api.openai.com/v1',
-    llm_model: 'gpt-4o',
-    providers_available: ['ollama', 'vllm', 'openai', 'anthropic', 'gemini'],
-    available_models: [],
-  };
-
-  beforeEach(() => vi.restoreAllMocks());
-  afterEach(() => vi.unstubAllGlobals());
-
-  // A cloud provider's endpoint sits behind Advanced, open here because the fixture sets one,
-  // and its model is the free "Model name" field (#1631).
-  const cloudFields = async () => ({
-    endpoint: (await screen.findByPlaceholderText(en.settings.catalog.endpointPlaceholder)) as HTMLInputElement,
-    model: screen.getByRole('textbox', { name: en.settings.catalog.modelName }) as HTMLInputElement,
-  });
-  // The vLLM fields are other elements than the cloud ones, so they are read after the switch.
-  const vllmFields = () => ({
-    endpoint: screen.getByPlaceholderText(/vllm serve/) as HTMLInputElement,
-    model: screen.getByPlaceholderText(/qwen3:8b, hermes3:8b/i) as HTMLInputElement,
-  });
-
-  const selectVllm = async () => {
-    mockFetch({ '/api/settings': () => jsonResponse(openAiSettings) });
-    render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
-    const { endpoint, model } = await cloudFields();
-    expect(endpoint.value).toBe('https://api.openai.com/v1');
-    expect(model.value).toBe('gpt-4o');
-
-    fireEvent.click(screen.getByRole('button', { name: /vLLM/ }));
-    return vllmFields();
-  };
-
-  // Killed by: frontend/src/components/SettingsModal.tsx :: setLlmBaseUrl('');
-  // Becomes: setLlmBaseUrl(llmBaseUrl);
-  it('clears an endpoint carried over from another provider instead of keeping it', async () => {
-    const { endpoint } = await selectVllm();
-
-    // Empty, and empty specifically: `https://api.openai.com/v1` left in this field is the
-    // one wrong value worse than a blank one, because it is saved as configuration and
-    // then sends the operator's prompts to OpenAI from a panel that says vLLM.
-    expect(endpoint.value).toBe('');
-  });
-
-  // Killed by: frontend/src/components/SettingsModal.tsx :: setLlmModel('');
-  // Becomes: setLlmModel(llmModel);
-  it('clears a model carried over from another provider instead of keeping it', async () => {
-    const { model } = await selectVllm();
-
-    // A vLLM server answers any name but its own `--model` with a 404 about a model the
-    // operator never chose, so `gpt-4o` surviving the switch is worse than a blank field.
-    expect(model.value).toBe('');
-  });
-
-  // The denylist this replaced named the values the panel *pre-fills*, which is not the set of
-  // values the panel can *hold*: `ui/app.py`'s model list offers `gpt-4o-mini`, `o1-mini` and
-  // `o3-mini`, and an Ollama endpoint on any port but 11434 is still a legal endpoint. Each of
-  // those survived the switch and was then saved as `VLLM_MODEL` / `VLLM_BASE_URL`, which came
-  // back from the server as "The model gpt-4o-mini does not exist" — a sentence about a model
-  // the operator did not choose on a panel that said vLLM.
-  // Killed by: frontend/src/components/SettingsModal.tsx :: if (llmProvider !== 'vllm') {
-  // Becomes: if (llmBaseUrl.includes('api.openai.com')) {
-  it('clears values a denylist of the pre-filled ones would have kept', async () => {
-    mockFetch({
-      '/api/settings': () =>
-        jsonResponse({
-          ...openAiSettings,
-          llm_base_url: 'http://10.0.0.7:11500/v1',
-          llm_model: 'gpt-4o-mini',
-        }),
-    });
-    render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
-    const cloud = await cloudFields();
-    expect(cloud.endpoint.value).toBe('http://10.0.0.7:11500/v1');
-    expect(cloud.model.value).toBe('gpt-4o-mini');
-
-    fireEvent.click(screen.getByRole('button', { name: /vLLM/ }));
-
-    const { endpoint, model } = vllmFields();
-    expect(endpoint.value).toBe('');
-    expect(model.value).toBe('');
-  });
-
-  // The other half of "clear what another provider left": clearing is what a *change of
-  // provider* means, so re-selecting the card already selected must not wipe the two fields
-  // the operator just typed — they are the only source of them.
-  // Killed by: frontend/src/components/SettingsModal.tsx :: if (llmProvider !== 'vllm') {
-  // Becomes: if (true) {
-  it('keeps what the operator typed when vLLM is re-selected', async () => {
-    mockFetch({
-      '/api/settings': () =>
-        jsonResponse({
-          ...openAiSettings,
-          llm_provider: 'vllm',
-          llm_base_url: 'http://gpu.internal:8000/v1',
-          llm_model: 'qwen2.5-coder-32b-instruct',
-        }),
-    });
-    render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
-    // vLLM is already the provider, so the endpoint field carries vLLM's own placeholder.
-    const endpoint = (await screen.findByPlaceholderText(/vllm serve/)) as HTMLInputElement;
-    const model = screen.getByPlaceholderText(/qwen3:8b, hermes3:8b/i) as HTMLInputElement;
-
-    fireEvent.click(screen.getByRole('button', { name: /vLLM/ }));
-
-    expect(endpoint.value).toBe('http://gpu.internal:8000/v1');
-    expect(model.value).toBe('qwen2.5-coder-32b-instruct');
-  });
-
-  // Killed by: frontend/src/components/SettingsModal.tsx :: {llmProvider === 'vllm' && (
-  // Becomes: {false && (
-  it('says the API key is optional, because `vllm serve --api-key` is', async () => {
-    await selectVllm();
-
-    expect(screen.getByTestId('vllm-key-optional').textContent).toMatch(/optional/i);
-    expect(screen.getByTestId('vllm-key-optional').textContent).toMatch(/--api-key/);
-  });
-
-  // Killed by: frontend/src/components/SettingsModal.tsx :: { id: 'vllm', label: 'vLLM' },
-  // Becomes: { id: 'vllm', label: 'Self-hosted' },
-  it('offers a card labelled vLLM, the name the operator is looking for', async () => {
-    mockFetch({ '/api/settings': () => jsonResponse(openAiSettings) });
-    render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
-
-    await screen.findByText(/Endpoint Base URL/i);
-    expect(screen.getByRole('button', { name: /vLLM/ })).toBeTruthy();
-  });
-
-  // The vLLM branch was placed first in `handleProviderSelect`'s chain; this is the
-  // neighbour it must not have changed on the way in.
-  // Killed by: frontend/src/components/SettingsModal.tsx :: } else if (newProvider === 'ollama') {
-  // Becomes: } else if (false) {
-  it('still fills in localhost:11434 when Ollama is chosen', async () => {
-    mockFetch({ '/api/settings': () => jsonResponse(openAiSettings) });
-    render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
-    await cloudFields();
-
-    fireEvent.click(screen.getByRole('button', { name: /Ollama/ }));
-
-    const endpoint = screen.getByPlaceholderText('http://localhost:11434') as HTMLInputElement;
-    expect(endpoint.value).toBe('http://localhost:11434');
-  });
-});
 
 describe('SettingsModal developer mode (owner ruling 2026-09-22)', () => {
   beforeEach(() => vi.restoreAllMocks());
@@ -1374,9 +772,6 @@ describe('SettingsModal read-only folders', () => {
     read_roots_missing: ['~/gone'],
   };
 
-  const saveCall = (calls: ReturnType<typeof mockFetch>) =>
-    calls.find((c) => c.method === 'POST' && c.url.endsWith('/api/settings'));
-
   it('shows the workspace folder and each read-only folder, marking the missing one', async () => {
     mockFetch({ '/api/settings': () => jsonResponse(withRoots) });
     render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
@@ -1413,39 +808,47 @@ describe('SettingsModal read-only folders', () => {
     expect(screen.queryByRole('list', { name: 'Read-only folders' })).toBeNull();
   });
 
-  it('sends the edited list as read_roots on save', async () => {
+  const saveCalls = (calls: ReturnType<typeof mockFetch>) =>
+    calls.filter((c) => c.method === 'POST' && c.url.endsWith('/api/settings'));
+
+  // Killed by: frontend/src/components/SettingsModal.tsx :: const next = readRoots.filter((r) => r !== root);
+  // Becomes: const next = readRoots.filter((r) => r === root);
+  it('saves each folder change as it is made, and sends only the folders', async () => {
     const calls = mockFetch({
-      '/api/settings': (_url, init) =>
-        init?.method === 'POST'
-          ? jsonResponse({ ...withRoots, read_roots: ['/data/papers', '~/notes'], read_roots_missing: [] })
-          : jsonResponse(withRoots),
+      '/api/settings': (_url, init) => {
+        if (init?.method !== 'POST') return jsonResponse(withRoots);
+        const sent = JSON.parse(init.body as string) as { read_roots: string[] };
+        return jsonResponse({ ...withRoots, read_roots: sent.read_roots, read_roots_missing: [] });
+      },
     });
     render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
 
     fireEvent.click(await screen.findByRole('button', { name: 'Remove ~/gone' }));
+    await waitFor(() => expect(saveCalls(calls)).toHaveLength(1));
+    expect(saveCalls(calls)[0].body).toEqual({ read_roots: ['/data/papers'] });
+
     fireEvent.change(screen.getByLabelText(/folder to add/i), { target: { value: '  ~/notes ' } });
     fireEvent.click(screen.getByRole('button', { name: /add folder/i }));
-    fireEvent.click(screen.getByRole('button', { name: /save & apply/i }));
-
-    await waitFor(() => expect(saveCall(calls)).toBeTruthy());
-    expect((saveCall(calls)?.body as { read_roots?: string[] }).read_roots).toEqual([
-      '/data/papers',
-      '~/notes',
-    ]);
+    await waitFor(() => expect(saveCalls(calls)).toHaveLength(2));
+    expect(saveCalls(calls)[1].body).toEqual({ read_roots: ['/data/papers', '~/notes'] });
+    expect(await screen.findByTestId('settings-read-roots-status')).toHaveAttribute('data-state', 'saved');
   });
 
-  it('leaves read_roots out of the save when the list was not touched', async () => {
+  it('saves nothing when the folders were not touched and the window is closed', async () => {
     const calls = mockFetch({ '/api/settings': () => jsonResponse(withRoots) });
-    render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
+    const onClose = vi.fn();
+    render(<SettingsModal {...devModeOff} isOpen onClose={onClose} />);
 
     await screen.findByRole('list', { name: 'Read-only folders' });
-    fireEvent.click(screen.getByRole('button', { name: /save & apply/i }));
+    fireEvent.click(screen.getByTestId('settings-close'));
 
-    await waitFor(() => expect(saveCall(calls)).toBeTruthy());
-    expect(saveCall(calls)?.body).not.toHaveProperty('read_roots');
+    expect(onClose).toHaveBeenCalled();
+    expect(saveCalls(calls)).toEqual([]);
   });
 
-  it("shows the server's reason when it refuses a folder", async () => {
+  // Killed by: frontend/src/components/SettingsModal.tsx :: restore: setReadRoots,
+  // Becomes: restore: () => {},
+  it("shows the server's reason when it refuses a folder, and takes the folder back off the list", async () => {
     const detail = "read_roots: '/nope' is not an existing folder";
     mockFetch({
       '/api/settings': (_url, init) =>
@@ -1455,11 +858,32 @@ describe('SettingsModal read-only folders', () => {
 
     fireEvent.change(await screen.findByLabelText(/folder to add/i), { target: { value: '/nope' } });
     fireEvent.click(screen.getByRole('button', { name: /add folder/i }));
-    fireEvent.click(screen.getByRole('button', { name: /save & apply/i }));
 
     // Said as a sentence: the Core's words, with the full stop it left off (#1436).
-    expect(await screen.findByText(`${detail}.`)).toBeTruthy();
+    const status = await screen.findByTestId('settings-read-roots-status');
+    await waitFor(() => expect(status).toHaveAttribute('data-state', 'error'));
+    expect(status).toHaveTextContent(`${detail}. ${en.settings.autosave.restored}`);
+    const list = screen.getByRole('list', { name: 'Read-only folders' });
+    expect(Array.from(list.querySelectorAll('li')).map((r) => r.textContent)).toEqual([
+      '/data/papers',
+      '~/gonenot usable',
+    ]);
   });
+});
+
+describe('SettingsModal saves as you go', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('has no Save button to press: the footer only closes', async () => {
+    mockFetch({});
+    render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
+    await screen.findByTestId('settings-close');
+
+    expect(screen.queryByRole('button', { name: /save/i })).toBeNull();
+    expect(screen.queryByRole('button', { name: /check connection/i })).toBeNull();
+    expect(screen.getByTestId('settings-close')).toHaveTextContent(en.settings.footer.close);
+  });
+
 });
 
 describe('SettingsModal external tool servers', () => {
@@ -1526,65 +950,27 @@ describe('SettingsModal failures in plain words (#1436)', () => {
 
   it.each([
     ...faults,
-  ])('says the connection could not be tested after %s', async (_label, fault) => {
-    // Killed by: frontend/src/components/SettingsModal.tsx :: plainFailure(err, t.failure.test)
-    // Becomes: String(err)
-    mockFetch({ '/api/settings/test': fault, '/api/settings': () => jsonResponse(baseSettings) });
-    render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
-
-    await screen.findByLabelText(/model to install/i);
-    fireEvent.click(screen.getByRole('button', { name: /check connection/i }));
-
-    const feedback = await screen.findByTestId('settings-feedback');
-    expect(feedback).toHaveTextContent(SETTINGS_FAILURE.test);
-    expectPlain(feedback.textContent);
-  });
-
-  it.each([
-    ...faults,
-  ])('says saving went wrong after %s', async (_label, fault) => {
-    // Killed by: frontend/src/components/SettingsModal.tsx :: plainFailure(err, t.failure.save)
-    // Becomes: String(err)
+  ])('says saving went wrong after %s, under the field, and puts the saved value back', async (_label, fault) => {
+    // Killed by: frontend/src/components/SettingsModal.tsx :: `${plainFailure(err, copyRef.current.settings.failure.save)} ${copyRef.current.settings.autosave.restored}`
+    // Becomes: `${String(err)} ${copyRef.current.settings.autosave.restored}`
+    // Killed by: frontend/src/lib/useAutoSave.ts :: opts.current.restore(savedNow());
+    // Becomes:
     mockFetch({ '/api/settings': failOnly('/api/settings', 'POST', fault) });
     render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
 
-    await screen.findByLabelText(/model to install/i);
-    fireEvent.click(screen.getByRole('button', { name: /save & apply/i }));
+    const folder = await screen.findByLabelText(en.settings.folders.addLabel);
+    fireEvent.change(folder, { target: { value: '/tmp/notes' } });
+    fireEvent.keyDown(folder, { key: 'Enter' });
 
-    const feedback = await screen.findByTestId('settings-feedback');
-    expect(feedback).toHaveTextContent(SETTINGS_FAILURE.save);
-    expectPlain(feedback.textContent);
-  });
-
-  it.each([
-    ...faults,
-  ])('says installing went wrong after %s', async (_label, fault) => {
-    // Killed by: frontend/src/components/SettingsModal.tsx :: plainFailure(err, t.failure.install)
-    // Becomes: String(err)
-    mockFetch({ '/api/models/pull': fault });
-    render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
-
-    fireEvent.change(await screen.findByLabelText(/model to install/i), { target: { value: 'llama3.2:3b' } });
-    fireEvent.click(screen.getByRole('button', { name: /install/i }));
-
-    const feedback = await screen.findByTestId('settings-feedback');
-    expect(feedback).toHaveTextContent(SETTINGS_FAILURE.install);
-    expectPlain(feedback.textContent);
-  });
-
-  it.each([
-    ...faults,
-  ])('says deleting went wrong after %s', async (_label, fault) => {
-    // Killed by: frontend/src/components/SettingsModal.tsx :: plainFailure(err, t.failure.remove)
-    // Becomes: String(err)
-    mockFetch({ '/api/models/delete': fault });
-    render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
-
-    fireEvent.click(await screen.findByRole('button', { name: /delete llama3\.2:1b/i }));
-
-    const feedback = await screen.findByTestId('settings-feedback');
-    expect(feedback).toHaveTextContent(SETTINGS_FAILURE.remove);
-    expectPlain(feedback.textContent);
+    const status = await screen.findByTestId('settings-read-roots-status');
+    await waitFor(() => expect(status).toHaveAttribute('data-state', 'error'));
+    expect(status).toHaveTextContent(SETTINGS_FAILURE.save);
+    expect(status).toHaveTextContent(en.settings.autosave.restored);
+    expectPlain(status.textContent);
+    // The list shows what the app is still using, not the folder that was refused.
+    expect(screen.getByTestId('settings-read-roots')).not.toHaveTextContent('/tmp/notes');
+    // Said under the field, not in the banner at the top.
+    expect(screen.queryByTestId('settings-feedback')).toBeNull();
   });
 
   it.each([
@@ -1592,7 +978,7 @@ describe('SettingsModal failures in plain words (#1436)', () => {
   ])('says the clones could not be loaded after %s', async (_label, fault) => {
     // Killed by: frontend/src/components/SettingsModal.tsx :: setPersonaLoadError(coreReason(err) ?? '');
     // Becomes: setPersonaLoadError(String(err));
-    mockFetch({ '/api/personas': fault });
+    mockFetch({ '/api/clones': fault });
     render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
 
     const alert = await screen.findByText(/could not load clones/i);
@@ -1618,7 +1004,7 @@ describe('SettingsModal failures in plain words (#1436)', () => {
   it("keeps the Core's reason for the clones when it gives one", async () => {
     // Killed by: frontend/src/lib/personasApi.ts :: if (!res.ok) throw await failureOf(res);
     // Becomes: if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    mockFetch({ '/api/personas': () => jsonResponse({ detail: 'The clones folder is missing.' }, false, 500) });
+    mockFetch({ '/api/clones': () => jsonResponse({ detail: 'The clones folder is missing.' }, false, 500) });
     render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
 
     const alert = await screen.findByText(/could not load clones/i);
@@ -1626,147 +1012,42 @@ describe('SettingsModal failures in plain words (#1436)', () => {
   });
 });
 
-describe('SettingsModal API key onboarding', () => {
-  const geminiSettings: RuntimeSettings = {
-    ...baseSettings,
-    llm_provider: 'gemini',
-    llm_model: 'gemini-1.5-pro',
-  };
-
-  it('renders a direct console link when a public provider is selected', async () => {
-    mockFetch({
-      '/api/settings': () => jsonResponse(geminiSettings),
-    });
-    render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
-
-    const link = (await screen.findByTestId('provider-key-console-link')) as HTMLAnchorElement;
-    expect(link).toBeTruthy();
-    expect(link.href).toBe('https://aistudio.google.com/app/apikey');
-    expect(link.textContent).toContain('Google Gemini');
-  });
-
-  it('shows a format warning when a mismatched key is entered', async () => {
-    mockFetch({
-      '/api/settings': () => jsonResponse(geminiSettings),
-    });
-    render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
-
-    await screen.findByTestId('provider-key-console-link');
-    const input = screen.getByPlaceholderText(/Enter API key/i);
-    fireEvent.change(input, { target: { value: 'sk-proj-invalid1234567890' } });
-
-    const warning = await screen.findByTestId('api-key-warning');
-    expect(warning.textContent).toContain('OpenAI');
-  });
-
-  it('shows a valid format badge when a correct key is entered', async () => {
-    mockFetch({
-      '/api/settings': () => jsonResponse(geminiSettings),
-    });
-    render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
-
-    await screen.findByTestId('provider-key-console-link');
-    const input = screen.getByPlaceholderText(/Enter API key/i);
-    fireEvent.change(input, { target: { value: 'AIzaSy' + 'A'.repeat(33) } });
-
-    const validBadge = await screen.findByTestId('api-key-valid');
-    expect(validBadge.textContent).toContain('This looks like a valid Google Gemini key.');
-  });
-
-  // Killed by: frontend/src/components/SettingsModal.tsx :: setLlmModel(() => '');
-  // Becomes: setLlmModel((m) => m);
-  it('clears localhost:11434 and the Ollama model when switching to Gemini, and writes no model of its own', async () => {
-    // The listing never answers here, so what shows is the form before Google has spoken.
-    mockFetch({
-      '/api/models/catalog': () => new Promise<never>(() => {}),
-      '/api/settings': () =>
-        jsonResponse({
-          ...baseSettings,
-          llm_provider: 'ollama',
-          llm_base_url: 'http://localhost:11434',
-          llm_model: 'qwen3:8b',
-        }),
-    });
-    render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
-
-    const endpoint = (await screen.findByPlaceholderText('http://localhost:11434')) as HTMLInputElement;
-    expect(endpoint.value).toBe('http://localhost:11434');
-
-    fireEvent.click(screen.getByRole('button', { name: /Gemini/ }));
-
-    // No model id is remembered in source: the field is empty until Google's list says
-    // what exists, and the reason is said in words.
-    expect((screen.getByRole('textbox', { name: 'Model name' }) as HTMLInputElement).value).toBe('');
-    expect(screen.getByTestId('settings-model-catalog-detail').textContent).toBe(
-      fmt(en.settings.catalog.loading, { vendor: 'Google' }),
-    );
-    expect(screen.queryByTestId('curated-models-pills')).toBeNull();
-    // The endpoint is now an override behind Advanced, closed and empty.
-    const advanced = screen.getByRole('button', { name: en.settings.catalog.advanced });
-    expect(advanced).toHaveAttribute('aria-expanded', 'false');
-    fireEvent.click(advanced);
-    expect((screen.getByPlaceholderText(en.settings.catalog.endpointPlaceholder) as HTMLInputElement).value).toBe('');
-  });
-
-  it('does not display previous provider configured key badge when switching to Gemini', async () => {
-    mockFetch({
-      '/api/settings': () =>
-        jsonResponse({
-          ...baseSettings,
-          llm_provider: 'openai',
-          llm_base_url: 'https://api.openai.com/v1',
-          llm_model: 'gpt-4o',
-          llm_api_key_set: true,
-          llm_api_key_masked: 'sk-...1234',
-        }),
-    });
-    render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
-
-    await screen.findByText('Saved (sk-...1234)');
-
-    fireEvent.click(screen.getByRole('button', { name: /Gemini/ }));
-
-    expect(screen.queryByText('Saved (sk-...1234)')).toBeNull();
-    expect(screen.getByPlaceholderText(/AIzaSy/i)).toBeTruthy();
-  });
+describe('SettingsModal tabs', () => {
+  afterEach(() => vi.unstubAllGlobals());
 
   it('switches visible sections when tabs are clicked', async () => {
-    mockFetch({
-      '/api/settings': () => jsonResponse(geminiSettings),
-    });
+    mockFetch({});
     render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
 
     await screen.findByTestId('settings-tabs-bar');
     expect(screen.getByTestId('settings-tab-llm')).toBeTruthy();
 
     fireEvent.click(screen.getByTestId('settings-tab-llm'));
-    expect(screen.getByRole('button', { name: /Gemini/ })).toBeTruthy();
+    expect(await screen.findByTestId('settings-connections')).toBeTruthy();
+    expect(screen.getByTestId('settings-default-models')).toBeTruthy();
+    expect(screen.queryByTestId('settings-read-roots')).toBeNull();
   });
 
   it('opens on the tab a link asks for, each time it opens', async () => {
-    mockFetch({
-      '/api/settings': () => jsonResponse(geminiSettings),
-    });
+    mockFetch({});
     const props = { ...devModeOff, onClose: () => {}, initialTab: 'usage' as const };
     const { rerender } = render(<SettingsModal {...props} isOpen />);
 
     expect(await screen.findByTestId('settings-usage')).toBeTruthy();
-    expect(screen.queryByRole('button', { name: /Gemini/ })).toBeNull();
+    expect(screen.queryByTestId('settings-connections')).toBeNull();
 
     // The user moves away, closes, and follows the link again: Usage, not where they left it.
     fireEvent.click(screen.getByTestId('settings-tab-all'));
     rerender(<SettingsModal {...props} isOpen={false} />);
     rerender(<SettingsModal {...props} isOpen />);
-    await waitFor(() => expect(screen.queryByRole('button', { name: /Gemini/ })).toBeNull());
+    await waitFor(() => expect(screen.queryByTestId('settings-connections')).toBeNull());
     expect(screen.getByTestId('settings-usage')).toBeTruthy();
   });
 
   it('prevents tabs bar and header from shrinking and hides scrollbars (#1644)', async () => {
     // Killed by: frontend/src/components/SettingsModal.tsx :: scrollbar-hide shrink-0
     // Becomes: scrollbar-none
-    mockFetch({
-      '/api/settings': () => jsonResponse(geminiSettings),
-    });
+    mockFetch({});
     render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
 
     const header = await screen.findByTestId('settings-header');
@@ -1778,478 +1059,6 @@ describe('SettingsModal API key onboarding', () => {
 
     const allTab = screen.getByTestId('settings-tab-all');
     expect(allTab.className).toContain('shrink-0');
-  });
-});
-
-
-
-describe('SettingsModal cloud model list (#1631)', () => {
-  beforeEach(() => vi.restoreAllMocks());
-  afterEach(() => vi.unstubAllGlobals());
-
-  const entry = (id: string, display_name: string | null, chat_capable = true) => ({
-    id,
-    display_name,
-    context_window: null,
-    max_output_tokens: null,
-    chat_capable,
-    created_at: null,
-  });
-
-  // Ids of no real provider: the picker shows whatever the listing says, and nothing else.
-  const liveCatalog: CatalogResult = {
-    provider: 'gemini',
-    status: 'live',
-    entries: [entry('model-alpha', 'Alpha'), entry('model-beta', 'Beta'), entry('embed-one', null, false)],
-    recommended: 'model-beta',
-    fetched_at: '2026-09-25T00:00:00Z',
-    detail: null,
-  };
-
-  const geminiSettings = (over: Partial<RuntimeSettings> = {}): RuntimeSettings => ({
-    ...baseSettings,
-    llm_provider: 'gemini',
-    llm_base_url: '',
-    llm_model: '',
-    llm_api_key_set: true,
-    llm_api_key_masked: 'AIza...wxyz',
-    providers_available: ['ollama', 'gemini'],
-    available_models: ['model-alpha', 'model-beta'],
-    catalog: liveCatalog,
-    ...over,
-  });
-
-  const keyRejected: CatalogResult = {
-    provider: 'gemini',
-    status: 'key_rejected',
-    entries: [],
-    recommended: null,
-    fetched_at: null,
-    // The Core's English sentence, with the internals a raw error would carry.
-    detail: 'ProviderAuthError: HTTP 401 PERMISSION_DENIED from /v1beta/models',
-  };
-
-  const saveBody = (calls: Array<{ url: string; method: string; body?: unknown }>) =>
-    calls.find((c) => c.url === '/api/settings' && c.method === 'POST')?.body as { llm_model?: string } | undefined;
-
-  // Killed by: frontend/src/components/SettingsModal.tsx :: setLlmModel(recommendedModel);
-  // Becomes: setLlmModel(llmModelRef.current);
-  it("preselects the provider's recommended model, and saves it", async () => {
-    const calls = mockFetch({ '/api/settings': () => jsonResponse(geminiSettings()) });
-    render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
-
-    const select = (await screen.findByTestId('settings-model-select')) as HTMLSelectElement;
-    await waitFor(() => expect(select.value).toBe('model-beta'));
-    const labels = Array.from(select.options).map((o) => o.textContent);
-    expect(labels).toEqual([
-      'Alpha (model-alpha)',
-      `Beta (model-beta) ${en.settings.catalog.recommended}`,
-      en.settings.catalog.otherModel,
-    ]);
-    // Typing stays possible, but is not in the way of a listed choice.
-    expect(screen.queryByRole('textbox', { name: 'Model name' })).toBeNull();
-
-    fireEvent.click(screen.getByRole('button', { name: en.settings.footer.save }));
-    await waitFor(() => expect(saveBody(calls)?.llm_model).toBe('model-beta'));
-  });
-
-  // Killed by: frontend/src/components/SettingsModal.tsx :: if (!recommendedModel || llmModelRef.current.trim() !== '') return;
-  // Becomes: if (!recommendedModel) return;
-  it('keeps a model the user already chose over the recommendation', async () => {
-    const calls = mockFetch({ '/api/settings': () => jsonResponse(geminiSettings({ llm_model: 'model-alpha' })) });
-    render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
-
-    await screen.findByTestId('settings-model-select');
-    // Read from what is saved, not from the field at first paint: the recommendation would
-    // land a render later, after a check of the field had already passed.
-    fireEvent.click(screen.getByRole('button', { name: en.settings.footer.save }));
-    await waitFor(() => expect(saveBody(calls)?.llm_model).toBeDefined());
-    expect(saveBody(calls)?.llm_model).toBe('model-alpha');
-    expect((screen.getByTestId('settings-model-select') as HTMLSelectElement).value).toBe('model-alpha');
-  });
-
-  // Killed by: frontend/src/components/SettingsModal.tsx :: return fmt(t.catalog.keyRejected, { vendor });
-  // Becomes: return catalog.detail ?? fmt(t.catalog.keyRejected, { vendor });
-  it('says in plain words that the key was refused, with nothing to pick and typing still open', async () => {
-    mockFetch({
-      '/api/settings': () =>
-        jsonResponse(geminiSettings({ catalog: keyRejected, available_models: [], llm_model: 'my-model' })),
-    });
-    render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
-
-    const detail = await screen.findByTestId('settings-model-catalog-detail');
-    expect(detail.textContent).toBe(fmt(en.settings.catalog.keyRejected, { vendor: 'Google' }));
-    expectPlain(detail.textContent);
-    expect(detail.textContent).not.toContain('401');
-    expect(screen.queryByTestId('settings-model-select')).toBeNull();
-    const typed = screen.getByRole('textbox', { name: 'Model name' }) as HTMLInputElement;
-    expect(typed.value).toBe('my-model');
-    // Nothing listed means nothing to compare against, so no "not in the list" note.
-    expect(screen.queryByTestId('settings-model-unlisted')).toBeNull();
-  });
-
-  // Killed by: frontend/src/components/SettingsModal.tsx :: catalogIsLive && typedModel !== '' && !catalog.entries.some((e) => e.id === typedModel);
-  // Becomes: false;
-  it('lets a model missing from the list be typed, notes it softly, and saves it as typed', async () => {
-    const calls = mockFetch({ '/api/settings': () => jsonResponse(geminiSettings()) });
-    render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
-
-    const select = (await screen.findByTestId('settings-model-select')) as HTMLSelectElement;
-    await waitFor(() => expect(select.value).toBe('model-beta'));
-    expect(screen.queryByTestId('settings-model-unlisted')).toBeNull();
-
-    fireEvent.change(select, { target: { value: '__custom__' } });
-    const typed = screen.getByRole('textbox', { name: 'Model name' });
-    fireEvent.change(typed, { target: { value: 'model-gamma' } });
-
-    const note = screen.getByTestId('settings-model-unlisted');
-    expect(note.textContent).toBe(fmt(en.settings.catalog.notInList, { vendor: 'Google' }));
-    expectPlain(note.textContent);
-
-    fireEvent.click(screen.getByRole('button', { name: en.settings.footer.save }));
-    await waitFor(() => expect(saveBody(calls)?.llm_model).toBe('model-gamma'));
-  });
-
-  // Killed by: frontend/src/components/SettingsModal.tsx :: const res = await fetch('/api/models?refresh=1');
-  // Becomes: const res = await fetch('/api/models');
-  it('asks the provider again when the list is refreshed, and shows what it now lists', async () => {
-    const refreshed: CatalogResult = {
-      ...liveCatalog,
-      entries: [...liveCatalog.entries, entry('model-delta', 'Delta')],
-    };
-    const calls = mockFetch({
-      '/api/settings': () => jsonResponse(geminiSettings()),
-      '/api/models?refresh=1': () =>
-        jsonResponse({
-          provider: 'gemini',
-          models: ['model-alpha', 'model-beta', 'model-delta'],
-          current_model: 'model-beta',
-          catalog: refreshed,
-        }),
-    });
-    render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
-
-    await screen.findByTestId('settings-model-select');
-    fireEvent.click(screen.getByRole('button', { name: en.settings.catalog.refresh }));
-
-    // Within the chat-model picker: the fast-model picker lists the same models.
-    await waitFor(() =>
-      expect(
-        within(screen.getByTestId('settings-model-select')).getByRole('option', { name: 'Delta (model-delta)' }),
-      ).toBeTruthy(),
-    );
-    expect(calls.some((c) => c.url === '/api/models?refresh=1')).toBe(true);
-  });
-
-  // Killed by: frontend/src/components/SettingsModal.tsx :: {endpointOpen && <div className="mt-2">{endpointField}</div>}
-  // Becomes: {<div className="mt-2">{endpointField}</div>}
-  it('keeps the endpoint override behind Advanced until it is asked for', async () => {
-    mockFetch({ '/api/settings': () => jsonResponse(geminiSettings()) });
-    render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
-
-    const advanced = await screen.findByRole('button', { name: en.settings.catalog.advanced });
-    expect(advanced).toHaveAttribute('aria-expanded', 'false');
-    expect(screen.queryByPlaceholderText(en.settings.catalog.endpointPlaceholder)).toBeNull();
-
-    fireEvent.click(advanced);
-    expect(advanced).toHaveAttribute('aria-expanded', 'true');
-    expect(screen.getByPlaceholderText(en.settings.catalog.endpointPlaceholder)).toBeTruthy();
-  });
-
-  // Killed by: frontend/src/components/SettingsModal.tsx :: setEndpointOpen(Boolean(data.llm_base_url));
-  // Becomes: setEndpointOpen(false);
-  it('opens Advanced by itself when a proxy is already set, so it is never hidden', async () => {
-    mockFetch({
-      '/api/settings': () => jsonResponse(geminiSettings({ llm_base_url: 'https://proxy.example/v1beta' })),
-    });
-    render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
-
-    const endpoint = (await screen.findByPlaceholderText(
-      en.settings.catalog.endpointPlaceholder,
-    )) as HTMLInputElement;
-    expect(endpoint.value).toBe('https://proxy.example/v1beta');
-  });
-
-  // Killed by: frontend/src/components/SettingsModal.tsx :: {t.catalog.advanced}
-  // Becomes: {'Advanced — custom endpoint / proxy'}
-  it('shows the model list in Korean, with no English sentence left', async () => {
-    window.localStorage.clear();
-    mockFetch({
-      '/api/settings': () =>
-        jsonResponse(geminiSettings({ catalog: keyRejected, available_models: [], ui_language: 'ko' })),
-    });
-    render(
-      <LocaleProvider hints={['ko-KR']}>
-        <SettingsModal {...devModeOff} isOpen onClose={() => {}} />
-      </LocaleProvider>,
-    );
-
-    const detail = await screen.findByTestId('settings-model-catalog-detail');
-    expect(detail.textContent).toBe(fmt(ko.settings.catalog.keyRejected, { vendor: 'Google' }));
-    expect(screen.getByRole('button', { name: ko.settings.catalog.advanced })).toBeTruthy();
-    expect(screen.getByRole('textbox', { name: ko.settings.catalog.modelName })).toHaveAttribute(
-      'placeholder',
-      ko.settings.catalog.typePlaceholder,
-    );
-    expect(screen.queryByText(en.settings.catalog.advanced)).toBeNull();
-    expect(screen.queryByText(fmt(en.settings.catalog.keyRejected, { vendor: 'Google' }))).toBeNull();
-  });
-
-  const noKey: CatalogResult = {
-    provider: 'gemini',
-    status: 'no_key',
-    entries: [],
-    recommended: null,
-    fetched_at: null,
-    detail: null,
-  };
-
-  const ollamaSaved = (): RuntimeSettings => ({
-    ...baseSettings,
-    llm_provider: 'ollama',
-    llm_base_url: 'http://localhost:11434',
-    llm_model: 'qwen3:8b',
-    catalog: null,
-  });
-  const previewCalls = (calls: Array<{ url: string; method: string; body?: unknown }>) =>
-    calls.filter((c) => c.url === '/api/models/catalog' && c.method === 'POST');
-
-  // Killed by: frontend/src/components/SettingsModal.tsx :: const needsPreview = Boolean(providerMeta) && currentSettings !== null && !usesSavedCatalog && typedKeyUsable;
-  // Becomes: const needsPreview = false;
-  it('lists the models of a provider picked but not yet saved (#1657)', async () => {
-    const calls = mockFetch({
-      '/api/settings': () => jsonResponse(ollamaSaved()),
-      '/api/models/catalog': () => jsonResponse({ provider: 'gemini', models: [], catalog: liveCatalog }),
-    });
-    render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
-    await screen.findByPlaceholderText('http://localhost:11434');
-
-    fireEvent.click(screen.getByRole('button', { name: /Gemini/ }));
-
-    const select = (await screen.findByTestId('settings-model-select')) as HTMLSelectElement;
-    await waitFor(() => expect(select.value).toBe('model-beta'));
-    expect(Array.from(select.options).map((o) => o.value)).toContain('model-alpha');
-    // Asked for Gemini, with no key of the form's and not the Ollama endpoint.
-    expect(previewCalls(calls).map((c) => c.body)).toEqual([{ provider: 'gemini', refresh: false }]);
-  });
-
-  // Killed by: frontend/src/components/SettingsModal.tsx :: api_key: asked.key || undefined,
-  // Becomes: api_key: undefined,
-  // Killed by: frontend/src/components/SettingsModal.tsx :: {cloudConnectedCount !== null &&
-  // Becomes: {false && cloudConnectedCount !== null &&
-  it('says a cloud provider is connected once a typed key lists its models', async () => {
-    const key = 'AIzaSy' + 'C'.repeat(33);
-    mockFetch({
-      '/api/settings': () => jsonResponse(ollamaSaved()),
-      '/api/models/catalog': (_url, init) => {
-        const body = JSON.parse(init?.body as string) as { api_key?: string };
-        return jsonResponse({ provider: 'gemini', models: [], catalog: body.api_key ? liveCatalog : noKey });
-      },
-    });
-    render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
-    await screen.findByPlaceholderText('http://localhost:11434');
-    fireEvent.click(screen.getByRole('button', { name: /Gemini/ }));
-    await screen.findByTestId('settings-model-catalog-detail', {}, { timeout: 3000 });
-    expect(screen.queryByTestId('settings-llm-connected')).toBeNull();
-    fireEvent.change(screen.getByPlaceholderText(/Enter API key/i), { target: { value: key } });
-
-    const line = await screen.findByTestId('settings-llm-connected', {}, { timeout: 3000 });
-    // Two chat models; the embedding model is not one to pick.
-    expect(line.textContent).toBe('Connected · 2 models available');
-  });
-
-  // Killed by: frontend/src/i18n/locales/en/settings.json :: "one": "Connected · {count} model available",
-  // Becomes: "one": "Connected · {count} models available",
-  it('says a held key is connected, in the singular for one model', async () => {
-    mockFetch({
-      '/api/settings': () =>
-        jsonResponse(geminiSettings({ catalog: { ...liveCatalog, entries: [entry('model-alpha', 'Alpha')] } })),
-    });
-    render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
-    const line = await screen.findByTestId('settings-llm-connected', {}, { timeout: 3000 });
-    expect(line.textContent).toBe('Connected · 1 model available');
-  });
-
-  // Killed by: frontend/src/components/SettingsModal.tsx :: catalogIsLive && listedModels.length > 0 ? listedModels.length : null
-  // Becomes: catalog !== null ? listedModels.length : null
-  it('does not say connected when the listing failed, and says why in plain words', async () => {
-    const key = 'AIzaSy' + 'D'.repeat(33);
-    mockFetch({
-      '/api/settings': () => jsonResponse(ollamaSaved()),
-      '/api/models/catalog': () => jsonResponse({ provider: 'gemini', models: [], catalog: keyRejected }),
-    });
-    render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
-    await screen.findByPlaceholderText('http://localhost:11434');
-    fireEvent.click(screen.getByRole('button', { name: /Gemini/ }));
-    fireEvent.change(screen.getByPlaceholderText(/Enter API key/i), { target: { value: key } });
-
-    await waitFor(
-      () =>
-        expect(screen.getByTestId('settings-model-catalog-detail').textContent).toBe(
-          fmt(en.settings.catalog.keyRejected, { vendor: 'Google' }),
-        ),
-      { timeout: 3000 },
-    );
-    expectPlain(screen.getByTestId('settings-model-catalog-detail').textContent ?? '');
-    expect(screen.queryByTestId('settings-llm-connected')).toBeNull();
-  });
-
-  it('does not say connected on a saved failure', async () => {
-    mockFetch({
-      '/api/settings': () =>
-        jsonResponse(geminiSettings({ available_models: [], catalog: { ...keyRejected, status: 'unreachable' } })),
-    });
-    render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
-    const detail = await screen.findByTestId('settings-model-catalog-detail', {}, { timeout: 3000 });
-    expect(detail.textContent).toBe(fmt(en.settings.catalog.unreachable, { vendor: 'Google' }));
-    expect(screen.queryByTestId('settings-llm-connected')).toBeNull();
-  });
-
-  // Killed by: frontend/src/components/SettingsModal.tsx :: catalogIsLive && listedModels.length > 0 ? listedModels.length : null
-  // Becomes: catalogIsLive ? listedModels.length : null
-  it('does not say connected on a listing with nothing to chat with', async () => {
-    mockFetch({
-      '/api/settings': () =>
-        jsonResponse(geminiSettings({ catalog: { ...liveCatalog, entries: [entry('embed-one', null, false)] } })),
-    });
-    render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
-    await screen.findByTestId('settings-model-catalog-detail', {}, { timeout: 3000 });
-    expect(screen.queryByTestId('settings-llm-connected')).toBeNull();
-  });
-
-  it('says neither connected nor failed before a key is entered', async () => {
-    mockFetch({
-      '/api/settings': () => jsonResponse(ollamaSaved()),
-      '/api/models/catalog': () => jsonResponse({ provider: 'gemini', models: [], catalog: noKey }),
-    });
-    render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
-    await screen.findByPlaceholderText('http://localhost:11434');
-    fireEvent.click(screen.getByRole('button', { name: /Gemini/ }));
-    await waitFor(
-      () =>
-        expect(screen.getByTestId('settings-model-catalog-detail').textContent).toBe(
-          fmt(en.settings.catalog.noKey, { vendor: 'Google' }),
-        ),
-      { timeout: 3000 },
-    );
-    expect(screen.queryByTestId('settings-llm-connected')).toBeNull();
-  });
-
-  it('asks with a key typed into the form, in the body and never the URL', async () => {
-    const key = 'AIzaSy' + 'B'.repeat(33);
-    const calls = mockFetch({
-      '/api/settings': () => jsonResponse(ollamaSaved()),
-      '/api/models/catalog': (_url, init) => {
-        const body = JSON.parse(init?.body as string) as { api_key?: string };
-        return jsonResponse({ provider: 'gemini', models: [], catalog: body.api_key ? liveCatalog : keyRejected });
-      },
-    });
-    render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
-    await screen.findByPlaceholderText('http://localhost:11434');
-    fireEvent.click(screen.getByRole('button', { name: /Gemini/ }));
-    fireEvent.change(screen.getByPlaceholderText(/Enter API key/i), { target: { value: key } });
-
-    const select = (await screen.findByTestId('settings-model-select', {}, { timeout: 3000 })) as HTMLSelectElement;
-    await waitFor(() => expect(select.value).toBe('model-beta'));
-    const withKey = previewCalls(calls).filter((c) => (c.body as { api_key?: string }).api_key === key);
-    expect(withKey.length).toBe(1);
-    expect(calls.every((c) => !c.url.includes(key))).toBe(true);
-  });
-
-  // Killed by: frontend/src/components/SettingsModal.tsx :: sameEndpoint(formEndpoint, currentSettings.llm_base_url ?? '');
-  // Becomes: true;
-  it('asks again when the saved provider is pointed at another endpoint (#1663)', async () => {
-    const calls = mockFetch({
-      '/api/settings': () => jsonResponse(geminiSettings()),
-      '/api/models/catalog': () => jsonResponse({ provider: 'gemini', models: [], catalog: keyRejected }),
-    });
-    render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
-    fireEvent.click(await screen.findByRole('button', { name: en.settings.catalog.advanced }));
-    fireEvent.change(screen.getByPlaceholderText(en.settings.catalog.endpointPlaceholder), {
-      target: { value: 'https://proxy.example/v1beta' },
-    });
-
-    await waitFor(
-      () =>
-        expect(screen.getByTestId('settings-model-catalog-detail').textContent).toBe(
-          fmt(en.settings.catalog.keyRejected, { vendor: 'Google' }),
-        ),
-      { timeout: 3000 },
-    );
-    expect(previewCalls(calls).map((c) => c.body)).toEqual([
-      { provider: 'gemini', base_url: 'https://proxy.example/v1beta', refresh: false },
-    ]);
-  });
-
-  // Killed by: frontend/src/components/SettingsModal.tsx :: sameEndpoint(formEndpoint, currentSettings.llm_base_url ?? '');
-  // Becomes: formEndpoint === (currentSettings.llm_base_url ?? '').trim();
-  it('keeps the saved list when the saved endpoint is respelled as another loopback name', async () => {
-    const calls = mockFetch({
-      '/api/settings': () => jsonResponse(geminiSettings({ llm_base_url: 'http://127.0.0.1:8080/v1beta' })),
-      '/api/models/catalog': () => jsonResponse({ provider: 'gemini', models: [], catalog: keyRejected }),
-    });
-    render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
-    const endpoint = (await screen.findByPlaceholderText(
-      en.settings.catalog.endpointPlaceholder,
-    )) as HTMLInputElement;
-    fireEvent.change(endpoint, { target: { value: 'http://localhost:8080/v1beta/' } });
-    await new Promise((r) => setTimeout(r, 700));
-
-    expect(previewCalls(calls)).toEqual([]);
-    const select = screen.getByTestId('settings-model-select') as HTMLSelectElement;
-    expect(within(select).getAllByRole('option').map((o) => (o as HTMLOptionElement).value)).toContain('model-beta');
-  });
-
-  // Killed by: frontend/src/components/SettingsModal.tsx :: if (!typedKeyUsable) return fmt(t.catalog.keyMalformed, { vendor });
-  // Becomes: if (!typedKeyUsable) return fmt(t.catalog.noKey, { vendor });
-  it('says a typed key is not in the right shape, without asking with it', async () => {
-    const calls = mockFetch({ '/api/settings': () => jsonResponse(ollamaSaved()) });
-    render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
-    await screen.findByPlaceholderText('http://localhost:11434');
-    fireEvent.click(screen.getByRole('button', { name: /Gemini/ }));
-    fireEvent.change(screen.getByPlaceholderText(/Enter API key/i), { target: { value: 'not-a-key' } });
-
-    await waitFor(() =>
-      expect(screen.getByTestId('settings-model-catalog-detail').textContent).toBe(
-        fmt(en.settings.catalog.keyMalformed, { vendor: 'Google' }),
-      ),
-    );
-    expect(previewCalls(calls).every((c) => !(c.body as { api_key?: string }).api_key)).toBe(true);
-  });
-
-  // Killed by: frontend/src/components/SettingsModal.tsx :: if (!asked) {
-  // Becomes: if (false) {
-  it("says so when refreshing a picked provider's list fails", async () => {
-    let answered = 0;
-    mockFetch({
-      '/api/settings': () => jsonResponse(ollamaSaved()),
-      '/api/models/catalog': () =>
-        answered++ === 0
-          ? jsonResponse({ provider: 'gemini', models: [], catalog: liveCatalog })
-          : jsonResponse({ detail: 'boom' }, false, 500),
-    });
-    render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
-    await screen.findByPlaceholderText('http://localhost:11434');
-    fireEvent.click(screen.getByRole('button', { name: /Gemini/ }));
-    fireEvent.click(await screen.findByRole('button', { name: en.settings.catalog.refresh }));
-
-    expect(await screen.findByText(en.settings.catalog.refreshFailed)).toBeTruthy();
-  });
-
-  it("says Google refused the key when the picked provider's listing is refused", async () => {
-    mockFetch({
-      '/api/settings': () => jsonResponse(ollamaSaved()),
-      '/api/models/catalog': () => jsonResponse({ provider: 'gemini', models: [], catalog: keyRejected }),
-    });
-    render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
-    await screen.findByPlaceholderText('http://localhost:11434');
-    fireEvent.click(screen.getByRole('button', { name: /Gemini/ }));
-
-    await waitFor(() =>
-      expect(screen.getByTestId('settings-model-catalog-detail').textContent).toBe(
-        fmt(en.settings.catalog.keyRejected, { vendor: 'Google' }),
-      ),
-    );
   });
 });
 
@@ -2279,9 +1088,7 @@ describe('SettingsModal Remote GPU Worker', () => {
           status: 'ok',
           connected: true,
           tunnel: mockTunnel,
-          applied_changes: {
-            comfyui_base_url: 'http://127.0.0.1:8188',
-          },
+          applied_changes: { picture_connection: 'remote-gpu-pictures' },
         }),
     });
 
@@ -2290,8 +1097,11 @@ describe('SettingsModal Remote GPU Worker', () => {
     const card = await screen.findByTestId('settings-remote-gpu-card');
     expect(card).toBeTruthy();
 
+    // No machine name is assumed: the field starts empty and says what it wants.
     const hostInput = screen.getByTestId('remote-gpu-host-input') as HTMLInputElement;
-    expect(hostInput.value).toBe('dell');
+    expect(hostInput.value).toBe('');
+    expect(hostInput.placeholder).toBe(en.settings.remoteGpu.hostPlaceholder);
+    fireEvent.change(hostInput, { target: { value: 'gpu-box' } });
 
     const connectBtn = screen.getByTestId('remote-gpu-connect-button');
     fireEvent.click(connectBtn);
@@ -2306,6 +1116,34 @@ describe('SettingsModal Remote GPU Worker', () => {
       expect(card.innerHTML).toContain('NVIDIA GeForce RTX 5070 Ti');
     });
     expect(screen.getByTestId('remote-gpu-disconnect-button')).toBeTruthy();
+    expect(screen.getByTestId('remote-gpu-status-info')).toHaveTextContent(
+      'Reached: comfyui (port 8188), ollama (port 11434)',
+    );
+  });
+
+  // Killed by: frontend/src/components/SettingsModal.tsx :: connectionsChangedHere(); // what the connect added
+  // Becomes:
+  it('reads the connections again after a connect, which adds the GPU computer as connections', async () => {
+    const calls = mockFetch({
+      '/api/settings/remote-gpu/connect': () =>
+        jsonResponse({
+          status: 'ok',
+          connected: true,
+          tunnel: { host: 'gpu-box', connected: true, mappings: [] },
+          applied_changes: { picture_connection: 'remote-gpu-pictures' },
+        }),
+    });
+    render(<SettingsModal isOpen={true} onClose={() => {}} {...devModeOff} />);
+    const reads = () => calls.filter((c) => c.method === 'GET' && c.url === '/api/connections').length;
+    await waitFor(() => expect(reads()).toBeGreaterThan(0));
+    const before = reads();
+
+    fireEvent.change(await screen.findByTestId('remote-gpu-host-input'), { target: { value: 'gpu-box' } });
+    fireEvent.click(screen.getByTestId('remote-gpu-connect-button'));
+
+    await waitFor(() => expect(reads()).toBeGreaterThan(before));
+    // The connection saved its own rows; the form sent no setting for it.
+    expect(calls.filter((c) => c.method === 'POST' && c.url === '/api/settings')).toEqual([]);
   });
 
   it('keeps the LLM local on connect unless the box is ticked', async () => {
@@ -2317,6 +1155,7 @@ describe('SettingsModal Remote GPU Worker', () => {
     render(<SettingsModal isOpen={true} onClose={() => {}} {...devModeOff} />);
     const box = (await screen.findByTestId('remote-gpu-sync-llm')) as HTMLInputElement;
     expect(box.checked).toBe(false);
+    fireEvent.change(screen.getByTestId('remote-gpu-host-input'), { target: { value: 'gpu-box' } });
     fireEvent.click(screen.getByTestId('remote-gpu-connect-button'));
     await waitFor(() => expect(calls.some((c) => c.url.includes('/remote-gpu/connect'))).toBe(true));
     const first = calls.find((c) => c.url.includes('/remote-gpu/connect'));
@@ -2337,6 +1176,7 @@ describe('SettingsModal Remote GPU Worker', () => {
     });
     render(<SettingsModal isOpen={true} onClose={() => {}} {...devModeOff} />);
     fireEvent.click(await screen.findByTestId('remote-gpu-sync-llm'));
+    fireEvent.change(screen.getByTestId('remote-gpu-host-input'), { target: { value: 'gpu-box' } });
     fireEvent.click(screen.getByTestId('remote-gpu-connect-button'));
     await waitFor(() => expect(calls.some((c) => c.url.includes('/remote-gpu/connect'))).toBe(true));
     const first = calls.find((c) => c.url.includes('/remote-gpu/connect'));
@@ -2344,36 +1184,23 @@ describe('SettingsModal Remote GPU Worker', () => {
     expect(await screen.findByText(new RegExp(en.settings.remoteGpu.llmModelMissing))).toBeTruthy();
   });
 
-  it('shows the addresses a dead tunnel put back, not the saved tunnel ones', async () => {
+  // Killed by: frontend/src/components/SettingsModal.tsx :: if (gpuData.restored_settings) connectionsChangedHere();
+  // Becomes:
+  it('reads the connections again when a dead tunnel removed the ones it had added', async () => {
     // The status route first: '/api/settings' also matches its URL.
-    mockFetch({
+    const calls = mockFetch({
       '/api/settings/remote-gpu/status': () =>
         jsonResponse({
-          host: '',
+          host: 'dell',
           connected: false,
-          restored_settings: { llm_base_url: 'http://127.0.0.1:11434' },
+          restored_settings: { picture_connection: 'remote-gpu-pictures' },
         }),
-      '/api/settings': () =>
-        jsonResponse({ ...baseSettings, llm_base_url: 'http://127.0.0.1:11435' }),
     });
     render(<SettingsModal isOpen={true} onClose={() => {}} {...devModeOff} />);
-    await waitFor(() =>
-      expect(screen.getAllByDisplayValue('http://127.0.0.1:11434').length).toBeGreaterThan(0),
-    );
-  });
-
-  it('clears the tunnel address when the address it replaced was empty', async () => {
-    mockFetch({
-      '/api/settings/remote-gpu/status': () =>
-        jsonResponse({ host: 'dell', connected: false, restored_settings: { llm_base_url: '' } }),
-      '/api/settings': () =>
-        jsonResponse({ ...baseSettings, llm_base_url: 'http://127.0.0.1:11435' }),
-    });
-    render(<SettingsModal isOpen={true} onClose={() => {}} {...devModeOff} />);
-    // The host is set in the same step that applies the restore, so once it shows the
-    // restore has run.
     await screen.findByDisplayValue('dell');
-    expect(screen.queryAllByDisplayValue('http://127.0.0.1:11435')).toHaveLength(0);
+    await waitFor(() =>
+      expect(calls.filter((c) => c.method === 'GET' && c.url === '/api/connections').length).toBeGreaterThan(1),
+    );
   });
 
   it('disconnects remote GPU tunnel and restores state', async () => {
@@ -2388,9 +1215,7 @@ describe('SettingsModal Remote GPU Worker', () => {
         jsonResponse({
           status: 'ok',
           connected: false,
-          restored_settings: {
-            comfyui_base_url: 'http://127.0.0.1:8188',
-          },
+          restored_settings: { picture_connection: 'remote-gpu-pictures' },
         }),
     });
 
@@ -2407,9 +1232,82 @@ describe('SettingsModal Remote GPU Worker', () => {
 
     expect(await screen.findByTestId('remote-gpu-connect-button')).toBeTruthy();
   });
+
+  it('provides quick preset buttons for 1-click filling remote host', async () => {
+    mockFetch({
+      '/api/settings/remote-gpu/hosts': () => jsonResponse({ hosts: ['box-a', 'box-b'] }),
+    });
+    render(<SettingsModal isOpen={true} onClose={() => {}} {...devModeOff} />);
+
+    const hostInput = (await screen.findByTestId('remote-gpu-host-input')) as HTMLInputElement;
+    expect(hostInput.value).toBe('');
+
+    const boxAPreset = await screen.findByTestId('remote-gpu-preset-box-a');
+    const boxBPreset = await screen.findByTestId('remote-gpu-preset-box-b');
+
+    fireEvent.click(boxAPreset);
+    expect(hostInput.value).toBe('box-a');
+
+    fireEvent.click(boxBPreset);
+    expect(hostInput.value).toBe('box-b');
+  });
+
+  it('displays honest routing badges when connected with remote flags', async () => {
+    mockFetch({
+      '/api/settings/remote-gpu/status': () =>
+        jsonResponse({
+          host: 'dell',
+          connected: true,
+          llm_on_remote: true,
+          images_on_remote: true,
+          gpu: { name: 'RTX 4090', total_mb: 24576, used_mb: 2048, driver: '550.0' },
+          mappings: [{ service_name: 'ollama', remote_port: 11434, local_port: 11435 }],
+        }),
+    });
+    render(<SettingsModal isOpen={true} onClose={() => {}} {...devModeOff} />);
+
+    const routingStatus = await screen.findByTestId('remote-gpu-routing-status');
+    expect(routingStatus).toBeTruthy();
+    expect(routingStatus.className).not.toContain('bg-gradient');
+    expect(routingStatus.textContent).not.toContain('──(부재 시 자동 백업)──▶');
+
+    const routingLlm = screen.getByTestId('remote-gpu-routing-llm');
+    expect(routingLlm.textContent).toContain('dell');
+
+    const routingImages = screen.getByTestId('remote-gpu-routing-images');
+    expect(routingImages.textContent).toContain('dell');
+  });
+
+  it('reports connection error cleanly on card with raw error in disclosure', async () => {
+    mockFetch({
+      '/api/settings/remote-gpu/connect': () =>
+        jsonResponse(
+          {
+            status: 'error',
+            error: 'ssh: connect to host badhost port 22: Connection refused',
+          },
+          false,
+          500,
+        ),
+    });
+    render(<SettingsModal isOpen={true} onClose={() => {}} {...devModeOff} />);
+
+    const hostInput = await screen.findByTestId('remote-gpu-host-input');
+    fireEvent.change(hostInput, { target: { value: 'badhost' } });
+    fireEvent.click(screen.getByTestId('remote-gpu-connect-button'));
+
+    const errorEl = await screen.findByTestId('remote-gpu-connect-error');
+    expect(errorEl.textContent).toContain('badhost');
+    expect(errorEl.textContent).toContain('Connection refused');
+
+    const details = errorEl.querySelector('details');
+    expect(details).toBeTruthy();
+    expect(details?.textContent).toContain('ssh: connect to host badhost port 22: Connection refused');
+  });
 });
 
 /** The usage offer in "All" reads its own report; a save in Settings → Usage must still reach it. */
+
 describe('SettingsModal usage offer', () => {
   beforeEach(() => {
     vi.restoreAllMocks();
@@ -2429,10 +1327,16 @@ describe('SettingsModal usage offer', () => {
 
   it('hides the offer as soon as a limit is saved, without reopening Settings', async () => {
     const calls = mockFetch({
-      '/api/settings': (url) =>
-        url.includes('remote-gpu')
-          ? jsonResponse({ host: '', connected: false })
-          : jsonResponse({ ...baseSettings, llm_provider: 'openai' }),
+      '/api/connections': () =>
+        jsonResponse({
+          connections: [
+            {
+              id: 'openai', kind: 'openai', label: 'OpenAI', base_url: null, key_set: true, key_masked: 'sk-…abcd',
+              source: 'settings', paid: true, status: 'connected', detail: null, model_count: 3,
+            },
+          ],
+          kinds: [],
+        }),
       '/api/usage/limits': () => jsonResponse(usageReport(light)),
       '/api/usage': () => jsonResponse(usageReport(noLimits)),
     });
@@ -2441,466 +1345,37 @@ describe('SettingsModal usage offer', () => {
 
     expect(await screen.findByTestId('settings-usage-offer')).toBeTruthy();
     fireEvent.click(await screen.findByTestId('settings-usage-preset-light'));
-    fireEvent.click(screen.getByTestId('settings-usage-save'));
 
-    await screen.findByTestId('settings-usage-saved');
+    await waitFor(() =>
+      expect(screen.getByTestId('settings-usage-save-status')).toHaveAttribute('data-state', 'saved'),
+    );
     expect(calls.some((c) => c.method === 'PUT' && c.url === '/api/usage/limits')).toBe(true);
     expect(screen.queryByTestId('settings-usage-offer')).toBeNull();
   });
-});
 
-describe('SettingsModal keys per provider, chat and fast models', () => {
-  beforeEach(() => vi.restoreAllMocks());
-  afterEach(() => vi.unstubAllGlobals());
-
-  const entry = (id: string, display_name: string | null) => ({
-    id,
-    display_name,
-    context_window: null,
-    max_output_tokens: null,
-    chat_capable: true,
-    created_at: null,
-  });
-
-  const catalog: CatalogResult = {
-    provider: 'gemini',
-    status: 'live',
-    entries: [entry('model-alpha', 'Alpha'), entry('model-beta', 'Beta')],
-    recommended: 'model-beta',
-    fetched_at: '2026-09-26T00:00:00Z',
-    detail: null,
-  };
-
-  const keyed = (over: Partial<RuntimeSettings> = {}): RuntimeSettings => ({
-    ...baseSettings,
-    llm_provider: 'gemini',
-    llm_base_url: '',
-    llm_model: 'model-beta',
-    llm_model_fast: '',
-    llm_api_key_set: true,
-    llm_api_key_masked: 'AQ....wxyz',
-    providers_available: ['ollama', 'vllm', 'openai', 'anthropic', 'gemini'],
-    available_models: ['model-alpha', 'model-beta'],
-    catalog,
-    providers: [
-      { id: 'openai', key_set: true, key_masked: 'sk-...1234', key_source: 'settings', key_env_var: null },
-      { id: 'anthropic', key_set: false, key_masked: '', key_source: '', key_env_var: null },
-      { id: 'gemini', key_set: true, key_masked: 'AQ....wxyz', key_source: 'settings', key_env_var: null },
-      { id: 'vllm', key_set: false, key_masked: '', key_source: '', key_env_var: null },
-    ],
-    ...over,
-  });
-
-  type Call = { url: string; method: string; body?: unknown };
-  const saveBody = (calls: Call[]) =>
-    calls.find((c) => c.url === '/api/settings' && c.method === 'POST')?.body as Record<string, unknown> | undefined;
-
-  // Killed by: frontend/src/components/SettingsModal.tsx :: const keyRow = currentSettings?.providers?.find((row) => row.id === llmProvider);
-  // Becomes: const keyRow = currentSettings?.providers?.find((row) => row.id === currentSettings?.llm_provider);
-  it("shows each provider's own saved key, and switching provider never asks for it again", async () => {
-    mockFetch({ '/api/settings': () => jsonResponse(keyed()) });
-    render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
-
-    expect((await screen.findByTestId('api-key-state')).textContent).toBe(
-      fmt(en.settings.apiKey.configured, { masked: 'AQ....wxyz' }),
-    );
-
-    fireEvent.click(screen.getByRole('button', { name: /OpenAI/ }));
-
-    expect(screen.getByTestId('api-key-state').textContent).toBe(
-      fmt(en.settings.apiKey.configured, { masked: 'sk-...1234' }),
-    );
-    expect(screen.getByPlaceholderText(en.settings.apiKey.keepPlaceholder)).toBeTruthy();
-
-    fireEvent.click(screen.getByRole('button', { name: /Anthropic/ }));
-    expect(screen.queryByTestId('api-key-state')).toBeNull();
-    expect(screen.queryByTestId('api-key-remove')).toBeNull();
-  });
-
-  it('says which environment variable overrides the key, and offers no removal for it', async () => {
+  // Killed by: frontend/src/components/settings/ConnectionsSection.tsx :: data.connections.some((c) => c.paid) && paidOffer
+  // Becomes: paidOffer
+  it('offers no limit while every connection is free', async () => {
     mockFetch({
-      '/api/settings': () =>
-        jsonResponse(
-          keyed({
-            providers: [
-              {
-                id: 'gemini',
-                key_set: true,
-                key_masked: 'AQ....9999',
-                key_source: 'env',
-                key_env_var: 'GEMINI_API_KEY',
-              },
-            ],
-          }),
-        ),
-    });
-    render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
-
-    expect((await screen.findByTestId('api-key-state')).textContent).toBe(
-      fmt(en.settings.apiKey.fromEnv, { variable: 'GEMINI_API_KEY' }),
-    );
-    expect(screen.queryByTestId('api-key-remove')).toBeNull();
-  });
-
-  it("removes one provider's key and leaves the others", async () => {
-    vi.spyOn(window, 'confirm').mockReturnValue(true);
-    const after = keyed();
-    after.providers = after.providers!.map((row) =>
-      row.id === 'openai' ? { ...row, key_set: false, key_masked: '', key_source: '' } : row,
-    );
-    const calls = mockFetch({
-      // Listed first: '/api/settings' would match this URL too.
-      '/api/settings/api-keys/': () => jsonResponse(after),
-      '/api/settings': () => jsonResponse(keyed()),
-    });
-    render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
-    await screen.findByTestId('api-key-state');
-    fireEvent.click(screen.getByRole('button', { name: /OpenAI/ }));
-
-    fireEvent.click(screen.getByTestId('api-key-remove'));
-
-    await waitFor(() => expect(screen.queryByTestId('api-key-state')).toBeNull());
-    expect(calls.some((c) => c.method === 'DELETE' && c.url === '/api/settings/api-keys/openai')).toBe(true);
-    expect(screen.getByText(fmt(en.settings.apiKey.removed, { name: 'OpenAI' }))).toBeTruthy();
-    fireEvent.click(screen.getByRole('button', { name: /Gemini/ }));
-    expect(screen.getByTestId('api-key-state').textContent).toBe(
-      fmt(en.settings.apiKey.configured, { masked: 'AQ....wxyz' }),
-    );
-  });
-
-  // Killed by: frontend/src/components/SettingsModal.tsx :: text: code === 'key_in_use' ? t.apiKey.inUse : t.apiKey.unknownProvider,
-  // Becomes: text: plainFailure(new CoreFailure(res.status, detail), t.apiKey.removeFailed),
-  it('shows a refused removal in Korean rather than the English sentence from the Core', async () => {
-    vi.spyOn(window, 'confirm').mockReturnValue(true);
-    mockFetch({
-      '/api/settings/api-keys/': () =>
-        jsonResponse(
-          {
-            detail:
-              'This key is in use. Switch to another provider first, or paste a new key to replace it.',
-            code: 'key_in_use',
-          },
-          false,
-          400,
-        ),
-      '/api/settings': () => jsonResponse(keyed()),
-    });
-    render(
-      <LocaleProvider hints={['ko-KR']}>
-        <SettingsModal {...devModeOff} isOpen onClose={() => {}} />
-      </LocaleProvider>,
-    );
-    await screen.findByTestId('api-key-state');
-
-    fireEvent.click(screen.getByTestId('api-key-remove'));
-
-    const shown = await screen.findByText(ko.settings.apiKey.inUse);
-    expect(shown.textContent).toBe('사용 중인 키입니다. 먼저 다른 Provider로 바꾸거나, 새 키를 붙여 넣어 교체하십시오.');
-    expectPlain(shown.textContent ?? '');
-    expect(screen.queryByText(/This key is in use/)).toBeNull();
-    expect(screen.getByTestId('api-key-state')).toBeTruthy();
-  });
-
-  // Killed by: frontend/src/components/SettingsModal.tsx :: {(currentSettings?.env_overrides ?? []).length > 0 && (
-  // Becomes: {false && (
-  it('says in Korean which environment variable overrides the choice', async () => {
-    mockFetch({
-      '/api/settings': () =>
-        jsonResponse(
-          keyed({
-            llm_provider_source: 'env',
-            llm_provider_env_var: 'LLM_PROVIDER',
-            llm_model_source: 'env',
-            llm_model_env_var: 'GEMINI_MODEL',
-            env_overrides: [
-              { field: 'llm_provider', env_var: 'LLM_PROVIDER', message: 'The environment variable LLM_PROVIDER is set.' },
-              { field: 'llm_model', env_var: 'GEMINI_MODEL', message: 'The environment variable GEMINI_MODEL is set.' },
-            ],
-          }),
-        ),
-    });
-    render(
-      <LocaleProvider hints={['ko-KR']}>
-        <SettingsModal {...devModeOff} isOpen onClose={() => {}} />
-      </LocaleProvider>,
-    );
-
-    const notices = await screen.findByTestId('settings-env-overrides');
-
-    expect(within(notices).getByText(fmt(ko.settings.llm.envOverride.provider, { variable: 'LLM_PROVIDER' }))).toBeTruthy();
-    expect(within(notices).getByText(fmt(ko.settings.llm.envOverride.model, { variable: 'GEMINI_MODEL' }))).toBeTruthy();
-    expect(notices.textContent).toContain('환경 변수 LLM_PROVIDER에 값이 설정되어 있어 여기서 고른 Provider보다 우선합니다.');
-    expect(notices.textContent).not.toContain('The environment variable');
-  });
-
-  it('shows no override notice when the saved choice is the one in effect', async () => {
-    mockFetch({ '/api/settings': () => jsonResponse(keyed({ env_overrides: [] })) });
-    render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
-    await screen.findByTestId('api-key-state');
-
-    expect(screen.queryByTestId('settings-env-overrides')).toBeNull();
-  });
-
-  // Killed by: frontend/src/components/SettingsModal.tsx :: llm_api_key_provider: typedSaveKey ? llmProvider : undefined,
-  // Becomes: llm_api_key_provider: undefined,
-  it('files a typed key under the provider it was typed for', async () => {
-    const calls = mockFetch({ '/api/settings': () => jsonResponse(keyed()) });
-    render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
-    await screen.findByTestId('api-key-state');
-    fireEvent.click(screen.getByRole('button', { name: /OpenAI/ }));
-
-    fireEvent.change(screen.getByPlaceholderText(en.settings.apiKey.keepPlaceholder), {
-      target: { value: 'sk-proj-abcdefghijklmnopqrstuvwxyz0123456789' },
-    });
-    fireEvent.click(screen.getByRole('button', { name: en.settings.footer.save }));
-
-    await waitFor(() => expect(saveBody(calls)?.llm_api_key_provider).toBe('openai'));
-    expect(saveBody(calls)?.llm_api_key).toBe('sk-proj-abcdefghijklmnopqrstuvwxyz0123456789');
-  });
-
-  it('saves no key provider when no key was typed', async () => {
-    const calls = mockFetch({ '/api/settings': () => jsonResponse(keyed()) });
-    render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
-    await screen.findByTestId('api-key-state');
-
-    fireEvent.click(screen.getByRole('button', { name: en.settings.footer.save }));
-
-    await waitFor(() => expect(saveBody(calls)).toBeDefined());
-    expect(saveBody(calls)?.llm_api_key).toBeUndefined();
-    expect(saveBody(calls)?.llm_api_key_provider).toBeUndefined();
-  });
-
-  // Killed by: frontend/src/components/SettingsModal.tsx :: llm_model_fast: llmModelFast.trim(),
-  // Becomes: llm_model_fast: undefined,
-  it('offers a fast model that defaults to the chat model, and saves the choice', async () => {
-    const calls = mockFetch({ '/api/settings': () => jsonResponse(keyed()) });
-    render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
-
-    const fast = (await screen.findByTestId('settings-fast-model-select')) as HTMLSelectElement;
-    expect(fast.value).toBe('');
-    expect(fast.options[0].textContent).toBe(en.settings.llm.fastSameAsDeep);
-    expect(screen.getByText(en.settings.llm.model)).toBeTruthy();
-
-    fireEvent.change(fast, { target: { value: 'model-alpha' } });
-    fireEvent.click(screen.getByRole('button', { name: en.settings.footer.save }));
-
-    await waitFor(() => expect(saveBody(calls)?.llm_model_fast).toBe('model-alpha'));
-    expect(saveBody(calls)?.llm_model).toBe('model-beta');
-  });
-
-  it('sends an empty fast model so a save can go back to following the chat model', async () => {
-    const calls = mockFetch({ '/api/settings': () => jsonResponse(keyed({ llm_model_fast: 'model-alpha' })) });
-    render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
-
-    const fast = (await screen.findByTestId('settings-fast-model-select')) as HTMLSelectElement;
-    await waitFor(() => expect(fast.value).toBe('model-alpha'));
-    fireEvent.change(fast, { target: { value: '' } });
-    fireEvent.click(screen.getByRole('button', { name: en.settings.footer.save }));
-
-    await waitFor(() => expect(saveBody(calls)?.llm_model_fast).toBe(''));
-  });
-
-  it('shows the key state and both models in Korean', async () => {
-    window.localStorage.clear();
-    mockFetch({
-      '/api/settings': () =>
-        jsonResponse(
-          keyed({
-            ui_language: 'ko',
-            providers: [
-              {
-                id: 'gemini',
-                key_set: true,
-                key_masked: 'AQ....9999',
-                key_source: 'env',
-                key_env_var: 'GEMINI_API_KEY',
-              },
-            ],
-          }),
-        ),
-    });
-    render(
-      <LocaleProvider hints={['ko-KR']}>
-        <SettingsModal {...devModeOff} isOpen onClose={() => {}} />
-      </LocaleProvider>,
-    );
-
-    expect((await screen.findByTestId('api-key-state')).textContent).toBe(
-      '환경 변수 GEMINI_API_KEY 적용 중',
-    );
-    expect(screen.getByText('대화 모델')).toBeTruthy();
-    const fast = screen.getByTestId('settings-fast-model-select') as HTMLSelectElement;
-    expect(fast.options[0].textContent).toBe('대화 모델과 같음');
-    expect(screen.getByText(ko.settings.llm.fastModel)).toBeTruthy();
-  });
-});
-
-describe('SettingsModal provider and model follow-ups (#1657, #1672)', () => {
-  beforeEach(() => vi.restoreAllMocks());
-  afterEach(() => vi.unstubAllGlobals());
-
-  const entry = (id: string, display_name: string | null) => ({
-    id,
-    display_name,
-    context_window: null,
-    max_output_tokens: null,
-    chat_capable: true,
-    created_at: null,
-  });
-  // Ids of no real provider.
-  const liveCatalog: CatalogResult = {
-    provider: 'gemini',
-    status: 'live',
-    entries: [entry('model-alpha', 'Alpha'), entry('model-beta', 'Beta')],
-    recommended: 'model-beta',
-    fetched_at: '2026-09-27T00:00:00Z',
-    detail: null,
-  };
-  const geminiSaved = (llm_model: string): RuntimeSettings => ({
-    ...baseSettings,
-    llm_provider: 'gemini',
-    llm_base_url: '',
-    llm_model,
-    llm_api_key_set: true,
-    llm_api_key_masked: 'AIza...wxyz',
-    providers_available: ['ollama', 'gemini'],
-    available_models: ['model-alpha', 'model-beta'],
-    catalog: liveCatalog,
-  });
-  const vllmSaved: RuntimeSettings = {
-    ...baseSettings,
-    llm_provider: 'vllm',
-    llm_base_url: 'http://box:8000/v1',
-    llm_model: 'served-model',
-    providers_available: ['ollama', 'vllm'],
-    available_models: [],
-    catalog: null,
-  };
-  const saveBody = (calls: Array<{ url: string; method: string; body?: unknown }>) =>
-    calls.find((c) => c.url === '/api/settings' && c.method === 'POST')?.body as { llm_model?: string } | undefined;
-
-  // Killed by: frontend/src/components/SettingsModal.tsx :: if (remembered) {
-  // Becomes: if (false) {
-  it('gives the saved model back when the user looks at another provider and returns', async () => {
-    const calls = mockFetch({
-      '/api/settings': () => jsonResponse(geminiSaved('model-alpha')),
-      '/api/models/catalog': () =>
-        jsonResponse({ provider: 'ollama', models: ['qwen3:8b'], reachable: true, catalog: null }),
-    });
-    render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
-    const select = (await screen.findByTestId('settings-model-select')) as HTMLSelectElement;
-    expect(select.value).toBe('model-alpha');
-
-    fireEvent.click(screen.getByRole('button', { name: /Ollama/ }));
-    await screen.findByPlaceholderText('http://localhost:11434');
-    fireEvent.click(screen.getByRole('button', { name: /Gemini/ }));
-
-    const back = (await screen.findByTestId('settings-model-select')) as HTMLSelectElement;
-    await waitFor(() => expect(back.value).toBe('model-alpha'));
-    fireEvent.click(screen.getByRole('button', { name: en.settings.footer.save }));
-    await waitFor(() => expect(saveBody(calls)?.llm_model).toBe('model-alpha'));
-  });
-
-  // Killed by: frontend/src/components/SettingsModal.tsx :: typedModel === (currentSettings?.llm_model ?? '').trim() &&
-  // Becomes: false &&
-  it('says the saved model is no longer offered, and switches only when asked', async () => {
-    const calls = mockFetch({ '/api/settings': () => jsonResponse(geminiSaved('model-old')) });
-    render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
-
-    const notice = await screen.findByTestId('settings-model-retired');
-    const sentence = fmt(en.settings.catalog.retired, {
-      model: 'model-old',
-      vendor: 'Google',
-      recommended: 'model-beta',
-    });
-    expect(notice.textContent).toBe(`${sentence}${en.settings.catalog.switchModel}`);
-    expectPlain(sentence);
-    expect(sentence).not.toMatch(/404|not_found|catalog/i);
-    expect(screen.queryByTestId('settings-model-unlisted')).toBeNull();
-    // Not switched by itself: the saved choice is still what the form holds.
-    expect((screen.getByRole('textbox', { name: en.settings.catalog.modelName }) as HTMLInputElement).value).toBe(
-      'model-old',
-    );
-
-    fireEvent.click(screen.getByRole('button', { name: en.settings.catalog.switchModel }));
-
-    expect((screen.getByTestId('settings-model-select') as HTMLSelectElement).value).toBe('model-beta');
-    expect(screen.queryByTestId('settings-model-retired')).toBeNull();
-    fireEvent.click(screen.getByRole('button', { name: en.settings.footer.save }));
-    await waitFor(() => expect(saveBody(calls)?.llm_model).toBe('model-beta'));
-  });
-
-  // Killed by: frontend/src/components/SettingsModal.tsx :: typedModel === (currentSettings?.llm_model ?? '').trim() &&
-  // Becomes: false &&
-  it('says the saved model is no longer offered in Korean too', async () => {
-    mockFetch({ '/api/settings': () => jsonResponse(geminiSaved('model-old')) });
-    render(
-      <LocaleProvider hints={['ko-KR']}>
-        <SettingsModal {...devModeOff} isOpen onClose={() => {}} />
-      </LocaleProvider>,
-    );
-    const notice = await screen.findByTestId('settings-model-retired');
-    expect(notice.textContent).toBe(
-      `${fmt(ko.settings.catalog.retired, { model: 'model-old', vendor: 'Google', recommended: 'model-beta' })}${ko.settings.catalog.switchModel}`,
-    );
-  });
-
-  // Killed by: frontend/src/components/SettingsModal.tsx :: const localKeyRefused = needsLocalListing && localMatches && localListing.keyRefused === true && detectedModels.length === 0;
-  // Becomes: const localKeyRefused = false;
-  it('says the vLLM server refused the key, not that no list came back', async () => {
-    mockFetch({
-      '/api/settings': () => jsonResponse(vllmSaved),
-      '/api/models/catalog': () =>
-        jsonResponse({ provider: 'vllm', models: [], reachable: true, key_refused: true, catalog: null }),
-    });
-    render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
-
-    const note = await screen.findByTestId('settings-local-key-refused');
-    expect(note.textContent).toBe(fmt(en.settings.llm.vllmKeyRefused, { endpoint: 'http://box:8000/v1' }));
-    expect(note.textContent).not.toMatch(/401|403|HTTP|Unauthorized/);
-    expectPlain(en.settings.llm.vllmKeyRefused.replace('{endpoint}', 'the address'));
-    expect(screen.queryByTestId('settings-local-not-answering')).toBeNull();
-  });
-
-  // Killed by: frontend/src/components/SettingsModal.tsx :: const localKeyRefused = needsLocalListing && localMatches && localListing.keyRefused === true && detectedModels.length === 0;
-  // Becomes: const localKeyRefused = false;
-  it('says the vLLM server refused the key in Korean too', async () => {
-    mockFetch({
-      '/api/settings': () => jsonResponse(vllmSaved),
-      '/api/models/catalog': () =>
-        jsonResponse({ provider: 'vllm', models: [], reachable: true, key_refused: true, catalog: null }),
-    });
-    render(
-      <LocaleProvider hints={['ko-KR']}>
-        <SettingsModal {...devModeOff} isOpen onClose={() => {}} />
-      </LocaleProvider>,
-    );
-    const note = await screen.findByTestId('settings-local-key-refused');
-    expect(note.textContent).toBe(fmt(ko.settings.llm.vllmKeyRefused, { endpoint: 'http://box:8000/v1' }));
-  });
-
-  // Killed by: frontend/src/components/SettingsModal.tsx :: : testResults.llm.key_refused
-  // Becomes: : false
-  it('words a refused key on Check connection instead of showing the status code', async () => {
-    mockFetch({
-      '/api/settings/test': () =>
+      '/api/connections': () =>
         jsonResponse({
-          results: {
-            llm: { status: 'error', provider: 'vllm', error: 'vLLM HTTP 401', key_refused: true },
-          },
+          connections: [
+            {
+              id: 'ollama', kind: 'ollama', label: 'Ollama', base_url: 'http://127.0.0.1:11434', key_set: false,
+              key_masked: null, source: 'settings', paid: false, status: 'connected', detail: null, model_count: 2,
+            },
+          ],
+          kinds: [],
         }),
-      '/api/settings': () => jsonResponse(vllmSaved),
-      '/api/models/catalog': () =>
-        jsonResponse({ provider: 'vllm', models: [], reachable: true, key_refused: true, catalog: null }),
+      '/api/usage': () => jsonResponse(usageReport(noLimits)),
     });
     render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
-    await screen.findByTestId('settings-local-key-refused');
 
-    fireEvent.click(screen.getByRole('button', { name: /check connection/i }));
-
-    expect(await screen.findByText(en.settings.connectivity.keyRefused)).toBeTruthy();
-    expectPlain(en.settings.connectivity.keyRefused);
-    expect(screen.queryByText('vLLM HTTP 401')).toBeNull();
+    await screen.findByTestId('connection-row-ollama');
+    // The Usage section's own read is out too; give the offer's read the same chance.
+    await screen.findByTestId('settings-usage');
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(screen.queryByTestId('settings-usage-offer')).toBeNull();
   });
 });
 
@@ -2953,5 +1428,28 @@ describe('SettingsModal unreadable settings file (#1860)', () => {
     // The language control sits right below the notice's place, so the section has rendered.
     await screen.findByText(en.settings.language.title);
     expect(screen.queryByTestId('settings-set-aside')).toBeNull();
+  });
+});
+
+/** The pre-gateway single-provider form is gone, and so are its routes (model-gateway.md §3.7.1). */
+describe('SettingsModal models', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('reads the connections and the model sets, and calls none of the deleted routes', async () => {
+    const calls = mockFetch({});
+    render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} initialTab="llm" />);
+
+    expect(await screen.findByTestId('settings-connections-empty')).toBeTruthy();
+    await screen.findByTestId('settings-default-models-no-connection');
+    expect(calls.some((c) => c.url === '/api/connections')).toBe(true);
+    expect(calls.some((c) => c.url.startsWith('/api/models?capability=chat'))).toBe(true);
+    expect(calls.some((c) => c.url.startsWith('/api/models?capability=image'))).toBe(true);
+    for (const gone of ['/api/settings/api-keys', '/api/models/catalog', '/api/settings/test', '/api/models/pull']) {
+      expect(calls.some((c) => c.url.startsWith(gone))).toBe(false);
+    }
+    // No provider cards, key field or endpoint field from the old form.
+    expect(screen.queryByTestId('api-key-input')).toBeNull();
+    expect(screen.queryByTestId('settings-model-select')).toBeNull();
+    expect(screen.queryByRole('button', { name: /^Gemini/ })).toBeNull();
   });
 });

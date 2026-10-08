@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 
 from uclone_x.core.immutable import ImmutableStrMapping
 from uclone_x.core.provenance import Provenance
+from uclone_x.llm.models import ImagePart
 from uclone_x.sandbox.models import (
     SECRET_ENV_PATTERNS,
     ContainerIsolation,
@@ -27,6 +28,7 @@ __all__ = [
     "IsolationPolicy",
     "MCPConnectionConfig",
     "MCPTransport",
+    "REPLY_NOTE_KEY",
     "NoIsolation",
     "SECRET_ENV_PATTERNS",
     "ToolContext",
@@ -36,6 +38,12 @@ __all__ = [
     "effective_isolation_level",
     "is_secret_env_name",
 ]
+
+
+#: The output key under which a tool asks for one line at the end of the turn's reply: a
+#: string, or a mapping with an `en` and a `ko` string. The agent appends it by code
+#: (`uclone_x.agent.reply_lines`), so the person gets it whatever the model wrote (#1808).
+REPLY_NOTE_KEY = "reply_note"
 
 
 class ToolResultStatus(StrEnum):
@@ -119,6 +127,14 @@ class ToolContext(BaseModel):
         "serves every room it sits in. Empty for a turn no room started.",
     )
 
+    clone_names: tuple[str, ...] = Field(
+        default=(),
+        description="The names the clone running this call goes by (its agent id and "
+        "configured name), filled per turn by the agent. `record_memory_fact` files a fact "
+        "under any of them as a fact about `self`, the clone itself (#2016); a name that is "
+        "also one of `person_names` stays the person's.",
+    )
+
     approved_by_person: bool = Field(
         default=False,
         description="True only when a person approved this very call through the runtime's "
@@ -148,6 +164,24 @@ class ToolContext(BaseModel):
         exclude=True,
         description="Backreference to the executing agent for tools that require agent delegation.",
     )
+    stored_results: Any | None = Field(
+        default=None,
+        exclude=True,
+        description="The session's full tool-result bodies (`core.tool_results.ResultBodies`), "
+        "which `tool_result_read` reads a handle from. `None` outside a session.",
+    )
+    image_model: str | None = Field(
+        default=None,
+        description="The picture model of the clone running this call: a model ref, "
+        "`auto`, or `None` to follow the system default (model-gateway §3.4). "
+        "`generate_image` draws with it.",
+    )
+    accepts_images: bool = Field(
+        default=False,
+        description="Whether the model this turn calls takes image input (the provider "
+        "listing's per-model flag). A tool that can return a picture returns text instead "
+        "when this is False; unknown answers False.",
+    )
 
 
 class ToolResult(BaseModel):
@@ -161,6 +195,11 @@ class ToolResult(BaseModel):
 
     execution_time_ms: float = 0.0
     artifacts: tuple[str, ...] = Field(default_factory=tuple)
+    images: tuple[ImagePart, ...] = Field(
+        default_factory=tuple,
+        description="Pictures the result carries for the model (`ChatMessage.images` on "
+        "the tool message). The text `output` never holds image bytes.",
+    )
     isolation_level: IsolationLevel | None = Field(
         default=None,
         description="The isolation level actually applied during execution, unifying "

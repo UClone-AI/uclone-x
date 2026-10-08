@@ -35,7 +35,7 @@ from uclone_x.story.skill_data import (
     load_muse_tables_sourced,
 )
 from uclone_x.tools.base import BaseTool
-from uclone_x.tools.models import ToolContext
+from uclone_x.tools.models import REPLY_NOTE_KEY, ToolContext
 
 __all__ = [
     "MAX_CARDS",
@@ -173,6 +173,15 @@ class MuseSparkTool(BaseTool[MuseSparkParams]):
             "seed": seed,
             "table_digest": table.digest(),
             "cards": draw_cards(table, seed, params.count),
+            # Appended to the turn's reply by code (`agent/reply_lines.py`): the Writer
+            # named the seed in 0 of 8 replies on qwen3:8b, and without it a draw the
+            # person liked cannot be drawn again (#1808).
+            REPLY_NOTE_KEY: {
+                "en": f"These cards were drawn with seed {seed}; ask for seed {seed} to "
+                "draw them again.",
+                "ko": f"이 카드는 시드 {seed}로 뽑았습니다. 같은 카드를 다시 보려면 시드 "
+                f"{seed}로 뽑아 달라고 하세요.",
+            },
         }
         if note is not None:
             result["note"] = note

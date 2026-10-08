@@ -19,9 +19,12 @@ import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import pytest
 from playwright.async_api import Page, Response, Route, async_playwright
+
+from tests.e2e.conftest import clone_id
 
 pytestmark = pytest.mark.e2e
 
@@ -134,7 +137,8 @@ async def test_a_group_conversation_names_each_speaker_and_the_model_that_served
         seq = (await attribution.get_attribute("data-testid") or "").removeprefix("served-by-")
 
         reply = page.locator(f"[data-testid='row-{seq}']")
-        speaker = await reply.inner_text()
+        # The row names its speaker by the clone's display name ("Scout"), not its id.
+        speaker = (await reply.inner_text()).lower()
         assert "scout" in speaker or "champion" in speaker, (
             f"a group turn named nobody, so two senders share one column: {speaker!r}"
         )
@@ -205,8 +209,11 @@ async def test_a_conversation_can_seat_another_agent_while_it_is_open(
 
 
 def _is_persona_load(response: Response) -> bool:
-    """The persona list the head adopts its first name from, at load (`App.tsx`)."""
-    return response.request.method == "GET" and "/api/personas" in response.url
+    """The clone list the head adopts its first name from, at load (`App.tsx`).
+
+    The listing itself, `GET /api/clones`: not one clone's entry or picture beneath it.
+    """
+    return response.request.method == "GET" and urlparse(response.url).path == "/api/clones"
 
 
 def _is_room_create(response: Response) -> bool:
@@ -303,9 +310,17 @@ async def test_new_starts_a_conversation_that_its_first_message_names(
             f"so the assertions below are about a different room"
         )
 
-        # On screen as well as in the record: the conversation shows who it seated.
+        # On screen as well as in the record: the conversation shows who it seated. The
+        # seat is the clone's id; the strip names it the way the listing does (`cloneLabel`:
+        # the display name for the screen's language, else any, else the handle).
+        listed = await page.request.get(f"{ui_test_server}/api/clones")
+        entry = next(row for row in (await listed.json())["clones"] if row["id"] == adopted)
+        names: dict[str, str] = entry.get("display_name") or {}
+        label = (names.get("en") or "").strip() or next(
+            (n.strip() for n in names.values() if n.strip()), str(entry["handle"])
+        )
         strip = page.locator("[data-testid='participant-strip']")
-        await strip.get_by_text(adopted).first.wait_for(timeout=10000)
+        await strip.get_by_text(label, exact=True).first.wait_for(timeout=10000)
 
         # A conversation with nothing in it says so, rather than rendering a blank column.
         # Which of the two lines it says is what #1145 was reading at random: this one is the
@@ -565,7 +580,8 @@ async def test_a_one_agent_conversation_that_was_answered_does_not_say_nobody_an
         await page.wait_for_selector("[data-testid='row-4']", timeout=20000)
 
         state = await _settled_on_silence(page, ui_test_server, room_id)
-        assert state["transcript"][-1]["sender_id"] == "scout", (
+        scout = await clone_id(page, ui_test_server, "scout")
+        assert state["transcript"][-1]["sender_id"] == scout, (
             f"the premise is a silence recorded after scout's reply: {state['transcript']}"
         )
 

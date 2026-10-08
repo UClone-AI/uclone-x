@@ -71,6 +71,7 @@ _NUMBER_TRIES = 5
 _PROPOSAL_NAME = re.compile(r"^p(\d+)\.yaml$")
 
 _ID = re.compile(ENTRY_ID_PATTERN)
+_BACKUP_SUFFIX = re.compile(r"\.(?:yaml|yml)(?:[.~].*|\Z)", re.IGNORECASE)
 
 
 def _rename_target(relative: str) -> str | None:
@@ -79,10 +80,18 @@ def _rename_target(relative: str) -> str | None:
     `mara.yml`, `mara.yaml~` and `mara.yaml.bak` all mean `mara.yaml`; a name that is not
     an entry id (`Old Map.txt`) means none.
     """
-    base = PurePosixPath(PurePosixPath(relative).stem)
-    if base.suffix in (".yaml", ".yml"):
-        base = PurePosixPath(base.stem)
-    return f"{base}.yaml" if _ID.fullmatch(str(base)) else None
+    path = PurePosixPath(relative)
+    name = path.name
+    match = _BACKUP_SUFFIX.search(name)
+    if match is not None:
+        base_str = name[: match.start()]
+    else:
+        base_str = path.stem
+    if len(base_str) > 80:
+        return None
+    if not _ID.fullmatch(base_str):
+        return None
+    return f"{base_str}.yaml"
 
 
 def _rename_advice(relative: str, beside: list[str]) -> str:
@@ -90,10 +99,10 @@ def _rename_advice(relative: str, beside: list[str]) -> str:
 
     A name is suggested only when `_rename_target` gives one, no other file in the folder
     has that name in any mix of capitals, and `_rename_target` gives no other file there
-    the same name, so two files are never both told to become it. Names are compared ignoring case because a Mac or Windows disk treats `Mara.yaml`
-    and `mara.yaml` as one file, so the rename would replace it (#1595).
+    the same name, so two files are never both told to become it. Names are compared
+    ignoring case because a Mac or Windows disk treats `Mara.yaml` and `mara.yaml` as
+    one file, so the rename would replace it (#1595).
     """
-    path = PurePosixPath(relative)
     target = _rename_target(relative)
     if target is not None:
         wanted = target.casefold()
@@ -103,8 +112,8 @@ def _rename_advice(relative: str, beside: list[str]) -> str:
         if not taken and not shared:
             return f"If it is an entry, rename it to '{target}'."
     return (
-        f"If it is an entry, give it a name ending in '.yaml' that no other file in "
-        f"'{path.parent}/' has, even with different capitals."
+        "If it is an entry, give it an unused name ending in '.yaml' using only lowercase "
+        "letters, digits, and hyphens (up to 80 characters)."
     )
 
 
@@ -217,7 +226,8 @@ class StoryWork:
             )
         for kind in CODEX_KINDS:
             folder = f"{CODEX_DIR}/{kind}"
-            for relative in self._library.folders_in(self._story_id, folder):
+            folders = self._library.folders_in(self._story_id, folder)
+            for relative in folders:
                 unreadable.append(
                     UnreadableFile(
                         relative,
@@ -233,7 +243,7 @@ class StoryWork:
                         UnreadableFile(
                             relative,
                             f"'{relative}' was not read: codex entries are read only from "
-                            f"files ending in '.yaml'. {_rename_advice(relative, files)}",
+                            f"files ending in '.yaml'. {_rename_advice(relative, files + folders)}",
                         )
                     )
                     continue

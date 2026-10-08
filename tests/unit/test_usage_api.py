@@ -231,9 +231,8 @@ async def test_a_dashboard_with_its_own_storage_enforces_the_limit_its_panel_sho
     (dashboard_dir / "settings.json").write_text(
         json.dumps(
             {
-                "llm_provider": "anthropic",
-                "llm_api_key": "sk-ant-test",
-                "llm_api_key_provider": "anthropic",
+                "connections": [{"id": "anthropic", "kind": "anthropic", "key": "sk-ant-test"}],
+                "default_models": {"deep": "anthropic/claude-a"},
             }
         )
     )
@@ -254,7 +253,7 @@ async def test_a_dashboard_with_its_own_storage_enforces_the_limit_its_panel_sho
         == 200
     )
     _book(dashboard_dir, timedelta(minutes=1), 200, "Anthropic", "claude-a")
-    llm = app.state.session_manager.default_llm
+    llm, _model = app.state.session_manager.gateway.default_deep()
     assert llm is not None and llm.paid
 
     with pytest.raises(UsageLimitReachedError):
@@ -264,11 +263,11 @@ async def test_a_dashboard_with_its_own_storage_enforces_the_limit_its_panel_sho
     assert not (session_root / USAGE_FILE_NAME).exists()
 
 
-def test_the_dashboard_builds_every_connector_through_its_gated_helper() -> None:
+def test_the_dashboard_builds_no_connector_of_its_own() -> None:
     """A direct `create_llm_connector` call in the dashboard would take the default gate.
 
-    The test above drives one path (the connector built at startup); this holds the rest to
-    the one helper that passes the dashboard's gate.
+    The test above drives the gateway, which builds every connector with the dashboard's
+    gate; this holds the dashboard to asking the gateway rather than building one itself.
     """
     import uclone_x.ui.app as app_module
 
@@ -282,4 +281,4 @@ def test_the_dashboard_builds_every_connector_through_its_gated_helper() -> None
         and isinstance(call.func, ast.Name)
         and call.func.id == "create_llm_connector"
     ]
-    assert callers == ["build_llm"]
+    assert callers == []

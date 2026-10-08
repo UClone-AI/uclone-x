@@ -5,8 +5,8 @@ explicit, attributable errors rather than as substituted values. That is only po
 if there is a taxonomy to raise from, so this module is the single root for every
 runtime error the framework raises.
 
-The A2A section mirrors the error table of `docs/a2a-protocol-spec.md` section 6.2 one
-type at a time, because section 10.5 requires the in-process fastpath to raise the same
+The A2A section mirrors the A2A protocol specification's error table one type at a
+time, because the A2A specification requires the in-process fastpath to raise the same
 typed error a remote caller would have received over the JSON-RPC binding. The canonical
 code mappings ride on the class so a binding can translate without a lookup table of its
 own.
@@ -17,7 +17,7 @@ from __future__ import annotations
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING, ClassVar, Literal
 
 if TYPE_CHECKING:
     # Import-time cycle, annotation-time not: `uclone_x.agent.session` imports this
@@ -45,6 +45,7 @@ __all__ = [
     "EmbeddingError",
     "ExtendedAgentCardNotConfiguredError",
     "ExtensionSupportRequiredError",
+    "FormTextMismatchError",
     "FrontendBuildFailedError",
     "HeadRoomWriteError",
     "InvalidAgentResponseError",
@@ -93,6 +94,8 @@ __all__ = [
     "PushNotificationNotSupportedError",
     "RoomAlreadyExistsError",
     "RoomError",
+    "RoomWorkspaceRefusedError",
+    "WorkspaceRefusalCode",
     "RoomIdError",
     "RoomNotFoundError",
     "SandboxViolationError",
@@ -116,7 +119,6 @@ __all__ = [
     "TelemetryExportError",
     "TokenBudgetExhaustedError",
     "ToolError",
-    "TurnBudgetExceededError",
     "TurnNotLandedError",
     "TurnNotStartedError",
     "UCloneXError",
@@ -349,6 +351,20 @@ class SessionRecordUnreadableError(AgentStateError):
         self.cause = cause
 
 
+class FormTextMismatchError(PlainRefusalError):
+    """A shortened tool result was handed in as text other than what it records (#1848).
+
+    A form -- an excerpt or a stub -- is held as the kept result it was cut from and the
+    share it keeps, and its text is rendered from those. Text that differs from that
+    rendering would be sent as something the record does not say, so it is refused. The
+    message is plain; `detail` names the form and its handle, for the log only.
+    """
+
+    def __init__(self, message: str, *, detail: str) -> None:
+        super().__init__(message, reason_code="form_text_mismatch")
+        self.detail = detail
+
+
 class StaleSessionWriteError(AgentStateError):
     """A session write was refused because the record moved on since it was read (#219).
 
@@ -473,7 +489,7 @@ class StepBudgetExceededError(BudgetExceededError):
     The quantity bounded here is the **agent step** — one model invocation and its tool
     round, taken without returning to the caller — never the interaction turn. Bounding
     interaction turns terminates long human conversations, which is the defect recorded
-    in issue 2026-09-05-001. See `docs/guides/agent-runtime-terminology.md`.
+    in issue 2026-09-05-001. See the agent-runtime terminology guide.
     """
 
     def __init__(
@@ -482,42 +498,10 @@ class StepBudgetExceededError(BudgetExceededError):
         *,
         max_steps: int | None = None,
         current_steps: int | None = None,
-        max_turns: int | None = None,
-        current_turns: int | None = None,
     ) -> None:
         super().__init__(message)
-        # The deprecated `max_turns`/`current_turns` keywords name the same quantity, so a
-        # caller that still passes them lands on the canonical attributes rather than on a
-        # second, silently diverging pair.
-        if max_steps is not None and max_turns is not None and max_steps != max_turns:
-            raise ValueError(
-                f"Conflicting values for max_steps and deprecated alias max_turns: {max_steps} != {max_turns}"
-            )
-        if (
-            current_steps is not None
-            and current_turns is not None
-            and current_steps != current_turns
-        ):
-            raise ValueError(
-                f"Conflicting values for current_steps and deprecated alias current_turns: {current_steps} != {current_turns}"
-            )
-        self.max_steps = max_steps if max_steps is not None else max_turns
-        self.current_steps = current_steps if current_steps is not None else current_turns
-
-    @property
-    def max_turns(self) -> int | None:
-        """[Deprecated alias for max_steps] The step ceiling that was reached."""
-        return self.max_steps
-
-    @property
-    def current_turns(self) -> int | None:
-        """[Deprecated alias for current_steps] The steps taken when the ceiling hit."""
-        return self.current_steps
-
-
-# Deprecated alias. The name says "turn" for a ceiling that has only ever bounded steps;
-# it stays exported so existing `except TurnBudgetExceededError` handlers keep catching.
-TurnBudgetExceededError = StepBudgetExceededError
+        self.max_steps = max_steps
+        self.current_steps = current_steps
 
 
 class CapabilityUnavailableError(UCloneXError):
@@ -1211,7 +1195,7 @@ class UnparseableDirectiveError(OntologyError):
 
 
 # --------------------------------------------------------------------------------------
-# A2A (docs/a2a-protocol-spec.md section 6.2)
+# A2A (the A2A protocol specification's error table)
 # --------------------------------------------------------------------------------------
 
 
@@ -1467,6 +1451,23 @@ class HeadRoomWriteError(RoomError):
     """
 
 
+#: Why a conversation's workspace was not changed: the head words it from this.
+WorkspaceRefusalCode = Literal["not_a_folder", "app_state", "story_open"]
+
+
+class RoomWorkspaceRefusedError(RoomError):
+    """A conversation's workspace was not changed (clone-data-scopes §3.6).
+
+    The message is the English sentence; `code` says which refusal it is, so a head words
+    it in the reader's language: the path is not an existing folder (`not_a_folder`), it
+    holds the app's own state (`app_state`), or a story is open (`story_open`).
+    """
+
+    def __init__(self, message: str, code: WorkspaceRefusalCode) -> None:
+        super().__init__(message)
+        self.code: WorkspaceRefusalCode = code
+
+
 class TurnNotStartedError(RoomError):
     """A turn was refused because the room could not record that it was starting (#1366).
 
@@ -1482,9 +1483,10 @@ class TurnNotLandedError(RoomError):
 
     The seat has already been put back to where it was before the turn, so the seat and
     the transcript agree that the turn did not happen. The message is written for the
-    person reading the conversation: it names the seat and what to do. The store's own
-    failure -- an `OSError` carrying a path, say -- is chained on `__cause__` and logged,
-    never written into the message.
+    person reading the conversation: it names the seat and that the reply could not be saved,
+    pointing to the server log for the reason (#1503). The store's own failure -- an
+    `OSError` carrying a path, say -- is chained on `__cause__` and logged, never written
+    into the message.
     """
 
 

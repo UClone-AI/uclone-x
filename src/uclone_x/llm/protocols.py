@@ -19,6 +19,7 @@ from uclone_x.llm.models import (
     StreamChunk,
     TokenBudget,
     TokenUsage,
+    request_without_images,
 )
 
 
@@ -163,7 +164,21 @@ class TokenBudgetManagerProtocol(Protocol):
 
 @runtime_checkable
 class ContextCompactorProtocol(Protocol):
-    """Protocol for automatic conversation pruning and semantic compaction."""
+    """Protocol for automatic conversation pruning and semantic compaction.
+
+    **What a compactor may put in the history (#1848, #1974).** A tool result it shows in
+    a smaller form -- an excerpt or a stub -- is a *form*: the message sets `form` and
+    `rendered_from` (`RenderedFrom`: the `tr_` handle of the kept result it was cut from,
+    the share it keeps, and whether the reader tool is offered), and its `content` must be
+    exactly the rendering of that form from that kept result (`render_form` in
+    `core/context_state.py`, which `stored_result_stub` and `excerpt_tool_result` write).
+    The session log keeps a form as that record and never as its text, and every request
+    renders it again from the kept result, so text other than the rendering is refused
+    when the history is written (`FormTextMismatchError`), and a form with no
+    `rendered_from` is refused too. The handle is the one the message records, never one
+    read out of its text. Any other message a compactor writes -- a summary, a ledger --
+    is new text and carries no form.
+    """
 
     keep_recent_turns: int
     """Dialogue turns held outside compaction.
@@ -229,3 +244,37 @@ class ContextCompactorProtocol(Protocol):
         that knows which path ran is the compactor. See `CompactionOutcome`.
         """
         ...
+
+
+@runtime_checkable
+class ImageInputProbe(Protocol):
+    """A provider that can say whether a model takes image input (#2107).
+
+    Separate from `LLMProviderProtocol` so a provider that cannot tell need not pretend:
+    a caller checks `isinstance` and treats a provider without this as "does not".
+    """
+
+    async def accepts_images(self, model: str | None = None) -> bool:
+        """Whether `model` (the provider's default when `None`) takes image input.
+
+        Never raises: an answer the provider cannot get is `False`.
+        """
+        ...
+
+
+async def request_for_model(provider: object, request: LLMRequest) -> LLMRequest:
+    """`request` as it may be sent to `provider`'s model: without images if it cannot see.
+
+    A conversation can switch to a model that does not read images after an earlier one
+    was shown some, and a provider refuses a request carrying images its model cannot read
+    (#2123). Each image then goes as a plain note (`request_without_images`); the stored
+    history is not touched. The provider is asked only when the request carries an image,
+    and one that cannot say counts as not reading them, as `ImageInputProbe` says.
+    """
+    if not any(message.images for message in request.messages):
+        return request
+    if isinstance(provider, ImageInputProbe) and await provider.accepts_images(
+        request.model or None
+    ):
+        return request
+    return request_without_images(request)

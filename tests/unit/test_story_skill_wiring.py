@@ -31,6 +31,7 @@ from uclone_x.llm.connectors.mock import MockLLMConnector
 from uclone_x.llm.models import ToolCallRequest
 from uclone_x.skills.auditor import Skill, SkillRegistry
 from uclone_x.skills.models import (
+    ROUTED_SKILL_TAG,
     AuditVerdict,
     SkillAuditReport,
     SkillManifest,
@@ -683,6 +684,46 @@ def test_a_skill_that_is_not_active_supplies_nothing(tmp_path: Path) -> None:
     assert agent.active_skill_dirs() == (active,)
 
 
+def test_a_skill_hidden_from_the_agent_supplies_it_no_data(tmp_path: Path) -> None:
+    """A skill the catalog hides for a missing tool puts no folder on the agent's calls (#1865).
+
+    Killed by: src/uclone_x/agent/base.py :: if missing_required_tools(skill.manifest, scope):
+    Becomes: if False:
+    """
+    folder = _skill(tmp_path / "skills", "painter-west", {"muse/western.yaml": _WESTERN})
+    registry = SkillRegistry()
+    manifest = SkillManifest(
+        name="painter-west",
+        description="Needs a tool the writer lacks.",
+        origin=SkillOrigin.HUMAN,
+        status=SkillStatus.ACTIVE,
+        content_sha256="sha_pw",
+        requires_tools=("generate_image",),
+    )
+    registry.register(
+        Skill(manifest=manifest, instructions_markdown="", directory=folder),
+        SkillAuditReport(
+            skill_name="painter-west",
+            is_safe=True,
+            recommendation=AuditVerdict.APPROVE,
+            content_sha256="sha_pw",
+        ),
+    )
+
+    def agent(tools: tuple[str, ...]) -> BaseAgent:
+        config = AgentConfig(
+            agent_id="writer",
+            name="Writer",
+            llm_config=AgentLLMConfig(model_name="mock"),
+            allowed_tools=tools,
+        )
+        return BaseAgent(config=config, skills=registry)
+
+    assert agent(("muse_spark",)).active_skill_dirs() == ()
+    assert agent(("muse_spark", "generate_image")).active_skill_dirs() == (folder,)
+    assert agent(()).active_skill_dirs() == (folder,)
+
+
 # --- story_outline builds from a structure ------------------------------------------------
 
 
@@ -857,3 +898,40 @@ def test_a_storys_genre_with_no_table_is_refused_saying_it_came_from_the_story(
         "There is no table for the open story's genre 'western', so nothing was drawn. "
         "Genres: fantasy, horror, mystery, romance, science-fiction."
     )
+
+
+def test_a_case_routed_skill_supplies_no_folder(tmp_path: Path) -> None:
+    """A case-routed skill is handed over by the router only; its folder stays off (#1865).
+
+    Killed by: src/uclone_x/agent/base.py ::             if ROUTED_SKILL_TAG in skill.manifest.tags:
+    Becomes:             if False:
+    """
+    routed = _skill(tmp_path / "skills", "art-routed", {"muse/western.yaml": _WESTERN})
+    plain = _skill(tmp_path / "skills", "art-plain", {"muse/western.yaml": _WESTERN})
+    registry = SkillRegistry()
+    for name, folder, tags in (
+        ("art-routed", routed, (ROUTED_SKILL_TAG,)),
+        ("art-plain", plain, ()),
+    ):
+        manifest = SkillManifest(
+            name=name,
+            description="A picture skill.",
+            origin=SkillOrigin.HUMAN,
+            status=SkillStatus.ACTIVE,
+            content_sha256=f"sha_{name}",
+            tags=tags,
+        )
+        registry.register(
+            Skill(manifest=manifest, instructions_markdown="", directory=folder),
+            SkillAuditReport(
+                skill_name=name,
+                is_safe=True,
+                recommendation=AuditVerdict.APPROVE,
+                content_sha256=f"sha_{name}",
+            ),
+        )
+    config = AgentConfig(
+        agent_id="artist", name="Artist", llm_config=AgentLLMConfig(model_name="mock")
+    )
+
+    assert BaseAgent(config=config, skills=registry).active_skill_dirs() == (plain,)

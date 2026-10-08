@@ -21,12 +21,12 @@ This module is pure.
 
 from __future__ import annotations
 
-import re
 import unicodedata
+
+from uclone_x.knowledge.fold import fold
 
 __all__ = ["MIN_QUOTE_CHARACTERS", "folded", "passage_in", "quote_found", "quote_too_short"]
 
-_SPACE = re.compile(r"\s+")
 
 #: The fewest letters or digits a quote may have.
 MIN_QUOTE_CHARACTERS = 3
@@ -49,7 +49,7 @@ _UNSPACED_SCRIPTS = (
 
 def folded(text: str) -> str:
     """`text` in NFC, with runs of white space as one space, trimmed, and case-folded."""
-    return _SPACE.sub(" ", unicodedata.normalize("NFC", text)).strip().casefold()
+    return fold(text)
 
 
 def quote_too_short(quote: str) -> bool:

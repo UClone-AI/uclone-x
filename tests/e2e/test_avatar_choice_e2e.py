@@ -8,7 +8,7 @@ decodes no image, so a rail pointed at an address that still serves the old byte
 looks the same there as one that shows the new picture.
 
 Also here: "Ask … to make one" opens a conversation with the request waiting in the box and
-sends nothing, and Settings › Images says what can draw now in the head's own words.
+sends nothing, and Settings › Models says what draws pictures now in the head's own words.
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ import pytest
 import yaml
 from playwright.async_api import Page, async_playwright
 
-from tests.e2e.conftest import dock_locator, mock_llm, running_ui
+from tests.e2e.conftest import clone_id, dock_locator, mock_llm, running_ui
 from uclone_x.llm.connectors.mock import MockLLMConnector
 
 pytestmark = pytest.mark.e2e
@@ -134,19 +134,22 @@ async def test_use_as_avatar_gives_the_drawn_picture_and_undo_takes_it_back(serv
             await page.fill("[data-testid='room-composer']", "Draw yourself, please.")
             await page.click("[data-testid='send-message']")
             await page.get_by_test_id("use-as-avatar-btn").wait_for(timeout=20_000)
-            assert await _rail_picture(page, "painter") == DEFAULT
+            painter = await clone_id(page, server, "painter")
+            assert await _rail_picture(page, painter) == DEFAULT
 
             await page.get_by_test_id("use-as-avatar-btn").click()
             done = page.get_by_test_id("use-as-avatar-done")
             await done.wait_for(timeout=10_000)
             assert "painter" in await done.inner_text()
             # Well inside the 15-second poll: the change itself asked for the listing again.
-            src = await _wait_rail(page, "painter", shows_picture=True)
-            assert "/api/personas/painter/avatar" in src
+            src = await _wait_rail(page, painter, shows_picture=True)
+            # The listing's `avatar_url` names the clone by id, so the address survives a
+            # rename; the route reads a handle too, which is why a handle here is a failure.
+            assert f"/api/clones/{painter}/avatar" in src, src
 
             await page.get_by_test_id("use-as-avatar-undo").click()
             await page.get_by_test_id("use-as-avatar-undone").wait_for(timeout=10_000)
-            assert await _wait_rail(page, "painter", shows_picture=False) == DEFAULT
+            assert await _wait_rail(page, painter, shows_picture=False) == DEFAULT
         finally:
             await browser.close()
 
@@ -158,8 +161,8 @@ async def test_a_picture_uploaded_on_the_profile_is_the_clone_s_face_until_it_is
     """Upload from the profile's menu, then Reset to default, each followed by the rail.
 
     `Killed by:` frontend/src/components/clones/CloneProfile.tsx ::
-    `imageSrc={personaPicture(name, persona)}` becoming
-    `imageSrc={personaPicture(name, persona) && undefined}` -- the rail
+    `imageSrc={personaPicture(cloneId, persona)}` becoming
+    `imageSrc={personaPicture(cloneId, persona) && undefined}` -- the rail
     follows the change while the profile's own picture never shows one, which jsdom cannot
     tell apart from a picture that decoded.
     """
@@ -171,9 +174,10 @@ async def test_a_picture_uploaded_on_the_profile_is_the_clone_s_face_until_it_is
             page = await browser.new_page(viewport={"width": 1600, "height": 900})
             await page.goto(plain_server, wait_until="networkidle")
             await page.get_by_test_id("room-composer").wait_for(timeout=20_000)
-            await page.get_by_test_id("clone-avatar-courier").click()
+            courier = await clone_id(page, plain_server, "courier")
+            await page.get_by_test_id(f"clone-avatar-{courier}").click()
             await (await dock_locator(page)).wait_for(state="visible", timeout=5_000)
-            await page.get_by_test_id("clone-profile-courier").wait_for(timeout=5_000)
+            await page.get_by_test_id(f"clone-profile-{courier}").wait_for(timeout=5_000)
 
             await page.get_by_test_id("clone-profile-avatar").click()
             assert await page.get_by_test_id("clone-avatar-reset").is_disabled()
@@ -182,7 +186,7 @@ async def test_a_picture_uploaded_on_the_profile_is_the_clone_s_face_until_it_is
                 await page.get_by_test_id("clone-avatar-upload").click()
             await (await chooser.value).set_files(str(upload))
             await page.get_by_test_id("clone-avatar-done").wait_for(timeout=10_000)
-            await _wait_rail(page, "courier", shows_picture=True)
+            await _wait_rail(page, courier, shows_picture=True)
             profile = page.get_by_test_id("clone-profile-avatar").locator("img")
             await profile.wait_for(timeout=5_000)
             assert await profile.evaluate("(el) => el.complete && el.naturalWidth > 0")
@@ -190,7 +194,7 @@ async def test_a_picture_uploaded_on_the_profile_is_the_clone_s_face_until_it_is
             await page.get_by_test_id("clone-profile-avatar").click()
             await page.get_by_test_id("clone-avatar-reset").click()
             await page.get_by_test_id("clone-avatar-done").wait_for(timeout=10_000)
-            assert await _wait_rail(page, "courier", shows_picture=False) == DEFAULT
+            assert await _wait_rail(page, courier, shows_picture=False) == DEFAULT
         finally:
             await browser.close()
 
@@ -209,8 +213,9 @@ async def test_asking_a_clone_for_pictures_waits_in_the_box_unsent(plain_server:
             page = await browser.new_page(viewport={"width": 1600, "height": 900})
             await page.goto(plain_server, wait_until="networkidle")
             await page.get_by_test_id("room-composer").wait_for(timeout=20_000)
-            await page.get_by_test_id("clone-avatar-courier").click()
-            await page.get_by_test_id("clone-profile-courier").wait_for(timeout=5_000)
+            courier = await clone_id(page, plain_server, "courier")
+            await page.get_by_test_id(f"clone-avatar-{courier}").click()
+            await page.get_by_test_id(f"clone-profile-{courier}").wait_for(timeout=5_000)
 
             await page.get_by_test_id("clone-profile-avatar").click()
             await page.get_by_test_id("clone-avatar-ask").click()
@@ -230,17 +235,18 @@ async def test_asking_a_clone_for_pictures_waits_in_the_box_unsent(plain_server:
             ).json()
             said = [m for m in room["transcript"] if m.get("kind", "utterance") == "utterance"]
             assert said == [], said
-            assert any(p["id"] == "courier" for p in room["participants"])
+            assert any(p["id"] == courier for p in room["participants"])
         finally:
             await browser.close()
 
 
 @pytest.mark.asyncio
-async def test_settings_images_says_what_draws_in_plain_words(plain_server: str) -> None:
-    """The Images tab names what can draw, and never an engine id or a reason code.
+async def test_settings_pictures_says_what_draws_in_plain_words(plain_server: str) -> None:
+    """Under the Pictures default, Settings › Models names what draws, never an engine id.
 
-    What draws depends on the machine -- a ComfyUI may be running, a model may be installed --
-    so the assertion is on the words, whichever sentence it is.
+    What draws depends on the machine -- a model may be installed, a connection may answer --
+    so the assertion is on the words, whichever sentence it is (model-gateway §3.5). The
+    Images tab is gone: its choice is the Pictures default now.
     """
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(headless=True)
@@ -248,14 +254,19 @@ async def test_settings_images_says_what_draws_in_plain_words(plain_server: str)
             page = await browser.new_page(viewport={"width": 1400, "height": 900})
             await page.goto(plain_server, wait_until="networkidle")
             await page.get_by_test_id("open-settings").click()
-            tab = page.get_by_test_id("settings-tab-tools")
-            assert (await tab.inner_text()).strip() == "Images"
-            await tab.click()
-            status = page.get_by_test_id("settings-images-status")
-            await status.wait_for(timeout=15_000)
-            text = await status.inner_text()
-            assert "Pictures are drawn with" in text or "Nothing can draw pictures" in text
+            await page.get_by_test_id("settings-tab-llm").click()
+            line = page.get_by_test_id("settings-default-image-now").or_(
+                page.get_by_test_id("settings-default-image-none")
+            )
+            await line.wait_for(timeout=15_000)
+            text = await line.inner_text()
+            assert (
+                "Now drawing" in text
+                or "Nothing can draw pictures" in text
+                or "cannot draw right now" in text
+            ), text
             for internal in ("comfyui-local", "diffusers-sdxl", "remote-cuda", "no_key", "_"):
                 assert internal not in text, f"{internal!r} is on the screen: {text!r}"
+            assert await page.get_by_test_id("settings-images").count() == 0
         finally:
             await browser.close()

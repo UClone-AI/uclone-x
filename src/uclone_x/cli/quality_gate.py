@@ -56,11 +56,6 @@ FAILURE_LOG_PATH = Path(".pytest_cache/failure_history.jsonl")
 # `./ucx test check`, while the design document claimed Tier 1 makes zero network calls.
 # A tier that is not named in a marker expression is not a boundary.
 #
-# `all` keeps its documented meaning ("Unit + E2E") and therefore also excludes the
-# recorded and live tiers. Since `gate` now includes E2E, `--all` selects the same set;
-# it is retained because it is in the guides, the review checklist and muscle memory, and
-# silently removing a flag that still appears in AGENTS.md would be worse than a synonym.
-#
 # `gate` is what `./ucx test check` runs: everything that is offline and free. It is not a
 # test level, and naming it separately is the point — `unit` now selects only tests of
 # product code, while the fitness functions that check the repository's own declarations are
@@ -97,7 +92,6 @@ _MARKER_EXPRESSIONS: Final[dict[str, str]] = {
     # the answer is that a release runs it by name, and naming it is what makes it
     # auditable rather than a step in someone's head.
     "pre-release": "pre_release",
-    "all": "not recorded and not live",
 }
 
 # Scopes that must disable coverage. `addopts` in `pyproject.toml` carries
@@ -127,7 +121,7 @@ _PARALLEL_SCOPES: Final[frozenset[str]] = frozenset({"fast", "unit", "fitness"})
 # own load-time requests (#942; #946 and #975). Running them beside eleven busy workers made
 # those races fire: the fully parallel gate passed 1 run in 3 even with #942's test fix
 # applied, against 3 in 3 for this split.
-_SPLIT_BROWSER_SCOPES: Final[frozenset[str]] = frozenset({"gate", "all"})
+_SPLIT_BROWSER_SCOPES: Final[frozenset[str]] = frozenset({"gate"})
 
 # The browser step's own workers, once the main workers have finished. Serial, the step had
 # become the gate's longest (about 2 min 15 s). On 4 `loadfile` workers it took 37-44 s and
@@ -169,7 +163,6 @@ TEST_SCOPES: Final[tuple[str, ...]] = (
     "live",
     "e2e",
     "pre-release",
-    "all",
 )
 
 # pytest's EXIT_NOTESTSCOLLECTED. Reported honestly rather than as a coverage failure:
@@ -188,7 +181,6 @@ SCOPE_LABELS: Final[dict[str, str]] = {
     "live": "Tier 3 Live Suite (real LLM endpoint)",
     "e2e": "E2E Playwright Suite",
     "pre-release": "Release Qualification Suite (clean-venv install matrix; network)",
-    "all": "Offline Gate + E2E Suite (same selection as the default gate)",
 }
 
 # Per-package branch-coverage floors, checked after the suite runs.
@@ -238,10 +230,10 @@ PACKAGE_COVERAGE_FLOORS: Final[dict[str, int]] = {
 PYTHON_CHECK_PATHS: Final[tuple[str, ...]] = (
     "src",
     "tests",
-    "swarm",
     "scripts",
     "evals",
     "oss",
+    "examples",
 )
 
 # Top-level Python directories intentionally outside the gate, with the reason.
@@ -318,8 +310,8 @@ SCOPE_RESOLUTION_EXIT_CODE: Final[int] = 2
 def resolve_check_paths(root: Path | None = None) -> tuple[str, ...]:
     """The declared check paths that exist in this tree, in declaration order.
 
-    Not every path exists in every tree. `swarm`, `scripts` and `oss` hold the
-    build swarm and the publication tooling, which are not part of the
+    Not every path exists in every tree. `scripts` and `oss` hold the
+    build tooling and the publication tooling, which are not part of the
     published open-source subset, and `ruff` and `pyright` both fail on a path
     that is not there. Filtering keeps one gate honest in both trees rather
     than making the published one carry a different definition of "passing".
@@ -529,10 +521,10 @@ def run_stage(
 # passed. The suite was written, reviewed and extended — PR #905 alone added ~1,150 lines
 # of it — and executed by nothing, so a frontend regression reached a green gate by
 # construction. It now runs in every scope below, which is every scope a commit is
-# measured against: `gate` (plain `./ucx test check`), `fast` (the documented edit loop, which
-# drops the browser suite "and nothing else") and `all` (the no-op synonym for `gate`).
+# measured against: `gate` (plain `./ucx test check`) and `fast` (the documented edit loop,
+# which drops the browser suite "and nothing else").
 # The named pytest tiers stay Python-only; `-fe` still adds the suite to any of them.
-_FRONTEND_SUITE_SCOPES: Final[frozenset[str]] = frozenset({"gate", "fast", "all"})
+_FRONTEND_SUITE_SCOPES: Final[frozenset[str]] = frozenset({"gate", "fast"})
 
 # What `run_frontend_suite` found. `absent`, `npm-missing` and `deps-missing` are separate
 # answers for the reason `LockfileStatus` separates its own: "does not apply" and "could
@@ -705,7 +697,7 @@ def build_pytest_command(
     everything" — a mistyped scope that quietly widened the selection would be exactly
     the silent substitution P6 forbids.
 
-    This is the scope's selection as **one** invocation. For `gate` and `all` the gate does
+    This is the scope's selection as **one** invocation. For `gate` the gate does
     not run it as it stands unless asked to with `serial`: it runs the two steps
     `build_pytest_steps` derives from the same marker expression. `serial` drops the worker
     flags from a parallel scope and changes nothing else.
@@ -756,8 +748,8 @@ def build_pytest_steps(
 ) -> list[PytestStep]:
     """The invocations that make up one scope's pytest stage, in the order they run.
 
-    One step for every scope except `gate` and `all`, whose step is `build_pytest_command`
-    unchanged. Those two run in two steps whose marker expressions partition the scope's
+    One step for every scope except `gate`, whose step is `build_pytest_command`
+    unchanged. It runs in two steps whose marker expressions partition the scope's
     selection by the `e2e` marker, so together they select exactly what the scope selects:
 
     1. everything except the browser suite, on workers, with `--cov-fail-under=0` because
@@ -945,9 +937,9 @@ def describe_installed_hook_drift(
 ) -> list[str]:
     """Report whether the *installed* pre-commit hook matches the tracked constant.
 
-    Three copies of this hook exist: the `PRE_COMMIT_HOOK` constant, the tracked mirror
-    `swarm/pre-commit.hook`, and the file git actually runs at `.git/hooks/pre-commit`.
-    An existing test pins mirror-to-constant, so **the live copy was checked by nothing** —
+    Two copies of this hook exist: the `PRE_COMMIT_HOOK` constant `ucx setup` installs,
+    and the file git actually runs at `.git/hooks/pre-commit`. Before this report
+    **the live copy was checked by nothing** —
     and on 2026-09-03 it was edited in place to add a documentation-only fast path (#285).
     The two sizes are deliberately not written down here: the constant's length changes
     whenever the hook does, and a number in prose goes stale silently. The report below
@@ -1005,7 +997,7 @@ def describe_installed_hook_drift(
     return [
         "[bold yellow]! The installed pre-commit hook differs from the tracked source.[/bold yellow]",
         f"[yellow]  installed: {installed_path} ({len(installed.encode('utf-8'))} bytes)[/yellow]",
-        f"[yellow]  tracked:   PRE_COMMIT_HOOK / swarm/pre-commit.hook "
+        f"[yellow]  tracked:   PRE_COMMIT_HOOK "
         f"({len(expected_content.encode('utf-8'))} bytes)[/yellow]",
         "[yellow]  Git runs the installed copy, so any guard added to the tracked source "
         "is NOT in effect[/yellow]",
@@ -1022,8 +1014,8 @@ def describe_installed_hook_drift(
 # merge on it, so it is written only when all three hold:
 #
 # 1. The run passed.
-# 2. The run was the full default gate: `./ucx test check`, including with `--all` (a no-op
-#    synonym for it), `-fe` or `--no-fail-fast`. `--fast` drops the browser suite and
+# 2. The run was the full default gate: `./ucx test check`, including with `-fe` or
+#    `--no-fail-fast`. `--fast` drops the browser suite and
 #    `--skip-tests` drops every test, so neither verified what a merge needs. The named tiers
 #    (`unit`, `e2e`, ...) never call this.
 # 3. The tree was the commit: `HEAD` resolves, `git status --porcelain` is empty both before
@@ -1203,10 +1195,10 @@ def run_quality_gate(
 
     Scope policy:
         Python static checks cover all top-level directories containing Python code:
-        `src`, `tests`, `swarm`, and `scripts`. Directories outside this set
+        `src`, `tests`, `scripts`, `evals` and `oss`. Directories outside this set
         (such as `frontend/`, `credentials/`, and `docs/`) are not covered by the
-        static checks. The frontend's vitest suite runs as its own stage in the `gate`,
-        `fast` and `all` scopes (#915), and so does the check that the committed bundle is
+        static checks. The frontend's vitest suite runs as its own stage in the `gate`
+        and `fast` scopes (#915), and so does the check that the committed bundle is
         what the source builds, which builds into a temporary directory (#878). The
         frontend production build into the committed directory runs only when explicitly
         requested (`check_frontend=True`), because it writes committed files.

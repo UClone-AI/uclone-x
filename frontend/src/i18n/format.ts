@@ -17,6 +17,7 @@ export type Values = Readonly<Record<string, string | number>>;
 export interface Plural {
   one: string;
   other: string;
+  zero?: string;
 }
 
 const PLACEHOLDER = /\{(\w+)\}/g;
@@ -57,7 +58,7 @@ export const fmt = (template: string, values: Values = {}): string =>
 
 /** The form of `forms` for `count`, filled with `count` and `values`. */
 export const plural = (forms: Plural, count: number, values: Values = {}): string =>
-  fmt(count === 1 ? forms.one : forms.other, { ...values, count });
+  fmt(count === 0 && forms.zero ? forms.zero : count === 1 ? forms.one : forms.other, { ...values, count });
 
 /** The placeholder names a template uses, in order of first appearance. */
 export const placeholders = (template: string): string[] => [

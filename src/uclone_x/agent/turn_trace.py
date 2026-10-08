@@ -6,12 +6,14 @@ Provides the Core read model for inspecting a turn from the session log and cont
 from __future__ import annotations
 
 import json
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from uclone_x.agent.request_record import (
+    EpochErrorCode,
+    EpochRecordError,
     RebuiltRequest,
     RecordErrorCode,
     RequestRecordError,
@@ -20,7 +22,9 @@ from uclone_x.agent.request_record import (
 )
 from uclone_x.agent.session import SessionState
 from uclone_x.core.context_state import ContextEpoch
+from uclone_x.core.session_log import kept_result_text, stored_result_entry
 from uclone_x.core.session_store import SessionStoreProtocol
+from uclone_x.core.tool_results import result_handle
 from uclone_x.errors import UCloneXError
 from uclone_x.llm.models import ChatMessage
 
@@ -60,6 +64,10 @@ class TraceToolResult(BaseModel):
     status: str | None = None
     outcome: str | None = None
     output: Any = None
+    #: The log names this result but the session no longer holds its text -- or the
+    #: event is from before results were named by handle (#2013) -- so `output` is
+    #: `None` and says nothing about what the call returned.
+    output_unavailable: bool = False
     duration_ms: float | None = None
     at: str | None = None
 
@@ -128,10 +136,11 @@ class TraceStep(BaseModel):
         description="Why `from_log` is `None`, as a stable code the UI maps to its own "
         "sentence (#1903); `from_log_reason` stays the English detail.",
     )
-    from_log_detail_code: RecordErrorCode | None = Field(
+    from_log_detail_code: EpochErrorCode | None = Field(
         default=None,
         description="For `epoch_unreadable`, what kind of gap stopped the epoch's rebuild, "
-        "as a stable code (#1911); `from_log_reason` stays the English detail.",
+        "as a stable code (#1911), one of the four an epoch can raise (#1915); "
+        "`from_log_reason` stays the English detail.",
     )
     response_status: Literal["ok", "error", "unavailable"]
     response_reason: str | None = None
@@ -176,7 +185,7 @@ class StepDetail(BaseModel):
     )
     from_log_reason: str | None = None
     from_log_code: FromLogCode | None = None
-    from_log_detail_code: RecordErrorCode | None = None
+    from_log_detail_code: EpochErrorCode | None = None
     response: ModelResponseRecord | None = None
     response_reason: str | None = None
     response_code: ResponseReasonCode | None = None
@@ -188,10 +197,10 @@ class StepDetail(BaseModel):
 NO_REQUEST_RECORDED = "no request is recorded for this step"
 #: The response reason for a step with no `MODEL_RESPONSE`: logs before #1489.
 NO_RESPONSE_RECORDED = "response recorded from #1489 on"
-#: `TurnTrace.subagents_reason` when a tool result names a helper but cannot be read.
+#: `TurnTrace.subagents_reason` when a tool result cannot be read -- its text is no
+#: longer held (#2013), or it names a helper and does not parse.
 SUBAGENT_UNREADABLE = (
-    "A tool result that names a helper could not be read, so a helper may be missing "
-    "from this list."
+    "A tool result of this turn could not be read, so a helper may be missing from this list."
 )
 #: Events written for a turn after its `TURN_END`: `TOOL_STEP_DROPPED` by the turn
 #: itself (`base.py`, after the `TURN_END` append), `TURN_ROLLED_BACK` by the room
@@ -200,28 +209,55 @@ _AFTER_END_TYPES = frozenset({"TOOL_STEP_DROPPED", "TURN_ROLLED_BACK"})
 _NUDGE_TYPES = frozenset({"EVIDENCE_NUDGE", "EVIDENCE_NUDGE_DECLINED", "GROUNDING_NUDGE"})
 
 
-def _extract_subagents(events: Sequence[Mapping[str, Any]]) -> tuple[list[str], str | None]:
+def logged_result_text(
+    store: SessionStoreProtocol, state: SessionState, handle: object
+) -> str | None:
+    """The text of the tool result a `TOOL_RESULT` event names by `handle` (#2013).
+
+    Read from the session's own log and bodies, as `tool_result_read` reads it: the
+    entry the handle names, its body, which must still hash to the handle. `None` when
+    the event names no handle or the session no longer holds that text.
+    """
+    if not isinstance(handle, str):
+        return None
+    entry = stored_result_entry(state.session_log, handle)
+    if entry is None:
+        return None
+    try:
+        body = store.load_context_body(state.session_id, entry.digest)
+    except (OSError, UnicodeDecodeError):
+        return None
+    if body is None or result_handle(body) != handle:
+        return None
+    return kept_result_text(entry, body)
+
+
+def _extract_subagents(
+    events: Sequence[Mapping[str, Any]], read: Callable[[object], str | None]
+) -> tuple[list[str], str | None]:
     """Helper ids named by this turn's tool results, and why the list may be short.
 
-    A `TOOL_RESULT.output` in the log is the canonical text of the result
-    (`canonical_tool_text`): a delegation's is a JSON object with `subagent_id`. One
-    that mentions `subagent_id` and does not parse is stated, not skipped.
+    A `TOOL_RESULT` names its result by handle (#2013), and `read` gives the canonical
+    text (`canonical_tool_text`): a delegation's is a JSON object with `subagent_id`. One
+    that cannot be read, or mentions `subagent_id` and does not parse, is stated, not
+    skipped.
     """
     seen: list[str] = []
     reason: str | None = None
     for ev in events:
         if ev.get("type") != "TOOL_RESULT":
             continue
-        output = ev.get("output")
-        parsed: Any = output
-        if isinstance(output, str):
-            if '"subagent_id"' not in output:
-                continue
-            try:
-                parsed = json.loads(output)
-            except ValueError:
-                reason = SUBAGENT_UNREADABLE
-                continue
+        text = read(ev.get("result_handle"))
+        if text is None:
+            reason = SUBAGENT_UNREADABLE  # a result the session no longer holds
+            continue
+        if '"subagent_id"' not in text:
+            continue
+        try:
+            parsed: Any = json.loads(text)
+        except ValueError:
+            reason = SUBAGENT_UNREADABLE  # a result that names a helper and does not parse
+            continue
         if not isinstance(parsed, dict):
             continue
         val = cast(dict[str, Any], parsed).get("subagent_id")
@@ -312,7 +348,7 @@ NO_EPOCH_FOR_REQUEST = "no epoch of the context state was opened at or before th
 
 
 def _unchecked(
-    code: FromLogCode, reason: str, detail_code: RecordErrorCode | None = None
+    code: FromLogCode, reason: str, detail_code: EpochErrorCode | None = None
 ) -> dict[str, Any]:
     """The `from_log` fields of a step that was not checked, with its code and reason.
 
@@ -344,7 +380,7 @@ class _LogCheck:
     def __init__(self, store: SessionStoreProtocol, state: SessionState) -> None:
         self._epochs = state.context_epochs
         self._render = epoch_renderer(store, state)
-        self._rendered: dict[int, list[ChatMessage] | RequestRecordError] = {}
+        self._rendered: dict[int, list[ChatMessage] | EpochRecordError] = {}
 
     def _own_epoch(self, turn: int, step: int) -> ContextEpoch | None:
         own: ContextEpoch | None = None
@@ -353,11 +389,11 @@ class _LogCheck:
                 own = epoch
         return own
 
-    def _conversation(self, epoch: ContextEpoch) -> list[ChatMessage] | RequestRecordError:
+    def _conversation(self, epoch: ContextEpoch) -> list[ChatMessage] | EpochRecordError:
         if epoch.number not in self._rendered:
             try:
                 self._rendered[epoch.number] = self._render(epoch)
-            except RequestRecordError as err:
+            except EpochRecordError as err:
                 self._rendered[epoch.number] = err
         return self._rendered[epoch.number]
 
@@ -371,8 +407,8 @@ class _LogCheck:
         if epoch is None:
             return _unchecked("no_epoch_for_request", NO_EPOCH_FOR_REQUEST)
         rendered = self._conversation(epoch)
-        if isinstance(rendered, RequestRecordError):
-            return _unchecked("epoch_unreadable", rendered.detail, rendered.code)
+        if isinstance(rendered, EpochRecordError):
+            return _unchecked("epoch_unreadable", rendered.detail, rendered.epoch_code)
         sent = list(rebuilt.layers.conversation)
         return {"from_log": rendered[: len(sent)] == sent}
 
@@ -428,7 +464,15 @@ def trace_turn(
     rolled_back = any(ev.get("type") == "TURN_ROLLED_BACK" for ev in marks)
     dropped_tool_steps = [dict(ev) for ev in marks if ev.get("type") == "TOOL_STEP_DROPPED"]
     nudges = [dict(ev) for ev in turn_events if ev.get("type") in _NUDGE_TYPES]
-    subagents, subagents_reason = _extract_subagents(turn_events)
+    results: dict[str, str | None] = {}
+
+    def read(handle: object) -> str | None:
+        key = handle if isinstance(handle, str) else ""
+        if key not in results:
+            results[key] = logged_result_text(store, state, handle)
+        return results[key]
+
+    subagents, subagents_reason = _extract_subagents(turn_events, read)
 
     step_numbers: set[int] = set()
     step_responses: dict[int, ModelResponseRecord] = {}
@@ -460,13 +504,15 @@ def trace_turn(
         # By `tool_call_id` (§4.4.1); by position only when no response names the call.
         target = call_step.get(call_id, current_step if current_step is not None else 1)
         step_numbers.add(target)
+        output = read(ev.get("result_handle"))
         step_tool_results.setdefault(target, []).append(
             TraceToolResult(
                 tool_call_id=call_id,
                 name=str(ev.get("name", "")),
                 status=ev.get("status"),
                 outcome=ev.get("outcome"),
-                output=ev.get("output"),
+                output=output,
+                output_unavailable=output is None,
                 duration_ms=ev.get("duration_ms"),
                 at=ev.get("at"),
             )

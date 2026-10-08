@@ -1,16 +1,17 @@
-"""HTTP routes for the Files screen (#1554) and its story view (#1560): thin translations.
+"""HTTP routes for the Files screen (#1554): thin translations.
 
-Every decision -- what is listed, what may move, whether a story is in use, whether a
-proposed change may be applied -- is made by `uclone_x.artifacts.library.ArtifactLibrary`
-or `uclone_x.story.view.StoryView` (P8). A route builds the library for the
+Every decision -- what is listed, what may move, whether a story is in use -- is made by
+`uclone_x.artifacts.library.ArtifactLibrary` (P8). A route builds the library for the
 workspace, calls one method, and maps a refusal to a status code carrying the refusal's
-own plain sentence. A failure that is not a refusal is answered with a fixed sentence and
+own plain sentence. The story view's routes (#1560) are the story extension's own
+(`ui.extension_routes`, #2205); they map their refusals through `http_error` here. A failure that is not a refusal is answered with a fixed sentence and
 logged with its cause: no class name, path or traceback reaches the screen.
 """
 
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from fastapi import FastAPI, HTTPException, Request
@@ -23,7 +24,6 @@ from uclone_x.artifacts.library import (
     StoryInUseError,
 )
 from uclone_x.errors import HeadRoomWriteError, PlainRefusalError, StaleRoomWriteError
-from uclone_x.story.view import StoryNotFoundError, StoryView, WriterBusyError
 
 if TYPE_CHECKING:
     from uclone_x.ui.person import PersonGate
@@ -60,23 +60,22 @@ class _OpenStoryRequest(BaseModel):
     room_id: str
 
 
-class _DecideRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+def http_error(
+    exc: Exception,
+    *,
+    failed: str = FILES_FAILURE_DETAIL,
+    busy: tuple[type[Exception], ...] = (),
+    missing: tuple[type[Exception], ...] = (),
+) -> HTTPException:
+    """A refusal keeps its sentence; anything else is logged and answered plainly.
 
-    #: The digest of the proposal as the view showed it.
-    seen_digest: str
-
-
-class _RejectRequest(_DecideRequest):
-    reason: str | None = None
-
-
-def _http_error(exc: Exception, *, failed: str = FILES_FAILURE_DETAIL) -> HTTPException:
-    """A refusal keeps its sentence; anything else is logged and answered plainly."""
-    if isinstance(exc, (StoryInUseError, WriterBusyError, HeadRoomWriteError)):
+    `busy` and `missing` are an extension's own refusals answered 409 and 404, as the
+    library's `StoryInUseError` and `ArtifactNotFoundError` are (#2205).
+    """
+    if isinstance(exc, (StoryInUseError, HeadRoomWriteError, *busy)):
         # A head's room (#1885): its plain sentence says where the conversation continues.
         return HTTPException(status_code=409, detail=str(exc))
-    if isinstance(exc, (ArtifactNotFoundError, StoryNotFoundError)):
+    if isinstance(exc, (ArtifactNotFoundError, *missing)):
         return HTTPException(status_code=404, detail=str(exc))
     if isinstance(exc, StaleRoomWriteError):
         return HTTPException(status_code=409, detail=FILES_CONFLICT_DETAIL)
@@ -86,7 +85,13 @@ def _http_error(exc: Exception, *, failed: str = FILES_FAILURE_DETAIL) -> HTTPEx
     return HTTPException(status_code=500, detail=failed)
 
 
-def register_artifact_routes(app: FastAPI, stack: RoomStack, person: PersonGate) -> None:
+def register_artifact_routes(
+    app: FastAPI,
+    stack: RoomStack,
+    person: PersonGate,
+    *,
+    refuse_cross_origin: Callable[[Request], None],
+) -> None:
     """Mount the Files screen's routes under `/api/artifacts/library`.
 
     Approve and reject record that a person decided (`decided_in: story_view`), so both
@@ -107,98 +112,65 @@ def register_artifact_routes(app: FastAPI, stack: RoomStack, person: PersonGate)
         )
 
     @app.get("/api/artifacts/library")
-    async def survey_artifacts() -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
+    async def survey_artifacts(request: Request) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
         """Every file in the artifact folders, current and archived, with what it covers."""
+        refuse_cross_origin(request)  # another site must not survey artifact library (#2146)
         try:
             return _library().survey().model_dump(mode="json")
         except Exception as exc:
-            raise _http_error(exc, failed=FILES_READ_FAILURE_DETAIL) from exc
+            raise http_error(exc, failed=FILES_READ_FAILURE_DETAIL) from exc
 
     @app.get("/api/artifacts/library/file")
-    async def open_artifact(path: str = "") -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
+    async def open_artifact(request: Request, path: str = "") -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
         """One listed file's text, or for an image its kind (the bytes are at `/content`)."""
+        refuse_cross_origin(request)  # another site must not read artifact files (#2146)
         try:
             return _library().open_file(path).model_dump(mode="json")
         except Exception as exc:
-            raise _http_error(exc, failed=FILES_READ_FAILURE_DETAIL) from exc
+            raise http_error(exc, failed=FILES_READ_FAILURE_DETAIL) from exc
 
     @app.post("/api/artifacts/library/archive")
-    async def archive_artifact(body: _PathRequest) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
+    async def archive_artifact(body: _PathRequest, request: Request) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
         """Move a file or story under the archive; 409 when a conversation is writing it."""
+        refuse_cross_origin(request)
         try:
             moved = _library().archive(body.path, release_writer=body.release_writer)
         except Exception as exc:
-            raise _http_error(exc) from exc
+            raise http_error(exc) from exc
         return {"path": moved.path, "note": moved.note}
 
     @app.post("/api/artifacts/library/restore")
-    async def restore_artifact(body: _PathRequest) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
+    async def restore_artifact(body: _PathRequest, request: Request) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
         """Move an archived file or story back where it was."""
+        refuse_cross_origin(request)
         try:
             moved = _library().restore(body.path)
         except Exception as exc:
-            raise _http_error(exc) from exc
+            raise http_error(exc) from exc
         return {"path": moved}
 
     @app.post("/api/artifacts/library/delete")
-    async def delete_artifact(body: _DeleteRequest) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
+    async def delete_artifact(body: _DeleteRequest, request: Request) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
         """Remove an archived file or story for good; refused unless `confirm` is true.
 
         A file that is not archived is refused with a 400 (archive first, #1692). The
         request's `release_writer` is accepted and has nothing to do: archiving settled it.
         """
+        refuse_cross_origin(request)
         try:
             removed = _library().delete(body.path, confirm=body.confirm)
         except Exception as exc:
-            raise _http_error(exc) from exc
+            raise http_error(exc) from exc
         return {"deleted": body.path, "note": removed.note}
 
     @app.post("/api/artifacts/library/stories/{story_id}/open")
-    async def open_story(story_id: str, body: _OpenStoryRequest) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
+    async def open_story(  # pyright: ignore[reportUnusedFunction]
+        story_id: str, body: _OpenStoryRequest, request: Request
+    ) -> dict[str, Any]:
         """Open a story in the conversation `room_id` and make it that room's story."""
+        refuse_cross_origin(request)
         try:
             opened = _library().open_story_in_conversation(story_id, body.room_id)
         except Exception as exc:
-            raise _http_error(exc) from exc
+            raise http_error(exc) from exc
         return opened.model_dump(mode="json")
-
-    def _story_view() -> StoryView:
-        return StoryView(
-            stack.session_manager().workspace_dir,
-            stack.service,
-            turn_busy=_turn_busy,
-        )
-
-    @app.get("/api/artifacts/library/stories/{story_id}")
-    async def show_story(story_id: str) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
-        """The story whole: outline, codex, and the proposed changes waiting for a person."""
-        try:
-            return _story_view().show(story_id).model_dump(mode="json")
-        except Exception as exc:
-            raise _http_error(exc, failed=FILES_READ_FAILURE_DETAIL) from exc
-
-    @app.post("/api/artifacts/library/stories/{story_id}/proposals/{proposal_id}/approve")
-    async def approve_proposal(  # pyright: ignore[reportUnusedFunction]
-        request: Request, story_id: str, proposal_id: str, body: _DecideRequest
-    ) -> dict[str, Any]:
-        """Apply a proposed change a person approved in the story view."""
-        person.require(request)
-        try:
-            decided = _story_view().approve(story_id, proposal_id, seen_digest=body.seen_digest)
-        except Exception as exc:
-            raise _http_error(exc) from exc
-        return decided.model_dump(mode="json")
-
-    @app.post("/api/artifacts/library/stories/{story_id}/proposals/{proposal_id}/reject")
-    async def reject_proposal(  # pyright: ignore[reportUnusedFunction]
-        request: Request, story_id: str, proposal_id: str, body: _RejectRequest
-    ) -> dict[str, Any]:
-        """Mark a proposed change rejected by a person in the story view."""
-        person.require(request)
-        try:
-            decided = _story_view().reject(
-                story_id, proposal_id, seen_digest=body.seen_digest, reason=body.reason
-            )
-        except Exception as exc:
-            raise _http_error(exc) from exc
-        return decided.model_dump(mode="json")

@@ -18,6 +18,7 @@ from uclone_x.agent.image_set_planner import (
     assemble_prompts,
     bad_entries,
     detect_image_set,
+    fallback_image_set_note,
     plan_image_set,
     plan_schema,
     repeated_locations,
@@ -435,15 +436,21 @@ def _agent(llm: BaseLLMConnector, tmp_path: Path, persona: str | None = "artist"
         llm=llm,
         tools=registry,
         context=AgentContext(agent_id="artist", session_id="s1", workspace_root=tmp_path),
-        personas=tuple(
+        personas=(
+            *(
+                PersonaDefinition(
+                    name=name,
+                    role=name,
+                    system_prompt=name,
+                    allowed_tools=("generate_image",),
+                    enable_write_tools=True,
+                )
+                for name in ("artist", "writer")
+            ),
+            # A clone whose range does not reach `generate_image`: never offered it.
             PersonaDefinition(
-                name=name,
-                role=name,
-                system_prompt=name,
-                allowed_tools=("generate_image",),
-                enable_write_tools=True,
-            )
-            for name in ("artist", "writer")
+                name="critic", role="critic", system_prompt="critic", allowed_tools=("file_read",)
+            ),
         ),
     )
 
@@ -491,7 +498,7 @@ async def test_plan_survives_a_character_sheet_step(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_planning_failure_leaves_the_turn_as_it_was(tmp_path: Path) -> None:
+async def test_planning_failure_leaves_no_plan_and_no_failure_text(tmp_path: Path) -> None:
     llm = _PlanningLLM(LLMProviderError("connection refused at 127.0.0.1:11434"))
     result = await _agent(llm, tmp_path).execute_turn(_ASK)
     assert result.is_completed
@@ -510,18 +517,67 @@ async def test_unusable_plan_leaves_the_turn_as_it_was(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_other_personas_and_plain_requests_are_not_planned(tmp_path: Path) -> None:
-    """Killed by: src/uclone_x/agent/base.py :: if llm is None or self._persona not in IMAGE_SET_PERSONAS:
-    Becomes: if llm is None:
+async def test_another_clone_offered_generate_image_is_planned(tmp_path: Path) -> None:
+    """Any clone offered `generate_image` gets the plan, not only the Artist (#2091).
+
+    Killed by: src/uclone_x/agent/base.py ::         if llm is None:  # any clone offered generate_image is planned, not only the Artist
+    Becomes:         if llm is None or self._persona != "artist":
     """
-    writer = _PlanningLLM(_plan_json(3))
-    await _agent(writer, tmp_path, persona="writer").execute_turn(_ASK)
-    assert writer.structured == []
-    assert [d.name for d in writer.turns[0].tools] == ["generate_image"]
+    llm = _PlanningLLM(_plan_json(3))
+    result = await _agent(llm, tmp_path, persona="writer").execute_turn(_ASK)
+    assert result.is_completed
+    assert len(llm.structured) == 1
+    assert "[Image Set Plan]" in (llm.turns[0].messages[-1].content or "")
+
+
+@pytest.mark.asyncio
+async def test_a_clone_without_a_resolved_persona_is_planned_when_offered_the_tool(
+    tmp_path: Path,
+) -> None:
+    """The offered tool decides, not the persona: a fallback-prompt clone is planned too.
+
+    Killed by: src/uclone_x/agent/base.py ::         if llm is None:  # any clone offered generate_image is planned, not only the Artist
+    Becomes:         if llm is None or self._persona is None:
+    """
+    llm = _PlanningLLM(_plan_json(3))
+    result = await _agent(llm, tmp_path, persona=None).execute_turn(_ASK)
+    assert result.is_completed
+    assert "generate_image" in [d.name for d in llm.turns[0].tools]
+    assert len(llm.structured) == 1
+
+
+@pytest.mark.asyncio
+async def test_unoffered_tools_and_plain_requests_are_not_planned(tmp_path: Path) -> None:
+    """Killed by: src/uclone_x/agent/base.py ::         if not any(tool.name == "generate_image" for tool in tool_defs):  # nothing to plan for
+    Becomes:         if False:
+    """
+    critic = _PlanningLLM(_plan_json(3))
+    await _agent(critic, tmp_path / "a", persona="critic").execute_turn(_ASK)
+    assert "generate_image" not in [d.name for d in critic.turns[0].tools]
+    assert critic.structured == []
 
     plain = _PlanningLLM(_plan_json(3))
-    await _agent(plain, tmp_path).execute_turn("은발 엘프 궁수 한 장 그려줘")
+    await _agent(plain, tmp_path / "b").execute_turn("은발 엘프 궁수 한 장 그려줘")
     assert plain.structured == []
+
+
+@pytest.mark.asyncio
+async def test_in_a_room_only_the_latest_message_asks_for_a_set(tmp_path: Path) -> None:
+    """A set an earlier speaker asked for is not this request's (#1953).
+
+    Killed by: src/uclone_x/agent/base.py ::             request = latest_span_message(message, self._turn_person_names)
+    Becomes:             request = message
+    """
+    earlier = _PlanningLLM(_plan_json(3))
+    span = f"[critic]: {_ASK}\n[user]: 은발 엘프 궁수 한 장 그려줘"
+    await _agent(earlier, tmp_path / "a").execute_turn(span, room_id="room-1")
+    assert earlier.structured == []
+
+    latest = _PlanningLLM(_plan_json(3))
+    span = f"[critic]: 멋지네요\n[user]: {_ASK}"
+    await _agent(latest, tmp_path / "b").execute_turn(span, room_id="room-1")
+    assert len(latest.structured) == 1
+    assert (latest.structured[0].messages[-1].content or "").endswith(_ASK)
 
 
 def test_earlier_skips_the_request_and_system_turns(tmp_path: Path) -> None:
@@ -529,13 +585,11 @@ def test_earlier_skips_the_request_and_system_turns(tmp_path: Path) -> None:
     Becomes: if False:
     """
     agent = _agent(_PlanningLLM(_plan_json(3)), tmp_path)
-    agent._history.extend(  # pyright: ignore[reportPrivateUsage]
-        [
-            ChatMessage(role=MessageRole.SYSTEM, content="persona"),
-            ChatMessage(role=MessageRole.USER, content="철수는 붉은 머리"),
-            ChatMessage(role=MessageRole.ASSISTANT, content="알겠습니다"),
-            ChatMessage(role=MessageRole.USER, content=_ASK),
-        ]
+    agent._active_session.append(  # pyright: ignore[reportPrivateUsage]
+        ChatMessage(role=MessageRole.SYSTEM, content="persona"),
+        ChatMessage(role=MessageRole.USER, content="철수는 붉은 머리"),
+        ChatMessage(role=MessageRole.ASSISTANT, content="알겠습니다"),
+        ChatMessage(role=MessageRole.USER, content=_ASK),
     )
     earlier = agent._image_set_earlier(_ASK)  # pyright: ignore[reportPrivateUsage]
     assert earlier == "user: 철수는 붉은 머리\nassistant: 알겠습니다"
@@ -657,3 +711,26 @@ async def test_a_place_left_in_shared_does_not_reach_the_other_scenes() -> None:
     assert "forest" not in prompts[1]
     assert "forest" not in prompts[2]
     assert all("long hair" in p for p in prompts)
+
+
+def test_fallback_image_set_note() -> None:
+    """Killed by: src/uclone_x/agent/image_set_planner.py :: f"[Image Set Request ({count} images)]\n"
+    Becomes: ""
+    """
+    note = fallback_image_set_note(5)
+    assert "[Image Set Request (5 images)]" in note
+    assert "count=5" in note
+    assert "prompts=[...]" in note
+
+
+@pytest.mark.asyncio
+async def test_planning_failure_provides_fallback_image_set_note(tmp_path: Path) -> None:
+    """Killed by: src/uclone_x/agent/base.py :: return fallback_image_set_note(count)
+    Becomes: return None
+    """
+    llm = _PlanningLLM(LLMProviderError("connection error"))
+    result = await _agent(llm, tmp_path).execute_turn(_ASK)
+    assert result.is_completed
+    assert result.error is None
+    # Instead of silently dropping guidance, fallback guidance is present
+    assert any("[Image Set Request (3 images)]" in (m.content or "") for m in llm.turns[0].messages)

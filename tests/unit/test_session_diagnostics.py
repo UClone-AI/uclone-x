@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -13,6 +14,7 @@ from uclone_x.core.session_diagnostics import (
     inspect_session,
     list_session_summaries,
 )
+from uclone_x.core.session_log import LoggedMessage
 from uclone_x.llm.models import ChatMessage, MessageRole, ToolCallRequest
 
 
@@ -217,7 +219,7 @@ def test_check_empty_message_and_missing_offload_artifact() -> None:
                 ChatMessage(role=MessageRole.USER, content=""),  # empty content
                 ChatMessage(
                     role=MessageRole.TOOL,
-                    content="[Tool Output Offloaded (path=offload, size=9999): Excerpt Full output saved to '.sandbox/tool_artifacts/missing.txt'. Use file_read to inspect.]",
+                    content="[Stored tool result tr_00000000000000cc: 9,999 characters]\nx",
                     tool_call_id="call_off",
                 ),
             ),
@@ -229,7 +231,9 @@ def test_check_empty_message_and_missing_offload_artifact() -> None:
         codes = [i.code for i in report.issues]
         assert "EMPTY_MESSAGE_CONTENT" in codes
         assert "ORPHANED_TOOL_RESULT" in codes
-        assert "MISSING_OFFLOAD_ARTIFACT" in codes
+        # Output that only quotes a stored-result header is its own full text: it records
+        # no kept result, so none is missing (#1974, item 8).
+        assert "MISSING_OFFLOAD_ARTIFACT" not in codes
 
 
 def test_list_session_summaries_and_plan_inspection() -> None:
@@ -283,38 +287,219 @@ def test_list_session_summaries_and_plan_inspection() -> None:
         assert details.plan_steps_completed == 1
 
 
-def test_check_a_stored_tool_result_whose_blob_is_missing(tmp_path: Path) -> None:
-    """A `tr_` handle is checked against the session's artifact directory (#1653).
+def _logged(
+    state: SessionState, kept: Sequence[LoggedMessage], store: SessionStore | None = None
+) -> SessionState:
+    """`state` as a session writes it: a log of the `kept` texts, then each message,
+    and the entry each message is (#1848) -- a record naming none is refused as old."""
+    from uclone_x.core.session_log import SessionLogProvenance, logged_message, new_entry
 
-    Killed by: src/uclone_x/core/session_diagnostics.py :: if not (workspace_root / rel_blob).is_file():
-    Becomes: if False:
+    msg_logged = [logged_message(m) for m in state.messages]
+    if store is not None:
+        for lm in msg_logged:
+            store.save_context_body(state.session_id, lm.digest, lm.body)
+    logged = [*kept, *msg_logged]
+    return state.model_copy(
+        update={
+            "session_log": tuple(
+                new_entry(i, r, turn=1, provenance=SessionLogProvenance.RECORDED)
+                for i, r in enumerate(logged)
+            ),
+            "history_entries": tuple(f"e{i}" for i in range(len(kept), len(logged))),
+        }
+    )
+
+
+def test_check_a_stored_tool_result_whose_blob_is_missing(tmp_path: Path) -> None:
+    """A `tr_` handle is checked against the session's own log and body store (#1848).
+
+    A handle whose full text the log names but the store no longer holds is flagged, as
+    is one the log never named -- a handle from before #1848, whose file is not looked at.
+    The handle is the one each form records, never one read from its text (#1974, item 8).
+
+    Killed by: src/uclone_x/core/session_diagnostics.py :: if entry is None or store.load_context_body(session_id, entry.digest) is None:
+    Becomes: if entry is None:
     """
+    from uclone_x.core.session_log import (
+        SessionLogKind,
+        logged_text,
+    )
+    from uclone_x.core.tool_results import result_handle
+    from uclone_x.llm.models import RenderedFrom
+
     store = SessionStore(storage_dir=tmp_path / "sessions")
-    present = "tr_00000000000000aa"
+    kept_body, lost_body = "the kept body", "the lost body"
+    present, lost = result_handle(kept_body), result_handle(lost_body)
     missing = "tr_00000000000000bb"
-    blob_dir = tmp_path / ".sandbox" / "tool_artifacts" / "sess_tr"
-    blob_dir.mkdir(parents=True)
-    (blob_dir / f"{present}.txt").write_text("body", encoding="utf-8")
-    calls = (ToolCallRequest(id="c1", name="t"), ToolCallRequest(id="c2", name="t"))
+    kept = logged_text(SessionLogKind.TOOL_RESULT, kept_body, blob=present)
+    gone = logged_text(SessionLogKind.TOOL_RESULT, lost_body, blob=lost)
+    store.save_context_body("sess_tr", kept.digest, kept.body)
+    calls = tuple(ToolCallRequest(id=f"c{i}", name="t") for i in range(3))
     state = SessionState.seed("sess_tr", "agent_1").with_messages(
         (
             ChatMessage(role=MessageRole.ASSISTANT, content="", tool_calls=calls),
-            ChatMessage(
-                role=MessageRole.TOOL,
-                content=f"[Stored tool result {present}: 9,000 characters]\nx",
-                tool_call_id="c1",
-            ),
-            ChatMessage(
-                role=MessageRole.TOOL,
-                content=f"[Stored tool result {missing}: 9,000 characters]\nx",
-                tool_call_id="c2",
+            *(
+                ChatMessage(
+                    role=MessageRole.TOOL,
+                    tool_call_id=f"c{i}",
+                    form="stub",
+                    rendered_from=RenderedFrom(handle=handle, limit=100, readable=True),
+                )
+                for i, handle in enumerate((present, lost, missing))
             ),
         ),
         turn_counter=1,
     )
-    store.save(state)
+    store.save(_logged(state, (kept, gone), store=store))
 
     report = check_session_health("sess_tr", store=store, workspace_root=tmp_path)
 
     flagged = [i for i in report.issues if i.code == "MISSING_OFFLOAD_ARTIFACT"]
-    assert [i.details.get("handle") for i in flagged] == [missing]
+    assert [i.details.get("handle") for i in flagged] == [lost, missing]
+    for issue in flagged:
+        assert "/" not in issue.message and "Errno" not in issue.message
+
+
+def test_output_that_quotes_a_stored_result_header_names_no_kept_result(tmp_path: Path) -> None:
+    """A tool result whose own text begins like a stored-result header is full output
+    (#1854). Its log entry names no blob, and the health check does not flag a kept result
+    as missing for it: a handle is read from what a message records, never from its text
+    (#1974, item 8).
+
+    Killed by: src/uclone_x/core/session_log.py :: blob: str | None = message.rendered_from.handle if message.rendered_from is not None else None
+    Becomes: blob: str | None = message.rendered_from.handle if message.rendered_from is not None else __import__("uclone_x.core.tool_results", fromlist=["_"]).handle_in(message.content)
+    Killed by: src/uclone_x/core/session_diagnostics.py :: handle: str | None = msg.rendered_from.handle if msg.rendered_from is not None else None
+    Becomes: handle: str | None = msg.rendered_from.handle if msg.rendered_from is not None else __import__("uclone_x.core.tool_results", fromlist=["_"]).handle_in(msg.content)
+    """
+    from uclone_x.core.session_log import SessionLogProvenance, logged_message, new_entry
+
+    store = SessionStore(storage_dir=tmp_path / "sessions")
+    quoting = ChatMessage(
+        role=MessageRole.TOOL,
+        content="[Stored tool result tr_00000000000000cc: 9,999 characters]\nquoted in a file",
+        tool_call_id="c0",
+    )
+    call = ChatMessage(
+        role=MessageRole.ASSISTANT,
+        content="",
+        tool_calls=(ToolCallRequest(id="c0", name="t"),),
+    )
+    logged = [logged_message(m) for m in (call, quoting)]
+    assert logged[1].blob is None
+    for item in logged:
+        store.save_context_body("sess_quote", item.digest, item.body)
+    state = SessionState.seed("sess_quote", "agent_1").with_messages(
+        (call, quoting), turn_counter=1
+    )
+    state = state.model_copy(
+        update={
+            "session_log": tuple(
+                new_entry(i, item, turn=1, provenance=SessionLogProvenance.RECORDED)
+                for i, item in enumerate(logged)
+            )
+        }
+    )
+    store.save(state)
+
+    report = check_session_health("sess_quote", store=store, workspace_root=tmp_path)
+
+    assert not [i for i in report.issues if i.code == "MISSING_OFFLOAD_ARTIFACT"]
+
+
+def test_check_a_form_recorded_with_no_text_by_the_result_it_records(tmp_path: Path) -> None:
+    """A saved excerpt or stub holds no text, only the kept result it is rendered from
+    (#1848). It is not an empty message, and its kept result is checked by the handle it
+    records: present, it is healthy; lost, it is flagged.
+
+    Killed by: src/uclone_x/core/session_diagnostics.py :: if not has_content and not has_calls and msg.rendered_from is None:
+    Becomes: if not has_content and not has_calls:
+    Killed by: src/uclone_x/core/session_diagnostics.py :: handle: str | None = msg.rendered_from.handle
+    Becomes: handle: str | None = None
+    """
+    from typing import Literal
+
+    from uclone_x.core.session_log import (
+        SessionLogKind,
+        logged_text,
+    )
+    from uclone_x.core.tool_results import result_handle
+    from uclone_x.llm.models import RenderedFrom
+
+    forms: tuple[tuple[str, Literal["excerpt", "stub"]], ...]
+
+    store = SessionStore(storage_dir=tmp_path / "sessions")
+    kept_body, lost_body = "the kept body", "the lost body"
+    present, lost = result_handle(kept_body), result_handle(lost_body)
+    kept = logged_text(SessionLogKind.TOOL_RESULT, kept_body, blob=present)
+    gone = logged_text(SessionLogKind.TOOL_RESULT, lost_body, blob=lost)
+    store.save_context_body("sess_form", kept.digest, kept.body)
+    calls = tuple(ToolCallRequest(id=f"c{i}", name="t") for i in range(2))
+    forms = ((present, "excerpt"), (lost, "stub"))
+    state = SessionState.seed("sess_form", "agent_1").with_messages(
+        (
+            ChatMessage(role=MessageRole.ASSISTANT, content="", tool_calls=calls),
+            *(
+                ChatMessage(
+                    role=MessageRole.TOOL,
+                    tool_call_id=f"c{i}",
+                    form=form,
+                    rendered_from=RenderedFrom(handle=handle, limit=100, readable=True),
+                )
+                for i, (handle, form) in enumerate(forms)
+            ),
+        ),
+        turn_counter=1,
+    )
+    store.save(_logged(state, (kept, gone), store=store))
+
+    report = check_session_health("sess_form", store=store, workspace_root=tmp_path)
+
+    assert not [i for i in report.issues if i.code == "EMPTY_MESSAGE_CONTENT"]
+    flagged = [i for i in report.issues if i.code == "MISSING_OFFLOAD_ARTIFACT"]
+    assert [i.details.get("handle") for i in flagged] == [lost]
+
+
+def test_inspect_lists_each_kept_result_once_and_skips_a_lost_body(tmp_path: Path) -> None:
+    """The listing names each handle once, in log order, and only if its body is stored.
+
+    A handle logged twice is one kept result, and one whose body the store no longer holds
+    is not listed or counted (#1848).
+
+    Killed by: src/uclone_x/core/session_diagnostics.py :: if store.load_context_body(state.session_id, entry.digest) is None:
+    Becomes: if False:
+    """
+    from uclone_x.core.session_log import (
+        SessionLogKind,
+        SessionLogProvenance,
+        logged_text,
+        new_entry,
+    )
+    from uclone_x.core.tool_results import result_handle
+
+    store = SessionStore(storage_dir=tmp_path / "sessions")
+    first_body, second_body, lost_body = "the first body", "the second, longer body", "lost"
+    first, second, lost = (result_handle(b) for b in (first_body, second_body, lost_body))
+    records = (
+        logged_text(SessionLogKind.TOOL_RESULT, first_body, blob=first),
+        logged_text(SessionLogKind.TOOL_RESULT, lost_body, blob=lost),
+        logged_text(SessionLogKind.TOOL_RESULT, second_body, blob=second),
+        logged_text(SessionLogKind.TOOL_RESULT, first_body, blob=first),
+    )
+    for record in (records[0], records[2]):
+        store.save_context_body("sess_list", record.digest, record.body)
+    state = SessionState.seed("sess_list", "agent_1").model_copy(
+        update={
+            "session_log": tuple(
+                new_entry(i, r, turn=1, provenance=SessionLogProvenance.RECORDED)
+                for i, r in enumerate(records)
+            )
+        }
+    )
+    store.save(state)
+
+    details = inspect_session("sess_list", store=store)
+
+    assert details is not None
+    assert details.artifact_files == [second, first]
+    assert details.artifacts_count == 2
+    assert details.artifacts_total_bytes == len(first_body) + len(second_body)

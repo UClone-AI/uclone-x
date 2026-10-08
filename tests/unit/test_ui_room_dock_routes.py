@@ -27,9 +27,11 @@ import pytest
 from fastapi.testclient import TestClient
 from pydantic import BaseModel, Field
 
+from tests.support.clones import make_clones
 from uclone_x.agent.base import BaseAgent
 from uclone_x.agent.models import AgentConfig, AgentContext, ToolExecutionRecord
 from uclone_x.agent.session import SessionState
+from uclone_x.core.agent_home import seat_id_for
 from uclone_x.llm import MockLLMConnector
 from uclone_x.llm.models import LLMRequest, ModelResponse, ToolCallRequest
 from uclone_x.ontology.engine import OntologyEngine
@@ -264,19 +266,20 @@ class TestASeatsHistory:
         Becomes: uses = list(state.tool_uses)
         """
         room_id = _create(client, ["scout", "critic"])
+        scout = seat_id_for("scout")  # a handle is seated by its clone's id
         _seed(
             client,
             room_id,
             transcript=(
                 RoomMessage(seq=1, sender_id="user", content="go"),
-                _utterance(2, "scout", turn_id="t_a", tools_recorded=True),
+                _utterance(2, scout, turn_id="t_a", tools_recorded=True),
                 _utterance(3, "critic", turn_id="t_b", tools_recorded=True),
-                _utterance(4, "scout", turn_id="t_c", tools_recorded=True),
+                _utterance(4, scout, turn_id="t_c", tools_recorded=True),
             ),
             tool_uses=(
-                _use("t_a", tool_call_id="c1"),
+                _use("t_a", scout, tool_call_id="c1"),
                 _use("t_b", "critic", tool_call_id="c2"),
-                _use("t_a", tool_call_id="c3", tool_name="web_search"),
+                _use("t_a", scout, tool_call_id="c3", tool_name="web_search"),
             ),
         )
 
@@ -294,7 +297,7 @@ class TestASeatsHistory:
     ) -> None:
         """`[]` for a raised turn would claim it used no tools; nobody recorded that.
 
-        Killed by: src/uclone_x/ui/room_dock.py :: recorded = message.tools_recorded and message.turn_id is not None
+        Killed by: src/uclone_x/ui/room_dock.py :: recorded = message.tools_recorded
         Becomes: recorded = True
         """
         room_id = _create(client, ["scout"])
@@ -302,17 +305,17 @@ class TestASeatsHistory:
             client,
             room_id,
             transcript=(
-                _utterance(1, "scout", turn_id="t_x", tools_recorded=False, error="boom"),
-                _utterance(2, "scout", turn_id=None, tools_recorded=False),
+                _utterance(
+                    1, seat_id_for("scout"), turn_id="t_x", tools_recorded=False, error="boom"
+                ),
             ),
         )
 
         turns = client.get(f"/api/rooms/{room_id}/seats/scout/history").json()["turns"]
 
-        assert [t["tools"] for t in turns] == [None, None]
+        assert [t["tools"] for t in turns] == [None]
         assert turns[0]["status"] == "failed"
         assert "failed or was stopped" in turns[0]["tools_not_recorded_reason"]
-        assert "before the conversation kept" in turns[1]["tools_not_recorded_reason"]
 
     def test_a_seat_that_has_not_spoken_says_so(self, client: TestClient) -> None:
         """Killed by: src/uclone_x/ui/room_dock.py :: "live": stack.live_agent(state.room_id, seat.session_id) is not None,
@@ -335,7 +338,7 @@ class TestASeatsHistory:
         Becomes: record = record
         """
         room_id = _create(client, ["scout"])
-        _take_one_turn(client, room_id, _Seat("scout", "s"))
+        _take_one_turn(client, room_id, _Seat(seat_id_for("scout"), "s"))
         assert client.delete(f"/api/rooms/{room_id}/history").status_code == 200
 
         body = client.get(f"/api/rooms/{room_id}/seats/scout/history").json()
@@ -353,7 +356,7 @@ class TestASeatsHistory:
         refused = client.get(f"/api/rooms/{room_id}/seats/ghost/history")
 
         assert refused.status_code == 404
-        assert "scout" in refused.json()["detail"]
+        assert seat_id_for("scout") in refused.json()["detail"], "the roster names seats by id"
 
     def test_an_unknown_room_is_a_404(self, client: TestClient) -> None:
         """Killed by: src/uclone_x/ui/room_dock.py :: raise _http_error(exc) from exc
@@ -423,6 +426,37 @@ class TestARoomsFiles:
         assert gone["exists"] is False, "a recorded file since deleted is not listed as present"
         assert gone["type"] == "image"
         assert body["total"] == 2
+
+    def test_a_file_is_looked_for_in_the_rooms_own_workspace(
+        self, client: TestClient, tmp_path: Path
+    ) -> None:
+        """A room working in another folder wrote its files there (clone-data-scopes §3.6).
+
+        Killed by: src/uclone_x/ui/room_dock.py :: workspace = stack.workspace_of(state.room_id)
+        Becomes: workspace = stack.session_manager().workspace_dir
+        """
+        project = tmp_path / "project"
+        project.mkdir()
+        (project / "plan.md").write_text("# plan", encoding="utf-8")
+        room_id = _create(client, ["scout"])
+        _seed(
+            client,
+            room_id,
+            workspace=str(project.resolve()),
+            written_files=(
+                RoomWrittenFile(
+                    path="plan.md",
+                    participant_id="scout",
+                    tool_name="file_write",
+                    turn_id="t1",
+                    written_at="2026-09-22T00:00:01+00:00",
+                ),
+            ),
+        )
+
+        (entry,) = client.get(f"/api/rooms/{room_id}/artifacts").json()["artifacts"]
+
+        assert entry["exists"] is True
 
     def test_a_room_with_no_known_gap_says_what_the_list_covers_not_that_none_were_written(
         self, client: TestClient
@@ -641,7 +675,7 @@ class TestARoomsFiles:
         Becomes: + 0,
         """
         room_id = _create(client, ["scout"])
-        seat = _Seat("scout", "s")
+        seat = _Seat(seat_id_for("scout"), "s")
         seat.tool_executions = (_shell_call(),)
         _take_one_turn(client, room_id, seat)
         assert client.delete(f"/api/rooms/{room_id}/history").status_code == 200
@@ -665,7 +699,7 @@ class TestARoomsFiles:
         Becomes: record = record
         """
         room_id = _create(client, ["scout"])
-        seat = _Seat("scout", "s")
+        seat = _Seat(seat_id_for("scout"), "s")
         seat.fail_with = RuntimeError("stopped mid-write")
         _take_one_turn(client, room_id, seat)
         transcript = client.get(f"/api/rooms/{room_id}").json()["transcript"]
@@ -696,7 +730,12 @@ class TestARoomsFiles:
         stored = json.loads(store.room_path(room_id).read_text(encoding="utf-8"))
         stored.pop("file_record", None)
         stored["transcript"].append(
-            {"seq": len(stored["transcript"]) + 1, "sender_id": "scout", "content": "old reply"}
+            {
+                "seq": len(stored["transcript"]) + 1,
+                "sender_id": "scout",
+                "content": "old reply",
+                "turn_id": "t_old",
+            }
         )
         store.room_path(room_id).write_text(json.dumps(stored), encoding="utf-8")
 
@@ -705,14 +744,20 @@ class TestARoomsFiles:
         assert not _claims_none_written(body)
         assert "began before files written by tools were recorded" in body["reason"]
 
-    def test_an_agent_row_without_a_turn_id_is_a_gap_and_a_humans_is_not(
+    def test_an_agent_row_without_a_turn_id_is_refused_and_a_humans_is_not(
         self, client: TestClient
     ) -> None:
-        """Only agent rows count: a human's row has no turn id either, and ran no tool.
+        """A room holding an agent row saved before tools were recorded does not load.
 
-        Killed by: src/uclone_x/ui/room_dock.py :: if m.is_utterance and m.turn_id is None and m.sender_id not in humans
-        Becomes: if m.is_utterance and m.turn_id is None
+        Such a row's tools are not known, and its empty list must never read as "no tools
+        were used" (P6), so the room is refused whole on the unreadable-room path. A
+        departed seat's row is known for an agent's by its decision or provenance.
+
+        Killed by: src/uclone_x/room/models.py :: and (m.sender_id in agents or m.decision is not None or m.provenance is not None)
+        Becomes: and False
         """
+        from uclone_x.ui.rooms import UNREADABLE_ROOM_DETAIL
+
         room_id = _create(client, ["scout"])
         human_only = (RoomMessage(seq=1, sender_id="user", content="hello"),)
         _seed(client, room_id, transcript=human_only)
@@ -720,15 +765,22 @@ class TestARoomsFiles:
         assert human_body["record_gaps"] == []
         assert human_body["reason"] == _NONE_LISTED
 
-        _seed(
-            client,
-            room_id,
-            transcript=(*human_only, _utterance(2, "scout", turn_id=None, tools_recorded=False)),
-        )
-        body = client.get(f"/api/rooms/{room_id}/artifacts").json()
+        from uclone_x.core.provenance import Provenance
 
-        assert not _claims_none_written(body)
-        assert "1 turn(s) were saved without a record of their tools" in body["reason"]
+        store = _stack(client).store
+        stored = json.loads(store.room_path(room_id).read_text(encoding="utf-8"))
+        answered_by = Provenance.primary(provider="p", model="m").model_dump(mode="json")
+        for row in (
+            {"seq": 2, "sender_id": seat_id_for("scout"), "content": "old reply"},
+            {"seq": 2, "sender_id": "gone", "content": "old reply", "provenance": answered_by},
+        ):
+            legacy = {**stored, "transcript": [*stored["transcript"], row]}
+            store.room_path(room_id).write_text(json.dumps(legacy), encoding="utf-8")
+
+            for route in ("artifacts", "topology", "seats/scout/history"):
+                resp = client.get(f"/api/rooms/{room_id}/{route}")
+                assert resp.status_code == 500, (row["sender_id"], route, resp.text)
+                assert resp.json()["detail"] == UNREADABLE_ROOM_DETAIL
 
     def test_a_turn_still_running_is_named_rather_than_none(
         self, client: TestClient, monkeypatch: pytest.MonkeyPatch
@@ -813,7 +865,7 @@ class TestARoomsTopology:
 
         seats = [n for n in body["nodes"] if n["kind"] == "seat"]
         assert [(n["id"], n["status"]) for n in seats] == [
-            ("seat:scout", "idle"),
+            (f"seat:{seat_id_for('scout')}", "idle"),
             ("seat:critic", "idle"),
         ]
         assert body["edges"] == []
@@ -824,31 +876,34 @@ class TestARoomsTopology:
         Becomes: if False:
         """
         room_id = _create(client, ["scout", "critic"])
+        scout = seat_id_for("scout")
         _seed(
             client,
             room_id,
             transcript=(
                 RoomMessage(seq=1, sender_id="user", content="go"),
-                _utterance(2, "scout", turn_id="t_a", tools_recorded=True),
-                _utterance(3, "critic", turn_id=None, tools_recorded=False),
+                _utterance(2, scout, turn_id="t_a", tools_recorded=True),
+                _utterance(3, "critic", turn_id="t_b", tools_recorded=False),
             ),
-            tool_uses=(_use("t_a", tool_name="delegate", subagent_id="sub_1", tool_call_id="c1"),),
+            tool_uses=(
+                _use("t_a", scout, tool_name="delegate", subagent_id="sub_1", tool_call_id="c1"),
+            ),
         )
 
         body = client.get(f"/api/rooms/{room_id}/topology").json()
 
         ids = {n["id"]: n for n in body["nodes"]}
-        assert ids["seat:scout"]["status"] == "answered"
-        assert ids["seat:scout"]["turn_count"] == 1
-        assert "turn:t_a" in ids and "turn:seq-3" in ids
+        assert ids[f"seat:{scout}"]["status"] == "answered"
+        assert ids[f"seat:{scout}"]["turn_count"] == 1
+        assert "turn:t_a" in ids and "turn:t_b" in ids
         assert "turn:seq-1" not in ids, "the human's message is not a seat's turn"
         assert ids["tool:t_a:0"]["tool_name"] == "delegate"
-        assert ids["subagent:sub_1"]["parent_participant_id"] == "scout"
+        assert ids["subagent:sub_1"]["parent_participant_id"] == scout
         edges = {(e["source"], e["target"], e["kind"]) for e in body["edges"]}
-        assert ("seat:scout", "turn:t_a", "took_turn") in edges
-        assert ("turn:t_a", "turn:seq-3", "followed_by") in edges
+        assert (f"seat:{scout}", "turn:t_a", "took_turn") in edges
+        assert ("turn:t_a", "turn:t_b", "followed_by") in edges
         assert ("turn:t_a", "tool:t_a:0", "called") in edges
-        assert ("seat:scout", "subagent:sub_1", "spawned") in edges
+        assert (f"seat:{scout}", "subagent:sub_1", "spawned") in edges
         assert body["summary"] == {"seats": 2, "turns": 2, "tool_calls": 1, "subagents": 1}
 
     def test_a_rewind_is_a_named_gap_in_the_graphs_turns(self, client: TestClient) -> None:
@@ -870,8 +925,8 @@ class TestARoomsTopology:
     def test_complete_turns_do_not_hide_unrecorded_tool_calls(self, client: TestClient) -> None:
         """`history_complete` speaks for turn rows; tool-level gaps are named apart (#1388 N3).
 
-        Every turn row is present, but one turn ended before reporting its tools and one
-        was saved by a build that kept no tool record, so the tool-call total is low.
+        Every turn row is present, but one turn ended before reporting its tools, so the
+        tool-call total is low.
 
         Killed by: src/uclone_x/ui/room_dock.py :: "tool_call_gaps": [text for _, _, text in tool_gaps],
         Becomes: "tool_call_gaps": [],
@@ -884,10 +939,7 @@ class TestARoomsTopology:
         _seed(
             client,
             room_id,
-            transcript=(
-                _utterance(1, "scout", turn_id="t_a", tools_recorded=False, error="boom"),
-                _utterance(2, "scout", turn_id=None, tools_recorded=False),
-            ),
+            transcript=(_utterance(1, "scout", turn_id="t_a", tools_recorded=False, error="boom"),),
             file_record=RoomFileRecord(kept_since_creation=True, unrecorded_turns=1),
         )
 
@@ -895,15 +947,9 @@ class TestARoomsTopology:
 
         assert body["history_complete"] is True
         assert body["history_gaps"] == []
-        assert body["tool_call_gaps"] == [
-            "1 turn(s) were saved without a record of their tools",
-            "1 turn(s) ended before reporting their tools",
-        ]
-        # The same gaps as codes with their counts, in the same order (#1911).
-        assert body["tool_call_gap_codes"] == [
-            {"code": "saved_without_tools", "count": 1},
-            {"code": "unreported", "count": 1},
-        ]
+        assert body["tool_call_gaps"] == ["1 turn(s) ended before reporting their tools"]
+        # The same gap as a code with its count (#1911).
+        assert body["tool_call_gap_codes"] == [{"code": "unreported", "count": 1}]
 
     def test_a_room_with_no_known_tool_gap_names_none(self, client: TestClient) -> None:
         """Killed by: src/uclone_x/ui/room_dock.py :: if record.unrecorded_turns:
@@ -1012,7 +1058,9 @@ class TestASeatsKnowledge:
         client.post(f"/api/rooms/{room_id}/messages", json={"content": "hello"})
         _wait_for_rows(client, room_id, 2)
         room = client.get(f"/api/rooms/{room_id}").json()
-        session_id = next(p["session_id"] for p in room["participants"] if p["id"] == "scout")
+        session_id = next(
+            p["session_id"] for p in room["participants"] if p["id"] == seat_id_for("scout")
+        )
         live = _stack(client).live_agent(room_id, session_id)
         manager = _stack(client).session_manager()
         assert live is not None and live.ontology is manager.ontology_for("scout")
@@ -1026,7 +1074,7 @@ class TestASeatsKnowledge:
         body = client.get(f"/api/rooms/{room_id}/knowledge", params={"agent_id": "scout"}).json()
 
         assert body["status"] == "ok" and body["reason"] is None
-        assert body["participant_id"] == "scout"
+        assert body["participant_id"] == seat_id_for("scout"), "a seat is its clone's id"
         assert ("Postgres", "is_a", "Database") in {
             (t["subject"], t["predicate"], t["object"]) for t in body["triples"]
         }
@@ -1057,6 +1105,7 @@ class TestASeatsKnowledge:
         Killed by: src/uclone_x/ui/room_dock.py :: axioms = engine.list_axioms() if isinstance(engine, OntologyEngine) else []
         Becomes: axioms = []
         """
+        make_clones("critic")  # a seat's memory is its clone's (clone-data-scopes §3.3)
         room_id = _create(client, ["scout", "critic"])
         _stack(client).session_manager().ontology_for("scout").teach_axiom(
             name="part_of_is_transitive",
@@ -1089,7 +1138,7 @@ class TestASeatsKnowledge:
         refused = client.get(f"/api/rooms/{room_id}/knowledge")
 
         assert refused.status_code == 400
-        assert "scout, critic" in refused.json()["detail"]
+        assert f"{seat_id_for('scout')}, critic" in refused.json()["detail"]
 
     def test_a_non_member_is_a_404_naming_the_roster(self, client: TestClient) -> None:
         room_id = _create(client, ["scout"])
@@ -1097,7 +1146,7 @@ class TestASeatsKnowledge:
         refused = client.get(f"/api/rooms/{room_id}/knowledge", params={"agent_id": "ghost"})
 
         assert refused.status_code == 404
-        assert "scout" in refused.json()["detail"]
+        assert seat_id_for("scout") in refused.json()["detail"]
 
 
 # --------------------------------------------------------------------------------------
@@ -1147,7 +1196,7 @@ class _CasWriter(_Seat):
     """Writes `cas.md` and reports it, so only the landing save stands between the two."""
 
     def __init__(self, session_id: str, workspace: Path) -> None:
-        super().__init__("scout", session_id)
+        super().__init__(seat_id_for("scout"), session_id)
         self.workspace = workspace
         self.tool_executions = (
             ToolExecutionRecord(
@@ -1183,7 +1232,7 @@ class TestAFileOnDiskIsNeverReportedAsNoneWritten:
         registry.register(cast(Any, _RealWriter(workspace)))
         llm = _WriteThenFail()
         agent = BaseAgent(
-            config=AgentConfig(agent_id="scout", name="Scout"), tools=registry, llm=llm
+            config=AgentConfig(agent_id=seat_id_for("scout"), name="Scout"), tools=registry, llm=llm
         )
         _take_one_turn(client, room_id, cast(Any, agent))
 
@@ -1340,7 +1389,7 @@ class TestTheDockNeverSaysNothingWasWritten:
         registry.register(cast(Any, SubagentDelegationTool()))
         llm = _DelegateThenWrite()
         agent = BaseAgent(
-            config=AgentConfig(agent_id="scout", name="Scout"), tools=registry, llm=llm
+            config=AgentConfig(agent_id=seat_id_for("scout"), name="Scout"), tools=registry, llm=llm
         )
         _take_one_turn(client, room_id, cast(Any, agent))
 
@@ -1382,7 +1431,9 @@ class TestTheDockNeverSaysNothingWasWritten:
             ),
         )
         agent = BaseAgent(
-            config=AgentConfig(agent_id="scout", name="Scout", workspace_dir=workspace),
+            config=AgentConfig(
+                agent_id=seat_id_for("scout"), name="Scout", workspace_dir=workspace
+            ),
             tools=registry,
             llm=llm,
         )
@@ -1557,7 +1608,7 @@ def _knowledge(client: TestClient, room_id: str, seat: str) -> dict[str, Any]:
 def _memory_file(seat: str) -> Path:
     from uclone_x.core.agent_home import AgentHome
 
-    return AgentHome.for_username(seat).memory_path
+    return AgentHome.for_handle(seat).knowledge_path
 
 
 def _record(
@@ -1593,6 +1644,7 @@ class TestRemembersListsTheClonesFacts:
         Killed by: src/uclone_x/ui/room_dock.py :: **known,
         Becomes: **{"facts": [], "facts_reason": None},
         """
+        make_clones("sage")  # a seat's memory is its clone's (clone-data-scopes §3.3)
         room_id = _create(saving_client, ["sage"])
         saving_client.post(f"/api/rooms/{room_id}/messages", json={"content": "I like teal"})
         _wait_for_rows(saving_client, room_id, 2)
@@ -1616,9 +1668,10 @@ class TestRemembersListsTheClonesFacts:
     def test_another_clones_facts_are_not_listed(self, client: TestClient) -> None:
         """Each clone's memory is its own (P7); `critic` must not show what `scout` saved.
 
-        Killed by: src/uclone_x/ui/room_dock.py :: facts = read_saved_facts(seat.id)
-        Becomes: facts = read_saved_facts("scout")
+        Killed by: src/uclone_x/ui/room_dock.py :: saved = read_saved_memory(seat.id)
+        Becomes: saved = read_saved_memory("scout")
         """
+        make_clones("critic")  # a seat's memory is its clone's (clone-data-scopes §3.3)
         room_id = _create(client, ["scout", "critic"])
         _record("scout", "Kenny", "favourite_colour", "teal", "elsewhere")
         _record("critic", "Build", "status", "green", "elsewhere")
@@ -1642,7 +1695,9 @@ class TestRemembersListsTheClonesFacts:
         """
         room_id = _create(client, ["scout"])
         room = client.get(f"/api/rooms/{room_id}").json()
-        session_id = next(p["session_id"] for p in room["participants"] if p["id"] == "scout")
+        session_id = next(
+            p["session_id"] for p in room["participants"] if p["id"] == seat_id_for("scout")
+        )
         _record("scout", "Kenny", "lives_in", "Seoul", "s-1", room=room_id)
         _record("scout", "Kenny", "works_at", "UClone", "s-2", room="another-room")
         _record("scout", "Kenny", "likes", "tea", session_id)
@@ -1698,8 +1753,7 @@ class TestRemembersListsTheClonesFacts:
         body = _knowledge(client, room_id, "scout")
 
         assert body["facts"] == []
-        assert body["facts_reason"] == "No facts are listed for scout."
-        assert not _absence_claim(body["facts_reason"])
+        assert body["facts_reason"] is None
 
     def test_a_seat_whose_id_names_no_agent_home_lists_none_and_claims_no_read(self) -> None:
         """No memory can be saved under such an id, so there are no facts that failed to read.
@@ -1718,8 +1772,8 @@ class TestRemembersListsTheClonesFacts:
 
         answer, facts = _known_facts("room-1", seat)
 
-        assert answer == {"facts": [], "facts_reason": "No facts are listed for Con."}
-        assert facts == []
+        assert answer == {"facts": [], "facts_reason": None}
+        assert facts == {}
 
     def test_an_unreadable_memory_is_said_plainly_and_left_where_it_is(
         self, client: TestClient
@@ -1731,8 +1785,8 @@ class TestRemembersListsTheClonesFacts:
 
         Killed by: src/uclone_x/ui/room_dock.py :: "facts": None,
         Becomes: "facts": [],
-        Killed by: src/uclone_x/ui/room_dock.py :: "worked_out": None if facts is None else worked_out_list(facts, axioms),
-        Becomes: "worked_out": worked_out_list(facts or [], axioms),
+        Killed by: src/uclone_x/ui/room_dock.py :: "worked_out": None if statements is None else worked_out_list(statements, axioms),
+        Becomes: "worked_out": worked_out_list(statements or {}, axioms),
         """
         room_id = _create(client, ["scout"])
         path = _memory_file("scout")
@@ -1749,7 +1803,7 @@ class TestRemembersListsTheClonesFacts:
         assert not _TECHNICAL.search(reason), reason
         assert not _absence_claim(reason), reason
         assert path.read_text(encoding="utf-8") == '{"facts": [ {"subject": '
-        assert not list(path.parent.glob("memory.json.unreadable-*")), "a read moved it"
+        assert not list(path.parent.glob("knowledge.sqlite3.unreadable-*")), "a read moved it"
 
 
 # --------------------------------------------------------------------------------------
@@ -1759,10 +1813,13 @@ class TestRemembersListsTheClonesFacts:
 
 def _file_facts(seat: str) -> dict[str, dict[str, Any]]:
     """Every fact in the clone's memory document, retracted ones included, read from disk."""
-    import json
+    from uclone_x.core.agent_home import AgentHome
+    from uclone_x.knowledge.sqlite_store import SqliteKnowledgeStore
+    from uclone_x.memory.graph import fact_of
 
-    document = json.loads(_memory_file(seat).read_text(encoding="utf-8"))
-    return {f["fact_id"]: f for f in document["facts"]}
+    agent_id = AgentHome.for_handle(seat).agent_id()
+    store = SqliteKnowledgeStore(_memory_file(seat), agent_id, create=False)
+    return {row.edge.id: fact_of(row).model_dump(mode="json") for row in store.rows()}
 
 
 def _assert_plain_refusal(detail: Any, *internals: str) -> None:
@@ -1809,6 +1866,7 @@ class TestForgetAFact:
         Killed by: src/uclone_x/ui/room_dock.py :: return stack.session_manager().memory_for(agent_id)
         Becomes: return CrossSessionMemory(storage_path=stack.session_manager().memory_for(agent_id).storage_path)
         """
+        make_clones("sage")  # a seat's memory is its clone's (clone-data-scopes §3.3)
         room_id = _create(saving_client, ["sage"])
         saving_client.post(f"/api/rooms/{room_id}/messages", json={"content": "I like teal"})
         _wait_for_rows(saving_client, room_id, 2)
@@ -1888,7 +1946,7 @@ class TestForgetAFact:
         assert refused.status_code == 409
         detail = refused.json()["detail"]
         assert detail == "The clone's memory could not be read, so nothing was changed."
-        _assert_plain_refusal(detail, str(path), "JSONDecodeError")
+        _assert_plain_refusal(detail, str(path), "DatabaseError")
         assert path.read_text(encoding="utf-8") == '{"facts": [ {"subject": '
 
     def test_a_failed_save_refuses_plainly(
@@ -1897,15 +1955,13 @@ class TestForgetAFact:
         """Killed by: src/uclone_x/ui/room_dock.py :: raise _memory_edit_refusal(500, "save_failed") from None
         Becomes: raise
         """
-        from uclone_x.memory.store import CrossSessionMemory
-
         _create(client, ["scout"])
         gone = _record("scout", "Kenny", "lives_in", "Busan", "a-chat")
 
-        def refuse(self: CrossSessionMemory) -> None:
-            raise PermissionError(13, "Permission denied", "/secret/home/scout/memory.json")
+        def refuse(*args: object, **kwargs: object) -> None:
+            raise PermissionError(13, "Permission denied", "/secret/home/scout/knowledge.sqlite3")
 
-        monkeypatch.setattr(CrossSessionMemory, "save", refuse)
+        monkeypatch.setattr("uclone_x.memory.store.retract_edge", refuse)
         refused = client.delete(f"/api/agents/scout/memory/{gone}")
 
         assert refused.status_code == 500
@@ -1966,6 +2022,51 @@ class TestCorrectAFact:
         assert refused.status_code == 404
         _assert_plain_refusal(refused.json()["detail"], "mem_000000000000")
 
+    def test_cross_clone_edit_or_delete_refused_with_404_leaving_fact_untouched(
+        self, client: TestClient
+    ) -> None:
+        from uclone_x.memory.store import default_cross_session_memory
+
+        make_clones("critic")
+        _create(client, ["scout", "critic"])
+        fact_id = _record("scout", "Kenny", "lives_in", "Busan", "a-chat")
+        scout_memory = default_cross_session_memory("scout")
+
+        patch_res = client.patch(
+            f"/api/agents/critic/memory/{fact_id}", json={"value": "different"}
+        )
+        assert patch_res.status_code == 404
+        _assert_plain_refusal(patch_res.json()["detail"], fact_id)
+        scout_fact = scout_memory.get_fact(fact_id)
+        assert scout_fact is not None
+        assert scout_fact.object_value == "Busan"
+        assert scout_fact.retracted is False
+
+        del_res = client.delete(f"/api/agents/critic/memory/{fact_id}")
+        assert del_res.status_code == 404
+        _assert_plain_refusal(del_res.json()["detail"], fact_id)
+        scout_fact = scout_memory.get_fact(fact_id)
+        assert scout_fact is not None
+        assert scout_fact.object_value == "Busan"
+        assert scout_fact.retracted is False
+
+    def test_correct_with_identical_value_returns_200_and_leaves_fact_unchanged(
+        self, client: TestClient
+    ) -> None:
+        room_id = _create(client, ["scout"])
+        fact_id = _record("scout", "Kenny", "lives_in", "Busan", "s-1", room=room_id)
+        before = _file_facts("scout")
+
+        answered = client.patch(f"/api/agents/scout/memory/{fact_id}", json={"value": " Busan "})
+
+        assert answered.status_code == 200, answered.text
+        fact = answered.json()["fact"]
+        assert fact["fact_id"] == fact_id
+        assert fact["object_value"] == "Busan"
+        assert fact["origin"] == "saved"
+        assert fact["retracted"] is False
+        assert _file_facts("scout") == before
+
 
 class TestAnEmptyKnowledgeRecordIsNotPresentedAsNothingLearned:
     """#1404: nothing in a room turn writes to a clone's rules engine."""
@@ -1997,8 +2098,8 @@ class TestRoomDockTurnSummaryRoutes:
         _seed(
             client,
             room_id,
-            transcript=(_utterance(1, "scout", turn_id="t1", tools_recorded=True),),
-            tool_uses=(_use("t1", written_path="file.txt"),),
+            transcript=(_utterance(1, seat_id_for("scout"), turn_id="t1", tools_recorded=True),),
+            tool_uses=(_use("t1", seat_id_for("scout"), written_path="file.txt"),),
         )
         resp = client.get(f"/api/rooms/{room_id}/turns/1")
         assert resp.status_code == 200
@@ -2065,22 +2166,6 @@ class TestRoomDockTurnTraceRoutes:
         assert body["trace"] is None
         assert body["reason"]["code"] == "not_an_agent_turn"
 
-    def test_trace_turn_not_linked(self, client: TestClient) -> None:
-        """Killed by: src/uclone_x/ui/room_dock.py :: return _TRACE_REASONS["turn_not_linked"]
-        Becomes: return None
-        """
-        room_id = _create(client, ["scout"])
-        _seed(
-            client,
-            room_id,
-            transcript=(_utterance(1, "scout", turn_id=None, tools_recorded=False),),
-        )
-        resp = client.get(f"/api/rooms/{room_id}/turns/1/trace")
-        assert resp.status_code == 200
-        body = resp.json()
-        assert body["trace"] is None
-        assert body["reason"]["code"] == "turn_not_linked"
-
     def test_trace_turn_not_saved(self, client: TestClient) -> None:
         """A row whose save failed, and whose seat has no saved session, says so.
 
@@ -2093,7 +2178,11 @@ class TestRoomDockTurnTraceRoutes:
             room_id,
             transcript=(
                 _utterance(
-                    1, "scout", turn_id="t1", tools_recorded=False, persist_error="disk full"
+                    1,
+                    seat_id_for("scout"),
+                    turn_id="t1",
+                    tools_recorded=False,
+                    persist_error="disk full",
                 ),
             ),
         )
@@ -2111,7 +2200,7 @@ class TestRoomDockTurnTraceRoutes:
         _seed(
             client,
             room_id,
-            transcript=(_utterance(1, "scout", turn_id="t1", tools_recorded=True),),
+            transcript=(_utterance(1, seat_id_for("scout"), turn_id="t1", tools_recorded=True),),
         )
         resp = client.get(f"/api/rooms/{room_id}/turns/1/trace")
         assert resp.status_code == 200
@@ -2125,14 +2214,16 @@ class TestRoomDockTurnTraceRoutes:
         """
         room_id = _create(client, ["scout"])
         room = client.get(f"/api/rooms/{room_id}").json()
-        session_id = next(p["session_id"] for p in room["participants"] if p["id"] == "scout")
+        session_id = next(
+            p["session_id"] for p in room["participants"] if p["id"] == seat_id_for("scout")
+        )
         stack = _stack(client)
         store = stack.session_manager().core_store
-        store.save(SessionState(session_id=session_id, agent_id="scout"))
+        store.save(SessionState(session_id=session_id, agent_id=seat_id_for("scout")))
         _seed(
             client,
             room_id,
-            transcript=(_utterance(1, "scout", turn_id="t1", tools_recorded=True),),
+            transcript=(_utterance(1, seat_id_for("scout"), turn_id="t1", tools_recorded=True),),
         )
         resp = client.get(f"/api/rooms/{room_id}/turns/1/trace")
         assert resp.status_code == 200
@@ -2151,10 +2242,12 @@ class TestRoomDockTurnTraceRoutes:
         """
         room_id = _create(client, ["scout"])
         room = client.get(f"/api/rooms/{room_id}").json()
-        session_id = next(p["session_id"] for p in room["participants"] if p["id"] == "scout")
+        session_id = next(
+            p["session_id"] for p in room["participants"] if p["id"] == seat_id_for("scout")
+        )
         stack = _stack(client)
         store = stack.session_manager().core_store
-        store.save(SessionState(session_id=session_id, agent_id="scout"))
+        store.save(SessionState(session_id=session_id, agent_id=seat_id_for("scout")))
         log_path = store.event_log_path(session_id)
         assert log_path is not None
         log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2162,7 +2255,7 @@ class TestRoomDockTurnTraceRoutes:
         _seed(
             client,
             room_id,
-            transcript=(_utterance(1, "scout", turn_id="t1", tools_recorded=True),),
+            transcript=(_utterance(1, seat_id_for("scout"), turn_id="t1", tools_recorded=True),),
         )
         resp = client.get(f"/api/rooms/{room_id}/turns/1/trace")
         assert resp.status_code == 200
@@ -2185,10 +2278,12 @@ class TestRoomDockTurnTraceRoutes:
         """
         room_id = _create(client, ["scout"])
         room = client.get(f"/api/rooms/{room_id}").json()
-        session_id = next(p["session_id"] for p in room["participants"] if p["id"] == "scout")
+        session_id = next(
+            p["session_id"] for p in room["participants"] if p["id"] == seat_id_for("scout")
+        )
         stack = _stack(client)
         store = stack.session_manager().core_store
-        store.save(SessionState(session_id=session_id, agent_id="scout"))
+        store.save(SessionState(session_id=session_id, agent_id=seat_id_for("scout")))
         log_path = store.event_log_path(session_id)
         assert log_path is not None
         log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2213,7 +2308,7 @@ class TestRoomDockTurnTraceRoutes:
         _seed(
             client,
             room_id,
-            transcript=(_utterance(1, "scout", turn_id="t1", tools_recorded=True),),
+            transcript=(_utterance(1, seat_id_for("scout"), turn_id="t1", tools_recorded=True),),
         )
 
         resp = client.get(f"/api/rooms/{room_id}/turns/1/trace")
@@ -2240,16 +2335,18 @@ class TestRoomDockTurnTraceRoutes:
     @staticmethod
     def _scout_session(client: TestClient, room_id: str) -> str:
         room = client.get(f"/api/rooms/{room_id}").json()
-        return str(next(p["session_id"] for p in room["participants"] if p["id"] == "scout"))
+        return str(
+            next(p["session_id"] for p in room["participants"] if p["id"] == seat_id_for("scout"))
+        )
 
     def _real_turns(self, client: TestClient, room_id: str, count: int = 3) -> tuple[Any, Path]:
         """`count` one-step turns by the real agent loop, in the room's own session store."""
         session_id = self._scout_session(client, room_id)
         store = _stack(client).session_manager().core_store
         agent = BaseAgent(
-            config=AgentConfig(agent_id="scout", name="Scout"),
+            config=AgentConfig(agent_id=seat_id_for("scout"), name="Scout"),
             llm=MockLLMConnector(responses=[f"reply {n}" for n in range(1, count + 1)]),
-            context=AgentContext(session_id=session_id, agent_id="scout"),
+            context=AgentContext(session_id=session_id, agent_id=seat_id_for("scout")),
             store=store,
         )
 
@@ -2266,7 +2363,7 @@ class TestRoomDockTurnTraceRoutes:
             client,
             room_id,
             transcript=tuple(
-                _utterance(n, "scout", turn_id=f"t{n}", tools_recorded=True)
+                _utterance(n, seat_id_for("scout"), turn_id=f"t{n}", tools_recorded=True)
                 for n in range(1, count + 1)
             ),
         )
@@ -2348,9 +2445,13 @@ class TestRoomDockTurnTraceRoutes:
             client,
             room_id,
             transcript=(
-                _utterance(1, "scout", turn_id="t1", tools_recorded=True, persist_error="disk"),
-                _utterance(2, "scout", turn_id="t9", tools_recorded=True),
-                _utterance(3, "scout", turn_id="t8", tools_recorded=True, persist_error="disk"),
+                _utterance(
+                    1, seat_id_for("scout"), turn_id="t1", tools_recorded=True, persist_error="disk"
+                ),
+                _utterance(2, seat_id_for("scout"), turn_id="t9", tools_recorded=True),
+                _utterance(
+                    3, seat_id_for("scout"), turn_id="t8", tools_recorded=True, persist_error="disk"
+                ),
             ),
         )
 
@@ -2377,14 +2478,12 @@ class TestRoomDockTurnTraceRoutes:
             room_id,
             transcript=(
                 _utterance(1, "user", turn_id=None, tools_recorded=False),
-                _utterance(2, "scout", turn_id=None, tools_recorded=False),
-                _utterance(3, "scout", turn_id="t1", tools_recorded=True),
+                _utterance(2, seat_id_for("scout"), turn_id="t1", tools_recorded=True),
             ),
         )
         for seq, code in (
             (1, "not_an_agent_turn"),
-            (2, "turn_not_linked"),
-            (3, "session_not_found"),
+            (2, "session_not_found"),
         ):
             trace = client.get(f"/api/rooms/{room_id}/turns/{seq}/trace")
             step = client.get(f"/api/rooms/{room_id}/turns/{seq}/trace/steps/1")
@@ -2426,7 +2525,7 @@ class TestRoomDockTurnTraceRoutes:
         room_id = _create(client, ["scout"])
         session_id = self._scout_session(client, room_id)
         store = _stack(client).session_manager().core_store
-        store.save(SessionState(session_id=session_id, agent_id="scout"))
+        store.save(SessionState(session_id=session_id, agent_id=seat_id_for("scout")))
         log_path = store.event_log_path(session_id)
         assert log_path is not None
         log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2438,7 +2537,7 @@ class TestRoomDockTurnTraceRoutes:
         _seed(
             client,
             room_id,
-            transcript=(_utterance(1, "scout", turn_id="t1", tools_recorded=True),),
+            transcript=(_utterance(1, seat_id_for("scout"), turn_id="t1", tools_recorded=True),),
         )
 
         resp = client.get(f"/api/rooms/{room_id}/turns/1/trace")
@@ -2506,8 +2605,8 @@ def test_every_topology_code_has_a_sentence_in_the_head(language: str) -> None:
 
     Killed by: src/uclone_x/ui/room_dock.py :: HistoryGapCode = Literal["before_record", "cleared", "rewound", "unsaved", "uncounted"]
     Becomes: HistoryGapCode = Literal["before_record", "cleared", "rewound", "unsaved", "renamed"]
-    Killed by: src/uclone_x/ui/room_dock.py :: ToolCallGapCode = Literal["saved_without_tools", "unreported"]
-    Becomes: ToolCallGapCode = Literal["saved_without_tools", "renamed"]
+    Killed by: src/uclone_x/ui/room_dock.py :: ToolCallGapCode = Literal["unreported"]
+    Becomes: ToolCallGapCode = Literal["renamed"]
     Killed by: src/uclone_x/ui/room_dock.py :: TopologyReasonCode = Literal["no_seat"]
     Becomes: TopologyReasonCode = Literal["renamed"]
     """
@@ -2517,3 +2616,367 @@ def test_every_topology_code_has_a_sentence_in_the_head(language: str) -> None:
     assert set(get_args(HistoryGapCode)) == set(topology["historyGapReasons"])
     assert set(get_args(ToolCallGapCode)) == set(topology["toolCallGapReasons"])
     assert set(get_args(TopologyReasonCode)) == set(topology["reasons"])
+
+
+# --------------------------------------------------------------------------------------
+# The paths that follow a room's workspace (clone-data-scopes §3.6, #2128)
+# --------------------------------------------------------------------------------------
+
+
+def test_an_artifact_link_with_a_room_is_read_in_that_rooms_workspace(
+    client: TestClient, tmp_path: Path
+) -> None:
+    """A seat's picture link resolves where the seat drew it, not in the server's folder.
+
+    Killed by: src/uclone_x/ui/app.py :: root = room_stack.workspace_of(room_id) if room_id else None
+    Becomes: root = None
+    """
+    project = tmp_path / "project"
+    (project / "artifacts").mkdir(parents=True)
+    (project / "artifacts" / "note.md").write_text("drawn here", encoding="utf-8")
+    room_id = _create(client, ["scout"])
+    _seed(client, room_id, workspace=str(project.resolve()))
+
+    with_room = client.get(
+        "/api/artifacts/content", params={"path": "artifacts/note.md", "room_id": room_id}
+    )
+    without = client.get("/api/artifacts/content", params={"path": "artifacts/note.md"})
+
+    assert with_room.status_code == 200 and with_room.text == "drawn here"
+    assert without.status_code == 404, "the server's own folder does not hold it"
+
+
+def test_another_sites_page_cannot_read_a_rooms_folder(client: TestClient, tmp_path: Path) -> None:
+    """A room's folder can be any folder a person picked, so its files are not another site's.
+
+    Killed by: src/uclone_x/ui/app.py :: _refuse_cross_origin(request)  # another site must not read a workspace's files
+    Becomes: pass
+    """
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "note.md").write_text("private", encoding="utf-8")
+    room_id = _create(client, ["scout"])
+    _seed(client, room_id, workspace=str(project.resolve()))
+
+    refused = client.get(
+        "/api/artifacts/content",
+        params={"path": "note.md", "room_id": room_id},
+        headers={"Origin": "https://evil.example"},
+    )
+
+    assert refused.status_code == 403
+    assert "private" not in refused.text
+
+
+def test_a_rooms_folder_does_not_show_the_apps_own_state(
+    client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A room pointed at a folder that holds the app's state cannot read that state through it.
+
+    Temp home and state folders only: `app_state_roots` reads `HOME` and the `UCLONE_*` dirs.
+
+    Killed by: src/uclone_x/ui/app.py :: if in_app_state_dir(resolved_path):
+    Becomes: if False:
+    """
+    home = tmp_path / "home"
+    agents = home / "clones"
+    agents.mkdir(parents=True)
+    (agents / "secret.json").write_text('{"memory": "kept"}', encoding="utf-8")
+    (home / "note.md").write_text("fine", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("UCLONE_AGENTS_DIR", str(agents))
+    monkeypatch.setenv("UCLONE_SESSION_DIR", str(tmp_path / "sessions"))
+    room_id = _create(client, ["scout"])
+    _seed(client, room_id, workspace=str(home.resolve()))
+
+    state = client.get(
+        "/api/artifacts/content", params={"path": "clones/secret.json", "room_id": room_id}
+    )
+    beside = client.get("/api/artifacts/content", params={"path": "note.md", "room_id": room_id})
+
+    assert state.status_code == 403 and "kept" not in state.text
+    assert beside.status_code == 200 and beside.text == "fine"
+
+
+# What the dashboard sends: served by `ucx ui` itself, and through `vite.config.ts`'s proxy.
+_SAME_ORIGIN = {"Origin": "http://127.0.0.1:5180", "Host": "127.0.0.1:5180"}
+_VITE_PROXY = {"Origin": "http://localhost:5173", "Host": "localhost:5180"}
+
+
+def test_another_sites_page_cannot_list_the_conversations(client: TestClient) -> None:
+    """The room list names every conversation by title, which is not another site's (#2143).
+
+    Same-origin and Origin-less reads, which are what the dashboard sends, still answer.
+
+    Killed by: src/uclone_x/ui/rooms.py :: refuse_cross_origin(request)  # another site must not list the conversations (#2143)
+    Becomes: pass
+    """
+    _create(client, ["scout"])
+
+    refused = client.get("/api/rooms", headers={"Origin": "https://evil.example"})
+    plain = client.get("/api/rooms")
+    served = client.get("/api/rooms", headers=_SAME_ORIGIN)
+    vite = client.get("/api/rooms", headers=_VITE_PROXY)
+
+    assert refused.status_code == 403
+    assert "Dock" not in refused.text
+    for answered in (plain, served, vite):
+        assert answered.status_code == 200, answered.text
+        assert [r["title"] for r in answered.json()["rooms"]] == ["Dock"]
+
+
+def test_another_sites_page_cannot_read_the_servers_folder(
+    client: TestClient, tmp_path: Path
+) -> None:
+    """With no room, the read is in the server's workspace, which is not another site's (#2143).
+
+    Killed by: src/uclone_x/ui/app.py :: _refuse_cross_origin(request)  # another site must not read a workspace's files
+    Becomes: pass
+    """
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(exist_ok=True)
+    (workspace / "note.md").write_text("private", encoding="utf-8")
+
+    for params in ({"path": "note.md"}, {"path": "note.md", "room_id": ""}):
+        refused = client.get(
+            "/api/artifacts/content", params=params, headers={"Origin": "https://evil.example"}
+        )
+        assert refused.status_code == 403
+        assert "private" not in refused.text
+    for headers in ({}, _SAME_ORIGIN, _VITE_PROXY):
+        same = client.get("/api/artifacts/content", params={"path": "note.md"}, headers=headers)
+        assert same.status_code == 200 and same.text == "private"
+
+
+def test_the_servers_folder_does_not_show_the_apps_own_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A server launched from a folder that holds the app's state cannot read that state (#2143).
+
+    Temp home and state folders only: `app_state_roots` reads `HOME` and the `UCLONE_*` dirs.
+
+    Killed by: src/uclone_x/ui/app.py :: if in_app_state_dir(resolved_path):
+    Becomes: if False:
+    """
+    home = tmp_path / "home"
+    agents = home / "clones"
+    agents.mkdir(parents=True)
+    (agents / "secret.json").write_text('{"memory": "kept"}', encoding="utf-8")
+    (home / "note.md").write_text("fine", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("UCLONE_AGENTS_DIR", str(agents))
+    monkeypatch.setenv("UCLONE_SESSION_DIR", str(tmp_path / "sessions"))
+    app = create_ui_app(
+        static_dir=tmp_path,
+        storage_dir=tmp_path / "sessions",
+        workspace_dir=home,
+        llm=MockLLMConnector(),
+    )
+    with TestClient(app) as started:
+        state = started.get("/api/artifacts/content", params={"path": "clones/secret.json"})
+        beside = started.get("/api/artifacts/content", params={"path": "note.md"})
+
+    assert state.status_code == 403 and "kept" not in state.text
+    assert beside.status_code == 200 and beside.text == "fine"
+
+
+def test_a_peer_a_seat_calls_works_in_the_rooms_workspace(
+    client: TestClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The A2A callee is bound to the room's folder as it is at the call, not the server's.
+
+    Killed by: src/uclone_x/ui/rooms.py :: workspace_root=lambda: self.workspace_of(state.room_id),
+    Becomes: workspace_root=resolver.workspace_root,
+    """
+    import uclone_x.ui.rooms as rooms_module
+
+    seen: dict[str, Any] = {}
+
+    def _capture(transport: Any, **kwargs: Any) -> tuple[str, ...]:
+        seen.update(kwargs)
+        return ()
+
+    monkeypatch.setattr(rooms_module, "register_persona_handlers", _capture)
+    stack = _stack(client)
+    room_id = _create(client, ["scout"])
+    stack.orchestrator(stack.service.get(room_id))
+    project = tmp_path / "project"
+    project.mkdir()
+    _seed(client, room_id, workspace=str(project.resolve()))
+
+    assert seen["workspace_root"]() == project.resolve()
+
+
+def test_another_sites_page_cannot_list_clones(client: TestClient) -> None:
+    """The clone listing names installed clones, which is not another site's (#2146).
+
+    Killed by: src/uclone_x/ui/clones.py :: refuse_cross_origin(request)  # another site must not list clones (#2146)
+    Becomes: pass
+    """
+    refused = client.get("/api/clones", headers={"Origin": "https://evil.example"})
+    plain = client.get("/api/clones")
+    served = client.get("/api/clones", headers=_SAME_ORIGIN)
+    vite = client.get("/api/clones", headers=_VITE_PROXY)
+
+    assert refused.status_code == 403
+    for answered in (plain, served, vite):
+        assert answered.status_code == 200, answered.text
+
+
+def test_another_sites_page_cannot_inspect_room_context(client: TestClient) -> None:
+    """A room's context occupancy is not readable cross-origin (#2146).
+
+    Killed by: src/uclone_x/ui/rooms.py :: refuse_cross_origin(request)  # another site must not inspect context occupancy (#2146)
+    Becomes: pass
+    """
+    room_id = _create(client, ["scout"])
+    refused = client.get(
+        f"/api/rooms/{room_id}/context", headers={"Origin": "https://evil.example"}
+    )
+    plain = client.get(f"/api/rooms/{room_id}/context")
+    served = client.get(f"/api/rooms/{room_id}/context", headers=_SAME_ORIGIN)
+    vite = client.get(f"/api/rooms/{room_id}/context", headers=_VITE_PROXY)
+
+    assert refused.status_code == 403
+    for answered in (plain, served, vite):
+        assert answered.status_code == 200, answered.text
+
+
+def test_another_sites_page_cannot_read_artifact_library_file(
+    client: TestClient, tmp_path: Path
+) -> None:
+    """The artifact library file text is private and not another site's (#2146).
+
+    Killed by: src/uclone_x/ui/artifacts.py :: refuse_cross_origin(request)  # another site must not read artifact files (#2146)
+    Becomes: pass
+    """
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(exist_ok=True)
+    artifacts_dir = workspace / "artifacts"
+    artifacts_dir.mkdir(exist_ok=True)
+    (artifacts_dir / "note.md").write_text("library file content", encoding="utf-8")
+
+    refused = client.get(
+        "/api/artifacts/library/file",
+        params={"path": "artifacts/note.md"},
+        headers={"Origin": "https://evil.example"},
+    )
+    assert refused.status_code == 403
+    assert "library file content" not in refused.text
+
+    for headers in ({}, _SAME_ORIGIN, _VITE_PROXY):
+        answered = client.get(
+            "/api/artifacts/library/file",
+            params={"path": "artifacts/note.md"},
+            headers=headers,
+        )
+        assert answered.status_code == 200, answered.text
+        assert "library file content" in answered.text
+
+
+def test_another_sites_page_cannot_read_room_dock_topology(client: TestClient) -> None:
+    """The dock topology describes conversation internals and must refuse cross-origin (#2146).
+
+    Killed by: src/uclone_x/ui/room_dock.py :: refuse_cross_origin(request)  # another site must not read room topology (#2146)
+    Becomes: pass
+    """
+    room_id = _create(client, ["scout"])
+    refused = client.get(
+        f"/api/rooms/{room_id}/topology", headers={"Origin": "https://evil.example"}
+    )
+    plain = client.get(f"/api/rooms/{room_id}/topology")
+    served = client.get(f"/api/rooms/{room_id}/topology", headers=_SAME_ORIGIN)
+    vite = client.get(f"/api/rooms/{room_id}/topology", headers=_VITE_PROXY)
+
+    assert refused.status_code == 403
+    for answered in (plain, served, vite):
+        assert answered.status_code == 200, answered.text
+
+
+def test_another_sites_page_cannot_tap_event_stream(client: TestClient) -> None:
+    """The live event stream carries room events and messages and must refuse cross-origin (#2146).
+
+    Killed by: src/uclone_x/ui/app.py :: _refuse_cross_origin(request)  # another site must not tap the event stream (#2146)
+    Becomes: pass
+    """
+    refused = client.get(
+        "/api/stream",
+        params={"max_events": 1},
+        headers={"Origin": "https://evil.example"},
+    )
+    assert refused.status_code == 403
+
+    for headers in ({}, _SAME_ORIGIN, _VITE_PROXY):
+        answered = client.get("/api/stream", params={"max_events": 1}, headers=headers)
+        assert answered.status_code == 200, answered.text
+
+
+def test_another_sites_page_cannot_read_remaining_get_routes(client: TestClient) -> None:
+    """Every remaining GET route refuses cross-origin reads (#2146).
+
+    Same-origin and Origin-less reads, which are what the dashboard sends, still answer.
+    """
+    room_id = _create(client, ["scout"])
+    evil = {"Origin": "https://evil.example"}
+
+    endpoints: list[tuple[str, dict[str, str]]] = [
+        ("/api/clones/scout", {}),
+        ("/api/sessions", {}),
+        ("/api/artifacts", {}),
+        ("/api/artifacts/library", {}),
+        ("/api/knowledge-graph", {"agent_id": "scout"}),
+        ("/api/ontology", {"agent_id": "scout"}),
+        (f"/api/rooms/{room_id}/artifacts", {}),
+        (f"/api/rooms/{room_id}/seats/scout/history", {}),
+        (f"/api/rooms/{room_id}/knowledge", {"agent_id": "scout"}),
+    ]
+
+    for path, params in endpoints:
+        refused = client.get(path, params=params, headers=evil)
+        assert refused.status_code == 403, (
+            f"Expected 403 for {path} with evil origin, got {refused.status_code}"
+        )
+        for headers in ({}, _SAME_ORIGIN, _VITE_PROXY):
+            answered = client.get(path, params=params, headers=headers)
+            assert answered.status_code == 200, (
+                f"Expected 200 for {path} with headers {headers}, got {answered.status_code}"
+            )
+
+
+def test_origin_matching_host_on_non_loopback_server_succeeds_and_mismatch_is_refused(
+    tmp_path: Path,
+) -> None:
+    """On a non-loopback server, Origin matching Host succeeds, and mismatched Origin is refused.
+
+    Loopback hosts (localhost, 127.0.0.1) pass by the loopback rule. When accessed via a LAN
+    or external host name (e.g. ucx ui --host 0.0.0.0), Origin == Host is what protects same-origin
+    pages while cross-origin pages are refused.
+
+    Killed by: src/uclone_x/ui/app.py :: parsed.netloc == host
+    Becomes: False
+    """
+    app = create_ui_app(
+        static_dir=tmp_path,
+        storage_dir=tmp_path / "sessions",
+        workspace_dir=tmp_path / "workspace",
+        llm=MockLLMConnector(),
+        bind_host="0.0.0.0",
+    )
+    with TestClient(app) as test_client:
+        same_origin = test_client.get(
+            "/api/rooms",
+            headers={"Host": "192.168.1.50:5180", "Origin": "http://192.168.1.50:5180"},
+        )
+        assert same_origin.status_code == 200, same_origin.text
+
+        evil = test_client.get(
+            "/api/rooms",
+            headers={"Host": "192.168.1.50:5180", "Origin": "https://evil.example"},
+        )
+        assert evil.status_code == 403
+
+        other_host = test_client.get(
+            "/api/rooms",
+            headers={"Host": "192.168.1.50:5180", "Origin": "http://192.168.1.99:5180"},
+        )
+        assert other_host.status_code == 403

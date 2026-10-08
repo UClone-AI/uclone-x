@@ -128,7 +128,7 @@ class TestTheWriterCannotRewriteTheCodexInATurn:
     async def test_file_write_is_refused_and_file_read_still_answers(self, tmp_path: Path) -> None:
         """The reproduction from the review of #1581, through `execute_turn`.
 
-        Killed by: src/uclone_x/tools/base.py :: if in_story_library(resolved, workspace_root):
+        Killed by: src/uclone_x/tools/base.py :: if protected is not None:
         Becomes: if False:
         Killed by: src/uclone_x/tools/builtin/filesystem.py :: safe_path = self.resolve_write_path(params.path, workspace)
         Becomes: safe_path = self.resolve_safe_path(params.path, workspace)
@@ -198,8 +198,8 @@ class TestTheLibraryIsKnownByWhatThePathIs:
     ) -> None:
         """Before any story exists there is no folder to compare with, so the name decides.
 
-        Killed by: src/uclone_x/tools/base.py :: if parts and parts[0].casefold() == STORIES_DIRNAME:
-        Becomes: if parts and parts[0] == STORIES_DIRNAME:
+        Killed by: src/uclone_x/tools/base.py :: if parts and parts[0].casefold() == dirname:
+        Becomes: if parts and parts[0] == dirname:
         """
         path = f"{spelling}/salt-road-0000/story.yaml"
         assert await _write(tmp_path, path) == (False, _refusal(path))
@@ -244,8 +244,8 @@ class TestOnlyTheLibraryIsRefused:
         "path", ["notes/stories/idea.md", "stories-notes/idea.md", "storiesque.md"]
     )
     async def test_other_paths_are_written_as_before(self, tmp_path: Path, path: str) -> None:
-        """Killed by: src/uclone_x/tools/base.py :: if parts and parts[0].casefold() == STORIES_DIRNAME:
-        Becomes: if any(part.casefold() == STORIES_DIRNAME for part in parts) or parts[0].startswith(STORIES_DIRNAME):
+        """Killed by: src/uclone_x/tools/base.py :: if parts and parts[0].casefold() == dirname:
+        Becomes: if any(part.casefold() == dirname for part in parts) or parts[0].startswith(dirname):
         """
         await _story(tmp_path)
         assert await _write(tmp_path, path) == (True, None)
@@ -269,7 +269,7 @@ class TestEveryGeneralWriterRefuses:
     async def test_generate_image(self, tmp_path: Path) -> None:
         """Refused before any image is made.
 
-        Killed by: src/uclone_x/tools/base.py :: if in_story_library(resolved, workspace_root):
+        Killed by: src/uclone_x/tools/base.py :: if protected is not None:
         Becomes: if False:
         """
         story_id = await _story(tmp_path)
@@ -943,3 +943,22 @@ class TestCharacterSheetFolderShapes:
             "'characters' leads to a file, not a folder, so the character sheet was not saved.",
         )
         assert (tmp_path / "cast.txt").read_text(encoding="utf-8") == "not a folder"
+
+
+class TestComfyImageGenToolArtifactPath:
+    async def test_comfy_image_returns_relative_workspace_path(self, tmp_path: Path) -> None:
+        """The tool result returns a workspace-relative path, not an absolute path.
+
+        Killed by: src/uclone_x/tools/builtin/comfy_image_tool.py :: "path": rel_path,
+        Becomes: "path": str(dest_path),
+        """
+        client = AsyncMock(spec=ComfyClient)
+        client.queue_prompt.return_value = "prompt_1"
+        client.wait_for_output.return_value = ["pic_00001.png"]
+        client.download_image.return_value = b"png bytes"
+        result = await ComfyImageGenTool(client=client).execute(
+            {"prompt": "Lord Vane", "output_path": "pic.png"}, _ctx(tmp_path)
+        )
+        assert result.success, result.error
+        assert isinstance(result.output, dict)
+        assert result.output["path"] == "pic.png"

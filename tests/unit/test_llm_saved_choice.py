@@ -33,6 +33,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from typer.testing import CliRunner
 
+from tests.support.clones import make_clones
 from uclone_x.agent.clone_builder import AppScope
 from uclone_x.cli import main
 from uclone_x.cli.commands import room as room_cmd
@@ -45,17 +46,28 @@ from uclone_x.errors import (
 )
 from uclone_x.llm.connectors import saved_choice as saved_choice_module
 from uclone_x.llm.connectors.factory import create_llm_connector, saved_choice_in_effect
-from uclone_x.llm.connectors.mock import MockLLMConnector
 from uclone_x.llm.connectors.ollama import OLLAMA_ENDPOINT_ENV_VARS, OllamaConnector
 from uclone_x.llm.connectors.saved_choice import (
     lock_file,
     read_saved_choice,
     remember_choice_if_unset,
+    save_api_key,
     settings_file,
     update_settings_file,
 )
 from uclone_x.llm.connectors.vllm import VLLM_ENDPOINT_ENV_VARS
 from uclone_x.llm.models import FinishReason, LLMRequest, ModelResponse, TokenUsage
+
+# The agent ids these tests run as. Each is a clone now, since a name no clone carries is
+# refused rather than given a home (clone-data-scopes §3.4); persona-less, so each speaks as
+# the prompt the test gives it.
+_SAVED_CLONES = ("saved", "assistant")
+
+
+@pytest.fixture(autouse=True)
+def _saved_clones() -> None:  # pyright: ignore[reportUnusedFunction]
+    make_clones(*_SAVED_CLONES)
+
 
 runner = CliRunner()
 
@@ -91,6 +103,31 @@ def _save(**values: Any) -> Path:
     return target
 
 
+def _row(kind: str, *, base_url: str | None = None, key: str | None = None) -> dict[str, str]:
+    """A connection row whose id is its kind, as setup and `ucx llm use` save one."""
+    row = {"id": kind, "kind": kind}
+    if base_url is not None:
+        row["base_url"] = base_url
+    if key is not None:
+        row["key"] = key
+    return row
+
+
+def _save_choice(
+    kind: str,
+    model: str | None = None,
+    *,
+    base_url: str | None = None,
+    key: str | None = None,
+    **values: Any,
+) -> Path:
+    """One connection of ``kind`` and, given ``model``, the default deep model on it."""
+    data: dict[str, Any] = {"connections": [_row(kind, base_url=base_url, key=key)], **values}
+    if model is not None:
+        data["default_models"] = {"deep": f"{kind}/{model}"}
+    return _save(**data)
+
+
 def _flat(text: str) -> str:
     """Rich wraps at the terminal width; compare on single spaces."""
     return " ".join(text.split())
@@ -115,7 +152,7 @@ def test_the_factory_builds_the_saved_choice_when_nothing_else_names_one() -> No
 
     Mutated, the factory skips the saved choice and refuses as before the fix.
     """
-    _save(llm_provider="ollama", llm_model="qwen3:1.7b", llm_base_url="http://127.0.0.1:11999")
+    _save_choice("ollama", "qwen3:1.7b", base_url="http://127.0.0.1:11999")
 
     llm = create_llm_connector(fallback_to_mock=False)
 
@@ -133,7 +170,7 @@ def test_a_credential_in_the_environment_outranks_the_saved_choice(
 
     Mutated, an exported OPENAI_API_KEY loses to a model saved months ago.
     """
-    _save(llm_provider="ollama", llm_model="qwen3:1.7b")
+    _save_choice("ollama", "qwen3:1.7b")
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test-saved-choice")
 
     assert saved_choice_in_effect() is None
@@ -155,23 +192,44 @@ def test_anything_the_caller_names_outranks_the_saved_choice(
     provider: str | None,
     base_url: str | None,
 ) -> None:
-    _save(llm_provider="ollama", llm_model="qwen3:1.7b")
+    _save_choice("ollama", "qwen3:1.7b")
     for name, value in env.items():
         monkeypatch.setenv(name, value)
 
     assert saved_choice_in_effect(provider, base_url) is None
 
 
-def test_a_saved_provider_this_version_does_not_know_is_refused_naming_the_file() -> None:
-    """Ignoring it would report "nothing configured" to someone who configured something."""
-    target = _save(llm_provider="some-future-provider", llm_model="x")
+def test_a_saved_connection_this_version_does_not_know_is_refused_naming_the_file() -> None:
+    """Ignoring it silently would leave the person no way to find what they configured.
+
+    It used to be dropped on read, so the refusal said no default model was saved -- the
+    wrong cause, pointing away from the row. It is read now, as unsupported (P6).
+
+    Killed by: src/uclone_x/llm/connections.py :: written_kind = _text(row.get("kind"))
+    Becomes: written_kind = None
+    """
+    target = _save(
+        connections=[{"id": "future", "kind": "some-future-provider"}],
+        default_models={"deep": "future/x"},
+    )
 
     with pytest.raises(LLMProviderError) as caught:
         create_llm_connector(fallback_to_mock=False)
 
-    message = str(caught.value)
-    assert str(target) in message
-    assert "some-future-provider" in message
+    assert not isinstance(caught.value, LLMProviderNotConfiguredError)
+    message = _flat(str(caught.value))
+    assert f"The model choice saved in {target}" in message
+    assert "does not support: some-future-provider" in message
+    assert not any(word in message for word in INTERNALS)
+
+
+def test_a_file_with_only_the_old_model_keys_has_no_model_saved() -> None:
+    """The pre-gateway keys are never read: no migration, by ruling."""
+    _save(llm_provider="ollama", llm_model="qwen3:1.7b", llm_api_keys={"openai": "sk-test"})
+
+    assert read_saved_choice() is None
+    with pytest.raises(LLMProviderNotConfiguredError):
+        create_llm_connector(fallback_to_mock=False)
 
 
 def test_the_refusal_says_no_model_has_been_saved_yet() -> None:
@@ -223,18 +281,21 @@ def test_setup_saves_its_model_when_none_is_saved() -> None:
 def test_setup_keeps_a_model_the_person_already_chose() -> None:
     """A later `ucx install` must not replace what someone picked in Settings.
 
-    Killed by: src/uclone_x/llm/connectors/saved_choice.py :: if before is not None and before.provider != provider.lower():
-    Becomes: if False:
-    """
-    _save(llm_provider="openai", llm_model="gpt-4o-mini")
+    Setup adds its own connection beside the person's, but the default stays theirs.
 
-    written, existing = remember_choice_if_unset(
+    Killed by: src/uclone_x/llm/connectors/saved_choice.py :: if model is not None and saved_default_models(current).deep is None:
+    Becomes: if model is not None:
+    """
+    _save_choice("openai", "gpt-4o-mini", key="sk-test")
+
+    _written, existing = remember_choice_if_unset(
         provider="ollama", model="qwen3:8b", base_url="http://localhost:11434"
     )
 
-    assert written is False
     assert existing is not None and existing.model == "gpt-4o-mini"
-    assert json.loads(settings_file().read_text())["llm_provider"] == "openai"
+    data = json.loads(settings_file().read_text())
+    assert data["default_models"] == {"deep": "openai/gpt-4o-mini"}
+    assert data["connections"][0] == _row("openai", key="sk-test")
 
 
 def test_saving_keeps_every_other_setting_in_the_file() -> None:
@@ -243,14 +304,14 @@ def test_saving_keeps_every_other_setting_in_the_file() -> None:
     Killed by: src/uclone_x/llm/connectors/saved_choice.py :: data.update(updates)
     Becomes: data = dict(updates)
     """
-    _save(llm_provider=None, read_roots=["/srv/notes"], comfyui_base_url="http://127.0.0.1:8188")
+    _save(read_roots=["/srv/notes"], comfyui_base_url="http://127.0.0.1:8188")
 
     remember_choice_if_unset(provider="ollama", model="qwen3:8b", base_url=None)
 
     data = json.loads(settings_file().read_text())
     assert data["read_roots"] == ["/srv/notes"]
     assert data["comfyui_base_url"] == "http://127.0.0.1:8188"
-    assert data["llm_model"] == "qwen3:8b"
+    assert data["default_models"] == {"deep": "ollama/qwen3:8b"}
 
 
 def test_an_unreadable_settings_file_is_left_as_it_is() -> None:
@@ -299,7 +360,7 @@ def test_ucx_run_asks_for_the_saved_model_and_says_where_it_came_from(
     Killed by: src/uclone_x/cli/commands/run.py :: chosen = model or saved.model
     Becomes: chosen = model
     """
-    target = _save(llm_provider="ollama", llm_model="qwen3:1.7b")
+    target = _save_choice("ollama", "qwen3:1.7b")
     llm = _answering_llm()
     monkeypatch.setattr(run, "create_llm_connector", _returning(llm))
 
@@ -315,7 +376,7 @@ def test_ucx_run_asks_for_the_saved_model_and_says_where_it_came_from(
 def test_an_explicit_model_flag_outranks_the_saved_model(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    _save(llm_provider="ollama", llm_model="qwen3:1.7b")
+    _save_choice("ollama", "qwen3:1.7b")
     llm = _answering_llm()
     monkeypatch.setattr(run, "create_llm_connector", _returning(llm))
 
@@ -331,7 +392,7 @@ def test_no_notice_when_the_saved_choice_is_not_what_answers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The notice would be false when `--provider` chose the connector instead."""
-    _save(llm_provider="ollama", llm_model="qwen3:1.7b")
+    _save_choice("ollama", "qwen3:1.7b")
 
     assert run.apply_saved_model("mock", None) == (None, None)
 
@@ -344,7 +405,7 @@ def test_a_room_asks_for_the_saved_model_and_says_so(
     Killed by: src/uclone_x/cli/commands/room.py :: model, saved_notice = apply_saved_model(provider, model)
     Becomes: saved_notice = None
     """
-    target = _save(llm_provider="ollama", llm_model="qwen3:1.7b")
+    target = _save_choice("ollama", "qwen3:1.7b")
     monkeypatch.setattr(run, "get_default_llm", _returning(MagicMock()))
     captured: dict[str, Any] = {}
 
@@ -389,7 +450,7 @@ def test_a_caller_that_names_no_model_is_sent_to_the_saved_model(
     """
     for var in ("OLLAMA_MODEL", "OLLAMA_INDEPTH_MODEL", "OLLAMA_FAST_MODEL"):
         monkeypatch.delenv(var, raising=False)
-    _save(llm_provider="ollama", llm_model="qwen3:1.7b")
+    _save_choice("ollama", "qwen3:1.7b")
     sent: list[str | None] = []
 
     async def record(self: OllamaConnector, request: LLMRequest) -> ModelResponse:
@@ -412,7 +473,7 @@ def test_a_model_the_caller_names_still_wins_over_the_saved_one(
     """Killed by: src/uclone_x/llm/connectors/ollama.py :: return resolve_model(requested, resolve_ollama_model(self._model), "Ollama")
     Becomes: return resolve_model(None, resolve_ollama_model(self._model), "Ollama")
     """
-    _save(llm_provider="ollama", llm_model="qwen3:1.7b")
+    _save_choice("ollama", "qwen3:1.7b")
     sent: list[str | None] = []
 
     async def record(self: OllamaConnector, request: LLMRequest) -> ModelResponse:
@@ -431,10 +492,10 @@ def test_the_saved_model_is_not_given_to_another_providers_connector(
 ) -> None:
     """A saved Ollama model means nothing to OpenAI; the OpenAI connector gets no model.
 
-    Killed by: src/uclone_x/llm/connectors/factory.py :: if data is None or not same_provider(_saved_text(data, "llm_provider"), provider):
-    Becomes: if data is None:
+    Killed by: src/uclone_x/llm/connectors/factory.py :: if conn is None or not same_provider(conn.kind, provider):
+    Becomes: if conn is None:
     """
-    _save(llm_provider="ollama", llm_model="qwen3:1.7b")
+    _save_choice("ollama", "qwen3:1.7b")
     monkeypatch.setenv("OPENAI_API_KEY", "sk-env-key-0001")
     monkeypatch.delenv("OPENAI_MODEL", raising=False)
 
@@ -457,7 +518,7 @@ def test_acp_says_which_saved_model_it_uses_on_stderr_only(
     """
     from uclone_x.cli.commands import acp
 
-    target = _save(llm_provider="ollama", llm_model="qwen3:1.7b")
+    target = _save_choice("ollama", "qwen3:1.7b")
 
     def stop(agent_id: str) -> Any:
         raise _MemoryOpened()
@@ -483,7 +544,7 @@ def test_ucx_run_names_the_saved_choice_before_that_provider_fails(
     Killed by: src/uclone_x/cli/commands/run.py :: notices.print(f"[dim]{escape(saved_notice)}[/dim]")
     Becomes: pass
     """
-    target = _save(llm_provider="openai", llm_model="gpt-4o-mini")
+    target = _save_choice("openai", "gpt-4o-mini")
 
     result = runner.invoke(main.app, ["run", "saved", "--prompt", "hi", "--cwd", str(tmp_path)])
 
@@ -494,39 +555,35 @@ def test_ucx_run_names_the_saved_choice_before_that_provider_fails(
 # --- setup fills in only what is missing ----------------------------------------------
 
 
-def test_setup_fills_in_a_missing_address_but_keeps_the_saved_model() -> None:
-    """Killed by: src/uclone_x/llm/connectors/saved_choice.py :: if model is not None and _clean(current.get("llm_model")) is None:
-    Becomes: if model is not None:
+def test_setup_writes_nothing_over_a_saved_connection_and_model() -> None:
+    """A re-install finds its connection and a default saved, and leaves both as they are.
+
+    Killed by: src/uclone_x/llm/connectors/saved_choice.py :: if not any(row.id == kind for row in rows):
+    Becomes: if True:
     """
-    _save(llm_provider="ollama", llm_model="qwen3:8b")
+    target = _save_choice("ollama", "qwen3:8b", base_url="http://gpu-box:11434")
+    before = target.read_text(encoding="utf-8")
 
     written, _before = remember_choice_if_unset(
         provider="ollama", model="qwen3:1.7b", base_url="http://localhost:11434"
     )
 
-    saved = read_saved_choice()
-    assert written is True
-    assert saved is not None
-    assert (saved.model, saved.base_url) == ("qwen3:8b", "http://localhost:11434")
+    assert written is False
+    assert target.read_text(encoding="utf-8") == before
 
 
-def test_setup_keeps_an_address_saved_without_a_provider() -> None:
-    """Killed by: src/uclone_x/llm/connectors/saved_choice.py :: if base_url is not None and _clean(current.get("llm_base_url")) is None:
-    Becomes: if base_url is not None:
-    """
-    _save(llm_provider=None, llm_base_url="http://gpu-box:11434")
+def test_setup_keeps_the_address_of_a_connection_saved_without_a_model() -> None:
+    """A connection added in Settings keeps its address; setup only names the default."""
+    _save(connections=[_row("ollama", base_url="http://gpu-box:11434")])
 
-    remember_choice_if_unset(
+    written, _before = remember_choice_if_unset(
         provider="ollama", model="qwen3:1.7b", base_url="http://localhost:11434"
     )
 
-    saved = read_saved_choice()
-    assert saved is not None
-    assert (saved.provider, saved.model, saved.base_url) == (
-        "ollama",
-        "qwen3:1.7b",
-        "http://gpu-box:11434",
-    )
+    assert written is True
+    data = json.loads(settings_file().read_text())
+    assert data["connections"] == [_row("ollama", base_url="http://gpu-box:11434")]
+    assert data["default_models"] == {"deep": "ollama/qwen3:1.7b"}
 
 
 # --- a dashboard that was already running --------------------------------------------
@@ -538,46 +595,38 @@ def _dashboard(tmp_path: Path) -> Any:
     return AgentSessionManager(storage_dir=tmp_path / "store", fallback_to_mock=True)
 
 
-def test_a_dashboard_started_before_setup_keeps_what_setup_saved(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_a_dashboard_started_before_setup_keeps_what_setup_saved(tmp_path: Path) -> None:
     """Reproduced: dashboard open, `ucx install`, then any Settings save put back `null`.
 
-    Killed by: src/uclone_x/ui/app.py :: changes, path=self._settings_file, replace_unreadable_with=everything
-    Becomes: everything, path=self._settings_file, replace_unreadable_with=everything
+    The dashboard now holds no model state at all (the gateway reads the file), so no save
+    of its own fields can write a model over the one setup saved; this pins that it stays so.
     """
     dashboard = _dashboard(tmp_path)
     target = dashboard._settings_file
     remember_choice_if_unset(
         provider="ollama", model="qwen3:1.7b", base_url="http://localhost:11434", path=target
     )
-    # The dashboard has a provider of its own from the environment, so it adopts nothing
-    # and what it holds for the LLM keys is still empty.
-    monkeypatch.setenv("LLM_PROVIDER", "mock")
-    dashboard.update_settings(comfyui_base_url="http://127.0.0.1:8188")
+
+    dashboard.update_settings(ui_language="ko")
 
     saved = read_saved_choice(target)
     assert saved is not None
     assert (saved.provider, saved.model) == ("ollama", "qwen3:1.7b")
-    assert json.loads(target.read_text())["comfyui_base_url"] == "http://127.0.0.1:8188"
+    assert json.loads(target.read_text())["ui_language"] == "ko"
 
 
 def test_a_dashboard_started_before_setup_uses_what_setup_saved(tmp_path: Path) -> None:
-    """Killed by: src/uclone_x/ui/app.py :: self._configured_provider = canonical_provider(saved.provider) or saved.provider
-    Becomes: pass
-    """
+    """The gateway reads the file on every call, so nothing has to be adopted."""
     dashboard = _dashboard(tmp_path)
     target = dashboard._settings_file
     remember_choice_if_unset(
         provider="ollama", model="qwen3:1.7b", base_url="http://localhost:11434", path=target
     )
 
-    dashboard.update_settings(comfyui_base_url="http://127.0.0.1:8188")
-
-    assert dashboard.configured_provider == "ollama"
-    assert dashboard.get_settings()["llm_model"] == "qwen3:1.7b"
-    saved = read_saved_choice(target)
-    assert saved is not None and (saved.provider, saved.model) == ("ollama", "qwen3:1.7b")
+    assert dashboard.get_settings()["default_models"]["deep"] == "ollama/qwen3:1.7b"
+    llm, model = dashboard.gateway.default_deep()
+    assert isinstance(llm, OllamaConnector)
+    assert model == "qwen3:1.7b"
 
 
 def test_the_settings_file_is_replaced_whole_never_written_in_place(tmp_path: Path) -> None:
@@ -587,9 +636,9 @@ def test_the_settings_file_is_replaced_whole_never_written_in_place(tmp_path: Pa
     Becomes: target.write_text(Path(temp).read_text())
     """
     target = tmp_path / "settings.json"
-    update_settings_file({"llm_provider": "ollama"}, path=target)
+    update_settings_file({"read_roots": ["/srv"]}, path=target)
 
-    assert json.loads(target.read_text()) == {"llm_provider": "ollama"}
+    assert json.loads(target.read_text()) == {"read_roots": ["/srv"]}
     # No temporary file is left behind; the lock's sidecar is the only other file.
     assert sorted(p.name for p in tmp_path.iterdir()) == [".settings.json.lock", "settings.json"]
 
@@ -601,9 +650,7 @@ def test_ucx_llm_use_makes_a_model_the_default() -> None:
     """Killed by: src/uclone_x/cli/commands/llm.py :: save_choice(provider=chosen, model=model, base_url=address)
     Becomes: pass
     """
-    _save(
-        llm_provider="openai", llm_model="gpt-4o-mini", llm_api_key="sk-test", read_roots=["/srv"]
-    )
+    _save_choice("openai", "gpt-4o-mini", key="sk-test", read_roots=["/srv"])
 
     result = runner.invoke(main.app, ["llm", "use", "qwen3:1.7b"])
 
@@ -613,10 +660,9 @@ def test_ucx_llm_use_makes_a_model_the_default() -> None:
     assert (saved.provider, saved.model, saved.api_key) == ("ollama", "qwen3:1.7b", None)
     data = json.loads(settings_file().read_text())
     assert data["read_roots"] == ["/srv"]
-    # Not deleted: kept for OpenAI, the provider it was saved for, and not sent to Ollama.
-    # The write moved the legacy single key into the per-provider store.
-    assert data["llm_api_keys"] == {"openai": "sk-test"}
-    assert "llm_api_key" not in data and "llm_api_key_provider" not in data
+    assert data["default_models"] == {"deep": "ollama/qwen3:1.7b"}
+    # Not deleted: kept on the OpenAI connection, and not sent to Ollama.
+    assert data["connections"][0] == _row("openai", key="sk-test")
     shown = _flat(result.output)
     assert (
         "qwen3:1.7b (ollama) is now the default model for `ucx run`, rooms and the dashboard."
@@ -629,7 +675,7 @@ def test_ucx_llm_use_keeps_the_saved_address_for_the_same_provider() -> None:
     """Killed by: src/uclone_x/cli/commands/llm.py :: address = before.base_url
     Becomes: pass
     """
-    _save(llm_provider="ollama", llm_model="qwen3:8b", llm_base_url="http://gpu-box:11434")
+    _save_choice("ollama", "qwen3:8b", base_url="http://gpu-box:11434")
 
     result = runner.invoke(main.app, ["llm", "use", "qwen3:1.7b"])
 
@@ -639,16 +685,8 @@ def test_ucx_llm_use_keeps_the_saved_address_for_the_same_provider() -> None:
 
 
 def test_switching_away_and_back_finds_the_saved_key_again() -> None:
-    """`ucx llm use` to Ollama and back to OpenAI used to delete the OpenAI key on the way.
-
-    Killed by: src/uclone_x/llm/connectors/saved_choice.py :: _fold_legacy_key(data, replace=False)
-    Becomes: pass
-
-    Mutated, the untagged key follows the saved provider to Ollama on the first switch,
-    since nothing recorded that it was OpenAI's.
-    """
-    # Saved before keys were tagged: it belongs to the provider saved with it.
-    _save(llm_provider="openai", llm_model="gpt-4o-mini", llm_api_key="sk-test")
+    """`ucx llm use` to Ollama and back to OpenAI used to delete the OpenAI key on the way."""
+    _save_choice("openai", "gpt-4o-mini", key="sk-test")
 
     runner.invoke(main.app, ["llm", "use", "qwen3:1.7b"])
     between = read_saved_choice()
@@ -663,18 +701,16 @@ def test_switching_away_and_back_finds_the_saved_key_again() -> None:
     assert getattr(llm, "api_key", None) == "sk-test"
 
 
-def test_one_services_key_is_never_sent_to_another() -> None:
-    """An OpenAI key kept in the file while Anthropic is saved is not given to Anthropic.
-
-    Killed by: src/uclone_x/llm/connectors/saved_choice.py :: return api_keys(data).get(_provider_id(provider))
-    Becomes: return next(iter(api_keys(data).values()), None)
-    """
+def _anthropic_default_beside_an_openai_key() -> None:
     _save(
-        llm_provider="anthropic",
-        llm_model="claude-sonnet",
-        llm_api_key="sk-test",
-        llm_api_key_provider="openai",
+        connections=[_row("openai", key="sk-test"), _row("anthropic")],
+        default_models={"deep": "anthropic/claude-sonnet"},
     )
+
+
+def test_one_services_key_is_never_sent_to_another() -> None:
+    """An OpenAI key saved beside an Anthropic default is not given to Anthropic."""
+    _anthropic_default_beside_an_openai_key()
 
     saved = read_saved_choice()
     assert saved is not None and saved.provider == "anthropic"
@@ -684,74 +720,47 @@ def test_one_services_key_is_never_sent_to_another() -> None:
         create_llm_connector()
 
 
-def test_a_key_saved_for_gemini_is_used_under_its_other_name_google() -> None:
-    """Killed by: src/uclone_x/llm/connectors/saved_choice.py :: return canonical_provider(provider) or provider.strip().lower()
-    Becomes: return provider.strip().lower()
+def test_a_key_saved_under_google_goes_to_the_gemini_connection() -> None:
+    """Killed by: src/uclone_x/llm/connectors/saved_choice.py :: kind = _known_provider(clean)
+    Becomes: kind = clean.lower()
     """
-    _save(llm_provider="google", llm_api_key="g-test", llm_api_key_provider="gemini")
+    _save_choice("gemini", "gemini-x")
+
+    save_api_key("google", "g-test")
 
     saved = read_saved_choice()
     assert saved is not None and saved.api_key == "g-test"
+    assert json.loads(settings_file().read_text())["connections"] == [_row("gemini", key="g-test")]
 
 
-def test_a_dashboard_does_not_send_another_services_key(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Killed by: src/uclone_x/ui/app.py :: saved = api_key_for(settings_data(self._settings_file), canonical)
-    Becomes: saved = api_key_for(settings_data(self._settings_file), "openai")
-    """
-    for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_MODEL", "LLM_PROVIDER"):
-        # Recorded as absent, so what the dashboard exports is removed afterwards.
-        monkeypatch.setenv(name, "")
-        monkeypatch.delenv(name)
+async def test_a_dashboard_does_not_send_another_services_key(tmp_path: Path) -> None:
     store = tmp_path / "store"
     store.mkdir()
     (store / "settings.json").write_text(
         json.dumps(
             {
-                "llm_provider": "anthropic",
-                "llm_api_key": "sk-test",
-                "llm_api_key_provider": "openai",
+                "connections": [_row("openai", key="sk-test"), _row("anthropic")],
+                "default_models": {"deep": "anthropic/claude-sonnet"},
             }
         ),
         encoding="utf-8",
     )
 
     dashboard = _dashboard(tmp_path)
+    llm, _model = dashboard.gateway.default_deep()
 
-    assert dashboard.configured_api_key is None
-    assert os.environ.get("ANTHROPIC_API_KEY") is None
-    assert dashboard.get_settings()["llm_api_key_set"] is False
+    assert llm is not None
+    assert getattr(llm, "api_key", None) != "sk-test"
+    with pytest.raises(LLMCredentialsNotConfiguredError):
+        await llm.generate(LLMRequest())
 
 
-def test_a_dashboard_records_which_provider_a_new_key_is_for(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_a_dashboard_hands_a_choice_saved_after_it_started_to_the_next_call(
+    tmp_path: Path,
 ) -> None:
-    """Killed by: src/uclone_x/ui/app.py :: self._save_key(*new_key, held=held)
-    Becomes: pass
-    """
-    for name in ("OPENAI_API_KEY", "LLM_PROVIDER"):
-        monkeypatch.setenv(name, "")
-        monkeypatch.delenv(name)
+    """A choice saved after the dashboard started reaches the next room turn, unadopted."""
     dashboard = _dashboard(tmp_path)
-
-    dashboard.update_settings(llm_provider="openai", llm_api_key="sk-test", llm_model="gpt-4o")
-    dashboard.update_settings(llm_provider="ollama", llm_model="qwen3:1.7b")
-
-    data = json.loads(dashboard._settings_file.read_text())
-    assert data["llm_api_keys"] == {"openai": "sk-test"}
-    assert dashboard.configured_api_key is None
-
-
-def test_a_dashboard_hands_an_adopted_choice_to_open_rooms(tmp_path: Path) -> None:
-    """A choice saved after the dashboard started reaches rooms the way a Settings save does.
-
-    Killed by: src/uclone_x/ui/app.py :: self._install_llm(adopted)
-    Becomes: self._llm = adopted
-    """
-    dashboard = _dashboard(tmp_path)
-    received: list[Any] = []
-    dashboard.on_llm_replaced(received.append)
+    assert dashboard.gateway.default_deep() == (None, None)
     remember_choice_if_unset(
         provider="ollama",
         model="qwen3:1.7b",
@@ -759,42 +768,29 @@ def test_a_dashboard_hands_an_adopted_choice_to_open_rooms(tmp_path: Path) -> No
         path=dashboard._settings_file,
     )
 
-    dashboard.get_settings()
+    llm, model = dashboard.gateway.default_deep()
 
-    assert len(received) == 1
-    assert isinstance(received[0], OllamaConnector)
-    assert received[0] is dashboard.default_llm
+    assert isinstance(llm, OllamaConnector)
+    assert model == "qwen3:1.7b"
 
 
-async def test_a_dashboard_with_its_own_storage_ignores_the_session_roots_choice(
+def test_a_dashboard_with_its_own_storage_ignores_the_session_roots_choice(
     tmp_path: Path,
 ) -> None:
     """A dashboard whose storage saved no model does not borrow the session root's.
 
-    Killed by: src/uclone_x/ui/app.py :: usage_gate=self._usage_gate, saved_choice_file=self._settings_file, **kwargs
-    Becomes: usage_gate=self._usage_gate, **kwargs
-    Killed by: src/uclone_x/llm/connectors/factory.py :: saved_choice_in_effect(provider, base_url, path=saved_choice_file)
-    Becomes: saved_choice_in_effect(provider, base_url)
-    Killed by: src/uclone_x/llm/connectors/factory.py :: f"{saved_choice_note(saved_choice_file)} "
-    Becomes: f"{saved_choice_note()} "
+    Killed by: src/uclone_x/llm/gateway.py :: return self._settings_path if self._settings_path is not None else settings_file()
+    Becomes: return settings_file()
 
-    Mutated, the factory reads `<session root>/settings.json` and the agent gets the Ollama
-    model saved there, which this dashboard's Settings never showed. (Read off `build_llm`
-    since the chat helper that called it was retired, #1893.)
+    Mutated, the gateway reads `<session root>/settings.json` and the clones get the Ollama
+    model saved there, which this dashboard's Settings never showed.
     """
-    _save(llm_provider="ollama", llm_model="qwen3:1.7b", llm_base_url="http://127.0.0.1:11999")
+    _save_choice("ollama", "qwen3:1.7b", base_url="http://127.0.0.1:11999")
     dashboard = _dashboard(tmp_path)
     assert dashboard.settings_file != settings_file()
 
-    dashboard.get_settings()  # adopts a choice saved in this dashboard's own storage
-
-    assert dashboard.default_llm is None
-    assert isinstance(dashboard.build_llm(provider=None, fallback_to_mock=True), MockLLMConnector)
-    # Without the mock default it refuses, naming the file it read, not the session root's.
-    with pytest.raises(LLMProviderNotConfiguredError) as caught:
-        dashboard.build_llm(provider=None, fallback_to_mock=False)
-    assert str(dashboard.settings_file) in str(caught.value)
-    assert str(settings_file()) not in str(caught.value)
+    assert dashboard.gateway.default_deep() == (None, None)
+    assert dashboard.gateway.connections() == ()
 
 
 # --- the settings lock and the environment's model variables ---------------------------
@@ -813,7 +809,7 @@ def test_a_second_writer_waits_for_the_lock(tmp_path: Path) -> None:
     done = threading.Event()
 
     def write() -> None:
-        update_settings_file({"llm_provider": "ollama"}, path=target)
+        update_settings_file({"ui_language": "ko"}, path=target)
         done.set()
 
     with lock_file(target).open("a", encoding="utf-8") as held:
@@ -825,7 +821,7 @@ def test_a_second_writer_waits_for_the_lock(tmp_path: Path) -> None:
     assert done.wait(5)
     writer.join()
 
-    assert json.loads(target.read_text()) == {"read_roots": ["/srv"], "llm_provider": "ollama"}
+    assert json.loads(target.read_text()) == {"read_roots": ["/srv"], "ui_language": "ko"}
     # Only its owner can open it, as for the settings file beside it.
     assert lock_file(target).stat().st_mode & 0o777 == 0o600
 
@@ -843,11 +839,11 @@ def test_a_lock_file_that_cannot_be_opened_does_not_stop_the_save(tmp_path: Path
     lock.touch()
     lock.chmod(0)  # what another owner's 0600 file is to this user
     try:
-        update_settings_file({"llm_provider": "ollama"}, path=target)
+        update_settings_file({"ui_language": "ko"}, path=target)
     finally:
         lock.chmod(0o600)
 
-    assert json.loads(target.read_text()) == {"llm_provider": "ollama"}
+    assert json.loads(target.read_text()) == {"ui_language": "ko"}
 
 
 def test_writes_still_work_where_there_is_no_lock(
@@ -857,9 +853,9 @@ def test_writes_still_work_where_there_is_no_lock(
     monkeypatch.setattr(saved_choice_module, "fcntl", None)
     target = tmp_path / "settings.json"
 
-    update_settings_file({"llm_provider": "ollama"}, path=target)
+    update_settings_file({"ui_language": "ko"}, path=target)
 
-    assert json.loads(target.read_text()) == {"llm_provider": "ollama"}
+    assert json.loads(target.read_text()) == {"ui_language": "ko"}
 
 
 def test_ollama_model_outranks_the_saved_model(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -868,7 +864,7 @@ def test_ollama_model_outranks_the_saved_model(monkeypatch: pytest.MonkeyPatch) 
     Killed by: src/uclone_x/llm/connectors/factory.py :: return found[0]
     Becomes: pass
     """
-    _save(llm_provider="ollama", llm_model="qwen3:1.7b")
+    _save_choice("ollama", "qwen3:1.7b")
     monkeypatch.setenv("OLLAMA_MODEL", "llama3.2")
     sent: list[str | None] = []
 
@@ -893,7 +889,7 @@ def test_ucx_run_asks_for_the_model_variable_and_says_so(
     """Killed by: src/uclone_x/cli/commands/run.py :: variable = model_env_override(saved.provider)
     Becomes: variable = None
     """
-    target = _save(llm_provider="vllm", llm_model="qwen3-small", llm_base_url="http://gpu:8000")
+    target = _save_choice("vllm", "qwen3-small", base_url="http://gpu:8000")
     monkeypatch.setenv("VLLM_MODEL", "qwen3-large")
     # The saved address is what builds vLLM here, not a variable.
     monkeypatch.delenv("VLLM_BASE_URL", raising=False)

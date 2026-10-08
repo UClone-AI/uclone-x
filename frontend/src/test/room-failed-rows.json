@@ -40,6 +40,17 @@
       "error": null,
       "refusal": null,
       "persist_error": "NotADirectoryError: [Errno 20] Not a directory: '/home/reader/.uclone/sessions/context/sess_room__room_failed_rows__scout'"
+    },
+    "persona_edit": {
+      "seq": 6,
+      "sender_id": "scout",
+      "kind": "utterance",
+      "content": "",
+      "completed": true,
+      "error": "The changes saved to this clone could not be applied, so it did not answer. It kept its previous definition in this conversation; save the changes again to apply them.",
+      "refusal": null,
+      "persist_error": null,
+      "persona_edit_dropped": true
     }
   }
 }

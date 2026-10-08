@@ -29,7 +29,6 @@ from uclone_x.core.session_diagnostics import (
     inspect_session,
     list_session_summaries,
 )
-from uclone_x.core.tool_results import handle_in
 from uclone_x.llm.models import MessageRole
 
 console = Console()
@@ -192,6 +191,9 @@ def session_show(
                 content_preview = clean_content[:117] + "..."
             else:
                 content_preview = clean_content
+        elif msg.rendered_from is not None:
+            # A form is recorded, not written: its text is rendered when it is sent (#1848).
+            content_preview = f"[dim italic]({msg.form} of a stored result)[/dim italic]"
         elif msg.role == MessageRole.ASSISTANT and msg.tool_calls:
             content_preview = (
                 f"[italic dim]{len(msg.tool_calls)} tool call(s) requested[/italic dim]"
@@ -212,10 +214,9 @@ def session_show(
         elif msg.role == MessageRole.TOOL:
             cid = msg.tool_call_id or "missing"
             tool_detail = f"[dim]id=[/dim]{cid}"
-            if handle_in(msg.content) is not None:
+            stored = msg.rendered_from is not None
+            if stored:
                 tool_detail += " [cyan](stored)[/cyan]"
-            elif msg.content and "[Tool Output Offloaded" in msg.content:
-                tool_detail += " [cyan](offloaded)[/cyan]"
             elif msg.content and "[Tool Output Truncated" in msg.content:
                 tool_detail += " [yellow](truncated)[/yellow]"
 
@@ -303,13 +304,13 @@ def session_status(
     else:
         content_lines.append("[bold]Execution Plan:[/bold] [dim]None attached[/dim]")
 
-    # Tool artifacts section
+    # Full tool results kept in the session store (#1848)
     content_lines.append("")
     if details.artifacts_count > 0:
         size_kb = round(details.artifacts_total_bytes / 1024, 2)
         content_lines.extend(
             [
-                f"[bold]Tool Output Artifacts:[/bold] [cyan]{details.artifacts_count} files[/cyan] ({size_kb} KB)",
+                f"[bold]Stored Tool Results:[/bold] [cyan]{details.artifacts_count} kept[/cyan] ({size_kb} KB)",
             ]
         )
         for fname in details.artifact_files[:5]:
@@ -317,7 +318,7 @@ def session_status(
         if len(details.artifact_files) > 5:
             content_lines.append(f"  [dim]... and {len(details.artifact_files) - 5} more[/dim]")
     else:
-        content_lines.append("[bold]Tool Output Artifacts:[/bold] [dim]0 files[/dim]")
+        content_lines.append("[bold]Stored Tool Results:[/bold] [dim]none kept[/dim]")
 
     panel = Panel(
         "\n".join(content_lines),

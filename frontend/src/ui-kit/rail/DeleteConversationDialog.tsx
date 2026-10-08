@@ -14,6 +14,11 @@ interface DeleteConversationDialogProps {
   onConfirm: () => Promise<void>;
   onClose: () => void;
   copy: DeleteConversationCopy;
+  /**
+   * What a participant is called, asked by agent id: a seat is its clone's id, which is not a
+   * name anybody reads. Left off, the id is shown.
+   */
+  agentLabel?: (agentId: string) => string;
   /** Escape's registry, injected: the kit may not import the head's (#1036, #1158). */
   useEscape: UseKitEscape;
 }
@@ -31,17 +36,23 @@ export const DeleteConversationDialog: React.FC<DeleteConversationDialogProps> =
   onConfirm,
   onClose,
   copy,
+  agentLabel,
   useEscape,
 }) => {
   const [refusal, setRefusal] = useState<string | null>(null);
   const [deleting, setDeleting] = useState(false);
   const cancelRef = useRef<HTMLButtonElement>(null);
   const dialogRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLElement | null>(null);
   const titleId = useId();
   const bodyId = useId();
 
   useEffect(() => {
+    triggerRef.current = document.activeElement as HTMLElement | null;
     cancelRef.current?.focus();
+    return () => {
+      triggerRef.current?.focus();
+    };
   }, []);
 
   const confirm = async () => {
@@ -83,10 +94,9 @@ export const DeleteConversationDialog: React.FC<DeleteConversationDialogProps> =
 
   const heading =
     room === null ? copy.unreadableHeading : copy.heading(room.title || room.room_id);
-  const body =
-    room === null
-      ? copy.unreadableBody
-      : copy.body(room.message_count, room.agent_ids.length > 0 ? room.agent_ids.join(', ') : copy.noAgents);
+  const who = (room?.agent_ids ?? []).map((id) => agentLabel?.(id) ?? id).join(', ');
+  const count = room ? (room.utterance_count ?? room.message_count) : 0;
+  const body = room === null ? copy.unreadableBody : copy.body(count, who || copy.noAgents);
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70">

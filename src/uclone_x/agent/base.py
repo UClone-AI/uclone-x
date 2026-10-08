@@ -7,16 +7,16 @@ import logging
 import uuid
 from collections import deque
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, Literal, cast
 
 from uclone_x.agent.artist_skill_router import (
-    CASE_SKILL_PERSONAS,
     case_skill_section,
+    case_skill_texts,
     extract_request_facts,
     grounded_facts,
     is_follow_up,
+    latest_span_message,
     route_first_turn,
     route_follow_up,
 )
@@ -26,13 +26,13 @@ from uclone_x.agent.hooks import (
     HookRunner,
 )
 from uclone_x.agent.image_set_planner import (
-    IMAGE_SET_PERSONAS,
     detect_image_set,
+    fallback_image_set_note,
     image_set_note,
     plan_image_set,
 )
 from uclone_x.agent.models import (
-    BASE_MEMORY_TOOLS,
+    BASE_SELF_TOOLS,
     AgentConfig,
     AgentContext,
     AgentState,
@@ -56,6 +56,7 @@ from uclone_x.agent.request_record import (
     RequestLayers,
     assemble_request_messages,
 )
+from uclone_x.agent.self_scene import ShowSelfTool
 from uclone_x.agent.session import (
     CompactionResult,
     SessionState,
@@ -67,18 +68,22 @@ from uclone_x.agent.session_lifecycle import (
 )
 from uclone_x.agent.tool_execution import ExecutionScope, ToolCallExecutor
 from uclone_x.agent.tool_invoker import ToolInvoker, ToolScope
+from uclone_x.agent.tools_module import ToolsModuleName, select_tools_module
 from uclone_x.agent.turn_executor import StreamProgress, TurnExecutor, TurnScope, named_model
 from uclone_x.core.capability import Capability
 from uclone_x.core.host import HostProtocol
 from uclone_x.core.immutable import unwrap_immutable
+from uclone_x.core.models import effective_tool_scope
 from uclone_x.core.provenance import (
     require_provenance,
 )
 from uclone_x.core.session_store import SessionStoreProtocol
 from uclone_x.core.tool_results import (
     STEP_REPLY_RESERVE_TOKENS,
-    artifacts_dir_for,
-    ingest_tool_text,
+    TOOL_RESULT_CAP_BYTES,
+    ResultBodies,
+    StepRefusalCode,
+    ingest_tool_result,
 )
 from uclone_x.engine.event_bus import (
     AgentEvent,
@@ -95,6 +100,7 @@ from uclone_x.errors import (
 )
 from uclone_x.llm.context_window import (
     SERVED_WINDOW_PROVIDERS,
+    ListedContextWindows,
     OllamaContextWindows,
     compaction_window,
 )
@@ -104,6 +110,7 @@ from uclone_x.llm.models import (
     LLMRequest,
     MessageRole,
     ModelResponse,
+    RenderedFrom,
     TokenBudget,
     TokenUsage,
     ToolCallRequest,
@@ -111,6 +118,7 @@ from uclone_x.llm.models import (
 )
 from uclone_x.llm.protocols import (
     ContextCompactorProtocol,
+    EmbedderProtocol,
     LLMProviderProtocol,
     TokenBudgetManagerProtocol,
 )
@@ -122,6 +130,7 @@ from uclone_x.memory import (
     RecordMemoryFactTool,
     RetractMemoryFactTool,
 )
+from uclone_x.memory.models import SELF_SUBJECT
 from uclone_x.ontology.protocols import OntologyEngineProtocol
 from uclone_x.sandbox.models import (
     AVAILABLE_ISOLATION_LEVELS,
@@ -130,7 +139,7 @@ from uclone_x.sandbox.models import (
     WorkspaceIsolation,
     effective_isolation_level,
 )
-from uclone_x.skills.models import SkillStatus
+from uclone_x.skills.models import ROUTED_SKILL_TAG, SkillStatus, missing_required_tools
 from uclone_x.skills.protocols import SkillProtocol, SkillRegistryProtocol
 from uclone_x.telemetry.protocols import TracerProtocol
 from uclone_x.telemetry.tracer import TelemetryTracer
@@ -155,11 +164,6 @@ logger = logging.getLogger(__name__)
 
 # Upper bound on failures retained by `BaseAgent.processing_errors`.
 _MAX_RECORDED_ERRORS = 100
-
-
-def _now_iso() -> str:
-    """Current UTC instant as an ISO-8601 string."""
-    return datetime.now(UTC).isoformat()
 
 
 VALID_TRANSITIONS: Mapping[AgentState, frozenset[AgentState]] = {
@@ -217,6 +221,7 @@ AGENT_BOUND_TOOL_TYPES: Final = (
     RetractMemoryFactTool,
     QueryMemoryFactsTool,
     LoadSkillTool,
+    ShowSelfTool,
 )
 
 
@@ -378,6 +383,7 @@ class BaseAgent(BaseAgentProtocol):
         a2a_transport: A2ATransportProtocol | None = None,
         approvals_answered: bool = True,
         lifecycle_hooks: Sequence[TurnLifecycleHookProtocol] = (),
+        avatar_present: Callable[[], bool] | None = None,
     ) -> None:
         self._a2a_transport = a2a_transport
         # Domain behaviour added to every turn by whoever composed this agent (#1732).
@@ -444,7 +450,14 @@ class BaseAgent(BaseAgentProtocol):
             profile_provider: Callable[[], ModelProfile] | None = None
             if isinstance(image_source, ImageModelSource):
                 image_source.bind_skill_registry(self._skills)
-                profile_provider = image_source.active_profile
+                source = image_source
+
+                def clone_profile() -> ModelProfile:
+                    # This clone's own picture model decides the prompt family (§3.4).
+                    return source.active_profile(self._config.llm_config.image_model)
+
+                profile_provider = clone_profile
+
             skill_tool = LoadSkillTool(
                 self._skills,
                 on_load=self._record_loaded_skill,
@@ -481,6 +494,23 @@ class BaseAgent(BaseAgentProtocol):
                 agent_local_tools[memory_tool.name] = memory_tool
                 if self._tools.get(memory_tool.name) is None:
                     self._tools.register(memory_tool)
+            # `show_self` reads this clone's own self facts, so it is bound here like the
+            # memory tools (clone-self-and-scenes §4.2). It draws through the registered
+            # `generate_image`, the instance the engine settings are bound to; an agent
+            # with no image tool has no `show_self`. Not a base tool: a persona with an
+            # `allowed_tools` list has it only by naming it (§4.5).
+            image_tool = self._tools.get("generate_image")
+            if isinstance(image_tool, ImageModelSource):
+                memory = self._memory
+                show_self = ShowSelfTool(
+                    clone_id=config.agent_id,
+                    image_tool=image_tool,
+                    facts=lambda: memory.list_facts(subject=SELF_SUBJECT),
+                    avatar_present=avatar_present,
+                )
+                agent_local_tools[show_self.name] = show_self
+                if self._tools.get(show_self.name) is None:
+                    self._tools.register(show_self)
         self._store = store
         self._injected_compactor = compactor
         self._budget = budget
@@ -493,6 +523,10 @@ class BaseAgent(BaseAgentProtocol):
         self._turn_room_id: str | None = None
         self._turn_caller_turn_id: str | None = None
         self._turn_story_id: str | None = None
+        self._turn_person_names: tuple[str, ...] = ()
+        #: The running turn's conversation workspace (clone-data-scopes §3.6), or None for
+        #: the agent's own; read before it by `_resolve_workspace_root`.
+        self._turn_workspace_root: Path | None = None
         self._pending_durable_events: list[dict[str, Any]] = []
         self._semantic_router = semantic_router
         # The tool catalog (#1736): what this agent holds, advertises, binds and resolves.
@@ -510,6 +544,11 @@ class BaseAgent(BaseAgentProtocol):
             local_tools=agent_local_tools,
             agent_bound_types=AGENT_BOUND_TOOL_TYPES,
             binder=tool_binder,
+            # The one place a clone's tools module is chosen (#2188): its own setting,
+            # else its provider's default. Every head builds its clones through here.
+            tools_module=select_tools_module(
+                config.tools_module, str(getattr(llm, "provider_name", "") or "")
+            ),
         )
         # Lambdas, not bound methods: tests patch these on the instance, and the harness
         # ladder swaps `_tools` after construction; the assembler must see both.
@@ -524,10 +563,13 @@ class BaseAgent(BaseAgentProtocol):
                 current_plan=lambda: self.current_plan,
                 history=lambda: self._history,
                 active_session=lambda: self._active_session,
+                log_reader=lambda: self._session_lifecycle.log_reader(self._context.session_id),
                 turn_counter=lambda: self._turn_counter,
                 anchor_is_stale=lambda: self._anchor_is_stale(self._active_session),
                 system_prompt_base=lambda: self._system_prompt_base(),
                 effective_system_prompt=lambda: self.effective_system_prompt,
+                tools_module=lambda: self._tool_invoker.tools_module,
+                text_tools_section=lambda: self._tool_invoker.text_tools_section(),
             )
         )
         self._tool_call_executor = ToolCallExecutor(
@@ -587,8 +629,10 @@ class BaseAgent(BaseAgentProtocol):
                 set_turn_caller_turn_id=lambda value: setattr(self, "_turn_caller_turn_id", value),
                 turn_story_id=lambda: self._turn_story_id,
                 set_turn_story_id=lambda value: setattr(self, "_turn_story_id", value),
+                set_turn_workspace_root=lambda value: setattr(self, "_turn_workspace_root", value),
                 transition_to=lambda: self.transition_to,
                 live_session=lambda: self._live_session,
+                result_bodies=lambda: self._result_bodies,
                 active_skill_dirs=lambda: self.active_skill_dirs,
                 context_window=lambda: self._context_window,
                 reply_reserve=lambda: self._reply_reserve,
@@ -603,6 +647,7 @@ class BaseAgent(BaseAgentProtocol):
                 ingest_tool_message=lambda: self._ingest_tool_message,
                 execute_single_tool=lambda: self._execute_single_tool,
                 after_tool_step=lambda: self._after_tool_step,
+                lifecycle_hooks=lambda: self._lifecycle_hooks,
                 invoke_model=lambda: self._invoke_model,
                 fit_step_to_window=lambda: self._fit_step_to_window,
                 execute_tools=lambda: self._execute_tools,
@@ -632,7 +677,6 @@ class BaseAgent(BaseAgentProtocol):
                 tool_invoker=lambda: self._tool_invoker,
                 effective_system_prompt=lambda: self.effective_system_prompt,
                 resolved_persona=lambda: self._resolved_persona,
-                resolve_workspace_root=lambda: self._resolve_workspace_root,
                 effective_session_id=lambda: self._effective_session_id,
                 refuse_session_mutation_during_turn=lambda: (
                     self._refuse_session_mutation_during_turn
@@ -665,7 +709,7 @@ class BaseAgent(BaseAgentProtocol):
                     self._refuse_session_mutation_during_turn
                 ),
                 write_pending_bodies=lambda: self._write_pending_bodies,
-                resolve_workspace_root=lambda: self._resolve_workspace_root,
+                result_bodies=lambda: self._result_bodies,
                 context_window=lambda: self._context_window,
                 explicit_threshold=lambda: self._explicit_threshold,
                 observe_context_window=lambda: self._observe_context_window,
@@ -773,6 +817,8 @@ class BaseAgent(BaseAgentProtocol):
     @property
     def workspace_root(self) -> Path | None:
         """Workspace root directory for the agent, if defined."""
+        if self._turn_workspace_root is not None:
+            return self._turn_workspace_root.resolve()
         if self._context.workspace_root is not None:
             return self._context.workspace_root.resolve()
         if self._workspace_root_hint is not None:
@@ -964,10 +1010,8 @@ class BaseAgent(BaseAgentProtocol):
         Reads the agent and changes nothing, so a registration can be worked out in full
         before any of it is applied (`_persona_definition_commit`).
         """
-        resolved = self._operator_allowed_tools
         persona = self._persona_in(store, self._persona) if self._persona else None
-        if not resolved and persona is not None and persona.granted_tools:
-            resolved = persona.granted_tools
+        resolved = effective_tool_scope(self._operator_allowed_tools, persona)
         if resolved == self._config.allowed_tools:
             return self._config
         return self._config.model_copy(update={"allowed_tools": resolved})
@@ -1051,10 +1095,6 @@ class BaseAgent(BaseAgentProtocol):
         base = self._system_prompt_base()
         return adapt_system_prompt(base, self._config.llm_config.model_name)
 
-    async def step(self, input_data: str | AgentEvent) -> TurnResult:
-        """[Deprecated alias for execute_turn] Execute a single reasoning turn."""
-        return await self.execute_turn(input_data)
-
     async def run_turn(self, input_data: str | AgentEvent) -> TurnResult:
         """Execute a single reasoning turn (alias for execute_turn)."""
         return await self.execute_turn(input_data)
@@ -1063,6 +1103,12 @@ class BaseAgent(BaseAgentProtocol):
     def llm(self) -> LLMProviderProtocol | None:
         """Active LLM provider connector instance."""
         return self._llm
+
+    @property
+    def embedder(self) -> EmbedderProtocol | None:
+        """The host's embedder, the one its tool binder ranks with; `None` without a binder."""
+        binder = self._tool_invoker.binder
+        return binder.embedder if binder is not None else None
 
     async def invoke_auxiliary_model(self, request: LLMRequest) -> ModelResponse:
         """One model call outside a turn, on this clone's own connector and budget (#1404).
@@ -1124,9 +1170,37 @@ class BaseAgent(BaseAgentProtocol):
         if updates:
             self._config = self._config.model_copy(update=updates)
 
+    def rebind_llm(
+        self,
+        llm: LLMProviderProtocol | None,
+        *,
+        model_name: str | None,
+        fast_model: str | None,
+    ) -> None:
+        """Take exactly this connector and these model ids, ``None`` included (model-gateway §3.4).
+
+        Unlike `hot_reload_llm`, where ``None`` keeps a slot, ``None`` here clears it: a
+        default that was cleared leaves the seat with no model (its next turn refuses in
+        plain words), and a default that moved to another connection must not keep the old
+        connection's fast model id on the new connector.
+        """
+        self._llm = llm
+        self._config = self._config.model_copy(
+            update={
+                "llm_config": self._config.llm_config.model_copy(
+                    update={"model_name": model_name, "fast_model": fast_model}
+                )
+            }
+        )
+
     @property
     def ontology(self) -> OntologyEngineProtocol | None:
         return self._ontology
+
+    @property
+    def tools_module(self) -> ToolsModuleName:
+        """How this agent builds its tools layer, chosen when it was built (#2188)."""
+        return self._tool_invoker.tools_module
 
     @property
     def skills(self) -> SkillRegistryProtocol | None:
@@ -1146,13 +1220,23 @@ class BaseAgent(BaseAgentProtocol):
         """The package folders of this agent's active skills, for `ToolContext.skill_dirs`.
 
         Read from the registry each time, so a skill approved or reloaded between steps
-        counts from the next one. A skill with no folder on disk is left out.
+        counts from the next one. A skill with no folder on disk is left out, and so is one
+        the catalog hides from this agent because its tool scope lacks a tool the skill
+        requires (#1826, #1865), or because it is case-routed: a skill not offered to a
+        clone supplies it no data either.
         """
         if self._skills is None:
             return ()
+        scope = self._config.allowed_tools
         dirs: list[Path] = []
         for skill in self._skills.list_skills():
             if skill.manifest.status != SkillStatus.ACTIVE:
+                continue
+            if missing_required_tools(skill.manifest, scope):
+                continue
+            # A case-routed skill reaches the model only through the router's section
+            # (#1865); its folder would let a file tool read what `load_skill` refuses.
+            if ROUTED_SKILL_TAG in skill.manifest.tags:
                 continue
             directory: object = getattr(skill, "directory", None)
             if isinstance(directory, Path):
@@ -1330,19 +1414,11 @@ class BaseAgent(BaseAgentProtocol):
         return self._live_session(self._context.session_id)
 
     @property
-    def _history(self) -> list[ChatMessage]:
+    def _history(self) -> tuple[ChatMessage, ...]:
+        """The active session's messages, derived from its log (#1848). Read-only: a
+        write goes through the session's door (`_LiveSession.append` and its siblings),
+        or `load_history` to replace the whole history."""
         return self._active_session.messages
-
-    @_history.setter
-    def _history(self, messages: list[ChatMessage] | tuple[ChatMessage, ...]) -> None:
-        # What is being replaced is logged first: it leaves the history, not the log. What
-        # replaces it is logged at once, so the count of what the history holds is current
-        # before anything else enters (#1443).
-        self._active_session.log_history()
-        self._active_session.messages = list(messages)
-        self._active_session.log_history()  # and what replaced it
-        self._active_session.declare_new_epoch("history_replaced")
-        self._active_session.updated_at = _now_iso()
 
     @property
     def _turn_counter(self) -> int:
@@ -1364,19 +1440,9 @@ class BaseAgent(BaseAgentProtocol):
         return self._run_steps
 
     @property
-    def run_turns(self) -> int:
-        """[Deprecated alias for run_steps] Agent steps taken in the current run."""
-        return self.run_steps
-
-    @property
     def steps_remaining(self) -> int:
         """Agent steps remaining in the current run before reaching max_steps ceiling."""
         return max(0, self._config.max_steps - self.run_steps)
-
-    @property
-    def turns_remaining(self) -> int:
-        """[Deprecated alias for steps_remaining] Steps remaining in the current run."""
-        return self.steps_remaining
 
     def consume_steps(self, count: int) -> None:
         """Consume steps from the current run budget (e.g. charged by child delegations per P4)."""
@@ -1407,6 +1473,10 @@ class BaseAgent(BaseAgentProtocol):
     def _live_session(self, session_id: str) -> _LiveSession:
         """Return the live session for `session_id`, seeding it if it is new."""
         return self._session_lifecycle.live_session(session_id)
+
+    def _result_bodies(self, session_id: str) -> ResultBodies:
+        """`session_id`'s full tool-result bodies, kept in its log and store (#1848)."""
+        return self._session_lifecycle.result_bodies(session_id)
 
     @property
     def history(self) -> tuple[ChatMessage, ...]:
@@ -1502,7 +1572,7 @@ class BaseAgent(BaseAgentProtocol):
         return self._session_lifecycle.hydrate_session(session_id)
 
     def delete_session(self, session_id: str | None = None) -> bool:
-        """Delete a session's record and clean up associated tool artifacts (P3)."""
+        """Delete a session's record, its event log and its kept tool results (P3)."""
         return self._session_lifecycle.delete_session(session_id)
 
     # Context compaction (#183 requirement 3, P5, #1736): `CompactionDriver` in
@@ -1787,6 +1857,7 @@ class BaseAgent(BaseAgentProtocol):
         room_id: str | None = None,
         story_id: str | None = None,
         person_names: tuple[str, ...] = (),
+        workspace_root: Path | None = None,
     ) -> TurnResult:
         """Execute a single reasoning turn with serialized execution lock (P4, Issue #60).
 
@@ -1798,7 +1869,7 @@ class BaseAgent(BaseAgentProtocol):
         story it has open (#1555). A room passes its id and its `story_id` for every seat,
         and each tool call this turn receives them on its `ToolContext`. The agent only
         carries `story_id`; what moves it between steps is a lifecycle hook (#1732) --
-        `uclone_x.story.StoryLifecycleHook`, which every head composes in, moves it after a
+        the story extension's `StoryLifecycleHook`, which every head composes in, moves it after a
         successful call of a tool declaring `opens_story`. The story a turn leaves open is
         `TurnResult.story_id`, which is what a room keeps (#1775).
 
@@ -1814,6 +1885,7 @@ class BaseAgent(BaseAgentProtocol):
         not a better attribution but the absence of a result: P6's "unrepairable
         failures propagate".
         """
+        self._turn_person_names = person_names
         result = await self._turn_executor.execute_turn(
             input_data,
             stream_callback=stream_callback,
@@ -1821,6 +1893,7 @@ class BaseAgent(BaseAgentProtocol):
             room_id=room_id,
             story_id=story_id,
             person_names=person_names,
+            workspace_root=workspace_root,
         )
         # Read with no `await` between the turn's end and here, so no next turn has yet
         # reset it. Stamped once rather than at each of the executor's six returns.
@@ -1835,18 +1908,24 @@ class BaseAgent(BaseAgentProtocol):
     ) -> str | None:
         """The planned prompts for an image set `message` asks for, as a turn section.
 
-        `None` -- and the turn runs as it would have -- unless the persona is one
-        `IMAGE_SET_PERSONAS` names, `generate_image` is offered this turn, and the message
-        asks for two or more varied images. A planning failure of any kind is logged and
-        also answers `None`: the plan improves a turn and must never be what breaks one.
-        No failure text reaches the person.
+        `None` -- and the turn runs as it would have -- unless `generate_image` is offered
+        this turn (to any clone, #2091) and the message asks for two or more varied images.
+        A planning failure logs a warning and answers `fallback_image_set_note` -- the
+        count and the rule, no prompts -- so the model is still told to vary the set;
+        `_drawing_sections` routes the case skills alongside it. No failure text reaches
+        the person.
         """
         llm = self._llm
-        if llm is None or self._persona not in IMAGE_SET_PERSONAS:
+        if llm is None:  # any clone offered generate_image is planned, not only the Artist
             return None
-        if not any(tool.name == "generate_image" for tool in tool_defs):
+        if not any(tool.name == "generate_image" for tool in tool_defs):  # nothing to plan for
             return None
-        count = detect_image_set(message)
+        # A room turn's message is the span this seat has not seen; the set asked for is
+        # in its latest message, not in an earlier speaker's (`latest_span_message`).
+        request = message
+        if self._turn_room_id is not None:
+            request = latest_span_message(message, self._turn_person_names)
+        count = detect_image_set(request)
         if count is None:
             return None
 
@@ -1859,7 +1938,7 @@ class BaseAgent(BaseAgentProtocol):
                 await emit("status", {"status": "thinking", "detail": "Planning the image set..."})
             prompts = await plan_image_set(
                 generate,
-                message,
+                request,
                 count,
                 model=self._config.llm_config.model_name or None,
                 context_window=limit if (limit or 0) > 0 else None,
@@ -1874,7 +1953,7 @@ class BaseAgent(BaseAgentProtocol):
                 type(exc).__name__,
                 exc,
             )
-            return None
+            return fallback_image_set_note(count)
         logger.info("Image-set plan for agent %s: %d prompts", self.agent_id, len(prompts))
         return image_set_note(prompts)
 
@@ -1887,18 +1966,26 @@ class BaseAgent(BaseAgentProtocol):
     ) -> str | None:
         """The case skills that fit `message`, as a turn section after the user's message.
 
-        `None` unless the persona is one `CASE_SKILL_PERSONAS` names and `generate_image`
-        is offered this turn. A follow-up (an image already drawn in this conversation) is
-        read from history; a first turn is routed by grounded extraction, one structured
-        call. An extraction failure of any kind is logged and answers `None`: routing
-        improves a turn and must never be what breaks one. No failure text reaches the
-        person.
+        `None` unless `generate_image` is offered this turn (to any clone, #2091) and the
+        agent's skill store holds the case skills. In a room the request is the span's
+        latest message (`latest_span_message`). A follow-up (an image already drawn in this
+        conversation) is read from history; a first turn is routed by grounded extraction,
+        one structured call. An extraction failure of any kind is logged and answers
+        `None`: routing improves a turn and must never be what breaks one. No failure text
+        reaches the person.
         """
         llm = self._llm
-        if llm is None or self._persona not in CASE_SKILL_PERSONAS:
+        if llm is None:  # any clone offered generate_image is routed, not only the Artist
             return None
-        if not any(tool.name == "generate_image" for tool in tool_defs):
+        if not any(tool.name == "generate_image" for tool in tool_defs):  # nothing to route for
             return None
+        texts = case_skill_texts(self._skills)
+        if not texts:
+            return None
+        if self._turn_room_id is not None:
+            # A room turn's message is the span of messages this seat has not seen; the
+            # request is its latest one, and an earlier speaker's words must not ground.
+            message = latest_span_message(message, self._turn_person_names)
         if is_follow_up(self._history):
             names = route_follow_up(message)
         else:
@@ -1919,7 +2006,7 @@ class BaseAgent(BaseAgentProtocol):
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                logger.warning(
+                logger.info(
                     "Case-skill routing skipped for agent %s: %s: %s",
                     self.agent_id,
                     type(exc).__name__,
@@ -1928,7 +2015,7 @@ class BaseAgent(BaseAgentProtocol):
                 return None  # an unread request is drawn unrouted
             names = route_first_turn(grounded_facts(facts, message))
         logger.info("Case skills for agent %s: %s", self.agent_id, ", ".join(names))
-        return case_skill_section(names)
+        return case_skill_section(names, texts)
 
     def _image_set_earlier(self, message: str, *, turns: int = 8, chars: int = 3000) -> str:
         """The recent conversation as plain lines, for the image-set planner.
@@ -1950,7 +2037,12 @@ class BaseAgent(BaseAgentProtocol):
         return "\n".join(reversed(picked))[-chars:]
 
     def _resolve_workspace_root(self) -> Path | None:
-        """Resolve the effective workspace root boundary for tool execution."""
+        """Resolve the effective workspace root boundary for tool execution.
+
+        The running turn's conversation workspace comes first (clone-data-scopes §3.6).
+        """
+        if self._turn_workspace_root is not None:
+            return self._turn_workspace_root.resolve()
         if self._context.workspace_root is not None:
             return self._context.workspace_root.resolve()
         if self._config.workspace_dir is not None:
@@ -2004,29 +2096,36 @@ class BaseAgent(BaseAgentProtocol):
             tc, tool_ctx, stream_callback=stream_callback, advertised=advertised
         )
 
-    def _ingest_tool_message(self, msg: ChatMessage, *, readable: bool) -> ChatMessage:
-        """`msg` as the history keeps it: whole under the result cap, else an excerpt.
+    def _ingest_tool_message(
+        self, msg: ChatMessage, *, readable: bool, cap_bytes: int = TOOL_RESULT_CAP_BYTES
+    ) -> ChatMessage:
+        """`msg` as the history keeps it: whole under `cap_bytes`, else an excerpt.
 
-        The full text goes to this session's artifact directory, which deleting or
-        resetting the session removes. `readable` says whether this turn offers
-        `tool_result_read`; when it does not, the excerpt says the rest cannot be read
-        rather than naming a tool the model cannot call.
+        The full text is kept in this session's log (#1848), which deleting or resetting
+        the session removes. `readable` says whether this turn offers `tool_result_read`;
+        when it does not, the excerpt says the rest cannot be read rather than naming a
+        tool the model cannot call.
         """
         if msg.role != MessageRole.TOOL or msg.content is None:
             return msg
-        workspace = self._resolve_workspace_root()
-        content = ingest_tool_text(
+        content, handle = ingest_tool_result(
             msg.content,
-            artifacts_dir=artifacts_dir_for(workspace) if workspace is not None else None,
-            session_id=self._context.session_id,
+            bodies=self._result_bodies(self._context.session_id),
+            tool_name=msg.name,
             readable=readable,
-            workspace_root=workspace,
+            cap_bytes=cap_bytes,
         )
-        if content == msg.content:
+        if handle is None:
+            # Under the cap: the result is its own text. An agent always holds its
+            # session's bodies, so an over-cap result is always kept and has a handle.
             return msg
-        # The form is recorded here, where the result was cut, not read back from its text
-        # later (#1854).
-        return msg.model_copy(update={"content": content, "form": "excerpt"})
+        # The form is recorded here, where the result was cut, with the handle the body
+        # was kept under -- never one read back out of the excerpt's text (#1854, #1974)
+        # -- so a rebuild from the log renders it from that body (#1848).
+        source = RenderedFrom(handle=handle, limit=cap_bytes, readable=readable)
+        return msg.model_copy(
+            update={"content": content, "form": "excerpt", "rendered_from": source}
+        )
 
     def _window_model(self) -> str | None:
         """The model the next request is sent to, as the window is looked up for it."""
@@ -2060,7 +2159,8 @@ class BaseAgent(BaseAgentProtocol):
         disagree.
         For a locally served model it is the configured `context_limit`, which the
         connector sends as `num_ctx`, or the window the daemon reported; never the model
-        table. `None` when unknown. See `compaction_window`.
+        table. For a hosted model, the window its provider's listing reports, else the
+        published table (#1978). `None` when unknown. See `compaction_window`.
         """
         llm = self._llm
         provider = getattr(llm, "provider_name", None)
@@ -2074,6 +2174,7 @@ class BaseAgent(BaseAgentProtocol):
             base_url=base_url if isinstance(base_url, str) else None,
             configured=self._config.llm_config.context_limit,
             store=store if isinstance(store, OllamaContextWindows) else None,
+            listed=store if isinstance(store, ListedContextWindows) else None,
         )
 
     def _explicit_threshold(self, window: int) -> int | None:
@@ -2090,6 +2191,9 @@ class BaseAgent(BaseAgentProtocol):
 
     async def _observe_context_window(self) -> None:
         """Ask a local server which window it serves, when the connector can (#1372).
+
+        A hosted connector whose provider lists windows (Gemini) reads its listing here
+        instead, once, when the catalogue holds no figure for the model (#1978).
 
         Before each compaction check, so the check counts against the daemon's figure as
         soon as the daemon has one. The connector reads the server only when it holds no
@@ -2122,7 +2226,7 @@ class BaseAgent(BaseAgentProtocol):
         extra_sections: Sequence[str],
         *,
         readable: bool,
-    ) -> str | None:
+    ) -> StepRefusalCode | None:
         """Cut the step that just ran to fit the window, or say why it cannot (#1480).
 
         See `TurnExecutor.fit_step_to_window`. The turn calls this back through the agent.
@@ -2155,7 +2259,13 @@ class BaseAgent(BaseAgentProtocol):
         composed in.
         """
         for hook in self._lifecycle_hooks:
-            context = hook.after_tool_step(records, context)
+            try:
+                context = hook.after_tool_step(records, context)
+            except Exception:
+                logger.exception(
+                    "Lifecycle hook %r failed in after_tool_step; preserving context",
+                    hook,
+                )
         self._turn_story_id = context.story_id
 
     def advertised_tool_definitions(self) -> list[ToolDefinition]:
@@ -2318,7 +2428,8 @@ class BaseAgent(BaseAgentProtocol):
         #
         # A child never holds more tools than its parent. The parent's *resolved* list is
         # read here, at spawn time, so a persona edited after the parent was created governs
-        # the next child too, and, less the memory tools (#1431), it becomes the child's own
+        # the next child too, and, less the memory tools (#1431) and the parent's own picture
+        # (#2160) -- `BASE_SELF_TOOLS` -- it becomes the child's own
         # `allowed_tools` so the child refuses a call outside it rather than merely not
         # being offered the tool. `query_memory_facts` stays only when this agent shares its
         # memory. A persona agent's registry used to be wrapped in a scope proxy the child
@@ -2330,10 +2441,18 @@ class BaseAgent(BaseAgentProtocol):
         child_allowed = tuple(
             name
             for name in self._config.allowed_tools
-            if name not in BASE_MEMORY_TOOLS
+            if name not in BASE_SELF_TOOLS
             or (shared_memory is not None and name == QueryMemoryFactsTool.name)
         )
-        child_tools = tools or self._tools
+        if tools is not None:
+            parent_names: set[str] = (
+                {t.name for t in self._tools.list_tools()} if self._tools is not None else set()
+            )
+            child_tools = ToolRegistry(
+                [tool for tool in tools.list_tools() if tool.name in parent_names]
+            )
+        else:
+            child_tools = self._tools
         # An empty list permits everything, so a parent permitted only memory tools must not
         # hand its child an empty list over the full registry. Such a child is permitted
         # nothing, so it gets an empty registry and no skills: with skills it would register
@@ -2365,7 +2484,8 @@ class BaseAgent(BaseAgentProtocol):
             agent_id=subagent_id,
             parent_agent_id=self.agent_id,
             depth=self._context.depth + 1,
-            workspace_root=self._context.workspace_root,
+            # The turn's workspace, so a child works where its parent's conversation does.
+            workspace_root=self._resolve_workspace_root(),
         )
 
         # Built by the same mapping as every other agent (`compose_agent`'s construction

@@ -11,6 +11,8 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from uclone_x.agent.persona_store import DEFAULT_PERSONA_NAME
+from uclone_x.core.agent_home import AgentHome, AgentHomeError, clone_id_of
 from uclone_x.errors import (
     OntologyPromotionError,
     OntologyRetractionBlockedError,
@@ -47,20 +49,45 @@ def _repo_root() -> Path:
         return Path.cwd()
 
 
-def _ontology_file(agent_name: str = "default", custom_dir: Path | None = None) -> Path:
-    """Resolve the ontology YAML file path for an agent."""
-    if custom_dir is not None:
-        target_dir = custom_dir
-    else:
-        target_dir = _repo_root() / "ontology"
-    target_dir.mkdir(parents=True, exist_ok=True)
-    return target_dir / f"{agent_name}.yaml"
+def _ontology_file(agent_name: str, custom_dir: Path) -> Path:
+    """The ontology YAML file `agent_name` has in `--dir`, which no clone engine reads."""
+    custom_dir.mkdir(parents=True, exist_ok=True)
+    return custom_dir / f"{agent_name}.yaml"
+
+
+def _clone_rules(agent_name: str) -> tuple[OntologyEngine, Path]:
+    """The rules engine of the clone `agent_name` names, and its `ontology.yaml`.
+
+    The clone store is brought up to date first, as every CLI start does, and this
+    repository's old `ontology/<handle>.yaml` is merged into the clone's file once
+    (clone-data-scopes §3.8 step 5); that file is only ever read from now on. A name no
+    clone carries is refused, never given rules.
+    """
+    from uclone_x.agent import persona_registry as registry_module
+    from uclone_x.agent.clone_builder import clone_ontology, import_repository_ontologies
+    from uclone_x.agent.clone_store import ensure_clone_store
+
+    repo = _repo_root()
+    package_dir = registry_module.BUILTIN_PERSONAS_DIR
+    ensure_clone_store(repo, builtin_dir=package_dir if package_dir.is_dir() else None)
+    import_repository_ontologies(repo)
+    try:
+        agent_id = clone_id_of(agent_name)
+    except AgentHomeError as exc:
+        console.print(f"[bold red]✖ {exc}[/bold red]")
+        raise typer.Exit(code=1) from None
+    engine = clone_ontology(agent_id)
+    assert isinstance(engine, OntologyEngine)  # `clone_ontology` builds the concrete engine
+    return engine, AgentHome.for_clone(agent_id).ontology_path
 
 
 def _load_engine(
-    agent_name: str = "default", custom_dir: Path | None = None
+    agent_name: str = DEFAULT_PERSONA_NAME, custom_dir: Path | None = None
 ) -> tuple[OntologyEngine, Path]:
-    """Load or initialize an OntologyEngine for the specified agent."""
+    """The engine `ucx ontology` reads and writes: the clone's own, unless `--dir` names
+    a directory of ontology files to use instead."""
+    if custom_dir is None:
+        return _clone_rules(agent_name)
     file_path = _ontology_file(agent_name, custom_dir)
     engine = OntologyEngine(agent_id=agent_name)
     if file_path.is_file():
@@ -79,10 +106,12 @@ def ontology_list(
         ),
     ] = None,
     agent: Annotated[
-        str, typer.Option("--agent", "-a", help="Agent ontology identifier")
-    ] = "default",
+        str,
+        typer.Option("--agent", "-a", help="Clone whose rules to use (default: the builtin clone)"),
+    ] = DEFAULT_PERSONA_NAME,
     dir_path: Annotated[
-        Path | None, typer.Option("--dir", "-d", help="Custom ontology directory")
+        Path | None,
+        typer.Option("--dir", "-d", help="Use <dir>/<agent>.yaml instead of the clone's rules"),
     ] = None,
 ) -> None:
     """List concepts, relations, and axioms in the agent's domain ontology."""
@@ -221,10 +250,12 @@ def ontology_teach(
         ),
     ] = None,
     agent: Annotated[
-        str, typer.Option("--agent", "-a", help="Agent ontology identifier")
-    ] = "default",
+        str,
+        typer.Option("--agent", "-a", help="Clone whose rules to use (default: the builtin clone)"),
+    ] = DEFAULT_PERSONA_NAME,
     dir_path: Annotated[
-        Path | None, typer.Option("--dir", "-d", help="Custom ontology directory")
+        Path | None,
+        typer.Option("--dir", "-d", help="Use <dir>/<agent>.yaml instead of the clone's rules"),
     ] = None,
 ) -> None:
     """Explicitly teach an asserted concept, relation, or invariant rule to the agent."""
@@ -334,10 +365,12 @@ def ontology_teach(
 @ontology_app.command("review")
 def ontology_review(
     agent: Annotated[
-        str, typer.Option("--agent", "-a", help="Agent ontology identifier")
-    ] = "default",
+        str,
+        typer.Option("--agent", "-a", help="Clone whose rules to use (default: the builtin clone)"),
+    ] = DEFAULT_PERSONA_NAME,
     dir_path: Annotated[
-        Path | None, typer.Option("--dir", "-d", help="Custom ontology directory")
+        Path | None,
+        typer.Option("--dir", "-d", help="Use <dir>/<agent>.yaml instead of the clone's rules"),
     ] = None,
     promote: Annotated[
         str | None,
@@ -470,10 +503,12 @@ def ontology_forget(
         str, typer.Argument(help="Name of concept, relation, or axiom to retract/forget")
     ],
     agent: Annotated[
-        str, typer.Option("--agent", "-a", help="Agent ontology identifier")
-    ] = "default",
+        str,
+        typer.Option("--agent", "-a", help="Clone whose rules to use (default: the builtin clone)"),
+    ] = DEFAULT_PERSONA_NAME,
     dir_path: Annotated[
-        Path | None, typer.Option("--dir", "-d", help="Custom ontology directory")
+        Path | None,
+        typer.Option("--dir", "-d", help="Use <dir>/<agent>.yaml instead of the clone's rules"),
     ] = None,
     force: Annotated[
         bool,
@@ -515,10 +550,12 @@ def ontology_validate(
         str | None, typer.Option("--content-hash", "--hash", help="Pinned content hash snapshot")
     ] = None,
     agent: Annotated[
-        str, typer.Option("--agent", "-a", help="Agent ontology identifier")
-    ] = "default",
+        str,
+        typer.Option("--agent", "-a", help="Clone whose rules to use (default: the builtin clone)"),
+    ] = DEFAULT_PERSONA_NAME,
     dir_path: Annotated[
-        Path | None, typer.Option("--dir", "-d", help="Custom ontology directory")
+        Path | None,
+        typer.Option("--dir", "-d", help="Use <dir>/<agent>.yaml instead of the clone's rules"),
     ] = None,
 ) -> None:
     """Validate input/output payload against active compiled ontology schema."""

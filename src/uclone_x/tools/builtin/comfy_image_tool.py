@@ -80,7 +80,7 @@ class ComfyImageGenParams(BaseModel):
     )
     output_path: str | None = Field(
         default=None,
-        description="Relative destination file path within workspace. Defaults to 'artifacts/images/{seed}_{uuid}.png'.",
+        description="Relative destination file path within workspace. Defaults to 'artifacts/<sid>/images/{seed}_{uuid}.png'.",
     )
     timeout_seconds: float = Field(
         default=60.0,
@@ -172,7 +172,9 @@ class ComfyImageGenTool(BaseTool[ComfyImageGenParams]):
     """Agent tool generating images via ComfyUI with workspace containment."""
 
     name: str = "generate_image"
-    writes_files: ClassVar[bool] = True  # can create, modify or delete a file on the host (#1167)
+    writes_files: ClassVar[bool] = (
+        False  # sandbox artifact image; does not modify host workspace files (#2079)
+    )
     description: str = (
         "Generate an image from a text prompt using ComfyUI standard txt2img workflow "
         "and save the output artifact securely within the workspace."
@@ -221,7 +223,9 @@ class ComfyImageGenTool(BaseTool[ComfyImageGenParams]):
         if params.output_path is not None:
             dest_path = self.resolve_write_path(params.output_path, context.require_workspace())
         else:
-            default_rel = f"artifacts/images/{actual_seed}_{uuid.uuid4().hex[:8]}.png"
+            # The session's own directory, the one the Docs & Artifacts listing reads (#1390).
+            session_dir = f"artifacts/{context.session_id or 'sess_default'}"
+            default_rel = f"{session_dir}/images/{actual_seed}_{uuid.uuid4().hex[:8]}.png"
             dest_path = self.resolve_safe_path(default_rel, context.require_workspace())
 
         # 2. Build standard txt2img workflow graph

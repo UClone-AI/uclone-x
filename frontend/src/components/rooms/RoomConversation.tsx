@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { UsageBanner } from './UsageBanner';
-import { ArrowDown, Bot, Cpu, Loader2, Mic, Plus, Send, Sparkles, Square, Trash2 } from 'lucide-react';
+import { ArrowDown, Bot, Cpu, Folder, Loader2, Mic, Plus, Send, Sparkles, Square, Trash2 } from 'lucide-react';
 import type {
   CloneChoice,
   RoomContext,
@@ -15,8 +15,11 @@ import {
   conversationShape,
   headerAttribution,
   roomsApi,
+  RoomsApiError,
+  roomFailureReason,
   lastServedModel,
   mentionCandidates,
+  mentionToken,
   mentionUnderCaret,
   participantLabel,
   servedByLabel,
@@ -40,10 +43,15 @@ import { cn } from '../../lib/utils';
 import { appendPhrase, useDictation } from '../../lib/useDictation';
 import { dictationLang, dictationSentence } from '../../lib/dictation';
 import { fmt, plural, useCopy, useLocale } from '../../i18n';
-import { AvatarAuthorContext, personaOfSeat, pictureOf, type AvatarUrls } from '../../lib/avatarChoice';
+import { AvatarAuthorContext, pictureOf, type AvatarUrls } from '../../lib/avatarChoice';
+import { editMemoryFact } from '../../lib/roomDock';
 import { Avatar, FillRing } from '../../ui-kit';
 import { Button } from '../ui/Button';
 import { RichText } from '../RichText';
+import { UseSystemDefault } from './UseSystemDefault';
+import { ArtifactRoomContext } from '../../lib/artifactRoom';
+import { BrowserStepLines } from './BrowserStepLines';
+import { BROWSER_TOOL, recordedStep, type BrowserStep } from '../../lib/browserLive';
 
 interface RoomConversationProps {
   room: RoomState;
@@ -114,6 +122,11 @@ interface RoomConversationProps {
   /** Toggle autonomous discussion mode. */
   onToggleAutonomous?: (enabled: boolean) => void;
   /**
+   * Point the conversation at a folder, or at the server's with `null` (clone-data-scopes
+   * §3.6). It rejects with the route's refusal, which the header says in place.
+   */
+  onSetWorkspace?: (workspace: string | null) => Promise<void>;
+  /**
    * Show one turn's record, by `seq`, on the workspace dock's Turn surface.
    *
    * Required rather than optional: `why ›` is the only way onto that surface, and an
@@ -134,6 +147,18 @@ interface RoomConversationProps {
    * `id`, after what is already typed, and never sent: the person sends it.
    */
   insertDraft?: { id: number; text: string } | null;
+  /**
+   * The browser steps of the turn in flight, live from the browser socket. A landed turn's
+   * steps are read from `room.tool_uses` instead, so they survive a reload.
+   */
+  browserSteps?: readonly BrowserStep[];
+  /** Front the dock's Browser tab, from a step line. */
+  onShowBrowser?: () => void;
+  /**
+   * A clone was changed from here (a failed turn's "Use system default"), so the owner reads
+   * its clone list again and an editor opened next starts from what is saved.
+   */
+  onClonesChanged?: () => void;
 }
 
 /**
@@ -144,6 +169,8 @@ interface RoomConversationProps {
  * (`note_human_activity`), so one per burst carries exactly as much information as forty.
  */
 export const TYPING_REPORT_INTERVAL_MS = 1500;
+
+const NO_STEPS: readonly BrowserStep[] = [];
 
 /**
  * What a row's words are drawn in, for the two shapes §3.2.3 distinguishes.
@@ -227,11 +254,28 @@ const TranscriptRow = React.memo<{
    */
   onOpenTurn: (seq: number) => void;
   avatarUrls: AvatarUrls | undefined;
-}>(function TranscriptRow({ room, message, shape, attribution, onRetry, onOpenTurn, avatarUrls }) {
+  /** This turn's recorded browser steps; empty for most turns. */
+  browserSteps: readonly BrowserStep[];
+  onShowBrowser: (() => void) | undefined;
+  onClonesChanged: () => void;
+}>(function TranscriptRow({
+  room,
+  message,
+  shape,
+  attribution,
+  onRetry,
+  onOpenTurn,
+  avatarUrls,
+  browserSteps,
+  onShowBrowser,
+  onClonesChanged,
+}) {
   const t = useCopy().conversation;
   const label = senderLabel(room, message.sender_id, t.you);
   const mine = senderKind(room, message.sender_id) === 'human';
   const isAgent = senderKind(room, message.sender_id) === 'agent';
+  const [forgotten, setForgotten] = useState(false);
+  const [isForgetting, setIsForgetting] = useState(false);
   // This turn's own model, whether or not the turn prints a line. FR-13.4 requires it to
   // be reachable *on the turn*, and the header is a statement about the conversation, not
   // an answer for a particular row. Read from `provenance`, never from what was said.
@@ -266,7 +310,7 @@ const TranscriptRow = React.memo<{
             // its single default, which is a kind marker rather than a likeness.
             imageSrc={
               senderKind(room, message.sender_id) === 'agent'
-                ? pictureOf(personaOfSeat(room, message.sender_id), avatarUrls)
+                ? pictureOf(message.sender_id, avatarUrls)
                 : undefined
             }
           />
@@ -298,18 +342,28 @@ const TranscriptRow = React.memo<{
           message.error && 'border-l-2 border-rose-800 pl-3',
         )}
       >
+        <BrowserStepLines
+          steps={browserSteps}
+          onShow={onShowBrowser}
+          testId={`row-browser-steps-${message.seq}`}
+        />
         {message.error ? (
           <div data-testid={`row-error-${message.seq}`} className="text-sm text-slate-300">
             {/* A plain sentence, never `message.error`: that field is the raw cause, kept
                 for the log's reader (#1408). */}
             <p>
-              {turnFailureSentence(
-                label,
-                message.refusal,
-                message.completed,
-                message.provider_failure,
-                t.outcome,
-              )}
+              {/* A saved edit this clone could not take (#1904): said as that, from the
+                  flag, because the person who saved it has to save it again, and "something
+                  went wrong" would not tell them the edit is gone. */}
+              {message.persona_edit_dropped
+                ? fmt(t.outcome.personaEditDropped, { label })
+                : turnFailureSentence(
+                    label,
+                    message.refusal,
+                    message.completed,
+                    message.provider_failure,
+                    t.outcome,
+                  )}
             </p>
             {message.refusal ? (
               <p data-testid={`row-remedy-${message.seq}`} className="mt-1 text-xs text-slate-400">
@@ -317,6 +371,14 @@ const TranscriptRow = React.memo<{
               </p>
             ) : (
               <>
+                {message.persona_edit_dropped ? (
+                  <p
+                    data-testid={`row-remedy-${message.seq}`}
+                    className="mt-1 text-xs text-slate-400"
+                  >
+                    {t.outcome.personaEditRemedy}
+                  </p>
+                ) : null}
                 {message.provider_failure &&
                 providerFailureRemedy(message.provider_failure.kind, t.outcome) ? (
                   <p
@@ -333,6 +395,16 @@ const TranscriptRow = React.memo<{
                 )}
               </>
             )}
+            {/* The one action a failure on the clone's own model offers (model-gateway
+                §3.6), whether the Core sent it as a refusal or as a provider failure. */}
+            {message.provider_failure ? (
+              <UseSystemDefault
+                failure={message.provider_failure}
+                label={label}
+                testId={`row-use-default-${message.seq}`}
+                onChanged={onClonesChanged}
+              />
+            ) : null}
           </div>
         ) : message.content.trim() === '' ? (
           /* A turn that said nothing is not a turn with nothing to say (P6). The room
@@ -357,7 +429,7 @@ const TranscriptRow = React.memo<{
         ) : (
           // The clone that wrote it, for a picture's "Use as avatar" (#1300); nobody's for
           // the person's own words.
-          <AvatarAuthorContext.Provider value={isAgent ? personaOfSeat(room, message.sender_id) : null}>
+          <AvatarAuthorContext.Provider value={isAgent ? message.sender_id : null}>
             <MessageBody text={message.content} />
           </AvatarAuthorContext.Provider>
         )}
@@ -372,17 +444,63 @@ const TranscriptRow = React.memo<{
           </p>
         ) : null}
 
+        {/* What the image tool added to a picture's request this turn (#1865), shown by the
+            reply so a person can see the picture was not drawn from their words alone. Tags
+            only; the tool's own explanation is written for the model. */}
+        {message.image_prompt_added && message.image_prompt_added.length > 0 ? (
+          <p
+            data-testid={`row-image-prompt-added-${message.seq}`}
+            className="mt-1 text-[11px] text-slate-500"
+          >
+            {fmt(t.row.imagePromptAdded, { label, tags: message.image_prompt_added.join(', ') })}
+          </p>
+        ) : null}
+        {message.image_negative_added && message.image_negative_added.length > 0 ? (
+          <p
+            data-testid={`row-image-negative-added-${message.seq}`}
+            className="mt-1 text-[11px] text-slate-500"
+          >
+            {fmt(t.row.imageNegativeAdded, { label, tags: message.image_negative_added.join(', ') })}
+          </p>
+        ) : null}
+
         {/* What the speaker saved to its memory from this turn, after the turn (#1404). A
             count, in the same quiet line: the facts themselves are in the Remembers panel,
             where they can be corrected or forgotten. A failure says only that it failed; the
             cause is in the server log. */}
         {message.knowledge_learned && message.knowledge_learned.length > 0 ? (
-          <p
-            data-testid={`row-knowledge-learned-${message.seq}`}
-            className="mt-1 text-[11px] text-slate-500"
-          >
-            {plural(t.row.knowledgeLearned, message.knowledge_learned.length, { label })}
-          </p>
+          <div className="mt-1 flex items-center gap-2 text-[11px] text-slate-500">
+            <p data-testid={`row-knowledge-learned-${message.seq}`}>
+              {forgotten
+                ? plural(t.row.knowledgeForgotten, message.knowledge_learned.length, { label })
+                : plural(t.row.knowledgeLearned, message.knowledge_learned.length, { label })}
+            </p>
+            {!forgotten ? (
+              <button
+                type="button"
+                data-testid={`row-knowledge-forget-${message.seq}`}
+                disabled={isForgetting}
+                onClick={async () => {
+                  setIsForgetting(true);
+                  try {
+                    const results = await Promise.all(
+                      message.knowledge_learned!.map((factId) =>
+                        editMemoryFact(message.sender_id, factId, null),
+                      ),
+                    );
+                    if (results.some((r) => r.ok || r.status === 404)) {
+                      setForgotten(true);
+                    }
+                  } finally {
+                    setIsForgetting(false);
+                  }
+                }}
+                className="text-slate-400 hover:text-slate-200 underline disabled:opacity-50"
+              >
+                {t.row.forget}
+              </button>
+            ) : null}
+          </div>
         ) : null}
         {message.knowledge_extract_error ? (
           <p
@@ -530,6 +648,26 @@ const NoteRow = React.memo<{ message: RoomTranscriptMessage }>(function NoteRow(
  */
 const A_ROOM_SEAT_CAN_CARRY_A_MODEL: boolean = false;
 
+/** The last part of a folder's path, for a header with no room for all of it. */
+function folderName(path: string): string {
+  return path.replace(/[\\/]+$/, '').split(/[\\/]/).pop() || path;
+}
+
+/**
+ * Why the workspace route refused, in the reader's language when the route named which
+ * refusal it was; the Core's own sentence otherwise.
+ */
+function workspaceRefusal(
+  err: unknown,
+  refusals: Readonly<Record<string, string>>,
+  words: { noReason: string; noAnswer: string; appFault: string },
+): string {
+  if (err instanceof RoomsApiError && err.code !== null && err.code in refusals) {
+    return refusals[err.code];
+  }
+  return roomFailureReason(err, words.noReason, words);
+}
+
 /**
  * How far above the transcript's bottom edge still counts as "at the bottom".
  *
@@ -567,10 +705,14 @@ export const RoomConversation: React.FC<RoomConversationProps> = ({
   agentModelOverride,
   onSelectAgentModel,
   onToggleAutonomous,
+  onSetWorkspace,
   onOpenTurn,
   onOpenSettings,
   avatarUrls,
   insertDraft = null,
+  browserSteps,
+  onShowBrowser,
+  onClonesChanged,
 }) => {
   const isAutonomous = Boolean(room.policy?.autonomous);
   // A room a terminal or protocol head keeps has that head as its one writer (#1885). The
@@ -641,14 +783,26 @@ export const RoomConversation: React.FC<RoomConversationProps> = ({
 
   // The owner's callbacks, called through a ref so the rows' props stay the same object
   // across renders and `TranscriptRow`'s memo holds. The owner passes fresh arrows each time.
-  const rowCallbacksRef = useRef({ onRetry, onOpenTurn });
-  rowCallbacksRef.current = { onRetry, onOpenTurn };
+  const rowCallbacksRef = useRef({ onRetry, onOpenTurn, onClonesChanged });
+  rowCallbacksRef.current = { onRetry, onOpenTurn, onClonesChanged };
+  const clonesChangedRow = useCallback(() => rowCallbacksRef.current.onClonesChanged?.(), []);
   const retryRow = useCallback(() => rowCallbacksRef.current.onRetry(), []);
   const openRowTurn = useCallback((seq: number) => rowCallbacksRef.current.onOpenTurn(seq), []);
 
   const [caret, setCaret] = useState(0);
   const [completionOpen, setCompletionOpen] = useState(false);
   const [inviting, setInviting] = useState(false);
+  const [choosingFolder, setChoosingFolder] = useState(false);
+  const [folderDraft, setFolderDraft] = useState('');
+  // The refusal itself, not its sentence, so the line follows the language control.
+  const [folderError, setFolderError] = useState<{ cause: unknown } | null>(null);
+  // `default_workspace` comes only on a full read; an act's answer leaves it out, so the
+  // last one seen is kept rather than the header losing the name.
+  const [serverFolder, setServerFolder] = useState(room.default_workspace ?? null);
+  useEffect(() => {
+    if (room.default_workspace) setServerFolder(room.default_workspace);
+  }, [room.default_workspace]);
+  const folder = room.workspace ?? null;
   // The failure itself, not its sentence, so the line follows the language control.
   const [sendError, setSendError] = useState<{ cause: unknown } | null>(null);
   const [sending, setSending] = useState(false);
@@ -755,6 +909,25 @@ export const RoomConversation: React.FC<RoomConversationProps> = ({
   const inFlight = live.turn ?? heldRef.current?.turn ?? null;
   const liveTurn =
     inFlight && !room.transcript.some((row) => row.turn_id === inFlight.turnId) ? inFlight : null;
+
+  // Browser steps (browser-agent.md §3.4): a landed turn's from its recorded calls, the turn
+  // in flight's from the live socket -- only its own clone's, since another clone's tab is not
+  // this turn's doing.
+  const recordedBrowserSteps = useMemo(() => {
+    const byTurn = new Map<string, BrowserStep[]>();
+    for (const use of room.tool_uses ?? []) {
+      if (use.tool_name !== BROWSER_TOOL) continue;
+      const steps = byTurn.get(use.turn_id) ?? [];
+      steps.push(recordedStep(use));
+      byTurn.set(use.turn_id, steps);
+    }
+    return byTurn;
+  }, [room.tool_uses]);
+  const liveBrowserSteps = useMemo(
+    () =>
+      liveTurn ? (browserSteps ?? NO_STEPS).filter((step) => step.clone === liveTurn.agentId) : NO_STEPS,
+    [browserSteps, liveTurn],
+  );
 
   /**
    * Is the reader still following the bottom edge, as of this instant?
@@ -1049,7 +1222,8 @@ export const RoomConversation: React.FC<RoomConversationProps> = ({
     if (!mention) return;
     const head = draft.slice(0, mention.start);
     const tail = draft.slice(mention.start + 1 + mention.prefix.length);
-    const inserted = `@${participant.id} `;
+    // The handle, which the Core resolves to the seat: a seat's id is not a name anybody types.
+    const inserted = `@${mentionToken(participant)} `;
     onDraftChange(`${head}${inserted}${tail}`);
     setCaret(mention.start + inserted.length);
     setCompletionOpen(false);
@@ -1082,6 +1256,7 @@ export const RoomConversation: React.FC<RoomConversationProps> = ({
   };
 
   return (
+    <ArtifactRoomContext.Provider value={room.room_id}>
     <section
       data-testid="room-conversation"
       // Which conversation this is, not only that there is one. A browser case that starts a
@@ -1110,7 +1285,7 @@ export const RoomConversation: React.FC<RoomConversationProps> = ({
                 kind="agent"
                 agentIcon={Bot}
                 size="2xs"
-                imageSrc={pictureOf(personaOfSeat(room, agent.id), avatarUrls)}
+                imageSrc={pictureOf(agent.id, avatarUrls)}
               />
               <span>{participantLabel(agent)}</span>
               {live.turn?.agentId === agent.id ? (
@@ -1136,7 +1311,9 @@ export const RoomConversation: React.FC<RoomConversationProps> = ({
             writing a global one.
 
             Not on screen today -- see `A_ROOM_SEAT_CAN_CARRY_A_MODEL` above and #1235. */}
-        <div className="ml-auto flex min-w-0 shrink items-center gap-2">
+        {/* Wraps rather than overflows: with the folder in it, the row is wider than a narrow
+            column even once `.column-icon-only` has reduced every control to its icon. */}
+        <div className="ml-auto flex min-w-0 shrink flex-wrap items-center justify-end gap-2">
         {A_ROOM_SEAT_CAN_CARRY_A_MODEL &&
         soleAgent &&
         onSelectAgentModel &&
@@ -1191,6 +1368,26 @@ export const RoomConversation: React.FC<RoomConversationProps> = ({
           </Button>
         ) : null}
 
+        {onSetWorkspace || folder || serverFolder ? (
+          <Button
+            data-testid="room-workspace"
+            onClick={() => {
+              setFolderDraft(folder ?? '');
+              setFolderError(null);
+              setChoosingFolder((open) => !open);
+            }}
+            disabled={keptBy !== null || !onSetWorkspace}
+            aria-label={t.workspace.label}
+            title={`${t.workspace.label}: ${folder ?? serverFolder ?? t.workspace.serverFolder}`}
+            className="min-w-0 max-w-[12rem] whitespace-nowrap text-xs"
+          >
+            <Folder className="w-3 h-3 shrink-0" />
+            <span className="column-icon-only truncate">
+              {folder ? folderName(folder) : t.workspace.serverFolder}
+            </span>
+          </Button>
+        ) : null}
+
         {keptBy === null ? (
         <Button
           data-testid="add-someone"
@@ -1217,6 +1414,56 @@ export const RoomConversation: React.FC<RoomConversationProps> = ({
         ) : null}
         </div>
       </header>
+
+      {choosingFolder && onSetWorkspace && keptBy === null ? (
+        <form
+          data-testid="workspace-panel"
+          className="px-4 py-2 border-b border-slate-800/60 flex flex-wrap items-center gap-2"
+          onSubmit={(event) => {
+            event.preventDefault();
+            const chosen = folderDraft.trim();
+            if (chosen === '') return;
+            setFolderError(null);
+            onSetWorkspace(chosen).then(
+              () => setChoosingFolder(false),
+              (cause: unknown) => setFolderError({ cause }),
+            );
+          }}
+        >
+          <input
+            data-testid="workspace-path"
+            value={folderDraft}
+            onChange={(event) => setFolderDraft(event.target.value)}
+            placeholder={serverFolder ?? t.workspace.pathPlaceholder}
+            aria-label={t.workspace.pathPlaceholder}
+            className="min-w-[12rem] flex-1 bg-transparent text-xs text-slate-200 outline-none border-b border-slate-700"
+          />
+          <Button type="submit" data-testid="workspace-use" className="shrink-0 text-xs">
+            {t.workspace.use}
+          </Button>
+          {folder ? (
+            <Button
+              type="button"
+              data-testid="workspace-use-server"
+              className="shrink-0 text-xs"
+              onClick={() => {
+                setFolderError(null);
+                onSetWorkspace(null).then(
+                  () => setChoosingFolder(false),
+                  (cause: unknown) => setFolderError({ cause }),
+                );
+              }}
+            >
+              {t.workspace.useServer}
+            </Button>
+          ) : null}
+          {folderError ? (
+            <span data-testid="workspace-refusal" role="alert" className="basis-full text-xs text-amber-300">
+              {workspaceRefusal(folderError.cause, t.workspace.refusals, c.sendFailure)}
+            </span>
+          ) : null}
+        </form>
+      ) : null}
 
       {inviting ? (
         <div data-testid="invite-list" className="px-4 py-2 border-b border-slate-800/60 flex flex-wrap gap-1">
@@ -1278,7 +1525,12 @@ export const RoomConversation: React.FC<RoomConversationProps> = ({
               attribution={attribution.get(message.seq)}
               onRetry={retryRow}
               onOpenTurn={openRowTurn}
+              onClonesChanged={clonesChangedRow}
               avatarUrls={avatarUrls}
+              browserSteps={
+                (message.turn_id && recordedBrowserSteps.get(message.turn_id)) || NO_STEPS
+              }
+              onShowBrowser={onShowBrowser}
             />
           ) : message.kind === 'note' ? (
             <NoteRow key={message.seq} message={message} />
@@ -1309,7 +1561,7 @@ export const RoomConversation: React.FC<RoomConversationProps> = ({
                   kind="agent"
                   agentIcon={Bot}
                   size="xs"
-                  imageSrc={pictureOf(personaOfSeat(room, liveTurn.agentId), avatarUrls)}
+                  imageSrc={pictureOf(liveTurn.agentId, avatarUrls)}
                 />
                 {senderLabel(room, liveTurn.agentId, t.you)}
               </div>
@@ -1324,6 +1576,11 @@ export const RoomConversation: React.FC<RoomConversationProps> = ({
                 bubbleClass(shape, false),
               )}
             >
+              <BrowserStepLines
+                steps={liveBrowserSteps}
+                onShow={onShowBrowser}
+                testId="live-turn-browser-steps"
+              />
               {!liveTurn.text.trim() ? (
                 <div
                   data-testid="live-turn-indicator"
@@ -1538,8 +1795,8 @@ export const RoomConversation: React.FC<RoomConversationProps> = ({
                 data-enter-takes={index === 0 ? 'true' : undefined}
                 className={index === 0 ? 'border-slate-400 text-slate-100' : undefined}
               >
-                @{participant.id}
-                {participant.display_name && participant.display_name !== participant.id ? (
+                @{mentionToken(participant)}
+                {participant.display_name && participant.display_name !== mentionToken(participant) ? (
                   <span className="text-slate-500"> · {participant.display_name}</span>
                 ) : null}
               </Button>
@@ -1825,6 +2082,7 @@ export const RoomConversation: React.FC<RoomConversationProps> = ({
       </div>
       )}
     </section>
+    </ArtifactRoomContext.Provider>
   );
 };
 

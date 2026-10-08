@@ -20,8 +20,10 @@ from uclone_x.agent.loop import (
     parse_interval_string,
     parse_loop_command_input,
 )
+from uclone_x.agent.persona_store import DEFAULT_PERSONA_NAME
 from uclone_x.agent.prompts import compose_system_prompt
 from uclone_x.agent.session import SessionStore
+from uclone_x.agent.tools_module import UnknownToolsModuleError
 from uclone_x.engine.event_bus import EventBus
 from uclone_x.llm.connectors.factory import create_llm_connector
 from uclone_x.sandbox.models import WorkspaceIsolation
@@ -47,7 +49,7 @@ async def _run_loop_agent(
     clean_context: bool = False,
     until_pattern: str | None = None,
     max_consecutive_failures: int = 3,
-    agent_name: str = "default",
+    agent_name: str = DEFAULT_PERSONA_NAME,
     provider: str | None = None,
     model: str | None = None,
     workspace_dir: Path | None = None,
@@ -65,6 +67,7 @@ async def _run_loop_agent(
         own_model_notice,
         record_in_room,
         report_set_aside,
+        tick_error_text,
     )
 
     saved_model, saved_notice = apply_saved_model(provider, model)
@@ -80,8 +83,9 @@ async def _run_loop_agent(
 
     default_system = compose_system_prompt(model_name=effective_model)
     # Deferred for the reason `run` is: `ucx --help` imports this module.
-    from uclone_x.agent.clone_builder import build_clone, local_app_scope, saved_models
-    from uclone_x.core.agent_home import AgentHomeError
+    from uclone_x.agent.clone_builder import build_clone, command_gateway, local_app_scope
+    from uclone_x.agent.persona_registry import get_default_persona_registry
+    from uclone_x.core.agent_home import AgentHomeError, seat_id_for
     from uclone_x.errors import PathTraversalError, RoomError
     from uclone_x.room.one_seat import open_head_room
     from uclone_x.room.store import RoomStore
@@ -91,8 +95,12 @@ async def _run_loop_agent(
     # room, or a new one is started; the clone keeps a room seat's session in it. A
     # session kept under the earlier `loop_<clone>` name is left on disk and not resumed.
     rooms = RoomStore()
+    # `--agent` is a handle; the seat and the memory are keyed by its clone's id (§4 step
+    # 3). The registry brings the clones up first (clone-data-scopes §3.8).
+    get_default_persona_registry(effective_cwd)
+    clone_id = seat_id_for(agent_name)
     try:
-        room = open_head_room(agent_name, session_id, head="loop", store=rooms)
+        room = open_head_room(clone_id, session_id, head="loop", store=rooms)
     except AgentHomeError as exc:
         err_console.print(f"[bold red]✖ Invalid --agent:[/bold red] {escape(str(exc))}")
         return 2
@@ -106,26 +114,32 @@ async def _run_loop_agent(
         )
 
     # Built as the desktop app builds the same clone (#1731).
-    agent = build_clone(
-        local_app_scope(
-            workspace_root=effective_cwd,
-            llm=llm,
-            tools=tools,
-            global_models=saved_models(effective_model),
-            bus=bus,
-            tracer=tracer,
-            store=store,
-            # P9: the approved skills in the runtime store; without them no `load_skill`.
-            skills=await load_runtime_skill_registry(),
-        ),
-        clone_id=agent_name,
-        session_id=room.session_id,
-        # `--model` wins over a persona's own model, as a model asked for in the app does;
-        # the saved choice only fills what the persona leaves empty (`saved_models`).
-        model_name=model,
-        fallback_prompt=default_system,
-        config_update={"isolation": WorkspaceIsolation()},
-    ).agent
+    try:
+        agent = build_clone(
+            local_app_scope(
+                workspace_root=effective_cwd,
+                llm=llm,
+                tools=tools,
+                gateway=command_gateway(llm, effective_model),
+                bus=bus,
+                tracer=tracer,
+                store=store,
+                # P9: the approved skills in the runtime store; without them no `load_skill`.
+                skills=await load_runtime_skill_registry(),
+            ),
+            clone_id=clone_id,
+            session_id=room.session_id,
+            # `--model` wins over a persona's own model, as a model asked for in the app does;
+            # the saved choice only fills what the persona leaves empty (`command_gateway`).
+            model_name=model,
+            fallback_prompt=default_system,
+            config_update={"isolation": WorkspaceIsolation()},
+        ).agent
+    except UnknownToolsModuleError as exc:
+        # The clone's file names a tools module this version lacks (#2188): its plain
+        # sentence, and no traceback.
+        err_console.print(str(exc), markup=False, highlight=False)
+        return 1
     own_model = own_model_notice(agent_name, agent.config.llm_config.model_name, saved_model)
     if own_model is not None:
         console.print(f"[dim]{escape(own_model)}[/dim]")
@@ -173,7 +187,7 @@ async def _run_loop_agent(
             )
         else:
             err_console.print(
-                f"[{status_style}]✖ Error: {escape(result.error or 'unknown error')}[/{status_style}]"
+                f"[{status_style}]✖ Error: {escape(tick_error_text(result) or 'unknown error')}[/{status_style}]"
             )
         # Each tick is a turn in the loop's room (#1837), saved to the seat first as a room
         # seat's turn is, so the room never shows a tick the seat's session lacks.
@@ -186,7 +200,7 @@ async def _run_loop_agent(
         record_in_room(
             rooms,
             room_id=room.room_id,
-            clone_id=agent_name,
+            clone_id=clone_id,
             turn=loop_tick_turn(job, result, session_set_aside=set_aside),
             out=err_console,
             head="loop",
@@ -275,7 +289,9 @@ def run_loop_cmd(
         "--max-failures",
         help="Maximum consecutive failed turns before aborting (default: 3)",
     ),
-    agent_name: str = typer.Option("default", "--agent", "-a", help="Agent identifier"),
+    agent_name: str = typer.Option(
+        DEFAULT_PERSONA_NAME, "--agent", "-a", help="Clone to run (default: the builtin clone)"
+    ),
     provider: str | None = typer.Option(None, "--provider", "-p", help="LLM Provider"),
     model: str | None = typer.Option(None, "--model", "-m", help="LLM Model"),
     cwd: Annotated[

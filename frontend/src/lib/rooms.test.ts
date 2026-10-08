@@ -6,6 +6,7 @@ import {
   conversationShape,
   headerAttribution,
   mentionCandidates,
+  mentionToken,
   mentionTokens,
   mentionUnderCaret,
   NEW_CONVERSATION_TITLE,
@@ -343,6 +344,18 @@ describe('resolveMention', () => {
     expect(resolveMention(participants, 'scout')?.id).toBe('scout');
   });
 
+  // Killed by: frontend/src/lib/rooms.ts :: (p) => p.kind === 'agent' && p.handle !== undefined && p.handle.toLowerCase() === lowered,
+  // Becomes: (p) => false,
+  it('reaches a clone`s seat by its handle, since the seat is its id (#1815)', () => {
+    const participants: RoomParticipant[] = [
+      { id: 'user', kind: 'human' },
+      { id: 'agt_1', kind: 'agent', handle: 'scout' },
+    ];
+
+    expect(resolveMention(participants, 'Scout')?.id).toBe('agt_1');
+    expect(resolveMention(participants, 'agt_1')?.id).toBe('agt_1');
+  });
+
   it('retries a token with trailing punctuation removed', () => {
     expect(resolveMention(roster('scout'), 'scout.')?.id).toBe('scout');
   });
@@ -444,6 +457,24 @@ describe('answerHint', () => {
 });
 
 describe('mentionCandidates / mentionUnderCaret', () => {
+  // Killed by: frontend/src/lib/rooms.ts :: if (p.handle?.toLowerCase().startsWith(lowered)) return true;
+  // Becomes: if (false) return true;
+  it('offers a clone seated by id when its handle is being typed (#1815)', () => {
+    const participants: RoomParticipant[] = [
+      { id: 'agt_1', kind: 'agent', handle: 'scout' },
+      { id: 'agt_2', kind: 'agent', handle: 'critic' },
+    ];
+
+    expect(mentionCandidates(participants, 'sc').map((p) => p.id)).toEqual(['agt_1']);
+  });
+
+  // Killed by: frontend/src/lib/rooms.ts :: return participant.handle || participant.id;
+  // Becomes: return participant.id;
+  it('writes a clone`s handle into the draft, and an id when there is none', () => {
+    expect(mentionToken({ id: 'agt_1', kind: 'agent', handle: 'scout' })).toBe('scout');
+    expect(mentionToken({ id: 'critic', kind: 'agent' })).toBe('critic');
+  });
+
   it('offers this conversation`s agents, filtered by what is typed', () => {
     const participants: RoomParticipant[] = [
       { id: 'user', kind: 'human' },

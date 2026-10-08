@@ -200,14 +200,14 @@ def test_quality_gate_static_scope_includes_all_python_directories() -> None:
     `test_quality_gate_scope_covers_every_python_directory`, which discovers directories
     instead of listing them.
     """
-    for required in ("src", "tests", "swarm", "scripts", "evals", "oss"):
+    for required in ("src", "tests", "scripts", "evals", "oss"):
         assert required in PYTHON_CHECK_PATHS, f"{required!r} dropped from the gate scope"
 
 
 def test_resolve_check_paths_skips_directories_that_are_absent(tmp_path: Path) -> None:
     """A declared path that is not in this tree is dropped, in declaration order.
 
-    `swarm`, `scripts` and `oss` are not published as open source, and both
+    `scripts` and `oss` are not published as open source, and both
     `ruff` and `pyright` fail on a path that does not exist -- so an unfiltered
     list would make the published gate fail on the absence of code that was
     never meant to be there.
@@ -411,14 +411,6 @@ def test_quality_gate_test_scopes(monkeypatch: pytest.MonkeyPatch) -> None:
         "-m",
         "e2e",
     ]
-
-    # All scope: "all" is documented as Unit + E2E, so it still excludes the recorded and
-    # live tiers rather than meaning "literally everything" (#377). Same two steps as gate.
-    calls.clear()
-    assert run_quality_gate(quiet=True, test_scope="all") == 0
-    assert calls[3][-1] == "(not recorded and not live) and not e2e"
-    assert calls[4][-1] == "(not recorded and not live) and e2e"
-    assert len(calls) == 5
 
 
 def test_quality_gate_fails_on_format(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1499,7 +1491,8 @@ def _top_level_python_dirs(repo_root: Path) -> set[str]:
         if entry.name in skip_parts:
             continue
         for path in entry.rglob("*.py"):
-            if skip_parts & set(path.parts):
+            # Relative parts: a checkout under `.worktrees/` would otherwise skip every file.
+            if skip_parts & set(path.relative_to(repo_root).parts):
                 continue
             found.add(entry.name)
             break
@@ -1940,7 +1933,6 @@ def _gate_calls_with_passing_subprocesses(monkeypatch: pytest.MonkeyPatch) -> li
     [
         ("gate", True),
         ("fast", True),
-        ("all", True),
         ("unit", False),
         ("fitness", False),
         ("recorded", False),
@@ -1957,7 +1949,7 @@ def test_the_frontend_suite_runs_in_every_scope_a_commit_is_measured_against(
     stub_frontend_suite: list[Path | None],
     stub_bundle_freshness: list[Path | None],
 ) -> None:
-    """`gate` (plain `./ucx test check`), `--fast` and `--all` run vitest; tiers do not.
+    """`gate` (plain `./ucx test check`) and `fast` run vitest; tiers do not.
 
     The bundle freshness check (stage 6b, #878) is selected with it, scope for scope.
 
@@ -1967,8 +1959,8 @@ def test_the_frontend_suite_runs_in_every_scope_a_commit_is_measured_against(
     tiers (`unit`, `e2e`, ...) are pytest selections for narrowing a failure and stay Python
     only, as they were.
 
-    Killed by: src/uclone_x/cli/quality_gate.py :: frozenset({"gate", "fast", "all"})
-    Becomes: frozenset({"fast", "all"})
+    Killed by: src/uclone_x/cli/quality_gate.py :: frozenset({"gate", "fast"})
+    Becomes: frozenset({"fast"})
     """
     _gate_calls_with_passing_subprocesses(monkeypatch)
 
@@ -2285,7 +2277,7 @@ def test_the_vitest_stage_starts_blocking_and_a_quiet_one_reports_no_restore(
 # --------------------------------------------------------------------------------------
 
 _WHOLLY_PARALLEL_SCOPES = ("fast", "unit", "fitness")
-_SPLIT_SCOPES = ("gate", "all")
+_SPLIT_SCOPES = ("gate",)
 _SERIAL_TEST_SCOPES = ("e2e", "recorded", "live", "pre-release")
 
 

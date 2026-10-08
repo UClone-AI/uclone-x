@@ -142,7 +142,7 @@ def test_a_link_with_the_workspace_directory_for_a_host_is_re_rooted(tmp_path: P
     host = "https://ucx-fresh-test2-pypi022/work"
     content = (
         f"![Night]({host}/api/artifacts/content?path=artifacts/images/img_1.png)\n"
-        f"[Open it](ucx-fresh-test2-pypi022/work/api/artifacts/content?path=artifacts/images/img_1.png)\n"
+        "[Open it](ucx-fresh-test2-pypi022/work/api/artifacts/content?path=artifacts/images/img_1.png)\n"
         f"![Gone]({host}/api/artifacts/content?path=artifacts/images/img_gone.png)"
     )
 
@@ -191,3 +191,28 @@ def test_a_filename_cannot_break_out_of_its_directive(tmp_path: Path, filename: 
     sanitized, count = sanitize_hallucinated_artifacts(content, tmp_path)
     assert count == 1
     assert sanitized == directive
+
+
+def test_bare_artifact_endpoint_link_is_sanitized(tmp_path: Path) -> None:
+    """A bare api/artifacts/content link without host or leading slash is sanitized.
+
+    Killed by: src/uclone_x/agent/hooks/artifact_validation.py :: or base == ARTIFACT_ENDPOINT.lstrip("/")
+    Becomes:
+    """
+    img_dir = tmp_path / "artifacts" / "images"
+    img_dir.mkdir(parents=True)
+    (img_dir / "img_1.png").write_bytes(b"PNG")
+    content = "[Bare](api/artifacts/content?path=artifacts/images/img_1.png)"
+
+    sanitized, count = sanitize_hallucinated_artifacts(content, tmp_path)
+
+    assert count == 1
+    assert sanitized == "[Bare](/api/artifacts/content?path=artifacts/images/img_1.png)"
+
+
+def test_extract_artifact_rel_path_with_literal_percent_escape() -> None:
+    """A file with literal percent escape in its filename is not double-decoded."""
+    assert (
+        extract_artifact_rel_path("/api/artifacts/content?path=artifacts/images/a%2520b.png")
+        == "artifacts/images/a%20b.png"
+    )

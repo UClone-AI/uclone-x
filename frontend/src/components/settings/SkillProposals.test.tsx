@@ -158,7 +158,7 @@ describe('Settings › Skills proposals (#1827)', () => {
     await waitFor(() => expect(screen.queryByTestId('skill-proposal')).toBeNull());
   });
 
-  it('turns a proposal down with its version', async () => {
+  it('turns a proposal down with its version and the digest of the text shown', async () => {
     const calls = mockFetch(() => payload([], [proposal()]), {
       'POST /api/skills/tidy-notes/reject': () => jsonResponse({ ok: true }),
     });
@@ -168,7 +168,59 @@ describe('Settings › Skills proposals (#1827)', () => {
 
     const notice = await screen.findByTestId('skill-decision-notice');
     expect(notice).toHaveTextContent(fmt(en.skills.proposals.turnedDown, { name: 'tidy-notes' }));
-    expect(calls.find((c) => c.method === 'POST')?.body).toEqual({ version: '0.1.0' });
+    expect(calls.find((c) => c.method === 'POST')?.body).toEqual({
+      version: '0.1.0',
+      seen_digest: 'd1gest',
+    });
+  });
+
+  it('says a turn-down was not made when the proposal changed since it was shown', async () => {
+    // Killed by: frontend/src/components/settings/SkillProposals.tsx :: copy.proposals.changedTurnDown,
+    // Becomes: copy.proposals.changed,
+    mockFetch(() => payload([], [proposal()]), {
+      'POST /api/skills/tidy-notes/reject': () =>
+        jsonResponse({ detail: 'This proposal changed.', code: 'seen_changed' }, false, 412),
+    });
+    render(<SkillsSection />);
+
+    fireEvent.click(await screen.findByTestId('skill-proposal-turn-down'));
+
+    const notice = await screen.findByTestId('skill-decision-notice');
+    expect(notice).toHaveTextContent(en.skills.proposals.changedTurnDown);
+    expectPlain(notice.textContent);
+  });
+
+  it("shows a refusal in the reader's language by its code, not the Core's English", async () => {
+    // Killed by: frontend/src/components/settings/SkillProposals.tsx :: : refusalCopy(err) ?? plainFailure(err, failed),
+    // Becomes: : plainFailure(err, failed),
+    mockFetch(() => payload([], [proposal()]), {
+      'POST /api/skills/tidy-notes/approve': () =>
+        jsonResponse(
+          { detail: 'This proposal holds files besides its instructions.', code: 'extra_files' },
+          false,
+          409,
+        ),
+    });
+    render(
+      <LocaleProvider hints={['ko-KR']}>
+        <SkillsSection />
+      </LocaleProvider>,
+    );
+
+    fireEvent.click(await screen.findByTestId('skill-proposal-approve'));
+
+    const notice = await screen.findByTestId('skill-decision-notice');
+    expect(notice).toHaveTextContent(ko.skills.refusals.extra_files);
+    expect(notice).not.toHaveTextContent('holds files');
+    expect(notice).not.toHaveTextContent('extra_files');
+    expectPlain(notice.textContent);
+  });
+
+  it('every refusal is plain in both languages', () => {
+    for (const refusals of [en.skills.refusals, ko.skills.refusals]) {
+      for (const text of Object.values(refusals)) expectPlain(text);
+    }
+    expect(Object.keys(ko.skills.refusals).sort()).toEqual(Object.keys(en.skills.refusals).sort());
   });
 
   it('offers a confirmed window when this window may not decide, without the refusal text', async () => {

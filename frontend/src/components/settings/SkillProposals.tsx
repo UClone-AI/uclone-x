@@ -13,9 +13,10 @@ import type { SkillProposal } from '../../types';
  * here. Approve and Turn down act on one proposal's version; Revoke stops an approved skill
  * that did not ship with UClone-X. The Core accepts each only from a window it opened itself
  * (#1589), so a refusal for that reason offers to open one, as the story view does. Approve
- * sends the digest of the text shown, and the Core installs that text or nothing; when the
- * proposal changed since, the panel says so and shows it again. Any other refusal is the
- * Core's own plain sentence, or a fixed one when it gave none.
+ * and Turn down send the digest of the text shown, and the Core acts on that text or not at
+ * all; when the proposal changed since, the panel says so and shows it again. Any other
+ * refusal is shown by its `code` in the reader's language, else as the Core's own plain
+ * sentence, or a fixed one when it gave none.
  */
 
 async function postDecision(name: string, action: string, body: object): Promise<void> {
@@ -43,8 +44,20 @@ export function useSkillDecisions(onChanged: () => void): SkillDecisions {
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [unconfirmed, setUnconfirmed] = useState(false);
+  // A refusal's `code` names its sentence in the reader's language (#1865); an unknown code
+  // or none falls back to the Core's English `detail`.
+  const refusals: Record<string, string> = copy.refusals;
+  const refusalCopy = (err: unknown): string | null =>
+    err instanceof CoreFailure && err.coreCode !== null && Object.prototype.hasOwnProperty.call(refusals, err.coreCode)
+      ? refusals[err.coreCode]
+      : null;
 
-  const decide = async (run: () => Promise<void>, done: string, failed: string) => {
+  const decide = async (
+    run: () => Promise<void>,
+    done: string,
+    failed: string,
+    changed: string = copy.proposals.changed,
+  ) => {
     setBusy(true);
     setNotice(null);
     setUnconfirmed(false);
@@ -54,15 +67,15 @@ export function useSkillDecisions(onChanged: () => void): SkillDecisions {
     } catch (err) {
       console.error('Skills: a decision failed', err);
       const notThisWindow = err instanceof CoreFailure && err.status === 403;
-      // 412: the proposal is no longer the text shown, so nothing was approved (#1827).
+      // 412: the proposal is no longer the text shown, so nothing was decided (#1827, #1865).
       const changedSinceShown = err instanceof CoreFailure && err.status === 412;
       setUnconfirmed(notThisWindow);
       setNotice(
         notThisWindow
           ? copy.confirmWindow.unconfirmed
           : changedSinceShown
-          ? copy.proposals.changed
-          : plainFailure(err, failed),
+          ? changed
+          : refusalCopy(err) ?? plainFailure(err, failed),
       );
     } finally {
       setBusy(false);
@@ -82,9 +95,10 @@ export function useSkillDecisions(onChanged: () => void): SkillDecisions {
       ),
     turnDown: (p) =>
       decide(
-        () => postDecision(p.name, 'reject', { version: p.version }),
+        () => postDecision(p.name, 'reject', { version: p.version, seen_digest: p.digest }),
         fmt(copy.proposals.turnedDown, { name: p.name }),
         copy.proposals.turnDownFailed,
+        copy.proposals.changedTurnDown,
       ),
     revoke: (name) =>
       decide(

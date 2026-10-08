@@ -41,7 +41,7 @@ from uclone_x.errors import (
     ADKUnmappedRoleError,
     ADKUnrepresentableMessageError,
 )
-from uclone_x.llm.models import ChatMessage, MessageRole, ToolCallRequest
+from uclone_x.llm.models import ChatMessage, ImagePart, MessageRole, ToolCallRequest
 
 # ---------------------------------------------------------------------------------------
 # Fixtures: the shapes that actually exercise the hard parts.
@@ -472,7 +472,7 @@ def test_fields_with_no_adk_slot_raise_rather_than_being_dropped(message: ChatMe
 def test_a_shortened_tool_result_is_refused_rather_than_losing_its_form() -> None:
     """A FunctionResponse has no slot for ``form``; dropping it would read back as full.
 
-    Killed by: src/uclone_x/adapters/uclone2/adk_content.py :: if message.form is not None:
+    Killed by: src/uclone_x/adapters/uclone2/adk_content.py :: if message.form is not None or message.rendered_from is not None:
     Becomes: if False:
     """
     message = ChatMessage(
@@ -837,7 +837,7 @@ def test_adk_mirror_conforms_to_real_sdk() -> None:
     """Verify that ADKContent mirror types exactly match the real google.genai types.
 
     Permitted by the P5 test-only SDK import exception (Issue #381).
-    Skips if the optional `llm` extra is absent ("Requires uv sync --extra llm").
+    Skips if google-genai (in the `dev` extra) is absent.
     Fails loudly if the schemas diverge.
     """
     try:
@@ -845,7 +845,7 @@ def test_adk_mirror_conforms_to_real_sdk() -> None:
             types as genai_types,  # pyright: ignore[reportUnknownVariableType]
         )
     except ImportError:
-        pytest.skip("Requires uv sync --extra llm")
+        pytest.skip("Requires google-genai (uv sync --extra dev)")
 
     # Construct a complete mirror content representing what we emit
     content = ADKContent(role=ADK_ROLE_USER, parts=(ADKPart(text="test text"),))
@@ -867,3 +867,16 @@ def test_adk_mirror_conforms_to_real_sdk() -> None:
 
     # 3. Verify round-trip equivalence
     assert mirror == content
+
+
+@pytest.mark.parametrize("role", [MessageRole.USER, MessageRole.TOOL])
+def test_a_message_with_an_image_is_refused_not_sent_as_text_only(role: MessageRole) -> None:
+    """The adapter maps text; a picture it cannot carry is refused, never dropped (#2107).
+
+    Killed by: src/uclone_x/adapters/uclone2/adk_content.py :: if message.images:
+    Becomes: if False:
+    """
+    image = ImagePart.from_bytes(b"probe", "image/png")
+    message = _MINIMAL_BY_ROLE[role].model_copy(update={"images": (image,)})
+    with pytest.raises(ADKUnrepresentableMessageError, match="image"):
+        ADKContentAdapter.to_adk_content(message)

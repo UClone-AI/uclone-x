@@ -2,11 +2,11 @@
  * The two requests behind the persona editor (#892): read the catalogue, save a draft.
  * Kept apart from `personaDraft.ts` so the editor components never import a request.
  */
-import { fmt } from '../i18n/format';
 import type { PersonaCatalog, PersonaInfo } from '../types';
 import { failureOf } from './coreFailure';
 import {
   describeRefusal,
+  draftFromPersona,
   type PersonaDraft,
   type PersonaEditMode,
   type PersonaEditorCopy,
@@ -14,14 +14,17 @@ import {
   type PromptDraftResult,
 } from './personaDraft';
 
+/** `GET /api/clones`, whose `clones` are the catalogue's entries. */
 export const fetchPersonaCatalog = async (): Promise<PersonaCatalog> => {
-  const res = await fetch('/api/personas');
+  const res = await fetch('/api/clones');
   if (!res.ok) throw await failureOf(res);
-  const data = (await res.json()) as Partial<PersonaCatalog>;
+  const data = (await res.json()) as Partial<Omit<PersonaCatalog, 'personas'>> & { clones?: PersonaInfo[] };
   return {
-    personas: data.personas ?? [],
+    personas: data.clones ?? [],
     available_tools: data.available_tools ?? [],
     personas_dir: data.personas_dir ?? null,
+    base_tools: data.base_tools ?? [],
+    write_tools: data.write_tools ?? [],
   };
 };
 
@@ -30,26 +33,28 @@ export const savePersona = async (
   mode: PersonaEditMode,
   copy: PersonaEditorCopy,
 ): Promise<PersonaSaveResult> => {
-  const url = mode === 'create' ? '/api/personas' : `/api/personas/${encodeURIComponent(draft.name)}`;
+  // An edit addresses the clone by its id; the body carries only what the clone is.
+  const { id, ...body } = draft;
+  const url = mode === 'create' ? '/api/clones' : `/api/clones/${encodeURIComponent(id || draft.name)}`;
   let res: Response;
   try {
     res = await fetch(url, {
       method: mode === 'create' ? 'POST' : 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(draft),
+      body: JSON.stringify(body),
     });
-  } catch (err) {
-    return { ok: false, message: fmt(copy.unreachable, { reason: String(err) }) };
+  } catch (_err) {
+    return { ok: false, message: copy.unreachable };
   }
-  const body = (await res.json().catch(() => ({}))) as {
+  const answer = (await res.json().catch(() => ({}))) as {
     persona?: PersonaInfo;
     live_agents_updated?: number;
     detail?: unknown;
   };
-  if (!res.ok || !body.persona) {
-    return { ok: false, message: describeRefusal(body.detail, res.status, copy) };
+  if (!res.ok || !answer.persona) {
+    return { ok: false, message: describeRefusal(answer.detail, res.status, copy) };
   }
-  return { ok: true, persona: body.persona, liveAgentsUpdated: body.live_agents_updated ?? 0 };
+  return { ok: true, persona: answer.persona, liveAgentsUpdated: answer.live_agents_updated ?? 0 };
 };
 
 export const synthesizePersonaPrompt = async (params: {
@@ -59,7 +64,7 @@ export const synthesizePersonaPrompt = async (params: {
   allowed_tools: readonly string[];
 }): Promise<PromptDraftResult> => {
   try {
-    const res = await fetch('/api/personas/synthesize', {
+    const res = await fetch('/api/clones/synthesize', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(params),
@@ -72,7 +77,7 @@ export const synthesizePersonaPrompt = async (params: {
       detail?: string;
     };
     if (!res.ok) {
-      return { ok: false, message: data.detail || `HTTP ${res.status}` };
+      return { ok: false, message: data.detail || 'The draft could not be generated.' };
     }
     const prompt = data.system_prompt ?? '';
     if (!prompt) return { ok: false, message: 'the server returned no draft' };
@@ -90,3 +95,28 @@ export const synthesizePersonaPrompt = async (params: {
   }
 };
 
+
+/**
+ * "Use system default" on a turn that failed on a clone's own model (model-gateway.md §3.6):
+ * the clone's slots that name `ref` are cleared, so they follow the default again, and every
+ * other field is sent back as the Core holds it. A clone with no slot naming `ref` any more
+ * has its conversation model cleared, the slot the failure is about. Rejects with the Core's
+ * refusal.
+ */
+export const clearCloneModel = async (clone: string, ref: string): Promise<PersonaInfo> => {
+  const read = await fetch(`/api/clones/${encodeURIComponent(clone)}`);
+  if (!read.ok) throw await failureOf(read);
+  const { persona } = (await read.json()) as { persona: PersonaInfo };
+  const draft = draftFromPersona(persona);
+  const slots = ['model_name', 'fast_model', 'image_model'] as const;
+  const named = slots.filter((slot) => draft[slot] === ref);
+  for (const slot of named.length > 0 ? named : (['model_name'] as const)) draft[slot] = null;
+  const { id, ...fields } = draft;
+  const saved = await fetch(`/api/clones/${encodeURIComponent(id || draft.name)}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(fields),
+  });
+  if (!saved.ok) throw await failureOf(saved);
+  return ((await saved.json()) as { persona: PersonaInfo }).persona;
+};

@@ -72,12 +72,19 @@ describe('fmt', () => {
 describe('plural', () => {
   const forms = { one: '{count} tool from {name}', other: '{count} tools from {name}' };
 
-  // Killed by: frontend/src/i18n/format.ts ::   fmt(count === 1 ? forms.one : forms.other, { ...values, count });
+  // Killed by: frontend/src/i18n/format.ts ::   fmt(count === 0 && forms.zero ? forms.zero : count === 1 ? forms.one : forms.other, { ...values, count });
   // Becomes:   fmt(forms.other, { ...values, count });
   it('uses `one` for exactly one and `other` for every other count', () => {
     expect(plural(forms, 1, { name: 'git' })).toBe('1 tool from git');
     expect(plural(forms, 0, { name: 'git' })).toBe('0 tools from git');
     expect(plural(forms, 2, { name: 'git' })).toBe('2 tools from git');
+  });
+
+  it('uses `zero` when provided and count is 0', () => {
+    const withZero = { ...forms, zero: 'no tools from {name}' };
+    expect(plural(withZero, 0, { name: 'git' })).toBe('no tools from git');
+    expect(plural(withZero, 1, { name: 'git' })).toBe('1 tool from git');
+    expect(plural(withZero, 2, { name: 'git' })).toBe('2 tools from git');
   });
 });
 

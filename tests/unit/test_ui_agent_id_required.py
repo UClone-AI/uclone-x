@@ -31,7 +31,7 @@ def test_the_refusal_says_where_to_find_the_names(client: TestClient) -> None:
     assert refused.status_code == 400, refused.text
     detail = refused.json()["detail"]
 
-    assert "/api/personas" in detail
+    assert "/api/clones" in detail
     assert "no default agent" in detail
 
 

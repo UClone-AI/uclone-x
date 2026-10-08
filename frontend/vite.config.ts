@@ -38,6 +38,8 @@ export default defineConfig({
       '/api': {
         target: 'http://localhost:5180',
         changeOrigin: true,
+        // The dock's Browser tab is a WebSocket under /api (browser-agent.md §3.4).
+        ws: true,
       },
     },
   },

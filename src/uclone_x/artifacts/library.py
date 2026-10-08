@@ -44,7 +44,6 @@ from __future__ import annotations
 
 import logging
 import os
-import re
 import shutil
 import unicodedata
 from collections.abc import Callable
@@ -55,6 +54,11 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from uclone_x.artifacts.kinds import (
+    FolderItemUnreadableError,
+    LeasedFolderKind,
+    UnknownFolderItemError,
+)
 from uclone_x.errors import (
     HeadRoomWriteError,
     PathTraversalError,
@@ -63,17 +67,10 @@ from uclone_x.errors import (
     StaleRoomWriteError,
     UnreadableRoomRecordError,
 )
-from uclone_x.room.models import RoomState, head_room_write_refusal, room_head
+from uclone_x.extensions import leased_folder_kinds
+from uclone_x.room.models import RoomState, head_room_write_refusal
 from uclone_x.room.service import RoomService
 from uclone_x.sandbox.path_validator import PathValidator
-from uclone_x.story.library import (
-    STORIES_DIRNAME,
-    STORY_FILE,
-    StoryError,
-    StoryLibrary,
-    StoryRecord,
-    UnknownStoryError,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -98,9 +95,11 @@ __all__ = [
     "StoryWriter",
 ]
 
-#: The workspace folders this service lists and changes. `artifacts/` is where the image
-#: and document tools save by default; `stories/` is the story library (#1555).
-ARTIFACT_ROOTS: tuple[str, ...] = ("artifacts", STORIES_DIRNAME)
+#: The workspace folders this service lists and changes, before any leased folder kind's
+#: root is added: `artifacts/` is where the image and document tools save by default. An
+#: extension's leased folder kind adds its own root -- the story library's `stories/`
+#: (#1555, #2205).
+ARTIFACT_ROOTS: tuple[str, ...] = ("artifacts",)
 
 #: Where an archived file waits, under the workspace, at its original relative path.
 ARCHIVE_DIRNAME = ".archive"
@@ -125,7 +124,6 @@ MAX_OPEN_BYTES = 1_000_000
 
 _IMAGE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".webp", ".svg", ".gif"})
 _DOCUMENT_SUFFIXES = frozenset({".md", ".txt", ".json", ".yaml", ".yml", ".csv", ".html"})
-_STORY_ID = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 
 Kind = Literal["document", "image", "story", "file"]
 
@@ -295,14 +293,6 @@ def _stamp(seconds: float) -> str:
     return datetime.fromtimestamp(seconds, tz=UTC).isoformat()
 
 
-def _is_story_folder(folder: Path) -> bool:
-    return (
-        _STORY_ID.fullmatch(folder.name) is not None
-        and not folder.is_symlink()
-        and (folder / STORY_FILE).is_file()
-    )
-
-
 def _same_entry(entry: Path, candidate: Path) -> bool:
     """Whether the directory entry `entry` is the file `candidate` names, links unfollowed.
 
@@ -339,14 +329,27 @@ class ArtifactLibrary:
         rooms: RoomService,
         *,
         turn_in_flight: Callable[[str], bool],
+        kinds: tuple[LeasedFolderKind, ...] | None = None,
     ) -> None:
         """`turn_in_flight(room_id)` says whether that conversation is answering now.
 
-        It is required, not defaulted, so the caller must say how it knows.
+        It is required, not defaulted, so the caller must say how it knows. `kinds` are the
+        leased folder kinds listed one item per folder (the story library); by default the
+        ones the installed extensions add (`extensions.leased_folder_kinds`, #2205).
         """
         self._workspace = workspace.resolve()
         self._rooms = rooms
         self._turn_in_flight = turn_in_flight
+        self._kinds = {
+            kind.root: kind for kind in (leased_folder_kinds() if kinds is None else kinds)
+        }
+        self._roots: tuple[str, ...] = (*ARTIFACT_ROOTS, *self._kinds)
+
+    def _story_kind(self) -> LeasedFolderKind:
+        """The one leased folder kind a story id names, refused when none is installed."""
+        for kind in self._kinds.values():
+            return kind
+        raise ArtifactNotFoundError("Stories are not available here, so none was opened.")
 
     # -- listing ------------------------------------------------------------------------
 
@@ -376,16 +379,17 @@ class ArtifactLibrary:
         skipped_links = 0
         for archived in (False, True):
             base = self._workspace / ARCHIVE_DIRNAME if archived else self._workspace
-            for root in ARTIFACT_ROOTS:
+            for root in self._roots:
                 folder = base / root
                 if not folder.is_dir() or folder.is_symlink():
                     continue
                 listed, links = self._walk(folder, root, archived, written, gaps)
                 skipped_links += links
                 entries.extend(listed)
-                if root == STORIES_DIRNAME:
+                kind = self._kinds.get(root)
+                if kind is not None:
                     entries.extend(
-                        self._stories(folder, archived, written, story_rooms, titles, gaps)
+                        self._stories(kind, folder, archived, written, story_rooms, titles, gaps)
                     )
         entries.extend(self._recorded_elsewhere(written, gaps))
         if skipped_links:
@@ -455,7 +459,8 @@ class ArtifactLibrary:
                     links += 1
                     continue
                 if child.is_dir():
-                    if current == folder and root == STORIES_DIRNAME and _is_story_folder(child):
+                    kind = self._kinds.get(root) if current == folder else None
+                    if kind is not None and kind.is_item(child):
                         continue  # listed whole by `_stories`
                     stack.append(child)
                     continue
@@ -497,6 +502,7 @@ class ArtifactLibrary:
 
     def _stories(
         self,
+        kind: LeasedFolderKind,
         folder: Path,
         archived: bool,
         written: dict[str, list[ConversationRef]],
@@ -505,15 +511,15 @@ class ArtifactLibrary:
         gaps: list[str],
     ) -> list[ArtifactEntry]:
         """One entry per story folder, carrying its files and who is writing it."""
-        # The story library reads `<base>/stories`; for the archive, base is `.archive`.
-        library = StoryLibrary(folder.parent)
+        # The kind reads `<base>/<root>`; for the archive, base is `.archive`.
+        base = folder.parent
         entries: list[ArtifactEntry] = []
         try:
             children = sorted(folder.iterdir())
         except OSError:
             return entries  # `_walk` already reported this folder
         for child in children:
-            if child.name.startswith(".") or not child.is_dir() or not _is_story_folder(child):
+            if child.name.startswith(".") or not child.is_dir() or not kind.is_item(child):
                 continue
             story_id = child.name
             relative = self._display(child)
@@ -522,13 +528,13 @@ class ArtifactLibrary:
             reason: str | None = None
             writer: StoryWriter | None = None
             try:
-                record = library.load(story_id)
-            except StoryError as exc:
+                record = kind.load(base, story_id)
+            except FolderItemUnreadableError as exc:
                 reason = str(exc)
             else:
                 title = record.title
-                if record.lease is not None and not archived:
-                    holder = record.lease.holder
+                if record.holder is not None and not archived:
+                    holder = record.holder
                     writer = StoryWriter(
                         room_id=holder, title=titles.get(holder), exists=holder in titles
                     )
@@ -591,7 +597,7 @@ class ArtifactLibrary:
         entries: list[ArtifactEntry] = []
         for relative in sorted(written):
             head = relative.split("/", 1)[0]
-            if head in ARTIFACT_ROOTS or head == ARCHIVE_DIRNAME:
+            if head in self._roots or head == ARCHIVE_DIRNAME:
                 continue
             path = self._workspace / relative
             if path.is_symlink() or not path.is_file():
@@ -615,7 +621,7 @@ class ArtifactLibrary:
         head = relative.split("/", 1)[0]
         if head == ARCHIVE_DIRNAME:
             head = relative.split("/", 2)[1] if relative.count("/") >= 1 else ""
-        if head not in ARTIFACT_ROOTS and not self._recorded(relative):
+        if head not in self._roots and not self._recorded(relative):
             raise ArtifactError("That file is not one the clones saved, so it is not opened here.")
         absolute = self._workspace / relative
         if not absolute.is_file():
@@ -663,7 +669,7 @@ class ArtifactLibrary:
                 "that copy first."
             )
         if located.story_id is not None:
-            self._settle_lease(located.story_id, release_writer)
+            self._settle_lease(self._kinds[located.root], located.story_id, release_writer)
         target.parent.mkdir(parents=True, exist_ok=True)
         os.replace(located.absolute, target)
         note = None
@@ -806,7 +812,7 @@ class ArtifactLibrary:
         resolved = self._workspace.joinpath(*parts)
         archived = bool(parts) and parts[0] == ARCHIVE_DIRNAME
         body = parts[1:] if archived else parts
-        if len(body) < 2 or body[0] not in ARTIFACT_ROOTS:
+        if len(body) < 2 or body[0] not in self._roots:
             raise ArtifactError(
                 "Only files in the artifacts and stories folders can be archived or deleted here."
             )
@@ -824,9 +830,10 @@ class ArtifactLibrary:
                 "what is there."
             )
         story_id: str | None = None
-        if body[0] == STORIES_DIRNAME:
-            story_folder = base / STORIES_DIRNAME / body[1]
-            if _is_story_folder(story_folder):
+        kind = self._kinds.get(body[0])
+        if kind is not None:
+            story_folder = base / body[0] / body[1]
+            if kind.is_item(story_folder):
                 if len(body) > 2:
                     raise ArtifactError(
                         f"{resolved.name} is part of the story '{body[1]}'. Archive or delete the "
@@ -842,18 +849,17 @@ class ArtifactLibrary:
             story_id=story_id,
         )
 
-    def _settle_lease(self, story_id: str, release_writer: bool) -> None:
+    def _settle_lease(self, kind: LeasedFolderKind, story_id: str, release_writer: bool) -> None:
         """Refuse, or give back, the writing lease before a story leaves the library."""
-        library = StoryLibrary(self._workspace)
         try:
-            record = library.load(story_id)
-        except StoryError:
+            record = kind.load(self._workspace, story_id)
+        except FolderItemUnreadableError:
             # `story.yaml` does not load, so no lease can be read -- and none is honoured:
             # the story tools refuse an unreadable story the same way.
             return
-        if record.lease is None:
+        if record.holder is None:
             return
-        holder = record.lease.holder
+        holder = record.holder
         state: RoomState | None = None
         exists = True
         try:
@@ -880,7 +886,7 @@ class ArtifactLibrary:
                 room_id=holder,
                 title=title,
             )
-        library.release(story_id, holder)
+        kind.release(self._workspace, story_id, holder)
         if state is not None and state.story_id == story_id:
             self._rooms.set_story(holder, None)
         logger.info("Released story %r from conversation %s before moving it", story_id, holder)
@@ -902,22 +908,20 @@ class ArtifactLibrary:
             ) from exc
         # Before the lease is touched: a room a head keeps is written by that head alone
         # (#1885), so the story is neither leased to it nor named in it.
-        head = room_head(room)
+        head = room.head
         if head is not None:
             raise HeadRoomWriteError(head_room_write_refusal(head))
-        library = StoryLibrary(self._workspace)
+        kind = self._story_kind()
         try:
-            opening = library.open(story_id, room_id)
-        except UnknownStoryError as exc:
+            record, writable = kind.open(self._workspace, story_id, room_id)
+        except UnknownFolderItemError as exc:
             raise ArtifactNotFoundError(
                 f"There is no story called '{story_id}' any more. Refresh the list to see the "
                 "stories there are."
             ) from exc
-        record: StoryRecord = opening.story
-        writable = opening.writable
         note: str | None = None
-        if not writable and record.lease is not None:
-            holder = record.lease.holder
+        if not writable and record.holder is not None:
+            holder = record.holder
             try:
                 holder_title: str | None = self._rooms.get(holder).title
                 holder_exists = True
@@ -932,7 +936,7 @@ class ArtifactLibrary:
                     "but not change it."
                 )
             else:
-                record, _ = library.take_over(story_id, room_id)
+                record = kind.take_over(self._workspace, story_id, room_id)
                 writable = True
         self._rooms.set_story(room_id, story_id)
         return StoryOpened(

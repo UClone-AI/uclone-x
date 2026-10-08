@@ -18,7 +18,7 @@ type Outcome =
   | { kind: 'failed'; name: string; failure: AvatarFailure };
 
 /**
- * **Use as avatar ▾** under a picture a clone drew.
+ * **Use as avatar ▾** under a picture a clone drew, in the card's one row of actions.
  *
  * The button gives the picture to the clone that wrote the message; the chevron lists every
  * clone, for a picture one clone drew for another. It is a direct act -- the picture is set
@@ -74,7 +74,7 @@ export const UseAsAvatar: React.FC<{ path: string }> = ({ path }) => {
   return (
     <span
       data-testid="use-as-avatar"
-      className="flex flex-wrap items-center justify-end gap-x-3 gap-y-1 border-t border-slate-800 px-3 py-1.5 text-[11px] text-slate-400"
+      className="inline-flex flex-wrap items-center justify-end gap-x-3 gap-y-1 text-[11px] text-slate-400"
     >
       {working && (
         <span role="status" className="text-slate-500">

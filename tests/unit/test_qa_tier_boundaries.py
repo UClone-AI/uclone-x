@@ -123,7 +123,7 @@ def test_live_scope_selects_live_tests_and_carries_the_opt_in() -> None:
     assert "--live" in cmd
 
 
-@pytest.mark.parametrize("scope", ["unit", "recorded", "e2e", "all"])
+@pytest.mark.parametrize("scope", ["unit", "recorded", "e2e", "gate"])
 def test_only_the_live_scope_opts_into_live_execution(scope: str) -> None:
     """No other scope may spend tokens."""
     assert "--live" not in build_pytest_command(scope)
@@ -154,14 +154,6 @@ def test_no_everyday_scope_opts_into_release_qualification(scope: str) -> None:
     Becomes: if test_scope in ("pre-release", "live"):
     """
     assert "--pre-release" not in build_pytest_command(scope)
-
-
-def test_all_scope_still_excludes_the_paid_and_recorded_tiers() -> None:
-    """`--all` is documented as "Unit + E2E"; it must not silently mean "everything"."""
-    expression = _marker_expression(build_pytest_command("all"))
-    assert "not recorded" in expression
-    assert "not live" in expression
-    assert "not e2e" not in expression
 
 
 def test_unknown_scope_raises_instead_of_widening_selection() -> None:

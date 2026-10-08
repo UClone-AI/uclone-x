@@ -23,15 +23,14 @@ import { describe, it, expect } from 'vitest';
  *
  * Out of scope, deliberately, and each for a stated reason:
  *
- *   - `components/artifacts/ResourceSummary.tsx:294` pulses a dot. §3.2.6 places it outside
- *     this redesign by name, so it stays and this check does not read it.
  *   - `components/ui/StatusDot.tsx` is the pre-kit copy, still drawn by `Header`,
  *     `PlaygroundTab` and `ResourceSummary`. The rail reads the kit's copy instead, so
  *     flattening this one is a change to three surfaces this branch is not about.
  *   - `App.tsx`'s dock opener carries a cyan halo, which §3.2.6 likewise leaves alone.
  *
  * Widening the scope is a change to those surfaces, not to this test: add the file to
- * `SCANNED` once it has actually been quieted.
+ * `SCANNED` once it has actually been quieted. `ResourceSummary.tsx` and `PersonaEditor.tsx`
+ * were quieted under #1061.
  */
 
 /** Every script in the kit, as text. The raw glob is Vite's; `?raw` needs no `@types/node`. */
@@ -42,7 +41,12 @@ const KIT_SOURCES: Record<string, string> = import.meta.glob(
 
 /** This head's side of the rail: the words, the glyphs, the binding. */
 const HEAD_SOURCES: Record<string, string> = import.meta.glob(
-  ['./components/layout/WorkspaceSidebar.tsx', './components/rooms/*.tsx'],
+  [
+    './components/layout/WorkspaceSidebar.tsx',
+    './components/rooms/*.tsx',
+    './components/artifacts/ResourceSummary.tsx',
+    './components/personas/PersonaEditor.tsx',
+  ],
   { query: '?raw', import: 'default', eager: true },
 );
 
@@ -77,6 +81,12 @@ describe('the rail stays still (#1061)', () => {
     // and this head binds three files to it.
     expect(Object.keys(KIT_SOURCES).length).toBeGreaterThanOrEqual(11);
     expect(Object.keys(HEAD_SOURCES).length).toBeGreaterThanOrEqual(1);
+    expect(Object.keys(HEAD_SOURCES)).toEqual(
+      expect.arrayContaining([
+        './components/artifacts/ResourceSummary.tsx',
+        './components/personas/PersonaEditor.tsx',
+      ]),
+    );
 
     expect(restlessOffences(SCANNED)).toEqual([]);
   });

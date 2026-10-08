@@ -22,6 +22,8 @@ from uclone_x.errors import (
     ProviderFailureError,
     ProviderUnreachableError,
 )
+from uclone_x.llm.context_window import LISTED_CONTEXT_WINDOWS, ListedContextWindows
+from uclone_x.llm.providers import canonical_provider
 
 CatalogStatus = Literal["live", "no_key", "key_rejected", "unreachable", "no_listing"]
 
@@ -53,6 +55,47 @@ class CatalogEntry(BaseModel):
     created_at: datetime | None = Field(
         default=None, description="When the provider says the model was published, if it does."
     )
+    accepts_images: bool = Field(
+        default=False,
+        description="True only when the provider's own listing says the model reads images "
+        "(Anthropic's `capabilities.image_input.supported`, #2107). False when the listing "
+        "is silent, as OpenAI's and Gemini's are: nothing here guesses from a model's name.",
+    )
+
+
+class ListedImageInput:
+    """Which listed models their provider says read images (#2107).
+
+    Filled from the catalogue (`read_catalog`) whenever a listing is read, and by a connector
+    that reads its provider's listing to answer `accepts_images`. Like `ListedContextWindows`
+    a model is found by its id exactly, never by a prefix. `get` is `None` for a provider
+    whose listing was never read here, so a caller can tell "not read" from "read, and no".
+    """
+
+    def __init__(self) -> None:
+        self._read: set[str] = set()
+        self._accepting: set[tuple[str, str]] = set()
+
+    def remember(self, provider: str, entries: Sequence[CatalogEntry]) -> None:
+        """Record which of `entries` read images, and that `provider`'s listing was read."""
+        key = canonical_provider(provider) or provider.strip().lower()
+        self._read.add(key)
+        for entry in entries:
+            if entry.accepts_images:
+                self._accepting.add((key, entry.id.strip()))
+
+    def get(self, provider: str | None, model: str | None) -> bool | None:
+        """Whether `model` reads images, or `None` when no listing of `provider` was read."""
+        if not provider:
+            return None
+        key = canonical_provider(provider) or provider.strip().lower()
+        if key not in self._read:
+            return None
+        return bool(model) and (key, (model or "").strip()) in self._accepting
+
+
+#: The store a turn reads. One per process, like `LISTED_CONTEXT_WINDOWS`.
+LISTED_IMAGE_INPUT = ListedImageInput()
 
 
 class CatalogResult(BaseModel):
@@ -88,11 +131,17 @@ async def read_catalog(
     lister: Lister | None,
     recommend: Callable[[str, Sequence[CatalogEntry]], str | None],
     now: Callable[[], datetime] = lambda: datetime.now(UTC),
+    windows: ListedContextWindows | None = None,
+    images: ListedImageInput | None = None,
 ) -> CatalogResult:
     """Ask the provider for its listing, and say plainly why when it cannot be read.
 
     `lister` is None when there is no key to ask with. `display_provider` is the name the
     user holds the key with ("Google"), for the sentence; `provider` is the settings id.
+    The window each listed model reports is remembered in `windows`
+    (`LISTED_CONTEXT_WINDOWS` by default), where the compaction trigger and the room's
+    context readout look it up (#1978). Whether each reads images is remembered in `images`
+    (`LISTED_IMAGE_INPUT` by default), where a turn asks before offering `look` (#2107).
     """
     if lister is None:
         return CatalogResult(provider=provider, status="no_key", detail=_NO_KEY_DETAIL)
@@ -114,6 +163,8 @@ async def read_catalog(
             status="no_listing",
             detail=_NO_LISTING_DETAIL.format(provider=display_provider),
         )
+    (windows if windows is not None else LISTED_CONTEXT_WINDOWS).remember(provider, listed)
+    (images if images is not None else LISTED_IMAGE_INPUT).remember(provider, listed)
     return CatalogResult(
         provider=provider,
         status="live",

@@ -29,12 +29,12 @@ branch and no backport policy for security fixes.
 ## Current security posture — read before relying on this project
 
 UClone-X maintains an explicit threat model and security boundary analysis in:
-👉 [`docs/security-threat-model.md`](docs/security-threat-model.md)
+👉 [`docs/public/security.md`](docs/public/security.md)
 
 Key security properties of the architecture:
 
 - **Sandbox Default Isolation**: Per Principle 3, the default execution sandbox isolation level is `workspace` (restricting filesystem writes to dedicated directories/worktrees). `none` is available only via explicit user opt-in.
 - **Skill Execution & Synthesis**: Dynamic skill synthesis is subject to human-in-the-loop verification and Skill Auditor inspection (Fail-Closed default).
-- **A2A Dual-Transport**: In-memory transport operates within the same process boundaries, while external connections adhere to Google A2A protocol authentication and authorization standards.
+- **A2A and ACP servers**: `ucx a2a serve` and `ucx acp` do not authenticate their callers and `ucx a2a serve` has no TLS. Anyone who can reach the port can submit tasks, so keep the default `127.0.0.1` binding.
 
-Do not assume any protection beyond what is explicitly documented in [`docs/security-threat-model.md`](docs/security-threat-model.md). If you are evaluating UClone-X for untrusted execution scenarios, review the threat model in full before proceeding.
+Do not assume any protection beyond what is explicitly documented in [`docs/public/security.md`](docs/public/security.md). If you are evaluating UClone-X for untrusted execution scenarios, review the threat model in full before proceeding.

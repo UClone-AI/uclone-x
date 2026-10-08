@@ -469,7 +469,7 @@ def test_the_measured_agent_cannot_edit_the_tree_its_answers_are_checked_against
 ) -> None:
     """Giving the agent a workspace also gave it write access, and the first run used it.
 
-    `qwen3:1.7b` renamed a row in `docs/nfr-performance-budgets.md` part-way through the
+    `qwen3:1.7b` renamed a row in the performance-budgets document part-way through the
     100 problems. That is not a capability finding: every later problem about that file is
     then a question about a tree the benchmark itself changed. All 100 frontier problems
     ask the agent to check a claim; none ask it to modify anything.

@@ -8,9 +8,19 @@ and the message itself is stored once as a body in the session's context body st
 (#1421) under that digest -- so the record grows by a few fields per message, not by the
 message.
 
-A tool result whose history form is an excerpt of a stored result (#1422) also names the
-`tr_` handle of the full body in the tool-result blob store, so the log holds every tool
-output in full even where the history keeps only its head and tail.
+A tool result too long to keep whole in the history (#1422) is logged twice: as the
+full redacted output, an entry whose body is the text itself (`logged_text`), and as the
+form the history shows it in -- the message with its `form` and what it was rendered
+from (`ChatMessage.rendered_from`), and no text -- whose entry names the same `tr_`
+handle. The handle is the first 16 hex digits of the full body's digest, so it resolves
+only among the session's own entries (`stored_result_entry`). The log holds every tool
+output in full, and never the text of an excerpt or stub: that is rendered from the full
+body wherever it is read (#1848).
+
+A tool result that fit the history whole and is stubbed later, by compaction, is not
+logged again (#2013): the message entry that holds it already has its full text as its
+body, so the stub names that entry -- its handle is the first 16 hex digits of the
+message's own digest (`is_result_message`, `kept_result_text`).
 
 Kinds (#1849). A tool result is logged by what produced it: `subagent` for a delegated
 sub-agent's result, `retrieval` for a search tool's hits (`SUBAGENT_TOOLS`,
@@ -20,8 +30,12 @@ They are logged once per turn as a `memory` entry whose body is the section's te
 (`logged_text`), with the `tr_` handle `tool_result_read` reads it by. Logging them
 changes no request.
 
+A handle that names no such entry -- one from before #1848, whose body was a file under
+the workspace -- resolves to nothing, and reading it says the result is no longer
+available.
+
 The writer is `_LiveSession` in `agent/session_lifecycle.py`, the one place a session's
-history is held (`log_history` for messages, `log_entry` for the rest); a loaded record
+history is held (`_LiveSession.append` and its siblings for messages, `log_entry` for the rest); a loaded record
 is reconciled against its messages there too.
 """
 
@@ -30,7 +44,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Final
@@ -38,8 +52,7 @@ from typing import Final
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from uclone_x.core.secrets import redact_credentials
-from uclone_x.core.tool_results import handle_in
-from uclone_x.llm.models import ChatMessage, MessageRole
+from uclone_x.llm.models import ChatMessage, ImagePart, MessageRole, image_digest
 
 __all__ = [
     "RETRIEVAL_TOOLS",
@@ -49,10 +62,17 @@ __all__ = [
     "SessionLogKind",
     "SessionLogProvenance",
     "history_entry_ids",
+    "is_kept_text",
+    "is_result_message",
+    "kept_result_text",
     "log_kind",
     "logged_message",
     "logged_text",
+    "result_handle_of",
     "new_entry",
+    "stored_result_entry",
+    "tool_result_kind",
+    "with_image_data",
 ]
 
 
@@ -77,13 +97,10 @@ class SessionLogKind(StrEnum):
 class SessionLogProvenance(StrEnum):
     """How an entry came to be in the log.
 
-    `RECORDED`: written when the message entered the history. `MIGRATED`: backfilled when a
-    record written before the log existed was loaded -- the message is real, but when it
-    entered and what it displaced are not known, so its `turn` is `None`.
+    `RECORDED`: written when the message entered the history.
     """
 
     RECORDED = "recorded"
-    MIGRATED = "migrated"
 
 
 class SessionLogEntry(BaseModel):
@@ -93,9 +110,8 @@ class SessionLogEntry(BaseModel):
 
     id: str = Field(description="`e<n>`, the entry's position in the log.")
     kind: SessionLogKind
-    turn: int | None = Field(
-        description="The session's turn counter when the message entered the history; "
-        "`None` for a migrated entry."
+    turn: int = Field(
+        description="The session's turn counter when the message entered the history."
     )
     digest: str = Field(
         description="SHA-256 of the message's canonical JSON, the name its body is stored "
@@ -105,8 +121,8 @@ class SessionLogEntry(BaseModel):
     provenance: SessionLogProvenance
     blob: str | None = Field(
         default=None,
-        description="For a tool result held as an excerpt: the `tr_` handle of the full "
-        "result in the tool-result blob store.",
+        description="The `tr_` handle of a full tool result or memory section: on the "
+        "entry whose body is that text, and on an excerpt or stub that names it.",
     )
 
     @field_validator("digest")
@@ -128,6 +144,15 @@ SUBAGENT_TOOLS: Final = frozenset({"delegate_subagent"})
 RETRIEVAL_TOOLS: Final = frozenset({"query_memory_facts", "web_search", "file_search"})
 
 
+def tool_result_kind(tool_name: str | None) -> SessionLogKind:
+    """The kind of entry a result of the tool `tool_name` is logged as (#1849)."""
+    if tool_name in SUBAGENT_TOOLS:
+        return SessionLogKind.SUBAGENT
+    if tool_name in RETRIEVAL_TOOLS:
+        return SessionLogKind.RETRIEVAL
+    return SessionLogKind.TOOL_RESULT
+
+
 def log_kind(message: ChatMessage) -> SessionLogKind:
     """The kind of entry `message` is logged as.
 
@@ -138,11 +163,7 @@ def log_kind(message: ChatMessage) -> SessionLogKind:
     if message.role == MessageRole.SYSTEM:
         return SessionLogKind.SUMMARY if message.compaction_ledger else SessionLogKind.SYSTEM
     if message.role == MessageRole.TOOL:
-        if message.name in SUBAGENT_TOOLS:
-            return SessionLogKind.SUBAGENT
-        if message.name in RETRIEVAL_TOOLS:
-            return SessionLogKind.RETRIEVAL
-        return SessionLogKind.TOOL_RESULT
+        return tool_result_kind(message.name)
     if message.role == MessageRole.ASSISTANT and message.tool_calls:
         return SessionLogKind.TOOL_CALL
     return SessionLogKind.UTTERANCE
@@ -156,6 +177,9 @@ class LoggedMessage:
     digest: str
     kind: SessionLogKind
     blob: str | None
+    #: The message's image bytes, as (digest, base64) for each image that has them (#2107).
+    #: Never part of `body`: each is kept as its own context body, named by its digest.
+    images: tuple[tuple[str, str], ...] = ()
 
 
 def logged_message(message: ChatMessage) -> LoggedMessage:
@@ -164,17 +188,78 @@ def logged_message(message: ChatMessage) -> LoggedMessage:
     The body is the message's canonical JSON -- every field, keys sorted -- so it is the
     message, not a rendering of it, and `ChatMessage.model_validate_json(body)` gives it
     back. Callers pass messages that are already redacted, as everything in a history is.
+
+    A tool result shown in a smaller form is logged as its form, not its text (#1848): the
+    message with `form` and `rendered_from` and no `content`, and the entry's `blob` is
+    the handle of the full result it is rendered from. Any other message's entry names
+    no blob, whatever its text says: a handle is never read out of a message's text. Its text is a function of that
+    body and the recorded parameters (`core/context_state.render_form`), so the log holds
+    each result once, in full, and a record of how it is shown -- never the text of a
+    form. The digest is the same whether or not the message given carries the text.
+
+    Raises:
+        ValueError: `message` has a form but records nothing it was rendered from, so the
+            log could keep it only as its text.
     """
+    if message.form is not None:
+        if message.rendered_from is None:
+            raise ValueError(
+                f"a tool result in the {message.form} form records no result it was "
+                "rendered from, so the log cannot keep it as a form (#1848)"
+            )
+        message = message.model_copy(update={"content": None})
     body = json.dumps(
         message.model_dump(mode="json"), sort_keys=True, separators=(",", ":"), ensure_ascii=False
     )
-    blob = handle_in(message.content) if message.role == MessageRole.TOOL else None
+    # The handle a form records, never one read from a message's text: output that only
+    # quotes a stored-result header is its own full text, and names no kept result.
+    blob: str | None = message.rendered_from.handle if message.rendered_from is not None else None
     return LoggedMessage(
         body=body,
         digest=hashlib.sha256(body.encode("utf-8")).hexdigest(),
         kind=log_kind(message),
         blob=blob,
+        images=tuple((part.digest, part.data) for part in message.images if part.data is not None),
     )
+
+
+def with_image_data(message: ChatMessage, load: Callable[[str], str | None]) -> ChatMessage:
+    """`message` with each image's bytes put back from the body `load` gives its digest.
+
+    A logged body and a saved record keep an image's digest only (`ImagePart.data` is
+    never dumped), so a message read back has no bytes until they are put back here. A
+    body that is missing, will not read, or does not hash to the digest leaves that image
+    without bytes, and a connector says an image was there (`IMAGE_UNAVAILABLE_NOTE`): a
+    lost picture is not a reason to refuse the conversation, as a lost message is (#2107).
+    """
+    if all(part.data is not None for part in message.images):
+        return message
+    parts: list[ImagePart] = []
+    for part in message.images:
+        if part.data is None:
+            try:
+                data = load(part.digest)
+            except (OSError, UnicodeDecodeError):
+                data = None
+            if data is None or image_digest(data) != part.digest:
+                parts.append(part)
+                continue
+            part = part.model_copy(update={"data": data})
+        parts.append(part)
+    return message.model_copy(update={"images": tuple(parts)})
+
+
+def result_handle_of(message: ChatMessage) -> str:
+    """The `tr_` handle the full text of the tool result `message` is read by (#2013).
+
+    A form is rendered from a kept result and names its handle. A result shown whole is
+    its own message entry, named by the first 16 hex digits of that entry's digest
+    (`stored_result_entry`), so a record that points at the result -- the log's
+    `TOOL_RESULT` event -- holds the handle, not a second copy of the text.
+    """
+    if message.rendered_from is not None:
+        return message.rendered_from.handle
+    return "tr_" + logged_message(message).digest[:16]
 
 
 def logged_text(kind: SessionLogKind, text: str, *, blob: str | None) -> LoggedMessage:
@@ -183,8 +268,8 @@ def logged_text(kind: SessionLogKind, text: str, *, blob: str | None) -> LoggedM
     For what a request sent outside the history, such as the recalled memory section of
     a turn's `[Turn Context]`. The body is the text itself, redacted, so its digest is
     never that of a message's canonical JSON and `history_entry_ids` never matches it to
-    a history message. `blob` is the `tr_` handle the same text is stored under in the
-    tool-result store, when it was.
+    a history message. `blob` is the `tr_` handle `tool_result_read` reads the text by,
+    the first 16 hex digits of this body's digest.
     """
     body = redact_credentials(text)
     return LoggedMessage(
@@ -196,7 +281,7 @@ def logged_text(kind: SessionLogKind, text: str, *, blob: str | None) -> LoggedM
 
 
 def new_entry(
-    position: int, rendered: LoggedMessage, *, turn: int | None, provenance: SessionLogProvenance
+    position: int, rendered: LoggedMessage, *, turn: int, provenance: SessionLogProvenance
 ) -> SessionLogEntry:
     """The entry at `position` for `rendered`."""
     return SessionLogEntry(
@@ -208,6 +293,67 @@ def new_entry(
         provenance=provenance,
         blob=rendered.blob,
     )
+
+
+def stored_result_entry(log: Sequence[SessionLogEntry], handle: str) -> SessionLogEntry | None:
+    """The entry whose body is the full text `handle` names, the latest if several (#1848).
+
+    That entry names `handle` and its digest begins with the handle's 16 hex digits: an
+    excerpt or stub that names the handle is a message's JSON, whose digest does not.
+    `None` when the log holds no such entry.
+
+    A tool result message logged whole (`is_result_message`) is such an entry too: a
+    stub compaction renders from it names it by its own digest rather than logging the
+    text a second time (#2013).
+    """
+    prefix = handle.removeprefix("tr_")
+    if prefix == handle or not prefix:
+        return None
+    for entry in reversed(log):
+        if entry.digest.startswith(prefix) and (entry.blob == handle or is_result_message(entry)):
+            return entry
+    return None
+
+
+_RESULT_KINDS: Final = frozenset(
+    {SessionLogKind.TOOL_RESULT, SessionLogKind.RETRIEVAL, SessionLogKind.SUBAGENT}
+)
+
+
+def is_result_message(entry: SessionLogEntry) -> bool:
+    """Whether `entry` is a tool result message logged whole, which a handle can name (#2013).
+
+    Its body is the message's JSON and it names no blob: the history showed the result
+    in full. A form names the handle it is rendered from, and a kept text names its own.
+    """
+    return entry.blob is None and entry.kind in _RESULT_KINDS
+
+
+def kept_result_text(entry: SessionLogEntry, body: str) -> str | None:
+    """The full text a handle to `entry` reads, given the entry's stored `body` (#2013).
+
+    A kept text's body is the text. A tool result message's body is its JSON, and the
+    text is its content; `None` when that body is not a whole tool result message.
+    """
+    if not is_result_message(entry):
+        return body
+    try:
+        message = ChatMessage.model_validate_json(body)
+    except ValueError:
+        return None
+    if message.role is not MessageRole.TOOL or message.form is not None:
+        return None
+    return message.content if isinstance(message.content, str) else None
+
+
+def is_kept_text(entry: SessionLogEntry) -> bool:
+    """Whether `entry` is a kept text -- a full tool result or a recalled memory section
+    -- rather than a history message (#1848).
+
+    A kept text is logged as a record of what a handle names, never as a message: its
+    digest begins with its own handle's hex digits, which a message's JSON body does not.
+    """
+    return entry.blob is not None and stored_result_entry((entry,), entry.blob) is entry
 
 
 def history_entry_ids(log: Sequence[SessionLogEntry], digests: Sequence[str]) -> list[str | None]:

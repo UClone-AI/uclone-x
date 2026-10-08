@@ -11,6 +11,7 @@ from uclone_x.agent.models import AgentConfig
 from uclone_x.core.provenance import Provenance
 from uclone_x.engine.event_bus import EventBus, EventType
 from uclone_x.llm.models import FinishReason, ModelResponse, TokenUsage
+from uclone_x.tools.registry import LocalTool, ToolRegistry
 
 
 @pytest.mark.asyncio
@@ -135,17 +136,15 @@ async def test_concurrent_subagent_delegation_with_llm() -> None:
 
 @pytest.mark.asyncio
 async def test_p4_bounded_execution_and_config() -> None:
-    """Verify Principle 4 bounded execution limits: max_turns, max_subagent_depth, and depth progression."""
+    """Verify Principle 4 bounded execution limits: max_steps, max_subagent_depth, and depth progression."""
     config = AgentConfig(
         agent_id="p4_lead",
         name="P4 Lead",
-        max_turns=10,
+        max_steps=10,
         max_subagent_depth=2,
-        max_concurrent_subagents=3,
     )
-    assert config.max_turns == 10
+    assert config.max_steps == 10
     assert config.max_subagent_depth == 2
-    assert config.max_concurrent_subagents == 3
 
     bus = EventBus()
     agent = BaseAgent(config=config, bus=bus)
@@ -162,3 +161,41 @@ async def test_p4_bounded_execution_and_config() -> None:
     assert grandchild.context.parent_agent_id == child.agent_id
 
     await agent.stop()
+
+
+@pytest.mark.asyncio
+async def test_spawn_subagent_custom_tools_filtered_by_parent_tools() -> None:
+    """When a custom tool registry is passed to spawn_subagent, only tools held by the parent are kept.
+
+    Killed by: src/uclone_x/agent/base.py :: if tool.name in parent_names
+    Becomes: if True
+    """
+    bus = EventBus()
+    tool_a = LocalTool(name="tool_a", description="Tool A")
+    tool_b = LocalTool(name="tool_b", description="Tool B")
+
+    parent_registry = ToolRegistry()
+    parent_registry.register(tool_a)
+
+    child_registry = ToolRegistry()
+    child_registry.register(tool_a)
+    child_registry.register(tool_b)
+
+    parent_config = AgentConfig(
+        agent_id="parent_tool_filter",
+        name="Parent Tool Filter Agent",
+    )
+    parent = BaseAgent(config=parent_config, bus=bus, tools=parent_registry)
+    await parent.start()
+
+    sub = await parent.spawn_subagent(
+        role="worker",
+        goal="Perform task",
+        tools=child_registry,
+    )
+
+    assert sub.tools is not None
+    assert sub.tools.get("tool_a") is not None
+    assert sub.tools.get("tool_b") is None
+
+    await parent.stop()

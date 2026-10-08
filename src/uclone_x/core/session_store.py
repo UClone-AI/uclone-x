@@ -5,9 +5,8 @@ performs `expanduser`, `read_text` and `os.replace`, so a host that keeps sessio
 but the local filesystem has no seam at all (the core/shell architecture note C6).
 
 This protocol lifts the backend-neutral half of that class's public surface. Deliberately
-**not** on it: `storage_dir`, `session_path`, `reap_orphaned_temp_files` and the
-`artifacts_dir` parameter. Each is a fact about keeping sessions in files — a temporary
-file to reap, a directory to name — and putting them here would make every future backend
+**not** on it: `storage_dir`, `session_path` and `reap_orphaned_temp_files`. Each is a
+fact about keeping sessions in files — a temporary file to reap, a directory to name — and putting them here would make every future backend
 implement a filesystem vocabulary in order to satisfy an interface that claims not to
 require one.
 
@@ -43,7 +42,6 @@ extraction.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
@@ -100,7 +98,7 @@ class SessionStoreProtocol(Protocol):
         """
         ...
 
-    def delete(self, session_id: str, artifacts_dir: Path | None = None) -> bool:
+    def delete(self, session_id: str) -> bool:
         """Remove the session; return whether one was there to remove."""
         ...
 

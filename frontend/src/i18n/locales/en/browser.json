@@ -1,0 +1,20 @@
+{
+  "title": "Connect your Chrome",
+  "intro": "With the UClone-X extension, clones open their tabs in your own Chrome, in a \"UClone-X\" tab group, signed in where you are. Chrome shows a bar on every tab a clone uses; close it to take the tab back.",
+  "loading": "Reading the browser connection…",
+  "loadFailed": "The browser connection could not be read.",
+  "connected": "Connected. Clones open their tabs in your Chrome.",
+  "connectedVersion": "Connected. Clones open their tabs in your Chrome (extension {version}).",
+  "notConnected": "Not connected. Until you connect, clones browse in a separate Chrome window that UClone-X opens.",
+  "stepsTitle": "To connect",
+  "stepExtensions": "In Chrome, open chrome://extensions and turn on \"Developer mode\".",
+  "stepLoad": "Press \"Load unpacked\" and choose this folder:",
+  "stepPaste": "Click the UClone-X extension, paste this pairing code, and press \"Connect\":",
+  "copy": "Copy",
+  "copied": "Copied",
+  "copyFailed": "Could not copy. Select the text and copy it yourself.",
+  "newCode": "New pairing code",
+  "newCodeBusy": "Making a new code…",
+  "newCodeHelp": "The current code stops working, and a connected Chrome is disconnected until it gets the new one.",
+  "newCodeFailed": "A new pairing code could not be made. Check that UClone-X is running and try again."
+}

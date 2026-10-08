@@ -140,7 +140,7 @@ class CapabilityFragment:
 #: Tool guidance, in the order it is composed. Keyed by tool name; see the module docstring.
 CAPABILITY_FRAGMENTS: Final[tuple[CapabilityFragment, ...]] = (
     CapabilityFragment(tool="file_write", text=ARTIFACT_REPORTING, writes_files=True),
-    CapabilityFragment(tool="generate_image", text=IMAGE_GENERATION, writes_files=True),
+    CapabilityFragment(tool="generate_image", text=IMAGE_GENERATION, writes_files=False),
     CapabilityFragment(tool="install_package", text=ENVIRONMENT_REPAIR, writes_files=True),
 )
 

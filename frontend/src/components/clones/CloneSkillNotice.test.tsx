@@ -138,7 +138,7 @@ describe('the notice that a skill is not offered to a clone', () => {
     expect(screen.getByTestId('skill-hidden-from')).toHaveTextContent('scout: needs generate_image');
   });
 
-  // Killed by: frontend/src/components/clones/CloneProfile.tsx ::           <CloneSkillNotice cloneId={cloneId} />
+  // Killed by: frontend/src/components/clones/CloneProfile.tsx ::           <CloneSkillNotice cloneId={handle} />
   // Becomes: (removed)
   it('shows the clone notice on the Clone surface, under its settings', async () => {
     inLocale(

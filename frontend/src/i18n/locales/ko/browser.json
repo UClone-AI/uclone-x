@@ -1,0 +1,20 @@
+{
+  "title": "내 Chrome 연결",
+  "intro": "UClone-X 확장 프로그램을 쓰면 클론이 내 Chrome의 \"UClone-X\" 탭 그룹에 탭을 열고, 내가 로그인한 상태 그대로 사용합니다. 클론이 쓰는 탭마다 Chrome이 막대를 표시하며, 그 막대를 닫으면 탭을 되찾습니다.",
+  "loading": "브라우저 연결을 읽는 중입니다…",
+  "loadFailed": "브라우저 연결을 읽지 못했습니다.",
+  "connected": "연결되었습니다. 클론이 내 Chrome에 탭을 엽니다.",
+  "connectedVersion": "연결되었습니다. 클론이 내 Chrome에 탭을 엽니다(확장 프로그램 {version}).",
+  "notConnected": "연결되지 않았습니다. 연결하기 전까지 클론은 UClone-X가 여는 별도의 Chrome 창에서 브라우저를 사용합니다.",
+  "stepsTitle": "연결 방법",
+  "stepExtensions": "Chrome에서 chrome://extensions를 열고 '개발자 모드'를 켭니다.",
+  "stepLoad": "'압축해제된 확장 프로그램을 로드합니다' 버튼을 누르고 이 폴더를 선택합니다:",
+  "stepPaste": "UClone-X 확장 프로그램을 누르고 이 연결 코드를 붙여 넣은 뒤 '연결'을 누릅니다:",
+  "copy": "복사",
+  "copied": "복사했습니다",
+  "copyFailed": "복사하지 못했습니다. 텍스트를 선택해 직접 복사하세요.",
+  "newCode": "새 연결 코드",
+  "newCodeBusy": "새 코드를 만드는 중입니다…",
+  "newCodeHelp": "지금 코드는 더 이상 쓸 수 없고, 연결된 Chrome은 새 코드를 받을 때까지 연결이 끊깁니다.",
+  "newCodeFailed": "새 연결 코드를 만들지 못했습니다. UClone-X가 실행 중인지 확인하고 다시 시도하세요."
+}

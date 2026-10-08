@@ -38,7 +38,7 @@ def offline_client(tmp_path: Path) -> TestClient:
 def test_synthesize_persona_prompt_is_written_by_the_model(tmp_path: Path) -> None:
     llm = MockLLMConnector(default_response="너는 집밥 한식을 알려주는 요리사다.")
     res = _client(tmp_path, llm).post(
-        "/api/personas/synthesize",
+        "/api/clones/synthesize",
         json={
             "name": "요리사",
             "role": "한식 셰프",
@@ -59,7 +59,7 @@ def test_synthesize_persona_prompt_is_written_by_the_model(tmp_path: Path) -> No
 def test_synthesize_persona_prompt_sends_every_filled_field(tmp_path: Path) -> None:
     # The unscripted mock echoes the last message it was sent, so the reply is the request.
     res = _client(tmp_path, MockLLMConnector()).post(
-        "/api/personas/synthesize",
+        "/api/clones/synthesize",
         json={
             "name": "scout",
             "role": "Researcher",
@@ -76,13 +76,13 @@ def test_synthesize_persona_prompt_sends_every_filled_field(tmp_path: Path) -> N
 
 def test_synthesize_persona_prompt_strips_an_enclosing_code_fence(tmp_path: Path) -> None:
     llm = MockLLMConnector(default_response="```markdown\nYou are Scout.\n- Cite sources.\n```")
-    res = _client(tmp_path, llm).post("/api/personas/synthesize", json={"name": "scout"})
+    res = _client(tmp_path, llm).post("/api/clones/synthesize", json={"name": "scout"})
     assert res.json()["system_prompt"] == "You are Scout.\n- Cite sources."
 
 
 def test_synthesize_persona_prompt_falls_back_when_the_model_is_silent(tmp_path: Path) -> None:
     res = _client(tmp_path, MockLLMConnector(default_response="   ")).post(
-        "/api/personas/synthesize", json={"name": "scout"}
+        "/api/clones/synthesize", json={"name": "scout"}
     )
     data = res.json()
     assert data["source"] == "template"
@@ -94,7 +94,7 @@ def test_synthesize_persona_prompt_falls_back_and_names_the_cause(
     offline_client: TestClient,
 ) -> None:
     res = offline_client.post(
-        "/api/personas/synthesize",
+        "/api/clones/synthesize",
         json={
             "name": "code_reviewer",
             "role": "Senior Code Reviewer",
@@ -115,7 +115,7 @@ def test_synthesize_persona_prompt_falls_back_and_names_the_cause(
 
 def test_synthesize_persona_prompt_validation_error(offline_client: TestClient) -> None:
     res = offline_client.post(
-        "/api/personas/synthesize",
+        "/api/clones/synthesize",
         json={"name": "", "role": "", "description": "", "allowed_tools": []},
     )
     assert res.status_code == 400
@@ -124,7 +124,7 @@ def test_synthesize_persona_prompt_validation_error(offline_client: TestClient) 
 
 def test_synthesize_persona_prompt_tool_directives(offline_client: TestClient) -> None:
     res = offline_client.post(
-        "/api/personas/synthesize",
+        "/api/clones/synthesize",
         json={
             "name": "researcher",
             "role": "Deep Web Researcher",

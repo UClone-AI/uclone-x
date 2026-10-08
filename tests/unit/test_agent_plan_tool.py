@@ -126,7 +126,7 @@ async def test_compaction_preserves_plan(tmp_path: Path) -> None:
 
     # Seed messages
     for i in range(10):
-        agent._history.append(ChatMessage(role=MessageRole.USER, content=f"msg {i}"))  # type: ignore[reportPrivateUsage]
+        agent._active_session.append(ChatMessage(role=MessageRole.USER, content=f"msg {i}"))  # type: ignore[reportPrivateUsage]
         agent._live_session(agent._context.session_id).turn_counter += 1  # type: ignore[reportPrivateUsage]
 
     # Create plan

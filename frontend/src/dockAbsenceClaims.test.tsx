@@ -86,7 +86,7 @@ const history = (over: Partial<SeatHistory>): SeatHistory => ({
 const use = (over: Partial<RoomToolUse>): RoomToolUse => ({
   turn_id: 't1',
   participant_id: 'scout',
-  tool_name: 'run_command',
+  tool_name: 'bash_run',
   tool_call_id: 'c1',
   status: 'success',
   error: null,
@@ -309,7 +309,7 @@ describe('the dock makes no categorical absence claim (#1374)', () => {
     expect(text(container)).not.toMatch(/has not remembered anything yet/);
     expect(text(container)).not.toMatch(ABSENCE_CLAIM);
   });
-});
+}, 20_000);
 
 //: The catalogs the dock's product panels read their sentences from (`multilingual-ui.md`).
 const DOCK_CATALOGS: Record<string, string> = import.meta.glob(

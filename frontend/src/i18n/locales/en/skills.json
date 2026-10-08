@@ -109,6 +109,7 @@
     "turnedDown": "{name} was turned down and will not be used.",
     "approveFailed": "The skill could not be approved.",
     "changed": "This proposal changed after it was shown to you, so it was not approved. It is shown again below: look at it again, then approve it.",
+    "changedTurnDown": "This proposal changed after it was shown to you, so it was not turned down. It is shown again below: look at it again, then decide.",
     "turnDownFailed": "The proposal could not be turned down."
   },
   "revoke": {
@@ -116,6 +117,22 @@
     "hint": "Stop using this skill. Its files are kept, so it can be approved again later.",
     "done": "{name} is revoked and no longer used.",
     "failed": "The skill could not be revoked."
+  },
+  "refusals": {
+    "shipped": "This skill comes with UClone-X, so it cannot be changed or revoked here.",
+    "has_files": "This skill has files besides its instructions, so a clone cannot propose a new version of it. A person can change it by hand.",
+    "extra_files": "This proposal holds files besides its instructions, so it cannot be approved. You can turn it down instead.",
+    "not_found": "That proposal was not found. It may already have been approved or turned down.",
+    "not_active": "That skill is not in use, so there is nothing to revoke.",
+    "failed_check": "The safety check did not pass this proposal, so it cannot be approved. You can turn it down instead.",
+    "check_not_finished": "The safety check could not read this proposal, so it cannot be approved.",
+    "changed_meanwhile": "This proposal changed while it was being checked, so it was not approved. Look at it again, then approve it.",
+    "seen_changed": "This proposal changed after it was shown to you, so nothing was done. Look at it again, then decide.",
+    "not_saved": "The skill folder could not be changed, so nothing was saved.",
+    "no_store": "There is no skill folder for this project, so there is nothing to change.",
+    "not_changed": "The skill could not be changed. Try again.",
+    "no_version": "Say which version of the skill.",
+    "not_seen": "Look at the proposal again, then decide."
   },
   "confirmWindow": {
     "unconfirmed": "Only you can decide this, and this window was not opened by UClone-X, so it cannot tell that it is you. Open a window UClone-X confirms, then decide there.",

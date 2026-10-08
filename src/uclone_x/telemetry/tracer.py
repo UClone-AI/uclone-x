@@ -419,11 +419,6 @@ class TelemetryTracer(TraceRecorderProtocol, SpanStreamProtocol):
         return self._buffer_evicted_span_count
 
     @property
-    def dropped_span_count(self) -> int:
-        """Deprecated alias for `buffer_evicted_span_count` (#206)."""
-        return self._buffer_evicted_span_count
-
-    @property
     def drop_reasons(self) -> Mapping[str, int]:
         """Buffer-departure counts by reason — `buffer_overflow`, or a caller's reason.
 

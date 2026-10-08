@@ -84,20 +84,23 @@ class SetAvatarTool(BaseTool[SetAvatarParams]):
                 "shipped one -- one of the two."
             )
         workspace = context.require_workspace()
-        store = PersonaAvatarStore(get_default_persona_registry(workspace))
+        registry = get_default_persona_registry(workspace)
+        store = PersonaAvatarStore(registry)
         if params.image_path is None:
             change = store.reset(persona, undo_of=params.undo_of)
         else:
-            try:
-                source = self.resolve_safe_path(params.image_path, workspace)
-            except PathTraversalError as exc:
-                raise AvatarRefused(
-                    f"'{params.image_path}' is outside the workspace, so it was not used. "
-                    "Use a picture in the workspace."
-                ) from exc
+            source = store.named_previous(persona, params.image_path)
+            if source is None:
+                try:
+                    source = self.resolve_safe_path(params.image_path, workspace)
+                except PathTraversalError as exc:
+                    raise AvatarRefused(
+                        f"'{params.image_path}' is outside the workspace, so it was not used. "
+                        "Use a picture in the workspace."
+                    ) from exc
             change = store.set_from_path(persona, source, undo_of=params.undo_of)
         return {
-            "avatar_url": avatar_url(persona, store.find(persona)),
+            "avatar_url": avatar_url(registry.id_of(persona) or persona, store.find(persona)),
             "previous_path": _relative(change.previous, workspace),
             "change_id": change.change_id,
         }

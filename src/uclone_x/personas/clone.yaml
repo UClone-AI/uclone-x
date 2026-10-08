@@ -1,4 +1,7 @@
 name: clone
+display_name:
+  en: Clone
+  ko: 클론
 role: Personal AI Clone & Collaborator
 description: Primary personal AI clone and executive partner in UClone-X.
 enable_write_tools: true

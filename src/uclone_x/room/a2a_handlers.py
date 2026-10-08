@@ -35,7 +35,7 @@ import logging
 import tempfile
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from uclone_x.a2a.in_memory import A2AInMemoryTransport
 from uclone_x.a2a.models import TaskMessage, TaskResult, TaskStatus
@@ -45,7 +45,7 @@ from uclone_x.agent.clone_builder import follow_global_models, with_app_lifecycl
 from uclone_x.agent.composition import HostDependencies, compose_agent
 from uclone_x.agent.hooks import HookAction, HookContext, HookDecision, HookEvent, HookRunner
 from uclone_x.agent.models import (
-    BASE_MEMORY_TOOLS,
+    BASE_SELF_TOOLS,
     DEFAULT_SYSTEM_PROMPT,
     AgentContext,
     AgentLLMConfig,
@@ -54,6 +54,7 @@ from uclone_x.agent.models import (
 )
 from uclone_x.agent.persona_registry import PersonaRegistry
 from uclone_x.agent.session import SessionStore
+from uclone_x.core.agent_home import peer_handles
 from uclone_x.core.provenance import Provenance
 from uclone_x.tools.builtin.a2a import (
     A2A_CALL_TOOL_NAME,
@@ -62,8 +63,10 @@ from uclone_x.tools.builtin.a2a import (
     A2A_STEP_BUDGET_KEY,
     A2A_STORY_KEY,
 )
-from uclone_x.tools.models import ToolResultStatus
 from uclone_x.tools.registry import ToolRegistry
+
+if TYPE_CHECKING:
+    from uclone_x.llm.gateway import ModelGateway
 
 logger = logging.getLogger(__name__)
 
@@ -108,21 +111,12 @@ class _DeferredApprovalRunner(HookRunner):
 
 
 def _written_paths(result: TurnResult) -> list[str]:
-    """Files the turn's own tools say they wrote, each once, in the order they were written."""
+    """Files the turn's own tools say they produced, each once, in order (#2085)."""
     paths: list[str] = []
     for execution in result.tool_executions:
-        if not execution.writes_files or execution.status is not ToolResultStatus.SUCCESS:
-            continue
-        output = execution.output
-        if not isinstance(output, Mapping):
-            continue
-        candidates: list[object] = [output.get("path")]
-        listed = output.get("paths")
-        if isinstance(listed, list | tuple):
-            candidates.extend(listed)
-        for candidate in candidates:
-            if isinstance(candidate, str) and candidate and candidate not in paths:
-                paths.append(candidate)
+        for path in execution.produced_paths:
+            if path not in paths:
+                paths.append(path)
     return paths
 
 
@@ -139,11 +133,7 @@ def _wrote_unnamed(result: TurnResult) -> bool:
             return True
         if not execution.writes_files:
             continue
-        output = execution.output
-        named = isinstance(output, Mapping) and (
-            isinstance(output.get("path"), str) or bool(output.get("paths"))
-        )
-        if execution.status is not ToolResultStatus.SUCCESS or not named:
+        if not execution.produced_paths:
             return True
     return False
 
@@ -185,11 +175,17 @@ class PersonaTaskHandler:
         *,
         host_factory: Callable[[], HostDependencies],
         persona_registry: PersonaRegistry,
-        workspace_root: Path,
+        workspace_root: Path | Callable[[], Path],
         llm_config: AgentLLMConfig | None = None,
         read_roots: Callable[[], tuple[Path, ...]] | None = None,
         global_models: Callable[[], tuple[str | None, str | None]] | None = None,
+        gateway: ModelGateway | None = None,
     ) -> None:
+        """`workspace_root` may be read per task: a room passes its own, which can change.
+
+        With `gateway`, the callee's model is resolved through it, as a seat's is
+        (model-gateway §3.4), and `global_models` is not read.
+        """
         self._persona_name = persona_name
         self._host_factory = host_factory
         self._registry = persona_registry
@@ -197,6 +193,7 @@ class PersonaTaskHandler:
         self._llm_config = llm_config
         self._read_roots: Callable[[], tuple[Path, ...]] = read_roots or (lambda: ())
         self._global_models = global_models
+        self._gateway = gateway
 
     def _refuse(self, message: TaskMessage, error: str) -> TaskResult:
         return TaskResult(
@@ -215,17 +212,18 @@ class PersonaTaskHandler:
 
     @staticmethod
     def _callee_tools(persona: PersonaDefinition) -> tuple[str, ...]:
-        """The operator list the called agent is held to: its persona's, less memory.
+        """The operator list the called agent is held to: its persona's, less its own state.
 
         Written into the config rather than left to the persona, because the persona's
         list always carries the memory tools (`BASE_PERSONA_TOOLS`) and this agent has no
-        memory to use them on. An unrestricted persona stays unrestricted; with no store its
+        memory to use them on. `set_avatar` goes too (#2160): a peer answering a request is
+        not the clone the user is talking to, so it does not change its picture there. An unrestricted persona stays unrestricted; with no store its
         memory tools are neither offered nor resolvable (#1098).
         """
         return tuple(
             name
             for name in persona.granted_tools
-            if name not in BASE_MEMORY_TOOLS and name != A2A_CALL_TOOL_NAME
+            if name not in BASE_SELF_TOOLS and name != A2A_CALL_TOOL_NAME
         )
 
     def _compose(
@@ -236,6 +234,8 @@ class PersonaTaskHandler:
         scratch: Path,
     ) -> BaseAgent:
         """Build the one-off agent for this task, under the caller's step budget."""
+        root = self._workspace_root
+        workspace = root() if callable(root) else root
         # A callee works in its caller's story, and moves it as a seat would (#1732).
         base = with_app_lifecycle_hooks(self._host_factory())
         inherited = tuple(base.hooks or ()) + (
@@ -256,7 +256,12 @@ class PersonaTaskHandler:
         # The seat rule: the model the request names, else the persona's, else the Settings
         # deep and fast ones, read per call -- never a connector's built-in default.
         llm_config = self._llm_config or persona.llm_config
-        if self._global_models is not None:
+        if self._gateway is not None:
+            seat = self._gateway.bind(llm_config)
+            llm_config = seat.llm_config
+            if seat.llm is not None:
+                host = dataclasses.replace(host, llm=seat.llm)
+        elif self._global_models is not None:
             deep, fast = self._global_models()
             llm_config = follow_global_models(llm_config, deep, fast)
         config = agent_config_for_persona(
@@ -265,13 +270,13 @@ class PersonaTaskHandler:
             name=persona.name,
             system_prompt=DEFAULT_SYSTEM_PROMPT,
             llm_config=llm_config,
-            workspace_dir=self._workspace_root,
+            workspace_dir=workspace,
             read_roots=self._read_roots(),
         )
         update: dict[str, Any] = {"allowed_tools": self._callee_tools(persona)}
         budget = _step_budget(message)
         if budget is not None:
-            update |= {"max_steps": budget, "max_turns": budget}
+            update |= {"max_steps": budget}
         config = config.model_copy(update=update)
         if persona.allowed_tools and not config.allowed_tools:
             # Permitted only memory tools: an empty list would permit everything.
@@ -282,7 +287,7 @@ class PersonaTaskHandler:
             context=AgentContext(
                 session_id=f"a2a_{message.task_id}",
                 agent_id=persona.name,
-                workspace_root=self._workspace_root,
+                workspace_root=workspace,
                 parent_agent_id=message.sender_agent_id,
                 depth=1,
             ),
@@ -381,11 +386,12 @@ def register_persona_handlers(
     *,
     host_factory: Callable[[], HostDependencies],
     persona_registry: PersonaRegistry,
-    workspace_root: Path,
+    workspace_root: Path | Callable[[], Path],
     llm_config: AgentLLMConfig | None = None,
     read_roots: Callable[[], tuple[Path, ...]] | None = None,
     personas: Sequence[str] | None = None,
     global_models: Callable[[], tuple[str | None, str | None]] | None = None,
+    gateway: ModelGateway | None = None,
 ) -> tuple[str, ...]:
     """Register a handler for every persona some persona may call; return their names.
 
@@ -398,7 +404,10 @@ def register_persona_handlers(
         if personas is not None
         else tuple(
             dict.fromkeys(
-                peer for persona in persona_registry.list_personas() for peer in persona.a2a_peers
+                peer
+                for persona in persona_registry.list_personas()
+                # Stored as clone ids, registered by handle (clone-data-scopes §3.3).
+                for peer in peer_handles(persona.a2a_peers, persona_registry.writable_dir())
             )
         )
     )
@@ -413,6 +422,7 @@ def register_persona_handlers(
                 llm_config=llm_config,
                 read_roots=read_roots,
                 global_models=global_models,
+                gateway=gateway,
             ),
         )
     return names

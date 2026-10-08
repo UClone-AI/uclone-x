@@ -1,8 +1,8 @@
 """Tests for the isolation model: the decided default, and what it deliberately cannot say.
 
 The discriminated union exists so that a control which cannot be enforced at a level is
-not a field of that level. `docs/security-threat-model.md` D1: "a security control that
-is accepted and silently ignored is precisely what P6 forbids."
+not a field of that level. The threat model (`docs/public/security.md`): "a security
+control that is accepted and silently ignored is precisely what P6 forbids."
 """
 
 from __future__ import annotations
@@ -178,7 +178,7 @@ BENIGN_NAMES: tuple[str, ...] = (
     # --- boundary specimens (contain credential substring 'TOKEN' but are benign configuration) ---
     # MAX_TOKENS: src/uclone_x/llm/connectors/gemini.py
     "MAX_TOKENS",
-    # TOKEN_BUDGET: docs/dynamic-persona-interface.md, a P4 concept of this framework
+    # TOKEN_BUDGET: the dynamic persona interface document, a P4 concept of this framework
     "TOKEN_BUDGET",
     # .env.example, all four. LANGFUSE_PUBLIC_KEY is the sharp one: it is publishable by
     # design and sits beside LANGFUSE_SECRET_KEY, which *_SECRET_KEY correctly refuses.

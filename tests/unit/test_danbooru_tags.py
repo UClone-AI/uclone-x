@@ -211,7 +211,7 @@ async def test_the_engine_receives_the_normalized_prompt_and_the_result_says_why
         remote_engine=engine, comfy_engine=engine, local_engine=engine
     )
     profile = _danbooru()
-    dispatcher.get_active_profile = lambda: profile  # type: ignore[method-assign]
+    dispatcher.get_active_profile = lambda own=None: profile  # type: ignore[method-assign]
     tool = GenerateImageTool(dispatcher=dispatcher)
     context = ToolContext(agent_id="a", session_id="s", workspace_root=tmp_path)
 
@@ -225,4 +225,112 @@ async def test_the_engine_receives_the_normalized_prompt_and_the_result_says_why
     assert (
         "Changed the tag 'golden hair' to the Danbooru tag 'blonde hair'."
         in result["prompt_changes"]
+    )
+
+
+def test_real_danbooru_no_tags_stay_and_their_aliases_become_the_tag() -> None:
+    """Rule 1 and 3 for the tags read from Danbooru's tag and alias lists (#1865).
+
+    `no hat` and `no headwear` are aliases of `missing headwear` there and have no posts
+    of their own, so they are rewritten, not kept as written; `no glasses` is an alias of
+    the real `no eyewear`, which then stays.
+
+    Killed by: src/uclone_x/tools/builtin/danbooru_tags.py ::     "no hat": "missing headwear",
+    Becomes:     "no hatx": "missing headwear",
+    Killed by: src/uclone_x/tools/builtin/danbooru_tags.py ::         "no animal ears",
+    Becomes:         "no animal earsx",
+    Killed by: src/uclone_x/tools/builtin/danbooru_tags.py ::     "no glasses": "no eyewear",
+    Becomes:     "no glassesx": "no eyewear",
+    """
+    result = normalize_danbooru_tags("1girl, no hat, no_animal_ears, No Glasses, no text")
+
+    assert result.prompt == "1girl, missing headwear, no_animal_ears, no eyewear"
+    assert result.moved_to_negative == ("text",)
+    assert "Changed the tag 'no hat' to the Danbooru tag 'missing headwear'." in result.changes
+
+
+def test_no_headwear_is_an_alias_and_becomes_missing_headwear() -> None:
+    """`no headwear` is a Danbooru alias of `missing headwear`, not a tag of its own.
+
+    Killed by: src/uclone_x/tools/builtin/danbooru_tags.py ::     "no headwear": "missing headwear",
+    Becomes:     "no headwearx": "missing headwear",
+    """
+    result = normalize_danbooru_tags("1girl, No_Headwear, smile")
+
+    assert result.prompt == "1girl, missing headwear, smile"
+    assert result.moved_to_negative == ()
+    assert result.changes == (
+        "Changed the tag 'No_Headwear' to the Danbooru tag 'missing headwear'.",
+    )
+
+
+def test_every_real_no_tag_is_kept_and_none_is_an_alias() -> None:
+    """A tag in `REAL_NO_TAGS` is the tag itself: no entry is also rewritten away."""
+    from uclone_x.tools.builtin.danbooru_tags import NEAR_MISS_TAGS, REAL_NO_TAGS
+
+    assert not REAL_NO_TAGS & set(NEAR_MISS_TAGS)
+    for tag in sorted(REAL_NO_TAGS):
+        assert normalize_danbooru_tags(f"cat, {tag}").prompt == f"cat, {tag}"
+
+
+def test_korean_danbooru_tag_is_translated_and_reported() -> None:
+    """Known Korean Danbooru tags are translated and reported (#1865).
+
+    Killed by: src/uclone_x/tools/builtin/danbooru_tags.py :: changes.append(f"Translated the tag '{tag}' to the Danbooru tag '{current}'.")
+    Becomes: pass
+    """
+    result = normalize_danbooru_tags("1girl, 금발, 파란 눈, 트윈테일, smile")
+
+    assert result.prompt == "1girl, blonde hair, blue eyes, twintails, smile"
+    assert result.changes == (
+        "Translated the tag '금발' to the Danbooru tag 'blonde hair'.",
+        "Translated the tag '파란 눈' to the Danbooru tag 'blue eyes'.",
+        "Translated the tag '트윈테일' to the Danbooru tag 'twintails'.",
+    )
+
+
+def test_untranslated_non_latin_tag_is_dropped_and_reported() -> None:
+    """Non-Latin tags not in the dictionary are dropped and reported (#1865).
+
+    Killed by: src/uclone_x/tools/builtin/danbooru_tags.py :: changes.append(f"Dropped a tag that is not Latin script: '{tag}'.")
+    Becomes: pass
+    """
+    result = normalize_danbooru_tags("1girl, 두 손으로 은색 쟁반 들고 서 있는 소녀, 少女, smile")
+
+    assert result.prompt == "1girl, smile"
+    assert result.changes == (
+        "Dropped a tag that is not Latin script: '두 손으로 은색 쟁반 들고 서 있는 소녀'.",
+        "Dropped a tag that is not Latin script: '少女'.",
+    )
+
+
+def test_weighted_korean_tag_is_translated_or_dropped() -> None:
+    """A weighted Korean tag has its inner term translated if known, or dropped (#1865)."""
+    result = normalize_danbooru_tags("1girl, (금발:1.2), [두 손으로:1.1], smile")
+
+    assert result.prompt == "1girl, (blonde hair:1.2), smile"
+    assert result.changes == (
+        "Translated the tag '(금발:1.2)' to the Danbooru tag '(blonde hair:1.2)'.",
+        "Dropped a tag that is not Latin script: '[두 손으로:1.1]'.",
+    )
+
+
+def test_h5_korean_prompt_normalizes_to_clean_danbooru_tags() -> None:
+    """Full H5 Korean prompt normalizes to clean Danbooru tags (#1865)."""
+    prompt = (
+        "1girl, 금발, 파란 눈, 흑백 메이드복, 두 손으로 은색 쟁반 들고 서 있는 소녀, 흰 배경, 전신"
+    )
+    result = normalize_danbooru_tags(prompt)
+
+    assert (
+        result.prompt
+        == "1girl, blonde hair, blue eyes, black and white maid outfit, white background, full body"
+    )
+    assert result.changes == (
+        "Translated the tag '금발' to the Danbooru tag 'blonde hair'.",
+        "Translated the tag '파란 눈' to the Danbooru tag 'blue eyes'.",
+        "Translated the tag '흑백 메이드복' to the Danbooru tag 'black and white maid outfit'.",
+        "Dropped a tag that is not Latin script: '두 손으로 은색 쟁반 들고 서 있는 소녀'.",
+        "Translated the tag '흰 배경' to the Danbooru tag 'white background'.",
+        "Translated the tag '전신' to the Danbooru tag 'full body'.",
     )

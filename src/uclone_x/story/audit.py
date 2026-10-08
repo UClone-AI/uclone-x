@@ -7,10 +7,15 @@ checked **deterministically** -- by the ontology reasoner, not by the model -- a
 codex as it stands once the scene has ended in story time (`uclone_x.story.timeline`), under
 the story's rules (`story.yaml` `axioms`).
 
-How facts are made from the codex:
+How facts are made from the codex: the codex is read as the story's uGraph store
+(`uclone_x.story.codex_store`), and the facts are the approved edges that hold once the
+scene has ended. So:
 
 - every state value of every entry is a fact `(entry id, key, value)`; a list gives one fact
   per element, and a value that is a set of named fields is reported as not checked;
+- a relation (`relations: {harin: parent}`) is the fact `(entry id, relation:harin,
+  parent)` (`relation_predicate`): one word per pair, so a rule that the property is
+  functional says a scene may not give the pair another;
 - the key `status` becomes a type: `status: dead` is `type Dead`, so a rule like
   "Alive and Dead are disjoint" applies to it;
 - names are matched to entries by id, name or alias, ignoring case, so `Lord Vane` and
@@ -23,7 +28,10 @@ rule as `disjointWith Alive HalfDead`. A class is shown as the rules spell it (#
 the story wrote it, not by the name the reasoner gave it.
 
 A contradiction comes back with where each fact came from: a codex entry's starting state,
-a progression at a scene, or a submitted fact with its quote. Every rule that was not
+a progression at a scene, or a submitted fact with its quote. A fact the reasoner derived
+(`yerin type Dead`, from `yerin type Translucent` and `Translucent subClassOf Dead`) lists
+the asserted facts it was derived from, with theirs, so a contradiction that rests on a
+scene fact only through a rule still involves the scene. Every rule that was not
 applied is listed (P6): a check never says a scene is consistent with a rule it did not
 run.
 
@@ -57,13 +65,25 @@ from uclone_x.ontology.justification import (
 )
 from uclone_x.ontology.models import OntologyAxiom, OntologyRelation
 from uclone_x.ontology.reasoner import OntologyReasoner
+from uclone_x.story.codex_store import CodexYamlStore
 from uclone_x.story.context import CodexIndex
+from uclone_x.story.names import CodexNames
 from uclone_x.story.quotes import MIN_QUOTE_CHARACTERS, quote_found, quote_too_short
 from uclone_x.story.quotes import folded as _folded
 from uclone_x.story.schemas import Outline, StoryAxiom
-from uclone_x.story.timeline import assumptions, entry_snapshot, place_scenes
+from uclone_x.story.timeline import assumptions
 
-__all__ = ["SubmittedFact", "audit_scene"]
+__all__ = ["RELATION_PREFIX", "SubmittedFact", "audit_scene", "relation_predicate"]
+
+#: How a relation reads to the reasoner: `relation:<the other entry's id>`, its word the
+#: object, so one pair has one property (`relation_predicate`).
+RELATION_PREFIX = "relation:"
+
+
+def relation_predicate(other_id: str) -> str:
+    """The property a relation to entry `other_id` is checked as, by the codex and a scene."""
+    return f"{RELATION_PREFIX}{other_id}"
+
 
 _WORD_JOIN = re.compile(r"[\s_-]+")
 _KIND_PREFIX = re.compile(r"^(?:rdf|rdfs|owl)\s*:\s*", re.IGNORECASE)
@@ -185,24 +205,11 @@ def _plain_reason(reason: str) -> str:
     return reason
 
 
-class _Names:
-    """Codex names, ids and aliases, folded, to the entry id they name."""
-
-    def __init__(self, codex: CodexIndex) -> None:
-        self._ids: dict[str, str] = {}
-        for item in codex.items:
-            for name in (item.entry.id, item.entry.name, *item.entry.aliases):
-                self._ids.setdefault(_folded(name), item.entry.id)
-
-    def resolve(self, name: str) -> str | None:
-        return self._ids.get(_folded(name))
-
-
 @dataclass
 class _Triples:
     """The facts to check, each with every place it came from."""
 
-    names: _Names
+    names: CodexNames
     class_name: _Classes
     facts: dict[str, Fact]
     origins: dict[str, list[dict[str, Any]]]
@@ -225,10 +232,15 @@ class _Triples:
         self.origins.setdefault(fact.id, []).append(origin)
 
 
-def _as_text(value: object) -> str:
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    return str(value)
+def _sources(contradiction: dict[str, Any]) -> list[dict[str, Any]]:
+    """Where every fact a contradiction rests on came from, including the facts a derived
+    one was derived from."""
+    found: list[dict[str, Any]] = []
+    for part in cast("list[dict[str, Any]]", contradiction["facts"]):
+        found += part.get("sources", ())
+        for leaf in cast("list[dict[str, Any]]", part.get("derived_from", ())):
+            found += leaf["sources"]
+    return found
 
 
 def audit_scene(
@@ -247,7 +259,8 @@ def audit_scene(
     Raises:
         ValueError: the outline has no scene `scene_id` (the caller checks first).
     """
-    placements = place_scenes(outline)
+    store = CodexYamlStore.read(story_id, outline, codex)
+    placements = store.placements
     if scene_id not in placements:
         raise ValueError(f"the outline has no scene '{scene_id}'")
 
@@ -256,7 +269,7 @@ def audit_scene(
     # (#1601); reading them again below returns the same names.
     for axiom in axioms:
         _axiom_terms(axiom, class_name)
-    triples = _Triples(_Names(codex), class_name, {}, {}, set())
+    triples = _Triples(CodexNames(codex), class_name, {}, {}, set())
     rejected: list[dict[str, Any]] = []
     accepted = 0
     for number, fact in enumerate(facts, start=1):
@@ -285,21 +298,17 @@ def audit_scene(
         rejected.append({"fact": number, "reason": reason})
 
     not_checked: list[dict[str, str]] = []
-    for item in codex.items:
-        snapshot = entry_snapshot(item.entry, placements, scene_id, through_scene=True)
-        file = f"codex/{item.kind}/{item.entry.id}.yaml"
-        for key, value in snapshot.state.items():
-            origin: dict[str, Any] = {"from": "codex", "file": file, "field": f"state.{key}"}
-            if key in snapshot.set_at:
-                origin["set_by_progression_at"] = snapshot.set_at[key]
-            values: list[object] = cast(list[object], value) if isinstance(value, list) else [value]
-            for element in values:
-                if isinstance(element, dict | list) or element is None:
-                    not_checked.append(
-                        {"file": file, "field": f"state.{key}", "reason": "not a single value"}
-                    )
-                    continue
-                triples.add(item.entry.id, key, _as_text(element), origin)
+    for row in store.rows_at(store.point(scene_id, ended=True)):
+        origin: dict[str, Any] = dict(row.record["origin"])
+        edge = row.edge
+        if not row.record["single"]:
+            not_checked.append(
+                {"file": origin["file"], "field": origin["field"], "reason": "not a single value"}
+            )
+        elif edge.object_id is not None:
+            triples.add(edge.subject_id, relation_predicate(edge.object_id), edge.predicate, origin)
+        else:
+            triples.add(edge.subject_id, edge.predicate, str(edge.value), origin)
 
     engine = OntologyEngine(
         agent_id=f"story:{story_id}",
@@ -345,7 +354,24 @@ def audit_scene(
             else:
                 rule = closure.facts.get(fact_id)
                 if rule is not None:
-                    involved.append({"rule": " ".join(rule.triple)})
+                    part: dict[str, Any] = {"rule": " ".join(rule.triple)}
+                    leaves = sorted(
+                        {
+                            premise
+                            for step in closure.explain(fact_id)
+                            for premise in step.premises
+                            if premise in triples.origins
+                        }
+                    )
+                    if leaves:
+                        part["derived_from"] = [
+                            {
+                                "fact": " ".join(triples.facts[leaf].triple),
+                                "sources": triples.origins[leaf],
+                            }
+                            for leaf in leaves
+                        ]
+                    involved.append(part)
         contradictions.append(
             {
                 "kind": inconsistency.kind,
@@ -356,9 +382,7 @@ def audit_scene(
     # A contradiction the codex has on its own is not this scene's; it is still shown.
     for contradiction in contradictions:
         contradiction["involves_this_scene"] = any(
-            source.get("from") == "scene"
-            for part in contradiction["facts"]
-            for source in part.get("sources", ())
+            source.get("from") == "scene" for source in _sources(contradiction)
         )
 
     unsupported = closure.unsupported_axioms

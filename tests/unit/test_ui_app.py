@@ -10,6 +10,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from tests.support.app_clone import app_clone
+from tests.support.clones import make_clones
 from uclone_x.core.provenance import (
     ExecutionPath,
 )
@@ -25,6 +26,15 @@ from uclone_x.ui.app import (
     AgentSessionManager,
     create_ui_app,
 )
+
+# The agent ids these tests chat as. Each is a clone now, since a name no clone carries is
+# refused memory rather than given a home (clone-data-scopes §3.4).
+_TEST_CLONES = ("agent-general", "agent_worker_1", "champion")
+
+
+@pytest.fixture(autouse=True)
+def _test_clones() -> None:  # pyright: ignore[reportUnusedFunction]
+    make_clones(*_TEST_CLONES)
 
 
 def stubbed_ollama_with_model(
@@ -136,19 +146,24 @@ def test_sessions_sorted_by_recency(tmp_path: Path) -> None:
     assert sessions[1]["session_id"] == "sess_older"
 
 
-def test_list_personas_api_returns_catalog(tmp_path: Path) -> None:
-    """GET /api/personas returns the catalog of declarative personas discovered by PersonaRegistry (#897)."""
+def test_list_clones_api_returns_catalog(tmp_path: Path) -> None:
+    """GET /api/clones returns the catalog of declarative personas discovered by PersonaRegistry (#897).
+
+    `/api/clones` absorbed `/api/personas` (clone-data-scopes §3.7): the rows are under
+    `clones`, each carrying the persona fields beside its status.
+    """
     mock_llm = MockLLMConnector()
     storage_dir = tmp_path / "sessions"
     app = create_ui_app(static_dir=tmp_path, storage_dir=storage_dir, llm=mock_llm)
     client = TestClient(app)
 
-    res = client.get("/api/personas")
+    res = client.get("/api/clones")
     assert res.status_code == 200
     data = res.json()
     assert data["status"] == "ok"
     assert data["count"] > 0
-    personas = {p["name"]: p for p in data["personas"]}
+    assert "personas" not in data
+    personas = {p["name"]: p for p in data["clones"]}
     assert "writer" in personas
     assert "artist" in personas
     assert "clone" in personas
@@ -203,10 +218,10 @@ def test_the_live_agents_listing_is_not_served(tmp_path: Path) -> None:
 
     It overlaid live-instance state onto the persona rows, and after #1731 took the chat
     path away it answered an empty list for every install. The rail lists clones from
-    `GET /api/personas`; a head still asking the old path must see a 404, not an answer
+    `GET /api/clones`; a head still asking the old path must see a 404, not an answer
     from some other route or from the page mount.
 
-    Killed by: src/uclone_x/ui/app.py :: @app.get("/api/personas")
+    Killed by: src/uclone_x/ui/clones.py :: @app.get("/api/clones")
     Becomes: @app.get("/api/agents")
     """
     (tmp_path / "index.html").write_text("<!doctype html><title>UClone</title>", encoding="utf-8")
@@ -219,6 +234,43 @@ def test_the_live_agents_listing_is_not_served(tmp_path: Path) -> None:
     res = client.get("/api/agents")
 
     assert res.status_code == 404, (res.status_code, res.text[:200])
+
+
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("GET", "/api/personas"),
+        ("POST", "/api/personas"),
+        ("GET", "/api/personas/writer"),
+        ("PUT", "/api/personas/writer"),
+        ("GET", "/api/personas/writer/avatar"),
+        ("PUT", "/api/personas/writer/avatar"),
+        ("DELETE", "/api/personas/writer/avatar"),
+        ("POST", "/api/personas/synthesize"),
+    ],
+)
+def test_the_personas_routes_are_removed_with_no_alias(
+    tmp_path: Path, method: str, path: str
+) -> None:
+    """`/api/personas/*` is gone, not aliased: `/api/clones` is the one clone resource.
+
+    clone-data-scopes §3.7. A head still asking the old path must be refused -- not
+    answered with the clone listing under another name, and not with the page.
+    """
+    (tmp_path / "index.html").write_text("<!doctype html><title>UClone</title>", encoding="utf-8")
+    client = TestClient(create_ui_app(static_dir=tmp_path, storage_dir=tmp_path / "sessions"))
+
+    # The control: the same app answers the resource that replaced it, and the page.
+    assert client.get("/api/clones").status_code == 200
+    assert client.get("/api/clones/writer").status_code == 200
+    assert client.get("/").status_code == 200
+
+    res = client.request(method, path, json={"name": "writer"})
+
+    # A read is 404. A write can meet the page mount first, which answers 405 for any
+    # method but GET, as it does for the retired chat routes above; neither is an answer.
+    expected = {404} if method == "GET" else {404, 405}
+    assert res.status_code in expected, (res.status_code, res.text[:200])
 
 
 def _said(request: LLMRequest) -> list[tuple[str, str | None]]:

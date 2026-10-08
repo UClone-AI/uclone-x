@@ -20,17 +20,19 @@ from uclone_x.agent.hooks import (
     sanitize_hallucinated_artifacts,
 )
 from uclone_x.agent.models import ToolExecutionRecord
-from uclone_x.agent.session import redact_message
 from uclone_x.llm.models import ChatMessage, MessageRole
 from uclone_x.tools.protocols import ToolRegistryProtocol
 
 __all__ = [
     "DECLINE_PHRASES",
+    "EMPTY_REPLY_NUDGE",
     "EVIDENCE_REQUIRED_NUDGE",
     "GROUNDING_REQUIRED_NUDGE_PREFIX",
     "GROUNDING_REQUIRED_NUDGE_SUFFIX",
     "apply_artifact_sanitization",
+    "compose_empty_reply_nudge",
     "evaluate_artifact_nudge",
+    "extract_produced_artifact_paths",
     "grounding_supports",
     "is_evidence_nudge_declined",
 ]
@@ -48,6 +50,34 @@ EVIDENCE_REQUIRED_NUDGE = (
     "you were given, say that it is answerable from what you were given. If it does not, say "
     "plainly that you could not verify it."
 )
+
+
+#: Sent back, once per turn, to a model whose step wrote nothing and called nothing, with
+#: room left to write (#1808). Short and plain: it asks for the reply and adds nothing the
+#: model could mistake for a task.
+EMPTY_REPLY_NUDGE = (
+    "Your last reply was empty. Reply to the person's message now, in their language."
+)
+
+
+def compose_empty_reply_nudge(available_tools: Sequence[str] = ()) -> str:
+    """A nudge sent to a model whose step wrote nothing and called no tool (#1808, #2168).
+
+    Reasoning models (like qwen3:8b) can spend tokens in thinking blocks planning calls to
+    unadvertised tools, which local runtimes drop silently. When tools are advertised,
+    names them so the model knows what is available, or instructs text-only replies.
+    """
+    if not available_tools:
+        return (
+            "Your last reply was empty. Reply to the person's message now, in their language. "
+            "Do not attempt tool calls; reply directly in text."
+        )
+    tools_str = ", ".join(f"'{t}'" for t in sorted(available_tools))
+    return (
+        f"Your last reply was empty. Reply to the person's message now, in their language. "
+        f"If you call a tool, choose only from the available tools: {tools_str}. "
+        f"Otherwise, reply directly in text."
+    )
 
 
 DECLINE_PHRASES: tuple[str, ...] = (
@@ -217,21 +247,48 @@ def grounding_supports(
     return supports
 
 
+def extract_produced_artifact_paths(
+    tool_executions: Sequence[ToolExecutionRecord],
+) -> set[str]:
+    """Relative paths of the files this turn's tool calls produced (#2085).
+
+    Read through `ToolExecutionRecord.produced_paths`, the one answer the room uses too,
+    and never from an output's shape: a reader here that parsed `path`/`url`/`images`
+    missed the image tool's link-only result (#2013) and nudged every real picture.
+    """
+    produced: set[str] = set()
+    for record in tool_executions:
+        for path in record.produced_paths:
+            clean = extract_artifact_rel_path(path) or path.lstrip("/\\")
+            produced.add(clean.replace("\\", "/"))
+    return produced
+
+
 def _detect_missing_artifacts(
     resp_content: str,
     tools: ToolRegistryProtocol | None,
     workspace_root: Path | None,
+    produced_paths: Collection[str] | None = None,
+    user_message: str | None = None,
 ) -> list[str]:
-    """Find referenced image artifacts in response content that do not exist on disk."""
+    """Find referenced image artifacts in response content that do not exist on disk or were not produced."""
     if tools is None or tools.get("generate_image") is None:
         return []
     missing: list[str] = []
+    norm_produced = {p.lstrip("/\\").replace("\\", "/") for p in (produced_paths or ())}
     for match in MD_IMAGE_RE.finditer(resp_content):
         raw_url = match.group(2)
         rel = extract_artifact_rel_path(raw_url)
         if rel and (rel.startswith("artifacts/images/") or rel.startswith("artifacts/")):
+            norm_rel = rel.lstrip("/\\").replace("\\", "/")
             if is_artifact_missing(rel, workspace_root):
                 missing.append(rel)
+            elif produced_paths is not None:
+                is_user_ref = bool(
+                    user_message and (norm_rel in user_message or Path(rel).name in user_message)
+                )
+                if not is_user_ref and norm_rel not in norm_produced:
+                    missing.append(rel)
     return missing
 
 
@@ -240,41 +297,52 @@ def evaluate_artifact_nudge(
     tools: ToolRegistryProtocol | None,
     workspace_root: Path | None,
     artifact_nudged: bool,
+    produced_paths: Collection[str] | None = None,
+    user_message: str | None = None,
 ) -> tuple[str, str] | None:
-    """Check if in-turn nudge is needed for missing artifact image links."""
+    """Check if in-turn nudge is needed for missing or unproduced artifact image links."""
     if artifact_nudged or not resp_content:
         return None
-    missing = _detect_missing_artifacts(resp_content, tools, workspace_root)
+    missing = _detect_missing_artifacts(
+        resp_content,
+        tools,
+        workspace_root,
+        produced_paths=produced_paths,
+        user_message=user_message,
+    )
     if not missing:
         return None
     first_missing = Path(missing[0]).name
-    nudge = (
-        f"The referenced image file '{first_missing}' does not exist on disk, and no image generation "
-        f"tool was called to produce it. Never predict, invent, or guess image URLs. "
-        f"To provide an image, you must call the 'generate_image' tool with your prompt."
-    )
+    if is_artifact_missing(missing[0], workspace_root):
+        nudge = (
+            f"The referenced image file '{first_missing}' does not exist on disk. "
+            f"Never predict, invent, or guess image URLs. "
+            f"To provide an image, you must call the 'generate_image' tool with your prompt."
+        )
+    else:
+        # Say only what is true: a turn that did call the tool must not be told it did not,
+        # or the model drops the picture it made (#2085).
+        made = sorted(Path(p).name for p in (produced_paths or ()) if p.startswith("artifacts/"))
+        if made:
+            follow = f"This turn made: {', '.join(made)}. Link those files instead."
+        else:
+            follow = (
+                "If the person asked for a new picture, call the 'generate_image' tool; "
+                "do not reuse an earlier file's link."
+            )
+        nudge = f"The referenced image file '{first_missing}' was not made in this turn. {follow}"
     return missing[0], nudge
 
 
-def apply_artifact_sanitization(
-    content: str,
-    workspace_root: Path | None,
-    history: list[ChatMessage],
-    assistant_msg_idx: int | None,
-) -> str:
-    """Post-turn sanitization for any remaining hallucinated artifact images."""
+def apply_artifact_sanitization(content: str, workspace_root: Path | None) -> str:
+    """Post-turn sanitization for any remaining hallucinated artifact images.
+
+    Returns the sanitized reply; the caller writes it into the history through the
+    session's door, which logs it and declares the rewrite when a request showed the
+    message (#1848). This function no longer writes the history itself: a rewrite here
+    declared nothing, so a shown answer could change inside an epoch.
+    """
     if not content:
         return ""
-    sanitized, count = sanitize_hallucinated_artifacts(content, workspace_root)
-    if count > 0:
-        if assistant_msg_idx is not None and assistant_msg_idx < len(history):
-            orig_msg = history[assistant_msg_idx]
-            history[assistant_msg_idx] = redact_message(
-                ChatMessage(
-                    role=MessageRole.ASSISTANT,
-                    content=sanitized or None,
-                    tool_calls=orig_msg.tool_calls,
-                )
-            )
-        return sanitized
-    return content
+    sanitized, _count = sanitize_hallucinated_artifacts(content, workspace_root)
+    return sanitized

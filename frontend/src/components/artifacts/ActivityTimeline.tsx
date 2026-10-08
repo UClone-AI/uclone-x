@@ -28,6 +28,7 @@ import {
   type RoomToolUse,
   type SeatHistory,
 } from '../../lib/roomDock';
+import { readDeveloperMode } from '../../lib/developerMode';
 import {
   classifyTool,
   parseArgs,
@@ -103,6 +104,7 @@ export interface ActivityTimelineProps {
   refreshKey?: unknown;
   /** Front Docs on a file a call wrote. */
   onOpenInDocs?: (path: string) => void;
+  developerMode?: boolean;
 }
 
 const itemFromUse = (
@@ -217,7 +219,9 @@ export const ActivityTimeline: React.FC<ActivityTimelineProps> = ({
   events = [],
   refreshKey,
   onOpenInDocs,
+  developerMode,
 }) => {
+  const devMode = developerMode ?? (typeof window !== 'undefined' ? readDeveloperMode() : false);
   const [searchTerm, setSearchTerm] = useState<string>('');
   const [categoryFilter, setCategoryFilter] = useState<string>('all');
   const [statusFilter, setStatusFilter] = useState<string>('all');
@@ -644,11 +648,16 @@ export const ActivityTimeline: React.FC<ActivityTimelineProps> = ({
                       <div className="p-2.5 rounded-xl bg-rose-950/30 border border-rose-900/50 space-y-1">
                         <div className="flex items-center gap-1.5 text-rose-400 font-semibold text-[11px]">
                           <AlertTriangle className="w-3.5 h-3.5" />
-                          <span>{t.errorTrace}</span>
+                          <span data-testid={`activity-error-summary-${act.id}`}>{t.toolFailed}</span>
                         </div>
-                        <pre className="text-rose-300 text-[10px] whitespace-pre-wrap overflow-x-auto">
-                          {act.error}
-                        </pre>
+                        {devMode && (
+                          <div className="space-y-1 pt-1 border-t border-rose-900/40">
+                            <div className="text-[10px] text-rose-400 font-semibold font-sans">{t.errorTrace}</div>
+                            <pre data-testid={`activity-error-trace-${act.id}`} className="text-rose-300 text-[10px] whitespace-pre-wrap overflow-x-auto font-mono">
+                              {act.error}
+                            </pre>
+                          </div>
+                        )}
                       </div>
                     )}
                   </div>

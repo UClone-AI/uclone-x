@@ -15,13 +15,17 @@ import logging
 import re
 import shutil
 import socket
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Any, cast
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_REMOTE_OLLAMA_PORT = 11434
 DEFAULT_REMOTE_COMFYUI_PORT = 8188
+#: The `PortMapping.service_name` of the tunnel's ComfyUI forward.
+COMFYUI_SERVICE_NAME = "comfyui"
 
 _VALID_HOST_REGEX = re.compile(r"^[a-zA-Z0-9_\-\.\@\:]+$")
 
@@ -34,6 +38,35 @@ def is_valid_host(host: str) -> bool:
     if stripped.startswith("-"):
         return False
     return bool(_VALID_HOST_REGEX.match(stripped))
+
+
+def find_configured_ssh_hosts(ssh_config_path: Path | None = None) -> list[str]:
+    """Parse ~/.ssh/config (or `ssh_config_path`) for concrete Host declarations.
+
+    Ignores wildcards like '*' or patterns with '?'. Returns sorted unique hostnames.
+    """
+    path = ssh_config_path if ssh_config_path is not None else Path.home() / ".ssh" / "config"
+    if not path.is_file():
+        return []
+    hosts: set[str] = set()
+    try:
+        content = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    for line in content.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        tokens = stripped.replace("=", " ").split()
+        if not tokens:
+            continue
+        if tokens[0].lower() == "host":
+            for name in tokens[1:]:
+                if "*" in name or "?" in name:
+                    continue
+                if is_valid_host(name):
+                    hosts.add(name)
+    return sorted(hosts)
 
 
 def is_port_in_use(port: int, host: str = "127.0.0.1") -> bool:
@@ -134,7 +167,18 @@ class TunnelSessionStatus:
     gpu: RemoteGPUInfo | None = None
     error: str | None = None
     comfyui_autostarted: bool = False
+    ollama_autostarted: bool = False
     ollama_models: list[str] = field(default_factory=list[str])
+
+    @property
+    def comfyui_local_port(self) -> int | None:
+        """The local port forwarded to the remote ComfyUI while connected, else `None`."""
+        if not self.connected:
+            return None
+        for mapping in self.mappings:
+            if mapping.service_name == COMFYUI_SERVICE_NAME:
+                return mapping.local_port
+        return None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -145,6 +189,7 @@ class TunnelSessionStatus:
             "gpu": self.gpu.to_dict() if self.gpu else None,
             "error": self.error,
             "comfyui_autostarted": self.comfyui_autostarted,
+            "ollama_autostarted": self.ollama_autostarted,
             "ollama_models": list(self.ollama_models),
         }
 
@@ -152,6 +197,9 @@ class TunnelSessionStatus:
 _REMOTE_PROBE_PYTHON_CMD = (
     "python3 -c '"
     "import json, subprocess, shutil, socket, os\n"
+    'for p in ["/opt/homebrew/bin", "/usr/local/bin"]:\n'
+    '    if p not in os.environ.get("PATH", ""):\n'
+    '        os.environ["PATH"] = p + ":" + os.environ.get("PATH", "")\n'
     'res = {"gpu": None, "ports": {}, "comfyui_dir": None, "ollama_models": []}\n'
     'nv = shutil.which("nvidia-smi") or "/usr/lib/wsl/lib/nvidia-smi"\n'
     "try:\n"
@@ -161,6 +209,14 @@ _REMOTE_PROBE_PYTHON_CMD = (
     '        res["gpu"] = {"name": parts[0], "total_mb": int(parts[1]), "used_mb": int(parts[2]), "driver": parts[3]}\n'
     "except Exception:\n"
     "    pass\n"
+    'if res["gpu"] is None:\n'
+    "    try:\n"
+    '        brand = subprocess.check_output(["sysctl", "-n", "machdep.cpu.brand_string"], text=True, stderr=subprocess.DEVNULL).strip()\n'
+    '        if "Apple" in brand:\n'
+    '            mem_bytes = int(subprocess.check_output(["sysctl", "-n", "hw.memsize"], text=True, stderr=subprocess.DEVNULL).strip())\n'
+    '            res["gpu"] = {"name": brand, "total_mb": mem_bytes // (1024 * 1024), "used_mb": 0, "driver": "Apple Metal"}\n'
+    "    except Exception:\n"
+    "        pass\n"
     'for port, name in [(11434, "ollama"), (8188, "comfyui")]:\n'
     "    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n"
     "    s.settimeout(0.5)\n"
@@ -300,6 +356,113 @@ async def probe_remote_host(host: str, timeout: float = 6.0) -> RemoteHostInspec
     )
 
 
+async def launch_remote_ollama(
+    host: str,
+    timeout: float = 8.0,
+) -> tuple[bool, str | None]:
+    """Launch Ollama daemon on remote host if not running and wait for port 11434 to listen."""
+    clean_host = host.strip()
+    if not is_valid_host(clean_host):
+        return False, f"Invalid host: {clean_host!r}"
+
+    remote_cmd = (
+        "if [ -f /opt/homebrew/bin/ollama ]; then OLLAMA=/opt/homebrew/bin/ollama; "
+        "elif [ -f /usr/local/bin/ollama ]; then OLLAMA=/usr/local/bin/ollama; "
+        "else OLLAMA=ollama; fi; "
+        "nohup $OLLAMA serve </dev/null >/tmp/ollama.log 2>&1 &"
+    )
+    cmd = [
+        "ssh",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=5",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+        "--",
+        clean_host,
+        remote_cmd,
+    ]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=6.0)
+        if proc.returncode != 0:
+            err = stderr.decode(errors="replace").strip()
+            return False, f"Failed to spawn remote Ollama: {err}"
+    except Exception as exc:
+        return False, f"Failed to execute Ollama launch command: {exc}"
+
+    poll_py = (
+        "python3 -c '"
+        "import socket, sys\n"
+        "s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n"
+        "s.settimeout(0.5)\n"
+        'r = s.connect_ex(("127.0.0.1", 11434))\n'
+        "s.close()\n"
+        "sys.exit(0 if r == 0 else 1)\n"
+        "'"
+    )
+    poll_cmd = [
+        "ssh",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=3",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+        "--",
+        clean_host,
+        poll_py,
+    ]
+    start_time = asyncio.get_event_loop().time()
+    while asyncio.get_event_loop().time() - start_time < timeout:
+        await asyncio.sleep(0.5)
+        try:
+            p = await asyncio.create_subprocess_exec(
+                *poll_cmd,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await asyncio.wait_for(p.wait(), timeout=3.0)
+            if p.returncode == 0:
+                return True, None
+        except Exception:
+            pass
+
+    diag = ""
+    tail_cmd = [
+        "ssh",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=3",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+        "--",
+        clean_host,
+        "tail -n 15 /tmp/ollama.log 2>/dev/null || true",
+    ]
+    try:
+        p = await asyncio.create_subprocess_exec(
+            *tail_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        stdout, _ = await asyncio.wait_for(p.communicate(), timeout=3.0)
+        diag = stdout.decode(errors="replace").strip()
+    except Exception:
+        pass
+
+    err_msg = f"Ollama failed to start listening on port 11434 within {timeout:g}s."
+    if diag:
+        err_msg += f"\nLast log:\n{diag}"
+    return False, err_msg
+
+
 async def launch_remote_comfyui(
     host: str,
     comfy_dir: str,
@@ -307,9 +470,11 @@ async def launch_remote_comfyui(
 ) -> tuple[bool, str | None]:
     """Launch ComfyUI on remote host if not running and wait for port 8188 to listen."""
     clean_host = host.strip()
-    clean_dir = comfy_dir.strip()
+    clean_dir = comfy_dir.strip() if comfy_dir else ""
     if not is_valid_host(clean_host):
         return False, f"Invalid host: {clean_host!r}"
+    if not clean_dir:
+        return False, "ComfyUI directory not specified"
 
     remote_cmd = (
         f"if [ -f {clean_dir}/venv/bin/python3 ]; then PY={clean_dir}/venv/bin/python3; else PY=python3; fi; "
@@ -416,7 +581,56 @@ class SSHTunnelManager:
         self._drain_task: asyncio.Task[None] | None = None
         self._stderr_lines: list[str] = []
         self._lock = asyncio.Lock()
+        self._disconnect_listeners: list[Callable[[], Any]] = []
         atexit.register(self._sync_cleanup)
+
+    def add_disconnect_listener(self, callback: Callable[[], Any]) -> None:
+        """Register a callback to be invoked when the SSH tunnel disconnects or terminates."""
+        if callback not in self._disconnect_listeners:
+            self._disconnect_listeners.append(callback)
+
+    async def _drain_stderr(self, stream: asyncio.StreamReader) -> None:
+        while True:
+            line = await stream.readline()
+            if not line:
+                break
+            self._stderr_lines.append(line.decode(errors="replace").strip())
+            if len(self._stderr_lines) > 100:
+                self._stderr_lines.pop(0)
+
+    async def _watch_and_drain(self, p: asyncio.subprocess.Process) -> None:
+        drain_subtask: asyncio.Task[None] | None = None
+        try:
+            if p.stderr is not None:
+                drain_subtask = asyncio.create_task(self._drain_stderr(p.stderr))
+            await p.wait()
+            if drain_subtask is not None:
+                with contextlib.suppress(BaseException):
+                    await drain_subtask
+        except asyncio.CancelledError:
+            if drain_subtask is not None:
+                drain_subtask.cancel()
+                with contextlib.suppress(BaseException):
+                    await drain_subtask
+            return
+        except Exception:
+            logger.exception("SSH tunnel watcher encountered an error")
+            return
+
+        was_connected = False
+        if self._session is not None and self._session.connected:
+            was_connected = True
+            self._session.connected = False
+            self._session.pid = None
+
+        if was_connected:
+            for cb in list(self._disconnect_listeners):
+                try:
+                    res = cb()
+                    if asyncio.iscoroutine(res):
+                        await res
+                except Exception:
+                    logger.exception("Error in disconnect listener %r", cb)
 
     def _sync_cleanup(self) -> None:
         """Synchronous cleanup handler registered with atexit."""
@@ -452,6 +666,7 @@ class SSHTunnelManager:
         preferred_local_ollama_port: int | None = None,
         preferred_local_comfyui_port: int | None = None,
         auto_start_comfyui: bool = True,
+        auto_start_ollama: bool = True,
         timeout: float = 12.0,
     ) -> TunnelSessionStatus:
         """Probe remote host and establish an SSH port-forwarding tunnel."""
@@ -480,12 +695,30 @@ class SSHTunnelManager:
                 inspection.ports.get("comfyui") and inspection.ports["comfyui"].listening
             )
             comfyui_autostarted = False
+            ollama_autostarted = False
+
+            # Auto-start Ollama if not yet listening
+            if not ollama_listening and auto_start_ollama:
+                started, start_err = await launch_remote_ollama(
+                    clean_host,
+                    timeout=min(8.0, timeout),
+                )
+                if started:
+                    ollama_listening = True
+                    ollama_autostarted = True
+                else:
+                    logger.warning("Auto-start of Ollama on %s failed: %s", clean_host, start_err)
 
             # Auto-start ComfyUI if not yet listening
-            if not comfy_listening and auto_start_comfyui and inspection.comfyui_dir:
+            if (
+                not comfy_listening
+                and auto_start_comfyui
+                and inspection.comfyui_dir
+                and inspection.comfyui_dir.strip()
+            ):
                 started, start_err = await launch_remote_comfyui(
                     clean_host,
-                    inspection.comfyui_dir,
+                    inspection.comfyui_dir.strip(),
                     timeout=10.0,
                 )
                 if started:
@@ -518,7 +751,7 @@ class SSHTunnelManager:
                 )
                 mappings.append(
                     PortMapping(
-                        service_name="comfyui",
+                        service_name=COMFYUI_SERVICE_NAME,
                         remote_port=DEFAULT_REMOTE_COMFYUI_PORT,
                         local_port=comfy_target_local,
                     )
@@ -555,20 +788,9 @@ class SSHTunnelManager:
                 self._session = status
                 return status
 
-            # Asynchronously drain stderr in the background to avoid OS pipe deadlock
+            # Asynchronously drain stderr and watch process termination
             self._stderr_lines.clear()
-
-            async def _drain_stderr(stream: asyncio.StreamReader) -> None:
-                while True:
-                    line = await stream.readline()
-                    if not line:
-                        break
-                    self._stderr_lines.append(line.decode(errors="replace").strip())
-                    if len(self._stderr_lines) > 100:
-                        self._stderr_lines.pop(0)
-
-            if proc.stderr is not None:
-                self._drain_task = asyncio.create_task(_drain_stderr(proc.stderr))
+            self._drain_task = asyncio.create_task(self._watch_and_drain(proc))
 
             # Wait for ports to be bound locally
             deadline = asyncio.get_event_loop().time() + timeout
@@ -618,6 +840,7 @@ class SSHTunnelManager:
                 mappings=mappings,
                 gpu=inspection.gpu,
                 comfyui_autostarted=comfyui_autostarted,
+                ollama_autostarted=ollama_autostarted,
                 ollama_models=inspection.ollama_models,
             )
             self._session = status

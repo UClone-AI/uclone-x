@@ -21,6 +21,7 @@ import pytest
 from playwright.async_api import APIRequestContext, async_playwright
 
 from tests.e2e.conftest import is_extraction_request, nothing_learned, running_ui
+from uclone_x.core.agent_home import CLONE_FILE_NAME, clone_handles, default_agents_root
 from uclone_x.llm.connectors.mock import MockLLMConnector
 from uclone_x.llm.models import LLMRequest, MessageRole, ModelResponse, ToolCallRequest
 
@@ -111,8 +112,13 @@ async def test_an_agent_created_in_settings_is_listed_and_answers_with_its_instr
             await section.get_by_test_id("persona-row-surveyor").wait_for(timeout=10_000)
             await section.get_by_role("status").wait_for(timeout=5_000)
 
-            written = workspace / ".uclone" / "personas" / "surveyor.yaml"
-            assert written.is_file(), "the save did not land in the directory the loader reads"
+            # A saved clone lives in its own directory's `clone.yaml` (clone-data-scopes §3.3).
+            root = default_agents_root()
+            (agent_id,) = clone_handles(root).get("surveyor", ("",))
+            written = root / agent_id / CLONE_FILE_NAME
+            assert agent_id and written.is_file(), (
+                "the save did not land in the directory the loader reads"
+            )
 
             await _room_turn(page.request, server, "surveyor", "go")
         finally:

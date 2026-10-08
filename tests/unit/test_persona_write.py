@@ -28,6 +28,7 @@ from uclone_x.agent.base import BaseAgent
 from uclone_x.agent.models import BASE_PERSONA_TOOLS
 from uclone_x.agent.persona_registry import PersonaRegistry
 from uclone_x.agent.prompts import compose_system_prompt
+from uclone_x.core.agent_home import CLONE_FILE_NAME, AgentHome, default_agents_root
 from uclone_x.llm.connectors.mock import MockLLMConnector
 from uclone_x.llm.models import LLMRequest, MessageRole, ModelResponse
 from uclone_x.tools.base import BaseTool
@@ -96,6 +97,19 @@ def _tools() -> ToolRegistry:
     return registry
 
 
+#: A model ref on the `mock` connection `_with_box` saves (model-gateway §3.1).
+_BOX_MODEL = "box/hermes3:8b"
+
+
+def _with_box(workspace: Path) -> None:
+    """Save a `box` connection, so a persona may name a model on it (§3.7.1)."""
+    sessions = workspace / "sessions"
+    sessions.mkdir(parents=True, exist_ok=True)
+    (sessions / "settings.json").write_text(
+        '{"connections": [{"id": "box", "kind": "mock"}]}', encoding="utf-8"
+    )
+
+
 def _client(workspace: Path, llm: MockLLMConnector | None = None) -> TestClient:
     app = create_ui_app(
         static_dir=workspace / "static",
@@ -136,7 +150,8 @@ def _draft(name: str = "surveyor", **overrides: Any) -> dict[str, Any]:
         "description": "Maps a site before anyone digs.",
         "system_prompt": "You survey.\nReport  \n what you map.",
         "allowed_tools": ["map_area"],
-        "model_name": "hermes3:8b",
+        # A model ref on a saved connection (model-gateway §3.4); `_with_box` saves `box`.
+        "model_name": None,
         "model_tier": "fast",
         "temperature": 0.3,
         "max_tokens": 512,
@@ -148,9 +163,14 @@ def _draft(name: str = "surveyor", **overrides: Any) -> dict[str, Any]:
 
 
 def _listed(client: TestClient) -> dict[str, dict[str, Any]]:
-    res = client.get("/api/personas")
+    res = client.get("/api/clones")
     assert res.status_code == 200
-    return {p["name"]: p for p in res.json()["personas"]}
+    return {p["name"]: p for p in res.json()["clones"]}
+
+
+def _clone_file(name: str) -> Path:
+    """The `clone.yaml` a persona called `name` is stored in (clone-data-scopes §3.2)."""
+    return AgentHome.for_handle(name).clone_path
 
 
 def _files_under(root: Path) -> set[Path]:
@@ -168,26 +188,35 @@ def workspace(tmp_path: Path, builtin_personas_absent: None) -> Path:
 
 
 def test_create_writes_one_yaml_file_in_the_directory_the_loader_reads(workspace: Path) -> None:
-    """A created persona is a file in `<workspace>/.uclone/personas/`, and the catalogue lists it.
+    """A created persona is a clone directory -- `id` and `clone.yaml` -- and is listed.
 
-    That directory, not `~/.uclone/personas/`, is the one `PersonaRegistry.reload` reads
-    (`DEFAULT_WORKSPACE_PERSONAS_SUBDIR` under the workspace root), so it is the one a write
-    must land in for the next process to see it.
+    Since 2026-09-27 the clone root, not `<workspace>/.uclone/personas/`, is what
+    `PersonaRegistry.reload` reads (clone-data-scopes §3.2), so it is the one a write must
+    land in for the next process to see it, and the workspace is left without a file.
 
-    Killed by: src/uclone_x/agent/persona_store.py :: os.replace(temp_path, target)
-    Becomes: os.remove(temp_path)
+    Killed by: src/uclone_x/core/agent_home.py :: os.rename(staged, target)
+    Becomes: pass
     """
+    _with_box(workspace)
     client = _client(workspace)
 
-    res = client.post("/api/personas", json=_draft())
+    res = client.post("/api/clones", json=_draft(model_name=_BOX_MODEL))
 
     assert res.status_code == 201, res.text
-    assert _files_under(workspace / PERSONAS_SUBDIR) == {Path("surveyor.yaml")}
+    clone_dir = _clone_file("surveyor").parent
+    assert clone_dir.parent == default_agents_root()
+    assert _files_under(clone_dir) == {Path("id"), Path(CLONE_FILE_NAME)}
+    assert not (workspace / PERSONAS_SUBDIR).exists()
     listed = _listed(client)["surveyor"]
     assert listed["role"] == "Site Surveyor"
     assert listed["system_prompt"] == "You survey.\nReport  \n what you map."
     assert listed["allowed_tools"] == ["map_area"]
-    assert listed["model_name"] == "hermes3:8b"
+    assert listed["model_name"] == _BOX_MODEL
+    assert listed["llm_config"] == {
+        "model_name": _BOX_MODEL,
+        "fast_model": None,
+        "image_model": None,
+    }
     assert listed["model_tier"] == "fast"
     assert listed["temperature"] == 0.3
     assert listed["max_tokens"] == 512
@@ -213,9 +242,11 @@ def test_a_written_persona_round_trips_through_a_fresh_loader(workspace: Path) -
     Killed by: src/uclone_x/agent/persona_store.py :: llm_dict["model_tier"] = ModelTier(tier)
     Becomes: pass
     """
+    _with_box(workspace)
     client = _client(workspace)
     prompt = "당신은 측량사입니다.\n  indented line  \n\ntrailing   "
-    assert client.post("/api/personas", json=_draft(system_prompt=prompt)).status_code == 201
+    created = client.post("/api/clones", json=_draft(system_prompt=prompt, model_name=_BOX_MODEL))
+    assert created.status_code == 201
 
     fresh = PersonaRegistry(workspace_root=workspace, include_defaults=False)
     loaded = fresh.get_persona("surveyor")
@@ -223,7 +254,7 @@ def test_a_written_persona_round_trips_through_a_fresh_loader(workspace: Path) -
     assert loaded is not None
     assert loaded.system_prompt == prompt
     assert loaded.allowed_tools == ("map_area",)
-    assert loaded.llm_config.model_name == "hermes3:8b"
+    assert loaded.llm_config.model_name == _BOX_MODEL
     assert loaded.llm_config.model_tier == "fast"
     assert loaded.llm_config.max_tokens == 512
     assert loaded.enable_subagent_tools is True
@@ -232,56 +263,63 @@ def test_a_written_persona_round_trips_through_a_fresh_loader(workspace: Path) -
 def test_create_refuses_a_name_that_is_already_defined(workspace: Path) -> None:
     """Create never overwrites: an existing name is a 409 and its file is left as it was.
 
-    Killed by: src/uclone_x/agent/persona_store.py :: if create and draft.name in self._personas:
+    Killed by: src/uclone_x/agent/clone_store.py :: if create and (record is not None or clone_handles(self.root).get(draft.name)):
     Becomes: if False:
     """
     client = _client(workspace)
-    assert client.post("/api/personas", json=_draft()).status_code == 201
-    before = (workspace / PERSONAS_SUBDIR / "surveyor.yaml").read_bytes()
+    assert client.post("/api/clones", json=_draft()).status_code == 201
+    before = _clone_file("surveyor").read_bytes()
 
-    res = client.post("/api/personas", json=_draft(role="Impostor"))
+    res = client.post("/api/clones", json=_draft(role="Impostor"))
 
     assert res.status_code == 409
     assert "surveyor" in res.json()["detail"]
-    assert (workspace / PERSONAS_SUBDIR / "surveyor.yaml").read_bytes() == before
+    assert _clone_file("surveyor").read_bytes() == before
 
 
 # --- update ------------------------------------------------------------------------------
 
 
 def test_update_rewrites_the_file_the_persona_was_loaded_from(workspace: Path) -> None:
-    """An edit replaces the persona's own file, even one not named after it.
+    """An edit replaces the clone's own file, even for a persona imported from another name.
 
-    A second file would be shadowed or would shadow depending on sort order, so an edit
-    written beside the original can silently disappear on the next restart.
+    A workspace file not named after its persona is imported at start into the clone of
+    that name (clone-data-scopes §3.8 step 2). The edit rewrites that clone's `clone.yaml`
+    in place: a second clone would be refused as a duplicate handle, and the import source
+    is never written back to (the migration deletes and changes nothing it read).
 
-    Killed by: src/uclone_x/agent/persona_store.py :: in_place = source is not None and source.parent == directory
-    Becomes: in_place = False
+    Killed by: src/uclone_x/agent/clone_store.py :: replace_clone_file(record.agent_id, text, root=self.root)
+    Becomes: create_clone(draft.name, text, root=self.root)
     """
     personas_dir = workspace / PERSONAS_SUBDIR
     personas_dir.mkdir(parents=True)
-    (personas_dir / "zz_legacy.yml").write_text(
-        "name: surveyor\nrole: Old\nsystem_prompt: old prompt\n", encoding="utf-8"
-    )
+    legacy = personas_dir / "zz_legacy.yml"
+    legacy.write_text("name: surveyor\nrole: Old\nsystem_prompt: old prompt\n", encoding="utf-8")
+    legacy_bytes = legacy.read_bytes()
     client = _client(workspace)
+    clone_file = _clone_file("surveyor")
 
-    res = client.put("/api/personas/surveyor", json=_draft(role="New"))
+    res = client.put("/api/clones/surveyor", json=_draft(role="New"))
 
     assert res.status_code == 200, res.text
-    assert _files_under(personas_dir) == {Path("zz_legacy.yml")}
-    assert yaml.safe_load((personas_dir / "zz_legacy.yml").read_text())["role"] == "New"
+    assert _clone_file("surveyor") == clone_file
+    assert yaml.safe_load(clone_file.read_text(encoding="utf-8"))["role"] == "New"
+    assert legacy.read_bytes() == legacy_bytes
     assert _listed(client)["surveyor"]["role"] == "New"
 
 
 def test_update_of_an_unknown_persona_is_404(workspace: Path) -> None:
     """Update is not create: an unknown name is a 404 and nothing is written.
 
-    Killed by: src/uclone_x/agent/persona_store.py :: if not create and not self.has_persona(draft.name):
-    Becomes: if False:
+    The refusal is made more than once on the way down (the clone store and each persona
+    store check), so no one guard pins it; the route's mapping of it to a 404 does.
+
+    Killed by: src/uclone_x/ui/app.py :: except PersonaNotFound as exc:
+    Becomes: except PersonaWriteRefused as exc:
     """
     client = _client(workspace)
 
-    res = client.put("/api/personas/nobody", json=_draft(name="nobody"))
+    res = client.put("/api/clones/nobody", json=_draft(name="nobody"))
 
     assert res.status_code == 404
     assert not (workspace / PERSONAS_SUBDIR).exists()
@@ -290,26 +328,92 @@ def test_update_of_an_unknown_persona_is_404(workspace: Path) -> None:
 def test_update_refuses_a_body_naming_a_different_persona(workspace: Path) -> None:
     """Renaming is not an edit; a body whose name differs from the path is refused.
 
-    Killed by: src/uclone_x/ui/app.py :: if name is not None and draft.name != name:
+    Killed by: src/uclone_x/ui/app.py :: if addressed is not None and draft.name != addressed:
     Becomes: if False:
     """
     client = _client(workspace)
-    assert client.post("/api/personas", json=_draft()).status_code == 201
+    assert client.post("/api/clones", json=_draft()).status_code == 201
 
-    res = client.put("/api/personas/surveyor", json=_draft(name="digger"))
+    res = client.put("/api/clones/surveyor", json=_draft(name="digger"))
 
     assert res.status_code == 422
     assert set(_listed(client)) == {"surveyor"}
 
 
+def test_an_edit_addressed_by_the_clone_id_is_the_edit_addressed_by_its_handle(
+    workspace: Path,
+) -> None:
+    """`PUT /api/clones/{ref}` takes the clone's id as well as its handle (§3.7).
+
+    Seats and chats address a clone by id, so a head holding only the id edits the same
+    clone, in the same file, with the same answer; and a body naming another handle is
+    still refused, since the address resolves to the clone's handle before the check.
+    """
+    client = _client(workspace)
+    assert client.post("/api/clones", json=_draft()).status_code == 201
+    clone_id = _listed(client)["surveyor"]["id"]
+    assert isinstance(clone_id, str) and clone_id.startswith("agt_")
+    clone_file = _clone_file("surveyor")
+
+    by_id = client.put(f"/api/clones/{clone_id}", json=_draft(role="By id"))
+
+    assert by_id.status_code == 200, by_id.text
+    persona = by_id.json()["persona"]
+    assert (persona["id"], persona["handle"], persona["role"]) == (clone_id, "surveyor", "By id")
+    assert _clone_file("surveyor") == clone_file
+    assert yaml.safe_load(clone_file.read_text(encoding="utf-8"))["role"] == "By id"
+
+    by_handle = client.put("/api/clones/surveyor", json=_draft(role="By handle"))
+
+    assert by_handle.status_code == 200, by_handle.text
+    assert by_handle.json()["persona"]["id"] == clone_id
+    assert client.get(f"/api/clones/{clone_id}").json() == client.get("/api/clones/surveyor").json()
+    assert client.get(f"/api/clones/{clone_id}").json()["persona"]["role"] == "By handle"
+
+    renamed = client.put(f"/api/clones/{clone_id}", json=_draft(name="digger"))
+
+    assert renamed.status_code == 422, renamed.text
+    assert set(_listed(client)) == {"surveyor"}
+
+
+def test_the_clone_listing_names_each_clone_by_id_and_handle_and_its_peers_by_id(
+    workspace: Path,
+) -> None:
+    """Each `GET /api/clones` row carries `id`, `handle` and `display_name` (§3.7).
+
+    `a2a_peers` are clone ids, as stored: a draft may name a peer by handle, and the
+    listing gives it back as that peer's id, which a head shows by the peer's own row.
+    """
+    client = _client(workspace)
+    assert client.post("/api/clones", json=_draft(name="digger")).status_code == 201
+    created = client.post(
+        "/api/clones",
+        json=_draft(display_name={"en": "Surveyor"}, a2a_peers=["digger"]),
+    )
+    assert created.status_code == 201, created.text
+
+    listed = _listed(client)
+
+    digger, surveyor = listed["digger"], listed["surveyor"]
+    for row, handle in ((digger, "digger"), (surveyor, "surveyor")):
+        assert isinstance(row["id"], str) and row["id"].startswith("agt_"), row
+        assert row["handle"] == row["name"] == handle
+        assert row["id"] == AgentHome.for_handle(handle).path.name
+    assert digger["id"] != surveyor["id"]
+    assert surveyor["display_name"] == {"en": "Surveyor"}
+    assert digger["display_name"] == {}
+    assert surveyor["a2a_peers"] == [digger["id"]]
+    assert created.json()["persona"]["a2a_peers"] == [digger["id"]]
+
+
 def test_editing_a_builtin_writes_an_override_and_leaves_the_shipped_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A built-in persona is edited by an override file in the workspace, never in the package.
+    """A built-in persona is edited in its installed clone, never in the package.
 
     The shipped file is what an upgrade replaces; editing it would lose the change on the
-    next install and, in a read-only site-packages, fail outright. The loader already lets
-    a workspace file win over a built-in of the same name, so the override is that file.
+    next install and, in a read-only site-packages, fail outright. Install copied it into a
+    clone directory (clone-data-scopes §3.5), so the edit is that clone's `clone.yaml`.
     A built-in whose prompt appends the default prompt round-trips as its own text plus the
     flag, not as a frozen copy of the composed default.
 
@@ -336,12 +440,11 @@ def test_editing_a_builtin_writes_an_override_and_leaves_the_shipped_file(
 
     edit = {k: v for k, v in before.items() if k in _draft()}
     edit.update(role="Senior Guide", append_default_prompt=True)
-    res = client.put("/api/personas/guide", json=edit)
+    res = client.put("/api/clones/guide", json=edit)
 
     assert res.status_code == 200, res.text
     assert shipped_file.read_bytes() == shipped_bytes
-    override = workspace / PERSONAS_SUBDIR / "guide.yaml"
-    written = yaml.safe_load(override.read_text(encoding="utf-8"))
+    written = yaml.safe_load(_clone_file("guide").read_text(encoding="utf-8"))
     assert written["system_prompt"] == "You guide."
     assert written["append_default_prompt"] is True
     after = _listed(client)["guide"]
@@ -382,7 +485,7 @@ def test_a_name_that_cannot_be_a_filename_is_refused_and_nothing_is_written(
     message is that rule's, which is what separates this refusal from the directory check
     behind it (that one would also refuse `../escaped`, with different words).
 
-    Killed by: src/uclone_x/agent/persona_store.py :: _refuse_an_unwritable_name(draft.name)
+    Killed by: src/uclone_x/agent/clone_store.py :: refuse_an_unusable_username(draft.name)
     Becomes: pass
     """
     workspace = tmp_path / "ws"
@@ -390,7 +493,7 @@ def test_a_name_that_cannot_be_a_filename_is_refused_and_nothing_is_written(
     client = _client(workspace)
     before = _files_under(tmp_path)
 
-    res = client.post("/api/personas", json=_draft(name=bad_name))
+    res = client.post("/api/clones", json=_draft(name=bad_name))
 
     assert res.status_code == 422
     assert "cannot be a persona name" in str(res.json()["detail"])
@@ -401,30 +504,32 @@ def test_a_name_that_cannot_be_a_filename_is_refused_and_nothing_is_written(
 def test_a_write_that_resolves_outside_the_personas_directory_is_refused(
     tmp_path: Path, builtin_personas_absent: None
 ) -> None:
-    """A persona file that is a symlink out of the directory is not written through.
+    """A clone file that is a symlink out of its directory is replaced, not written through.
 
-    A name cannot reach outside the directory (the name rule above), but the file an edit
-    rewrites is the one the persona was *loaded* from, and that can be a link. Writing
-    through it would change a file the user never pointed the head at.
+    A name cannot reach outside the root (the name rule above), but the file an edit
+    rewrites can be a link. Writing through it would change a file the user never pointed
+    the head at, so the new text replaces the link in one step and the target is untouched.
 
-    Killed by: src/uclone_x/agent/persona_store.py :: if resolved_target.parent != directory.resolve():
-    Becomes: if False:
+    Killed by: src/uclone_x/core/agent_home.py :: os.replace(staged, home.clone_path)
+    Becomes: home.clone_path.write_text(clone_yaml_text, encoding="utf-8")
     """
     outside = tmp_path / "elsewhere.yaml"
-    outside.write_text("name: linked\nrole: Linked\nsystem_prompt: linked\n", encoding="utf-8")
+    outside.write_text("handle: linked\nrole: Linked\nsystem_prompt: linked\n", encoding="utf-8")
     outside_bytes = outside.read_bytes()
     workspace = tmp_path / "ws"
-    personas_dir = workspace / PERSONAS_SUBDIR
-    personas_dir.mkdir(parents=True)
-    (personas_dir / "linked.yaml").symlink_to(outside)
+    workspace.mkdir()
     client = _client(workspace)
+    assert client.post("/api/clones", json=_draft(name="linked")).status_code == 201
+    clone_file = _clone_file("linked")
+    clone_file.unlink()
+    clone_file.symlink_to(outside)
 
-    res = client.put("/api/personas/linked", json=_draft(name="linked", role="Changed"))
+    res = client.put("/api/clones/linked", json=_draft(name="linked", role="Changed"))
 
-    assert res.status_code == 422
-    assert "outside" in res.json()["detail"]
+    assert res.status_code == 200, res.text
     assert outside.read_bytes() == outside_bytes
-    assert _listed(client)["linked"]["role"] == "Linked"
+    assert not clone_file.is_symlink()
+    assert _listed(client)["linked"]["role"] == "Changed"
 
 
 def test_an_unregistered_tool_is_refused_and_the_previous_definition_stands(
@@ -432,23 +537,24 @@ def test_an_unregistered_tool_is_refused_and_the_previous_definition_stands(
 ) -> None:
     """A tool name the runtime does not have is a 422, and the file and catalogue are unchanged.
 
-    The candidate file is written to a temporary name, loaded by the loader, and only then
-    moved over the real one, so a refused edit leaves no half-written file behind either.
+    The candidate text is parsed by the loader before anything is written, and the file is
+    then replaced in one step, so a refused edit leaves no half-written file behind either.
 
-    Killed by: src/uclone_x/agent/persona_store.py :: persona = self._parse_file(temp_path, label=target)
-    Becomes: persona = self._parse_file(temp_path, label=target) if False else PersonaDefinition(name=draft.name, role=draft.role, system_prompt=draft.system_prompt)
+    Killed by: src/uclone_x/agent/clone_store.py :: self._parse(checked, draft.name, label)
+    Becomes: pass
     """
     client = _client(workspace)
-    assert client.post("/api/personas", json=_draft()).status_code == 201
-    before = (workspace / PERSONAS_SUBDIR / "surveyor.yaml").read_bytes()
+    assert client.post("/api/clones", json=_draft()).status_code == 201
+    clone_dir = _clone_file("surveyor").parent
+    before = _clone_file("surveyor").read_bytes()
 
-    res = client.put("/api/personas/surveyor", json=_draft(allowed_tools=["map_aera"]))
+    res = client.put("/api/clones/surveyor", json=_draft(allowed_tools=["map_aera"]))
 
     assert res.status_code == 422
     assert "map_aera" in res.json()["detail"]
     assert "map_area" in res.json()["detail"]  # the loader's did-you-mean
-    assert (workspace / PERSONAS_SUBDIR / "surveyor.yaml").read_bytes() == before
-    assert _files_under(workspace / PERSONAS_SUBDIR) == {Path("surveyor.yaml")}
+    assert _clone_file("surveyor").read_bytes() == before
+    assert _files_under(clone_dir) == {Path("id"), Path(CLONE_FILE_NAME)}
     assert _listed(client)["surveyor"]["allowed_tools"] == ["map_area"]
 
 
@@ -476,7 +582,7 @@ def test_an_invalid_payload_is_refused_not_trimmed(
     """
     client = _client(workspace)
 
-    res = client.post("/api/personas", json=_draft(**overrides))
+    res = client.post("/api/clones", json=_draft(**overrides))
 
     assert res.status_code == 422, res.text
     assert not (workspace / PERSONAS_SUBDIR).exists()
@@ -506,7 +612,7 @@ def test_a_running_agent_takes_the_edited_prompt_and_tools_on_its_next_turn(
     """
     llm = _RecordingConnector()
     client = _client(workspace, llm)
-    assert client.post("/api/personas", json=_draft()).status_code == 201
+    assert client.post("/api/clones", json=_draft()).status_code == 201
     agent = app_clone(_manager(client), "surveyor", "sess_survey")
 
     _turn(client, agent)
@@ -514,7 +620,7 @@ def test_a_running_agent_takes_the_edited_prompt_and_tools_on_its_next_turn(
     assert _own_tools_sent(llm.requests[-1]) == ["map_area"]
 
     res = client.put(
-        "/api/personas/surveyor",
+        "/api/clones/surveyor",
         json=_draft(system_prompt="You dig now.", allowed_tools=["dig_site"]),
     )
     assert res.status_code == 200, res.text
@@ -552,7 +658,7 @@ def test_a_sub_agent_of_a_tool_scoped_persona_gets_only_the_parent_s_tools_edits
     with TestClient(app) as client:
         portal = client.portal
         assert portal is not None
-        assert client.post("/api/personas", json=_draft()).status_code == 201
+        assert client.post("/api/clones", json=_draft()).status_code == 201
         parent = app_clone(manager, "surveyor", "sess_sub")
         portal.call(_take_turn, parent)
 
@@ -563,7 +669,7 @@ def test_a_sub_agent_of_a_tool_scoped_persona_gets_only_the_parent_s_tools_edits
 
         assert offered_to_a_child(parent) == ["map_area"]
 
-        edit = client.put("/api/personas/surveyor", json=_draft(allowed_tools=["dig_site"]))
+        edit = client.put("/api/clones/surveyor", json=_draft(allowed_tools=["dig_site"]))
         assert edit.status_code == 200, edit.text
         parent.define_persona(_saved(client, "surveyor"))
         assert offered_to_a_child(parent) == ["dig_site"]

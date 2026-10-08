@@ -1,20 +1,32 @@
-# Publish to PyPI when a version tag is pushed.
+# Publish to PyPI when a version tag is pushed, then create its GitHub Release.
 #
 # PyPI trusted publishing: no token is stored anywhere. PyPI accepts the upload
 # because it comes from this workflow, in this repository, in the `pypi`
-# environment, as registered once under the project's Publishing settings.
+# environment, as registered once under the project's Publishing settings. The
+# GitHub Release is created with this run's own GITHUB_TOKEN.
+#
+# Run by hand (Actions tab, "Run workflow", with a tag), it creates the GitHub
+# Release for a tag that already exists and touches nothing else: no build, no
+# PyPI upload. A Release that already exists is left as it is, on either path.
 
 name: Release
 
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing version tag to create the GitHub Release for, e.g. v0.3.1"
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 jobs:
   build:
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -54,6 +66,7 @@ jobs:
 
   publish:
     needs: build
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     environment: pypi
@@ -66,3 +79,75 @@ jobs:
           path: dist/
 
       - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+
+  github-release:
+    needs: publish
+    # A dispatched run skips `publish`, which would otherwise skip this job too.
+    if: ${{ !cancelled() && (github.event_name == 'workflow_dispatch' || needs.publish.result == 'success') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+    steps:
+      # This run's own commit, which carries the notes script; older tags predate it.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Tag exists
+        run: |
+          set -euo pipefail
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+((a|b|rc)[0-9]+)?$ ]] || {
+            echo "::error::'$TAG' is not a version tag (vX.Y.Z)"
+            exit 1
+          }
+          git rev-parse --verify --quiet "refs/tags/${TAG}^{commit}" >/dev/null || {
+            echo "::error::tag $TAG does not exist in this repository"
+            exit 1
+          }
+
+      # Notes are the tag's own CHANGELOG entry; a missing or empty entry fails here.
+      - name: Release notes
+        run: |
+          set -euo pipefail
+          git show "refs/tags/${TAG}:CHANGELOG.md" > "$RUNNER_TEMP/CHANGELOG.md"
+          python3 .github/scripts/changelog_section.py "${TAG#v}" "$RUNNER_TEMP/CHANGELOG.md" > "$RUNNER_TEMP/notes.md"
+          cat "$RUNNER_TEMP/notes.md"
+
+      # A re-run, or a backfill of a tag that already has one, leaves the Release alone.
+      - name: Release already exists
+        id: existing
+        run: |
+          set -euo pipefail
+          if out="$(gh release view "$TAG" --json tagName 2>&1)"; then
+            echo "::notice::the GitHub Release for $TAG already exists; leaving it unchanged"
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          elif [[ "$out" == *"release not found"* ]]; then
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "$out" >&2
+            exit 1
+          fi
+
+      - name: Built distributions
+        if: steps.existing.outputs.exists == 'false' && github.event_name == 'push'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Create the GitHub Release
+        if: steps.existing.outputs.exists == 'false'
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          args=(--verify-tag --title "uclone-x ${version}" --notes-file "$RUNNER_TEMP/notes.md")
+          [[ "$version" =~ (a|b|rc)[0-9]+$ ]] && args+=(--prerelease)
+          assets=()
+          [[ -d dist ]] && assets=(dist/*)
+          gh release create "$TAG" "${args[@]}" "${assets[@]}"

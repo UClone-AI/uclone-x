@@ -20,7 +20,9 @@ What they pin, in order of what it would cost to get wrong:
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
+from typing import get_args
 
 import pytest
 import yaml
@@ -31,8 +33,10 @@ from uclone_x.story.library import StoryError, StoryLibrary, StoryReadOnlyError
 from uclone_x.story.proposals import apply_proposal
 from uclone_x.story.schemas import Chapter, Outline, Proposal, Scene, dump_file
 from uclone_x.story.view import (
+    StoryNoteCode,
     StoryNotFoundError,
     StoryNotWritableError,
+    StoryRefusalCode,
     StoryView,
     WriterBusyError,
 )
@@ -523,7 +527,7 @@ def test_the_write_itself_still_checks_the_lease(workspace: Path, rooms: RoomSer
 
 
 def test_no_tool_reaches_the_approval_path() -> None:
-    """No tool module imports the approval path: only the UI's routes import this module.
+    """No tool module imports the approval path: only the story view's routes import this module.
 
     This pins imports, not reachability: a persona with an unconfined shell can still
     call the local API (#1589 item 6)."""
@@ -533,4 +537,245 @@ def test_no_tool_reaches_the_approval_path() -> None:
         if "from uclone_x.story.view import" in path.read_text(encoding="utf-8")
         or "import uclone_x.story.view" in path.read_text(encoding="utf-8")
     )
-    assert importers == ["ui/artifacts.py"]
+    # The routes are the story extension's own since #2205, mounted by the web head.
+    assert importers == ["story/routes.py"]
+
+
+# -- the board: scenes linked to the codex (§1.1 row 5) ---------------------------------
+
+
+def _start_yaml(**over: object) -> str:
+    state: dict[str, object] = {
+        "request": "a story about a salt road",
+        "brief": {
+            "title": "The Salt Road",
+            "genre": "fantasy",
+            "tone": "grim",
+            "audience": "adult",
+            "length": "short",
+        },
+        **over,
+    }
+    return yaml.safe_dump(state, allow_unicode=True)
+
+
+def _board_story(workspace: Path, rooms: RoomService, start: str | None) -> str:
+    """Two chapters; ch01.s01 lists Vane and Mara (only proposed), names the gate in its text,
+    plants the oath thread, and is where Vane is wounded and a scar appears."""
+    story_id, room_id = _story(workspace, rooms)
+    outline = Outline(
+        chapters=[
+            Chapter(
+                id="ch01",
+                title="The Crossing",
+                scenes=[
+                    Scene(id="ch01.s01", title="The gate", characters=["vane", "mara"]),
+                    Scene(id="ch01.s02", title="The bridge", summary="Vane crosses alone."),
+                ],
+            ),
+            Chapter(id="ch02", title="The Salt", scenes=[Scene(id="ch02.s01", title="Salt")]),
+        ]
+    )
+    _put(workspace, story_id, "outline.yaml", dump_file(outline))
+    _put(
+        workspace,
+        story_id,
+        "manuscript/ch01.s01.md",
+        "An arrow grazed Lord Vane at the salt gate.",
+    )
+    _put(
+        workspace,
+        story_id,
+        "codex/characters/vane.yaml",
+        yaml.safe_dump(
+            {
+                "id": "vane",
+                "name": "Lord Vane",
+                "aliases": ["Vane"],
+                "state": {"status": "alive"},
+                "progressions": [{"at": "ch01.s01", "set": {"wounded": True}, "note": "Grazed."}],
+                "visual": {"progressions": [{"at": "ch01.s01", "add_tags": ["scar"]}]},
+            }
+        ),
+    )
+    _put(
+        workspace,
+        story_id,
+        "codex/places/gate.yaml",
+        yaml.safe_dump({"id": "gate", "name": "Salt Gate", "aliases": ["salt gate"]}),
+    )
+    _put(
+        workspace,
+        story_id,
+        "codex/threads/oath.yaml",
+        yaml.safe_dump({"id": "oath", "name": "The oath", "planted_in": "ch01.s01"}),
+    )
+    mara = Proposal.model_validate(
+        {
+            "id": "p002",
+            "kind": "characters",
+            "entry_id": "mara",
+            "change": {"new_entry": {"id": "mara", "name": "Mara"}},
+            "proposed_at": "2026-09-25T10:00:00+00:00",
+            "room_id": room_id,
+        }
+    )
+    _put(workspace, story_id, "proposals/p002.yaml", dump_file(mara, compact=True))
+    if start is not None:
+        _put(workspace, story_id, "start.yaml", start)
+    return story_id
+
+
+def test_the_board_links_each_scene_to_its_codex_entries_changes_and_proposals(
+    workspace: Path, rooms: RoomService, view: StoryView
+) -> None:
+    start = _start_yaml(
+        arc={"functions": [["setup"], ["reversal"]], "twist_chapter": 2, "climax_chapter": 2},
+        continuity=[
+            {
+                "scene_id": "ch01.s01",
+                "scene_title": "The gate",
+                "quote": "Lord Vane at the salt gate",
+                "note": "베인 경은 이미 죽었는데 성문에 나옵니다.",
+                "kind": "disjointWith",
+            }
+        ],
+        continuity_checked=["ch01.s01"],
+    )
+    story_id = _board_story(workspace, rooms, start)
+
+    shown = view.show(story_id)
+
+    assert shown.board_note is None
+    assert shown.outline is not None
+    first, second = shown.outline.chapters
+    assert (first.functions, first.twist, second.functions, second.twist, second.climax) == (
+        ["setup"],
+        False,
+        ["reversal"],
+        True,
+        True,
+    )
+    gate, bridge = first.scenes
+    assert [(e.name, e.how, e.in_codex) for e in gate.entries] == [
+        ("Lord Vane", "listed", True),
+        ("Mara", "listed", False),  # only proposed: named from the proposal, not linked
+        ("Salt Gate", "mentioned", True),
+        ("The oath", "planted", True),
+    ]
+    assert [(c.entry_name, c.set, c.add_looks, c.note) for c in gate.changes] == [
+        ("Lord Vane", {"wounded": True}, [], "Grazed."),
+        ("Lord Vane", {}, ["scar"], None),
+    ]
+    assert gate.continuity == "checked"
+    assert [(f.quote, f.note) for f in gate.findings] == [
+        ("Lord Vane at the salt gate", "베인 경은 이미 죽었는데 성문에 나옵니다.")
+    ]
+    # The reasoner's kind of contradiction stays in the record, never on the board.
+    assert "disjointWith" not in shown.model_dump_json()
+    # p001 quotes ch01.s01 and places its change there; p002 (a new entry) rests on nothing.
+    assert gate.pending == ["p001"]
+    # The bridge's summary names Vane by alias; it was never checked and has no proposal.
+    assert [(e.name, e.how) for e in bridge.entries] == [("Lord Vane", "mentioned")]
+    assert (bridge.continuity, bridge.findings, bridge.pending, bridge.changes) == (
+        None,
+        [],
+        [],
+        [],
+    )
+
+
+def test_a_board_without_a_readable_arc_shows_no_chapter_functions(
+    workspace: Path, rooms: RoomService, view: StoryView
+) -> None:
+    # An arc for three chapters over an outline of two: the arc no longer fits.
+    unfit = _start_yaml(
+        arc={"functions": [["setup"], ["reversal"], ["climax"]], "twist_chapter": 2},
+        continuity_unread=["ch01.s01"],
+    )
+    story_id = _board_story(workspace, rooms, unfit)
+    shown = view.show(story_id)
+    assert shown.outline is not None
+    first, second = shown.outline.chapters
+    assert (first.functions, second.functions, second.twist) == ([], [], False)
+    assert first.scenes[0].continuity == "unread"
+
+    _put(workspace, story_id, "start.yaml", "request: [unclosed")
+    broken = view.show(story_id)
+    assert broken.board_note is not None
+    assert "could not be read" in broken.board_note
+    assert broken.outline is not None
+    assert broken.outline.chapters[0].scenes[0].continuity is None
+
+
+def test_a_story_not_started_with_story_start_has_a_board_and_no_note(
+    workspace: Path, rooms: RoomService, view: StoryView
+) -> None:
+    story_id = _board_story(workspace, rooms, None)
+    shown = view.show(story_id)
+    assert shown.board_note is None
+    assert shown.outline is not None
+    assert shown.outline.chapters[0].functions == []
+    assert shown.outline.chapters[0].scenes[0].entries[0].name == "Lord Vane"
+
+
+# -- the notes and refusals in the reader's language ----------------------------------------
+
+
+def test_each_note_carries_the_code_the_head_words_it_from(
+    workspace: Path, rooms: RoomService, answering: set[str], view: StoryView
+) -> None:
+    """A Korean screen words a note from its code, not from the English sentence beside it.
+
+    Killed by: src/uclone_x/story/view.py :: board_code="start_unreadable" if board_note else None,
+    Becomes: board_code=None,
+    Killed by: src/uclone_x/story/view.py :: decide_code=decide[0] if decide else None,
+    Becomes: decide_code=None,
+    Killed by: src/uclone_x/story/view.py :: return None, ("no_outline", "This story has no outline yet."), None, {}
+    Becomes: return None, ("outline_unreadable", "This story has no outline yet."), None, {}
+    Killed by: src/uclone_x/story/view.py :: return "writer_gone", (
+    Becomes: return "no_writer", (
+    """
+    story_id, room_id = _story(workspace, rooms)
+    shown = view.show(story_id)
+    assert (shown.decide_code, shown.outline_code, shown.board_code) == (None, None, None)
+
+    answering.add(room_id)
+    with pytest.raises(WriterBusyError) as busy:
+        view.approve(story_id, "p001", seen_digest=shown.pending[0].digest)
+    assert busy.value.code == "writer_busy"
+    answering.discard(room_id)
+
+    _put(workspace, story_id, "start.yaml", "request: [unclosed")
+    (_story_dir(workspace, story_id) / "outline.yaml").unlink()
+    shown = view.show(story_id)
+    assert (shown.board_code, shown.outline_code) == ("start_unreadable", "no_outline")
+    _put(workspace, story_id, "outline.yaml", "chapters: 3\n")
+    assert view.show(story_id).outline_code == "outline_unreadable"
+
+    rooms.delete(room_id)
+    assert view.show(story_id).decide_code == "writer_gone"
+    with pytest.raises(StoryNotWritableError) as gone:
+        view.reject(story_id, "p001", seen_digest=shown.pending[0].digest, reason=None)
+    assert gone.value.code == "writer_gone"
+
+    StoryLibrary(workspace).release(story_id, room_id)
+    assert view.show(story_id).decide_code == "no_writer"
+    with pytest.raises(StoryNotFoundError) as missing:
+        view.show("night-train")
+    assert missing.value.code == "story_gone"
+
+
+_LOCALES = Path(__file__).resolve().parents[2] / "frontend" / "src" / "i18n" / "locales"
+
+
+@pytest.mark.parametrize("language", ["en", "ko"])
+def test_every_note_and_refusal_code_has_a_sentence_in_the_head(language: str) -> None:
+    """Equal, not contained: a code the catalog lacks reads as English on a Korean screen.
+
+    Killed by: src/uclone_x/story/view.py :: StoryRefusalCode = Literal["story_gone", "no_writer", "writer_gone", "writer_busy"]
+    Becomes: StoryRefusalCode = Literal["story_gone", "no_writer", "writer_gone", "writer_away"]
+    """
+    catalog = json.loads((_LOCALES / language / "dock.json").read_text(encoding="utf-8"))
+    assert set(get_args(StoryNoteCode)) == set(catalog["story"]["notes"])
+    assert set(get_args(StoryRefusalCode)) == set(catalog["story"]["refusals"])

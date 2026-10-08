@@ -188,16 +188,22 @@ def conversation_room_id(head: str, clone_id: str, conversation_id: str) -> str:
     return f"{head}_{digest[:24]}"
 
 
+def _named(clone_id: str) -> str:
+    """What a refusal calls a clone: the handle a person typed, else the id it has."""
+    from uclone_x.core.agent_home import handle_of, is_agent_id
+
+    if is_agent_id(clone_id):
+        return handle_of(clone_id) or clone_id
+    return clone_id
+
+
 def _seat_in(state: RoomState, room_id: str, clone_id: str, head: str) -> Participant:
     """`clone_id`'s seat in the stored room, refused unless the room is its alone and `head`'s.
 
     A room has a single owner (owner ruling). A stored room that `head` did not create --
     one the app keeps, which carries no head, or another head's -- is refused, so `ucx run
     --session-id <a room the app shows>` cannot become a second writer beside the app
-    (#1885). A head room stored before the mark existed carries no head either, so it is
-    refused here too and stays the app's to continue (author's choice): the two cannot be
-    told apart, and guessing wrong would make two writers of one room. The ACP and A2A
-    heads' rooms can be told apart, by their id (`_unmarked_server_room`).
+    (#1885).
     """
     from uclone_x.errors import RoomError
 
@@ -207,31 +213,21 @@ def _seat_in(state: RoomState, room_id: str, clone_id: str, head: str) -> Partic
     )
     if seat is None:
         raise RoomError(
-            f"Room {room_id!r} does not seat {clone_id!r}. Name a room this clone is in, "
+            f"Room {room_id!r} does not seat {_named(clone_id)!r}. Name a room this clone is in, "
             f"or leave the id out to start a new one."
         )
     if not is_one_seat(state.participants):
         raise RoomError(
-            f"Room {room_id!r} seats other clones besides {clone_id!r}. Name a room this "
+            f"Room {room_id!r} seats other clones besides {_named(clone_id)!r}. Name a room this "
             f"clone is in alone, or leave the id out to start a new one."
         )
-    if state.head != head and not _unmarked_server_room(state, room_id, head):
+    if state.head != head:
         keeper = "the app" if state.head is None else head_keeper(state.head)
         raise RoomError(
             f"Room {room_id!r} belongs to {keeper}, so {head_keeper(head)} cannot continue "
             f"it. Continue it there, or leave the id out to start a new one."
         )
     return seat
-
-
-def _unmarked_server_room(state: RoomState, room_id: str, head: str) -> bool:
-    """Whether `state` is an ACP or A2A head's own room, stored before rooms were marked.
-
-    Those rooms are keyed by `conversation_room_id`, whose id starts with the head's name,
-    and nothing else mints such an id, so an unmarked one is that head's own. Refusing it
-    would end every ACP session and A2A context begun before #1885 at its next turn.
-    """
-    return state.head is None and head in ("acp", "a2a") and room_id.startswith(f"{head}_")
 
 
 def resolve_one_seat_room(
@@ -272,9 +268,7 @@ def _stored_or_created(
     """The stored room under `room_id`, or a new one seating the person and `clone_id`.
 
     A new room is marked with `head`, the head that keeps it (#1885). A stored room keeps
-    the mark it has: a head room written before the mark existed is not marked later, so
-    what the app may do with a room it already shows does not change under it (author's
-    choice).
+    the mark it has.
     """
     from uclone_x.errors import RoomNotFoundError
 
@@ -345,7 +339,11 @@ def record_head_turn(
             or another writer moved it since it was read (`StaleRoomWriteError`).
         OSError: the store could not be written.
     """
-    from uclone_x.room.orchestrator import memory_save_outcome, record_turn_tools
+    from uclone_x.room.orchestrator import (
+        image_prompt_additions,
+        memory_save_outcome,
+        record_turn_tools,
+    )
 
     state = _stored_or_created(
         RoomService(store), room_id=room_id, clone_id=clone_id, title=title, head=head
@@ -356,9 +354,11 @@ def record_head_turn(
         seq=len(state.transcript) + 1, sender_id=ONE_SEAT_HUMAN_ID, content=turn.prompt
     )
     tried, unsaved = memory_save_outcome(turn.executions)
+    prompt_added, negative_added = image_prompt_additions(turn.executions)
     answered = RoomMessage(
         seq=asked.seq + 1,
         sender_id=clone_id,
+        session_id=seat.session_id or None,  # the trace reads it (clone-data-scopes §4)
         content=turn.content,
         provenance=turn.provenance,
         usage=turn.usage,
@@ -371,6 +371,8 @@ def record_head_turn(
         tools_recorded=turn.tools_recorded,
         memory_facts_tried=tried,
         memory_facts_unsaved=unsaved,
+        image_prompt_added=prompt_added,
+        image_negative_added=negative_added,
         session_set_aside=turn.session_set_aside,
     )
     uses, written = record_turn_tools(seat, turn_id, turn.executions)

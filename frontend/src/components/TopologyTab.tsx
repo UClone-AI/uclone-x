@@ -36,14 +36,6 @@ const toolTone = (status: string): Tone =>
   status === 'success' ? 'success' : status === 'running' ? 'warning' : 'danger';
 
 /**
- * The conversation drawn from its edges: who is seated, the turns in the order they were
- * taken, the tools each turn called, and the helper agents a seat started.
- *
- * The order and the nesting come from the Core's edges (`followed_by`, `called`,
- * `spawned`), not from re-sorting the nodes here, so what is drawn is what the Core said.
- * A developer surface (the DAG tab); the everyday view of the same turns is Activity.
- */
-/**
  * The Core's gap clauses in the reader's language (#1911): each clause's code worded by the
  * catalog, with the count it names. A clause keeps the Core's English when its code is one this
  * head does not know, and every clause does when the codes are missing (a Core older than
@@ -64,6 +56,14 @@ const wordGaps = (
   });
 };
 
+/**
+ * The conversation drawn from its edges: who is seated, the turns in the order they were
+ * taken, the tools each turn called, and the helper agents a seat started.
+ *
+ * The order and the nesting come from the Core's edges (`followed_by`, `called`,
+ * `spawned`), not from re-sorting the nodes here, so what is drawn is what the Core said.
+ * A developer surface (the DAG tab); the everyday view of the same turns is Activity.
+ */
 export function TopologyTab({ roomId, refreshKey }: TopologyTabProps) {
   const t = useCopy().dock.topology;
   const [reloads, setReloads] = useState(0);
@@ -108,8 +108,9 @@ export function TopologyTab({ roomId, refreshKey }: TopologyTabProps) {
     };
   }, [data]);
 
-  // The Core's `reason` and gaps are worded from their codes (#1911); the Core's English is
-  // shown for a code this head does not know, or from a Core older than the codes.
+  // The Core's `reason` and gaps are worded from their codes (#1911). For a reason code this
+  // head does not know, or from a Core older than the codes, the catalog's `unknownReason`
+  // sentence leads and the Core's English follows it (#1915).
   const reasons: Readonly<Record<string, string>> = t.reasons;
   const reason: ReactNode = !roomId ? (
     t.noRoom
@@ -122,9 +123,12 @@ export function TopologyTab({ roomId, refreshKey }: TopologyTabProps) {
     t.loading
   ) : data.reason_code && Object.prototype.hasOwnProperty.call(reasons, data.reason_code) ? (
     reasons[data.reason_code]
-  ) : (
-    data.reason
-  );
+  ) : data.reason ? (
+    <>
+      {t.unknownReason}{' '}
+      <code className="break-words font-mono text-[11px] text-slate-400">{data.reason}</code>
+    </>
+  ) : null;
   const historyGaps = data ? wordGaps(data.history_gaps ?? [], data.history_gap_codes, t.historyGapReasons) : [];
   const toolCallGaps = data
     ? wordGaps(data.tool_call_gaps ?? [], data.tool_call_gap_codes, t.toolCallGapReasons)

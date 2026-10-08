@@ -53,8 +53,8 @@ beforeEach(() => {
     'fetch',
     vi.fn((input: RequestInfo | URL) => {
       switch (String(input).split('?')[0]) {
-        case '/api/personas':
-          return Promise.resolve(answer({ personas: [{ name: 'champion' }] }));
+        case '/api/clones':
+          return Promise.resolve(answer({ clones: [{ name: 'champion' }] }));
         default:
           return Promise.resolve(answer({}, 404));
       }

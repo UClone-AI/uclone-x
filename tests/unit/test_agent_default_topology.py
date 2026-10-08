@@ -14,8 +14,11 @@ from uclone_x.agent.persona_registry import PersonaRegistry
 def test_default_personas_ship_as_package_files():
     """The default built-ins are discovered from `personas/`, not defined in code.
 
-    Killed by: src/uclone_x/agent/persona_registry.py :: if self._include_defaults and BUILTIN_PERSONAS_DIR.is_dir():
-    Becomes: if False:
+    Since 2026-09-27 each ships as a package file installed as a clone at start
+    (clone-data-scopes §3.4), so the install is what makes them discoverable.
+
+    Killed by: src/uclone_x/agent/persona_registry.py :: install=self._include_defaults,
+    Becomes: install=False,
     """
     registry = PersonaRegistry()
 
@@ -29,6 +32,8 @@ def test_default_personas_ship_as_package_files():
     assert isinstance(scout, PersonaDefinition)
     assert scout.role == "Research & Search Specialist"
     assert not scout.enable_write_tools
+    # Owner ruling on design §8 q6 (#2109): scout researches with the browser.
+    assert "browser" in scout.allowed_tools
 
     guardian = registry.get_persona("guardian")
     assert isinstance(guardian, PersonaDefinition)

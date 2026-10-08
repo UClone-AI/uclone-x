@@ -2,21 +2,31 @@
 
 # ⚡ UClone-X
 
-**AI clones that run on your own machine — chat with them one-to-one or in a group,
-and let them remember, read your files, search and draw.**
+**Open-source, self-hosted AI agents that run on your own machine — chat with them
+one-to-one or in a group, and let them remember, read your files, search and draw.**
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Python](https://img.shields.io/badge/Python-3.11+-blue.svg)](https://www.python.org/)
-[![LLM Agnostic](https://img.shields.io/badge/LLM-Gemini_|_Claude_|_OpenAI_|_Local-orange.svg)](https://github.com/UClone-AI/uclone-x/blob/main/docs/llm-agnostic-interface.md)
+[![LLM Agnostic](https://img.shields.io/badge/LLM-Gemini_|_Claude_|_OpenAI_|_Local-orange.svg)](https://github.com/UClone-AI/uclone-x/blob/main/docs/public/overview.md)
+[![PyPI](https://img.shields.io/pypi/v/uclone-x.svg)](https://pypi.org/project/uclone-x/)
 
 </div>
 
 ---
 
-UClone-X is a local AI workspace. You install it, open the dashboard in your
-browser, and talk to *clones* — agents with their own instructions, memory and
-tools. A local model through Ollama works with no account and no API key; a
-Gemini, Claude or OpenAI key works too.
+UClone-X is an open-source local AI workspace: a multi-agent chat app for your
+own computer. You install it, open the dashboard in your browser, and talk to
+*clones* — AI agents with their own instructions, long-term memory and tools. A
+local LLM through Ollama works with no account and no API key; a Gemini, Claude
+or OpenAI key works too.
+
+* **Private by default** — no account and no server of its own; with a local
+  model, nothing leaves your machine.
+* **Group chat with AI agents** — several clones in one conversation, each
+  addressable by name.
+* **Tools** — files in your workspace, web search, local image generation
+  (SDXL), and any MCP server you connect.
+* **Any model** — Ollama, vLLM, Gemini, Claude or OpenAI.
 
 Underneath is an event-driven agent runtime you can also use on its own: see
 [For developers](#for-developers).
@@ -93,10 +103,10 @@ With pip, into a Python 3.11+ environment of your own:
 `pip install "uclone-x[cli,http]"`. The two extras are not optional in practice:
 `cli` is the `ucx` shell and `http` serves the dashboard. The base install is the
 runtime without a shell — what you want if you are importing `uclone_x` as a
-library. Provider SDKs and the heavier stacks are the genuinely optional extras:
+library (see `examples/single_agent.py`). Model providers need no extra: every
+connector speaks HTTP directly. The heavier stacks are the genuinely optional extras:
 
 ```bash
-pip install "uclone-x[llm]"         # Gemini, Claude, OpenAI SDKs
 pip install "uclone-x[ontology]"    # LinkML, rdflib, networkx
 pip install "uclone-x[code_intel]"  # tree-sitter AST parsing
 pip install "uclone-x[all]"
@@ -240,8 +250,8 @@ external broker.
   behind one interface, with schema translation and fallback routing.
 * **Dynamic personas and sub-agents** — agents create, supervise and terminate
   child agents with their own prompts and strict tool boundaries.
-* **Pluggable sandboxing** — host, workspace, container or WASM isolation
-  selected per tool rather than globally.
+* **Workspace sandboxing** — tool calls are confined to the workspace by default;
+  container and WASM levels are defined but not yet built.
 * **Ontology grounding** — LinkML domain schemas and a semantic graph the agent
   reasons against instead of inventing structure per prompt.
 * **OpenTelemetry native** — traces, metrics and OTLP export built in.
@@ -258,34 +268,21 @@ depending on it.
 | LLM connectors (Gemini, Claude, OpenAI, Ollama, vLLM) | Implemented |
 | Dashboard: conversations, clones, memory, settings | Implemented |
 | Local image generation | Implemented |
-| Sandbox isolation modes | Implemented (host and workspace); container and WASM partial |
+| Sandbox isolation modes | Implemented (host and workspace); container and WASM are configuration only |
 | Ontology engine, skills, code intelligence | Implemented, evolving |
-| A2A protocol | **Specified, not implemented.** No conformance is claimed |
+| A2A and ACP servers | **Partial**: HTTP+JSON A2A and stdio ACP, no authentication. No conformance is claimed |
 
 ### Documentation
 
-The documents below are the design and specification of the runtime; they are
-written for contributors rather than as a user manual.
-
-* [Documentation index](https://github.com/UClone-AI/uclone-x/blob/main/docs/README.md)
-* [Module structure](https://github.com/UClone-AI/uclone-x/blob/main/docs/module-structure.md) — the packages as built, their layers
-  and dependency edges
-* [Architecture overview](https://github.com/UClone-AI/uclone-x/blob/main/docs/architecture-overview.md)
-* [Event-driven agent core](https://github.com/UClone-AI/uclone-x/blob/main/docs/event-driven-agent-core.md)
+* [Documentation index](https://github.com/UClone-AI/uclone-x/blob/main/docs/public/README.md)
+* [Architecture overview](https://github.com/UClone-AI/uclone-x/blob/main/docs/public/overview.md) — layers, agents, rooms,
+  and what each subsystem implements today
+* [Getting started with a checkout](https://github.com/UClone-AI/uclone-x/blob/main/docs/public/getting-started.md)
+* [CLI reference](https://github.com/UClone-AI/uclone-x/blob/main/docs/public/cli.md)
+* [A2A and ACP](https://github.com/UClone-AI/uclone-x/blob/main/docs/public/protocols.md)
+* [Security](https://github.com/UClone-AI/uclone-x/blob/main/docs/public/security.md) — what is protected and what is not
 * [Core principles P0–P9](https://github.com/UClone-AI/uclone-x/blob/main/docs/principles/core-principles.md) — the normative
   rules every part of the runtime is built against
-* [Product requirements](https://github.com/UClone-AI/uclone-x/blob/main/docs/PRD.md)
-* [CLI specification](https://github.com/UClone-AI/uclone-x/blob/main/docs/cli-specification.md)
-* [LLM-agnostic interface](https://github.com/UClone-AI/uclone-x/blob/main/docs/llm-agnostic-interface.md)
-* [Dynamic persona and sub-agent interface](https://github.com/UClone-AI/uclone-x/blob/main/docs/dynamic-persona-interface.md)
-* [Local collaboration engine](https://github.com/UClone-AI/uclone-x/blob/main/docs/local-collaboration-engine.md)
-* [Sandbox execution](https://github.com/UClone-AI/uclone-x/blob/main/docs/sandbox-execution-architecture.md)
-* [Ontology architecture](https://github.com/UClone-AI/uclone-x/blob/main/docs/agent-ontology-architecture.md)
-* [Skill system](https://github.com/UClone-AI/uclone-x/blob/main/docs/skill-system-architecture.md)
-* [Code intelligence (AST, LSP, SCIP)](https://github.com/UClone-AI/uclone-x/blob/main/docs/code-intelligence-lsp-scip.md)
-* [Telemetry](https://github.com/UClone-AI/uclone-x/blob/main/docs/telemetry-opentelemetry.md)
-* [A2A protocol specification](https://github.com/UClone-AI/uclone-x/blob/main/docs/a2a-protocol-spec.md)
-* [Security threat model](https://github.com/UClone-AI/uclone-x/blob/main/docs/security-threat-model.md)
 
 ### Working on UClone-X
 
@@ -307,7 +304,7 @@ strict mode, the test suite at or above 70% branch coverage, and a passing
 frontend vitest suite. A change that does not pass it is not ready.
 
 See [CONTRIBUTING.md](https://github.com/UClone-AI/uclone-x/blob/main/CONTRIBUTING.md) for how patches reach this repository,
-and the [local development guide](https://github.com/UClone-AI/uclone-x/blob/main/docs/local-development-guide.md) for the
+and [getting started with a checkout](https://github.com/UClone-AI/uclone-x/blob/main/docs/public/getting-started.md) for the
 longer setup walkthrough.
 
 ## About this repository

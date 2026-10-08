@@ -14,6 +14,14 @@ import { MarkdownRenderer } from '../MarkdownRenderer';
 import { roomDockUrls, useRoomRead, type RoomArtifacts } from '../../lib/roomDock';
 import { en } from '../../i18n/en';
 import { fmt, useCopy } from '../../i18n';
+import { artifactUrlInRoom } from '../../lib/artifactRoom';
+
+/**
+ * A file this conversation lists, read in the conversation's own workspace -- the one its
+ * clones wrote it in, which need not be the server's (clone-data-scopes §3.6).
+ */
+const contentUrl = (path: string, roomId: string | null): string =>
+  artifactUrlInRoom(`/api/artifacts/content?path=${encodeURIComponent(path)}`, roomId);
 
 interface DocViewerProps {
   /** The conversation on screen; Docs lists only the files it wrote (#1354). */
@@ -100,7 +108,7 @@ export const DocViewer: React.FC<DocViewerProps> = ({
     }
     let isMounted = true;
     const companionPath = selectedPath.replace(/\.[^.]+$/, '.json');
-    fetch(`/api/artifacts/content?path=${encodeURIComponent(companionPath)}`)
+    fetch(contentUrl(companionPath, roomId))
       .then(async (res) => {
         if (!res.ok) return null;
         return (await res.json()) as Record<string, unknown>;
@@ -116,12 +124,12 @@ export const DocViewer: React.FC<DocViewerProps> = ({
     return () => {
       isMounted = false;
     };
-  }, [selectedPath, missing, unchecked]);
+  }, [selectedPath, missing, unchecked, roomId]);
 
   useEffect(() => {
     if (!selectedPath || missing || unchecked || IMAGE_FILE.test(selectedPath)) return;
     let isMounted = true;
-    fetch(`/api/artifacts/content?path=${encodeURIComponent(selectedPath)}`)
+    fetch(contentUrl(selectedPath, roomId))
       .then(async (res) => {
         if (!res.ok) {
           const detail = await res.text();
@@ -138,7 +146,7 @@ export const DocViewer: React.FC<DocViewerProps> = ({
     return () => {
       isMounted = false;
     };
-  }, [selectedPath, missing, unchecked]);
+  }, [selectedPath, missing, unchecked, roomId]);
 
   const current = loaded.path === selectedPath ? loaded : null;
   const content = current?.content ?? '';
@@ -360,13 +368,13 @@ export const DocViewer: React.FC<DocViewerProps> = ({
         ) : IMAGE_FILE.test(selectedPath) ? (
           <div data-testid="image-artifact-preview" className="flex flex-col items-center justify-center p-4 bg-slate-950/60 rounded-xl border border-slate-800/80">
             <img
-              src={`/api/artifacts/content?path=${encodeURIComponent(selectedPath)}`}
+              src={contentUrl(selectedPath, roomId)}
               alt={selectedPath}
               className="max-h-[600px] w-auto object-contain rounded-lg shadow-lg border border-slate-800/60"
             />
             <div className="mt-3 flex items-center gap-3 text-xs text-slate-400 font-mono">
               <a
-                href={`/api/artifacts/content?path=${encodeURIComponent(selectedPath)}`}
+                href={contentUrl(selectedPath, roomId)}
                 target="_blank"
                 rel="noreferrer"
                 className="text-cyan-400 hover:underline"

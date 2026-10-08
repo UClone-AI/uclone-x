@@ -10,10 +10,13 @@ from __future__ import annotations
 import httpx
 import pytest
 
+from uclone_x.llm.catalog import CatalogEntry, read_catalog
 from uclone_x.llm.context_window import (
     PUBLISHED_CONTEXT_WINDOWS,
+    ListedContextWindows,
     OllamaContextWindows,
     compaction_window,
+    hosted_context_window,
     published_context_window,
 )
 
@@ -128,8 +131,8 @@ class TestThePublishedTable:
         A table entry would have to pick one of those for everybody, and the one it would
         pick is the wrong one by a factor of four.
 
-        Killed by: src/uclone_x/llm/context_window.py :: "google-genai": {
-        Becomes: "ollama": {"llama3.2": 131_072}, "google-genai": {
+        Killed by: src/uclone_x/llm/context_window.py :: "anthropic": {
+        Becomes: "ollama": {"llama3.2": 131_072}, "anthropic": {
         """
         assert "ollama" not in PUBLISHED_CONTEXT_WINDOWS
         assert "vllm" not in PUBLISHED_CONTEXT_WINDOWS
@@ -142,6 +145,73 @@ class TestThePublishedTable:
         Becomes: name = name.split("/")[0]
         """
         assert published_context_window("openai", "openai/gpt-4o") == 128_000
+
+    def test_a_vertex_snapshot_resolves_through_its_alias(self) -> None:
+        """Vertex names a Claude snapshot `claude-opus-4-5@20251101`, and `@` was no delimiter (#1920).
+
+        IDs from Anthropic's "Claude on Google Cloud" model table, read 2026-09-28. Each
+        had no window, so a seat on Vertex showed none.
+
+        Killed by: src/uclone_x/llm/context_window.py :: _DELIMITERS: frozenset[str] = frozenset({"-", ".", ":", "_", "/", "@"})
+        Becomes: _DELIMITERS: frozenset[str] = frozenset({"-", ".", ":", "_", "/", "~"})
+        """
+        assert published_context_window("anthropic", "claude-opus-4-5@20251101") == 200_000
+        assert published_context_window("anthropic", "claude-sonnet-4-5@20250929") == 200_000
+        assert published_context_window("anthropic", "claude-haiku-4-5@20251001") == 200_000
+
+    def test_an_at_suffix_matches_its_own_key_and_not_a_longer_one(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`claude-opus-5-5@...` is Opus 5.5, and `claude-opus-5@...` is Opus 5, not Opus 5.5.
+
+        Both publish 1M today, so the two windows are made to differ here; otherwise a
+        match on the wrong key passes. Without `@` as a delimiter, `claude-opus-5-5@date`
+        fell through to `claude-opus-5` by its `-`.
+
+        Killed by: src/uclone_x/llm/context_window.py :: _DELIMITERS: frozenset[str] = frozenset({"-", ".", ":", "_", "/", "@"})
+        Becomes: _DELIMITERS: frozenset[str] = frozenset({"-", ".", ":", "_", "/", "~"})
+        """
+        monkeypatch.setitem(PUBLISHED_CONTEXT_WINDOWS["anthropic"], "claude-opus-5-5", 555)
+        monkeypatch.setitem(PUBLISHED_CONTEXT_WINDOWS["anthropic"], "claude-opus-5", 5)
+        assert published_context_window("anthropic", "claude-opus-5-5@20260101") == 555
+        assert published_context_window("anthropic", "claude-opus-5@x") == 5
+        assert published_context_window("anthropic", "claude-opus-5@x") != 555
+
+    def test_a_bedrock_id_resolves_with_or_without_a_region_prefix(self) -> None:
+        r"""Bedrock prefixes the model with `anthropic.`, and an inference profile adds a geography (#1920).
+
+        IDs from Anthropic's two Bedrock pages and AWS's inference-profile page, read
+        2026-09-28. An inference-profile ARN reaches the same ID after the gateway split.
+
+        Killed by: src/uclone_x/llm/context_window.py :: _BEDROCK_PREFIX = re.compile(r"^(?:[a-z][a-z-]*\.)?anthropic\.")
+        Becomes: _BEDROCK_PREFIX = re.compile(r"^(?:[a-z][a-z-]*\.)?anthropiq\.")
+        """
+        assert published_context_window("anthropic", "anthropic.claude-opus-5-5") == 1_000_000
+        assert (
+            published_context_window("anthropic", "anthropic.claude-opus-4-5-20251101-v1:0")
+            == 200_000
+        )
+        assert (
+            published_context_window("anthropic", "us.anthropic.claude-sonnet-4-5-20250929-v1:0")
+            == 200_000
+        )
+        assert (
+            published_context_window("anthropic", "global.anthropic.claude-opus-4-6-v1")
+            == 1_000_000
+        )
+        arn = (
+            "arn:aws:bedrock:us-east-1:111122223333:inference-profile/"
+            "eu.anthropic.claude-haiku-4-5-20251001-v1:0"
+        )
+        assert published_context_window("anthropic", arn) == 200_000
+
+    def test_a_bedrock_prefix_is_only_stripped_whole(self) -> None:
+        r"""A name that merely contains `anthropic.` past its first segment is not a Bedrock ID.
+
+        Killed by: src/uclone_x/llm/context_window.py :: _BEDROCK_PREFIX = re.compile(r"^(?:[a-z][a-z-]*\.)?anthropic\.")
+        Becomes: _BEDROCK_PREFIX = re.compile(r"^(?:[a-z][a-z.]*\.)?anthropic\.")
+        """
+        assert published_context_window("anthropic", "a.b.anthropic.claude-opus-5-5") is None
 
 
 def _ps_client(payload: object, status: int = 200) -> httpx.AsyncClient:
@@ -310,4 +380,128 @@ class TestTheCompactionWindow:
         assert (
             compaction_window("openai", "gpt-4o", base_url=None, configured=5_000, store=store)
             == 5_000
+        )
+
+
+class TestTheListedWindow:
+    """A hosted model's window from its provider's own listing (#1978, catalogue §3.2)."""
+
+    def test_a_gemini_window_comes_from_the_listing_and_not_a_table(self) -> None:
+        """Gemini's listing reports `inputTokenLimit` for every model, so no table row is
+        kept for it: its rows named only retired `gemini-1.5-*` models, and PR #1806's
+        attempt to update them is what §3.6 rejects. The figure here is one no table held,
+        so it can only have come from the listing.
+
+        Killed by: src/uclone_x/llm/context_window.py :: from_listing = store.get(provider, model)
+        Becomes: from_listing = None
+        """
+        store = ListedContextWindows()
+        store.remember("gemini", [CatalogEntry(id="gemini-2.0-flash", context_window=123_456)])
+
+        assert hosted_context_window("gemini", "gemini-2.0-flash", listed=store) == 123_456
+        # The request's own spelling of the same id.
+        assert hosted_context_window("gemini", "models/gemini-2.0-flash", listed=store) == 123_456
+        assert "gemini" not in PUBLISHED_CONTEXT_WINDOWS
+        assert (
+            hosted_context_window("gemini", "gemini-2.0-flash", listed=ListedContextWindows())
+            is None
+        )
+
+    def test_the_listing_wins_over_the_published_table(self) -> None:
+        """Where both know a model, the provider's live answer for this key is the one used.
+
+        Killed by: src/uclone_x/llm/context_window.py :: if from_listing is not None:
+        Becomes: if from_listing is None:
+        """
+        store = ListedContextWindows()
+        store.remember("anthropic", [CatalogEntry(id="claude-opus-5-5", context_window=777_000)])
+
+        assert hosted_context_window("anthropic", "claude-opus-5-5", listed=store) == 777_000
+        # A model the listing did not describe still has its published figure.
+        assert hosted_context_window("anthropic", "claude-haiku-4-5", listed=store) == 200_000
+
+    def test_a_listed_id_is_matched_exactly_and_never_by_a_neighbour(self) -> None:
+        """A listing names every id it serves, so a prefix neighbour's figure is a guess."""
+        store = ListedContextWindows()
+        store.remember("gemini", [CatalogEntry(id="gemini-2.5-flash", context_window=1_048_576)])
+
+        assert store.get("gemini", "gemini-2.5-flash-lite") is None
+        assert store.get("gemini", "gemini-2.5") is None
+        assert store.get("openai", "gemini-2.5-flash") is None
+
+    def test_google_is_the_same_provider_as_gemini(self) -> None:
+        """Settings accepts `google` as Gemini's name; the catalogue files it under `gemini`.
+
+        Killed by: src/uclone_x/llm/context_window.py :: return canonical_provider(provider) or provider.strip().lower()
+        Becomes: return provider.strip().lower()
+        """
+        store = ListedContextWindows()
+        store.remember("gemini", [CatalogEntry(id="gemini-2.5-pro", context_window=1_048_576)])
+
+        assert store.get("google", "gemini-2.5-pro") == 1_048_576
+
+    def test_an_entry_that_reports_no_window_leaves_the_window_unknown(self) -> None:
+        """A missing or zero figure is the provider saying nothing, not a window of zero.
+
+        Killed by: src/uclone_x/llm/context_window.py :: if name and tokens is not None and tokens > 0:
+        Becomes: if name and tokens is not None and tokens >= 0:
+        """
+        store = ListedContextWindows()
+        store.remember(
+            "anthropic",
+            [
+                CatalogEntry(id="claude-9-unreleased", context_window=None),
+                CatalogEntry(id="claude-9-zero", context_window=0),
+            ],
+        )
+
+        assert store.get("anthropic", "claude-9-unreleased") is None
+        assert store.get("anthropic", "claude-9-zero") is None
+        assert hosted_context_window("anthropic", "claude-9-zero", listed=store) is None
+
+    def test_an_unknown_hosted_model_has_no_compaction_window(self) -> None:
+        """With no listing figure and no table row, the trigger's window is `None`, and the
+        agent falls back to `compaction_threshold_tokens` (`CompactionDriver`) rather than
+        to a family figure such as the compactor's old bare `"gemini"` row."""
+        empty = ListedContextWindows()
+
+        assert (
+            compaction_window(
+                "gemini", "gemini-9-unreleased", base_url=None, configured=None, listed=empty
+            )
+            is None
+        )
+        assert (
+            compaction_window(
+                "gemini", "gemini-9-unreleased", base_url=None, configured=4_096, listed=empty
+            )
+            == 4_096
+        )
+
+    @pytest.mark.asyncio
+    async def test_reading_the_catalogue_remembers_each_listed_window(self) -> None:
+        """Settings reads the listing; the compaction trigger and the room readout use it.
+
+        Killed by: src/uclone_x/llm/catalog.py :: (windows if windows is not None else LISTED_CONTEXT_WINDOWS).remember(provider, listed)
+        Becomes: pass
+        """
+        store = ListedContextWindows()
+
+        async def lister() -> list[CatalogEntry]:
+            return [CatalogEntry(id="gemini-2.5-flash", context_window=1_048_576)]
+
+        result = await read_catalog(
+            provider="gemini",
+            display_provider="Google",
+            lister=lister,
+            recommend=lambda _provider, _entries: None,
+            windows=store,
+        )
+
+        assert result.status == "live"
+        assert (
+            compaction_window(
+                "gemini", "gemini-2.5-flash", base_url=None, configured=None, listed=store
+            )
+            == 1_048_576
         )

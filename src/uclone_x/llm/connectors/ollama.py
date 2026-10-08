@@ -26,6 +26,7 @@ from uclone_x.llm.connectors.base import (
     reported_count,
     resolve_model,
     resolve_token_counts,
+    tool_images_caption,
 )
 from uclone_x.llm.context_window import (
     OLLAMA_CONTEXT_WINDOWS,
@@ -34,6 +35,8 @@ from uclone_x.llm.context_window import (
     ollama_model_key,
 )
 from uclone_x.llm.models import (
+    IMAGE_UNAVAILABLE_NOTE,
+    ChatMessage,
     FinishReason,
     LLMRequest,
     MessageRole,
@@ -44,6 +47,18 @@ from uclone_x.llm.models import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _images_and_notes(msg: ChatMessage) -> tuple[list[str], list[str]]:
+    """The base64 of each of `msg`'s images, and a note for each it holds no bytes for.
+
+    Ollama takes a message's images as a list of base64 strings beside its text, with no
+    place for text between them, so an image this process cannot send becomes
+    `IMAGE_UNAVAILABLE_NOTE` in the message's text instead (#2107).
+    """
+    images = [image.data for image in msg.images if image.data is not None]
+    notes = [IMAGE_UNAVAILABLE_NOTE for image in msg.images if image.data is None]
+    return images, notes
 
 
 def describe_transport_error(exc: BaseException) -> str:
@@ -160,7 +175,7 @@ OLLAMA_ENDPOINT_ENV_VARS: tuple[str, ...] = (
 `OLLAMA_INDEPTH_BASE_URL` sits second because model resolution already reads
 `OLLAMA_MODEL`, `OLLAMA_INDEPTH_MODEL`, `OLLAMA_FAST_MODEL` in that order, and a tier
 should not mean one thing for a model and another for an endpoint. It was absent when this
-tuple was first written (#539), even though `docs/local-development-guide.md` documents it
+tuple was first written (#539), even though the local development guide documents it
 as part of the pre-configured 2-Tier setup and `cli/commands/llm.py` reads it — so the
 refusal that tuple feeds fired on an environment this repository tells people to create.
 The extraction preserved a pre-existing omission and then documented the result as
@@ -304,6 +319,14 @@ def resolve_ollama_timeout(timeout: float | None = None) -> float:
     return DEFAULT_OLLAMA_TIMEOUT_SECONDS
 
 
+def _tool_images_message(text: list[str], images: list[str]) -> dict[str, Any]:
+    """The `user` message carrying a run of tool results' images (#2107)."""
+    message: dict[str, Any] = {"role": "user", "content": "\n\n".join(text)}
+    if images:
+        message["images"] = images
+    return message
+
+
 class OllamaConnector(BaseLLMConnector):
     """Local LLM connector for Ollama endpoints."""
 
@@ -343,6 +366,47 @@ class OllamaConnector(BaseLLMConnector):
         self._num_ctx: dict[str, int] = {}
         # Models sent a `num_ctx` the daemon has not been asked about since.
         self._unconfirmed: set[str] = set()
+        # Whether `/api/show` listed `vision` for each (endpoint, model) asked about (#2107).
+        self._vision: dict[tuple[str, str], bool] = {}
+
+    async def accepts_images(self, model: str | None = None) -> bool:
+        """Whether the daemon says `model` reads images: `vision` in its `/api/show` (#2107).
+
+        Ollama has no listing that says so; `/api/show` reports each installed model's
+        `capabilities`, and a vision model lists `vision`. The answer is kept per endpoint
+        and model. A daemon that cannot be reached, a refused request or an unreadable
+        answer says `False` and is not kept, so a later turn asks again. Never raises.
+        """
+        chosen = resolve_ollama_model(named_model(model) or self._model)
+        if chosen is None:
+            return False
+        key = (self._endpoint, ollama_model_key(chosen))
+        held = self._vision.get(key)
+        if held is not None:
+            return held
+        client = self._get_client()
+        should_close = self._http_client is None
+        try:
+            resp = await client.post(
+                f"{self.base_url}/api/show",
+                json={"model": chosen},
+                timeout=min(self.timeout, 5.0),
+            )
+            if not resp.is_success:
+                return False
+            data: object = resp.json()
+        except Exception as exc:
+            logger.debug("Could not ask Ollama whether %s reads images: %s", chosen, exc)
+            return False
+        finally:
+            if should_close:
+                await client.aclose()
+        if not isinstance(data, dict):
+            return False
+        capabilities: object = cast(dict[str, Any], data).get("capabilities")
+        answer = isinstance(capabilities, list) and "vision" in cast(list[object], capabilities)
+        self._vision[key] = answer
+        return answer
 
     async def observe_context_window(self, model: str | None = None) -> int | None:
         """The window the daemon serves `model` at, reading `/api/ps` when it is not known.
@@ -467,6 +531,11 @@ class OllamaConnector(BaseLLMConnector):
         than coerced, so the distinction survives on the wire: a message with no recorded
         content sends no `content` field, and one holding `""` sends `"content": ""`.
 
+        **Images (#2107).** A `user` message's images go in its `images` field, as base64.
+        A `tool` message's images do not: as on OpenAI's format, they go on one `user`
+        message after the run of tool messages, its text naming the call each set came
+        from (`tool_images_caption`), so a model is not left to guess where they belong.
+
         **Ollama `think` parameter (#695)**: sent only when the caller sets
         `LLMRequest.thinking`, as that value. A request that leaves it `None` -- every agent
         turn -- sends no `think` key, so Ollama and the model template decide whether a
@@ -483,21 +552,30 @@ class OllamaConnector(BaseLLMConnector):
         """
         model = self._resolve_model(request.model)
         messages_payload: list[dict[str, Any]] = []
+        # The current run of tool messages' images and their captions, sent after the run
+        # on one `user` message (#2107).
+        run_images: list[str] = []
+        run_text: list[str] = []
 
         for msg in request.messages:
+            if msg.role is not MessageRole.TOOL and run_text:
+                messages_payload.append(_tool_images_message(run_text, run_images))
+                run_images, run_text = [], []
             m_dict: dict[str, Any] = {"role": msg.role.value}
             if msg.content is not None:
                 m_dict["content"] = msg.content
-            elif not (msg.role is MessageRole.ASSISTANT and msg.tool_calls):
+            elif not (msg.role is MessageRole.ASSISTANT and msg.tool_calls) and not (
+                msg.role is MessageRole.USER and msg.images
+            ):
                 raise UnmappableChatMessageError(
                     f"ChatMessage(role={msg.role.value!r}, name={msg.name!r}) has "
                     "content=None, so there is nothing to send as this message's content. "
                     "It is not coerced to '', because a message with no recorded content "
                     "and one holding the empty string are different inputs to the model "
                     "and would arrive identically (P6, #385). An assistant turn carrying "
-                    "tool_calls is the one exception: there the absence is the encoding, "
-                    "not a missing value, and the content key is omitted rather than "
-                    "emitted as ''."
+                    "tool_calls, and a user message carrying images, are the exceptions: "
+                    "there the absence is the encoding, not a missing value, and the "
+                    "content key is omitted rather than emitted as ''."
                 )
             if msg.tool_calls:
                 m_dict["tool_calls"] = [
@@ -509,7 +587,21 @@ class OllamaConnector(BaseLLMConnector):
                     }
                     for tc in msg.tool_calls
                 ]
+            if msg.images:
+                images, notes = _images_and_notes(msg)
+                if msg.role is MessageRole.TOOL:
+                    run_text.extend([tool_images_caption(msg), *notes])
+                    run_images.extend(images)
+                else:
+                    if notes:
+                        # A user message can be images alone, with no text to follow (#2124).
+                        text = [msg.content] if msg.content is not None else []
+                        m_dict["content"] = "\n\n".join([*text, *notes])
+                    if images:
+                        m_dict["images"] = images
             messages_payload.append(m_dict)
+        if run_text:
+            messages_payload.append(_tool_images_message(run_text, run_images))
 
         options: dict[str, Any] = {"temperature": request.temperature}
         if request.max_tokens is not None:

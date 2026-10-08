@@ -413,8 +413,8 @@ def _gen_result() -> ImageGenerationResult:
 async def test_the_tool_result_lists_what_was_filled_in(tmp_path: Path) -> None:
     """P6: what the defaults added reaches the model in the tool result, single and batch.
 
-    Killed by: src/uclone_x/tools/builtin/image.py ::                 return replace(generated, prompt_changes=fill.changes)
-    Becomes:                 return generated
+    Killed by: src/uclone_x/tools/builtin/image.py ::                     prompt_changes=fill.changes,
+    Becomes:                     prompt_changes=(),
     """
     from uclone_x.tools.builtin.image import GenerateImageParams
     from uclone_x.tools.models import ToolContext
@@ -426,7 +426,7 @@ async def test_the_tool_result_lists_what_was_filled_in(tmp_path: Path) -> None:
         remote_engine=mock_engine, comfy_engine=mock_engine, local_engine=mock_engine
     )
     profile = _danbooru()
-    dispatcher.get_active_profile = lambda: profile  # type: ignore[method-assign]
+    dispatcher.get_active_profile = lambda own=None: profile  # type: ignore[method-assign]
     tool = GenerateImageTool(dispatcher=dispatcher)
     context = ToolContext(agent_id="a", session_id="s", workspace_root=tmp_path)
 
@@ -442,6 +442,66 @@ async def test_the_tool_result_lists_what_was_filled_in(tmp_path: Path) -> None:
         list(fill_prompt_defaults("1girl", "", profile).changes),
         list(fill_prompt_defaults("1boy, masterpiece", "", profile).changes),
     ]
+
+
+@pytest.mark.asyncio
+async def test_each_sidecar_records_the_filled_prompt_and_what_was_added(tmp_path: Path) -> None:
+    """The image's metadata keeps the prompt the engine drew from, not only the model's (#1865).
+
+    The sidecar records the filled prompt and negative prompt, the fill's changes, and the
+    tags it added, as tags; the tool result carries the added tags for the conversation
+    (once, at the top, when every picture of a batch gained the same ones).
+
+    Killed by: src/uclone_x/tools/builtin/image.py ::             **fill_record,
+    Becomes:             **{},
+    Killed by: src/uclone_x/tools/builtin/image.py ::                     **batch_fill,
+    Becomes:                     **{},
+    Killed by: src/uclone_x/tools/builtin/image.py ::                     filled_prompt=fill.prompt,
+    Becomes:                     filled_prompt=None,
+    """
+    from uclone_x.tools.builtin.image import GenerateImageParams
+    from uclone_x.tools.models import ToolContext
+
+    mock_engine = AsyncMock()
+    mock_engine.is_available.return_value = True
+    mock_engine.generate.return_value = _gen_result()
+    dispatcher = ImagePipelineDispatcher(
+        remote_engine=mock_engine, comfy_engine=mock_engine, local_engine=mock_engine
+    )
+    profile = _danbooru()
+    dispatcher.get_active_profile = lambda own=None: profile  # type: ignore[method-assign]
+    tool = GenerateImageTool(dispatcher=dispatcher)
+    context = ToolContext(agent_id="a", session_id="s", workspace_root=tmp_path)
+
+    single = await tool.run(GenerateImageParams(prompt="1girl, solo"), context)
+    batch = await tool.run(GenerateImageParams(prompts=["1girl", "1boy"]), context)
+
+    fill = fill_prompt_defaults("1girl, solo", "", profile)
+    from uclone_x.tools.base import artifact_path_from_url
+    from uclone_x.tools.builtin.image import sidecar_path_for
+
+    def _sidecar_of(url: object) -> dict[str, object]:
+        rel = artifact_path_from_url(url)
+        assert rel is not None
+        side: dict[str, object] = json.loads((tmp_path / sidecar_path_for(rel)).read_text())
+        return side
+
+    sidecar = _sidecar_of(single["relative_url"])
+    assert sidecar["prompt"] == "1girl, solo"
+    assert sidecar["filled_prompt"] == fill.prompt
+    assert sidecar["filled_negative_prompt"] == fill.negative_prompt
+    assert sidecar["prompt_changes"] == list(fill.changes)
+    quality = [t.strip() for t in DANBOORU_QUALITY_TAGS.split(",")]
+    assert sidecar["prompt_added"] == quality == single["prompt_added"]
+    assert single["negative_added"] == [t.strip() for t in fill.negative_prompt.split(",")]
+
+    # Both pictures gained the same tags, so the batch says them once, at the top (#2013).
+    assert batch["prompt_added"] == quality
+    for img in batch["images"]:
+        assert "prompt_added" not in img
+        side = _sidecar_of(img["relative_url"])
+        assert side["filled_prompt"] == f"{img['prompt']}, {DANBOORU_QUALITY_TAGS}"
+        assert side["prompt_added"] == quality
 
 
 @pytest.mark.asyncio
@@ -476,7 +536,7 @@ async def test_dispatcher_flux_profile_suppresses_negative() -> None:
         registry=registry,
     )
     # Force active profile resolution to the flux profile
-    dispatcher.get_active_profile = lambda: flux_profile  # type: ignore[method-assign]
+    dispatcher.get_active_profile = lambda own=None: flux_profile  # type: ignore[method-assign]
 
     await dispatcher.dispatch(
         prompt="A photo of a mountain",

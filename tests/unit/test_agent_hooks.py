@@ -340,6 +340,74 @@ async def test_hook_runner_ask_with_its_own_rewrite_carries_the_merged_call() ->
 
 
 @pytest.mark.asyncio
+async def test_hook_runner_pre_tool_use_fixed_keys_stripped_or_preserved() -> None:
+    """Fixed keys are restored to what the call declared; additions are stripped (#1504).
+
+    When a tool is unresolvable or does not declare a fixed key, an earlier hook cannot
+    inject `writes_files: True` to make approval stricter, and cannot rewrite fixed keys
+    like `tool_name`. Later hooks see the call as the agent sent it, with arguments rewritten.
+    """
+    seen_payload: dict[str, Any] = {}
+
+    class AttemptRewrite(BaseHook):
+        async def on_pre_tool_use(self, context: HookContext) -> HookDecision:
+            return HookDecision(
+                action=HookAction.MODIFY,
+                modified_payload={
+                    "tool_name": "forged_tool",
+                    "tool_call_id": "forged_id",
+                    "writes_files": True,
+                    "spawns_subagents": True,
+                    "needs_approval": True,
+                    "arguments": {"new": "val"},
+                    "custom_key": "custom_val",
+                },
+            )
+
+    class InspectPayload(BaseHook):
+        async def on_pre_tool_use(self, context: HookContext) -> HookDecision:
+            nonlocal seen_payload
+            seen_payload = dict(context.payload)
+            return HookDecision(action=HookAction.ALLOW)
+
+    runner = HookRunner(hooks=[AttemptRewrite(), InspectPayload()])
+    sent = {
+        "tool_name": "unresolved_tool",
+        "tool_call_id": "c1",
+        "arguments": {"orig": "val"},
+    }
+    ctx = HookContext(
+        agent_id="a1",
+        event_type=HookEvent.PRE_TOOL_USE,
+        payload=dict(sent),
+    )
+
+    decision = await runner.run_hooks(HookEvent.PRE_TOOL_USE, ctx)
+    assert decision.action == HookAction.MODIFY
+    assert decision.modified_payload is not None
+
+    # Fixed keys that were present in sent payload are preserved to original values
+    assert decision.modified_payload["tool_name"] == "unresolved_tool"
+    assert decision.modified_payload["tool_call_id"] == "c1"
+    assert seen_payload["tool_name"] == "unresolved_tool"
+    assert seen_payload["tool_call_id"] == "c1"
+
+    # Fixed keys that were NOT in sent payload are stripped (not forged in)
+    assert "writes_files" not in decision.modified_payload
+    assert "writes_files" not in seen_payload
+    assert "spawns_subagents" not in decision.modified_payload
+    assert "spawns_subagents" not in seen_payload
+    assert "needs_approval" not in decision.modified_payload
+    assert "needs_approval" not in seen_payload
+
+    # Non-fixed keys and arguments are modified as requested
+    assert decision.modified_payload["arguments"] == {"new": "val"}
+    assert seen_payload["arguments"] == {"new": "val"}
+    assert decision.modified_payload["custom_key"] == "custom_val"
+    assert seen_payload["custom_key"] == "custom_val"
+
+
+@pytest.mark.asyncio
 async def test_hook_runner_exception_handling_fail_open_vs_closed() -> None:
     """HookRunner must handle hook exceptions per failure policy."""
 

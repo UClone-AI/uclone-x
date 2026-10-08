@@ -93,7 +93,7 @@ async def test_a_local_tool_server_added_in_settings_connects_and_can_be_removed
             tools = row.get_by_role("list", name="Tools from echoer")
             await tools.get_by_text("echoer__echo").wait_for(timeout=5_000)
 
-            personas = await page.request.get(f"{server}/api/personas")
+            personas = await page.request.get(f"{server}/api/clones")
             assert personas.ok, await personas.text()
             assert "echoer__echo" in await personas.text(), "clones were not offered the tool"
 
@@ -105,7 +105,7 @@ async def test_a_local_tool_server_added_in_settings_connects_and_can_be_removed
             )
             await section.get_by_test_id("settings-mcp-empty").wait_for(timeout=10_000)
 
-            personas = await page.request.get(f"{server}/api/personas")
+            personas = await page.request.get(f"{server}/api/clones")
             assert "echoer__echo" not in await personas.text(), "the tool outlived its server"
         finally:
             await browser.close()

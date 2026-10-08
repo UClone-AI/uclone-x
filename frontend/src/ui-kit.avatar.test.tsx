@@ -25,13 +25,13 @@ describe('Avatar (#1300)', () => {
         label="surveyor"
         kind="agent"
         agentIcon={Glyph}
-        imageSrc="/api/personas/surveyor/avatar"
+        imageSrc="/api/clones/surveyor/avatar"
         data-testid="avatar"
       />,
     );
 
     const picture = screen.getByTestId('avatar').querySelector('img');
-    expect(picture).toHaveAttribute('src', '/api/personas/surveyor/avatar');
+    expect(picture).toHaveAttribute('src', '/api/clones/surveyor/avatar');
     // Decorative: the name is on the wrapper's title and is rendered beside it, so a screen
     // reader that read an alt too would say the clone's name twice.
     expect(picture).toHaveAttribute('alt', '');
@@ -49,7 +49,7 @@ describe('Avatar (#1300)', () => {
         label="surveyor"
         kind="agent"
         agentIcon={Glyph}
-        imageSrc="/api/personas/surveyor/avatar"
+        imageSrc="/api/clones/surveyor/avatar"
         data-testid="avatar"
       />,
     );
@@ -281,8 +281,8 @@ describe('avatars are files this workspace holds, never a service (#1300)', () =
       './lib/plantedAvatar.ts':
         "export const url = (n: string) => `https://api.dicebear.com/7.x/bottts/svg?seed=${n}`;",
       './lib/personaAvatar.ts':
-        'export const personaAvatarUrl = (name: string): string =>\n' +
-        '  `/api/personas/${encodeURIComponent(name)}/avatar`;',
+        'export const personaAvatarUrl = (clone: string): string =>\n' +
+        '  `/api/clones/${encodeURIComponent(clone)}/avatar`;',
     };
 
     expect(generatorOffences(planted)).toEqual([

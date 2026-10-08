@@ -17,7 +17,14 @@
       "one": "{label}은(는) 이 턴에서 1가지를 기억합니다.",
       "other": "{label}은(는) 이 턴에서 {count}가지를 기억합니다."
     },
+    "knowledgeForgotten": {
+      "one": "{label}이(가) 이 턴에서 기억한 1가지를 잊었습니다.",
+      "other": "{label}이(가) 이 턴에서 기억한 {count}가지를 잊었습니다."
+    },
+    "forget": "잊게 하기",
     "knowledgeExtractFailed": "{label}이(가) 이 턴에서 기억할 내용을 찾아내지 못했습니다.",
+    "imagePromptAdded": "{label}이(가) 그림 요청에 추가했습니다: {tags}.",
+    "imageNegativeAdded": "{label}이(가) 그림에서 빼도록 요청했습니다: {tags}.",
     "why": "이유 ›",
     "servedInstead": "{served} ({requested} 요청)"
   },
@@ -43,8 +50,20 @@
     "clearLabel": "이 대화 비우기",
     "clear": "비우기"
   },
+  "workspace": {
+    "label": "이 대화가 작업하는 폴더",
+    "serverFolder": "서버의 폴더",
+    "pathPlaceholder": "폴더의 전체 경로",
+    "use": "이 폴더 사용",
+    "useServer": "서버의 폴더 사용",
+    "refusals": {
+      "not_a_folder": "이 컴퓨터에 있는 폴더가 아닙니다. 존재하는 폴더의 전체 경로를 입력하십시오.",
+      "app_state": "이 폴더에는 이 앱의 클론과 대화가 들어 있어 대화의 폴더로 쓸 수 없습니다.",
+      "story_open": "이 대화에 스토리가 열려 있고, 스토리는 지금 폴더에 있습니다. 스토리를 먼저 닫은 다음 폴더를 바꾸십시오."
+    }
+  },
   "invite": {
-    "noClones": "아직 실행 중인 클론이 없습니다. 먼저 채팅에서 메시지를 보내면 답한 클론을 여기에 추가할 수 있습니다.",
+    "noClones": "아직 설치된 다른 클론이 없습니다.",
     "everyoneHere": "참여할 수 있는 클론이 모두 이 대화에 있습니다."
   },
   "empty": {
@@ -102,10 +121,23 @@
     "providerRemedy": {
       "provider_unreachable": "설정에서 사용자 지정 Endpoint를 지정했다면 그 주소도 확인하십시오."
     },
-    "providerFailed": "{label}이(가) 이 턴을 마치지 못했습니다. {message}",
+    "providerFailed": "{label}이(가) 이 턴을 마치지 못했습니다. {cause}",
+    "ownModelFailed": "{label}이(가) 이 턴을 마치지 못했습니다: 자체 모델 {model}을(를) 쓰도록 설정되어 있는데, 그 모델을 사용할 수 없었습니다. {cause}",
+    "providerCause": {
+      "model_unavailable": "{provider}에서 이 턴이 요청한 모델을 제공하지 않습니다.",
+      "provider_auth": "{provider}이(가) API 키를 받아들이지 않았습니다.",
+      "provider_quota": "{provider}에서 이 키의 사용 한도에 도달했습니다.",
+      "provider_unreachable": "{provider}에 연결할 수 없었습니다.",
+      "provider_outage": "{provider}에 지금 문제가 있습니다.",
+      "provider_error": "{provider}이(가) 오류로 응답했습니다."
+    },
+    "providerCauseOther": "{provider}이(가) 오류로 응답했습니다.",
+    "providerUnknown": "모델 Provider",
     "refused": "{label}이(가) 이 턴을 마치지 못했습니다: {reason}.",
     "stopped": "{label}이(가) 이 턴을 마치기 전에 중지되었습니다.",
     "wentWrong": "{label}이(가) 답하는 도중 문제가 생겨 이 턴을 마치지 못했습니다.",
+    "personaEditDropped": "{label}이(가) 저장된 변경 사항을 적용하지 못해 답하지 않았습니다. 이 대화에서는 이전 설정을 그대로 씁니다.",
+    "personaEditRemedy": "여기서 변경 사항을 쓰려면 클론을 다시 저장한 뒤 메시지를 다시 보내십시오.",
     "memoryNoneSaved": {
       "one": "{label}이(가) 무언가를 기억에 저장하려 했지만 아무것도 저장되지 않았습니다.",
       "other": "{label}이(가) {count}가지를 기억에 저장하려 했지만 하나도 저장되지 않았습니다."

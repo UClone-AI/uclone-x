@@ -25,6 +25,7 @@ __all__ = [
     "RoomOrchestratorProtocol",
     "RoomStoreProtocol",
     "SeatSessionSetAsideProtocol",
+    "SeatSessionStoreProtocol",
     "SpeakerSelectorProtocol",
     "StoryLeaseProtocol",
 ]
@@ -245,4 +246,15 @@ class SeatSessionSetAsideProtocol(Protocol):
 
         Answers `True` once per set-aside, so the notice lands on one row.
         """
+        ...
+
+
+class SeatSessionStoreProtocol(Protocol):
+    """Durable storage for room seat sessions, allowing them to be deleted with the room (#1427).
+
+    The Core session store has this shape (`SessionStore`).
+    """
+
+    def delete(self, session_id: str) -> bool:
+        """Remove the session; return whether one was there to remove."""
         ...

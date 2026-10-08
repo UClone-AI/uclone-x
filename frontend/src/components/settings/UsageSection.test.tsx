@@ -105,22 +105,27 @@ describe('UsageSection', () => {
     expect(screen.queryByTestId('settings-usage-env-per_5_hours')).toBeNull();
   });
 
-  it('saves a preset as its three figures, and shows the saved answer', async () => {
+  // Killed by: frontend/src/components/settings/UsageSection.tsx :: autoSave.commit(limits);
+  // Becomes:
+  it('saves a preset as its three figures when it is picked, and shows the saved answer', async () => {
     const saved = report({}, USAGE_PRESETS.standard);
     const calls = mockFetch([report()], () => answer(saved));
     render(<UsageSection />);
 
     fireEvent.click(await screen.findByTestId('settings-usage-preset-standard'));
     expect(screen.queryByTestId('settings-usage-custom')).toBeNull();
-    fireEvent.click(screen.getByTestId('settings-usage-save'));
 
-    await screen.findByTestId('settings-usage-saved');
+    await waitFor(() =>
+      expect(screen.getByTestId('settings-usage-save-status')).toHaveAttribute('data-state', 'saved'),
+    );
     expect(calls.filter((c) => c.method === 'PUT')).toEqual([
       { url: '/api/usage/limits', method: 'PUT', body: USAGE_PRESETS.standard },
     ]);
     expect(screen.getByTestId('settings-usage-window-per_5_hours')).toHaveTextContent('of 2M');
   });
 
+  // Killed by: frontend/src/components/settings/UsageSection.tsx :: onBlur={() => autoSave.commit(draft)}
+  // Becomes: onBlur={() => {}}
   it('sends an empty box as no limit, a whole number as a number, and anything else as typed', async () => {
     const calls = mockFetch([report()], () => answer({ detail: 'The weekly limit must be a whole number.' }, false, 400));
     render(<UsageSection />);
@@ -128,9 +133,10 @@ describe('UsageSection', () => {
     fireEvent.click(await screen.findByTestId('settings-usage-preset-custom'));
     fireEvent.change(screen.getByTestId('settings-usage-input-per_10_minutes'), { target: { value: '5000' } });
     fireEvent.change(screen.getByTestId('settings-usage-input-per_5_hours'), { target: { value: '500,000' } });
-    fireEvent.click(screen.getByTestId('settings-usage-save'));
+    // Saved when the box is left.
+    fireEvent.blur(screen.getByTestId('settings-usage-input-per_5_hours'));
 
-    const failed = await screen.findByTestId('settings-usage-save-failed');
+    const failed = await screen.findByRole('alert');
     // "500,000" reaches the Core as typed: saved as "no limit", it would lift the limit.
     expect(calls.find((c) => c.method === 'PUT')?.body).toEqual({
       per_10_minutes: 5000,
@@ -139,7 +145,9 @@ describe('UsageSection', () => {
     });
     // The Core's refusal is shown in its own words, after what did not happen.
     expect(failed).toHaveTextContent('The limits were not saved. The weekly limit must be a whole number.');
-    expect(screen.queryByTestId('settings-usage-saved')).toBeNull();
+    // The saved limits are back in the boxes, which stay open to be corrected.
+    expect(screen.getByTestId('settings-usage-input-per_5_hours')).toHaveValue('');
+    expect(screen.getByTestId('settings-usage-custom')).toBeInTheDocument();
   });
 
   it('treats an answer of another shape as a failed read, not as zero usage', async () => {

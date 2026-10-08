@@ -283,27 +283,30 @@ def llm_use(
 ) -> None:
     """Make MODEL the default for `ucx run`, rooms and the dashboard.
 
-    Saved where the dashboard's Settings keep the choice, so both change the same thing.
-    Without `--base-url`, an address already saved for the same provider is kept. Every
-    saved API key is kept too, under the provider it was saved for.
+    Saved where the dashboard's Settings keep the choice, so both change the same thing:
+    MODEL on the connection whose id is the provider (`ollama/qwen3:1.7b`), which is added
+    when there is none (model-gateway §3.2). Without `--base-url`, an address already
+    saved for that connection is kept. Every saved API key is kept too.
 
-    `--fast MODEL` saves the fast model, used for auxiliary calls; alone, it changes only
-    that. An empty `--fast ''` makes the fast model follow the default again.
+    `--fast MODEL` saves the default fast model on the same connection, used for room
+    routing and summaries; alone, it changes only that. An empty `--fast ''` makes the
+    fast model follow the default again.
     """
     from uclone_x.llm.connectors.factory import model_env_override, what_outranks_saved_choice
     from uclone_x.llm.connectors.saved_choice import (
-        LLM_MODEL_FAST_KEY,
         SAVED_PROVIDERS,
         read_saved_choice,
         save_choice,
+        save_default_models,
         settings_file,
-        update_settings_file,
     )
+    from uclone_x.llm.providers import canonical_provider
 
     if fast is not None:
         fast_model = fast.strip() or None
+        kind = canonical_provider(provider) or provider.strip().lower()
         try:
-            update_settings_file({LLM_MODEL_FAST_KEY: fast_model})
+            save_default_models({"fast": f"{kind}/{fast_model}" if fast_model else None})
         except (OSError, ValueError):
             console.print(
                 f"[red]Could not save the fast model: {escape(str(settings_file()))} could "
@@ -323,7 +326,7 @@ def llm_use(
         console.print("[red]Name a model to use, or pass --fast MODEL.[/red]")
         raise typer.Exit(code=2)
 
-    chosen = provider.strip().lower()
+    chosen = canonical_provider(provider) or provider.strip().lower()
     if chosen not in SAVED_PROVIDERS:
         known = ", ".join(sorted(SAVED_PROVIDERS))
         console.print(

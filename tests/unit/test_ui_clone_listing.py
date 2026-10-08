@@ -28,6 +28,7 @@ cost to get wrong:
 from __future__ import annotations
 
 import os
+import shutil
 import time
 from collections.abc import Iterable
 from pathlib import Path
@@ -36,13 +37,21 @@ from typing import Any, cast
 import pytest
 from fastapi.testclient import TestClient
 
+from uclone_x.agent import persona_registry
 from uclone_x.agent.base import BaseAgent
 from uclone_x.agent.models import AgentConfig, AgentContext, AgentState
+from uclone_x.agent.persona_registry import BUILTIN_PERSONAS_DIR as SHIPPED_PERSONAS_DIR
 from uclone_x.core.agent_home import AGENT_ID_PREFIX, AGENTS_DIR_ENV_VAR
+from uclone_x.core.models import BASE_PERSONA_TOOLS
 from uclone_x.llm import MockLLMConnector
 from uclone_x.room.models import ParticipantKind
 from uclone_x.ui.app import create_ui_app
 from uclone_x.ui.rooms import RoomStack
+
+# The app installs the shipped clones at start (clone-data-scopes §3.5), so the listing on a
+# fresh install is those six; `test_a_fresh_install_lists_the_shipped_clones` pins that.
+# Every other test here is about the rows *it* makes, so it installs none.
+pytestmark = pytest.mark.usefixtures("builtin_personas_absent")
 
 
 def _client(tmp_path: Path) -> TestClient:
@@ -157,6 +166,25 @@ def _without_what_the_fixture_supplied(sentence: str, root: Path, names: Iterabl
     return composed
 
 
+def test_a_fresh_install_lists_the_shipped_clones(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The first screen of a new install is the shipped clones, each dormant with an id.
+
+    The start installs them as clone directories (clone-data-scopes §3.5), so they are
+    rows of this listing like any clone a person made, not a second source it merges.
+    """
+    monkeypatch.setattr(persona_registry, "BUILTIN_PERSONAS_DIR", SHIPPED_PERSONAS_DIR)
+    monkeypatch.setenv(AGENTS_DIR_ENV_VAR, str(tmp_path / "agents"))
+
+    body = _body(_client(tmp_path))
+
+    shipped = sorted(path.stem for path in SHIPPED_PERSONAS_DIR.glob("*.yaml"))
+    assert sorted(clone["name"] for clone in body["clones"]) == shipped
+    assert {clone["status"] for clone in body["clones"]} == {"dormant"}
+    assert all(str(clone["id"]).startswith(AGENT_ID_PREFIX) for clone in body["clones"])
+
+
 def test_a_clone_that_has_never_run_is_listed_as_dormant(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -172,10 +200,13 @@ def test_a_clone_that_has_never_run_is_listed_as_dormant(
     Becomes: status=CloneStatus.LIVE,
     """
     agents_root = tmp_path / "agents"
-    (agents_root / "scout").mkdir(parents=True)
     monkeypatch.setenv(AGENTS_DIR_ENV_VAR, str(agents_root))
+    client = _client(tmp_path)
+    # Made after start: the start migrates an old-layout home into a clone directory
+    # (clone-data-scopes §3.8), so an id-less home is one that appeared since.
+    (agents_root / "scout").mkdir(parents=True)
 
-    body = _body(_client(tmp_path))
+    body = _body(client)
 
     assert [clone["name"] for clone in body["clones"]] == ["scout"]
     only = body["clones"][0]
@@ -189,8 +220,8 @@ def test_a_running_clone_is_reported_live_rather_than_left_to_be_inferred(
 ) -> None:
     """The surface draws a running clone differently, so the fact has to arrive typed.
 
-    Killed by: src/uclone_x/ui/clones.py :: if entry.username in running:
-    Becomes: if entry.username in frozenset():
+    Killed by: src/uclone_x/ui/clones.py :: if entry.agent_id in running or entry.username in running:
+    Becomes: if False:
     """
     agents_root = tmp_path / "agents"
     (agents_root / "scout").mkdir(parents=True)
@@ -204,6 +235,33 @@ def test_a_running_clone_is_reported_live_rather_than_left_to_be_inferred(
     assert by_name["scout"]["status"] == "live"
     assert by_name["scout"]["id"] == f"{AGENT_ID_PREFIX}abc"
     assert by_name["archivist"]["status"] == "dormant"
+
+
+def test_a_clone_seated_by_its_id_is_reported_live(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Seats are keyed by clone id (clone-data-scopes §4 step 3), not by handle.
+
+    A listing that matched only the handle would call every clone a conversation seats
+    "Installed and not running" -- the defect `_running_clone_names` exists to prevent,
+    back again through the change of key.
+
+    Killed by: src/uclone_x/ui/clones.py :: if entry.agent_id in running or entry.username in running:
+    Becomes: if entry.username in running:
+    """
+    agents_root = tmp_path / "agents"
+    (agents_root / "scout").mkdir(parents=True)
+    (agents_root / "scout" / "id").write_text(f"{AGENT_ID_PREFIX}abc\n", encoding="utf-8")
+    monkeypatch.setenv(AGENTS_DIR_ENV_VAR, str(agents_root))
+
+    body = _body(_seated_client(tmp_path, f"{AGENT_ID_PREFIX}abc"))
+
+    by_name = {clone["name"]: clone for clone in body["clones"]}
+    assert by_name["scout"]["status"] == "live"
+    assert by_name["scout"]["id"] == f"{AGENT_ID_PREFIX}abc"
+    assert [clone["name"] for clone in body["clones"]] == ["scout"], (
+        "the seat's id is the clone's, so it is not also listed as a clone with no files"
+    )
 
 
 def test_nothing_installed_and_an_unreadable_root_are_not_the_same_answer(
@@ -255,8 +313,12 @@ def test_a_missing_root_is_its_own_answer_too(
     """
     absent = tmp_path / "nowhere"
     monkeypatch.setenv(AGENTS_DIR_ENV_VAR, str(absent))
+    client = _client(tmp_path)
+    # The start creates the root to install into (clone-data-scopes §3.5), so a missing
+    # one is a root removed or redirected since.
+    shutil.rmtree(absent)
 
-    body = _body(_client(tmp_path))
+    body = _body(client)
 
     assert body["clones"] == []
     assert body["root_state"] == "missing"
@@ -473,12 +535,14 @@ def test_a_clone_that_has_never_run_says_so_rather_than_only_that_it_is_not_runn
     Becomes: if False:
     """
     agents_root = tmp_path / "agents"
+    monkeypatch.setenv(AGENTS_DIR_ENV_VAR, str(agents_root))
+    client = _client(tmp_path)
+    # Made after start, which migrates old-layout homes (clone-data-scopes §3.8).
     (agents_root / "archivist").mkdir(parents=True)
     (agents_root / "scout").mkdir(parents=True)
     (agents_root / "scout" / "id").write_text(f"{AGENT_ID_PREFIX}abc\n", encoding="utf-8")
-    monkeypatch.setenv(AGENTS_DIR_ENV_VAR, str(agents_root))
 
-    body = _body(_client(tmp_path))
+    body = _body(client)
 
     never_run = _reason_of(body, "archivist")
     has_run = _reason_of(body, "scout")
@@ -559,7 +623,10 @@ def test_a_missing_or_unreadable_root_counts_the_rows_it_holds_too(
     """
     absent = tmp_path / "nowhere"
     monkeypatch.setenv(AGENTS_DIR_ENV_VAR, str(absent))
-    missing = _body(_seated_client(tmp_path, "scout"))
+    client = _seated_client(tmp_path, "scout")
+    shutil.rmtree(absent)  # the start created it; see the test above
+
+    missing = _body(client)
 
     assert [clone["name"] for clone in missing["clones"]] == ["scout"]
     assert missing["root_state"] == "missing"
@@ -715,3 +782,21 @@ def test_no_reason_carries_the_cores_vocabulary_onto_the_wire(
         )
     # `1 clone(s) installed` is not copy anyone would write.
     assert "(s)" not in body["reason"]
+
+
+def test_clone_listing_includes_base_tools(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """GET /api/clones carries base_tools in extras and on each persona.
+
+    Killed by: src/uclone_x/ui/app.py :: "base_tools": list(BASE_PERSONA_TOOLS),
+    Becomes: "base_tools": [],
+    """
+    monkeypatch.setattr(persona_registry, "BUILTIN_PERSONAS_DIR", SHIPPED_PERSONAS_DIR)
+    monkeypatch.setenv(AGENTS_DIR_ENV_VAR, str(tmp_path / "agents"))
+
+    body = _body(_client(tmp_path))
+
+    assert body["base_tools"] == list(BASE_PERSONA_TOOLS)
+    assert len(body["base_tools"]) > 0
+    assert len(body["clones"]) > 0
+    for clone in body["clones"]:
+        assert clone["base_tools"] == list(BASE_PERSONA_TOOLS)

@@ -8,6 +8,8 @@
     "loop.registered": "🔄 **반복 작업을 등록했습니다** ({interval}마다 실행, ID: `{job_id}`):\n\"{prompt}\"\n\n*중지하려면 `/loop stop`을 입력하거나 대화 상단의 중지 버튼을 누르십시오.*",
     "loop.missing_prompt": "⚠️ 간격 뒤에 실행할 내용을 적으십시오. 예: `/loop 5m 빌드 확인`",
     "loop.interval_too_short": "⚠️ 반복 작업은 {interval}에 한 번까지만 실행할 수 있습니다. 더 긴 간격을 선택하십시오.",
+    "loop.resumed": "🔄 **앱이 다시 시작되어 반복 작업을 이어서 실행합니다** ({interval}마다, ID: `{job_id}`):\n\"{prompt}\"\n\n*중지하려면 `/loop stop`을 입력하십시오.*",
+    "loop.run_failed": "⚠️ 반복 작업 `{job_id}`의 {run}번째 실행이 실패했습니다: {reason} {interval} 뒤에 다시 시도합니다.",
     "loop.no_interval": "⚠️ 이 `/loop` 명령에는 간격이 없습니다. `/loop 5m <프롬프트>` 또는 `/loop 5분마다 <프롬프트>` 형식으로 입력하십시오."
   },
   "interval": {

@@ -133,22 +133,36 @@ class ToolRegistry:
         )
 
 
+def _browser_tool() -> ToolProtocol:
+    """The browser, or its stand-in on an install without the `http` extra (#2164).
+
+    Only a missing `websockets` is answered with the stand-in: that is the one module the
+    browser needs from an extra. Any other import failure is a defect and propagates.
+    """
+    try:
+        from uclone_x.browser.tool import BrowserTool
+    except ModuleNotFoundError as exc:
+        if (exc.name or "").partition(".")[0] != "websockets":
+            raise
+        from uclone_x.browser.unavailable import BrowserUnavailableTool
+
+        return BrowserUnavailableTool()
+    return BrowserTool()
+
+
 def create_default_registry(
     workspace_root: Path | None = None,
     enable_mcp: bool = True,
     mcp_config_path: Path | None = None,
 ) -> ToolRegistry:
-    """Create a ToolRegistry populated with the default builtin tool suite and configured MCP tools."""
+    """Create a ToolRegistry populated with the default builtin tool suite and configured MCP tools.
+
+    The extensions' tools come after the core's, and a tool an extension declares as a
+    replacement takes the core tool's place (`extensions.with_extension_tools`, #2205). A
+    broken extension raises `ExtensionError` here rather than leaving its tools out.
+    """
     from uclone_x.agent.avatar_tool import SetAvatarTool
-    from uclone_x.story.muse import MuseSparkTool
-    from uclone_x.story.tool import StoryLibraryTool
-    from uclone_x.story.tools import (
-        StoryAuditTool,
-        StoryCodexTool,
-        StoryContextTool,
-        StoryManuscriptTool,
-        StoryOutlineTool,
-    )
+    from uclone_x.extensions import a2a_character_lookup, with_extension_tools
     from uclone_x.tools.builtin.a2a import A2ACallTool
     from uclone_x.tools.builtin.character import CharacterSheetTool
     from uclone_x.tools.builtin.filesystem import (
@@ -170,36 +184,32 @@ def create_default_registry(
     )
 
     registry = ToolRegistry(
-        tools=[
-            FileReadTool(),
-            FileWriteTool(),
-            FileEditTool(),
-            FileSearchTool(),
-            DirectoryListTool(),
-            BashRunTool(name="bash_run"),
-            # The same shell under a second name, kept registered so a stored call or a
-            # persona file naming it still resolves. Not advertised beside `bash_run`:
-            # two identical schemas were ~1 KB per request and a coin flip for the model
-            # (#1424).
-            BashRunTool(name="run_command", alias_of="bash_run"),
-            WebFetchTool(),
-            WebSearchTool(),
-            GenerateImageTool(),
-            SetAvatarTool(),
-            CharacterSheetTool(),
-            StoryLibraryTool(),
-            MuseSparkTool(),
-            StoryOutlineTool(),
-            StoryCodexTool(),
-            StoryManuscriptTool(),
-            StoryContextTool(),
-            StoryAuditTool(),
-            InstallPackageTool(),
-            PlanUpdateTool(),
-            SubagentDelegationTool(),
-            A2ACallTool(),
-            ToolResultReadTool(),
-        ]
+        tools=with_extension_tools(
+            [
+                FileReadTool(),
+                FileWriteTool(),
+                FileEditTool(),
+                FileSearchTool(),
+                DirectoryListTool(),
+                BashRunTool(name="bash_run"),
+                # The same shell under a second name, kept registered so a stored call or a
+                # persona file naming it still resolves. Not advertised beside `bash_run`:
+                # two identical schemas were ~1 KB per request and a coin flip for the model
+                # (#1424).
+                BashRunTool(name="run_command", alias_of="bash_run"),
+                WebFetchTool(),
+                WebSearchTool(),
+                _browser_tool(),
+                GenerateImageTool(),
+                SetAvatarTool(),
+                CharacterSheetTool(),
+                InstallPackageTool(),
+                PlanUpdateTool(),
+                SubagentDelegationTool(),
+                A2ACallTool(characters=a2a_character_lookup()),
+                ToolResultReadTool(),
+            ]
+        )
     )
 
     if enable_mcp:

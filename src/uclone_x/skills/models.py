@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from uclone_x.sandbox.models import IsolationLevel
 
 __all__ = [
+    "ROUTED_SKILL_TAG",
     "AuditVerdict",
     "AutoApprovalPolicy",
     "SkillAuditReport",
@@ -152,6 +153,15 @@ class SkillManifest(BaseModel):
         return super().model_copy(deep=deep)
 
 
+ROUTED_SKILL_TAG = "case-routed"
+"""The manifest tag of a skill that code hands over, rather than one the model picks.
+
+A skill with this tag is left out of the system prompt's skill listing (listing it would
+change the cached prefix and invite the model to load every case at once), and the
+`load_skill` tool refuses it (#1865).
+"""
+
+
 def missing_required_tools(manifest: SkillManifest, tool_scope: Iterable[str]) -> tuple[str, ...]:
     """The tools `manifest` requires that `tool_scope` does not grant, in declared order (#1826).
 
@@ -192,7 +202,7 @@ class SkillAuditReport(BaseModel):
     The defaults fail in the safe direction. The previous shape defaulted to
     `risk_score=0.0` and `recommendation="approve"`, so an auditor that crashed, or was
     never invoked at all, produced a report reading "safe, approve" — the fail-open
-    posture recorded as finding F5 in `docs/security-threat-model.md`.
+    posture recorded as a finding in the threat model.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid", strict=True)

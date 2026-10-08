@@ -223,6 +223,8 @@ class EntrySnapshot:
     #: For each state key a progression set, the scene of the progression that set it last;
     #: a key not here holds the entry's starting value.
     set_at: dict[str, str] = field(default_factory=dict[str, str])
+    #: What the entry is to each other entry at that moment, by the other's id.
+    relations: dict[str, str] = field(default_factory=dict[str, str])
 
 
 def _described(at: str, kind: str, note: str | None, change: dict[str, Any]) -> dict[str, Any]:
@@ -267,6 +269,8 @@ def entry_snapshot(
     for order, (kind, progression) in enumerate(changes):
         if isinstance(progression, Progression):
             change: dict[str, Any] = {"set": dict(progression.set)}
+            if progression.relations:
+                change["relations"] = dict(progression.relations)
         else:
             change = {
                 "add_tags": list(progression.add_tags),
@@ -286,6 +290,7 @@ def entry_snapshot(
         ready.append((placement.position, order, progression, described))
 
     state: dict[str, Any] = dict(entry.state)
+    relations: dict[str, str] = dict(entry.relations)
     tags: list[str] | None = list(visual.tags) if visual is not None else None
     applied: list[dict[str, Any]] = []
     set_at: dict[str, str] = {}
@@ -297,9 +302,14 @@ def entry_snapshot(
                 else:
                     state[key] = value
                 set_at[key] = progression.at
+            for other, word in progression.relations.items():
+                if word is None:
+                    relations.pop(other, None)
+                else:
+                    relations[other] = word
         elif tags is not None:
             removed = set(progression.remove_tags)
             tags = [t for t in tags if t not in removed]
             tags += [t for t in progression.add_tags if t not in tags]
         applied.append(described)
-    return EntrySnapshot(state, tags, applied, in_this_scene, not_placed, set_at)
+    return EntrySnapshot(state, tags, applied, in_this_scene, not_placed, set_at, relations)

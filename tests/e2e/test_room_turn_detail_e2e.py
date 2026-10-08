@@ -24,6 +24,7 @@ count is drawn beside it, the two figures have to say which is which on the rend
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Iterator
 from pathlib import Path
@@ -184,25 +185,43 @@ async def test_the_composer_names_the_turns_it_counts_and_the_tokens_the_core_bo
 
 
 @pytest.fixture
-def server_serving_a_published_window(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> Iterator[str]:
+def server_serving_a_published_window(tmp_path: Path) -> Iterator[str]:
     """The same app, configured as if the operator had pointed it at a hosted model.
 
-    `update_settings` is the product's own path to this and is deliberately not used: it also
-    writes `LLM_PROVIDER` and `ANTHROPIC_MODEL` into `os.environ`, which would outlive the
-    test and reconfigure every suite that ran after it. The two fields the readout reads are
-    set directly instead. The connector that answers the turn is still the mock, because
-    nothing re-resolves it once the app is built -- which is what makes this a test of the
-    readout rather than of Anthropic.
+    The settings hold an Anthropic connection (a test key) and the default deep ref on it
+    (model-gateway §3.2), so the seat is bound to `anthropic/claude-3-5-sonnet-20241022`
+    the way the product binds one. The connector the gateway builds for it is still the
+    mock, named as Anthropic's, because no test may reach Anthropic -- which is what makes
+    this a test of the readout rather than of Anthropic.
     """
+    storage = tmp_path / "sessions"
+    storage.mkdir()
+    (storage / "settings.json").write_text(
+        json.dumps(
+            {
+                "connections": [{"id": "anthropic", "kind": "anthropic", "key": "sk-ant-test"}],
+                "default_models": {"deep": "anthropic/claude-3-5-sonnet-20241022"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    answering = mock_llm()
+
+    class _NamedAsAnthropic(type(answering)):  # the mock, reporting the provider it stands for
+        @property
+        def provider_name(self) -> str:
+            return "anthropic"
+
+    def build(**_kwargs: Any) -> Any:
+        return _NamedAsAnthropic(
+            default_model="claude-3-5-sonnet-20241022",
+            default_response="Mock response from UClone-X BaseAgent.",
+        )
 
     def configure(app: Any) -> None:
-        manager = app.state.room_stack.session_manager()
-        monkeypatch.setattr(manager, "_configured_provider", "anthropic")
-        monkeypatch.setattr(manager, "_configured_model", "claude-3-5-sonnet-20241022")
+        app.state.session_manager.gateway._factory = build  # pyright: ignore[reportPrivateUsage]
 
-    with running_ui(storage_dir=tmp_path, llm=mock_llm(), configure=configure) as url:
+    with running_ui(storage_dir=storage, llm=None, configure=configure) as url:
         yield url
 
 
@@ -282,6 +301,7 @@ async def test_why_on_turn_with_documents_shows_step_and_doc_and_open_in_docs(
     tmp_path: Path,
 ) -> None:
     """Opening why on a turn that wrote a document shows its step and doc rows, and Open lands in Docs."""
+    from uclone_x.core.agent_home import seat_id_for
     from uclone_x.core.provenance import ExecutionPath, Provenance, ServiceRef
     from uclone_x.room.models import (
         Participant,
@@ -298,6 +318,8 @@ async def test_why_on_turn_with_documents_shows_step_and_doc_and_open_in_docs(
     from uclone_x.room.store import RoomStore
 
     room_id = "room_docs_e2e"
+    # A room seats a clone by its id, which the rail files the conversation under.
+    scout = seat_id_for("scout")
     storage_dir = tmp_path / "state"
     workspace_dir = tmp_path / "workspace"
     workspace_dir.mkdir(parents=True, exist_ok=True)
@@ -313,18 +335,18 @@ async def test_why_on_turn_with_documents_shows_step_and_doc_and_open_in_docs(
         title="Documentation Room",
         participants=(
             Participant(id="user", kind=ParticipantKind.HUMAN, display_name="Kenny"),
-            Participant(id="scout", kind=ParticipantKind.AGENT, display_name="Scout"),
+            Participant(id=scout, kind=ParticipantKind.AGENT, display_name="Scout"),
         ),
         transcript=(
             RoomMessage(seq=1, kind=RoomMessageKind.JOIN, sender_id="user", content=""),
-            RoomMessage(seq=2, kind=RoomMessageKind.JOIN, sender_id="scout", content=""),
+            RoomMessage(seq=2, kind=RoomMessageKind.JOIN, sender_id=scout, content=""),
             RoomMessage(
                 seq=3, kind=RoomMessageKind.UTTERANCE, sender_id="user", content="Write guide.md"
             ),
             RoomMessage(
                 seq=4,
                 kind=RoomMessageKind.UTTERANCE,
-                sender_id="scout",
+                sender_id=scout,
                 content="I wrote the guide for you.",
                 turn_id="turn_4",
                 completed=True,
@@ -336,7 +358,7 @@ async def test_why_on_turn_with_documents_shows_step_and_doc_and_open_in_docs(
                 ),
                 decision=SpeakerDecision(
                     verdict=SelectionVerdict.SPEAK,
-                    speaker_id="scout",
+                    speaker_id=scout,
                     confidence=1.0,
                     selector="sole_agent",
                     reasoning="",
@@ -346,7 +368,7 @@ async def test_why_on_turn_with_documents_shows_step_and_doc_and_open_in_docs(
         tool_uses=(
             RoomToolUse(
                 turn_id="turn_4",
-                participant_id="scout",
+                participant_id=scout,
                 tool_name="file_write",
                 tool_call_id="call_write_guide",
                 status="success",
@@ -359,12 +381,12 @@ async def test_why_on_turn_with_documents_shows_step_and_doc_and_open_in_docs(
         written_files=(
             RoomWrittenFile(
                 path="docs/guide.md",
-                participant_id="scout",
+                participant_id=scout,
                 tool_name="file_write",
                 turn_id="turn_4",
             ),
         ),
-        turn_state=TurnState(agent_turns_since_human=1, last_speaker_id="scout"),
+        turn_state=TurnState(agent_turns_since_human=1, last_speaker_id=scout),
     )
     room_store.save(state)
 

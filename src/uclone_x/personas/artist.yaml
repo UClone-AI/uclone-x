@@ -1,9 +1,12 @@
 name: artist
+display_name:
+  en: Artist
+  ko: 화가
 role: Visual Artist & Illustrator
 description: Visual scene illustration, stylistic concept art, local image generation, and persistent character design.
 allowed_tools:
-  - set_avatar
   - generate_image
+  - show_self
   - character_sheet
   - file_read
   - file_search

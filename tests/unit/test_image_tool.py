@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import weakref
 from collections.abc import Callable
@@ -13,6 +14,7 @@ import pytest
 
 from uclone_x.core.tool_results import canonical_tool_text
 from uclone_x.errors import PlainRefusalError
+from uclone_x.tools.base import artifact_path_from_url, linked_paths
 from uclone_x.tools.builtin.comfy_client import COMFY_DEFAULT_CHECKPOINT
 from uclone_x.tools.builtin.image import (
     ACCELERATE_MISSING_SENTENCE,
@@ -51,6 +53,7 @@ from uclone_x.tools.builtin.image import (
     resolve_sampling,
     running_under_wsl,
     select_torch_device,
+    sidecar_path_for,
     style_guided_prompt,
     torch_out_of_memory_types,
     version_release,
@@ -62,6 +65,21 @@ from uclone_x.tools.builtin.image import (
     nvml_free_bytes as real_nvml_free_bytes,
 )
 from uclone_x.tools.models import ToolContext
+
+
+def _picture_rel(url: object) -> str:
+    """The workspace path a result's picture link serves; fails the test if it names none."""
+    rel = artifact_path_from_url(url)
+    assert rel is not None, f"not a picture link: {url!r}"
+    return rel
+
+
+def _sidecar(workspace: Path, url: object) -> dict[str, Any]:
+    """The recipe sidecar saved beside the picture a result links to."""
+    return cast(
+        dict[str, Any],
+        json.loads((workspace / sidecar_path_for(_picture_rel(url))).read_text(encoding="utf-8")),
+    )
 
 
 def test_deterministic_seeding_reproducibility_and_turn_entropy() -> None:
@@ -192,8 +210,8 @@ def _dispatcher_mocks(
 async def test_dispatcher_prefers_remote_cuda_over_every_local_engine() -> None:
     """A reachable remote worker wins even when both local engines are also ready.
 
-    Killed by: src/uclone_x/tools/builtin/image.py :: ("Remote CUDA worker", self._remote_engine),
-    Becomes: ("Remote CUDA worker", self._local_engine),
+    Killed by: src/uclone_x/tools/builtin/image.py :: ("Remote CUDA worker", "remote-cuda", self._remote_engine))
+    Becomes: ("Remote CUDA worker", "remote-cuda", self._local_engine))
     """
     mock_remote, mock_comfy, mock_local = _dispatcher_mocks(remote=True, comfy=True, local=True)
     dispatcher = ImagePipelineDispatcher(
@@ -218,8 +236,8 @@ async def test_dispatcher_prefers_remote_cuda_over_every_local_engine() -> None:
 async def test_dispatcher_prefers_a_detected_comfyui_over_the_in_process_engine() -> None:
     """With no remote worker, a running ComfyUI is chosen ahead of in-process diffusers (#1095).
 
-    Killed by: src/uclone_x/tools/builtin/image.py :: ("detected local ComfyUI daemon", self._comfy_engine),
-    Becomes: ("detected local ComfyUI daemon", self._local_engine),
+    Killed by: src/uclone_x/tools/builtin/image.py :: ("detected local ComfyUI daemon", "comfyui-local", self._comfy_engine))
+    Becomes: ("detected local ComfyUI daemon", "comfyui-local", self._local_engine))
     """
     mock_remote, mock_comfy, mock_local = _dispatcher_mocks(remote=False, comfy=True, local=True)
     dispatcher = ImagePipelineDispatcher(
@@ -243,8 +261,8 @@ async def test_dispatcher_prefers_a_detected_comfyui_over_the_in_process_engine(
 async def test_dispatcher_runs_in_process_when_no_daemon_is_running() -> None:
     """The daemon-free baseline: no remote, no ComfyUI, and an image is still produced.
 
-    Killed by: src/uclone_x/tools/builtin/image.py :: ("in-process diffusers engine", self._local_engine),
-    Becomes: ("in-process diffusers engine", self._comfy_engine),
+    Killed by: src/uclone_x/tools/builtin/image.py :: ("in-process diffusers engine", "diffusers-sdxl", self._local_engine))
+    Becomes: ("in-process diffusers engine", "diffusers-sdxl", self._comfy_engine))
     """
     mock_remote, mock_comfy, mock_local = _dispatcher_mocks(remote=False, comfy=False, local=True)
     dispatcher = ImagePipelineDispatcher(
@@ -364,13 +382,16 @@ async def test_generate_image_tool_run_writes_artifact_and_returns_provenance(
 
     assert result["status"] == "success"
     assert result["seed"] == 55555
-    assert result["engine"] == "diffusers-sdxl"
-    assert result["width"] == 1024
-    assert result["height"] == 1024
-    assert result["bytes_written"] == len(b"fake_png_binary_data")
+    # The provenance lives in the sidecar beside the picture, not in the result (#2013).
+    sidecar = _sidecar(tmp_path, result["relative_url"])
+    assert sidecar["engine"] == "diffusers-sdxl"
+    assert sidecar["device"] == "Apple M3"
+    assert sidecar["width"] == 1024
+    assert sidecar["height"] == 1024
+    assert sidecar["seed"] == 55555
 
-    # Verify written file on disk
-    img_path = tmp_path / result["path"]
+    # Verify written file on disk, found from the link the result carries
+    img_path = tmp_path / _picture_rel(result["relative_url"])
     assert img_path.is_file()
     assert img_path.read_bytes() == b"fake_png_binary_data"
 
@@ -416,7 +437,10 @@ async def test_generate_image_recipe_hash_includes_negative_prompt(tmp_path: Pat
         context,
     )
 
-    assert res1["recipe_hash"] != res2["recipe_hash"]
+    hash1 = _sidecar(tmp_path, res1["relative_url"])["recipe_hash"]
+    hash2 = _sidecar(tmp_path, res2["relative_url"])["recipe_hash"]
+    assert hash1 and hash2
+    assert hash1 != hash2
 
 
 @pytest.mark.asyncio
@@ -449,7 +473,41 @@ async def test_generate_image_tool_execute_decorates_artifacts_field(
 
     assert result.success is True
     assert len(result.artifacts) == 1
-    assert "artifacts/images/img_" in result.artifacts[0]
+    assert "artifacts/sess_exec/images/img_" in result.artifacts[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("count", [1, 3])
+async def test_a_generated_picture_is_saved_in_the_session_directory(
+    tmp_path: Path, count: int
+) -> None:
+    """Default saves land in `artifacts/<session id>/images/`, the directory the Docs &
+    Artifacts listing reads for a session (#1390), for one picture and for a batch.
+
+    Killed by: src/uclone_x/tools/builtin/image.py :: images_dir = f"artifacts/{session_id}/images"
+    Becomes: images_dir = f"artifacts/images"
+    """
+    dispatcher = AsyncMock(spec=ImagePipelineDispatcher)
+    dispatcher.dispatch.return_value = ImageGenerationResult(
+        image_bytes=b"png",
+        seed=1,
+        engine_name="mock-engine",
+        device_info="cpu",
+        duration_seconds=0.1,
+        width=64,
+        height=64,
+    )
+    context = ToolContext(agent_id="artist", workspace_root=tmp_path, session_id="sess_1390")
+
+    result = await GenerateImageTool(dispatcher=dispatcher).execute(
+        params={"prompt": "lighthouse", "count": count}, context=context
+    )
+
+    assert result.success is True
+    assert len(result.artifacts) == count
+    for rel in result.artifacts:
+        assert rel.startswith("artifacts/sess_1390/images/img_"), rel
+        assert (tmp_path / rel).is_file()
 
 
 @pytest.mark.asyncio
@@ -463,6 +521,7 @@ async def test_generate_image_tool_run_batch_count(tmp_path: Path) -> None:
         aspect_ratio: str,
         seed: int,
         style: str,
+        own: str | None = None,
     ) -> ImageGenerationResult:
         return ImageGenerationResult(
             image_bytes=f"png_{seed}".encode(),
@@ -493,20 +552,156 @@ async def test_generate_image_tool_run_batch_count(tmp_path: Path) -> None:
     assert result["status"] == "success"
     assert result["count"] == 3
     assert len(result["images"]) == 3
-    assert len(result["paths"]) == 3
-    assert len(result["relative_urls"]) == 3
     assert mock_dispatcher.dispatch.call_count == 3
     # Seeds should be progressive
     assert result["images"][0]["seed"] == 2000
     assert result["images"][1]["seed"] == 2001
     assert result["images"][2]["seed"] == 2002
-    assert "gundam girl robot armor #1" in result["markdown_gallery"]
+    # The shared prompt is said once, at the top (#2013)
+    assert result["prompt"] == "gundam girl robot armor"
+    # No gallery text, path lists or link lists: each picture is named once, by its link
+    for dropped in ("markdown_gallery", "paths", "relative_urls", "meta_paths"):
+        assert dropped not in result
+    paths = linked_paths(result)
+    assert len(paths) == 3
+    assert paths == [_picture_rel(img["relative_url"]) for img in result["images"]]
 
-    # Verify all 3 files exist on disk
-    for img_meta in result["images"]:
-        f_path = tmp_path / img_meta["path"]
+    # Verify all 3 files exist on disk, found from the links
+    for img_meta, rel in zip(result["images"], paths, strict=True):
+        f_path = tmp_path / rel
         assert f_path.is_file()
         assert f_path.read_bytes() == f"png_{img_meta['seed']}".encode()
+
+
+_DROPPED_RESULT_KEYS = (
+    "engine",
+    "device",
+    "path",
+    "paths",
+    "meta_path",
+    "meta_paths",
+    "recipe_hash",
+    "markdown_gallery",
+    "relative_urls",
+    "prompts",
+    "width",
+    "height",
+    "mime_type",
+    "duration_seconds",
+    "bytes_written",
+)
+_FILL_KEYS = {"prompt_changes", "prompt_added", "negative_added"}
+
+
+def _batch_tool() -> GenerateImageTool:
+    """A tool whose engine draws each picture from its seed, the same way every time."""
+    dispatcher = AsyncMock(spec=ImagePipelineDispatcher)
+
+    def _draw(
+        prompt: str,
+        negative_prompt: str,
+        aspect_ratio: str,
+        seed: int,
+        style: str,
+        own: str | None = None,
+    ) -> ImageGenerationResult:
+        return ImageGenerationResult(
+            image_bytes=f"png_{seed}".encode(),
+            seed=seed,
+            engine_name="diffusers-sdxl",
+            device_info="Apple M3",
+            duration_seconds=1.0,
+            width=768,
+            height=576,
+        )
+
+    dispatcher.dispatch.side_effect = _draw
+    return GenerateImageTool(dispatcher=dispatcher)
+
+
+def _assert_no_dropped_key(value: object) -> None:
+    """No dict anywhere in `value` carries a key the slim result dropped (#2013)."""
+    if isinstance(value, dict):
+        mapping = cast(dict[str, Any], value)
+        for key in _DROPPED_RESULT_KEYS:
+            assert key not in mapping, key
+        for inner in mapping.values():
+            _assert_no_dropped_key(inner)
+    elif isinstance(value, list):
+        for inner in cast(list[Any], value):
+            _assert_no_dropped_key(inner)
+
+
+@pytest.mark.asyncio
+async def test_a_same_prompt_batch_result_says_each_picture_once_and_the_prompt_once(
+    tmp_path: Path,
+) -> None:
+    """Pins the slim batch shape the model is sent, and every later request resends (#2013).
+
+    A count=4 batch of one prompt: the result's keys are exactly status, count, prompt,
+    style, aspect_ratio and images (plus a fill key only when the fill produced one), each
+    picture is exactly its link and seed, the prompt text appears once in the serialized
+    result, and none of the dropped keys (engine, device, paths, sidecar paths, recipe hash,
+    gallery text...) appear anywhere in it. The engine and recipe stay reachable from each
+    picture's sidecar.
+    """
+    prompt = "gundam girl robot armor, standing on a rooftop at dusk"
+    context = ToolContext(agent_id="a", workspace_root=tmp_path, session_id="s")
+
+    result = await _batch_tool().run(
+        GenerateImageParams(prompt=prompt, count=4, seed_override=2000), context
+    )
+
+    base = {"status", "count", "prompt", "style", "aspect_ratio", "images"}
+    assert base <= set(result) <= base | _FILL_KEYS
+    for key in _FILL_KEYS & set(result):
+        assert result[key], f"{key} is sent only when it says something"
+    assert result["count"] == 4
+    assert result["prompt"] == prompt
+    assert [set(img) for img in result["images"]] == [{"relative_url", "seed"}] * 4
+    assert [img["seed"] for img in result["images"]] == [2000, 2001, 2002, 2003]
+    assert json.dumps(result, ensure_ascii=False).count(prompt) == 1
+    _assert_no_dropped_key(result)
+
+    for img in result["images"]:
+        sidecar = _sidecar(tmp_path, img["relative_url"])
+        assert sidecar["prompt"] == prompt
+        assert sidecar["seed"] == img["seed"]
+        assert sidecar["engine"] == "diffusers-sdxl"
+        assert sidecar["recipe_hash"]
+
+
+@pytest.mark.asyncio
+async def test_a_batch_of_distinct_prompts_puts_each_prompt_on_its_own_picture(
+    tmp_path: Path,
+) -> None:
+    """Pins the slim shape for `prompts=[a, b]` (#2013): no shared prompt, one per picture.
+
+    Pictures drawn from different prompts share none, so the result has no top-level
+    `prompt` (and no `prompts` list); each picture carries its own prompt beside its link
+    and seed, and each prompt appears once in the serialized result.
+    """
+    prompts = ["1girl, silver hair, hero pose", "1girl, silver hair, sitting on a chair"]
+    context = ToolContext(agent_id="a", workspace_root=tmp_path, session_id="s")
+
+    result = await _batch_tool().run(
+        GenerateImageParams(prompts=prompts, seed_override=10), context
+    )
+
+    assert "prompt" not in result
+    assert result["count"] == 2
+    assert [img["prompt"] for img in result["images"]] == prompts
+    for img in result["images"]:
+        assert (
+            {"relative_url", "seed", "prompt"}
+            <= set(img)
+            <= ({"relative_url", "seed", "prompt"} | _FILL_KEYS)
+        )
+    text = json.dumps(result, ensure_ascii=False)
+    for p in prompts:
+        assert text.count(p) == 1
+    _assert_no_dropped_key(result)
+    assert len(linked_paths(result)) == 2
 
 
 def test_find_prompt_conflicts_detection_and_safeguards() -> None:
@@ -594,6 +789,7 @@ async def test_generate_image_tool_supports_diverse_prompts_list(
         aspect_ratio: str,
         seed: int,
         style: str,
+        own: str | None = None,
     ) -> ImageGenerationResult:
         return ImageGenerationResult(
             image_bytes=f"png_{prompt[:10]}_{seed}".encode(),
@@ -629,7 +825,10 @@ async def test_generate_image_tool_supports_diverse_prompts_list(
 
     assert result["status"] == "success"
     assert result["count"] == 3
-    assert result["prompts"] == distinct_prompts
+    # Each picture carries its own prompt; there is no shared one and no `prompts` list (#2013)
+    assert "prompts" not in result
+    assert "prompt" not in result
+    assert [img["prompt"] for img in result["images"]] == distinct_prompts
     assert mock_dispatcher.dispatch.call_count == 3
 
     # Dispatcher was called with each distinct prompt
@@ -683,6 +882,7 @@ async def test_generate_image_tool_execute_batch_artifacts(tmp_path: Path) -> No
         aspect_ratio: str,
         seed: int,
         style: str,
+        own: str | None = None,
     ) -> ImageGenerationResult:
         return ImageGenerationResult(
             image_bytes=b"dummy",
@@ -725,6 +925,7 @@ async def test_generate_image_tool_turn_index_different_seeds(tmp_path: Path) ->
         aspect_ratio: str,
         seed: int,
         style: str,
+        own: str | None = None,
     ) -> ImageGenerationResult:
         return ImageGenerationResult(
             image_bytes=f"image_{seed}".encode(),
@@ -841,8 +1042,10 @@ async def test_the_result_the_model_reads_names_no_workspace_directory(
     The text the model reads is checked, not the dict, because that is what it copies from.
     Both the single-image and the batch shape are covered; each carried the path twice.
 
-    Killed by: src/uclone_x/tools/builtin/image.py :: rel_meta_path = str(meta_path.relative_to(context.require_workspace().resolve()))
-    Becomes: rel_meta_path = str(meta_path)
+    Killed by: src/uclone_x/tools/builtin/image.py :: rel_path = str(dest_path.relative_to(context.require_workspace().resolve()))
+    Becomes: rel_path = str(dest_path)
+    Killed by: src/uclone_x/tools/builtin/image.py :: batch_path = str(dest_path.relative_to(context.require_workspace().resolve()))
+    Becomes: batch_path = str(dest_path)
     """
     workspace = tmp_path / "ucx-fresh-test2-pypi022" / "work"
     workspace.mkdir(parents=True)
@@ -866,10 +1069,13 @@ async def test_the_result_the_model_reads_names_no_workspace_directory(
     text = canonical_tool_text(result.output)
     assert "ucx-fresh-test2-pypi022" not in text
     output = cast(dict[str, Any], result.output)
-    links = output["relative_urls"] if count > 1 else [output["relative_url"]]
+    links = (
+        [img["relative_url"] for img in output["images"]] if count > 1 else [output["relative_url"]]
+    )
     assert len(links) == count
+    assert "relative_urls" not in output
     for link in links:
-        assert link.startswith("/api/artifacts/content?path=artifacts/images/img_")
+        assert link.startswith("/api/artifacts/content?path=artifacts/s/images/img_")
 
 
 @pytest.mark.asyncio
@@ -1529,14 +1735,18 @@ async def test_generate_image_tool_unique_short_id_and_sidecar_metadata(tmp_path
 
     assert result.success is True
     assert isinstance(result.output, dict)
-    rel_path = result.output["path"]
-    rel_meta = result.output["meta_path"]
-    assert isinstance(rel_path, str)
-    assert isinstance(rel_meta, str)
+    rel_path = _picture_rel(result.output["relative_url"])
+    rel_meta = sidecar_path_for(rel_path)
+    assert "meta_path" not in result.output
+    assert result.artifacts == (rel_path,)
 
-    # Compact short ID pattern: artifacts/images/img_<6hex>.png
-    assert re.match(r"^artifacts/images/img_[0-9a-f]{6}\.png$", rel_path)
-    assert re.match(r"^artifacts/images/img_[0-9a-f]{6}\.json$", rel_meta)
+    # Compact short ID pattern, in the session's own directory (#1390)
+    assert re.match(
+        r"^artifacts/sess_room__room_test__artist/images/img_[0-9a-f]{6}\.png$", rel_path
+    )
+    assert re.match(
+        r"^artifacts/sess_room__room_test__artist/images/img_[0-9a-f]{6}\.json$", rel_meta
+    )
 
     # Verify files on disk
     png_file = tmp_path / rel_path
@@ -1591,10 +1801,8 @@ async def test_generate_image_tool_no_collision_on_identical_seed(tmp_path: Path
     assert res1.success is True and res2.success is True
     assert isinstance(res1.output, dict) and isinstance(res2.output, dict)
 
-    path1 = res1.output["path"]
-    path2 = res2.output["path"]
-    assert isinstance(path1, str)
-    assert isinstance(path2, str)
+    path1 = _picture_rel(res1.output["relative_url"])
+    path2 = _picture_rel(res2.output["relative_url"])
     assert path1 != path2
 
     # Both images must exist simultaneously on disk (no overwriting!)
@@ -1680,6 +1888,59 @@ async def test_local_diffusers_image_engine_run_in_process_generation(tmp_path: 
         )
 
     assert png_bytes.startswith(b"\x89PNG")
+
+
+def test_two_generations_never_run_the_pipeline_at_once(tmp_path: Path) -> None:
+    """A second request waits for the first: a pipeline shared by two threads aborts on MPS.
+
+    The first run holds the pipeline until the second thread has started (or 0.3 s pass).
+    Unserialized, the second enters the pipeline in that window and two runs overlap.
+    """
+    import threading
+
+    from PIL import Image
+
+    checkpoint = tmp_path / "model.safetensors"
+    checkpoint.write_bytes(b"dummy")
+    engine = LocalDiffusersImageEngine(checkpoint_path=str(checkpoint))
+
+    first_inside = threading.Event()
+    second_started = threading.Event()
+    guard = threading.Lock()
+    active = 0
+    most_active = 0
+
+    def run_pipeline(**_: Any) -> MagicMock:
+        nonlocal active, most_active
+        with guard:
+            active += 1
+            most_active = max(most_active, active)
+        first_inside.set()
+        second_started.wait(timeout=0.3)
+        with guard:
+            active -= 1
+        return MagicMock(images=[Image.new("RGB", (8, 8))])
+
+    mock_pipeline = _sdxl_pipeline()
+    mock_pipeline.side_effect = run_pipeline
+
+    def generate() -> None:
+        engine._run_in_process_generation(  # pyright: ignore[reportPrivateUsage]
+            prompt="p", negative_prompt="", width=8, height=8, seed=1, style="anime"
+        )
+
+    with patch.object(engine, "_ensure_pipeline_loaded", return_value=mock_pipeline):
+        first = threading.Thread(target=generate)
+        first.start()
+        assert first_inside.wait(timeout=5)
+        second = threading.Thread(target=generate)
+        second.start()
+        second_started.set()
+        first.join(timeout=5)
+        second.join(timeout=5)
+
+    assert mock_pipeline.call_count == 2
+    assert most_active == 1
 
 
 class _FakeOutOfMemoryError(RuntimeError):
@@ -3243,7 +3504,7 @@ class _SwitchableDispatcher(ImagePipelineDispatcher):
         super().__init__()
         self.profile = profile
 
-    def get_active_profile(self) -> Any:
+    def get_active_profile(self, own: str | None = None) -> Any:
         return self.profile
 
 
@@ -3386,3 +3647,234 @@ def test_an_architecture_prompt_gets_no_anatomy_negative_from_any_shipped_profil
         ).negative_prompt
         for term in _ANATOMY_TERMS:
             assert term not in negative.lower(), (checkpoint, term)
+
+
+def test_deterministic_seeding_call_index_variation() -> None:
+    """Killed by: src/uclone_x/tools/builtin/image.py :: f"{session_id}__{turn_idx}__{seed_prompt_key(prompt)}__{call_index}"
+    Becomes: f"{session_id}__{turn_idx}__{seed_prompt_key(prompt)}"
+    """
+    seed0 = compute_deterministic_seed("sess_abc", 1, "prompt", call_index=0)
+    seed1 = compute_deterministic_seed("sess_abc", 1, "prompt", call_index=1)
+    seed2 = compute_deterministic_seed("sess_abc", 1, "prompt", call_index=2)
+    assert seed0 != seed1
+    assert seed1 != seed2
+    assert seed0 == compute_deterministic_seed("sess_abc", 1, "prompt")
+
+
+@pytest.mark.asyncio
+async def test_generate_image_avoids_overwriting_existing_output_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Killed by: src/uclone_x/tools/builtin/image.py :: if not dest.exists():
+    Becomes: if True:
+    """
+    import secrets
+    from unittest.mock import AsyncMock
+
+    from uclone_x.tools.builtin.image import ImageGenerationResult, ImagePipelineDispatcher
+
+    def _fake_token_hex(_n: int = 16) -> str:
+        return "fixed"
+
+    monkeypatch.setattr(secrets, "token_hex", _fake_token_hex)
+    dispatcher = AsyncMock(spec=ImagePipelineDispatcher)
+    dispatcher.dispatch.return_value = ImageGenerationResult(
+        image_bytes=b"new_image_bytes",
+        seed=123,
+        engine_name="mock_engine",
+        device_info="test_device",
+        duration_seconds=0.1,
+        width=512,
+        height=512,
+        mime_type="image/png",
+    )
+    context = ToolContext(agent_id="artist", workspace_root=tmp_path, session_id="sess_test")
+    existing_file = tmp_path / "artifacts" / "sess_test" / "images" / "img_fixed.png"
+    existing_file.parent.mkdir(parents=True, exist_ok=True)
+    existing_file.write_bytes(b"existing_bytes")
+
+    tool = GenerateImageTool(dispatcher=dispatcher)
+    res = await tool.execute(
+        params={"prompt": "test prompt"},
+        context=context,
+    )
+    assert res.success is True
+    output_dict = cast(dict[str, Any], res.output)
+    assert _picture_rel(output_dict["relative_url"]) == "artifacts/sess_test/images/img_fixed_1.png"
+    assert existing_file.read_bytes() == b"existing_bytes"
+    assert (
+        tmp_path / "artifacts" / "sess_test" / "images" / "img_fixed_1.png"
+    ).read_bytes() == b"new_image_bytes"
+
+
+@pytest.mark.asyncio
+async def test_generate_image_avoids_overwriting_explicit_existing_artifact_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Killed by: src/uclone_x/tools/builtin/image.py :: if dest_path.exists() and picture_rel.replace("\\", "/").startswith("artifacts/"):
+    Becomes: if False:
+    """
+    from unittest.mock import AsyncMock
+
+    from uclone_x.tools.builtin.image import ImageGenerationResult, ImagePipelineDispatcher
+
+    dispatcher = AsyncMock(spec=ImagePipelineDispatcher)
+    dispatcher.dispatch.return_value = ImageGenerationResult(
+        image_bytes=b"new_image_bytes",
+        seed=123,
+        engine_name="mock_engine",
+        device_info="test_device",
+        duration_seconds=0.1,
+        width=512,
+        height=512,
+        mime_type="image/png",
+    )
+    context = ToolContext(agent_id="artist", workspace_root=tmp_path, session_id="sess_test")
+    existing_file = tmp_path / "artifacts" / "images" / "img_explicit.png"
+    existing_file.parent.mkdir(parents=True, exist_ok=True)
+    existing_file.write_bytes(b"existing_bytes")
+
+    tool = GenerateImageTool(dispatcher=dispatcher)
+    res = await tool.execute(
+        params={"prompt": "test prompt", "output_path": "artifacts/images/img_explicit.png"},
+        context=context,
+    )
+    assert res.success is True
+    output_dict = cast(dict[str, Any], res.output)
+    assert artifact_path_from_url(output_dict["relative_url"]) == (
+        "artifacts/images/img_explicit_1.png"
+    )
+    assert existing_file.read_bytes() == b"existing_bytes"
+    assert (
+        tmp_path / "artifacts" / "images" / "img_explicit_1.png"
+    ).read_bytes() == b"new_image_bytes"
+
+
+def _seed_recording_tool() -> tuple[GenerateImageTool, AsyncMock]:
+    dispatcher = AsyncMock(spec=ImagePipelineDispatcher)
+    dispatcher.dispatch.return_value = ImageGenerationResult(
+        image_bytes=b"png",
+        seed=123,
+        engine_name="mock_engine",
+        device_info="test_device",
+        duration_seconds=0.1,
+        width=512,
+        height=512,
+        mime_type="image/png",
+    )
+    return GenerateImageTool(dispatcher=dispatcher), dispatcher
+
+
+async def _drawn_seeds(
+    tool: GenerateImageTool,
+    dispatcher: AsyncMock,
+    context: ToolContext,
+    prompts: list[str],
+) -> list[int]:
+    for prompt in prompts:
+        res = await tool.execute(params={"prompt": prompt}, context=context)
+        assert res.success is True
+    return [c.kwargs["seed"] for c in dispatcher.dispatch.call_args_list]
+
+
+@pytest.mark.asyncio
+async def test_the_same_prompt_twice_in_a_turn_gets_two_seeds_and_replays(
+    tmp_path: Path,
+) -> None:
+    """Review of #1966: through the tool, not `compute_deterministic_seed` alone.
+
+    Killed by: src/uclone_x/tools/builtin/image.py :: index = counts.get(key, 0)
+    Becomes: index = 0
+    """
+    context = ToolContext(
+        agent_id="artist", workspace_root=tmp_path, session_id="sess_seed", turn_index=4
+    )
+    tool, dispatcher = _seed_recording_tool()
+    first = await _drawn_seeds(tool, dispatcher, context, ["a red fox", "A red fox "])
+    assert first[0] != first[1]
+
+    replay_tool, replay_dispatcher = _seed_recording_tool()
+    replay = await _drawn_seeds(
+        replay_tool, replay_dispatcher, context, ["a red fox", "A red fox "]
+    )
+    assert replay == first
+
+
+@pytest.mark.asyncio
+async def test_a_prompts_seed_does_not_depend_on_which_prompts_ran_first(
+    tmp_path: Path,
+) -> None:
+    """Calls of one step run concurrently, so the order they reach the tool is not fixed.
+
+    Killed by: src/uclone_x/tools/builtin/image.py :: key = seed_prompt_key(prompt)
+    Becomes: key = ""
+    """
+    context = ToolContext(
+        agent_id="artist", workspace_root=tmp_path, session_id="sess_seed", turn_index=4
+    )
+    tool, dispatcher = _seed_recording_tool()
+    fox, owl = await _drawn_seeds(tool, dispatcher, context, ["a red fox", "a snowy owl"])
+    other_tool, other_dispatcher = _seed_recording_tool()
+    owl_again, fox_again = await _drawn_seeds(
+        other_tool, other_dispatcher, context, ["a snowy owl", "a red fox"]
+    )
+    assert (fox, owl) == (fox_again, owl_again)
+    assert fox == compute_deterministic_seed("sess_seed", 4, "a red fox")
+
+
+@pytest.mark.asyncio
+async def test_the_repeat_count_keeps_only_each_sessions_latest_turn(
+    tmp_path: Path,
+) -> None:
+    """A new turn starts the count again, and the table is bounded by session count.
+
+    Killed by: src/uclone_x/tools/builtin/image.py :: counts = held[1] if held is not None and held[0] == turn_idx else {}
+    Becomes: counts = held[1] if held is not None else {}
+    Killed by: src/uclone_x/tools/builtin/image.py :: del self._turn_prompt_calls[next(iter(self._turn_prompt_calls))]
+    Becomes: pass
+    """
+    tool, dispatcher = _seed_recording_tool()
+    for turn in (1, 2):
+        context = ToolContext(
+            agent_id="artist", workspace_root=tmp_path, session_id="sess_seed", turn_index=turn
+        )
+        await tool.execute(params={"prompt": "a red fox"}, context=context)
+    seeds = [c.kwargs["seed"] for c in dispatcher.dispatch.call_args_list]
+    assert seeds == [
+        compute_deterministic_seed("sess_seed", 1, "a red fox"),
+        compute_deterministic_seed("sess_seed", 2, "a red fox"),
+    ]
+
+    for i in range(200):
+        tool._repeat_index(f"sess_{i}", 1, "a red fox")  # pyright: ignore[reportPrivateUsage]
+    held = tool._turn_prompt_calls  # pyright: ignore[reportPrivateUsage]
+    assert len(held) == 64
+    assert "sess_199" in held and "sess_seed" not in held
+
+
+def test_a_link_is_read_back_as_the_workspace_path_it_was_made_from() -> None:
+    """`artifact_path_from_url` inverts `artifact_content_url`, and reads nothing else (#2013).
+
+    Killed by: src/uclone_x/tools/base.py :: if parts.scheme or parts.netloc or parts.path != "/api/artifacts/content":
+    Becomes: if parts.path != "/api/artifacts/content":
+    Killed by: src/uclone_x/tools/base.py :: if values is None or len(values) != 1 or not values[0]:
+    Becomes: if values is None or not values[0]:
+    """
+    from uclone_x.tools.base import artifact_content_url, artifact_path_from_url, linked_paths
+
+    for rel in ("images/cat.png", "images/a cat (1).png", "그림/고양이.png"):
+        assert artifact_path_from_url(artifact_content_url(rel)) == rel
+    for other in (
+        None,
+        3,
+        "https://host/api/artifacts/content?path=a.png",
+        "/api/artifacts/other?path=a.png",
+        "/api/artifacts/content?path=a.png&path=b.png",
+        "/api/artifacts/content?path=",
+    ):
+        assert artifact_path_from_url(other) is None
+    one = artifact_content_url("a.png")
+    two = artifact_content_url("b.png")
+    output = {"relative_url": one, "images": [{"relative_url": one}, {"relative_url": two}, 7]}
+    assert linked_paths(output) == ["a.png", "b.png"]
+    assert linked_paths("a.png") == []

@@ -3,7 +3,7 @@
 `frozen=True` prevents attribute rebinding; it does nothing about the contents of a
 `dict` field, so `event.payload["k"] = v` succeeds on a frozen model. That matters more
 here than in an ordinary codebase: P2 requires co-located agents to exchange events by
-reference with no serialisation, and `docs/a2a-protocol-spec.md` section 10.3 carries the
+reference with no serialisation, and the A2A protocol specification carries the
 obligation forward as a requirement on the fastpath — "where objects are shared by
 reference they MUST be immutable (frozen models) so zero-copy cannot become shared
 mutable state".

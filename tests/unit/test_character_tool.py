@@ -239,3 +239,28 @@ def test_sanitize_character_id() -> None:
         sanitize_character_id("../escaped")
     with pytest.raises(CharacterSheetError):
         sanitize_character_id("foo/bar")
+
+
+@pytest.mark.asyncio
+async def test_a_saved_sheet_is_declared_and_a_read_is_not(
+    tool_context: ToolContext, workspace: Path
+) -> None:
+    """A `save` names its sheet as an artifact, so the room lists it; its output's key is
+    `file_path`, which no reader of `path` ever saw (#2085). A `get` produced nothing.
+
+    Killed by: src/uclone_x/tools/builtin/character.py :: return (path,) if isinstance(path, str) and path else ()
+    Becomes: return ()
+    Killed by: src/uclone_x/tools/base.py :: artifacts=self.produced_artifacts(output),
+    Becomes: artifacts=(),
+    """
+    tool = CharacterSheetTool()
+    saved = await tool.execute(
+        params={"action": "save", "character_id": "elena", "name": "Elena"},
+        context=tool_context,
+    )
+    read = await tool.execute(
+        params={"action": "get", "character_id": "elena"}, context=tool_context
+    )
+
+    assert saved.artifacts == ("characters/elena.yaml",)
+    assert read.artifacts == ()

@@ -9,12 +9,12 @@ instantiated nowhere outside `tests/`.
 from __future__ import annotations
 
 import asyncio
-import json
 from pathlib import Path
 
 import pytest
 from pydantic import BaseModel, ConfigDict, Field
 
+from tests.support.clones import make_clone
 from uclone_x.agent.base import BaseAgent
 from uclone_x.agent.composition import HostDependencies, compose_agent
 from uclone_x.agent.models import AgentConfig
@@ -23,6 +23,7 @@ from uclone_x.core.agent_home import (
     AGENT_ID_PREFIX,
     AGENTS_DIR_ENV_VAR,
     AgentHomeError,
+    CloneNotFoundError,
     default_agents_root,
 )
 from uclone_x.engine.event_bus import EventBus
@@ -84,8 +85,9 @@ def test_default_memory_location_honours_the_environment_override(
     monkeypatch.setenv(AGENTS_DIR_ENV_VAR, str(tmp_path))
 
     assert default_agents_root() == tmp_path
+    home = make_clone("agent-one")
     store = default_cross_session_memory("agent-one")
-    assert store.storage_path == tmp_path / "agent-one" / "memory.json"
+    assert store.storage_path == tmp_path / home.path.name / "knowledge.sqlite3"
 
 
 def test_a_username_no_directory_can_carry_is_refused_not_repaired(
@@ -98,7 +100,9 @@ def test_a_username_no_directory_can_carry_is_refused_not_repaired(
     `a_b.json`. Four agents read and overwrote one document, and nothing anywhere said
     so. Only `a_b` is a name; the other three are refused (P6).
 
-    Killed by: src/uclone_x/core/agent_home.py :: refuse_an_unusable_username(username)
+    Refused as a name no clone can have, not as a clone that merely is not there yet.
+
+    Killed by: src/uclone_x/core/agent_home.py :: refuse_an_unusable_username(handle)  # before a lookup could call it merely absent
     Becomes: pass
     """
     monkeypatch.setenv(AGENTS_DIR_ENV_VAR, str(tmp_path))
@@ -107,53 +111,68 @@ def test_a_username_no_directory_can_carry_is_refused_not_repaired(
         with pytest.raises(AgentHomeError) as excinfo:
             default_cross_session_memory(rejected)
         assert rejected in str(excinfo.value)
+        assert not isinstance(excinfo.value, CloneNotFoundError), rejected
 
-    assert default_cross_session_memory("a_b").storage_path == tmp_path / "a_b" / "memory.json"
+    home = make_clone("a_b")
+    assert default_cross_session_memory("a_b").storage_path == home.knowledge_path
+    assert home.knowledge_path.parent.parent == tmp_path
 
 
 def test_an_agents_home_records_an_id_that_survives_a_second_lookup(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The id is minted once and then read, never re-minted.
+    """The id is the clone's, read on every lookup, and memory never mints one.
 
     An agent whose identifier changes is a different agent to everything that recorded
-    the old one, so the second call through must return the first call's value.
+    the old one, so the second call through must return the first call's value. Since
+    2026-09-27 (clone-data-scopes §3.4) the id is minted when the clone is created, and a
+    name no clone carries is refused rather than given a home of its own.
 
-    Killed by: src/uclone_x/memory/store.py :: home.agent_id()
-    Becomes: pass
+    Killed by: src/uclone_x/core/agent_home.py :: if not ids:
+    Becomes: if False:
     """
     monkeypatch.setenv(AGENTS_DIR_ENV_VAR, str(tmp_path))
 
-    default_cross_session_memory("archivist")
-    id_path = tmp_path / "archivist" / "id"
-    first = id_path.read_text(encoding="utf-8").strip()
-    assert first.startswith(AGENT_ID_PREFIX)
+    with pytest.raises(CloneNotFoundError):
+        default_cross_session_memory("archivist")
+    assert not [entry for entry in tmp_path.iterdir() if entry.is_dir()]
 
-    default_cross_session_memory("archivist")
-    assert id_path.read_text(encoding="utf-8").strip() == first
+    home = make_clone("archivist")
+    first = (home.path / "id").read_text(encoding="utf-8").strip()
+    assert first.startswith(AGENT_ID_PREFIX) and home.path.name == first
+
+    assert default_cross_session_memory("archivist").storage_path == home.knowledge_path
+    assert default_cross_session_memory("archivist").storage_path == home.knowledge_path
+    assert (home.path / "id").read_text(encoding="utf-8").strip() == first
 
 
 def test_an_unreadable_store_is_quarantined_and_reported(tmp_path: Path) -> None:
     """An unreadable memory is not an empty memory, and must not be overwritten.
 
-    Killed by: src/uclone_x/memory/store.py :: moved_to: str | None = str(set_aside_unreadable(self._storage_path))
-    Becomes: moved_to: str | None = None
+    The file is set aside, and a new store is made in its place: the damaged one is kept
+    for a person, and the next write does not land on top of it.
+
+    Killed by: src/uclone_x/memory/store.py :: moved = set_aside_database(self._storage_path)
+    Becomes: moved = None
     """
-    path = tmp_path / "mem.json"
-    path.write_text("{not json at all", encoding="utf-8")
+    path = tmp_path / "mem.sqlite3"
+    path.write_bytes(b"{not a database at all" * 50)
 
     memory = CrossSessionMemory(storage_path=path)
 
     assert memory.load_failure is not None
-    assert not path.exists()
-    assert list(tmp_path.glob("mem.json.unreadable-*"))
+    assert list(tmp_path.glob("mem.sqlite3.unreadable-*"))
+    assert (
+        next(tmp_path.glob("mem.sqlite3.unreadable-*")).read_bytes()
+        == b"{not a database at all" * 50
+    )
     section = memory.format_prompt_section()
     assert "UNAVAILABLE" in section
 
 
 def test_a_readable_store_reports_no_failure(tmp_path: Path) -> None:
-    path = tmp_path / "mem.json"
-    path.write_text(json.dumps({"version": "1.0.0", "facts": []}), encoding="utf-8")
+    path = tmp_path / "mem.sqlite3"
+    CrossSessionMemory(storage_path=path)
 
     memory = CrossSessionMemory(storage_path=path)
 

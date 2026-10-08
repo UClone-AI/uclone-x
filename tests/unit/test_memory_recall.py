@@ -10,6 +10,7 @@ from collections.abc import Sequence
 
 import pytest
 
+from tests.support.memory_seed import seed_fact
 from uclone_x.agent.base import BaseAgent
 from uclone_x.agent.models import AgentConfig, AgentLLMConfig
 from uclone_x.core.provenance import Provenance
@@ -76,15 +77,18 @@ def _put(
     confidence: float = 0.8,
     created_at: str = "2026-09-20T00:00:00+00:00",
 ) -> None:
-    memory._facts[fact_id] = MemoryFact(  # pyright: ignore[reportPrivateUsage]
-        fact_id=fact_id,
-        subject=subject,
-        predicate=predicate,
-        object_value=value,
-        provenance=_prov(),
-        source_session_id="sess_a",
-        confidence=confidence,
-        created_at=created_at,
+    seed_fact(
+        memory,
+        MemoryFact(
+            fact_id=fact_id,
+            subject=subject,
+            predicate=predicate,
+            object_value=value,
+            provenance=_prov(),
+            source_session_id="sess_a",
+            confidence=confidence,
+            created_at=created_at,
+        ),
     )
 
 
@@ -339,7 +343,7 @@ async def test_a_short_message_still_gets_the_projects_standing_preferences() ->
 
     Killed by: src/uclone_x/memory/recall.py :: PROJECT_FACTS_LIMIT = 3
     Becomes: PROJECT_FACTS_LIMIT = 0
-    Killed by: src/uclone_x/memory/models.py :: PROJECT_SUBJECT = "project"
+    Killed by: src/uclone_x/memory/models.py :: PROJECT_SUBJECT = PROJECT_ENTITY
     Becomes: PROJECT_SUBJECT = "projekt"
     """
     memory = CrossSessionMemory(max_facts_in_prompt=10)
@@ -390,8 +394,8 @@ async def test_a_fact_saved_under_the_persons_name_is_a_user_fact() -> None:
     Same rule as the extractor: the person's id, display name and aliases, and the words
     `PERSON_WORDS` lists, all file under `user` (#1857).
 
-    Killed by: src/uclone_x/memory/tools.py :: subject=person_subject(params.subject, context.person_names),
-    Becomes: subject=person_subject(params.subject, ()),
+    Killed by: src/uclone_x/memory/tools.py :: subject=fact_subject(params.subject, context.person_names, context.clone_names),
+    Becomes: subject=fact_subject(params.subject, (), context.clone_names),
     """
     memory = CrossSessionMemory(max_facts_in_prompt=10)
     tool = RecordMemoryFactTool(memory)
@@ -427,8 +431,8 @@ async def test_the_persons_name_matches_in_either_unicode_form(stored: str, writ
     subject that is not the person is kept in NFC, so the two forms of a third party's name
     are one subject.
 
-    Killed by: src/uclone_x/memory/models.py :: return " ".join(unicodedata.normalize("NFC", name).split()).casefold()
-    Becomes: return " ".join(name.split()).casefold()
+    Killed by: src/uclone_x/knowledge/fold.py :: return " ".join(unicodedata.normalize("NFC", text).split()).casefold()
+    Becomes: return " ".join(text.split()).casefold()
     Killed by: src/uclone_x/memory/models.py :: collapsed = " ".join(unicodedata.normalize("NFC", subject).split())
     Becomes: collapsed = " ".join(subject.split())
     """

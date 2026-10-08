@@ -9,7 +9,7 @@ import {
 import { makePersonaInfo } from '../../test/fixtures';
 
 /**
- * Issue #1056, scope (a): `GET /api/personas` has always returned nine fields per persona,
+ * Issue #1056, scope (a): `GET /api/personas` (now `GET /api/clones`) has always returned nine fields per persona,
  * and the head rendered two of them (`name`, `role`) everywhere it showed a persona. This
  * pins that the other seven -- description, model, temperature, max_tokens, allowed_tools,
  * and the two permission flags -- are actually on screen once a detail card is open, and
@@ -80,8 +80,8 @@ describe('PersonaDetail', () => {
     );
   });
 
-  it('states "not set" for a model or temperature the persona did not specify', () => {
-    // Killed by: frontend/src/ui-kit/rail/PersonaDetail.tsx :: persona.model_name || copy.notSet
+  it('states "not set" for a temperature the persona did not specify, and the system default for its model', () => {
+    // Killed by: frontend/src/ui-kit/rail/PersonaDetail.tsx :: persona.model_name || copy.systemDefault
     // Becomes: persona.model_name
     render(
       <PersonaDetail
@@ -89,6 +89,8 @@ describe('PersonaDetail', () => {
       />,
     );
 
-    expect(screen.getAllByText('not set')).toHaveLength(3);
+    expect(screen.getAllByText('not set')).toHaveLength(2);
+    // An empty model follows the system default (model-gateway.md §3.4); it is not unset.
+    expect(screen.getByText('System default')).toBeInTheDocument();
   });
 });

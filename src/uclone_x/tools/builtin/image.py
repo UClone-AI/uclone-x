@@ -6,6 +6,7 @@ import asyncio
 import gc
 import hashlib
 import inspect
+import ipaddress
 import json
 import logging
 import os
@@ -20,10 +21,12 @@ import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
+from dataclasses import replace as dataclass_replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, ClassVar, Literal, Protocol
+from urllib.parse import urlsplit
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field
@@ -31,7 +34,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from uclone_x.errors import LLMError, PlainRefusalError, UCloneXError
 from uclone_x.skills.models import SkillStatus
 from uclone_x.skills.protocols import SkillRegistryProtocol
-from uclone_x.tools.base import BaseTool, artifact_content_url, replace_file
+from uclone_x.tools.base import BaseTool, artifact_content_url, linked_paths, replace_file
 from uclone_x.tools.builtin.comfy_client import (
     DEFAULT_COMFYUI_BASE_URL,
     ComfyClient,
@@ -337,7 +340,7 @@ class NoImageEngineError(ImageGenerationError):
 #: which would otherwise hand it to the person as the reason.
 NO_IMAGE_ENGINE_TEXT = (
     "No image model is connected, so I can't draw right now. To fix this, connect one in "
-    "Settings › Images, or upload a picture instead."
+    "Settings › Models, or upload a picture instead."
 )
 
 
@@ -480,7 +483,7 @@ class GenerateImageParams(BaseModel):
     )
     output_path: str | None = Field(
         default=None,
-        description="Optional relative file path within workspace. Defaults to 'artifacts/images/img_{id}.png'; the suffix follows the format drawn (.jpg for a JPEG).",
+        description="Optional relative file path within workspace. Defaults to 'artifacts/<sid>/images/'; the suffix follows the format drawn (.jpg for a JPEG).",
     )
     count: int = Field(
         default=1,
@@ -506,9 +509,110 @@ class ImageGenerationResult:
     width: int
     height: int
     mime_type: str = "image/png"
+    #: Where it was drawn and the model that drew it, filled in by the dispatcher, which
+    #: knows which engine it asked; `model_id` is `None` when no model is known.
+    where: ImageWhere | None = None
+    model_id: str | None = None
+    #: The plain sentence saying what drew it, where, and whose choice that was
+    #: (`drawn_with`); `None` when no dispatcher drew it (an engine called directly).
+    drawn_with: str | None = None
     #: What the active model family's defaults added to the prompt, or left out of it,
     #: one plain sentence each (`fill_prompt_defaults`). Set by the dispatcher.
     prompt_changes: tuple[str, ...] = ()
+    #: The prompt and negative prompt the engine was given after that fill, or `None`
+    #: when no dispatcher filled them (an engine called directly). Set by the dispatcher.
+    filled_prompt: str | None = None
+    filled_negative_prompt: str | None = None
+
+
+def _tag_key(raw: str) -> str:
+    """A tag's name for comparison: weight syntax removed, `_` read as a space, lower case."""
+    return re.sub(r":[\d.]+$", "", raw.strip(" ()[]{}\t\n")).strip().lower().replace("_", " ")
+
+
+def added_tags(given: str, filled: str) -> list[str]:
+    """The tags of `filled` that `given` does not have, in `filled`'s order (#1865).
+
+    Compared by tag name, so a weight or `_` for a space is not an addition. What the
+    call-time fill put into a prompt the model wrote, as tags a person can read: the
+    person is shown these beside the picture, never the fill's sentences, which are
+    written for the model.
+    """
+    have = {_tag_key(t) for t in re.split(r"[,\n]", given) if t.strip()}
+    added: list[str] = []
+    for raw in re.split(r"[,\n]", filled):
+        tag = raw.strip()
+        key = _tag_key(tag)
+        if tag and key not in have:
+            have.add(key)
+            added.append(tag)
+    return added
+
+
+def _put_nonempty(into: dict[str, Any], key: str, values: list[str]) -> None:
+    """Set `into[key]` to `values` when there are any: an empty list tells the model nothing."""
+    if values:
+        into[key] = values
+
+
+def _slim_batch_result(
+    images: list[dict[str, Any]], *, style: str, aspect_ratio: str
+) -> dict[str, Any]:
+    """The result a batch of pictures sends the model: each picture once, shared fields once.
+
+    Each picture is its link and seed (#2013). The prompt, the prompt changes, the tags
+    the fill added, and where and with which model it was drawn (#1976) are said once at
+    the top when every picture shares them, and on each
+    picture only when they differ; an empty list is left out. The paths, sidecars, engine,
+    device and gallery text the result used to repeat are gone: a reply embeds the links,
+    the room reads the written files from them (`artifact_path_from_url`), and the viewer
+    reads the rest from each picture's sidecar.
+    """
+    result: dict[str, Any] = {"status": "success", "count": len(images)}
+    pictures: list[dict[str, Any]] = [
+        {"relative_url": img["relative_url"], "seed": img["seed"]} for img in images
+    ]
+    shared = (
+        "prompt",
+        "prompt_changes",
+        "prompt_added",
+        "negative_added",
+        "where",
+        "model_id",
+        "drawn_with",
+    )
+    for key in shared:
+        values = [img[key] for img in images]
+        if all(value == values[0] for value in values):
+            if values[0]:
+                result[key] = values[0]
+        else:
+            for picture, value in zip(pictures, values, strict=True):
+                if value:
+                    picture[key] = value
+    result["style"] = style
+    result["aspect_ratio"] = aspect_ratio
+    result["images"] = pictures
+    return result
+
+
+def _fill_record(
+    prompt: str, negative_prompt: str, result: ImageGenerationResult
+) -> dict[str, Any]:
+    """What the fill did to one image's prompts, for its sidecar and the tool result.
+
+    Empty when no dispatcher filled the prompts, so nothing is claimed that did not happen.
+    """
+    if result.filled_prompt is None:
+        return {}
+    filled_negative = result.filled_negative_prompt or ""
+    return {
+        "filled_prompt": result.filled_prompt,
+        "filled_negative_prompt": filled_negative,
+        "prompt_changes": list(result.prompt_changes),
+        "prompt_added": added_tags(prompt, result.filled_prompt),
+        "negative_added": added_tags(negative_prompt, filled_negative),
+    }
 
 
 class BaseImageEngine(ABC):
@@ -553,6 +657,10 @@ class RemoteCudaImageEngine(BaseImageEngine):
     @property
     def base_url(self) -> str:
         return self._base_url
+
+    def use_address(self, url: str | None) -> None:
+        """Probe and draw at ``url``, the GPU server connection's address (§3.5)."""
+        self._base_url = (url or "").rstrip("/")
 
     async def is_available(self) -> bool:
         """Probe remote worker health endpoint."""
@@ -1017,6 +1125,12 @@ class LocalDiffusersImageEngine(BaseImageEngine):
         #: The torch device the loaded pipeline was placed on ("cuda", "mps", "cpu").
         self._torch_device: str | None = None
         self._lock = threading.Lock()
+        #: One diffusion run at a time. `generate` runs each request on its own worker
+        #: thread, and a pipeline is not safe to call from two at once: on Apple silicon
+        #: two concurrent runs abort the whole server with a Metal assertion ("A command
+        #: encoder is already encoding to this command buffer"), which no `except` catches.
+        #: Kept apart from `_lock` so a waiting request does not also hold up the load.
+        self._generation_lock = threading.Lock()
 
     def checkpoint_resolution(self) -> CheckpointResolution:
         """Where the checkpoint search ended, and why — the three states, kept apart.
@@ -1153,6 +1267,32 @@ class LocalDiffusersImageEngine(BaseImageEngine):
         cfg: float | None = None,
         family: PromptFamily | None = None,
     ) -> bytes:
+        """Run one diffusion loop, waiting for any run already on the pipeline to finish."""
+        with self._generation_lock:
+            return self._generate_one(
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                width=width,
+                height=height,
+                seed=seed,
+                style=style,
+                steps=steps,
+                cfg=cfg,
+                family=family,
+            )
+
+    def _generate_one(
+        self,
+        prompt: str,
+        negative_prompt: str,
+        width: int,
+        height: int,
+        seed: int,
+        style: str,
+        steps: int | None = None,
+        cfg: float | None = None,
+        family: PromptFamily | None = None,
+    ) -> bytes:
         """Run the diffusion loop on a worker thread and return PNG bytes."""
         import io
 
@@ -1248,17 +1388,35 @@ class ComfyUIImageEngine(BaseImageEngine):
     """
 
     def __init__(self, base_url: str | None = None, checkpoint: str | None = None) -> None:
-        self._base_url = base_url or os.getenv(COMFY_URL_ENV) or DEFAULT_COMFYUI_BASE_URL
+        #: An address given here, or `COMFY_URL_ENV`'s: an override the saved one never beats.
+        self._override_url = base_url or os.getenv(COMFY_URL_ENV) or None
+        #: The ComfyUI connection's address (model-gateway §3.5), which the dispatcher hands
+        #: over from the picture settings on every read (#1976).
+        self._saved_url: str | None = None
         self._checkpoint = checkpoint or default_comfy_checkpoint()
 
     @property
     def base_url(self) -> str:
-        """Address the engine probes; never a daemon this process started."""
-        return self._base_url
+        """Address the engine probes; never a daemon this process started.
+
+        The override first (an explicit address or `COMFY_URL_ENV`, since the environment
+        overrides the file and is never storage), then the ComfyUI connection's address,
+        then the default.
+        """
+        return self._override_url or self._saved_url or DEFAULT_COMFYUI_BASE_URL
+
+    @property
+    def checkpoint(self) -> str:
+        """The checkpoint every graph this engine queues asks the daemon to load."""
+        return self._checkpoint
+
+    def use_saved_address(self, url: str | None) -> None:
+        """Probe and draw at ``url``, the ComfyUI connection's address, unless overridden."""
+        self._saved_url = url
 
     async def is_available(self) -> bool:
         """Whether a ComfyUI daemon answers at `base_url`."""
-        client = ComfyClient(base_url=self._base_url)
+        client = ComfyClient(base_url=self.base_url)
         try:
             return await client.alive()
         except Exception:
@@ -1280,7 +1438,7 @@ class ComfyUIImageEngine(BaseImageEngine):
         family: PromptFamily | None = None,
     ) -> ImageGenerationResult:
         """Queue a txt2img graph on the running daemon and fetch the produced PNG."""
-        client = ComfyClient(base_url=self._base_url)
+        client = ComfyClient(base_url=self.base_url)
         start_t = time.monotonic()
         # None keeps the workflow's own defaults, as before profiles reached here.
         sampling: dict[str, Any] = {}
@@ -1302,14 +1460,14 @@ class ComfyUIImageEngine(BaseImageEngine):
             filenames = await client.wait_for_output(prompt_id)
             if not filenames:
                 raise ImageGenerationError(
-                    f"ComfyUI at {self._base_url} finished without producing an image."
+                    f"ComfyUI at {self.base_url} finished without producing an image."
                 )
             img_bytes = await client.download_image(filenames[0])
         except ImageGenerationError:
             raise
         except Exception as exc:
             raise ImageGenerationError(
-                f"ComfyUI generation at {self._base_url} failed: {exc}"
+                f"ComfyUI generation at {self.base_url} failed: {exc}"
             ) from exc
         finally:
             await client.aclose()
@@ -1319,61 +1477,32 @@ class ComfyUIImageEngine(BaseImageEngine):
             image_bytes=img_bytes,
             seed=seed,
             engine_name="comfyui-local",
-            device_info=f"ComfyUI daemon at {self._base_url}",
+            device_info=f"ComfyUI daemon at {self.base_url}",
             duration_seconds=round(duration, 3),
             width=width,
             height=height,
         )
 
 
-#: The settings.json fields choosing who draws a picture (`image_engine`) and, when Google
-#: Gemini does, which of its image models (`image_model`). The shell reads them and hands
-#: the dispatcher an `ImageEngineChoice`; this module never reads the file itself.
-IMAGE_ENGINE_KEY = "image_engine"
-IMAGE_MODEL_KEY = "image_model"
-#: `auto` uses a ready local engine, and Gemini only when none is ready and Gemini is the
-#: chat provider with a key; `local` never sends a picture request over the internet;
-#: `gemini` draws with Gemini only.
-ImageEngineSetting = Literal["auto", "local", "gemini"]
-IMAGE_ENGINE_SETTINGS: tuple[ImageEngineSetting, ...] = ("auto", "local", "gemini")
-DEFAULT_IMAGE_ENGINE: ImageEngineSetting = "auto"
+#: The picture model that picks a ready engine on its own (model-gateway §3.5).
+IMAGE_AUTO = "auto"
+#: The cloud picture model offered first, when the model registry declares no other.
 DEFAULT_IMAGE_MODEL = "gemini-2.5-flash-image"
 #: The engine name results and sidecars carry for a picture Gemini drew.
 GEMINI_ENGINE_NAME = "gemini"
-#: A model id is interpolated into a URL path, so it is held to the characters ids use.
-_IMAGE_MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 #: How long one look at the local engines stands for, under `auto` with Gemini as the
 #: fallback. The tool description and the next draw read the same look, so the engine
 #: the description names is the one that draws.
 LOCAL_PROBE_TTL_SECONDS = 30.0
 NO_GEMINI_KEY_MESSAGE = (
-    "Pictures are set to be drawn by Google Gemini, but no Gemini API key is saved. "
-    "Add a Gemini key in Settings, or set the picture engine back to automatic."
+    "Pictures are set to be drawn by Google Gemini, but its connection has no key. "
+    "Add the key in Settings › Models, or choose another picture model."
 )
 
-
-def parse_image_engine_setting(value: object) -> ImageEngineSetting:
-    """`value` as an `image_engine` setting; absent means `auto`, anything unknown is refused."""
-    if value is None:
-        return DEFAULT_IMAGE_ENGINE
-    for setting in IMAGE_ENGINE_SETTINGS:
-        if value == setting:
-            return setting
-    raise PlainRefusalError(
-        f"The picture engine must be auto, local or gemini; {value!r} is not one of them."
-    )
-
-
-def parse_image_model(value: object) -> str:
-    """`value` as an `image_model` setting; absent means `DEFAULT_IMAGE_MODEL`."""
-    if value is None:
-        return DEFAULT_IMAGE_MODEL
-    if isinstance(value, str) and _IMAGE_MODEL_ID.fullmatch(value):
-        return value
-    raise PlainRefusalError(
-        f"The picture model must be a Gemini model id such as {DEFAULT_IMAGE_MODEL}; "
-        f"{value!r} is not one."
-    )
+#: The engine a picture model ref pins, by its connection's kind; `None` is `auto`.
+ImagePin = Literal["comfyui", "remote_gpu", "gemini"]
+#: Whose picture model a draw follows: the clone's own, or the system default.
+ImageChooser = Literal["clone", "default"]
 
 
 class GeminiImageClient(Protocol):
@@ -1386,26 +1515,126 @@ class GeminiImageClient(Protocol):
 
 @dataclass(frozen=True)
 class ImageEngineChoice:
-    """The picture settings in effect, as the shell read them.
+    """The picture model one draw follows, as the shell resolved it (model-gateway §3.5).
 
-    ``gemini`` is a client only when a Gemini key is saved or set; ``chat_provider`` is the
-    canonical id of the chat provider in effect. The default is the choice of a head that
-    binds nothing: `auto` with no Gemini client, which never leaves the local engines.
+    ``chosen`` is `auto` or a model ref (`comfyui/anillustrious_v4`,
+    `gemini/gemini-2.5-flash-image`, `remote_gpu/auto`); ``pin`` is the engine a ref names.
+    A ref that cannot be served at all (its connection gone, no key) carries ``refusal``,
+    the sentence the draw is refused with: it is never replaced by another model (P6).
+
+    The default is the choice of a head that binds nothing (tests, demos): `auto` with each
+    engine at its own address and no cloud model. A head that binds its settings sets
+    ``from_connections``: an own engine is then tried only when it has a connection
+    (``comfyui_base_url``, ``remote_url``), and the in-process engine, which needs none,
+    last. ``gemini`` is a client for ``gemini_model`` on the connection
+    ``gemini_connection``, built with that connection's own key (S3).
     """
 
-    setting: ImageEngineSetting = DEFAULT_IMAGE_ENGINE
-    model: str = DEFAULT_IMAGE_MODEL
-    chat_provider: str | None = None
+    chosen: str = IMAGE_AUTO
+    chosen_by: ImageChooser = "default"
+    pin: ImagePin | None = None
+    refusal: str | None = None
+    #: The registered own model a ComfyUI pin names (`ModelProfile.model_id`).
+    pinned_profile: str | None = None
+    from_connections: bool = False
+    #: The ComfyUI connection's address, or `None` when there is none.
+    comfyui_base_url: str | None = None
+    #: The remote GPU worker connection's address, or `None` when there is none.
+    remote_url: str | None = None
     gemini: GeminiImageClient | None = None
+    gemini_model: str | None = None
+    gemini_connection: str | None = None
+    #: The local port the remote-GPU tunnel forwards to its ComfyUI, while it is
+    #: connected; `None` for a head without that tunnel. `image_where` reads it.
+    gpu_tunnel_comfy_port: int | None = None
 
     @property
     def gemini_in_auto(self) -> bool:
-        """Whether `auto` may fall back to Gemini: Gemini chat, and a key to draw with."""
-        return self.chat_provider == GEMINI_ENGINE_NAME and self.gemini is not None
+        """Whether `auto` may fall back to the cloud: a cloud picture model with a key."""
+        return self.pin is None and self.gemini is not None and self.gemini_model is not None
+
+
+def chosen_by_words(choice: ImageEngineChoice) -> str:
+    """Whose choice drew, in the words a person reads after "Drawn with …"."""
+    if choice.pin is None:
+        return "picked automatically"
+    if choice.chosen_by == "clone":
+        return "the picture model chosen for this clone"
+    return "the picture model chosen in Settings"
+
+
+#: Where a picture was drawn, in the words "Drawn with …" uses.
+_WHERE_WORDS: dict[str, str] = {
+    "this_computer": "on this computer",
+    "gpu_server": "on your GPU server",
+    "cloud": "in the cloud (Google)",
+}
+
+
+def drawn_with(label: str | None, where: str | None, choice: ImageEngineChoice) -> str:
+    """The plain sentence a picture's result and sidecar carry: what drew it, where, and why.
+
+    ``label`` is the model's name when it is known; the remote GPU worker reports none.
+    """
+    model = label or "the model your GPU server has loaded"
+    place = _WHERE_WORDS.get(where or "", "")
+    return " ".join(part for part in ("Drawn with", model, place) if part) + (
+        f" ({chosen_by_words(choice)})."
+    )
 
 
 class ImageEngineRefusal(ImageGenerationError, PlainRefusalError):
     """A picture an engine could not draw, told in words already written for a person."""
+
+
+#: The engine names results, sidecars and `/api/media/status` carry, in the order the
+#: dispatcher tries them.
+ImageEngineName = Literal["remote-cuda", "comfyui-local", "diffusers-sdxl", "gemini"]
+#: Where a picture is drawn, as the Core decides it (design §3.1); the heads map it to
+#: "This computer", "Your GPU server" and "Cloud · Google".
+ImageWhere = Literal["this_computer", "gpu_server", "cloud"]
+
+
+def _is_this_computer(host: str) -> bool:
+    """Whether ``host`` names this machine: `localhost` or a loopback address."""
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def image_where(
+    engine: ImageEngineName,
+    comfy_url: str | None = None,
+    gpu_tunnel_comfy_port: int | None = None,
+) -> ImageWhere:
+    """Where ``engine`` draws (design §3.1).
+
+    The remote CUDA worker is always the GPU server, Gemini the cloud, the in-process
+    engine this computer. ComfyUI is decided by ``comfy_url``: a host that is not
+    loopback is the GPU server; a loopback address is the GPU server only on the port
+    the connected remote-GPU tunnel forwards to its ComfyUI (``gpu_tunnel_comfy_port``,
+    `None` while no tunnel is connected), and this computer otherwise. A tunnel made by
+    hand (`ssh -L` to a loopback port) cannot be told apart and reads as this computer.
+    """
+    if engine == "remote-cuda":
+        return "gpu_server"
+    if engine == "gemini":
+        return "cloud"
+    if engine == "diffusers-sdxl":
+        return "this_computer"
+    parts = urlsplit(comfy_url or "")
+    host = parts.hostname
+    if host is None:
+        raise ValueError(f"ComfyUI address {comfy_url!r} names no host")
+    if not _is_this_computer(host):
+        return "gpu_server"
+    port = parts.port or (443 if parts.scheme == "https" else 80)
+    if gpu_tunnel_comfy_port is not None and port == gpu_tunnel_comfy_port:
+        return "gpu_server"
+    return "this_computer"
 
 
 def png_dimensions(data: bytes) -> tuple[int, int] | None:
@@ -1535,6 +1764,29 @@ def sidecar_path_for(picture_rel: str) -> str:
     return str(path.parent / f"{path.stem}.json")
 
 
+def find_available_picture_path(
+    rel: str, workspace_root: Path, resolver: Callable[[str, Path], Path]
+) -> tuple[str, Path]:
+    """Return ``(rel, resolved)``, incrementing ``_1``, ``_2``... if ``resolved`` already exists on disk."""
+    dest = resolver(rel, workspace_root)
+    if not dest.exists():
+        return rel, dest
+    p = Path(rel)
+    stem, suffix = p.stem, p.suffix
+    parent = p.parent
+    counter = 1
+    while True:
+        candidate_rel = (
+            str(parent / f"{stem}_{counter}{suffix}")
+            if str(parent) != "."
+            else f"{stem}_{counter}{suffix}"
+        )
+        candidate_dest = resolver(candidate_rel, workspace_root)
+        if not candidate_dest.exists():
+            return candidate_rel, candidate_dest
+        counter += 1
+
+
 #: Last path parts that name no picture file: a folder, or a bare suffix like `.png`.
 _NO_FILE_NAMES = _PICTURE_SUFFIXES | {"", ".", ".."}
 
@@ -1547,7 +1799,9 @@ def names_no_file(rel: str) -> bool:
     """
     if not rel.strip("/\\"):
         return False
-    return rel.endswith(("/", "\\")) or Path(rel).name.lower() in _NO_FILE_NAMES
+    parts = [p for p in re.split(r"[/\\]+", rel.strip()) if p]
+    last = parts[-1].lower() if parts else ""
+    return rel.endswith(("/", "\\")) or last in _NO_FILE_NAMES
 
 
 def aspect_ratio_for(width: int, height: int) -> str:
@@ -1564,6 +1818,7 @@ def gemini_profile(model: str) -> ModelProfile:
         display_name=f"Google Gemini ({model})",
         family=PromptFamily.NATURAL_PROSE,
         suppress_negative=True,
+        engine_type="gemini",
     )
 
 
@@ -1649,12 +1904,27 @@ def compute_deterministic_seed(
     turn_idx: int,
     prompt: str,
     seed_override: int | None = None,
+    call_index: int = 0,
 ) -> int:
-    """Derive seed deterministically from session identifier, turn index, and prompt hash (P6)."""
+    """Derive seed deterministically from session identifier, turn index, prompt hash, and invocation order (P6)."""
     if seed_override is not None:
         return seed_override
-    token = f"{session_id}__{turn_idx}__{prompt.strip().lower()}"
+    token = (
+        f"{session_id}__{turn_idx}__{seed_prompt_key(prompt)}__{call_index}"
+        if call_index > 0
+        else f"{session_id}__{turn_idx}__{seed_prompt_key(prompt)}"
+    )
     return int(hashlib.md5(token.encode("utf-8")).hexdigest()[:8], 16)
+
+
+def seed_prompt_key(prompt: str) -> str:
+    """A prompt as the seed reads it: two prompts with one key are the same prompt (P6)."""
+    return prompt.strip().lower()
+
+
+#: How many sessions `GenerateImageTool` keeps a repeat count for. Each holds only its
+#: latest turn, so this bounds the whole table; the least recently drawing one goes first.
+_COUNTED_SESSIONS = 64
 
 
 #: SDXL's ~1-megapixel training buckets, per aspect ratio. Illustrious excluded images under
@@ -1726,14 +1996,30 @@ def _log_failed_refresh(task: asyncio.Task[bool]) -> None:
         logger.warning("Could not look at the local image engines: %s", error)
 
 
-class ImagePipelineDispatcher:
-    """Selects an engine by priority: remote CUDA, then a running ComfyUI, then in-process.
+#: The own engines a draw may use, with the name a person reads in a refusal.
+_PIN_ENGINE_NAMES: dict[ImagePin, str] = {
+    "comfyui": "ComfyUI",
+    "remote_gpu": "your GPU server",
+    "gemini": "Google Gemini",
+}
 
-    The order encodes the ruling behind #1095. The *baseline* is last on purpose: the
-    in-process engine needs no daemon, so a beginner with nothing but a checkpoint file
-    still generates images. A ComfyUI that happens to be running is preferred above it
-    because it is already warm and carries the graph features, but it is only ever
-    detected — this dispatcher never installs, starts or stops one.
+
+def _whose(choice: ImageEngineChoice) -> str:
+    return "chosen for this clone" if choice.chosen_by == "clone" else "chosen in Settings"
+
+
+class ImagePipelineDispatcher:
+    """Draws with the picture model in effect (model-gateway §3.5).
+
+    Under `auto`, the first ready own engine, by priority: the remote CUDA worker, then a
+    running ComfyUI, then the in-process engine; then the cloud picture model on a
+    connection with a key. The order encodes the ruling behind #1095. The *baseline* is
+    last among the own engines on purpose: the in-process engine needs no daemon, so a
+    beginner with nothing but a checkpoint file still generates images. A ComfyUI is only
+    ever detected -- this dispatcher never installs, starts or stops one.
+
+    A picture model ref pins one engine, and only that one is asked: a pin that cannot draw
+    now is refused in plain words, never replaced by another model (P6, model-gateway G7).
     """
 
     def __init__(
@@ -1742,65 +2028,128 @@ class ImagePipelineDispatcher:
         comfy_engine: ComfyUIImageEngine | None = None,
         local_engine: LocalDiffusersImageEngine | None = None,
         registry: ModelRegistry | None = None,
-        engine_settings: Callable[[], ImageEngineChoice] | None = None,
+        engine_settings: Callable[[str | None], ImageEngineChoice] | None = None,
+        pinned_comfy_engine: Callable[[str, str], BaseImageEngine] | None = None,
     ) -> None:
         self._remote_engine = remote_engine or RemoteCudaImageEngine()
         self._comfy_engine = comfy_engine or ComfyUIImageEngine()
         self._local_engine = local_engine or LocalDiffusersImageEngine()
         self._registry = registry or ModelRegistry()
-        self._engine_settings: Callable[[], ImageEngineChoice] = (
-            engine_settings or ImageEngineChoice
+        self._engine_settings: Callable[[str | None], ImageEngineChoice] = engine_settings or (
+            lambda _own: ImageEngineChoice()
         )
-        #: When the local engines were last looked at, and whether any was ready.
-        self._local_probe: tuple[float, bool] | None = None
+        #: Builds the engine a ComfyUI pin draws with: its connection's address and the
+        #: pinned model's checkpoint (a new one per draw, so two clones pinned to two
+        #: models never share a checkpoint setting).
+        self._pinned_comfy_engine: Callable[[str, str], BaseImageEngine] = pinned_comfy_engine or (
+            lambda url, checkpoint: ComfyUIImageEngine(base_url=url, checkpoint=checkpoint)
+        )
+        #: The engines last looked at under `auto`, when, and whether any was ready.
+        self._local_probe: tuple[tuple[object, ...], float, bool] | None = None
         #: The look a stale description started on the running loop, while it runs.
         self._local_refresh: asyncio.Task[bool] | None = None
+        #: The connection addresses last handed to the ComfyUI and remote engines.
+        self._comfy_saved_url: str | None = None
+        self._remote_saved_url: str | None = None
 
     @property
     def registry(self) -> ModelRegistry:
         """The model registry managing model profiles and prompt families."""
         return self._registry
 
-    def bind_engine_settings(self, source: Callable[[], ImageEngineChoice]) -> None:
+    def bind_engine_settings(self, source: Callable[[str | None], ImageEngineChoice]) -> None:
         """Read the picture settings from ``source`` on every draw and description.
 
+        ``source`` takes the clone's own picture model (`None` follows the system default).
         Called per read rather than once, so a setting changed in Settings applies to the
         next picture without rebuilding the tool.
         """
         self._engine_settings = source
         self._local_probe = None
 
-    def engine_choice(self) -> ImageEngineChoice:
-        """The picture settings in effect now."""
-        return self._engine_settings()
+    def engine_choice(self, own: str | None = None) -> ImageEngineChoice:
+        """The picture model in effect now, for a clone whose own picture model is ``own``.
 
-    def _local_engines(self) -> list[tuple[str, BaseImageEngine]]:
-        """The local engines, in the order they are tried."""
-        return [
-            ("Remote CUDA worker", self._remote_engine),
-            ("detected local ComfyUI daemon", self._comfy_engine),
-            ("in-process diffusers engine", self._local_engine),
-        ]
+        Every draw, description and diagnosis reads the settings here first, so the
+        connections' addresses reach the ComfyUI and remote engines here too, before any
+        engine is looked at (#1976).
+        """
+        choice = self._engine_settings(own)
+        if choice.from_connections:
+            if choice.comfyui_base_url != self._comfy_saved_url:
+                self._comfy_saved_url = choice.comfyui_base_url
+                self._comfy_engine.use_saved_address(choice.comfyui_base_url)
+            if choice.remote_url != self._remote_saved_url:
+                self._remote_saved_url = choice.remote_url
+                self._remote_engine.use_address(choice.remote_url)
+        return choice
 
-    async def _probe_local_engines(self) -> bool:
-        for _label, engine in self._local_engines():
+    def _local_engines(
+        self, choice: ImageEngineChoice
+    ) -> list[tuple[str, ImageEngineName, BaseImageEngine]]:
+        """The own engines ``choice`` lets draw, in the order they are tried.
+
+        A pin names one engine; `auto` tries every own engine that has a connection (all of
+        them, for a head that binds no settings), the in-process one last.
+        """
+        if choice.pin == "gemini":
+            return []
+        if choice.pin == "remote_gpu":
+            return [("chosen GPU server", "remote-cuda", self._remote_engine)]
+        if choice.pin == "comfyui":
+            return [("chosen ComfyUI daemon", "comfyui-local", self._comfy_engine)]
+        engines: list[tuple[str, ImageEngineName, BaseImageEngine]] = []
+        if not choice.from_connections or choice.remote_url:
+            engines.append(("Remote CUDA worker", "remote-cuda", self._remote_engine))
+        if not choice.from_connections or choice.comfyui_base_url:
+            engines.append(("detected local ComfyUI daemon", "comfyui-local", self._comfy_engine))
+        engines.append(("in-process diffusers engine", "diffusers-sdxl", self._local_engine))
+        return engines
+
+    async def _probe_local_engines(self, choice: ImageEngineChoice) -> bool:
+        for _label, _name, engine in self._local_engines(choice):
             if await engine.is_available():
                 return True
         return False
 
-    def _fresh_local_probe(self) -> bool | None:
+    def _local_model_id(self, name: ImageEngineName) -> str | None:
+        """The registered model the local engine ``name`` loads, or `None` when none is known.
+
+        Read from that engine's own checkpoint rather than the active profile, which may
+        describe the other local engine's; an unregistered checkpoint (the generic
+        fallback) and the remote worker, which reports no model, are `None`.
+        """
+        checkpoint: object = None
+        if name == "comfyui-local":
+            checkpoint = self._comfy_engine.checkpoint
+        elif name == "diffusers-sdxl":
+            checkpoint = self._local_engine.resolve_checkpoint()
+        if not isinstance(checkpoint, str) or not checkpoint:
+            return None
+        profile = self._registry.resolve(checkpoint)
+        return profile.model_id if is_registered_profile(profile) else None
+
+    @staticmethod
+    def _probe_key(choice: ImageEngineChoice) -> tuple[object, ...]:
+        return (choice.pin, choice.from_connections, choice.comfyui_base_url, choice.remote_url)
+
+    def _fresh_local_probe(self, choice: ImageEngineChoice) -> bool | None:
         probe = self._local_probe
-        if probe is not None and time.monotonic() - probe[0] < LOCAL_PROBE_TTL_SECONDS:
-            return probe[1]
+        if (
+            probe is not None
+            and probe[0] == self._probe_key(choice)
+            and time.monotonic() - probe[1] < LOCAL_PROBE_TTL_SECONDS
+        ):
+            return probe[2]
         return None
 
-    async def _look_at_local_engines(self) -> bool:
-        ready = await self._probe_local_engines()
-        self._local_probe = (time.monotonic(), ready)
+    async def _look_at_local_engines(self, choice: ImageEngineChoice) -> bool:
+        ready = await self._probe_local_engines(choice)
+        self._local_probe = (self._probe_key(choice), time.monotonic(), ready)
         return ready
 
-    async def _any_local_ready(self) -> bool:
-        cached = self._fresh_local_probe()
+    async def _any_local_ready(self, choice: ImageEngineChoice) -> bool:
+        cached = self._fresh_local_probe(choice)
         if cached is not None:
             return cached
         refresh = self._local_refresh
@@ -1810,9 +2159,9 @@ class ImagePipelineDispatcher:
             and refresh.get_loop() is asyncio.get_running_loop()
         ):
             return await refresh
-        return await self._look_at_local_engines()
+        return await self._look_at_local_engines(choice)
 
-    def _any_local_ready_without_blocking(self) -> bool:
+    def _any_local_ready_without_blocking(self, choice: ImageEngineChoice) -> bool:
         """`_any_local_ready` for synchronous code, never stalling a running event loop.
 
         With no loop running, the engines are looked at here. Under a running loop (the
@@ -1820,59 +2169,77 @@ class ImagePipelineDispatcher:
         a stale answer is served while one refresh runs on the loop, so a probe that takes
         its full timeout never holds a turn up (#1769). `dispatch` looks again itself.
         """
-        cached = self._fresh_local_probe()
+        cached = self._fresh_local_probe(choice)
         if cached is not None:
             return cached
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             loop = None
+        key = self._probe_key(choice)
         if loop is None:
-            ready = asyncio.run(self._probe_local_engines())
-            self._local_probe = (time.monotonic(), ready)
+            ready = asyncio.run(self._probe_local_engines(choice))
+            self._local_probe = (key, time.monotonic(), ready)
             return ready
         last = self._local_probe
-        if last is None:
+        if last is None or last[0] != key:
             with ThreadPoolExecutor(max_workers=1) as pool:
-                ready = pool.submit(asyncio.run, self._probe_local_engines()).result()
-            self._local_probe = (time.monotonic(), ready)
+                ready = pool.submit(asyncio.run, self._probe_local_engines(choice)).result()
+            self._local_probe = (key, time.monotonic(), ready)
             return ready
         if self._local_refresh is None or self._local_refresh.done():
-            self._local_refresh = loop.create_task(self._look_at_local_engines())
+            self._local_refresh = loop.create_task(self._look_at_local_engines(choice))
             self._local_refresh.add_done_callback(_log_failed_refresh)
-        return last[1]
+        return last[2]
 
-    def _setting_decides(self, choice: ImageEngineChoice) -> bool | None:
-        """Whether Gemini draws, when the setting alone says; `None` when `auto` must look.
+    @staticmethod
+    def _setting_decides(choice: ImageEngineChoice) -> bool | None:
+        """Whether the cloud draws, when the choice alone says; `None` when `auto` must look.
 
-        `local` never does; `gemini` always does; `auto` does only when Gemini may be the
-        fallback and no local engine is ready, which is looked at only in that case.
+        A pin decides; `auto` reaches the cloud only when a cloud picture model has a key
+        and no own engine is ready, which is looked at only in that case.
         """
-        if choice.setting != "auto":
-            return choice.setting == GEMINI_ENGINE_NAME
+        if choice.pin is not None:
+            return choice.pin == "gemini"
         if not choice.gemini_in_auto:
             return False
         return None
 
     def draws_with_gemini(self, choice: ImageEngineChoice | None = None) -> bool:
-        """Whether the next picture goes to Gemini under ``choice`` (the settings by default)."""
+        """Whether the next picture goes to the cloud under ``choice`` (the default's by default)."""
         choice = choice if choice is not None else self.engine_choice()
         decided = self._setting_decides(choice)
         if decided is not None:
             return decided
-        return not self._any_local_ready_without_blocking()
+        return not self._any_local_ready_without_blocking(choice)
 
     async def _draws_with_gemini_now(self, choice: ImageEngineChoice) -> bool:
         decided = self._setting_decides(choice)
         if decided is not None:
             return decided
-        return not await self._any_local_ready()
+        return not await self._any_local_ready(choice)
 
-    def get_active_profile(self) -> ModelProfile:
-        """The profile of the engine that draws next: Gemini's, or the local checkpoint's."""
-        choice = self.engine_choice()
-        if self.draws_with_gemini(choice):
-            return gemini_profile(choice.model)
+    def _cloud_profile(self, model: str) -> ModelProfile:
+        """The registered profile of the cloud picture model ``model``, else a prose one."""
+        profile = self._registry.resolve(model)
+        if is_registered_profile(profile) and profile.engine_type == "gemini":
+            return profile
+        return gemini_profile(model)
+
+    def _pinned_profile(self, choice: ImageEngineChoice) -> ModelProfile | None:
+        if choice.pin != "comfyui" or not choice.pinned_profile:
+            return None
+        profile = self._registry.resolve(choice.pinned_profile)
+        return profile if is_registered_profile(profile) else None
+
+    def get_active_profile(self, own: str | None = None) -> ModelProfile:
+        """The profile of the model that draws next: the cloud's, a pin's, or the local one's."""
+        choice = self.engine_choice(own)
+        if choice.refusal is None and self.draws_with_gemini(choice):
+            return self._cloud_profile(choice.gemini_model or DEFAULT_IMAGE_MODEL)
+        pinned = self._pinned_profile(choice)
+        if pinned is not None:
+            return pinned
         return self._local_profile()
 
     def _local_profile(self) -> ModelProfile:
@@ -1903,6 +2270,21 @@ class ImagePipelineDispatcher:
 
         return self._registry.resolve(None)
 
+    def _pin_silence(self, choice: ImageEngineChoice) -> str:
+        """What did not answer, for a pinned own engine, in the person's words."""
+        if choice.pin == "remote_gpu":
+            return f"your GPU server at {self._remote_engine.base_url or 'its address'} does not answer"
+        return (
+            f"ComfyUI at {choice.comfyui_base_url or self._comfy_engine.base_url} does not answer"
+        )
+
+    def _refuse_pin(self, choice: ImageEngineChoice, why: str) -> ImageEngineRefusal:
+        """The refusal for a pinned model that cannot draw now: named, with the remedy."""
+        return ImageEngineRefusal(
+            f"The picture model {choice.chosen} ({_whose(choice)}) cannot draw right now: "
+            f"{why}. Start it, or choose another picture model in Settings › Models."
+        )
+
     async def dispatch(
         self,
         prompt: str,
@@ -1910,31 +2292,75 @@ class ImagePipelineDispatcher:
         aspect_ratio: str,
         seed: int,
         style: str,
+        own: str | None = None,
     ) -> ImageGenerationResult:
-        """Route to the engine the picture settings name (`draws_with_gemini`).
+        """Draw with the picture model in effect for a clone whose own one is ``own``.
 
-        Otherwise the highest priority available local-private engine.
+        The cloud model when the choice sends the picture there (`draws_with_gemini`);
+        otherwise the pinned own engine, or under `auto` the highest-priority own engine
+        that is ready. Every result carries ``drawn_with``, the plain sentence saying what
+        drew it, where, and whose choice that was.
         """
-        choice = self.engine_choice()
+        choice = self.engine_choice(own)
+        if choice.refusal is not None:
+            raise ImageEngineRefusal(choice.refusal)
         if await self._draws_with_gemini_now(choice):
-            gemini = GeminiImageEngine(choice.gemini, choice.model)
-            family = PromptFamily.NATURAL_PROSE
-            gemini_fill = fill_prompt_defaults(
-                prompt, negative_prompt, gemini_profile(choice.model)
-            )
-            logger.info("Dispatching image generation to Google Gemini (%s)...", choice.model)
+            cloud_model = choice.gemini_model or DEFAULT_IMAGE_MODEL
+            profile = self._cloud_profile(cloud_model)
+            # The registry's name for it, when it has one; else the id the person chose.
+            registered = self._registry.resolve(cloud_model)
+            shown = registered.display_name if registered.model_id == cloud_model else cloud_model
+            gemini = GeminiImageEngine(choice.gemini, cloud_model)
+            gemini_fill = fill_prompt_defaults(prompt, negative_prompt, profile)
+            logger.info("Dispatching image generation to Google Gemini (%s)...", cloud_model)
             drawn = await gemini.draw(
-                style_guided_prompt(gemini_fill.prompt, style, family), aspect_ratio, seed
+                style_guided_prompt(gemini_fill.prompt, style, PromptFamily.NATURAL_PROSE),
+                aspect_ratio,
+                seed,
             )
-            return replace(drawn, prompt_changes=gemini_fill.changes)
-        profile = self.get_active_profile()
+            where = image_where("gemini")
+            return dataclass_replace(
+                drawn,
+                prompt_changes=gemini_fill.changes,
+                filled_prompt=gemini_fill.prompt,
+                filled_negative_prompt=gemini_fill.negative_prompt,
+                where=where,
+                model_id=cloud_model,
+                drawn_with=drawn_with(shown, where, choice),
+            )
+        pinned = self._pinned_profile(choice)
+        if choice.pin == "comfyui" and pinned is None:
+            raise ImageEngineRefusal(
+                f"The picture model {choice.chosen} ({_whose(choice)}) is not a model this "
+                "version knows. Choose another picture model in Settings › Models."
+            )
+        profile = pinned if pinned is not None else self.get_active_profile(own)
         # Tag form first (`danbooru` only), then what the prompt left open; both reported.
         fill = prepare_prompt(prompt, negative_prompt, profile)
         width, height = resolve_aspect_dimensions(aspect_ratio, profile=profile)
         steps, cfg = resolve_sampling(profile)
-        attempts = self._local_engines()
+        attempts: list[tuple[str, ImageEngineName, BaseImageEngine]] = self._local_engines(choice)
+        comfy_url = self._comfy_engine.base_url
+        if pinned is not None:
+            # A pin draws with its own checkpoint at its own connection, or not at all: the
+            # shared ComfyUI engine loads whatever checkpoint it found, and its result would
+            # carry the pinned model's name (#2176, P6).
+            if not choice.comfyui_base_url:
+                raise ImageEngineRefusal(
+                    f"The picture model {choice.chosen} ({_whose(choice)}) cannot be used: "
+                    "its connection has no address. Add the address in Settings › Models, "
+                    "or choose another picture model there."
+                )
+            comfy_url = choice.comfyui_base_url
+            attempts = [
+                (
+                    "pinned ComfyUI model",
+                    "comfyui-local",
+                    self._pinned_comfy_engine(comfy_url, pinned.filename or pinned.model_id),
+                )
+            ]
 
-        for label, engine in attempts:
+        for label, name, engine in attempts:
             if await engine.is_available():
                 logger.info("Dispatching image generation to %s...", label)
                 generated = await engine.generate(
@@ -1948,35 +2374,66 @@ class ImagePipelineDispatcher:
                     cfg=cfg,
                     family=profile.family,
                 )
-                return replace(generated, prompt_changes=fill.changes)
+                where = image_where(name, comfy_url, choice.gpu_tunnel_comfy_port)
+                model_id = pinned.model_id if pinned is not None else self._local_model_id(name)
+                shown = (
+                    pinned.display_name
+                    if pinned is not None
+                    else (self._registry.resolve(model_id).display_name if model_id else None)
+                )
+                return dataclass_replace(
+                    generated,
+                    where=where,
+                    model_id=model_id,
+                    drawn_with=drawn_with(shown, where, choice),
+                    prompt_changes=fill.changes,
+                    filled_prompt=fill.prompt,
+                    filled_negative_prompt=fill.negative_prompt,
+                )
 
+        if choice.pin is not None:
+            # Only the chosen engine was asked; nothing else draws in its place (G7).
+            raise self._refuse_pin(choice, self._pin_silence(choice))
         raise NoImageEngineError(
             "No image generation engine available. Local Private-First enforcement: "
-            + self.diagnostics()
+            + self.diagnostics(choice)
         )
 
-    def diagnostics(self) -> str:
+    def diagnostics(self, choice: ImageEngineChoice | None = None) -> str:
         """Why each engine declined, named one by one.
 
         A single "nothing is available" tells the user nothing actionable, and the three
         engines fail for unrelated reasons: an address, a daemon, and a file (P6).
         """
+        try:
+            choice = choice if choice is not None else self.engine_choice()
+        except UCloneXError as exc:
+            return str(exc)
         parts: list[str] = []
         if self._remote_engine.base_url:
             parts.append(
                 f"Configured remote worker at '{self._remote_engine.base_url}' was unreachable."
             )
+        elif choice.from_connections:
+            parts.append("No GPU server connection is saved.")
         else:
             parts.append(f"{REMOTE_URL_ENV} is not set.")
 
         # Configured and silent is a different problem from never configured, and telling
         # someone to "set UCX_COMFYUI_URL" when they already set it sends them to check a
         # variable that is correct (reviewer, PR #1096).
-        if os.getenv(COMFY_URL_ENV):
+        if choice.from_connections and not choice.comfyui_base_url:
+            parts.append("No ComfyUI connection is saved (optional — add one in Settings).")
+        elif os.getenv(COMFY_URL_ENV):
             parts.append(
                 f"No ComfyUI daemon answered at {self._comfy_engine.base_url}, the address "
                 f"{COMFY_URL_ENV} names (optional — start that daemon, or unset the variable "
                 "to fall back to the in-process engine)."
+            )
+        elif self._comfy_saved_url:
+            parts.append(
+                f"No ComfyUI daemon answered at {self._comfy_engine.base_url}, the address "
+                "of the ComfyUI connection (optional — start that daemon, or change the address)."
             )
         else:
             parts.append(
@@ -2004,25 +2461,18 @@ class ImagePipelineDispatcher:
             )
         else:
             parts.append("The in-process engine is installed but declined; see the log above.")
-        parts.append(self._gemini_diagnostic())
+        parts.append(self._gemini_diagnostic(choice))
         return " ".join(parts)
 
-    def _gemini_diagnostic(self) -> str:
-        """Why Google Gemini did not draw, in the terms of the `image_engine` rule."""
-        try:
-            choice = self.engine_choice()
-        except UCloneXError as exc:
-            return str(exc)
-        if choice.setting == "local":
-            return "Google Gemini is not used, because image_engine is set to local."
-        if choice.gemini is None:
-            return "Google Gemini can draw only with a Gemini API key saved in Settings."
-        if choice.setting == "auto" and not choice.gemini_in_auto:
+    @staticmethod
+    def _gemini_diagnostic(choice: ImageEngineChoice) -> str:
+        """Why the cloud did not draw, in the terms of the `auto` rule (§3.5)."""
+        if choice.gemini is None or choice.gemini_model is None:
             return (
-                "With image_engine set to auto, Google Gemini draws only while Gemini is "
-                "the chat provider."
+                "Automatic uses a cloud picture model only on a Google connection that has "
+                "a key, and none has."
             )
-        return f"Google Gemini ({choice.model}) is ready."
+        return f"Google Gemini ({choice.gemini_model}) is ready."
 
 
 class GenerateImageTool(BaseTool[GenerateImageParams]):
@@ -2036,7 +2486,9 @@ class GenerateImageTool(BaseTool[GenerateImageParams]):
     """
 
     name = "generate_image"
-    writes_files: ClassVar[bool] = True  # can create, modify or delete a file on the host (#1167)
+    writes_files: ClassVar[bool] = (
+        False  # sandbox artifact image; does not modify host workspace files (#2079)
+    )
     BASE_DESCRIPTION: ClassVar[str] = (
         "Generate a local-private image, illustration, or diagram from a text prompt. "
         "Runs in this process from a local checkpoint, on a detected local ComfyUI daemon, or on "
@@ -2066,10 +2518,32 @@ class GenerateImageTool(BaseTool[GenerateImageParams]):
         super().__init__(name=self.name, params_type=GenerateImageParams)
         self._dispatcher = dispatcher or ImagePipelineDispatcher()
         self._skills: SkillRegistryProtocol | None = None
+        # session id -> (its latest turn, how often each prompt key was drawn in that turn)
+        self._turn_prompt_calls: dict[str, tuple[int, dict[str, int]]] = {}
 
-    def active_profile(self) -> ModelProfile:
-        """The profile of the checkpoint a generation would use now (`ImageModelSource`)."""
-        return self._dispatcher.get_active_profile()
+    def _repeat_index(self, session_id: str, turn_idx: int, prompt: str) -> int:
+        """How many times `prompt` was already drawn in this session's turn `turn_idx`.
+
+        Counted per prompt, so a prompt's seed never depends on which other prompts ran
+        before it: tool calls of one step run concurrently and reach here in scheduler
+        order. Only a repeat of the same prompt in the same turn gets an index above 0.
+        """
+        held = self._turn_prompt_calls.pop(session_id, None)
+        counts = held[1] if held is not None and held[0] == turn_idx else {}
+        key = seed_prompt_key(prompt)
+        index = counts.get(key, 0)
+        counts[key] = index + 1
+        self._turn_prompt_calls[session_id] = (turn_idx, counts)
+        if len(self._turn_prompt_calls) > _COUNTED_SESSIONS:
+            del self._turn_prompt_calls[next(iter(self._turn_prompt_calls))]
+        return index
+
+    def active_profile(self, image_model: str | None = None) -> ModelProfile:
+        """The profile of the model a generation would use now (`ImageModelSource`).
+
+        ``image_model`` is the asking clone's own picture model; `None` follows the default.
+        """
+        return self._dispatcher.get_active_profile(image_model)
 
     def bind_skill_registry(self, registry: SkillRegistryProtocol) -> None:
         """Set the skill store the description lists image domains from (`ImageModelSource`).
@@ -2080,8 +2554,8 @@ class GenerateImageTool(BaseTool[GenerateImageParams]):
         """
         self._skills = registry
 
-    def bind_engine_settings(self, source: Callable[[], ImageEngineChoice]) -> None:
-        """Read the picture settings (`image_engine`, `image_model`) from ``source``."""
+    def bind_engine_settings(self, source: Callable[[str | None], ImageEngineChoice]) -> None:
+        """Read the picture model in effect from ``source``, given a clone's own picture model."""
         self._dispatcher.bind_engine_settings(source)
 
     def domain_skill_names(self) -> list[str]:
@@ -2128,6 +2602,7 @@ class GenerateImageTool(BaseTool[GenerateImageParams]):
         aspect_ratio: str,
         seed: int,
         style: str,
+        image_model: str | None = None,
     ) -> ImageGenerationResult:
         """Draw one image, refusing in plain words when no engine can.
 
@@ -2141,6 +2616,7 @@ class GenerateImageTool(BaseTool[GenerateImageParams]):
                 aspect_ratio=aspect_ratio,
                 seed=seed,
                 style=style,
+                own=image_model,
             )
         except NoImageEngineError as exc:
             logger.warning("generate_image: no engine could draw: %s", exc)
@@ -2202,16 +2678,20 @@ class GenerateImageTool(BaseTool[GenerateImageParams]):
             )
 
         session_id = context.session_id or "sess_default"
+        # The session's own directory, the one the Docs & Artifacts listing reads (#1390).
+        images_dir = f"artifacts/{session_id}/images"
         turn_idx = getattr(context, "turn_index", 0) or 0
         if not turn_idx and getattr(context, "agent_delegate", None) is not None:
             turn_idx = getattr(context.agent_delegate, "_turn_counter", 0) or 0
 
         base_prompt = params.prompts[0] if params.prompts is not None else params.prompt
+        call_idx = self._repeat_index(session_id, turn_idx, base_prompt)
         actual_seed = compute_deterministic_seed(
             session_id=session_id,
             turn_idx=turn_idx,
             prompt=base_prompt,
             seed_override=params.seed_override,
+            call_index=call_idx,
         )
 
         if params.prompts is not None or params.count > 1:
@@ -2219,8 +2699,6 @@ class GenerateImageTool(BaseTool[GenerateImageParams]):
                 params.prompts if params.prompts is not None else [params.prompt] * params.count
             )
             images: list[dict[str, Any]] = []
-            last_engine = ""
-            last_device = ""
             batch_id = secrets.token_hex(3)
             for i, p_text in enumerate(prompt_list):
                 curr_seed = (actual_seed + i) % (2**32)
@@ -2234,7 +2712,7 @@ class GenerateImageTool(BaseTool[GenerateImageParams]):
                     self.resolve_write_path(clean_rel, workspace)
                     resolve_image = self.resolve_write_path
                 else:
-                    clean_rel = f"artifacts/images/img_{batch_id}_{i + 1}.png"
+                    clean_rel = f"{images_dir}/img_{batch_id}_{i + 1}.png"
                     resolve_image = self.resolve_safe_path
 
                 gen_result = await self._dispatch_or_refuse(
@@ -2243,12 +2721,21 @@ class GenerateImageTool(BaseTool[GenerateImageParams]):
                     aspect_ratio=params.aspect_ratio,
                     seed=curr_seed,
                     style=params.style,
+                    image_model=context.image_model,  # each picture of a batch
                 )
-                last_engine = gen_result.engine_name
-                last_device = gen_result.device_info
                 batch_changes = list(gen_result.prompt_changes)
+                batch_fill = _fill_record(p_text, params.negative_prompt, gen_result)
                 batch_rel = picture_path_for(clean_rel, gen_result.mime_type)
-                dest_path = resolve_image(batch_rel, context.require_workspace())
+                if params.output_path is None:
+                    batch_rel, dest_path = find_available_picture_path(
+                        batch_rel, context.require_workspace(), resolve_image
+                    )
+                else:
+                    dest_path = resolve_image(batch_rel, context.require_workspace())
+                    if dest_path.exists() and batch_rel.replace("\\", "/").startswith("artifacts/"):
+                        batch_rel, dest_path = find_available_picture_path(
+                            batch_rel, context.require_workspace(), resolve_image
+                        )
                 batch_meta_rel = sidecar_path_for(batch_rel)
                 meta_path = self.resolve_write_path(batch_meta_rel, context.require_workspace())
 
@@ -2258,16 +2745,9 @@ class GenerateImageTool(BaseTool[GenerateImageParams]):
                 replace_file(dest_path, batch_image)
 
                 try:
-                    rel_path = str(dest_path.relative_to(context.require_workspace().resolve()))
+                    batch_path = str(dest_path.relative_to(context.require_workspace().resolve()))
                 except ValueError:
-                    rel_path = str(dest_path)
-
-                try:
-                    rel_meta_path = str(
-                        meta_path.relative_to(context.require_workspace().resolve())
-                    )
-                except ValueError:
-                    rel_meta_path = str(meta_path)
+                    batch_path = str(dest_path)
 
                 recipe_hash = hashlib.sha256(
                     f"{p_text}__{params.negative_prompt}__{curr_seed}__{gen_result.engine_name}".encode()
@@ -2275,7 +2755,7 @@ class GenerateImageTool(BaseTool[GenerateImageParams]):
 
                 meta_data: dict[str, Any] = {
                     "id": f"{batch_id}_{i + 1}",
-                    "image_path": rel_path,
+                    "image_path": batch_path,
                     "prompt": p_text,
                     "negative_prompt": params.negative_prompt,
                     "seed": curr_seed,
@@ -2284,69 +2764,45 @@ class GenerateImageTool(BaseTool[GenerateImageParams]):
                     "width": gen_result.width,
                     "height": gen_result.height,
                     "engine": gen_result.engine_name,
+                    "where": gen_result.where,
+                    "model_id": gen_result.model_id,
+                    "drawn_with": gen_result.drawn_with,
                     "device": gen_result.device_info,
                     "mime_type": gen_result.mime_type,
                     "duration_seconds": gen_result.duration_seconds,
                     "recipe_hash": recipe_hash,
                     "created_at": datetime.now(UTC).isoformat(),
+                    **batch_fill,
                 }
                 batch_meta = json.dumps(meta_data, indent=2, ensure_ascii=False).encode()
                 meta_path.parent.mkdir(parents=True, exist_ok=True)
                 replace_file(meta_path, batch_meta)
 
-                images.append(
-                    {
-                        "path": rel_path,
-                        "meta_path": rel_meta_path,
-                        "relative_url": artifact_content_url(rel_path),
-                        "seed": curr_seed,
-                        "recipe_hash": recipe_hash,
-                        "bytes_written": len(gen_result.image_bytes),
-                        "width": gen_result.width,
-                        "height": gen_result.height,
-                        "mime_type": gen_result.mime_type,
-                        "duration_seconds": gen_result.duration_seconds,
-                        "prompt": p_text,
-                        "prompt_changes": batch_changes,
-                    }
-                )
+                img_dict: dict[str, Any] = {
+                    "relative_url": artifact_content_url(batch_path),
+                    "seed": curr_seed,
+                    "prompt": p_text,
+                    "prompt_changes": batch_changes,
+                    "prompt_added": list(batch_fill.get("prompt_added") or []),
+                    "negative_added": list(batch_fill.get("negative_added") or []),
+                    "where": gen_result.where,
+                    "model_id": gen_result.model_id,
+                    "drawn_with": gen_result.drawn_with,
+                }
+                images.append(img_dict)
 
-            gallery_md = "\n".join(
-                f"{idx + 1}. ![{img['prompt'][:30]} #{idx + 1}]({img['relative_url']})"
-                for idx, img in enumerate(images)
-            )
-
-            res_dict: dict[str, Any] = {
-                "status": "success",
-                "count": len(images),
-                "path": images[0]["path"],
-                "paths": [img["path"] for img in images],
-                "meta_path": images[0]["meta_path"],
-                "meta_paths": [img["meta_path"] for img in images],
-                "relative_url": images[0]["relative_url"],
-                "relative_urls": [img["relative_url"] for img in images],
-                "images": images,
-                "markdown_gallery": gallery_md,
-                "prompt": images[0]["prompt"],
-                "style": params.style,
-                "aspect_ratio": params.aspect_ratio,
-                "engine": last_engine,
-                "device": last_device,
-            }
-            if params.prompts is not None:
-                res_dict["prompts"] = [img["prompt"] for img in images]
-            return res_dict
+            return _slim_batch_result(images, style=params.style, aspect_ratio=params.aspect_ratio)
 
         short_id = secrets.token_hex(3)
         # 1. Resolve and validate safe destination path when output_path is provided
         if params.output_path is not None:
-            clean_rel = params.output_path.lstrip("/\\") or f"artifacts/images/img_{short_id}.png"
+            clean_rel = params.output_path.lstrip("/\\") or f"{images_dir}/img_{short_id}.png"
             # Refused here, before anything is drawn; resolved again once the picture's own
             # format has fixed the suffix.
             self.resolve_write_path(clean_rel, context.require_workspace())
             resolve_dest = self.resolve_write_path
         else:
-            clean_rel = f"artifacts/images/img_{short_id}.png"
+            clean_rel = f"{images_dir}/img_{short_id}.png"
             resolve_dest = self.resolve_safe_path
 
         # 2. Dispatch generation
@@ -2356,10 +2812,21 @@ class GenerateImageTool(BaseTool[GenerateImageParams]):
             aspect_ratio=params.aspect_ratio,
             seed=actual_seed,
             style=params.style,
+            image_model=context.image_model,  # the asking clone's picture model (§3.4)
         )
 
+        fill_record = _fill_record(params.prompt, params.negative_prompt, gen_result)
         picture_rel = picture_path_for(clean_rel, gen_result.mime_type)
-        dest_path = resolve_dest(picture_rel, context.require_workspace())
+        if params.output_path is None:
+            picture_rel, dest_path = find_available_picture_path(
+                picture_rel, context.require_workspace(), resolve_dest
+            )
+        else:
+            dest_path = resolve_dest(picture_rel, context.require_workspace())
+            if dest_path.exists() and picture_rel.replace("\\", "/").startswith("artifacts/"):
+                picture_rel, dest_path = find_available_picture_path(
+                    picture_rel, context.require_workspace(), resolve_dest
+                )
         meta_rel = sidecar_path_for(picture_rel)
         meta_path = self.resolve_write_path(meta_rel, context.require_workspace())
 
@@ -2371,11 +2838,6 @@ class GenerateImageTool(BaseTool[GenerateImageParams]):
             rel_path = str(dest_path.relative_to(context.require_workspace().resolve()))
         except ValueError:
             rel_path = str(dest_path)
-
-        try:
-            rel_meta_path = str(meta_path.relative_to(context.require_workspace().resolve()))
-        except ValueError:
-            rel_meta_path = str(meta_path)
 
         recipe_hash = hashlib.sha256(
             f"{params.prompt}__{params.negative_prompt}__{actual_seed}__{gen_result.engine_name}".encode()
@@ -2392,34 +2854,43 @@ class GenerateImageTool(BaseTool[GenerateImageParams]):
             "width": gen_result.width,
             "height": gen_result.height,
             "engine": gen_result.engine_name,
+            "where": gen_result.where,
+            "model_id": gen_result.model_id,
+            "drawn_with": gen_result.drawn_with,
             "device": gen_result.device_info,
             "mime_type": gen_result.mime_type,
             "duration_seconds": gen_result.duration_seconds,
             "recipe_hash": recipe_hash,
             "created_at": datetime.now(UTC).isoformat(),
+            **fill_record,
         }
         meta_path.parent.mkdir(parents=True, exist_ok=True)
         replace_file(meta_path, json.dumps(meta_data, indent=2, ensure_ascii=False).encode())
 
-        return {
+        # What the model is sent, and so what every later request resends (#2013): the
+        # link a reply embeds, the seed and the prompt, and what the fill changed. The
+        # engine, device, timings and recipe live in the picture's sidecar, where the
+        # viewer reads them, and nowhere in the conversation.
+        single: dict[str, Any] = {
             "status": "success",
-            "path": rel_path,
-            "meta_path": rel_meta_path,
             "relative_url": artifact_content_url(rel_path),
+            "seed": actual_seed,
             "prompt": params.prompt,
             "style": params.style,
             "aspect_ratio": params.aspect_ratio,
-            "width": gen_result.width,
-            "height": gen_result.height,
-            "seed": actual_seed,
-            "recipe_hash": recipe_hash,
-            "engine": gen_result.engine_name,
-            "device": gen_result.device_info,
-            "mime_type": gen_result.mime_type,
-            "duration_seconds": gen_result.duration_seconds,
-            "bytes_written": len(gen_result.image_bytes),
-            "prompt_changes": list(gen_result.prompt_changes),
         }
+        # Left out when unknown, as the batch result leaves them out.
+        if gen_result.where:
+            single["where"] = gen_result.where
+        if gen_result.model_id:
+            single["model_id"] = gen_result.model_id
+        if gen_result.drawn_with:
+            # Said in plain words, so the reply can tell the person what drew it (§3.5).
+            single["drawn_with"] = gen_result.drawn_with
+        _put_nonempty(single, "prompt_changes", list(gen_result.prompt_changes))
+        _put_nonempty(single, "prompt_added", list(fill_record.get("prompt_added") or []))
+        _put_nonempty(single, "negative_added", list(fill_record.get("negative_added") or []))
+        return single
 
     async def execute(
         self,
@@ -2427,13 +2898,14 @@ class GenerateImageTool(BaseTool[GenerateImageParams]):
         context: ToolContext | None = None,
         **kwargs: Any,
     ) -> ToolResult:
-        """Execute tool and decorate result with artifact path provenance."""
+        """Execute tool and decorate result with artifact path provenance.
+
+        The result names each picture by its link only (#2013); the artifacts are the
+        workspace paths those links serve.
+        """
         result = await super().execute(params=params, context=context, **kwargs)
-        if result.success and isinstance(result.output, dict):
-            if "paths" in result.output and isinstance(result.output["paths"], list):
-                paths_val = tuple(str(p) for p in result.output["paths"])
-                return result.model_copy(update={"artifacts": paths_val})
-            if "path" in result.output:
-                path_val = str(result.output["path"])
-                return result.model_copy(update={"artifacts": (path_val,)})
+        if result.success:
+            paths = linked_paths(result.output)
+            if paths:
+                return result.model_copy(update={"artifacts": tuple(paths)})
         return result

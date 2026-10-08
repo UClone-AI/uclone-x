@@ -90,6 +90,10 @@ TURN_LOOP_EVENT_TYPES: frozenset[str] = frozenset(
         "EVIDENCE_NUDGE_DECLINED",
         "GROUNDING_NUDGE",
         "ARTIFACT_NUDGE",
+        # A step that wrote nothing and was asked once more, and the lines code added to
+        # a finished reply (#1808).
+        "EMPTY_REPLY_NUDGE",
+        "REPLY_LINES_ADDED",
         "TURN_END",
         # A turn's unanswered tool step, dropped at its end, and a turn a caller undid
         # (#1423). Both say what left the conversation, so the log still accounts for it.

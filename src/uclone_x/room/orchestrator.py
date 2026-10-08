@@ -20,6 +20,7 @@ import re
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from pathlib import Path
 from typing import Any, Final, cast
 
 from uclone_x.agent.models import ProviderFailure, ToolExecutionRecord
@@ -31,6 +32,7 @@ from uclone_x.engine.protocols import EventBusProtocol, PublisherHandleProtocol
 from uclone_x.errors import (
     HeadRoomWriteError,
     NothingToRetryError,
+    ProviderFailureKind,
     RoomError,
     RoomNotFoundError,
     SpeakerSelectionError,
@@ -64,7 +66,6 @@ from uclone_x.room.models import (
     SpeakerRequest,
     head_room_write_refusal,
     is_one_seat,
-    room_head,
     turn_refusal,
 )
 from uclone_x.room.protocols import (
@@ -78,6 +79,12 @@ from uclone_x.tools.models import ToolResultStatus
 __all__ = ["RoomOrchestrator", "memory_save_outcome", "record_turn_tools"]
 
 logger = logging.getLogger(__name__)
+
+#: The failures of a clone's own model ref that name it and offer the system default (§3.6):
+#: its connection removed or not listing the model, or not answering.
+_OWN_MODEL_FAILURES = frozenset(
+    {ProviderFailureKind.MODEL_UNAVAILABLE, ProviderFailureKind.PROVIDER_UNREACHABLE}
+)
 
 #: Characters of a tool call's arguments, and of its result, the room keeps (#1353). The
 #: full trace is the seat's own (G1, G2); the room's record is for a reader asking what a
@@ -106,17 +113,17 @@ def _preview(value: Any) -> tuple[str, bool]:
 MEMORY_SAVE_TOOL_NAME = "record_memory_fact"
 
 
-def _memory_fact_key(arguments: Mapping[str, Any]) -> tuple[str, str]:
-    """The `(subject, predicate)` a save names, normalised; `""` for a part it left out."""
+def _memory_fact_key(arguments: Mapping[str, Any]) -> tuple[str, str, str]:
+    """The `(subject, predicate, object_value)` a save names, normalised; `""` for a part it left out."""
 
     def part(name: str) -> str:
         value = arguments.get(name)
         return value.strip().casefold() if isinstance(value, str) else ""
 
-    return part("subject"), part("predicate")
+    return part("subject"), part("predicate"), part("object_value")
 
 
-def _agrees(named: tuple[str, str], other: tuple[str, str]) -> bool:
+def _agrees(named: tuple[str, str, str], other: tuple[str, str, str]) -> bool:
     """Whether `other` matches `named` on every part `named` actually names."""
     return all(mine == "" or mine == theirs for mine, theirs in zip(named, other, strict=True))
 
@@ -124,14 +131,15 @@ def _agrees(named: tuple[str, str], other: tuple[str, str]) -> bool:
 def _memory_save_outcome(executions: Sequence[ToolExecutionRecord]) -> tuple[int, int]:
     """`(tried, unsaved)`: the distinct facts a turn asked to save, and how many never were.
 
-    A fact is identified by the `(subject, predicate)` its call named, compared after
-    trimming and case-folding. A failed save counts as saved when any successful save in the
-    same turn agrees with it on every part the failed call named -- so a retry that fixed
+    A fact is identified by the `(subject, predicate, object_value)` its call named,
+    compared after trimming and case-folding. A failed save counts as saved when any
+    successful save in the same turn agrees with it on every part the failed call named,
+    provided the failure named at least a subject or a predicate -- a failed save that
+    names neither subject nor predicate is never resolved by a success. A retry that fixed
     a missing value, or supplied a subject the first call left out, resolves the failure.
     Failed saves that no success resolves are counted once per fact they can be told apart
     as: two failures where one's named parts agree with the other's are one fact. The
-    counts are only as exact as those names are. Two different facts filed under one
-    subject and predicate count as one, and the error text is never read, since it is
+    counts are only as exact as those names are. Error text is never read, since it is
     written for the model and not as a reason a reader may be shown.
     """
     saves = [e for e in executions if e.tool_name == MEMORY_SAVE_TOOL_NAME]
@@ -140,17 +148,59 @@ def _memory_save_outcome(executions: Sequence[ToolExecutionRecord]) -> tuple[int
         for save in saves
         if save.status == ToolResultStatus.SUCCESS
     }
-    unsaved: list[tuple[str, str]] = []
+    unsaved: list[tuple[str, str, str]] = []
     for save in saves:
         if save.status == ToolResultStatus.SUCCESS:
             continue
         key = _memory_fact_key(save.arguments)
-        if any(_agrees(key, done) for done in landed):
+        has_identity = bool(key[0] or key[1])
+        if has_identity and any(_agrees(key, done) for done in landed):
             continue
         if any(_agrees(key, seen) or _agrees(seen, key) for seen in unsaved):
             continue
         unsaved.append(key)
     return len(landed) + len(unsaved), len(unsaved)
+
+
+#: The image tool, whose results carry the tags its fill added to each picture's prompts.
+IMAGE_TOOL_NAME = "generate_image"
+
+
+def _image_prompt_additions(
+    executions: Sequence[ToolExecutionRecord],
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """`(prompt, negative)`: the tags the image tool added to this turn's pictures (#1865).
+
+    Read from each successful `generate_image` result -- the result itself, then each of
+    its `images` for a batch, since a batch says tags every picture shares once at the top
+    (#2013) -- in order, each tag once. Only lists of strings are read; the tool's
+    `prompt_changes` sentences are written for the model and are not.
+    """
+    prompt: list[str] = []
+    negative: list[str] = []
+
+    def take(into: list[str], value: object) -> None:
+        if isinstance(value, list):
+            for tag in cast(list[object], value):
+                if isinstance(tag, str) and tag and tag not in into:
+                    into.append(tag)
+
+    for execution in executions:
+        output = execution.output
+        if execution.tool_name != IMAGE_TOOL_NAME or execution.status != ToolResultStatus.SUCCESS:
+            continue
+        if not isinstance(output, dict):
+            continue
+        images = output.get("images")
+        pictures: list[object] = [output]
+        if isinstance(images, list):
+            pictures.extend(cast(list[object], images))
+        for picture in pictures:
+            if isinstance(picture, dict):
+                one = cast(dict[str, object], picture)
+                take(prompt, one.get("prompt_added"))
+                take(negative, one.get("negative_added"))
+    return tuple(prompt), tuple(negative)
 
 
 def _record_tools(
@@ -178,7 +228,9 @@ def _record_tools(
     One call can name several files: an output's `paths` list is recorded alongside its
     `path`, each file once (#1558), in `RoomToolUse.written_paths` and as one
     `RoomWrittenFile` each. That is how a peer called through `a2a_call` reports what it
-    wrote, and how an image call that made several pictures reports all of them.
+    wrote. The files come from `ToolExecutionRecord.produced_paths` (#2085): what the tool
+    declared in its result's `artifacts` -- an image call's pictures, which its output names
+    by link only (#2013) -- else a writing tool's `path`/`paths`.
     `RoomToolUse.written_path` stays the first of them. A writing call whose output says
     `unnamed_writes: true` -- a peer that may have written something it did not name -- is
     counted as a possible unnamed write too, as a helper is.
@@ -189,16 +241,9 @@ def _record_tools(
         succeeded = execution.status is ToolResultStatus.SUCCESS
         output = execution.output
         mapping: dict[str, Any] = dict(output) if isinstance(output, dict) else {}
-        named: list[str] = []
-        if execution.writes_files and succeeded:
-            path = mapping.get("path")
-            listed: object = mapping.get("paths")
-            candidates: list[object] = [path]
-            if isinstance(listed, list | tuple):
-                candidates.extend(cast(Sequence[object], listed))
-            for candidate in candidates:
-                if isinstance(candidate, str) and candidate and candidate not in named:
-                    named.append(candidate)
+        # What the call produced, as the tool declared it (#2085): not its output's shape,
+        # and not gated on `writes_files`, which the image tool no longer declares (#2079).
+        named: list[str] = list(execution.produced_paths)
         written_path: str | None = named[0] if named else None
         subagent_id: str | None = None
         child = mapping.get("subagent_id")
@@ -243,6 +288,7 @@ def _record_tools(
 #: ACP or A2A head's one-seat room records its turns the way a room seat's are (#1837).
 record_turn_tools = _record_tools
 memory_save_outcome = _memory_save_outcome
+image_prompt_additions = _image_prompt_additions
 
 
 class RoomOrchestrator:
@@ -543,7 +589,7 @@ class RoomOrchestrator:
         # The last *utterance*, not the last row — see `RoomState.last_utterance`, which
         # the rendering half asks the same question of.
         failed = state.last_utterance
-        if failed is None or failed.error is None:
+        if failed is None or (failed.error is None and failed.content.strip() != ""):
             spoke = failed.sender_id if failed is not None else "nobody"
             raise NothingToRetryError(
                 f"The last thing said in room {room_id!r} was {spoke!r}'s, and it did not "
@@ -571,7 +617,10 @@ class RoomOrchestrator:
             verdict=SelectionVerdict.SPEAK,
             speaker_id=speaker.id,
             selector="orchestrator",
-            reasoning=f"retry of {speaker.id!r}'s failed turn at seq {failed.seq}",
+            reasoning=(
+                f"retry of {speaker.id!r}'s "
+                f"{'failed' if failed.error is not None else 'silent'} turn at seq {failed.seq}"
+            ),
         )
         # Under the floor, like every other turn. `retry` is the second door into
         # `_take_turn`, and a retry running beside a live cascade put two agents on the
@@ -891,6 +940,7 @@ class RoomOrchestrator:
         completed = True
         refusal: RoomTurnRefusal | None = None
         provider_failure: ProviderFailure | None = None
+        persona_edit_dropped = False
         # What the turn says its tools were. Stays empty *and unrecorded* when the turn
         # raised or was cancelled: there is no `TurnResult` to read them from, and an
         # empty list stored as recorded would claim the seat used none (P6).
@@ -909,6 +959,9 @@ class RoomOrchestrator:
                 room_id=room_id,
                 story_id=state.story_id,
                 person_names=_person_names(state),  # per turn, never stored (#1857)
+                # The room's workspace, or None for the seat's own: bound for this turn
+                # only, so a change applies from the next turn (clone-data-scopes §3.6).
+                workspace_root=Path(state.workspace) if state.workspace is not None else None,
             )
         )
         self._active_turns[room_id] = (turn_id, turn_task)
@@ -945,7 +998,8 @@ class RoomOrchestrator:
                 error = result.error
                 # From the turn's stated stop reason, never from `error`'s wording (#969).
                 refusal = turn_refusal(result.stop_reason)
-                provider_failure = result.provider_failure
+                provider_failure = self._with_own_model(speaker.id, result.provider_failure)
+                persona_edit_dropped = result.stop_reason == "persona_edit_failed"
         finally:
             # Only if it is still ours. Evicting somebody else's live turn made
             # `interrupt` cancel nothing while answering as though it had -- a Stop that
@@ -965,8 +1019,9 @@ class RoomOrchestrator:
         # One predicate for the whole commit (#1423): the session below, the row's answer,
         # and `last_seen_seq` all read it, so they cannot disagree about whether the
         # turn happened. An interrupted turn is covered by `error` too: the cancel branch
-        # above sets it, so `completed` adds nothing here.
-        committed = error is None
+        # above sets it, so `completed` adds nothing here. A silent turn (empty content
+        # with no tool executions) did not answer, so its unseen span is not consumed (#2168).
+        committed = error is None and (bool(content.strip()) or bool(executions))
         rollback_error = None if committed else self._roll_back_seat(agent, speaker, checkpoint)
 
         # The seat's own session -- the model context, tool calls and results this
@@ -998,21 +1053,28 @@ class RoomOrchestrator:
         # on `state.last_decision`, or will get one; this turn's must not clobber it (#945).
         superseded = self._interjected(state, rendered_through)
         memory_facts_tried, memory_facts_unsaved = _memory_save_outcome(executions)
+        image_prompt_added, image_negative_added = _image_prompt_additions(executions)
         message = RoomMessage(
             seq=len(state.transcript) + 1,
             sender_id=speaker.id,
+            # The seat's session, recorded with the row: the trace is read from it, even
+            # after the seat is re-keyed (clone-data-scopes §4 step 3).
+            session_id=speaker.session_id or None,
             content=content,
             decision=decision,
             provenance=provenance,
             error=error,
             refusal=refusal,
             provider_failure=provider_failure,
+            persona_edit_dropped=persona_edit_dropped,
             completed=completed,
             rendered_through=rendered_through,
             persist_error=persist_error,
             session_set_aside=self._session_set_aside(speaker),
             memory_facts_tried=memory_facts_tried,
             memory_facts_unsaved=memory_facts_unsaved,
+            image_prompt_added=image_prompt_added,
+            image_negative_added=image_negative_added,
             turn_id=turn_id,
             tools_recorded=tools_recorded,
             usage=usage,
@@ -1135,6 +1197,7 @@ class RoomOrchestrator:
                 memory=memory,
                 generate=agent.invoke_auxiliary_model,
                 person_names=_person_names(state),
+                clone_names=_clone_names(state, speaker),
             )
         )
 
@@ -1394,6 +1457,36 @@ class RoomOrchestrator:
                 exc_info=True,
             )
 
+    def _with_own_model(
+        self, participant_id: str, failure: ProviderFailure | None
+    ) -> ProviderFailure | None:
+        """``failure``, naming the clone and its own model when that model is the cause (§3.6).
+
+        A clone that names its own model ref and finds it gone, unreachable or unlisted is
+        not moved to the system default: the row says which clone and which model, and
+        offers the one action ``use_system_default`` (model-gateway §3.6, G7). The turn is
+        not re-run.
+        """
+        if failure is None or failure.kind not in _OWN_MODEL_FAILURES:
+            return failure
+        pinned = getattr(self._resolver, "pinned_model", None)
+        found: object = pinned(participant_id) if callable(pinned) else None
+        if not isinstance(found, tuple):
+            return failure
+        parts = cast(tuple[object, ...], found)
+        if len(parts) != 2 or not all(isinstance(part, str) for part in parts):
+            return failure
+        name, ref = str(parts[0]), str(parts[1])
+        return failure.model_copy(
+            update={
+                "message": f"{name} is set to use its own model, {ref}, and it could not be "
+                f"used. {failure.message}",
+                "clone": name,
+                "model_ref": ref,
+                "action": "use_system_default",
+            }
+        )
+
     def _stream_callback(
         self, room_id: str, agent_id: str, turn_id: str
     ) -> Callable[[str, dict[str, Any]], Awaitable[None]] | None:
@@ -1590,7 +1683,7 @@ class RoomOrchestrator:
         beside it. Checked on the record as loaded, so a head room another surface has
         open is refused as soon as it asks.
         """
-        head = room_head(state)
+        head = state.head
         if head is not None:
             raise HeadRoomWriteError(head_room_write_refusal(head))
         return state
@@ -1903,18 +1996,37 @@ def _person_names(state: RoomState) -> tuple[str, ...]:
     for person in state.participants:
         if person.kind is not ParticipantKind.HUMAN:
             continue
-        others = [p for p in state.participants if p.id != person.id]
-        other_names = {fold_name(n) for p in others for n in (p.id, p.display_name, *p.aliases)}
-        other_words = {w for n in other_names for w in re.findall(r"\w+", n)}
-        for name in (person.id, person.display_name, *person.aliases):
-            folded = fold_name(name)
-            if folded in given:
-                continue
-            # A name of two words or more is never one of `other_words`.
-            if not (folded in other_names or folded in other_words):
-                given.add(folded)
-                names.append(name)
+        _add_unshared_names(state, person, names, given)
     return tuple(names)
+
+
+def _clone_names(state: RoomState, clone: Participant) -> tuple[str, ...]:
+    """The names that mean `clone` itself in this room: its id, display name and aliases.
+
+    Held to the rule `_person_names` holds the person's to, so a name another participant
+    goes by, whole or as one word of theirs, is left out: a fact about that participant
+    keeps its subject instead of becoming one about this clone (#2016).
+    """
+    names: list[str] = []
+    _add_unshared_names(state, clone, names, set())
+    return tuple(names)
+
+
+def _add_unshared_names(
+    state: RoomState, participant: Participant, names: list[str], given: set[str]
+) -> None:
+    """Append to `names` each of `participant`'s names no other participant could mean."""
+    others = [p for p in state.participants if p.id != participant.id]
+    other_names = {fold_name(n) for p in others for n in (p.id, p.display_name, *p.aliases)}
+    other_words = {w for n in other_names for w in re.findall(r"\w+", n)}
+    for name in (participant.id, participant.display_name, *participant.aliases):
+        folded = fold_name(name)
+        if folded in given:
+            continue
+        # A name of two words or more is never one of `other_words`.
+        if not (folded in other_names or folded in other_words):
+            given.add(folded)
+            names.append(name)
 
 
 def _lesson_lines(

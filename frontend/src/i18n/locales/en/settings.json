@@ -1,21 +1,26 @@
 {
   "tabs": {
     "all": "All",
-    "llm": "LLM & Models",
+    "llm": "Models",
     "usage": "Usage",
-    "tools": "Images",
+    "tools": "GPU computer",
     "folders": "Folder Access",
     "clones": "Personas & Clones",
     "skills": "Skills & MCP",
     "links": "Connections",
+    "browser": "Browser",
     "diagnostics": "Diagnostics"
   },
   "header": {
-    "title": "Runtime Settings & Endpoints",
-    "hotReload": "Hot-Reload",
-    "subtitle": "Configure live LLM model providers and endpoints without restart.",
+    "title": "Settings",
+    "subtitle": "Changes are saved as you make them.",
     "workspace": "📁 Workspace: {dir}",
     "close": "Close"
+  },
+  "autosave": {
+    "saving": "Saving…",
+    "saved": "Saved",
+    "restored": "The previous value is back."
   },
   "language": {
     "title": "Language",
@@ -26,156 +31,37 @@
   "setAside": {
     "notice": "This version could not open your saved settings. When you saved here, it kept that file unchanged beside the new one, so settings saved before, such as API keys, are not shown here."
   },
-  "feedback": {
-    "saved": "Settings successfully applied! Live agents and tools hot-reloaded.",
-    "installed": "Installed model \"{model}\".",
-    "installJoined": "Installed model \"{model}\" (an install was already running; this joined it).",
-    "installStopped": "Stopped waiting for \"{model}\". Ollama may still be downloading it.",
-    "confirmDelete": "Delete model \"{model}\"? This cannot be undone.",
-    "deleted": "Deleted model \"{model}\".",
-    "deleteStopped": "Stopped waiting for the removal of \"{model}\"."
-  },
   "failure": {
     "load": "The settings could not be loaded.",
-    "test": "The connection could not be tested.",
     "save": "Something went wrong saving the settings.",
-    "install": "Something went wrong installing the model.",
-    "remove": "Something went wrong deleting the model.",
     "diagnosticsRead": "Problem reporting could not be loaded.",
     "diagnosticsChoice": "Something went wrong saving your choice.",
     "diagnosticsClear": "Something went wrong deleting the recorded failures."
   },
-  "llm": {
-    "title": "LLM Provider",
-    "active": "Active:",
-    "providers": {
-      "ollama": "Local Private (Default)",
-      "vllm": "Self-hosted GPU server",
-      "openai": "OpenAI API",
-      "anthropic": "Anthropic Claude API",
-      "gemini": "Google Gemini API"
-    },
-    "endpoint": "Endpoint Base URL",
-    "endpointRequired": "required — no default",
-    "endpointOptional": "optional proxy",
-    "endpointOther": "e.g. proxy / host",
-    "endpointVllmPlaceholder": "http://<host>:8000/v1 — where you ran `vllm serve`",
-    "endpointPlaceholder": "Endpoint URL",
-    "endpointCloudHint": "Connects directly to the official {name} API by default. Fill this in only if you use a custom proxy.",
-    "model": "Chat model",
-    "customModelOption": "Custom / Other model...",
-    "customModelPlaceholder": "Enter custom model tag...",
-    "modelPlaceholder": "e.g. qwen3:8b, hermes3:8b",
-    "ollamaNotAnswering": "No model list came back from {endpoint}. Is Ollama running at this address? On this computer its address is usually http://localhost:11434.",
-    "vllmNotAnswering": "No model list came back from {endpoint}. Check that the vLLM server is running and that the address is right.",
-    "vllmKeyRefused": "The vLLM server at {endpoint} is running, but it refused the API key. Check the key and paste it again.",
-    "ollamaNoModels": "Ollama is running but has no models installed. Install one below.",
-    "fastModel": "Fast model",
-    "fastSameAsDeep": "Same as the chat model",
-    "fastModelName": "Fast model name",
-    "fastHint": "Used for quick background work, such as choosing who speaks next in a conversation. A clone that names its own model keeps it.",
-    "envOverride": {
-      "provider": "The environment variable {variable} is set, so it takes priority over the provider chosen here. Saving keeps your choice for when the variable is removed.",
-      "model": "The environment variable {variable} is set, so it takes priority over the model chosen here. Saving keeps your choice for when the variable is removed.",
-      "baseUrl": "The environment variable {variable} is set, so it takes priority over the endpoint entered here. Saving keeps your choice for when the variable is removed."
-    },
-    "localConnected": {
-      "one": "Connected · {count} model installed",
-      "other": "Connected · {count} models installed"
-    },
-    "cloudConnected": {
-      "one": "Connected · {count} model available",
-      "other": "Connected · {count} models available"
-    }
-  },
-  "catalog": {
-    "recommended": "(recommended)",
-    "otherModel": "Other model (type its name)…",
-    "modelName": "Model name",
-    "modelPicker": "Model",
-    "typePlaceholder": "Type a model name",
-    "refresh": "Refresh list",
-    "refreshFailed": "The model list could not be refreshed.",
-    "advanced": "Advanced — custom endpoint / proxy",
-    "endpointPlaceholder": "Default",
-    "notInList": "This model isn't in {vendor}'s list for your key. Check the spelling. You can still save it.",
-    "retired": "{model} is no longer offered by {vendor}. Switch to {recommended}?",
-    "switchModel": "Switch",
-    "noKey": "Enter your {vendor} API key below to load the models it can use.",
-    "keyRejected": "{vendor} did not accept the API key, so its models could not be listed. Check the key and paste it again.",
-    "keyMalformed": "That doesn't look like a {vendor} API key. Check it and paste it again.",
-    "unreachable": "Couldn't get {vendor}'s model list. Check your internet connection, then refresh the list.",
-    "noListing": "{vendor} did not list any models for this key.",
-    "emptyList": "{vendor} listed no chat models for this key.",
-    "loading": "Loading {vendor}'s models…",
-    "unavailable": "{vendor}'s model list isn't available right now."
-  },
-  "models": {
-    "title": "Manage Local Models",
-    "installPlaceholder": "e.g. llama3.2:1b",
-    "installLabel": "Model to install",
-    "install": "Install",
-    "cancelInstallTitle": "Stop waiting for this install",
-    "cancelInstall": "Cancel install",
-    "installWait": "Large models take a while. Cancelling — or closing this window — stops the wait, not the download. Reopen Settings to see whether it arrived.",
-    "delete": "Delete {model}",
-    "saveToManage": "Save first to install or remove models at this address."
-  },
-  "apiKey": {
-    "title": "API Key",
-    "vllmOptional": "optional — only if you started the server with --api-key",
-    "consoleTitle": "Get an API key from the {name} console",
-    "consoleLink": "Get a {name} key",
-    "configured": "Saved ({masked})",
-    "keepPlaceholder": "Leave blank to keep current key, or enter new key",
-    "placeholder": "Enter API key (e.g. {example})",
-    "hide": "Hide key",
-    "show": "Show key",
-    "valid": "This looks like a valid {name} key.",
-    "otherProvider": "This looks like a {detected} key. Check that it is a {expected} key.",
-    "wrongPrefix": "A {name} key starts with '{prefix}'.",
-    "badPattern": "This is not a valid {name} key. Check its length and characters.",
-    "notSetAfter": " API key is not set.",
-    "getKey": "Get a key",
-    "enterInSettings": "Enter in Settings",
-    "fromEnv": "Using environment variable {variable}",
-    "remove": "Remove key",
-    "removeTitle": "Remove the saved {name} key",
-    "confirmRemove": "Remove the saved {name} key?",
-    "removed": "The {name} key was removed.",
-    "removeFailed": "The key could not be removed.",
-    "inUse": "This key is in use. Switch to another provider first, or paste a new key to replace it.",
-    "unknownProvider": "That provider is not one Settings knows."
-  },
-  "providers": {
-    "costTips": {
-      "gemini": "Google AI Studio issues a free-tier key (15 requests per minute) without a credit card.",
-      "anthropic": "Create a key under API Keys in the Anthropic Console (requires purchased credits).",
-      "openai": "Create a secret key under API Keys on the OpenAI Platform."
-    }
-  },
   "remoteGpu": {
-    "title": "Remote GPU Worker (SSH Auto-Tunnel)",
-    "usedBy": "ComfyUI image generation (LLM optional)",
-    "hint": "Automatically establish an SSH tunnel to a remote workstation (e.g. Dell RTX 5070 Ti). Image generation runs there; the LLM stays where it is unless you tick the box below.",
-    "hostPlaceholder": "SSH host (e.g. dell or user@dell)",
+    "title": "Remote GPU computer",
+    "usedBy": "Draws pictures (and can run the model)",
+    "hint": "Connects to another computer over SSH and uses its graphics card. Its ComfyUI is added under Models as a picture connection; the model stays where it is unless you tick the box below.",
+    "hostPlaceholder": "Hostname or IP",
     "connect": "Connect",
     "connecting": "Connecting...",
     "disconnect": "Disconnect",
     "disconnecting": "Disconnecting...",
-    "statusConnected": "Tunnel Active",
+    "statusConnected": "Connected",
     "statusDisconnected": "Not Connected",
     "gpuDetected": "GPU: {name} ({totalMb} MB)",
-    "portsForwarded": "Ports forwarded: {ports}",
-    "autoStarted": "ComfyUI Auto-Started",
-    "noPorts": "No active remote services detected on port 11434 or 8188.",
-    "useForLlm": "Also run the LLM on this worker (Ollama)",
-    "llmModelMissing": "The LLM stays local: the selected model isn't installed on the worker."
-  },
-  "comfyui": {
-    "title": "ComfyUI Image Generation Endpoint",
-    "usedBy": "Used by 'generate_image' tool",
-    "hint": "Points to local or LAN GPU workstation running ComfyUI with standard txt2img workflows."
+    "servicesReached": "Reached: {services}",
+    "serviceAt": "{service} (port {port})",
+    "autoStarted": "ComfyUI was started for you",
+    "useForLlm": "Also run the model on that computer (Ollama)",
+    "llmModelMissing": "The model stays on this computer: the chosen model is not installed on the other one.",
+    "connectFailedHost": "Could not connect to {host}.",
+    "errorDetails": "Details",
+    "disconnectFailed": "Could not disconnect from the GPU computer.",
+    "routingLlm": "Model runs on {host}",
+    "routingImages": "Pictures are drawn on {host}",
+    "routingNotice": "Requests for these services are forwarded to the remote machine over the SSH tunnel.",
+    "presets": "Quick Presets:"
   },
   "folders": {
     "title": "Folders Clones Can Read",
@@ -189,32 +75,18 @@
     "notUsable": "not usable",
     "remove": "Remove {root}",
     "empty": "No other folders added here.",
-    "envIntro": "Also readable, set by UCLONE_READ_ROOTS when the app started:",
+    "envIntro": "Also readable, set when the app started:",
     "envListLabel": "Read-only folders from the environment",
     "ignored": "Ignored: {reason}",
     "addPlaceholder": "e.g. ~/Documents/notes",
     "addLabel": "Folder to add",
-    "add": "Add folder",
-    "unsaved": "Folder changes take effect when you save."
+    "add": "Add folder"
   },
   "developerMode": {
     "title": "Developer mode",
     "hint": "Adds a drawer of developer tools to the workspace dock (Knowledge Graph, DAG, EventBus and Ontology) and a Diagnostics section below (ACP and Evals). Takes effect at once and is kept in this browser."
   },
-  "connectivity": {
-    "title": "Connectivity Test Results",
-    "llm": "LLM ({provider}): ",
-    "reachable": "Endpoint Reachable",
-    "keyRefused": "The server is running, but it refused the API key.",
-    "models": "Available models: {list}",
-    "more": " (+{count} more)",
-    "comfyui": "ComfyUI: ",
-    "comfyuiOnline": "Server Online & Ready",
-    "comfyuiUnreachable": "Unreachable at configured URL"
-  },
   "footer": {
-    "check": "Check Connection",
-    "cancel": "Cancel",
-    "save": "Save & Apply Settings"
+    "close": "Close"
   }
 }

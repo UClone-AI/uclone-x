@@ -26,7 +26,7 @@ const VARIANT_CLASSES: Record<KitButtonVariant, string> = {
 const SIZE_CLASSES: Record<KitButtonSize, string> = {
   sm: 'px-2 py-0.5 text-xs',
   icon: 'p-1.5',
-  compact: 'p-1',
+  compact: 'min-w-6 min-h-6 p-1.5',
 };
 
 interface KitButtonProps extends Omit<React.ButtonHTMLAttributes<HTMLButtonElement>, 'className'> {

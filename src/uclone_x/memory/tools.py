@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from datetime import UTC, datetime
 from typing import ClassVar, cast
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from uclone_x.core.provenance import Provenance
-from uclone_x.memory.models import PROJECT_SUBJECT, person_subject
+from uclone_x.memory.models import PROJECT_SUBJECT, SELF_SUBJECT, fact_subject
 from uclone_x.memory.retrieval import FactRanking
 from uclone_x.memory.store import CrossSessionMemory
 from uclone_x.tools.base import BaseTool
@@ -37,6 +38,15 @@ class RecordMemoryFactParams(BaseModel):
         default_factory=tuple, description="Optional categorization tags."
     )
 
+    valid_until: str | None = Field(
+        default=None,
+        description=(
+            "Only when the person said the fact stopped being true: the date it ended, as "
+            "YYYY-MM-DD or an ISO 8601 time. Leave it out for a fact that still holds. A fact "
+            "with an end is kept as history and does not replace a current one."
+        ),
+    )
+
     @field_validator("tags", mode="before")
     @classmethod
     def _coerce_tags(cls, v: object) -> tuple[str, ...] | object:
@@ -44,6 +54,20 @@ class RecordMemoryFactParams(BaseModel):
             items = cast(list[object] | set[object], v)
             return tuple(str(x) for x in items)
         return v
+
+    @field_validator("valid_until", mode="after")
+    @classmethod
+    def _normalise_end(cls, v: str | None) -> str | None:
+        """The end as the store writes times (UTC, to the second); a date is its midnight."""
+        if v is None or not v.strip():
+            return None
+        try:
+            parsed = datetime.fromisoformat(v.strip().replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError("valid_until must be a date (YYYY-MM-DD) or an ISO 8601 time") from exc
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        return parsed.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 class RecordMemoryFactTool(BaseTool[RecordMemoryFactParams]):
@@ -57,7 +81,9 @@ class RecordMemoryFactTool(BaseTool[RecordMemoryFactParams]):
         "Carries in-band P6 provenance and automatically supersedes conflicting prior assertions. "
         'Use the subject "user" for facts about the person you work for, and the subject '
         f'"{PROJECT_SUBJECT}" for durable working preferences of this workspace, such as the '
-        "reply language or a code style."
+        "reply language or a code style. "
+        f'Use the subject "{SELF_SUBJECT}" for facts about yourself, the clone, that the '
+        "person told you, such as your looks, age or personality."
     )
 
     def __init__(self, memory: CrossSessionMemory) -> None:
@@ -74,8 +100,9 @@ class RecordMemoryFactTool(BaseTool[RecordMemoryFactParams]):
         try:
             fact = self._memory.record_fact(
                 # A fact about the person is filed under `user` whatever the model called
-                # them, as the extractor files it, so recall always includes it (#1857).
-                subject=person_subject(params.subject, context.person_names),
+                # them, as the extractor files it, so recall always includes it (#1857); one
+                # about the clone itself is filed under `self` the same way (#2016).
+                subject=fact_subject(params.subject, context.person_names, context.clone_names),
                 predicate=params.predicate,
                 object_value=params.object_value,
                 provenance=provenance,
@@ -85,6 +112,7 @@ class RecordMemoryFactTool(BaseTool[RecordMemoryFactParams]):
                 origin="saved",
                 source_room_id=context.room_id,
                 source_turn_id=context.turn_id,
+                valid_until=params.valid_until,
             )
         except ValueError as exc:
             # The store refuses an empty field before it touches anything, so this one
@@ -143,10 +171,9 @@ class RetractMemoryFactTool(BaseTool[RetractMemoryFactParams]):
 class ReadOnlyMemory:
     """A memory store reached through its search alone, so nothing holding it can write.
 
-    What a sub-agent gets when its parent shares its memory (#1431). The store rewrites its
-    whole document on every save, with no lock, so a second writer would overwrite the
-    parent's own saves. This view offers `search_facts` and nothing else: no record, no
-    retract, no save.
+    What a sub-agent gets when its parent shares its memory (#1431). A sub-agent is a
+    reader of what the clone knows, not a second author of it. This view offers
+    `search_facts` and nothing else: no record, no retract.
     """
 
     __slots__ = ("_memory",)

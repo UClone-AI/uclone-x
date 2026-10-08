@@ -9,7 +9,7 @@ to get wrong at a call site:
 1. **A derived field is not an input field.** `model_dump` emits `degraded`, but
    `degraded` is not something a sender gets to state: it is computed from `requested`
    and `served_by` so that "a substituted result cannot be reported as clean"
-   (`docs/llm-agnostic-interface.md`). Egress therefore *excludes* it, and the wire
+   (the LLM-agnostic interface document). Egress therefore *excludes* it, and the wire
    carries the authoritative fields only. On ingress `Provenance`'s own `mode="before"`
    validator (`core/provenance.py`, issue #28) **discards** any `degraded` it is handed
    and the receiver recomputes it — a peer's assertion is corrected, not raised on. Both

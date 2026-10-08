@@ -38,10 +38,15 @@ export const ConversationTitleEditor: React.FC<ConversationTitleEditorProps> = (
   const [refusal, setRefusal] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
+  const triggerRef = useRef<HTMLElement | null>(null);
 
   useEffect(() => {
+    triggerRef.current = document.activeElement as HTMLElement | null;
     inputRef.current?.focus();
     inputRef.current?.select();
+    return () => {
+      triggerRef.current?.focus();
+    };
   }, []);
 
   const save = async () => {

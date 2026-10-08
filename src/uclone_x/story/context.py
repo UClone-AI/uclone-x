@@ -142,6 +142,9 @@ def render_entry(item: CodexItem, snapshot: EntrySnapshot | None = None) -> dict
     state = snapshot.state if snapshot is not None else dict(entry.state)
     if state:
         out["state"] = state
+    relations = snapshot.relations if snapshot is not None else dict(entry.relations)
+    if relations:
+        out["relations"] = relations
     if snapshot is not None and snapshot.visual_tags is not None:
         out["visual_tags"] = list(snapshot.visual_tags)
     visual = entry.visual if isinstance(entry, CharacterEntry) else None
@@ -271,18 +274,86 @@ def continuity_note(scene_id: str, digest: str, text: str, *, rewrite_of_own: bo
     )
 
 
-def _naming_sentences(entry: CodexEntry, text: str) -> str:
-    """The first sentences of `text` that name `entry`, quoted, for a continuity line."""
+#: A sentence that remembers rather than shows (#1808): the dead recalled, missed or heard
+#: in the mind, the lost thing remembered. A write-time notice fired on 30 of 30 qwen3:8b
+#: drafts, the clean ones included, because a memory names the dead as an act does; a
+#: notice on every draft is one the Writer learns to pass over. Narrow on purpose: an act
+#: in the same sentence as one of these words is read as memory too, and missed.
+_RECALL = re.compile(
+    r"기억|회상|떠올|그리워|그리운|그립|생전|목소리가\s*(?:머릿속|귓가)|꿈에"
+    r"|\b(?:remember\w*|recall\w*|memor(?:y|ies))\b",
+    re.IGNORECASE,
+)
+
+#: A sentence that says the change happened, or that the act did not (#1808): the dead said
+#: to be dead or gone, the lost thing said to be lost or taken, or a use negated ("월광검을
+#: 뽑지 않았다"). Such sentences ("예린은 이미 영원히 떠났고", "월광검을 뽑아내지
+#: 않았다") keep a scene true to the change, and quoting them asks for a needless rewrite.
+#: As narrow as `_RECALL`, and missing the same way: an act in the same sentence as one of
+#: these words ("죽은 듯 잠든 예린이 눈을 떴다", "the lost sword in her hand", "그는 월광검을
+#: 들고도 휘두르지 않았다", where he holds it) is read as a statement, and missed. A sentence
+#: that only describes or asks about the dead without these words is still quoted. Of the
+#: "~지 않" forms only "않았" and "않는" count: "~지 않고" is also the everyday "without
+#: ~ing", and counting it passed over "주저하지 않고 월광검을 뽑아 들었다".
+_STATED_OR_DENIED = re.compile(
+    r"죽었|죽은|숨을\s*거[두둔뒀]|떠났|떠난|세상을\s*떠|잃었|잃은|빼앗겼|빼앗긴"
+    r"|지\s*않았|지\s*않는|지\s*못"
+    r"|\b(?:died|dead|gone|lost|(?:did|does|do|could)(?:\s+not|n['’]t))\b",
+    re.IGNORECASE,
+)
+
+#: A use of a lost item refused or replaced (#1808), read from right after its name: the
+#: next word is one of the item's own use verbs (including 쓰, 사용하, 잡, 꺼내), negated
+#: ("월광검을 뽑지 않고", "월광검을 뽑아내지 않았다"), or 아닌 ("월광검이 아닌 칼"). Anchored
+#: and limited to the use verbs because "~지 않고" is also "without ~ing": "월광검을 주저하지
+#: 않고 뽑았다" is a use and is quoted, and so is "꿈이 아닌 듯, 라온은 월광검을 쥐었다". Never
+#: for a character: "예린은 주저하지 않고 칼을 들었다" is the dead acting. Still quoted:
+#: a word between the name and the negated verb ("월광검을 끝내 뽑지 않고"), unless
+#: `_STATED_OR_DENIED` excuses it.
+_DENIED_USE = re.compile(
+    r"\S*\s+(?:(?:뽑|쥐|휘두르|들|차|겨누|베|끼|착용하|챙기|쓰|사용하|잡|꺼내)\S*지\s*않|아닌)"
+)
+
+
+def _use_denied(sentence: str, names: Sequence[str]) -> bool:
+    """Whether a name in `sentence` (casefolded) is followed by `_DENIED_USE`."""
+    return any(
+        _DENIED_USE.match(sentence, found.end())
+        for name in names
+        for found in re.finditer(re.escape(name), sentence)
+    )
+
+
+def _naming_sentences(entry: CodexEntry, text: str, *, lost: bool) -> str | None:
+    """The first sentences of `text` that name `entry`, quoted, for a continuity line.
+
+    Sentences that only remember (`_RECALL`), that say the death or loss happened or the act
+    did not (`_STATED_OR_DENIED`), or, for a `lost` item, that refuse its use
+    (`_use_denied`), are left out, and when every sentence that names the entry is one,
+    there is nothing to tell: `None`. A name the sentences do not hold -- split across a
+    line -- is still told, with no quote.
+    """
     names = [n.casefold() for n in (entry.name, *entry.aliases) if len(n) >= _MIN_NAME]
     found: list[str] = []
+    passed_over = False
     for sentence in _SENTENCE_END.split(text):
         sentence = " ".join(sentence.split())
-        if sentence and any(n in sentence.casefold() for n in names):
-            if len(sentence) > _QUOTE_CHARS:
-                sentence = sentence[: _QUOTE_CHARS - 1] + "…"
-            found.append(f'"{sentence}"')
+        if not (sentence and any(n in sentence.casefold() for n in names)):
+            continue
+        if (
+            _RECALL.search(sentence)
+            or _STATED_OR_DENIED.search(sentence)
+            or (lost and _use_denied(sentence.casefold(), names))
+        ):
+            passed_over = True
+            continue
+        if len(sentence) > _QUOTE_CHARS:
+            sentence = sentence[: _QUOTE_CHARS - 1] + "…"
+        found.append(f'"{sentence}"')
         if len(found) == _QUOTED_SENTENCES:
             break
+    if passed_over and not found:
+        return None
     return "; ".join(found)
 
 
@@ -419,26 +490,30 @@ def changed_before_and_named(
     """What the story changed before `scene_id` that `text` names, one plain line each (#1613).
 
     The findings of `named_changes`, each with the sentences of `text` that name it: what a
-    saved scene is told.
+    saved scene is told. A finding named only in sentences that remember it -- `기억`,
+    `떠올`, `remember` -- or that say it happened or the act did not -- `떠났`, `빼앗긴`,
+    `지 않았`, `died` -- is not told (#1808).
 
     Raises:
         ValueError: the outline has no scene `scene_id` (the caller checks first).
     """
     lines: list[str] = []
     for item in named_changes(outline, scene_id, codex, text):
+        quoted = _naming_sentences(item.entry, text, lost=item.kind == "lost")
+        if quoted is None:
+            continue  # only remembered or stated: the story's own, not a slip
         where = _at_scene(outline, item.at, item.change)
         if item.kind == "dead":
             name = item.entry.name
             lines.append(
                 f"{name} has been dead since {where}, which happens before this scene, and "
-                f"the new text names {name}: {_naming_sentences(item.entry, text)}"
+                f"the new text names {name}: {quoted}"
             )
             continue
         owner = item.owner.name if item.owner else ""
         line = (
             f"{owner} no longer has {item.entry.name} since {where}, which happens "
-            f"before this scene, and the new text names {item.entry.name}: "
-            f"{_naming_sentences(item.entry, text)}"
+            f"before this scene, and the new text names {item.entry.name}: {quoted}"
         )
         if item.holders:
             line += f" -- {', '.join(item.holders)} has it now."

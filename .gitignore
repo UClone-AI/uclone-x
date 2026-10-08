@@ -110,6 +110,8 @@ evals/reports/*.json
 # land beside it for the same reason, anchored for the same reason (#1578).
 /stories/
 /.archive/
+/.uclone/
+scene_01.txt
 .sandbox/
 
 # A clone's skill proposals and what approving, turning down or revoking them keeps

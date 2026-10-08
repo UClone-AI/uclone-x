@@ -1,12 +1,13 @@
 """`tool_result_read`: read back a tool result that was too long to keep whole (#1422).
 
 A result above the cap reaches the history as an excerpt naming a handle; the full text is
-stored in this conversation's artifact directory. This tool returns a window of it. The
+kept in this conversation's own session log (#1848). This tool returns a window of it. The
 window arrives as a new tool result at the end of the conversation -- nothing earlier is
 rewritten -- and fits under the same cap, so it is never shortened again.
 
-Read-only, and scoped to the caller's own conversation: the handle resolves only inside
-`ToolContext.session_id`'s directory, so one conversation cannot read another's results.
+Read-only, and scoped to the caller's own conversation: the handle resolves only among the
+entries of `ToolContext.stored_results`, the session the call runs in, so one conversation
+cannot read another's results. It needs no workspace.
 """
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from uclone_x.core.tool_results import (
     TOOL_RESULT_READ_TOOL,
-    contained_artifacts_dir,
+    ResultBodies,
     read_tool_result_page,
 )
 from uclone_x.tools.base import BaseTool
@@ -65,9 +66,9 @@ class ToolResultReadTool(BaseTool[ToolResultReadParams]):
 
     def run(self, params: ToolResultReadParams, context: ToolContext) -> str:
         """Return one page of the stored result as plain text."""
+        bodies = context.stored_results
         return read_tool_result_page(
-            contained_artifacts_dir(context.require_workspace()),
-            context.session_id,
+            bodies if isinstance(bodies, ResultBodies) else None,
             params.handle,
             params.offset,
             params.length,

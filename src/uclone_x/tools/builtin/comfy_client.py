@@ -200,6 +200,31 @@ class ComfyClient:
         except httpx.HTTPError as exc:
             raise ComfyUIError(f"Failed to fetch ComfyUI object info: {exc}") from exc
 
+    async def checkpoints(self, timeout: float = 3.0) -> list[str] | None:
+        """The checkpoint files the daemon can load, or ``None`` when it does not answer.
+
+        Read from ``/object_info/CheckpointLoaderSimple``, the list the checkpoint loader
+        node offers; a reply of another shape is no list rather than a guess.
+        """
+        try:
+            response = await self._get_client().get(
+                self._url("/object_info/CheckpointLoaderSimple"), timeout=timeout
+            )
+            response.raise_for_status()
+            body: object = response.json()
+        except (httpx.HTTPError, ValueError):
+            return None
+        names: object = body
+        for key in ("CheckpointLoaderSimple", "input", "required", "ckpt_name"):
+            if not isinstance(names, dict):
+                return []
+            names = cast(dict[str, object], names).get(key)
+        if isinstance(names, list) and names:
+            names = cast(list[object], names)[0]
+        if not isinstance(names, list):
+            return []
+        return [name for name in cast(list[object], names) if isinstance(name, str)]
+
     async def missing_nodes(self, required: list[str]) -> list[str]:
         """Check for the presence of required nodes and return missing node names.
 

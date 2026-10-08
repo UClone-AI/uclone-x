@@ -12,6 +12,7 @@ half-written transcript.
 
 from __future__ import annotations
 
+import logging
 import os
 import tempfile
 from datetime import UTC, datetime
@@ -26,7 +27,8 @@ from uclone_x.errors import (
     StaleRoomWriteError,
     UnreadableRoomRecordError,
 )
-from uclone_x.room.models import RoomState, with_legacy_loop_rows_as_notes
+from uclone_x.room.clone_ids import migrate_room_file
+from uclone_x.room.models import RoomState
 
 __all__ = [
     "ROOMS_SUBDIR",
@@ -40,6 +42,7 @@ __all__ = [
 #: variables for separate records: a headless run that wants its rooms elsewhere is not
 #: necessarily the same request as moving its sessions, and one variable governing both
 #: cannot express the difference.
+logger = logging.getLogger(__name__)
 ROOM_STORAGE_DIR_ENV_VAR = "UCLONE_ROOM_DIR"
 
 #: The folder, under the session family root, that the desktop app keeps its rooms in
@@ -123,13 +126,11 @@ class RoomStore:
         try:
             return resolve_session_path(self._dir, room_id)
         except PathTraversalError as exc:
-            msg = (
-                str(exc)
-                .replace("Session ID", "A room id")
-                .replace("session ID", "room id")
-                .replace("session id", "room id")
-            )
-            raise RoomIdError(f"{room_id!r} is not a usable room id: {msg}") from exc
+            if not room_id.strip():
+                raise RoomIdError("A conversation identifier must be non-empty.") from exc
+            raise RoomIdError(
+                "The conversation identifier is not valid: it must not contain path separators."
+            ) from exc
 
     def load(self, room_id: str) -> RoomState | None:
         """Return the stored room, or `None` when there is none.
@@ -146,11 +147,18 @@ class RoomStore:
         if not path.exists():
             return None
         try:
-            state = RoomState.model_validate_json(path.read_text(encoding="utf-8"))
-        except ValidationError as exc:
-            raise UnreadableRoomRecordError(room_id) from exc
-        # A room saved before `/loop` rows were notes still holds them as speech (#1661).
-        return with_legacy_loop_rows_as_notes(state)
+            return RoomState.model_validate_json(path.read_text(encoding="utf-8"))
+        except (ValidationError, UnicodeDecodeError):
+            # A room stored before seats were keyed by clone id carries `persona` on each
+            # seat, which this build refuses: it is rewritten once, then read (§4 step 3).
+            # `False` does not mean the room is broken: a reader that loses the race to
+            # another finds nothing left to rewrite, and the record is now the winner's.
+            # Either way the file is read once more, and only that read decides.
+            migrate_room_file(path)
+        try:
+            return RoomState.model_validate_json(path.read_text(encoding="utf-8"))
+        except (ValidationError, UnicodeDecodeError) as rewritten:
+            raise UnreadableRoomRecordError(room_id) from rewritten
 
     def save(self, state: RoomState) -> RoomState:
         """Persist `state` at the next revision, refusing a write that would lose an update.
@@ -161,10 +169,14 @@ class RoomStore:
         path = self.room_path(state.room_id)
         on_disk = self.load(state.room_id)
         if on_disk is not None and on_disk.revision != state.revision:
+            logger.warning(
+                "Refusing to persist room %r: held revision %s, but the record is at %s. A room has one writer by design.",
+                state.room_id,
+                state.revision,
+                on_disk.revision,
+            )
             raise StaleRoomWriteError(
-                f"Refusing to persist room {state.room_id!r}: held revision "
-                f"{state.revision}, but the record is at {on_disk.revision}. A room has "
-                f"one writer by design, so this means two orchestrators are driving it."
+                f"The conversation {state.room_id!r} could not be saved because it was changed by another action. Refresh and try again."
             )
 
         stamped = state.model_copy(

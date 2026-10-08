@@ -38,9 +38,6 @@
     "custom": "Custom — set each window yourself."
   },
   "customHelp": "Leave a box empty for no limit in that window.",
-  "save": "Save limits",
-  "saving": "Saving…",
-  "saved": "Limits saved.",
   "saveFailed": "The limits were not saved.",
   "providers": "By provider (last 7 days):",
   "noProviders": "No paid model has been used in the last 7 days.",

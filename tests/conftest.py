@@ -293,6 +293,8 @@ def _isolate_llm_provider(  # pyright: ignore[reportUnusedFunction]
         "GOOGLE_API_KEY",
         "OPENAI_BASE_URL",
         "ANTHROPIC_BASE_URL",
+        # Read as a connection's address by the model gateway's environment rules (S4).
+        "GEMINI_BASE_URL",
         "OLLAMA_MODEL",
         "OLLAMA_INDEPTH_MODEL",
         "OLLAMA_FAST_MODEL",
@@ -305,7 +307,7 @@ def _isolate_llm_provider(  # pyright: ignore[reportUnusedFunction]
         # default-window assertion.
         "OLLAMA_CONTEXT_LENGTH",
         # The embedding seam's own configuration (#1097). A developer following
-        # `docs/semantic-retrieval.md` and exporting these could not otherwise run the
+        # the semantic-retrieval document and exporting these could not otherwise run the
         # suite: the default-resolution tests read exactly these two names.
         "UCLONE_EMBEDDING_MODEL",
         "UCLONE_EMBEDDING_DIMENSIONS",

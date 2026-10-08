@@ -27,6 +27,7 @@ import zlib
 from collections.abc import Iterator
 from contextlib import ExitStack
 from pathlib import Path
+from urllib.parse import unquote
 
 import pytest
 from playwright.async_api import Page, async_playwright
@@ -61,6 +62,13 @@ TAG_WRAPPED_IMAGE_REPLY = (
 )
 
 IMAGE_WIDTH = 8
+
+#: A batch the way the image tool hands it to a reply: its numbered `markdown_gallery` list.
+BATCH_PATHS = [f"artifacts/images/img_9ed3de_{n}.png" for n in (1, 2, 3)]
+BATCH_REPLY = "Three to choose from.\n\n" + "\n".join(
+    f"{n}. ![candidate #{n}](/api/artifacts/content?path={path})"
+    for n, path in enumerate(BATCH_PATHS, start=1)
+)
 
 
 def _png_bytes(width: int, height: int) -> bytes:
@@ -104,9 +112,10 @@ def image_workspace_ui_server(tmp_path: Path) -> Iterator[UIServerFactory]:
     `running_ui`'s docstring records for `eval_reports_dir`. The file is written here instead,
     and the server is pointed at the directory holding it.
     """
-    artifact = tmp_path / ARTIFACT_PATH
-    artifact.parent.mkdir(parents=True, exist_ok=True)
-    artifact.write_bytes(_png_bytes(IMAGE_WIDTH, IMAGE_WIDTH))
+    for rel in (ARTIFACT_PATH, *BATCH_PATHS):
+        artifact = tmp_path / rel
+        artifact.parent.mkdir(parents=True, exist_ok=True)
+        artifact.write_bytes(_png_bytes(IMAGE_WIDTH, IMAGE_WIDTH))
 
     with ExitStack() as stack:
 
@@ -174,7 +183,7 @@ async def test_a_reply_that_links_a_generated_image_shows_the_image(
             await image.wait_for(timeout=10000)
 
             src = await image.get_attribute("src")
-            assert src is not None and ARTIFACT_PATH in src, (
+            assert src is not None and ARTIFACT_PATH in unquote(src), (
                 f"the image does not address the artifact the reply named: {src!r}"
             )
 
@@ -209,7 +218,7 @@ async def test_a_reply_with_image_tag_shows_the_image(
             await image.wait_for(timeout=10000)
 
             src = await image.get_attribute("src")
-            assert src is not None and ARTIFACT_PATH in src, (
+            assert src is not None and ARTIFACT_PATH in unquote(src), (
                 f"the image does not address the artifact: {src!r}"
             )
 
@@ -258,5 +267,50 @@ async def test_a_turn_that_sends_no_text_says_so_rather_than_drawing_an_empty_bu
             assert "without sending any text" in said or "sent no text" in said, (
                 f"a silent turn rendered as {said!r}"
             )
+        finally:
+            await browser.close()
+
+
+@pytest.mark.asyncio
+async def test_a_batch_is_one_card_to_choose_from_look_at_and_keep(
+    image_workspace_ui_server: UIServerFactory,
+) -> None:
+    """A batch of drawn pictures is one card, and each thing a reader does with it works.
+
+    In the browser because each half of it is something jsdom cannot see: the thumbnail a
+    reader picks has to load the picture it names (`naturalWidth`), the larger view sits over
+    the page (a portal, visible), and the download is a file the browser saves under the
+    picture's own name -- an `<a download>` jsdom renders the same whether or not it works.
+    """
+    base_url = image_workspace_ui_server(BATCH_REPLY)
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(headless=True)
+        try:
+            page = await browser.new_page(accept_downloads=True)
+            await _open_room_and_say(page, base_url, "Draw three")
+
+            row = page.locator("[data-testid='row-body-4']")
+            await row.locator("[data-testid='artifact-image-gallery']").wait_for(timeout=10000)
+            assert await row.locator("[data-testid='artifact-image-gallery']").count() == 1
+            assert await row.locator("[data-testid='artifact-image-thumb']").count() == 3
+
+            await row.locator("[data-testid='artifact-image-thumb']").nth(1).click()
+            large = row.locator("[data-testid='inline-artifact-image']")
+            assert BATCH_PATHS[1] in unquote(await large.get_attribute("src") or "")
+            await page.wait_for_function(
+                "(el) => el.complete && el.naturalWidth > 0", arg=await large.element_handle()
+            )
+
+            await large.click()
+            viewer = page.locator("[data-testid='image-lightbox']")
+            await viewer.wait_for(state="visible", timeout=5000)
+            assert "2 / 3" in (await viewer.text_content() or "")
+            await page.keyboard.press("Escape")
+            await viewer.wait_for(state="detached", timeout=5000)
+
+            async with page.expect_download() as info:
+                await row.locator("[data-testid='artifact-image-download']:visible").click()
+            download = await info.value
+            assert download.suggested_filename == "img_9ed3de_2.png", download.suggested_filename
         finally:
             await browser.close()

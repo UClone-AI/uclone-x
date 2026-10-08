@@ -120,6 +120,4 @@
   (`2026-09-02-007` §3). P6 governs only
   whether a recovery is permitted and how it must be made visible.
 
-* **Implementation Reference**: [`docs/telemetry-opentelemetry.md`](../../telemetry-opentelemetry.md),
-  [`docs/llm-agnostic-interface.md`](../../llm-agnostic-interface.md) §4,
-  [`docs/event-driven-agent-core.md`](../../event-driven-agent-core.md) §3
+* **Implementation Reference**: [`docs/public/overview.md`](../../public/overview.md)

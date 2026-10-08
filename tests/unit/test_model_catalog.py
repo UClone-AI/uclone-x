@@ -20,7 +20,13 @@ from uclone_x.errors import (
     ProviderOutageError,
     ProviderUnreachableError,
 )
-from uclone_x.llm.catalog import CatalogCache, CatalogEntry, CatalogResult, read_catalog
+from uclone_x.llm.catalog import (
+    CatalogCache,
+    CatalogEntry,
+    CatalogResult,
+    ListedImageInput,
+    read_catalog,
+)
 from uclone_x.llm.model_policy import recommend
 
 _T0 = datetime(2026, 9, 25, tzinfo=UTC)
@@ -232,3 +238,31 @@ def test_a_failed_listing_is_kept_for_a_minute_not_six_hours() -> None:
     assert cache.get(key) == failed
     clock[0] = _T0 + timedelta(seconds=60)
     assert cache.get(key) is None
+
+
+@pytest.mark.asyncio
+async def test_a_listing_read_remembers_which_models_take_images() -> None:
+    """Only what the listing says, by exact id; an unread provider is unknown (#2107).
+
+    Killed by: src/uclone_x/llm/catalog.py :: (images if images is not None else LISTED_IMAGE_INPUT).remember(provider, listed)
+    Becomes: pass
+    """
+    images = ListedImageInput()
+    assert images.get("anthropic", "claude-x") is None
+    listed = (
+        CatalogEntry(id="claude-x", chat_capable=True, accepts_images=True),
+        CatalogEntry(id="claude-y", chat_capable=True),
+    )
+    await read_catalog(
+        provider="anthropic",
+        display_provider="Anthropic",
+        lister=_lister(listed),
+        recommend=recommend,
+        now=lambda: _T0,
+        images=images,
+    )
+    assert images.get("anthropic", "claude-x") is True
+    assert images.get("anthropic", "claude-y") is False
+    assert images.get("anthropic", "claude") is False
+    assert images.get("anthropic", None) is False
+    assert images.get("openai", "claude-x") is None

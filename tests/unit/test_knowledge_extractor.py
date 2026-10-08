@@ -20,9 +20,15 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from pydantic import BaseModel
 
 from uclone_x.agent.base import BaseAgent
-from uclone_x.agent.models import AgentConfig, AgentContext, AgentLLMConfig
+from uclone_x.agent.models import (
+    AgentConfig,
+    AgentContext,
+    AgentLLMConfig,
+    ToolExecutionRecord,
+)
 from uclone_x.agent.session import SessionStore
 from uclone_x.core.provenance import ExecutionPath, Provenance, ServiceRef
 from uclone_x.engine.event_bus import AgentEvent, EventBus, EventType
@@ -34,6 +40,7 @@ from uclone_x.llm.models import (
     ModelResponse,
     StreamChunk,
     TokenUsage,
+    ToolCallRequest,
 )
 from uclone_x.memory.extractor import (
     EXTRACTED_CONFIDENCE_CAP,
@@ -55,6 +62,8 @@ from uclone_x.room.models import (
 )
 from uclone_x.room.orchestrator import RoomOrchestrator
 from uclone_x.room.store import RoomStore
+from uclone_x.tools.base import BaseTool
+from uclone_x.tools.models import ToolContext
 from uclone_x.tools.registry import ToolRegistry
 
 ALICE = Participant(id="alice", kind=ParticipantKind.HUMAN, display_name="Alice")
@@ -490,8 +499,8 @@ async def test_a_fact_seen_again_is_reinforced_not_repeated(tmp_path: Path) -> N
 
     Killed by: src/uclone_x/memory/extractor.py :: same = [f for f in active if _value_key(f.object_value) == candidate.keys[2]]
     Becomes: same = []
-    Killed by: src/uclone_x/memory/store.py :: "metadata": {**current.metadata, "observations": [*observations, turn_id]},
-    Becomes: "metadata": {**current.metadata, "observations": observations},
+    Killed by: src/uclone_x/memory/store.py :: metadata = {**current.metadata, "observations": [*observations, turn_id]}
+    Becomes: metadata = {**current.metadata, "observations": observations}
     """
     memory = _memory(tmp_path)
     held = memory.record_fact(
@@ -587,8 +596,8 @@ async def test_a_fact_stored_decomposed_is_shown_when_the_span_names_it_composed
 ) -> None:
     """The extraction prompt lists what the clone already holds about a named subject (#1899).
 
-    Killed by: src/uclone_x/memory/extractor.py :: if (subject := fold_name(fact.subject)) == "user" or subject in text
-    Becomes: if (subject := fact.subject.casefold()) == "user" or subject in text
+    Killed by: src/uclone_x/memory/extractor.py :: if (subject := fold_name(fact.subject)) in (PERSON_SUBJECT, SELF_SUBJECT) or subject in text
+    Becomes: if (subject := fact.subject.casefold()) in (PERSON_SUBJECT, SELF_SUBJECT) or subject in text
     """
     memory = _memory(tmp_path)
     memory.record_fact(_JOSE_DECOMPOSED, "lives_in", "Busan", _PROV, "s0", origin="told")
@@ -737,12 +746,12 @@ async def test_a_failed_save_says_so_plainly(
     memory = _memory(tmp_path)
 
     def refuse(*args: Any, **kwargs: Any) -> None:
-        raise OSError(28, "No space left on device", str(tmp_path / "scout-memory.json"))
+        raise OSError(28, "No space left on device", str(tmp_path / "scout-knowledge.sqlite3"))
 
     llm = _Model(extractions=[[_fact("user", "likes", "jazz")]])
     orch = _room(tmp_path, _Seats((SCOUT, _seat(SCOUT, llm, memory))))
     await orch.post("r1", ALICE.id, "I like jazz.")
-    monkeypatch.setattr(memory, "save", refuse)
+    monkeypatch.setattr(memory, "record_fact", refuse)
     await orch.wait_for_learning("r1")
 
     row = _row(orch._require_room("r1"), SCOUT.id)  # pyright: ignore[reportPrivateUsage]
@@ -844,10 +853,16 @@ def test_a_row_that_learned_nothing_is_saved_as_an_older_build_wrote_it(tmp_path
     Becomes: exclude_if=None,
     """
     store = RoomStore(tmp_path / "rooms")
-    quiet = RoomMessage(seq=1, sender_id="scout", content="Hello.")
-    taught = RoomMessage(seq=2, sender_id="scout", content="Noted.", knowledge_learned=("mem_a",))
+    quiet = RoomMessage(seq=1, sender_id="scout", content="Hello.", turn_id="t1")
+    taught = RoomMessage(
+        seq=2, sender_id="scout", content="Noted.", turn_id="t2", knowledge_learned=("mem_a",)
+    )
     failed = RoomMessage(
-        seq=3, sender_id="scout", content="Hm.", knowledge_extract_error=EXTRACTION_FAILED
+        seq=3,
+        sender_id="scout",
+        content="Hm.",
+        turn_id="t3",
+        knowledge_extract_error=EXTRACTION_FAILED,
     )
     store.save(
         RoomState(room_id="r1", participants=(ALICE, SCOUT), transcript=(quiet, taught, failed))
@@ -962,3 +977,170 @@ def test_fenced_and_wrapped_answers_are_read() -> None:
     wrapped = json.dumps({"facts": [_fact("user", "likes", "tea"), "junk", {"subject": ""}]})
     assert [c.value for c in _parse(fenced)] == ["jazz"]
     assert [c.value for c in _parse(wrapped)] == ["tea"]
+
+
+def test_generate_image_results_are_excluded_from_lesson_lines() -> None:
+    # Killed by: src/uclone_x/memory/extractor.py :: "generate_image",
+    # Becomes: "unused_generate_image",
+    from uclone_x.room.orchestrator import _lesson_lines  # pyright: ignore[reportPrivateUsage]
+
+    state = RoomState(room_id="r1", participants=(ALICE, SCOUT))
+    rec_img = ToolExecutionRecord(
+        tool_name="generate_image",
+        output={"status": "success", "image_path": "/tmp/img.png"},
+    )
+    rec_comfy = ToolExecutionRecord(
+        tool_name="comfy_image_gen",
+        output={"status": "success", "image_path": "/tmp/comfy.png"},
+    )
+    lines = _lesson_lines(
+        state,
+        speaker=SCOUT,
+        since=0,
+        rendered_through=0,
+        content="Here is the picture.",
+        executions=(rec_img, rec_comfy),
+    )
+    assert not any(line.kind == "tool" for line in lines)
+
+
+async def _never(_request: LLMRequest) -> ModelResponse:
+    raise AssertionError("must not be called")
+
+
+def test_self_fact_from_tool_source_is_dropped_by_curate() -> None:
+    # Killed by: src/uclone_x/memory/extractor.py :: if subject == SELF_SUBJECT and candidate.source != "person":
+    # Becomes: if False:
+    from uclone_x.memory.extractor import _Candidate, _curate  # pyright: ignore[reportPrivateUsage]
+
+    candidate = _Candidate(
+        subject="self",
+        relation="hair",
+        value="blonde",
+        source="tool",
+        confidence=0.9,
+    )
+    lesson = Lesson(
+        clone_id="fiona",
+        clone_name="Fiona",
+        room_id="r1",
+        session_id="s1",
+        turn_id="t1",
+        lines=(),
+        memory=CrossSessionMemory(),
+        generate=_never,
+        clone_names=("Fiona",),
+    )
+    kept = _curate([candidate], {"tool"}, lesson)
+    assert kept == []
+
+
+async def test_a_clone_turn_whose_generate_image_arguments_describe_its_looks_yields_no_self_fact(
+    tmp_path: Path,
+) -> None:
+    fiona = Participant(
+        id="fiona",
+        kind=ParticipantKind.AGENT,
+        display_name="Fiona",
+        session_id="sess_room__r1__fiona",
+    )
+
+    class _Params(BaseModel):
+        prompt: str = ""
+
+    class _Draw(BaseTool[_Params]):
+        name = "generate_image"
+        description = "draws"
+
+        def run(self, params: _Params, context: ToolContext) -> dict[str, Any]:
+            return {"status": "success", "image_path": "/tmp/fiona.png"}
+
+    tools = ToolRegistry()
+    tools.register(_Draw())
+
+    class _DrawingModel(_Model):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            self._call_made = False
+
+        async def generate(self, request: LLMRequest) -> ModelResponse:
+            system = str(request.messages[0].content) if request.messages else ""
+            if system.startswith(_EXTRACTION_MARK):
+                return await super().generate(request)
+            self.replies.append(request)
+            if not self._call_made:
+                self._call_made = True
+                return ModelResponse(
+                    finish_reason=FinishReason.TOOL_CALLS,
+                    content="",
+                    tool_calls=(
+                        ToolCallRequest(
+                            id="call_img",
+                            name="generate_image",
+                            arguments={
+                                "prompt": "A portrait of Fiona, 25 years old, with blonde hair"
+                            },
+                        ),
+                    ),
+                    usage=_USAGE,
+                    provenance=_PROV,
+                )
+            return ModelResponse(
+                finish_reason=FinishReason.STOP,
+                content="Here is a picture of me.",
+                tool_calls=(),
+                usage=_USAGE,
+                provenance=_PROV,
+            )
+
+    memory = _memory(tmp_path, "fiona")
+    llm = _DrawingModel(
+        extractions=[
+            [
+                _fact("self", "hair", "blonde", source="tool"),
+                _fact("Fiona", "age", "25", source="tool"),
+            ]
+        ]
+    )
+
+    agent = BaseAgent(
+        config=AgentConfig(
+            agent_id=fiona.id,
+            name=fiona.display_name,
+            llm_config=AgentLLMConfig(model_name="scripted"),
+        ),
+        llm=llm,
+        tools=tools,
+        context=AgentContext(session_id=fiona.session_id, agent_id=fiona.id),
+        memory=memory,
+        store=SessionStore(_SESSIONS[0] / fiona.id),
+    )
+
+    store = RoomStore(tmp_path / "rooms")
+    store.save(
+        RoomState(
+            room_id="r1",
+            participants=(ALICE, fiona),
+            policy=RoomPolicy(max_agent_turns_per_human_message=1),
+        )
+    )
+    orch = RoomOrchestrator(
+        store=store,
+        selectors=[_InOrder(fiona.id)],
+        resolver=_Seats((fiona, agent)),
+        extractor=KnowledgeExtractor(),
+    )
+
+    state = await _say(orch, "Draw your looks")
+
+    [req] = llm.extraction_requests
+    span = str(req.messages[1].content)
+    assert "generate_image" not in span
+    assert "blonde hair" not in span
+    assert "25 years old" not in span
+
+    assert memory.list_facts(subject="self") == []
+    assert memory.list_facts() == []
+
+    row = _row(state, fiona.id)
+    assert row.knowledge_learned == ()

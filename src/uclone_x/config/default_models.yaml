@@ -47,6 +47,18 @@ models:
     default_negative: ""
     suppress_negative: true
 
+  # A cloud picture model (model-gateway §3.5). The entry is what declares it a picture
+  # model, with its prompt family; it is offered only when a Google connection's own
+  # listing also names it (image-model-selection-and-editing §3.2).
+  - model_id: "gemini-2.5-flash-image"
+    display_name: "Gemini 2.5 Flash Image"
+    family: "prose"
+    engine_type: "gemini"
+    width: 1024
+    height: 1024
+    default_negative: ""
+    suppress_negative: true
+
 default_fallback:
   model_id: "generic_fallback"
   display_name: "Universal Image Generation Model"

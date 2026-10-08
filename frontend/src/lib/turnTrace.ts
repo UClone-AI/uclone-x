@@ -65,6 +65,8 @@ export interface TraceToolResult {
   outcome: string | null;
   /** The whole output as logged; on a failed call this is the raw error. */
   output: unknown;
+  /** The log names this result but no longer holds its text (#2013). */
+  output_unavailable?: boolean;
   duration_ms: number | null;
   at: string | null;
 }

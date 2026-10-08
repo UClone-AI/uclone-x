@@ -54,6 +54,11 @@ export interface ConversationListProps {
    * ask the same question. Left off, every participant draws `Avatar`'s default.
    */
   avatarSrc?: (agentId: string) => string | undefined;
+  /**
+   * What a participant is called, asked by agent id: a room seats a clone by its id, which
+   * is not a name anybody reads. Left off, the id is shown.
+   */
+  agentLabel?: (agentId: string) => string;
   /** Escape's registry, injected: the kit may not import the head's (#1036, #1158). */
   useEscape: UseKitEscape;
 }
@@ -90,8 +95,10 @@ export const ConversationList: React.FC<ConversationListProps> = ({
   copy,
   icons,
   avatarSrc,
+  agentLabel,
   useEscape,
 }) => {
+  const labelOf = (agentId: string) => agentLabel?.(agentId) ?? agentId;
   const cause = copy.emptyCause(modelConfigured, agentCount);
   const [renamingId, setRenamingId] = useState<string | null>(null);
   // The row as it was when Delete was pressed, not its id: a refused delete re-reads the
@@ -205,7 +212,7 @@ export const ConversationList: React.FC<ConversationListProps> = ({
                       {room.agent_ids.slice(0, ROSTER_PREVIEW_MAX).map((agentId) => (
                         <Avatar
                           key={agentId}
-                          label={agentId}
+                          label={labelOf(agentId)}
                           kind="agent"
                           agentIcon={icons.agent}
                           imageSrc={avatarSrc?.(agentId)}
@@ -215,7 +222,7 @@ export const ConversationList: React.FC<ConversationListProps> = ({
                       ))}
                     </span>
                     <span className="truncate text-[11px] text-slate-500">
-                      {room.agent_ids.join(', ')}
+                      {room.agent_ids.map(labelOf).join(', ')}
                       {room.agent_ids.length > ROSTER_PREVIEW_MAX
                         ? ` +${room.agent_ids.length - ROSTER_PREVIEW_MAX}`
                         : ''}
@@ -283,6 +290,7 @@ export const ConversationList: React.FC<ConversationListProps> = ({
         <DeleteConversationDialog
           useEscape={useEscape}
           room={deleting}
+          agentLabel={labelOf}
           onConfirm={async () => {
             await onDeleteRoom(deleting.room_id);
             setDeleting(null);

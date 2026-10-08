@@ -23,6 +23,7 @@ from typing import Final, cast
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
+from uclone_x.core.agent_home import handle_of, is_agent_id
 from uclone_x.errors import SpeakerSelectionError, UnknownRoomParticipantError
 from uclone_x.llm.models import ChatMessage, FinishReason, LLMRequest, MessageRole
 from uclone_x.llm.protocols import LLMProviderProtocol
@@ -203,6 +204,15 @@ class SoleAgentSelector:
         )
 
 
+def _mention_name(participant: Participant) -> str:
+    """The name a person types to address `participant`: a clone's handle, else its id."""
+    if is_agent_id(participant.id):
+        handle = handle_of(participant.id)
+        if handle is not None:
+            return handle
+    return participant.id
+
+
 class MentionSelector:
     """Routes to the participant the human addressed by name.
 
@@ -252,7 +262,7 @@ class MentionSelector:
             resolved = self._resolve(token, request.participants)
             if resolved is None:
                 roster = ", ".join(
-                    f"@{p.id}" + (f" ({'/'.join(p.aliases)})" if p.aliases else "")
+                    f"@{_mention_name(p)}" + (f" ({'/'.join(p.aliases)})" if p.aliases else "")
                     for p in request.participants
                 )
                 raise UnknownRoomParticipantError(
@@ -297,6 +307,13 @@ class MentionSelector:
             for participant in participants:
                 if participant.id.lower() == lowered:
                     return participant
+            # A clone's seat is its id (clone-data-scopes §4 step 3); a person addresses it
+            # by its handle, read from the clone now so a renamed clone answers its new one.
+            for participant in participants:
+                if participant.kind is ParticipantKind.AGENT and is_agent_id(participant.id):
+                    handle = handle_of(participant.id)
+                    if handle is not None and handle.lower() == lowered:
+                        return participant
             for participant in participants:
                 if any(alias.lower() == lowered for alias in participant.aliases):
                     return participant

@@ -306,15 +306,16 @@ def test_image_engine_report_does_not_count_a_remote_worker_that_never_answered(
 def test_image_engine_report_is_ready_on_the_in_process_engine_alone() -> None:
     """The daemon-free baseline is an engine too, so `ready` must count it on its own.
 
-    `ready` is a three-arm disjunction and this arm was pinned by no assertion in the suite
+    `ready` was a three-arm disjunction and this arm was pinned by no assertion in the suite
     (#1134): the engine-order case reads `engine`, which reaches the in-process engine
     through a branch of its own, and every `ready is True` case ran through the remote
     worker. Dropping `or self.in_process_ready` therefore left the suite green while
     `ucx media status` would have reported "not ready" on a machine that can generate --
-    the promise-the-wrong-way-round half of P6.
+    the promise-the-wrong-way-round half of P6. `ready` now reads `engine` (model-gateway
+    §3.5), so the arm is the in-process branch there.
 
-    Killed by: src/uclone_x/tools/builtin/image_status.py :: return self.remote_ready or self.comfy_alive or self.in_process_ready
-    Becomes: return self.remote_ready or self.comfy_alive
+    Killed by: src/uclone_x/tools/builtin/image_status.py :: if self.in_process_ready:
+    Becomes: if False:
     """
     alone = _report(deps_ok=True, checkpoint="/m/c.safetensors")
 
@@ -507,10 +508,12 @@ def test_probe_image_engines_treats_a_failed_probe_as_no_daemon(
 ) -> None:
     """A probe that raises is a daemon that is not there, not a crashed `ucx start` (P6).
 
-    Killed by: src/uclone_x/tools/builtin/image_status.py :: comfy_alive = False
+    Killed by: src/uclone_x/tools/builtin/image_status.py :: comfy_alive = False  # a probe that raises is no daemon there
     Becomes: comfy_alive = True
     """
     monkeypatch.delenv("UCX_IMAGE_REMOTE_URL", raising=False)
+    # A ComfyUI is probed only through a connection (model-gateway §3.5); the variable makes one.
+    monkeypatch.setenv("UCX_COMFYUI_URL", "http://127.0.0.1:1")
 
     with patch("uclone_x.tools.builtin.image.ComfyClient", side_effect=OSError("refused")):
         report = bootstrap.probe_image_engines()

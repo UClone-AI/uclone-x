@@ -17,7 +17,7 @@ import { makePersonaInfo } from '../../test/fixtures';
 describe('CloneProfile (#1300)', () => {
   const reader = makePersonaInfo();
 
-  // Killed by: frontend/src/components/clones/CloneProfile.tsx :: <h2 data-testid="clone-profile-name" className="text-lg font-semibold text-slate-100">{name}</h2>
+  // Killed by: frontend/src/components/clones/CloneProfile.tsx :: <h2 data-testid="clone-profile-name" className="text-lg font-semibold text-slate-100">{label}</h2>
   // Becomes: <h2 data-testid="clone-profile-name" className="text-lg font-semibold text-slate-100"></h2>
   it('names the clone it is showing, above its picture', () => {
     render(<CloneProfile cloneId="reader" persona={reader} onStartConversation={vi.fn()} />);
@@ -368,7 +368,7 @@ describe('CloneProfile (#1300)', () => {
       // Becomes: if (false) return;
       render(<StudioHost onModeChange={vi.fn()} />);
 
-      fireEvent.keyDown(document.getElementById('persona-model') as HTMLSelectElement, {
+      fireEvent.keyDown(document.getElementById('persona-tier') as HTMLSelectElement, {
         key: 'Escape',
       });
 

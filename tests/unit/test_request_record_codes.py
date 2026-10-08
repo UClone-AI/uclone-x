@@ -52,11 +52,21 @@ def _request(snapshot: str | None, **extra: Any) -> dict[str, Any]:
         "request": 1,
         "step": 1,
         "snapshot": snapshot,
-        "kept_message_count": 0,
-        "appended_messages": [{"role": "user", "content": "hello"}],
+        "kept_entry_count": 0,
+        "appended_entries": [{"entry": "e0", "form": "full"}],
     }
     event.update(extra)
     return event
+
+
+def _logged_state(store: SessionStore, *snapshots: ContextSnapshot) -> SessionState:
+    """A session whose log holds one user message, `hello`, as entry `e0` (#2013)."""
+    logged = logged_message(ChatMessage(role=MessageRole.USER, content="hello"))
+    store.save_context_body(_SID, logged.digest, logged.body)
+    log_entry = new_entry(0, logged, turn=1, provenance=SessionLogProvenance.RECORDED)
+    return SessionState(
+        session_id=_SID, agent_id="a", context_snapshots=snapshots, session_log=(log_entry,)
+    )
 
 
 def _store_bodies(store: SessionStore, *texts: str) -> None:
@@ -81,7 +91,7 @@ def test_a_request_whose_layer_body_is_gone_is_coded_body_missing(tmp_path: Path
     """
     store = SessionStore(tmp_path)
     snapshot = _snapshot()
-    state = SessionState(session_id=_SID, agent_id="a", context_snapshots=(snapshot,))
+    state = _logged_state(store, snapshot)
 
     assert _rebuild_code(store, state, _request(snapshot.snapshot_id)) == "body_missing"
 
@@ -91,7 +101,7 @@ def test_a_request_whose_snapshot_is_gone_is_coded_snapshot_missing(tmp_path: Pa
     Becomes: code="body_missing",
     """
     store = SessionStore(tmp_path)
-    state = SessionState(session_id=_SID, agent_id="a")
+    state = _logged_state(store)
 
     assert _rebuild_code(store, state, _request(_snapshot().snapshot_id)) == "snapshot_missing"
 
@@ -104,7 +114,7 @@ def test_a_request_with_no_readable_delta_is_coded_unreadable(tmp_path: Path) ->
     snapshot = _snapshot()
     state = SessionState(session_id=_SID, agent_id="a", context_snapshots=(snapshot,))
     event = _request(snapshot.snapshot_id)
-    del event["kept_message_count"]
+    del event["kept_entry_count"]
 
     assert _rebuild_code(store, state, event) == "unreadable"
 
@@ -117,13 +127,67 @@ def test_a_request_whose_bodies_do_not_parse_is_coded_unreadable(tmp_path: Path)
     tools = "not a tool list"
     _store_bodies(store, tools, _IDENTITY, _SLOW, _TURN)
     snapshot = _snapshot(tools)
-    state = SessionState(session_id=_SID, agent_id="a", context_snapshots=(snapshot,))
+    state = _logged_state(store, snapshot)
 
     assert _rebuild_code(store, state, _request(snapshot.snapshot_id)) == "unreadable"
     # The same record with a tool list that parses rebuilds: what raised is the parse.
     _store_bodies(store, _TOOLS)
-    fine = SessionState(session_id=_SID, agent_id="a", context_snapshots=(_snapshot(),))
-    assert len(rebuild_requests(store, fine, [_request(_snapshot().snapshot_id)])) == 1
+    fine = _logged_state(store, _snapshot())
+    rebuilt = rebuild_requests(store, fine, [_request(_snapshot().snapshot_id)])
+    assert [m.content for m in rebuilt[0].request.messages][-1] == "hello"
+
+
+def test_a_request_recorded_as_its_messages_text_is_refused_not_rebuilt(
+    tmp_path: Path,
+) -> None:
+    """A request logged before #2013 carries its conversation as message text, and no
+    log entries. It is refused as unreadable, in plain words, rather than rebuilt from
+    that copy -- which the log's own entries could not vouch for.
+
+    No single-line kill is declared: the refusal is overdetermined. The delta reads two
+    keys the old record lacks, and a message dict read in their place would not parse as
+    a `ContextEntry`, so each alone still refuses it. The test pins that an old record
+    is refused, and in plain words.
+    """
+    store = SessionStore(tmp_path)
+    _store_bodies(store, _TOOLS, _IDENTITY, _SLOW, _TURN)
+    snapshot = _snapshot()
+    state = _logged_state(store, snapshot)
+    old = _request(snapshot.snapshot_id)
+    del old["kept_entry_count"], old["appended_entries"]
+    old.update(kept_message_count=0, appended_messages=[{"role": "user", "content": "hello"}])
+
+    with pytest.raises(RequestRecordError) as raised:
+        rebuild_requests(store, state, [old])
+    assert raised.value.code == "unreadable"
+    # Plain copy: says what the reader lost, in the reader's terms.
+    assert str(raised.value) == (
+        "Part of this conversation's record could not be read, so a request in it "
+        "cannot be rebuilt."
+    )
+    # No internals: no field name, event type, path or digest reaches the sentence.
+    for internal in ("appended", "kept_", "REQUEST_CONTEXT", "#", "/", "sha", "e0"):
+        assert internal not in str(raised.value)
+
+
+def test_a_request_naming_an_entry_the_log_lacks_is_refused_plainly(tmp_path: Path) -> None:
+    """The conversation is rendered from the session log (#2013): an entry the log does
+    not have stops the request, in plain words, with no entry id or digest in them.
+    """
+    store = SessionStore(tmp_path)
+    _store_bodies(store, _TOOLS, _IDENTITY, _SLOW, _TURN)
+    snapshot = _snapshot()
+    state = _logged_state(store, snapshot)
+    event = _request(snapshot.snapshot_id, appended_entries=[{"entry": "e7", "form": "full"}])
+
+    with pytest.raises(RequestRecordError) as raised:
+        rebuild_requests(store, state, [event])
+    assert raised.value.code == "log_entry_missing"
+    assert "e7" in raised.value.detail
+    message = str(raised.value)
+    assert message and message[0].isupper() and message.endswith(".")
+    for internal in ("e7", "log entry", "digest", "/", "Error"):
+        assert internal not in message
 
 
 # --------------------------------------------------------------------------------------
@@ -166,8 +230,8 @@ def _epoch_code(store: SessionStore, state: SessionState) -> str:
 def test_an_epoch_naming_an_entry_the_log_lacks_is_coded_log_entry_missing(
     tmp_path: Path,
 ) -> None:
-    """Killed by: src/uclone_x/agent/request_record.py :: code="log_entry_missing",
-    Becomes: code="body_missing",
+    """Killed by: src/uclone_x/agent/request_record.py :: code="log_entry_missing",  # an entry the epoch names
+    Becomes: code="body_missing",  # an entry the epoch names
     """
     store = SessionStore(tmp_path)
     state = _epoch_state(

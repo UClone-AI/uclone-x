@@ -40,9 +40,15 @@ from uclone_x.errors import (
     MissingProvenanceError,
 )
 from uclone_x.llm import context_window as context_window_module
-from uclone_x.llm.compactor import estimate_message_tokens, resolve_model_context_limit
+from uclone_x.llm.compactor import estimate_message_tokens
+from uclone_x.llm.connectors.gemini import GeminiConnector
 from uclone_x.llm.connectors.ollama import OllamaConnector
-from uclone_x.llm.context_window import DEFAULT_OLLAMA_NUM_CTX, OllamaContextWindows
+from uclone_x.llm.connectors.vllm import VLLMConnector
+from uclone_x.llm.context_window import (
+    DEFAULT_OLLAMA_NUM_CTX,
+    ListedContextWindows,
+    OllamaContextWindows,
+)
 from uclone_x.llm.models import (
     ChatMessage,
     FinishReason,
@@ -1180,7 +1186,6 @@ def test_an_ollama_model_is_compacted_against_the_served_window_not_the_table(
     Killed by: src/uclone_x/llm/context_window.py :: SERVED_WINDOW_PROVIDERS: frozenset[str] = frozenset({"ollama"})
     Becomes: SERVED_WINDOW_PROVIDERS: frozenset[str] = frozenset({"vllm"})
     """
-    assert resolve_model_context_limit(_LLAMA) == _TABLE_WINDOW
     served_windows.remember(_OLLAMA_BASE, _LLAMA, _SERVED_WINDOW)
     agent = _ollama_agent(served_windows, model_name=_LLAMA)
     history = _history_between_the_two_thresholds()
@@ -1199,7 +1204,7 @@ def test_an_ollama_window_the_daemon_has_not_reported_is_the_one_sent_not_the_ta
     let the daemon truncate silently (P6).
 
     Killed by: src/uclone_x/llm/context_window.py :: sent = configured_tokens if configured_tokens is not None else default_ollama_num_ctx()
-    Becomes: sent = configured_tokens if configured_tokens is not None else resolve_model_context_limit(model)
+    Becomes: sent = configured_tokens if configured_tokens is not None else 128_000
     """
     agent = _ollama_agent(served_windows, model_name=_LLAMA)
 
@@ -1420,3 +1425,208 @@ async def test_the_compaction_check_reads_the_served_window_before_counting(
 
     assert daemon.ps_reads == 1
     assert agent._context_window() == _SERVED_WINDOW  # pyright: ignore[reportPrivateUsage]
+
+
+# --- #1978: a hosted model is compacted against the window its provider's listing reports --
+
+#: A figure no table in this repository holds, so a test reading it can only have read the
+#: listing. `gemini-2.0-flash` is used because the deleted tables both had a row for it
+#: (1,048,576 in one, 1,000,000 in the other), and neither may answer for it any more.
+_LISTED_MODEL = "gemini-2.0-flash"
+_LISTED_WINDOW = 20_000
+
+
+class _FakeGeminiListing:
+    """Answers `models.list` with one chat model and its `inputTokenLimit`."""
+
+    def __init__(self) -> None:
+        self.listing_reads = 0
+
+    def handler(self, request: httpx.Request) -> httpx.Response:
+        assert request.url.path.endswith("/models")
+        self.listing_reads += 1
+        return httpx.Response(
+            200,
+            json={
+                "models": [
+                    {
+                        "name": f"models/{_LISTED_MODEL}",
+                        "inputTokenLimit": _LISTED_WINDOW,
+                        "supportedGenerationMethods": ["generateContent"],
+                    }
+                ]
+            },
+        )
+
+
+def _gemini_agent(
+    store: ListedContextWindows, listing: _FakeGeminiListing, **llm_config: Any
+) -> BaseAgent:
+    connector = GeminiConnector(
+        api_key="k",
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(listing.handler)),
+        context_windows=store,
+    )
+    return BaseAgent(
+        config=AgentConfig(
+            agent_id="hosted",
+            name="Hosted",
+            llm_config=AgentLLMConfig(**llm_config),
+        ),
+        llm=connector,
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_gemini_model_is_compacted_against_the_window_its_listing_reports() -> None:
+    """The window comes from Gemini's `inputTokenLimit`, through `context_window.py` (#1978).
+
+    The compactor's own model table said 1,000,000 for this model, so a history of about
+    25,000 tokens was nowhere near its trigger. The listing says 20,000, so it is over 70%
+    of it, and the check reads the listing before counting.
+
+    Killed by: src/uclone_x/agent/base.py :: listed=store if isinstance(store, ListedContextWindows) else None,
+    Becomes: listed=None,
+    Killed by: src/uclone_x/llm/connectors/gemini.py :: self._windows.remember(self.provider_name, await self.list_models())
+    Becomes: await self.list_models()
+    """
+    store = ListedContextWindows()
+    listing = _FakeGeminiListing()
+    agent = _gemini_agent(store, listing, model_name=_LISTED_MODEL)
+    history = [ChatMessage(role=MessageRole.USER, content="x" * 100_000)]
+    assert int(_LISTED_WINDOW * 0.7) < estimate_message_tokens(history) < 60_000
+
+    assert agent._context_window() is None  # pyright: ignore[reportPrivateUsage]
+    await agent._observe_context_window()  # pyright: ignore[reportPrivateUsage]
+
+    assert listing.listing_reads == 1
+    assert agent._context_window() == _LISTED_WINDOW  # pyright: ignore[reportPrivateUsage]
+    assert agent._should_compact_session("s", history) is True  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_a_model_the_listing_does_not_name_has_no_window_and_compacts_at_the_threshold() -> (
+    None
+):
+    """An unlisted model's window is unknown, never a family default, and the listing is
+    asked once, not once per compaction check. With no window, the trigger is the configured
+    `compaction_threshold_tokens`.
+
+    Killed by: src/uclone_x/llm/context_window.py :: return hosted_context_window(provider, model, listed=listed)
+    Becomes: return 1_000_000
+    Killed by: src/uclone_x/llm/connectors/gemini.py :: if held is not None or self._listing_read:
+    Becomes: if held is not None:
+    """
+    store = ListedContextWindows()
+    listing = _FakeGeminiListing()
+    agent = _gemini_agent(
+        store, listing, model_name="gemini-unlisted", compaction_threshold_tokens=1_000
+    )
+    history = [ChatMessage(role=MessageRole.USER, content="x" * 8_000)]
+    assert estimate_message_tokens(history) > 1_000
+
+    await agent._observe_context_window()  # pyright: ignore[reportPrivateUsage]
+    await agent._observe_context_window()  # pyright: ignore[reportPrivateUsage]
+
+    assert listing.listing_reads == 1
+    assert agent._context_window() is None  # pyright: ignore[reportPrivateUsage]
+    assert agent._should_compact_session("s", history) is True  # pyright: ignore[reportPrivateUsage]
+
+
+# --- #1983: vLLM context window from `/v1/models` `max_model_len` ---------------------
+
+_VLLM_LISTED_MODEL = "Qwen/Qwen2.5-7B-Instruct"
+_VLLM_LISTED_WINDOW = 32_768
+
+
+class _FakeVLLMListing:
+    """Answers `/v1/models` with one chat model and its `max_model_len`."""
+
+    def __init__(self) -> None:
+        self.listing_reads = 0
+
+    def handler(self, request: httpx.Request) -> httpx.Response:
+        assert request.url.path.endswith("/models")
+        self.listing_reads += 1
+        return httpx.Response(
+            200,
+            json={
+                "object": "list",
+                "data": [
+                    {
+                        "id": _VLLM_LISTED_MODEL,
+                        "max_model_len": _VLLM_LISTED_WINDOW,
+                    }
+                ],
+            },
+        )
+
+
+def _vllm_agent(
+    store: ListedContextWindows, listing: _FakeVLLMListing, **llm_config: Any
+) -> BaseAgent:
+    connector = VLLMConnector(
+        base_url="http://localhost:8000",
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(listing.handler)),
+        context_windows=store,
+    )
+    return BaseAgent(
+        config=AgentConfig(
+            agent_id="hosted",
+            name="Hosted",
+            llm_config=AgentLLMConfig(**llm_config),
+        ),
+        llm=connector,
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_vllm_model_is_compacted_against_the_window_its_listing_reports() -> None:
+    """The window comes from vLLM's `max_model_len`, through `context_window.py` (#1983).
+
+    Before observation, the context window is unknown (None) and compaction at 24k tokens
+    does not trigger (threshold default is 60k). After observation, the window is 32768,
+    and a history exceeding 70% of 32768 (~24k tokens) triggers compaction.
+
+    Killed by: src/uclone_x/llm/connectors/vllm.py :: self._windows.remember(self.provider_name, await self.list_models())
+    Becomes: await self.list_models()
+    """
+    store = ListedContextWindows()
+    listing = _FakeVLLMListing()
+    agent = _vllm_agent(store, listing, model_name=_VLLM_LISTED_MODEL)
+    history = [ChatMessage(role=MessageRole.USER, content="x" * 100_000)]
+    assert int(_VLLM_LISTED_WINDOW * 0.7) < estimate_message_tokens(history) < 60_000
+
+    assert agent._context_window() is None  # pyright: ignore[reportPrivateUsage]
+    assert agent._should_compact_session("s", history) is False  # pyright: ignore[reportPrivateUsage]
+    await agent._observe_context_window()  # pyright: ignore[reportPrivateUsage]
+
+    assert listing.listing_reads == 1
+    assert agent._context_window() == _VLLM_LISTED_WINDOW  # pyright: ignore[reportPrivateUsage]
+    assert agent._should_compact_session("s", history) is True  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_a_vllm_model_the_listing_does_not_name_has_no_window_and_compacts_at_the_threshold() -> (
+    None
+):
+    """An unlisted model's window is unknown, never a default, and the listing is
+    asked once, not once per compaction check.
+
+    Killed by: src/uclone_x/llm/connectors/vllm.py :: if held is not None or self._listing_read:
+    Becomes: if held is not None:
+    """
+    store = ListedContextWindows()
+    listing = _FakeVLLMListing()
+    agent = _vllm_agent(
+        store, listing, model_name="vllm-unlisted", compaction_threshold_tokens=1_000
+    )
+    history = [ChatMessage(role=MessageRole.USER, content="x" * 8_000)]
+    assert estimate_message_tokens(history) > 1_000
+
+    await agent._observe_context_window()  # pyright: ignore[reportPrivateUsage]
+    await agent._observe_context_window()  # pyright: ignore[reportPrivateUsage]
+
+    assert listing.listing_reads == 1
+    assert agent._context_window() is None  # pyright: ignore[reportPrivateUsage]
+    assert agent._should_compact_session("s", history) is True  # pyright: ignore[reportPrivateUsage]

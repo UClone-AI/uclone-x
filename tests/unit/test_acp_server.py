@@ -21,6 +21,7 @@ from uclone_x.agent.persona_registry import PersonaRegistry
 from uclone_x.agent.persona_store import DEFAULT_PERSONA_NAME
 from uclone_x.agent.session import SessionState, SessionStore
 from uclone_x.cli.commands.acp import one_seat_acp_server
+from uclone_x.core.agent_home import seat_id_for
 from uclone_x.core.provenance import ExecutionPath, Provenance, ServiceRef
 from uclone_x.engine.event_bus import AgentEvent, EventBus, EventType
 from uclone_x.llm.connectors.base import BaseLLMConnector
@@ -1235,6 +1236,47 @@ async def test_acp_refused_turn_is_not_reported_completed_with_empty_output() ->
 
 
 @pytest.mark.asyncio
+async def test_acp_refused_step_is_said_in_the_locale_language(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A refused step carries its code, and a client on a Korean locale is sent the Korean
+    sentence rather than Core's English (#1862).
+
+    Killed by: src/uclone_x/shells/acp/server.py :: error = refusal_text(turn_result.error_code, language)
+    Becomes: error = turn_result.error
+    """
+    from uclone_x.core.tool_results import STEP_REFUSAL_TEXT
+    from uclone_x.i18n.language import LOCALE_ENV_VARS
+    from uclone_x.i18n.refusals import refusal_text
+
+    for name in LOCALE_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("LANG", "ko_KR.UTF-8")
+
+    async def refuse(prompt: str) -> TurnResult:
+        return TurnResult(
+            turn_index=1,
+            content="",
+            error=STEP_REFUSAL_TEXT["step.no_room_no_compaction"],
+            error_code="step.no_room_no_compaction",
+            stop_reason="step_results_over_window",
+            provenance=Provenance.primary("fake"),
+        )
+
+    agents: list[_FakeSessionAgent] = []
+    server = ACPServer(agent_factory=_fake_factory(agents, refuse))
+    sent = _capture(server)
+
+    await server.dispatch_method("new_session", {"sessionId": "full"}, req_id=1)
+    await _prompt(server, "full", "read everything", req_id=2)
+
+    final, _ = _final_and_texts(sent, 2)
+    message = final[0]["error"]["message"]
+    assert message == refusal_text("step.no_room_no_compaction", "ko")
+    assert message != STEP_REFUSAL_TEXT["step.no_room_no_compaction"]
+
+
+@pytest.mark.asyncio
 async def test_acp_model_without_tools_is_answered_with_its_remedy() -> None:
     """The turn's error for a model without tools names the model and the remedy, and is
     written for the user, so the client gets it rather than "the turn failed".
@@ -1628,6 +1670,8 @@ async def test_acp_cancelled_turn_that_is_still_running_keeps_its_agent() -> Non
 
     Killed by: src/uclone_x/shells/acp/server.py :: task = self.get_in_flight_task(session_id)
     Becomes: task = self._in_flight_tasks.pop(session_id, None)
+    Killed by: src/uclone_x/shells/acp/server.py :: self._in_flight_tasks.pop(session_id, None)
+    Becomes: pass
     """
     agents: list[_FakeSessionAgent] = []
     gate = asyncio.Event()
@@ -1666,6 +1710,7 @@ async def test_acp_cancelled_turn_that_is_still_running_keeps_its_agent() -> Non
     assert task is not None
     await task
     assert not server.is_turn_in_flight("one")
+    assert server.get_in_flight_task("one") is None
 
 
 # --------------------------------------------------------------------------------------
@@ -1727,8 +1772,8 @@ async def test_acp_new_session_whose_agent_cannot_be_built_is_answered_plainly_o
 ):
     """The client receives exactly one JSON-RPC error, in words, for a failed build.
 
-    Killed by: src/uclone_x/shells/acp/server.py :: await self.send_response(result)
-    Becomes: await self.send_response({"jsonrpc": "2.0", "id": req_id, "result": result})
+    Killed by: src/uclone_x/shells/acp/server.py :: return make_jsonrpc_error(req_id, INTERNAL_ERROR, CANNOT_START_MESSAGE)  # build failed
+    Becomes: return None
     """
     agents: list[_FakeSessionAgent] = []
     server = ACPServer(agent_factory=_factory_failing_from(agents, 0))
@@ -1846,15 +1891,17 @@ def _memory_ids_opened(monkeypatch: pytest.MonkeyPatch, argv: list[str]) -> list
 def test_acp_serve_keeps_memory_under_the_persona_name_by_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """`ucx acp serve` with no `--agent-id` keeps memory under the persona's name.
+    """`ucx acp serve` with no `--agent-id` keeps memory under the persona's clone.
 
-    The desktop app keys each agent by its persona's name, and the agent id names the
-    memory store; the old default, `default`, kept the editor's memory apart from the app's.
+    The desktop app keys each agent by its persona's clone id (clone-data-scopes §4 step
+    3), and the agent id names the memory store; the old default, `default`, kept the
+    editor's memory apart from the app's.
 
     Killed by: src/uclone_x/cli/commands/acp.py :: agent_id: Annotated[str | None, typer.Option("--agent-id", help=AGENT_ID_HELP)] = None,
     Becomes: agent_id: Annotated[str | None, typer.Option("--agent-id", help=AGENT_ID_HELP)] = "default",
     """
-    assert _memory_ids_opened(monkeypatch, ["acp", "serve"]) == [DEFAULT_PERSONA_NAME]
+    opened = _memory_ids_opened(monkeypatch, ["acp", "serve"])
+    assert opened == [seat_id_for(DEFAULT_PERSONA_NAME)]
 
 
 def test_acp_server_alias_keeps_memory_under_the_persona_name_by_default(
@@ -1865,7 +1912,8 @@ def test_acp_server_alias_keeps_memory_under_the_persona_name_by_default(
     Killed by: src/uclone_x/cli/main.py :: agent_id: str | None = typer.Option(None, "--agent-id", help=ACP_AGENT_ID_HELP),
     Becomes: agent_id: str | None = typer.Option("default", "--agent-id", help=ACP_AGENT_ID_HELP),
     """
-    assert _memory_ids_opened(monkeypatch, ["acp-server"]) == [DEFAULT_PERSONA_NAME]
+    opened = _memory_ids_opened(monkeypatch, ["acp-server"])
+    assert opened == [seat_id_for(DEFAULT_PERSONA_NAME)]
 
 
 def test_acp_serve_keeps_an_explicit_agent_id(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1991,3 +2039,33 @@ async def test_acp_cli_server_reads_the_names_from_the_session_s_room(tmp_path: 
     names = server._turn_person_names("named")  # pyright: ignore[reportPrivateUsage]
 
     assert names == (ONE_SEAT_HUMAN_ID, "Kenny")
+
+
+@pytest.mark.asyncio
+async def test_acp_turn_execution_unexpected_exception_logs_cause(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An unexpected exception in _execute_turn logs at exception level with cause (#1502).
+
+    Killed by: src/uclone_x/shells/acp/server.py :: logger.exception("Error executing turn for session %s: %s", session_id, exc)
+    Becomes: pass
+    """
+    agents: list[_FakeSessionAgent] = []
+
+    async def raises_boom(prompt: str) -> TurnResult:
+        raise RuntimeError("boom-turn-failure")
+
+    server = ACPServer(agent_factory=_fake_factory(agents, raises_boom))
+    _capture(server)
+
+    with caplog.at_level("ERROR"):
+        await server.dispatch_method("new_session", {"sessionId": "err_sess"}, req_id=1)
+        resp = await server.dispatch_method(
+            "prompt", {"sessionId": "err_sess", "prompt": "go"}, req_id=2
+        )
+        assert resp is None
+        task = server.get_in_flight_task("err_sess")
+        if task is not None:
+            await task
+
+    assert any("boom-turn-failure" in r.message for r in caplog.records)

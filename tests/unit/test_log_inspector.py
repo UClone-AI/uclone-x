@@ -1,9 +1,8 @@
-"""Unit tests for log inspection, filtering, and application logging setup."""
+"""Unit tests for log inspection and filtering."""
 
 from __future__ import annotations
 
 import json
-import logging
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -14,9 +13,6 @@ from uclone_x.core.log_inspector import (
     get_log_file,
     parse_log_line,
     read_logs,
-)
-from uclone_x.core.logging_setup import (
-    setup_application_logging,
 )
 
 
@@ -147,21 +143,3 @@ def test_read_logs_filtering_and_tail() -> None:
 def test_read_logs_nonexistent_file() -> None:
     entries = read_logs(Path("/nonexistent/ucx.log"))
     assert entries == []
-
-
-def test_setup_application_logging() -> None:
-    with TemporaryDirectory() as tmp:
-        log_dir = Path(tmp)
-        setup_application_logging(
-            log_dir=log_dir, log_level="INFO", enable_console=False, enable_file=True
-        )
-
-        test_logger = logging.getLogger("test_logger")
-        test_logger.info("Application started")
-        test_logger.debug("Should be filtered out")
-
-        log_file = log_dir / "ucx.log"
-        assert log_file.is_file()
-        content = log_file.read_text(encoding="utf-8")
-        assert "Application started" in content
-        assert "Should be filtered out" not in content

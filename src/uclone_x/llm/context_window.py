@@ -23,15 +23,22 @@ the `num_ctx` sent, clamped by the window the model was trained for -- and the c
 from the server, for the model it has loaded.** There is no table of local models, because
 a table cannot know what the daemon decided.
 
-**Hosted providers are the opposite case.** An Anthropic or OpenAI model's window is a
-published figure the API enforces exactly; there is no per-installation choice to observe,
-and no endpoint that reports one. For those a declared table *is* the measurement.
+**Hosted providers are the opposite case.** A hosted model's window is a figure the API
+enforces exactly; there is no per-installation choice to observe. Where the provider's own
+model listing reports it -- Gemini's `inputTokenLimit`, Anthropic's `max_input_tokens` --
+that listing is the source (`ListedContextWindows`, fed by the model catalogue, #1978).
+A table of ids goes stale at the next retirement, which is how Gemini's rows came to name
+only shut-down `gemini-1.5-*` models.
+`PUBLISHED_CONTEXT_WINDOWS` remains for a model the listing does not describe: OpenAI's
+listing reports no window at all, and an Anthropic id served through Bedrock or Vertex never
+appears in Anthropic's own listing.
 
 **The compaction trigger reads the same figures (#1372).** `compaction_window` is the one
 resolver `BaseAgent` uses for the trigger and for the step result budget. It used to read
-`MODEL_CONTEXT_WINDOWS` for every provider, so a `llama3*` model was compacted at 70% of
-128,000 while the daemon served 32,768, and between the two every turn was cut from the
-front by the daemon with no compaction and no ledger.
+the compactor's own model table for every provider, so a `llama3*` model was compacted at
+70% of 128,000 while the daemon served 32,768, and between the two every turn was cut from
+the front by the daemon with no compaction and no ledger. That second table is gone
+(#1978): a hosted window is resolved here, by `hosted_context_window`, and nowhere else.
 
 The hosted path has no provider default: a context window that is somewhat wrong is a ring
 drawn to the wrong fraction, and the reader cannot tell. An unrecognised hosted model
@@ -43,23 +50,31 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Literal, cast
+import re
+from collections.abc import Iterable
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import httpx
 
-from uclone_x.llm.compactor import resolve_model_context_limit
+from uclone_x.llm.providers import canonical_provider
+
+if TYPE_CHECKING:
+    from uclone_x.llm.catalog import CatalogEntry
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
     "DEFAULT_OLLAMA_NUM_CTX",
+    "LISTED_CONTEXT_WINDOWS",
     "PUBLISHED_CONTEXT_WINDOWS",
     "ContextWindow",
+    "ListedContextWindows",
     "OllamaContextWindows",
     "OLLAMA_CONTEXT_WINDOWS",
     "SERVED_WINDOW_PROVIDERS",
     "compaction_window",
     "default_ollama_num_ctx",
+    "hosted_context_window",
     "ollama_model_key",
     "published_context_window",
 ]
@@ -124,7 +139,8 @@ class ContextWindow:
         return f"ContextWindow(tokens={self.tokens}, source={self.source!r})"
 
 
-#: Context windows the provider publishes and its API enforces, in tokens.
+#: Context windows the provider publishes and its API enforces, in tokens, for a model its
+#: own listing does not describe. A listed figure wins over a row here (`hosted_context_window`).
 #:
 #: Deliberately no `"default"` key on any provider, unlike `PRICING_TABLE`. See the module
 #: docstring: an unknown model's window is unknown, and a ring has no honest way to show a
@@ -132,7 +148,9 @@ class ContextWindow:
 #:
 #: `ollama` and `vllm` are absent on purpose and must stay absent. Both serve whatever the
 #: operator loaded, at whatever window that server chose, so any figure written here would
-#: be a claim about someone else's machine.
+#: be a claim about someone else's machine. `gemini` is absent as well (#1978): its listing
+#: reports every model's `inputTokenLimit`, so a row here could only disagree with it or go
+#: stale, and before #1978 its rows named only retired `gemini-1.5-*` and `2.0` models.
 PUBLISHED_CONTEXT_WINDOWS: dict[str, dict[str, int]] = {
     "openai": {
         "gpt-4o": 128_000,
@@ -167,29 +185,29 @@ PUBLISHED_CONTEXT_WINDOWS: dict[str, dict[str, int]] = {
         "claude-3-haiku": 200_000,
         "claude-3-7-sonnet": 200_000,
     },
-    "gemini": {
-        "gemini-1.5-pro": 2_097_152,
-        "gemini-1.5-flash": 1_048_576,
-        "gemini-2.0-flash": 1_048_576,
-    },
-    "google-genai": {
-        "gemini-1.5-pro": 2_097_152,
-        "gemini-1.5-flash": 1_048_576,
-        "gemini-2.0-flash": 1_048_576,
-    },
 }
 
 #: Delimiters a model tag is split on: a dated or versioned tag (`gpt-4o-mini-2024-07-18`) must match `gpt-4o-mini` and not `gpt-4o`.
-_DELIMITERS: frozenset[str] = frozenset({"-", ".", ":", "_", "/"})
+#: `@` is Google Vertex's: it names a Claude snapshot as `claude-opus-4-5@20251101`
+#: (Anthropic's "Claude on Google Cloud" model table, read 2026-09-28).
+_DELIMITERS: frozenset[str] = frozenset({"-", ".", ":", "_", "/", "@"})
+
+#: Amazon Bedrock's provider prefix, optionally behind a cross-region inference profile's
+#: geography: `anthropic.claude-opus-5-5`, `anthropic.claude-sonnet-4-5-20250929-v1:0`,
+#: `us.anthropic.claude-sonnet-4-5-20250929-v1:0`, `global.anthropic.claude-opus-4-6-v1`
+#: (Anthropic's two Bedrock pages and AWS's inference-profile page, read 2026-09-28). The
+#: geography is matched by shape rather than listed, so a new one does not fall out.
+_BEDROCK_PREFIX = re.compile(r"^(?:[a-z][a-z-]*\.)?anthropic\.")
 
 
 def _normalize_model_name(model: str | None) -> str:
-    """Strip gateway and fine-tune prefixes."""
+    """Strip gateway, Bedrock and fine-tune prefixes."""
     if not model:
         return ""
     name = model.strip().lower()
     if "/" in name:
         name = name.split("/")[-1]
+    name = _BEDROCK_PREFIX.sub("", name, count=1)
     if name.startswith("ft:"):
         parts = name.split(":")
         if len(parts) > 1 and parts[1]:
@@ -222,6 +240,67 @@ def published_context_window(provider: str | None, model: str | None) -> int | N
                 best_len = key_len
                 found = tokens
     return found
+
+
+def _provider_key(provider: str) -> str:
+    """`provider` as the catalogue names it: `google` is `gemini`."""
+    return canonical_provider(provider) or provider.strip().lower()
+
+
+class ListedContextWindows:
+    """The window each model has in its provider's own model listing (#1978).
+
+    Filled from the catalogue (`uclone_x.llm.catalog.read_catalog`) whenever a listing is
+    read, and by a connector that reads its provider's listing for the model it is about to
+    send to (`GeminiConnector.observe_context_window`). A model is found by its id exactly,
+    as the listing spells it, and never by a prefix: a listing names every id it serves, so a
+    neighbour's figure would be a guess. A model the listing reports no window for is not
+    remembered, and its window stays unknown here.
+    """
+
+    def __init__(self) -> None:
+        self._listed: dict[tuple[str, str], int] = {}
+
+    def remember(self, provider: str, entries: Iterable[CatalogEntry]) -> None:
+        """Record the window of every entry that reports one."""
+        key = _provider_key(provider)
+        for entry in entries:
+            name = _normalize_model_name(entry.id)
+            tokens = entry.context_window
+            if name and tokens is not None and tokens > 0:
+                self._listed[(key, name)] = tokens
+
+    def get(self, provider: str | None, model: str | None) -> int | None:
+        """The listed window for `model`, or `None` when no listing read here reported one."""
+        if not provider:
+            return None
+        name = _normalize_model_name(model)
+        if not name:
+            return None
+        return self._listed.get((_provider_key(provider), name))
+
+
+#: The store the compaction trigger and the head read. One per process, like
+#: `OLLAMA_CONTEXT_WINDOWS`: a listing describes the provider, not any conversation.
+LISTED_CONTEXT_WINDOWS = ListedContextWindows()
+
+
+def hosted_context_window(
+    provider: str | None,
+    model: str | None,
+    *,
+    listed: ListedContextWindows | None = None,
+) -> int | None:
+    """A hosted model's window: its provider's listing first, then the published table.
+
+    `None` when neither knows the model; the caller says it does not know rather than
+    substituting a figure.
+    """
+    store = listed if listed is not None else LISTED_CONTEXT_WINDOWS
+    from_listing = store.get(provider, model)
+    if from_listing is not None:
+        return from_listing
+    return published_context_window(provider, model)
 
 
 def ollama_model_key(model: str) -> str:
@@ -334,6 +413,7 @@ def compaction_window(
     base_url: str | None,
     configured: int | None,
     store: OllamaContextWindows | None = None,
+    listed: ListedContextWindows | None = None,
 ) -> int | None:
     """The window an agent's compaction trigger and step budget count against (#1372).
 
@@ -347,7 +427,9 @@ def compaction_window(
     a claim about the operator's machine, and it is the figure that let the daemon truncate
     silently.
 
-    For any other provider, `configured` when set, else `MODEL_CONTEXT_WINDOWS`, as before.
+    For any other provider, `configured` when set, else `hosted_context_window`: the
+    provider's listing, then the published table, then `None` -- and with `None` the
+    trigger falls back to the configured `compaction_threshold_tokens`.
     """
     configured_tokens = configured if configured is not None and configured > 0 else None
     if (provider or "").strip().lower() in SERVED_WINDOW_PROVIDERS:
@@ -359,4 +441,4 @@ def compaction_window(
         return sent  # sent as num_ctx, so it is what the daemon serves
     if configured_tokens is not None:
         return configured_tokens
-    return resolve_model_context_limit(model)
+    return hosted_context_window(provider, model, listed=listed)

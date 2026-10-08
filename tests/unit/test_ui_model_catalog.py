@@ -1,12 +1,14 @@
-"""Settings shows the models the provider lists for this key, and nothing remembered (#1631).
+"""The model set holds what each connection lists for its key, and nothing remembered (#1631).
 
 The connector's `list_models` is replaced by a recorded listing, so what is checked is the
-wiring: which key and endpoint the listing is asked with, what `/api/settings` and
-`/api/models` return from it, and when a kept listing is asked for again.
+wiring: which key and endpoint each connection's listing is asked with, what `GET
+/api/models` returns from it (model-gateway §3.7.1), and when a kept listing is asked for
+again.
 """
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any, cast
 from unittest.mock import patch
@@ -15,12 +17,12 @@ import httpx
 import pytest
 
 from uclone_x.errors import ProviderAuthError
+from uclone_x.llm import gateway as gateway_module
+from uclone_x.llm import model_listing
 from uclone_x.llm.catalog import CatalogCache, CatalogEntry
 from uclone_x.llm.connectors.gemini import GeminiConnector
-from uclone_x.llm.connectors.mock import MockLLMConnector
-from uclone_x.llm.connectors.openai import OpenAIConnector
-from uclone_x.ui import app as app_module
-from uclone_x.ui.app import create_ui_app, list_local_models, read_provider_catalog
+from uclone_x.llm.model_listing import list_local_models, read_provider_catalog
+from uclone_x.ui.app import create_ui_app
 
 _LISTING = [
     CatalogEntry(id="gemini-2.5-pro", context_window=1048576),
@@ -31,7 +33,14 @@ _LISTING = [
 
 @pytest.fixture(autouse=True)
 def _no_model_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:  # pyright: ignore[reportUnusedFunction]
-    for name in ("GEMINI_MODEL", "LLM_PROVIDER", "GEMINI_API_KEY", "GOOGLE_API_KEY"):
+    for name in (
+        "GEMINI_MODEL",
+        "LLM_PROVIDER",
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
+        "VLLM_API_KEY",
+        "VLLM_BASE_URL",
+    ):
         monkeypatch.delenv(name, raising=False)
 
 
@@ -63,32 +72,44 @@ async def _get(app: Any, path: str) -> dict[str, Any]:
     return cast(dict[str, Any], res.json())
 
 
+def _app(tmp_path: Path, settings: dict[str, Any]) -> Any:
+    storage = tmp_path / "sessions"
+    storage.mkdir(parents=True, exist_ok=True)
+    (storage / "settings.json").write_text(json.dumps(settings), encoding="utf-8")
+    return create_ui_app(static_dir=tmp_path / "static", storage_dir=storage)
+
+
+_GEMINI = {"connections": [{"id": "gemini", "kind": "gemini", "key": "AIza-test-key"}]}
+
+
 @pytest.mark.asyncio
-async def test_settings_lists_what_the_provider_listed_and_suggests_from_it(
+async def test_the_model_set_holds_what_the_connection_listed_and_suggests_from_it(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """G1/G2: the picker holds the provider's chat models; no remembered id is shown.
+    """G1/G2: the picker holds the connection's chat models under their refs.
 
-    Killed by: src/uclone_x/ui/app.py :: settings["catalog"] = catalog.model_dump(mode="json") if catalog else None
-    Becomes: settings["catalog"] = None
-
-    Killed by: src/uclone_x/ui/app.py :: "llm_model": active_model or "",
-    Becomes: "llm_model": active_model or "gemini-1.5-pro",
+    Killed by: src/uclone_x/llm/gateway.py :: entries = [e for e in listing.entries if e.chat_capable]
+    Becomes: entries = list(listing.entries)
     """
     listing = _Listing(_LISTING)
     listing.install(monkeypatch)
-    app = create_ui_app(
-        static_dir=tmp_path, llm=GeminiConnector(api_key="AIza-test-key"), storage_dir=tmp_path
+    app = _app(tmp_path, _GEMINI)
+
+    data = await _get(app, "/api/models?capability=chat")
+
+    (group,) = data["groups"]
+    assert (group["connection_id"], group["kind"], group["status"]) == (
+        "gemini",
+        "gemini",
+        "connected",
     )
-
-    data = await _get(app, "/api/settings")
-
-    catalog = data["catalog"]
-    assert catalog["status"] == "live"
-    assert catalog["recommended"] == "gemini-2.5-flash"
-    assert [e["id"] for e in catalog["entries"]] == [e.id for e in _LISTING]
-    assert data["available_models"] == ["gemini-2.5-pro", "gemini-2.5-flash"]
-    assert data["llm_model"] == ""
+    assert [m["ref"] for m in group["models"]] == [
+        "gemini/gemini-2.5-pro",
+        "gemini/gemini-2.5-flash",
+    ]
+    assert group["models"][0]["context_window"] == 1048576
+    assert data["recommended"] == {"deep": "gemini/gemini-2.5-flash", "fast": None}
+    assert data["defaults"] == {"deep": None, "fast": None, "image": "auto"}
     assert listing.calls[0].api_key == "AIza-test-key"
 
 
@@ -96,41 +117,104 @@ async def test_settings_lists_what_the_provider_listed_and_suggests_from_it(
 async def test_a_kept_listing_is_reused_until_refresh_is_asked_for(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Killed by: src/uclone_x/ui/app.py :: catalog_cache.clear()  # the saved provider's "Refresh list"
+    """Killed by: src/uclone_x/llm/gateway.py :: self._catalog.clear()  # every connection is asked again
     Becomes: pass
     """
     listing = _Listing(_LISTING)
     listing.install(monkeypatch)
-    app = create_ui_app(
-        static_dir=tmp_path, llm=GeminiConnector(api_key="AIza-test-key"), storage_dir=tmp_path
-    )
+    app = _app(tmp_path, _GEMINI)
 
-    await _get(app, "/api/settings")
-    models = await _get(app, "/api/models")
+    await _get(app, "/api/models")
+    await _get(app, "/api/models")
     assert len(listing.calls) == 1
-    assert models["catalog"]["recommended"] == "gemini-2.5-flash"
 
     refreshed = await _get(app, "/api/models?refresh=1")
 
     assert len(listing.calls) == 2
-    assert refreshed["models"] == ["gemini-2.5-pro", "gemini-2.5-flash"]
+    assert [m["id"] for m in refreshed["groups"][0]["models"]] == [
+        "gemini-2.5-pro",
+        "gemini-2.5-flash",
+    ]
 
 
 @pytest.mark.asyncio
 async def test_a_refused_key_is_reported_and_no_models_are_offered(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """G3: no remembered list fills the picker when the provider refused to answer."""
+    """G3: no remembered list fills the group when the provider refused to answer."""
     _Listing(ProviderAuthError(provider="Google", model="")).install(monkeypatch)
-    app = create_ui_app(
-        static_dir=tmp_path, llm=GeminiConnector(api_key="AIza-test-key"), storage_dir=tmp_path
+    app = _app(tmp_path, _GEMINI)
+
+    (group,) = (await _get(app, "/api/models"))["groups"]
+
+    assert group["status"] == "key_rejected"
+    assert "did not accept the API key" in group["detail"]
+    assert group["models"] == []
+
+
+@pytest.mark.asyncio
+async def test_each_connection_is_asked_with_its_own_key_at_its_own_address(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """S3 as revised: a key goes only to its connection's address, and each keeps its listing.
+
+    Killed by: src/uclone_x/llm/model_listing.py :: cache_key = (cache_id or settings_id, endpoint or "", key_fingerprint(api_key))
+    Becomes: cache_key = (settings_id, "", "")
+    """
+    listing = _Listing(_LISTING)
+    listing.install(monkeypatch)
+    app = _app(
+        tmp_path,
+        {
+            "connections": [
+                {"id": "gemini", "kind": "gemini", "key": "AIza-home"},
+                {
+                    "id": "work",
+                    "kind": "gemini",
+                    "key": "AIza-work",
+                    "base_url": "https://proxy.invalid/v1beta",
+                },
+            ]
+        },
     )
 
-    data = await _get(app, "/api/settings")
+    data = await _get(app, "/api/models")
 
-    assert data["catalog"]["status"] == "key_rejected"
-    assert "did not accept the API key" in data["catalog"]["detail"]
-    assert data["available_models"] == []
+    sent = sorted((c.api_key, c.base_url) for c in listing.calls)
+    assert sent == [
+        ("AIza-home", GeminiConnector(api_key="k").base_url),
+        ("AIza-work", "https://proxy.invalid/v1beta"),
+    ]
+    assert [g["connection_id"] for g in data["groups"]] == ["gemini", "work"]
+
+
+@pytest.mark.asyncio
+async def test_a_mock_connection_lists_its_models(tmp_path: Path) -> None:
+    app = _app(tmp_path, {"connections": [{"id": "mock", "kind": "mock"}]})
+
+    (group,) = (await _get(app, "/api/models"))["groups"]
+
+    assert "mock/mock-llm" in [m["ref"] for m in group["models"]]
+
+
+@pytest.mark.asyncio
+async def test_another_site_cannot_spend_the_keys_on_a_listing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Killed by: src/uclone_x/ui/app.py :: _refuse_cross_origin(request)  # it asks every connection with its key
+    Becomes: pass
+    """
+    listing = _Listing(_LISTING)
+    listing.install(monkeypatch)
+    app = _app(tmp_path, _GEMINI)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
+    ) as client:
+        res = await client.get("/api/models", headers={"Origin": "https://evil.example"})
+
+    assert res.status_code == 403
+    assert listing.calls == []
 
 
 @pytest.mark.asyncio
@@ -169,26 +253,11 @@ async def test_a_custom_endpoint_is_where_the_listing_is_asked(
 
 
 @pytest.mark.asyncio
-async def test_a_local_server_keeps_its_installed_model_list(tmp_path: Path) -> None:
-    """Ollama, vLLM and the mock have no provider listing; their inventory is unchanged."""
-    app = create_ui_app(
-        static_dir=tmp_path,
-        llm=MockLLMConnector(api_key="sk-abcdef123456", base_url="http://mock-llm.invalid:8000"),
-        storage_dir=tmp_path,
-    )
-
-    data = await _get(app, "/api/settings")
-
-    assert data["catalog"] is None
-    assert "mock-llm" in data["available_models"]
-
-
-@pytest.mark.asyncio
 async def test_a_new_key_reads_the_listing_again(monkeypatch: pytest.MonkeyPatch) -> None:
     """A listing kept for one key is never shown for another: the new key may see other models.
 
-    Killed by: src/uclone_x/ui/app.py :: cache_key = (settings_id, endpoint or "", key_fingerprint(api_key))
-    Becomes: cache_key = (settings_id, endpoint or "", "")
+    Killed by: src/uclone_x/llm/model_listing.py :: cache_key = (cache_id or settings_id, endpoint or "", key_fingerprint(api_key))
+    Becomes: cache_key = (cache_id or settings_id, endpoint or "", "")
     """
     listing = _Listing(_LISTING)
     listing.install(monkeypatch)
@@ -201,135 +270,6 @@ async def test_a_new_key_reads_the_listing_again(monkeypatch: pytest.MonkeyPatch
     assert [c.api_key for c in listing.calls] == ["first-key", "second-key"]
 
 
-async def _post(
-    app: Any, path: str, body: dict[str, Any], headers: dict[str, str] | None = None
-) -> httpx.Response:
-    async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
-    ) as client:
-        return await client.post(path, json=body, headers=headers or {})
-
-
-@pytest.mark.asyncio
-async def test_a_picked_provider_is_listed_with_the_key_typed_on_the_form(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """#1657: Gemini picked while Ollama is saved shows Gemini's models before saving."""
-    listing = _Listing(_LISTING)
-    listing.install(monkeypatch)
-    app = create_ui_app(static_dir=tmp_path, llm=MockLLMConnector(), storage_dir=tmp_path)
-
-    res = await _post(app, "/api/models/catalog", {"provider": "gemini", "api_key": " AIza-typed "})
-
-    assert res.status_code == 200, res.text
-    data = res.json()
-    assert data["catalog"]["recommended"] == "gemini-2.5-flash"
-    assert data["models"] == ["gemini-2.5-pro", "gemini-2.5-flash"]
-    assert [c.api_key for c in listing.calls] == ["AIza-typed"]
-
-
-@pytest.mark.asyncio
-async def test_a_picked_provider_is_never_asked_with_another_providers_key(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The OpenAI key in use is not sent to Google to preview Gemini; Gemini's own env key is.
-
-    Killed by: src/uclone_x/ui/app.py :: api_key = typed_key or session_mgr.stored_api_key_for(provider, base_url)
-    Becomes: api_key = typed_key or session_mgr.stored_api_key_for("openai", base_url)
-
-    Killed by: src/uclone_x/ui/app.py :: saved = api_key_for(settings_data(self._settings_file), canonical)
-    Becomes: saved = api_key_for(settings_data(self._settings_file), "openai")
-    """
-    listing = _Listing(_LISTING)
-    listing.install(monkeypatch)
-    app = create_ui_app(
-        static_dir=tmp_path, llm=OpenAIConnector(api_key="sk-openai-in-use"), storage_dir=tmp_path
-    )
-
-    saved = await _post(
-        app, "/api/settings", {"llm_provider": "openai", "llm_api_key": "sk-saved-for-openai"}
-    )
-    assert saved.status_code == 200, saved.text
-    refused = (await _post(app, "/api/models/catalog", {"provider": "gemini"})).json()
-
-    assert refused["catalog"]["status"] == "no_key"
-    assert listing.calls == []
-
-    monkeypatch.setenv("GEMINI_API_KEY", "AIza-from-env")
-    await _post(app, "/api/models/catalog", {"provider": "gemini"})
-
-    assert [c.api_key for c in listing.calls] == ["AIza-from-env"]
-
-
-@pytest.mark.asyncio
-async def test_a_held_key_goes_only_to_the_endpoint_it_was_saved_with(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """An endpoint left on the form from another provider is not sent a held key.
-
-    Clicking Gemini while a vLLM box's address is still in the endpoint field must not send
-    `GEMINI_API_KEY` to that box, nor a key saved with one endpoint to another.
-
-    Killed by: src/uclone_x/ui/app.py :: if base_url is not None and not (
-    Becomes: if False and not (
-
-    Killed by: src/uclone_x/ui/app.py :: and base_url.rstrip("/") == (self._configured_base_url or "").rstrip("/")
-    Becomes: and True
-
-    Killed by: src/uclone_x/ui/app.py :: and same_provider(self._configured_provider, provider)
-    Becomes: and True
-    """
-    listing = _Listing(_LISTING)
-    listing.install(monkeypatch)
-    monkeypatch.setenv("GEMINI_API_KEY", "AIza-from-env")
-    app = create_ui_app(static_dir=tmp_path, llm=MockLLMConnector(), storage_dir=tmp_path)
-    proxy = "https://proxy.example/v1"
-
-    async def save(provider: str, key: str) -> None:
-        body = {"llm_provider": provider, "llm_api_key": key, "llm_base_url": proxy}
-        saved = await _post(app, "/api/settings", body)
-        assert saved.status_code == 200, saved.text
-
-    async def ask(base_url: str) -> None:
-        await _post(app, "/api/models/catalog", {"provider": "gemini", "base_url": base_url})
-
-    await ask("http://gpu-box:8000/v1")
-    await save("openai", "sk-saved-for-openai")
-    await ask(proxy)  # the endpoint saved with another provider's key
-    await save("gemini", "AIza-saved-for-proxy")
-    await ask("https://other.example/v1")
-    assert listing.calls == []
-
-    await ask(proxy + "/")
-    # The environment overrides the key saved in Settings, so its key is the one held.
-    assert [c.api_key for c in listing.calls] == ["AIza-from-env"]
-    monkeypatch.delenv("GEMINI_API_KEY")
-    await ask(proxy)
-    assert [c.api_key for c in listing.calls][-1] == "AIza-saved-for-proxy"
-
-
-@pytest.mark.asyncio
-async def test_another_site_cannot_spend_the_key_on_a_listing(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Killed by: src/uclone_x/ui/app.py :: _refuse_cross_origin(request)  # a page in another tab must not spend the user's key
-    Becomes: pass
-    """
-    listing = _Listing(_LISTING)
-    listing.install(monkeypatch)
-    app = create_ui_app(static_dir=tmp_path, llm=MockLLMConnector(), storage_dir=tmp_path)
-
-    res = await _post(
-        app,
-        "/api/models/catalog",
-        {"provider": "gemini", "api_key": "AIza-typed"},
-        headers={"Origin": "https://evil.example"},
-    )
-
-    assert res.status_code == 403
-    assert listing.calls == []
-
-
 @pytest.mark.asyncio
 async def test_a_local_server_that_does_not_answer_is_not_an_empty_one() -> None:
     """#1666: "nothing answered" and "nothing installed" are different answers.
@@ -337,7 +277,7 @@ async def test_a_local_server_that_does_not_answer_is_not_an_empty_one() -> None
     Settings says "is Ollama running?" for the first and "install a model" for the second;
     folded together, a stopped server read as an install with no models in it.
 
-    Killed by: src/uclone_x/ui/app.py :: return None  # something answered, but not Ollama's listing
+    Killed by: src/uclone_x/llm/model_listing.py :: return None  # something answered, but not Ollama's listing
     Becomes: return []
     """
 
@@ -352,7 +292,7 @@ async def test_a_local_server_that_does_not_answer_is_not_an_empty_one() -> None
 
     async def ask(url: str) -> list[str] | None:
         stub = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-        with patch("uclone_x.ui.app.httpx.AsyncClient", return_value=stub):
+        with patch("uclone_x.llm.model_listing.httpx.AsyncClient", return_value=stub):
             return await list_local_models("ollama", url)
 
     assert await ask("http://127.0.0.1:11435") is None
@@ -362,79 +302,38 @@ async def test_a_local_server_that_does_not_answer_is_not_an_empty_one() -> None
 
 
 @pytest.mark.asyncio
-async def test_a_picked_local_provider_lists_the_server_at_the_address_on_the_form(
+async def test_a_vllm_connection_is_sent_its_own_key_and_never_the_variable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """#1666: the Ollama picker is filled from the address typed, before it is saved.
+    """#1666, #1672 under connections: a box is sent the key saved on it, not `VLLM_API_KEY`.
 
-    Killed by: src/uclone_x/ui/app.py :: provider, base_url, vllm_headers=headers, raise_on_refused_key=True
-    Becomes: provider, None, vllm_headers=headers, raise_on_refused_key=True
-
-    Killed by: src/uclone_x/ui/app.py :: "reachable": local is not None,
-    Becomes: "reachable": True,
+    Killed by: src/uclone_x/llm/gateway.py :: vllm_headers=vllm_request_headers(conn.key, env_fallback=False),
+    Becomes: vllm_headers=vllm_request_headers(conn.key),
     """
-    asked: list[tuple[str, str | None]] = []
+    monkeypatch.setenv("VLLM_API_KEY", "sk-held-for-another-box")
+    sent: dict[str | None, Any] = {}
 
-    async def fake(provider: str, base_url: str | None = None, **_: object) -> list[str] | None:
-        asked.append((provider, base_url))
-        return ["qwen3:8b"] if base_url == "http://localhost:11434" else None
-
-    monkeypatch.setattr(app_module, "list_local_models", fake)
-    app = create_ui_app(static_dir=tmp_path, llm=MockLLMConnector(), storage_dir=tmp_path)
-
-    live = (
-        await _post(
-            app, "/api/models/catalog", {"provider": "ollama", "base_url": "http://localhost:11434"}
-        )
-    ).json()
-    dead = (
-        await _post(
-            app, "/api/models/catalog", {"provider": "ollama", "base_url": "http://127.0.0.1:11435"}
-        )
-    ).json()
-
-    assert live == {
-        "provider": "ollama",
-        "models": ["qwen3:8b"],
-        "reachable": True,
-        "catalog": None,
-    }
-    assert dead == {"provider": "ollama", "models": [], "reachable": False, "catalog": None}
-    assert asked == [("ollama", "http://localhost:11434"), ("ollama", "http://127.0.0.1:11435")]
-
-
-@pytest.mark.asyncio
-async def test_a_typed_vllm_address_is_not_sent_the_held_vllm_key(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """#1666: the form's address is fetched with no click, so a held key must not go with it.
-
-    Typing "http://gpu" and pausing would otherwise send `VLLM_API_KEY` to host `gpu`, or to a
-    typo'd domain. Only a key typed on the form goes there.
-
-    Killed by: src/uclone_x/ui/app.py :: headers = vllm_request_headers(api_key, env_fallback=False)
-    Becomes: headers = vllm_request_headers(api_key)
-    """
-    monkeypatch.setenv("VLLM_API_KEY", "sk-held-for-the-saved-box")
-    sent: list[dict[str, str] | None] = []
-
-    async def fake(
-        provider: str, base_url: str | None = None, **kw: dict[str, str] | None
-    ) -> list[str] | None:
-        sent.append(kw.get("vllm_headers"))
+    async def fake(provider: str, base_url: str | None = None, **kw: Any) -> list[str] | None:
+        sent[base_url] = kw.get("vllm_headers")
         return ["served-model"]
 
-    monkeypatch.setattr(app_module, "list_local_models", fake)
-    app = create_ui_app(static_dir=tmp_path, llm=MockLLMConnector(), storage_dir=tmp_path)
-
-    await _post(app, "/api/models/catalog", {"provider": "vllm", "base_url": "http://gpu:8000/v1"})
-    await _post(
-        app,
-        "/api/models/catalog",
-        {"provider": "vllm", "base_url": "http://gpu:8000/v1", "api_key": "sk-typed"},
+    monkeypatch.setattr(gateway_module, "list_local_models", fake)
+    app = _app(
+        tmp_path,
+        {
+            "connections": [
+                {"id": "vllm", "kind": "vllm", "base_url": "http://gpu:8000/v1", "key": "sk-own"},
+                {"id": "open-box", "kind": "vllm", "base_url": "http://open:8000/v1"},
+            ]
+        },
     )
 
-    assert sent == [{}, {"Authorization": "Bearer sk-typed"}]
+    await _get(app, "/api/models")
+
+    # `vllm` is the row the variable would override (S4): the saved row with that id is
+    # still sent the variable's key, and the other row is sent none.
+    assert sent["http://open:8000/v1"] == {}
+    assert sent["http://gpu:8000/v1"] == {"Authorization": "Bearer sk-held-for-another-box"}
 
 
 def _refusing_vllm(request: httpx.Request) -> httpx.Response:
@@ -451,13 +350,13 @@ async def test_a_vllm_server_that_refuses_the_key_is_not_reported_as_absent() ->
     Read as "no listing", the form said "No model list came back from <address>", which sends
     the user looking for a stopped server that is running.
 
-    Killed by: src/uclone_x/ui/app.py :: refused = resp.status_code in _KEY_REFUSED_STATUSES
+    Killed by: src/uclone_x/llm/model_listing.py :: refused = resp.status_code in _KEY_REFUSED_STATUSES
     Becomes: refused = False
     """
 
     async def ask(key: str, *, raising: bool) -> list[str] | None:
         stub = httpx.AsyncClient(transport=httpx.MockTransport(_refusing_vllm))
-        with patch("uclone_x.ui.app.httpx.AsyncClient", return_value=stub):
+        with patch("uclone_x.llm.model_listing.httpx.AsyncClient", return_value=stub):
             return await list_local_models(
                 "vllm",
                 "http://box:8000/v1",
@@ -467,85 +366,155 @@ async def test_a_vllm_server_that_refuses_the_key_is_not_reported_as_absent() ->
 
     assert await ask("sk-right", raising=True) == ["served-model"]
     assert await ask("sk-wrong", raising=False) is None
-    with pytest.raises(app_module.LocalKeyRefusedError):
+    with pytest.raises(model_listing.LocalKeyRefusedError):
         await ask("sk-wrong", raising=True)
 
 
 @pytest.mark.asyncio
-async def test_the_form_hears_that_the_vllm_server_refused_the_key(
+async def test_a_box_that_refuses_the_key_is_reported_as_refusing_and_checked_on_request(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """#1672: the listing route says `key_refused`, and still counts the server as reachable.
+    """#1672: a refused key is said as one, by the model set and by Check connection.
 
-    Killed by: src/uclone_x/ui/app.py :: "key_refused": True,
-    Becomes: "key_refused": False,
+    Killed by: src/uclone_x/llm/gateway.py :: listing = Listing("key_rejected", _KEY_REFUSED_LOCAL.format(label=label))
+    Becomes: listing = Listing("unreachable", None)
     """
 
     async def fake(provider: str, base_url: str | None = None, **_: object) -> list[str] | None:
-        raise app_module.LocalKeyRefusedError(base_url)
+        raise model_listing.LocalKeyRefusedError(base_url)
 
-    monkeypatch.setattr(app_module, "list_local_models", fake)
-    app = create_ui_app(static_dir=tmp_path, llm=MockLLMConnector(), storage_dir=tmp_path)
-
-    res = await _post(
-        app, "/api/models/catalog", {"provider": "vllm", "base_url": "http://box:8000/v1"}
+    monkeypatch.setattr(gateway_module, "list_local_models", fake)
+    app = _app(
+        tmp_path,
+        {"connections": [{"id": "box", "kind": "vllm", "base_url": "http://box:8000/v1"}]},
     )
 
-    assert res.json() == {
-        "provider": "vllm",
-        "models": [],
-        "reachable": True,
-        "key_refused": True,
-        "catalog": None,
+    (group,) = (await _get(app, "/api/models"))["groups"]
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
+    ) as client:
+        checked = (await client.post("/api/connections/box/check")).json()
+
+    assert (group["status"], group["models"]) == ("key_rejected", [])
+    assert checked["status"] == "key_rejected"
+    assert "did not accept the key" in checked["detail"]
+
+
+# -- Ollama's embedders are not conversation models (#2167 part 2) --
+
+_TAG_DETAILS_CHAT: dict[str, Any] = {"family": "qwen3", "families": ["qwen3"]}
+_TAG_DETAILS_BERT: dict[str, Any] = {"family": "bert", "families": ["bert"]}
+
+
+def _ollama(tags: list[dict[str, Any]], show: dict[str, list[str]] | None = None) -> Any:
+    """A test Ollama: `/api/tags` answers `tags`; `/api/show` answers `show[model]`, or a
+    body without `capabilities` (an older server) when the model is not in it."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/tags":
+            return httpx.Response(200, json={"models": tags})
+        if request.url.path == "/api/show":
+            name = json.loads(request.content)["model"]
+            body: dict[str, Any] = {"details": {}}
+            if show is not None and name in show:
+                body["capabilities"] = show[name]
+            return httpx.Response(200, json=body)
+        return httpx.Response(404)
+
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+
+async def _chat_flags(client: Any) -> dict[str, bool]:
+    with patch("uclone_x.llm.model_listing.httpx.AsyncClient", return_value=client):
+        entries = await model_listing.list_ollama_entries("http://127.0.0.1:11434")
+    assert entries is not None
+    return {e.id: e.chat_capable for e in entries}
+
+
+@pytest.mark.asyncio
+async def test_ollama_capabilities_in_the_listing_decide_chat() -> None:
+    """Ollama's own `capabilities` (since 0.6, in `/api/tags`) say `embedding` for an embedder.
+
+    Killed by: src/uclone_x/llm/model_listing.py :: _OLLAMA_CHAT_CAPABILITY in capabilities
+    Becomes: True
+    """
+    flags = await _chat_flags(
+        _ollama(
+            [
+                {"name": "qwen3:14b", "capabilities": ["completion", "tools"]},
+                {"name": "bge-m3:latest", "capabilities": ["embedding"]},
+            ]
+        )
+    )
+    assert flags == {"qwen3:14b": True, "bge-m3:latest": False}
+
+
+@pytest.mark.asyncio
+async def test_ollama_show_answers_when_the_listing_is_silent() -> None:
+    """A listing without `capabilities` asks `/api/show` for each model.
+
+    Killed by: src/uclone_x/llm/model_listing.py :: return await _ollama_show_capabilities(http_c, ollama_url, str(item["name"]))
+    Becomes: return None
+    """
+    flags = await _chat_flags(
+        _ollama(
+            # No family either, so only `/api/show` can tell these two apart.
+            [{"name": "qwen3:14b"}, {"name": "nomic-embed-text:latest"}],
+            show={"qwen3:14b": ["completion"], "nomic-embed-text:latest": ["embedding"]},
+        )
+    )
+    assert flags == {"qwen3:14b": True, "nomic-embed-text:latest": False}
+
+
+@pytest.mark.asyncio
+async def test_an_old_ollama_falls_back_to_the_family_it_reports() -> None:
+    """With neither field, the listing's family decides: a BERT encoder cannot chat.
+
+    The names here are chosen so no name rule could tell them apart.
+
+    Killed by: src/uclone_x/llm/model_listing.py :: else not _ollama_encoder_only(item)
+    Becomes: else True
+    """
+    flags = await _chat_flags(
+        _ollama(
+            [
+                {"name": "model-a:latest", "details": _TAG_DETAILS_BERT},
+                {"name": "model-b:latest", "details": {"family": "nomic-bert"}},
+                {"name": "model-c:latest", "details": _TAG_DETAILS_CHAT},
+                {"name": "model-d:latest"},  # the listing says nothing: offered, as before
+            ]
+        )
+    )
+    assert flags == {
+        "model-a:latest": False,
+        "model-b:latest": False,
+        "model-c:latest": True,
+        "model-d:latest": True,
     }
 
 
 @pytest.mark.asyncio
-async def test_check_connection_sends_vllm_key_only_to_the_endpoint_it_is_held_for(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """#1672: Check connection follows `stored_api_key_for`, like the listing does.
+async def test_the_conversation_set_leaves_ollama_embedders_out(tmp_path: Path) -> None:
+    """End to end: `GET /api/models?capability=chat` offers no embedding model.
 
-    A typed address gets only a typed key. The saved address gets the key held for it, here
-    `VLLM_API_KEY`, so an env-only key still reaches the server it belongs to. A refusal is
-    reported as one.
-
-    Killed by: src/uclone_x/ui/app.py :: headers=vllm_request_headers(vllm_key, env_fallback=False),
-    Becomes: headers=vllm_request_headers(vllm_key),
-
-    Killed by: src/uclone_x/ui/app.py :: vllm_key = eff_key or session_mgr.stored_api_key_for("vllm", eff_base)
-    Becomes: vllm_key = eff_key
-
-    Killed by: src/uclone_x/ui/app.py :: "key_refused": resp.status_code in _KEY_REFUSED_STATUSES,
-    Becomes: "key_refused": False,
+    Killed by: src/uclone_x/llm/gateway.py :: entries = await list_ollama_entries(conn.base_url)
+    Becomes: entries = [CatalogEntry(id=m) for m in (await list_local_models(conn.kind, conn.base_url) or [])]
     """
-    monkeypatch.setenv("VLLM_API_KEY", "sk-right")
-    saved_box = "http://box:8000/v1"
-    app = create_ui_app(static_dir=tmp_path, llm=MockLLMConnector(), storage_dir=tmp_path)
-    saved = await _post(app, "/api/settings", {"llm_provider": "vllm", "llm_base_url": saved_box})
-    assert saved.status_code == 200, saved.text
-    sent: list[str | None] = []
+    app = _app(
+        tmp_path,
+        {"connections": [{"id": "ollama", "kind": "ollama", "base_url": "http://127.0.0.1:11434"}]},
+    )
+    tags = [
+        {"name": "qwen3:14b", "capabilities": ["completion", "tools"]},
+        {"name": "bge-m3:latest", "capabilities": ["embedding"]},
+        {"name": "nomic-embed-text:latest", "capabilities": ["embedding"]},
+    ]
+    real_client = httpx.AsyncClient
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        sent.append(request.headers.get("Authorization"))
-        return _refusing_vllm(request)
+    def client(**kwargs: Any) -> Any:
+        # The test's own ASGI client is real; the listing's client talks to the test Ollama.
+        return real_client(**kwargs) if "transport" in kwargs else _ollama(tags)
 
-    async def check(base_url: str) -> dict[str, Any]:
-        stub = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-        body = {"target": "llm", "llm_provider": "vllm", "llm_base_url": base_url}
-        async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
-        ) as client:
-            # Only the route's own client is replaced; this one reaches the app.
-            with patch("uclone_x.ui.app.httpx.AsyncClient", return_value=stub):
-                res = await client.post("/api/settings/test", json=body)
-        return cast(dict[str, Any], res.json()["results"]["llm"])
-
-    typed = await check("http://typo-box:8000/v1")
-    held = await check(saved_box)
-
-    assert sent == [None, "Bearer sk-right"]
-    assert typed["status"] == "error"
-    assert typed["key_refused"] is True
-    assert held["status"] == "ok"
-    assert held["models"] == ["served-model"]
+    with patch("uclone_x.llm.model_listing.httpx.AsyncClient", side_effect=client):
+        (group,) = (await _get(app, "/api/models?capability=chat"))["groups"]
+    assert [m["ref"] for m in group["models"]] == ["ollama/qwen3:14b"]

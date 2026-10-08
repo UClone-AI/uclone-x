@@ -15,7 +15,7 @@ export const makeCloneChoice = (over: Partial<CloneChoice> = {}): CloneChoice =>
 });
 
 /**
- * A complete `/api/personas` entry (`src/uclone_x/ui/app.py` `list_personas`), all nine
+ * A complete `GET /api/clones` entry (`src/uclone_x/ui/app.py` `_persona_payload`), all nine
  * fields the backend returns, so a test overriding one field never accidentally exercises
  * a shape the endpoint does not send.
  */

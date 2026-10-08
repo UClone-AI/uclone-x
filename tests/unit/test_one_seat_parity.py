@@ -30,6 +30,9 @@ from typing import Any
 
 import pytest
 
+from tests.support.clones import make_clones
+from uclone_x.agent.clone_store import ensure_clone_store
+from uclone_x.agent.persona_store import BUILTIN_PERSONAS_DIR
 from uclone_x.core.provenance import ExecutionPath, Provenance, ServiceRef
 from uclone_x.llm.connectors.base import BaseLLMConnector
 from uclone_x.llm.models import (
@@ -129,6 +132,11 @@ def _clone_request(tmp: Path, *, other_seat: bool) -> tuple[LLMRequest, str]:
     llm = _RecordingLLM()
     with pytest.MonkeyPatch.context() as mp:
         mp.setenv(AGENTS_DIR_ENV_VAR, str(tmp / "agents"))
+        # Both are clones, as a name no clone carries is refused (clone-data-scopes §3.4):
+        # the clone is the installed builtin, so its persona's instructions are compared too;
+        # the other seat, whose request is not compared, is a bare one.
+        ensure_clone_store(None, builtin_dir=BUILTIN_PERSONAS_DIR)
+        make_clones(_OTHER)
         mgr = AgentSessionManager(
             storage_dir=tmp / "sessions", llm=llm, workspace_dir=tmp / "workspace"
         )

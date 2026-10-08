@@ -65,7 +65,11 @@ from uclone_x.llm.connectors.vllm import (
     VLLM_ENDPOINT_ENV_VARS,
     VLLMConnector,
 )
-from uclone_x.llm.context_window import DEFAULT_OLLAMA_NUM_CTX, OllamaContextWindows
+from uclone_x.llm.context_window import (
+    DEFAULT_OLLAMA_NUM_CTX,
+    ListedContextWindows,
+    OllamaContextWindows,
+)
 
 
 def _make_mock_client(handler: Callable[[httpx.Request], httpx.Response]) -> httpx.AsyncClient:
@@ -877,12 +881,12 @@ async def test_a_pull_that_keeps_reporting_is_not_killed_by_how_long_it_has_run(
     Killed by: src/uclone_x/llm/connectors/ollama.py :: backstop_at = loop.time() + total_timeout
     Becomes: backstop_at = loop.time() + silence_timeout
     """
-    silence = 0.05
+    silence = 0.08
     chunks = [(0.0, _progress("pulling manifest"))]
     chunks += [
-        (0.02, _progress("pulling 797b70c4edf8", completed=n * 2_000_000)) for n in range(20)
+        (0.005, _progress("pulling 797b70c4edf8", completed=n * 1_000_000)) for n in range(70)
     ]
-    chunks.append((0.02, _progress("success")))
+    chunks.append((0.005, _progress("success")))
 
     client = _ndjson_client(_TimedNdjsonStream(chunks))
     started = time.monotonic()
@@ -2207,7 +2211,7 @@ def test_factory_resolves_ollama_from_an_endpoint_variable(
 def test_the_guide_documented_indepth_endpoint_is_honoured(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A developer who followed `docs/local-development-guide.md` is not refused.
+    """A developer who followed `docs/public/getting-started.md` is not refused.
 
     That guide documents `OLLAMA_INDEPTH_BASE_URL` as part of the pre-configured 2-Tier
     setup, and `cli/commands/llm.py` reads it. #539 omitted it from
@@ -5882,6 +5886,111 @@ async def test_a_turn_with_no_model_anywhere_is_refused_rather_than_guessed() ->
             LLMRequest(messages=(ChatMessage(role=MessageRole.USER, content="hi"),))
         )
     assert "VLLM_MODEL" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_vllm_list_models_parses_max_model_len_into_context_window() -> None:
+    """vLLM reports `max_model_len` on each model entry, which becomes `context_window` (#1983).
+
+    A non-integer, bool, zero, or negative value leaves `context_window` as None.
+
+    Killed by: src/uclone_x/llm/connectors/vllm.py :: window: int | None = max_model_len
+    Becomes: window = None
+    """
+    listing = {
+        "object": "list",
+        "data": [
+            {
+                "id": "Qwen/Qwen2.5-7B-Instruct",
+                "max_model_len": 32768,
+                "created": 1700000000,
+            },
+            {
+                "id": "mistralai/Mistral-7B-v0.1",
+                "max_model_len": 0,
+            },
+            {
+                "id": "negative-len-model",
+                "max_model_len": -100,
+            },
+            {
+                "id": "bool-len-model",
+                "max_model_len": True,
+            },
+            {
+                "id": "str-len-model",
+                "max_model_len": "32768",
+            },
+            {
+                "id": "no-len-model",
+            },
+        ],
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path.endswith("/models")
+        return httpx.Response(200, json=listing)
+
+    connector = VLLMConnector(
+        base_url="http://localhost:8000",
+        http_client=_make_mock_client(handler),
+    )
+    entries = await connector.list_models()
+    by_id = {e.id: e for e in entries}
+
+    assert by_id["Qwen/Qwen2.5-7B-Instruct"].context_window == 32768
+    assert by_id["Qwen/Qwen2.5-7B-Instruct"].chat_capable is True
+    assert by_id["mistralai/Mistral-7B-v0.1"].context_window is None
+    assert by_id["negative-len-model"].context_window is None
+    assert by_id["bool-len-model"].context_window is None
+    assert by_id["str-len-model"].context_window is None
+    assert by_id["no-len-model"].context_window is None
+
+
+@pytest.mark.asyncio
+async def test_vllm_observe_context_window_populates_the_store() -> None:
+    """`observe_context_window` reads `/models` once and populates `ListedContextWindows` (#1983).
+
+    Killed by: src/uclone_x/llm/connectors/vllm.py :: return self._windows.get(self.provider_name, chosen)
+    Becomes: return None
+    """
+    reads = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal reads
+        assert request.url.path.endswith("/models")
+        reads += 1
+        return httpx.Response(
+            200,
+            json={
+                "object": "list",
+                "data": [
+                    {
+                        "id": "Qwen/Qwen2.5-7B-Instruct",
+                        "max_model_len": 32768,
+                    }
+                ],
+            },
+        )
+
+    store = ListedContextWindows()
+    connector = VLLMConnector(
+        base_url="http://localhost:8000",
+        http_client=_make_mock_client(handler),
+        context_windows=store,
+    )
+    assert connector.context_windows is store
+
+    # First observation reads listing and populates store
+    window = await connector.observe_context_window("Qwen/Qwen2.5-7B-Instruct")
+    assert window == 32768
+    assert reads == 1
+    assert store.get("vllm", "Qwen/Qwen2.5-7B-Instruct") == 32768
+
+    # Second observation reuses store without reading listing again
+    cached = await connector.observe_context_window("Qwen/Qwen2.5-7B-Instruct")
+    assert cached == 32768
+    assert reads == 1
 
 
 def test_the_factory_resolves_vllm_by_name_and_from_its_endpoint_variable(

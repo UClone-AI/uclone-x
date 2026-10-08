@@ -44,7 +44,6 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import os
 import re
 import time
 from datetime import UTC, datetime
@@ -187,32 +186,6 @@ class TestTheSessionStoreNeverWritesOverAnUnreadableRecord:
         _plain(str(caught.value))
         assert store.take_set_aside(SID) is False
 
-    def test_the_artifact_reaper_spares_a_session_kept_only_aside(self, tmp_path: Path) -> None:
-        """Its history names stored tool results by handle; a build that can read it needs them.
-
-        Killed by: src/uclone_x/agent/session.py :: return path.is_file() or bool(kept_copies(path))
-        Becomes: return path.is_file()
-        """
-        sessions = tmp_path / "sessions"
-        artifacts = tmp_path / "artifacts"
-        store = SessionStore(sessions, artifacts_dir=artifacts)
-        _newer_builds_record(store)
-        set_aside_unreadable(store.session_path(SID))
-        kept = artifacts / SID / "result.txt"
-        kept.parent.mkdir(parents=True)
-        kept.write_text("a tool result", encoding="utf-8")
-        hours_ago = time.time() - 6 * 3600
-        os.utime(kept.parent, (hours_ago, hours_ago))
-        orphan = artifacts / "sess_nobody" / "result.txt"
-        orphan.parent.mkdir(parents=True)
-        orphan.write_text("nobody's", encoding="utf-8")
-        os.utime(orphan.parent, (hours_ago, hours_ago))
-
-        SessionStore(sessions, artifacts_dir=artifacts)  # the reaper runs on construction
-
-        assert kept.read_text(encoding="utf-8") == "a tool result"
-        assert not orphan.exists()
-
 
 class TestTheSharedHelper:
     def test_a_copy_set_aside_in_the_same_instant_does_not_replace_the_first(
@@ -243,16 +216,15 @@ class TestTheSharedHelper:
         self, tmp_path: Path
     ) -> None:
         """The old whole-second name replaced the first quarantined copy with the second."""
-        path = tmp_path / "memory.json"
-        memory = CrossSessionMemory(storage_path=path)
+        path = tmp_path / "knowledge.sqlite3"
 
-        path.write_text("{ first unreadable", encoding="utf-8")
-        memory.load()
-        path.write_text("{ second unreadable", encoding="utf-8")
-        memory.load()
+        path.write_bytes(b"first unreadable" * 50)
+        CrossSessionMemory(storage_path=path)
+        path.write_bytes(b"second unreadable" * 50)
+        CrossSessionMemory(storage_path=path)
 
-        kept = sorted(p.read_text(encoding="utf-8") for p in set_aside_copies(path))
-        assert kept == ["{ first unreadable", "{ second unreadable"]
+        kept = sorted(p.read_bytes() for p in set_aside_copies(path))
+        assert kept == [b"first unreadable" * 50, b"second unreadable" * 50]
 
 
 class TestSettings:
@@ -445,8 +417,7 @@ class TestADeleteKeepsWhatAKeptCopyRefersTo:
         Killed by: src/uclone_x/agent/session.py :: if self._has_kept_copy(path):
         Becomes: if False:
         """
-        artifacts = tmp_path / "artifacts"
-        store = SessionStore(tmp_path / "sessions", artifacts_dir=artifacts)
+        store = SessionStore(tmp_path / "sessions")
         _newer_builds_record(store)
         body = "a layer body the kept copy's snapshot names"
         digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
@@ -455,9 +426,7 @@ class TestADeleteKeepsWhatAKeptCopyRefersTo:
         assert log is not None
         log.parent.mkdir(parents=True, exist_ok=True)
         log.write_text('{"event": "kept"}\n', encoding="utf-8")
-        result = artifacts / SID / "result.txt"
-        result.parent.mkdir(parents=True)
-        result.write_text("a tool result", encoding="utf-8")
+        result = _kept_tool_result(store)
 
         assert store.delete(SID) is True
 
@@ -469,12 +438,9 @@ class TestADeleteKeepsWhatAKeptCopyRefersTo:
 
     def test_with_no_copy_kept_a_delete_still_removes_them(self, tmp_path: Path) -> None:
         """A readable record deleted with nothing kept: its history goes with it, as before."""
-        artifacts = tmp_path / "artifacts"
-        store = SessionStore(tmp_path / "sessions", artifacts_dir=artifacts)
+        store = SessionStore(tmp_path / "sessions")
         store.save(SessionState.seed(SID, "agent"))
-        result = artifacts / SID / "result.txt"
-        result.parent.mkdir(parents=True)
-        result.write_text("a tool result", encoding="utf-8")
+        result = _kept_tool_result(store)
 
         assert store.delete(SID) is True
 
@@ -687,12 +653,9 @@ class TestTheReviewOf1867:
         """
         from uclone_x.agent import session as session_module
 
-        artifacts = tmp_path / "artifacts"
-        store = SessionStore(tmp_path / "sessions", artifacts_dir=artifacts)
+        store = SessionStore(tmp_path / "sessions")
         store.save(SessionState.seed(SID, "agent"))
-        result = artifacts / SID / "result.txt"
-        result.parent.mkdir(parents=True)
-        result.write_text("a tool result", encoding="utf-8")
+        result = _kept_tool_result(store)
 
         def _cannot_list(path: Path) -> tuple[Path, ...]:
             raise PermissionError("the folder cannot be listed")
@@ -722,18 +685,30 @@ def _set_aside_long_ago(monkeypatch: pytest.MonkeyPatch, *names: str) -> None:
     monkeypatch.setattr(set_aside_module, "_changed_at", _changed_at)
 
 
+def _kept_tool_result(store: SessionStore) -> Path:
+    """A full tool result kept for `SID`, where the session keeps one (#1848): a body.
+
+    Returns its file, so a test can say whether it is still there.
+    """
+    body = "a tool result"
+    digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    store.save_context_body(SID, digest, body)
+    return store.context_body_dir(SID) / digest
+
+
 def _deleted_with_its_history_kept(tmp_path: Path) -> tuple[SessionStore, Path, Path, Path]:
-    """A newer build's record deleted here: its copy, event log and tool result are kept."""
-    sessions, artifacts = tmp_path / "sessions", tmp_path / "artifacts"
-    store = SessionStore(sessions, artifacts_dir=artifacts)
+    """A newer build's record deleted here: its copy, event log and tool result are kept.
+
+    The tool result is a body in the session's context body store (#1848), so the path
+    returned is that body's file.
+    """
+    store = SessionStore(tmp_path / "sessions")
     _newer_builds_record(store)
     log = store.event_log_path(SID)
     assert log is not None
     log.parent.mkdir(parents=True, exist_ok=True)
     log.write_text('{"event": "kept"}\n', encoding="utf-8")
-    result = artifacts / SID / "result.txt"
-    result.parent.mkdir(parents=True)
-    result.write_text("a tool result", encoding="utf-8")
+    result = _kept_tool_result(store)
     assert store.delete(SID) is True
     (copy,) = set_aside_copies(store.session_path(SID))
     return store, copy, log, result
@@ -804,14 +779,11 @@ class TestTheReviewOf1877:
         Killed by: src/uclone_x/core/set_aside.py :: if entry.stat().st_size == 0:  # a claimed name, or one a crash left
         Becomes: if False:
         """
-        artifacts = tmp_path / "artifacts"
-        store = SessionStore(tmp_path / "sessions", artifacts_dir=artifacts)
+        store = SessionStore(tmp_path / "sessions")
         store.save(SessionState.seed(SID, "agent"))
         path = store.session_path(SID)
         path.with_name(f"{path.name}.unreadable-20260928T000000000000Z").touch()
-        result = artifacts / SID / "result.txt"
-        result.parent.mkdir(parents=True)
-        result.write_text("a tool result", encoding="utf-8")
+        result = _kept_tool_result(store)
 
         assert store.delete(SID) is True
 
@@ -871,13 +843,11 @@ class TestTheReviewOf1877:
         Becomes: pass
         Killed by: src/uclone_x/agent/session.py :: self.clear_event_log(session_id)  # the last copy is gone
         Becomes: pass
-        Killed by: src/uclone_x/agent/session.py :: cleanup_session_artifacts(self._artifacts_dir, session_id)
-        Becomes: pass
         """
         _, copy, log, result = _deleted_with_its_history_kept(tmp_path)
         _set_aside_long_ago(monkeypatch)
 
-        SessionStore(tmp_path / "sessions", artifacts_dir=tmp_path / "artifacts")
+        SessionStore(tmp_path / "sessions")
 
         assert not copy.exists()
         assert not log.exists()
@@ -894,12 +864,12 @@ class TestTheReviewOf1877:
         Becomes: EXPIRED_COPY_MAX_AGE = 0.0
         """
         store, copy, log, result = _deleted_with_its_history_kept(tmp_path)
-        SessionStore(tmp_path / "sessions", artifacts_dir=tmp_path / "artifacts")
+        SessionStore(tmp_path / "sessions")
         assert copy.exists() and log.exists() and result.exists()  # set aside just now
 
         store.save(SessionState.seed(SID, "agent"))  # the record, back under its id
         _set_aside_long_ago(monkeypatch)
-        SessionStore(tmp_path / "sessions", artifacts_dir=tmp_path / "artifacts")
+        SessionStore(tmp_path / "sessions")
 
         assert copy.exists()
 
@@ -917,7 +887,7 @@ class TestTheReviewOf1877:
         (young,) = [c for c in set_aside_copies(store.session_path(SID)) if c != old]
         _set_aside_long_ago(monkeypatch, old.name)
 
-        SessionStore(tmp_path / "sessions", artifacts_dir=tmp_path / "artifacts")
+        SessionStore(tmp_path / "sessions")
 
         assert not old.exists()
         assert young.exists() and log.exists() and result.exists()
@@ -944,113 +914,153 @@ class TestTheReviewOf1877:
 
 
 class TestAKeySavedOverAnUnreadableSettingsFile:
-    def test_the_key_is_saved_and_the_file_kept_aside(self, tmp_path: Path) -> None:
-        """Settings used to fail with the file's path as its reason (#1860, #1877).
+    async def test_a_connection_added_over_it_keeps_the_file_aside_and_saves_the_key(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A key now arrives on a connection row; the file it would merge into is not lost.
 
-        Now the unreadable file is kept aside as a Settings save without a key keeps it,
-        the key is saved into the new file, and Settings says the earlier file was kept.
+        The file may be a newer build's settings, other keys included (#1844), so it is kept
+        aside, unchanged, before the row is saved into a new file, and Settings says so
+        (#1877). The writer's refusal names the file's path, and never reaches the page.
 
-        Killed by: src/uclone_x/ui/app.py :: self._save_key(*new_key, held=held)
-        Becomes: save_api_key(new_key[0], new_key[1], path=self._settings_file)
-        Killed by: src/uclone_x/ui/app.py :: self._settings_set_aside = True  # and Settings says so
+        Killed by: src/uclone_x/ui/app.py :: self._settings_set_aside = True  # and Settings says the earlier file was kept
         Becomes: pass
         """
+        from uclone_x.llm.connectors.openai import OpenAIConnector
+
+        async def no_models(self: OpenAIConnector) -> list[object]:
+            return []
+
+        # Adding a connection checks it; the check is not what this test is about.
+        monkeypatch.setattr(OpenAIConnector, "list_models", no_models)
         manager = _manager(tmp_path)
         target = manager.settings_file
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text('{"llm_provider": "openai",', encoding="utf-8")
+        target.write_text('{"connections": [', encoding="utf-8")
 
-        manager.update_settings(llm_api_key="sk-new-1877", llm_api_key_provider="openai")
+        added = await manager.add_connection("openai", label=None, base_url=None, key="sk-new-1877")
 
-        saved = json.loads(target.read_text(encoding="utf-8"))
-        assert "sk-new-1877" in json.dumps(saved)
+        assert added["id"] == "openai"
         (aside,) = set_aside_copies(target)
-        assert aside.read_text(encoding="utf-8") == '{"llm_provider": "openai",'
+        assert aside.read_text(encoding="utf-8") == '{"connections": ['
+        saved = json.loads(target.read_text(encoding="utf-8"))
+        assert saved["connections"] == [{"id": "openai", "kind": "openai", "key": "sk-new-1877"}]
         assert manager.get_settings()["settings_set_aside"] is True
 
-    def test_a_file_unreadable_again_fails_without_its_path(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+
+def _reset_agent(workspace: Path, store: SessionStore) -> object:
+    from uclone_x.agent.base import BaseAgent
+    from uclone_x.agent.models import AgentConfig, AgentLLMConfig
+
+    return BaseAgent(
+        config=AgentConfig(
+            agent_id="agent",
+            name="Agent",
+            workspace_dir=workspace,
+            llm_config=AgentLLMConfig(model_name="mock"),
+        ),
+        llm=MockLLMConnector(),
+        tools=ToolRegistry(),
+        store=store,
+    )
+
+
+def _history_on_disk(tmp_path: Path, store: SessionStore) -> tuple[Path, Path, str]:
+    """An event log, a context body and a tool result under `SID`, as a turn leaves them."""
+    body = "a layer body the kept copy's snapshot names"
+    digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    store.save_context_body(SID, digest, body)
+    log = store.event_log_path(SID)
+    assert log is not None
+    log.parent.mkdir(parents=True, exist_ok=True)
+    log.write_text('{"event": "kept"}\n', encoding="utf-8")
+    result = _kept_tool_result(store)
+    return log, result, digest
+
+
+class TestAResetKeepsWhatAKeptCopyRefersTo:
+    def test_a_reset_whose_save_set_the_record_aside_keeps_its_history(
+        self, tmp_path: Path
     ) -> None:
-        """Another writer made it unreadable again: the failure names no file.
+        """The reset's own save keeps the unreadable record aside; the history stays with it.
 
-        Killed by: src/uclone_x/ui/app.py :: raise OSError("the settings file could not be read, so the key was not saved") from exc
-        Becomes: raise
+        Before, the reset went on to remove the event log, context bodies and tool results
+        the copy it had just made names, so the copy restored by hand lost them (#1921).
+        The record itself is reset.
+
+        Killed by: src/uclone_x/agent/session_lifecycle.py :: if self._keeps_copy_of(sid):
+        Becomes: if False:
+        Killed by: src/uclone_x/agent/session.py :: return self._has_kept_copy(self.session_path(session_id))
+        Becomes: return False
         """
-        from uclone_x.ui import app as app_module
+        from uclone_x.agent.base import BaseAgent
 
-        manager = _manager(tmp_path)
-        target = manager.settings_file
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text('{"llm_provider": "openai",', encoding="utf-8")
+        (tmp_path / "workspace").mkdir()
+        store = SessionStore(tmp_path / "sessions")
+        original = _newer_builds_record(store)
+        log, result, digest = _history_on_disk(tmp_path, store)
+        agent = _reset_agent(tmp_path / "workspace", store)
+        assert isinstance(agent, BaseAgent)
 
-        def _unreadable(provider: str, key: str, *, path: Path) -> None:
-            raise ValueError(f"The settings file at {path} cannot be read.")
+        agent.reset_session(SID)
 
-        monkeypatch.setattr(app_module, "save_api_key", _unreadable)
+        (aside,) = set_aside_copies(store.session_path(SID))
+        assert aside.read_bytes() == original
+        reset = store.load(SID)
+        assert reset is not None and reset.turn_counter == 0
+        assert log.read_text(encoding="utf-8") == '{"event": "kept"}\n'
+        assert store.load_context_body(SID, digest) is not None
+        assert result.read_text(encoding="utf-8") == "a tool result"
 
-        with pytest.raises(OSError) as caught:
-            manager.update_settings(llm_api_key="sk-new-1877", llm_api_key_provider="openai")
+    def test_with_no_copy_kept_a_reset_still_clears_the_history(self, tmp_path: Path) -> None:
+        """A readable record reset with nothing kept: its history goes, as before (#1442)."""
+        from uclone_x.agent.base import BaseAgent
 
-        assert not isinstance(caught.value, ValueError)
-        _plain(str(caught.value))
+        (tmp_path / "workspace").mkdir()
+        store = SessionStore(tmp_path / "sessions")
+        store.save(SessionState.seed(SID, "agent"))
+        log, result, digest = _history_on_disk(tmp_path, store)
+        agent = _reset_agent(tmp_path / "workspace", store)
+        assert isinstance(agent, BaseAgent)
+        agent.hydrate_session(SID)
 
-    def test_a_model_check_that_fails_leaves_the_earlier_settings_in_the_new_file(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        agent.reset_session(SID)
+
+        assert set_aside_copies(store.session_path(SID)) == ()
+        assert not log.exists()
+        assert store.load_context_body(SID, digest) is None
+        assert not result.exists()
+
+    def test_a_store_that_cannot_say_whether_it_keeps_a_copy_keeps_the_history(
+        self, tmp_path: Path
     ) -> None:
-        """The key stays saved; the model the check refused is not written with it.
+        """When asking the store about a kept copy raises, a reset keeps the event log (#1934).
 
-        Before, the file that replaced the unreadable one held the model being tried, while
-        Settings took it back.
+        Removing history a kept copy may name cannot be undone; keeping it can. So a
+        question that fails is answered "a copy may be kept", and the record alone is reset.
 
-        Killed by: src/uclone_x/ui/app.py :: replace_unreadable_with=held
-        Becomes: replace_unreadable_with=self._persisted_settings()
+        Killed by: src/uclone_x/agent/session_lifecycle.py :: logger.exception("Could not tell whether session %r has a kept copy", sid)
+        Becomes: return False
         """
-        manager = _manager(tmp_path)
-        target = manager.settings_file
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text('{"llm_provider": "openai",', encoding="utf-8")
-        before = manager.get_settings()["llm_model"]
+        from uclone_x.agent.base import BaseAgent
 
-        def _refused(*args: object, **kwargs: object) -> None:
-            raise RuntimeError("that model did not answer")
+        class _CannotTell(SessionStore):
+            def keeps_copy_of(self, session_id: str) -> bool:
+                raise OSError("the store could not be listed")
 
-        monkeypatch.setattr(manager, "_build_configured_llm", _refused)
+        (tmp_path / "workspace").mkdir()
+        store = _CannotTell(tmp_path / "sessions")
+        store.save(SessionState.seed(SID, "agent"))
+        log = store.event_log_path(SID)
+        assert log is not None
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_text('{"event": "kept"}\n', encoding="utf-8")
+        agent = _reset_agent(tmp_path / "workspace", store)
+        assert isinstance(agent, BaseAgent)
+        agent.hydrate_session(SID)
 
-        with pytest.raises(RuntimeError):
-            manager.update_settings(
-                llm_model="a-model-that-fails-1877",
-                llm_api_key="sk-new-1877",
-                llm_api_key_provider="openai",
-            )
+        agent.reset_session(SID)
 
-        text = target.read_text(encoding="utf-8")
-        assert "sk-new-1877" in text
-        assert "a-model-that-fails-1877" not in text
-        assert manager.get_settings()["llm_model"] == before
-
-    def test_a_key_refused_over_a_readable_file_is_refused_as_before(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Only an unreadable file is kept aside; a refusal about the key itself stands.
-
-        Killed by: src/uclone_x/ui/app.py :: raise refusal  # the file was readable: the refusal is about the key, as before
-        Becomes: pass
-        """
-        from uclone_x.ui import app as app_module
-
-        manager = _manager(tmp_path)
-        target = manager.settings_file
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text('{"llm_provider": "openai"}', encoding="utf-8")
-
-        def _refused(provider: str, key: str, *, path: Path) -> None:
-            raise ValueError("That key cannot be saved.")
-
-        monkeypatch.setattr(app_module, "save_api_key", _refused)
-
-        with pytest.raises(ValueError, match="That key cannot be saved."):
-            manager.update_settings(llm_api_key="sk-new-1877", llm_api_key_provider="openai")
-
-        assert set_aside_copies(target) == ()
-        assert json.loads(target.read_text(encoding="utf-8")) == {"llm_provider": "openai"}
-        assert manager.get_settings()["settings_set_aside"] is False
+        assert log.read_text(encoding="utf-8") == '{"event": "kept"}\n'
+        reset = store.load(SID)
+        assert reset is not None and reset.turn_counter == 0

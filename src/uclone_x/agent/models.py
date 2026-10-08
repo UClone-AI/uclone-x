@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator
 
 from uclone_x.agent.hooks.protocols import BaseHook
 from uclone_x.agent.prompts import compose_system_prompt
@@ -16,6 +15,7 @@ from uclone_x.core.immutable import ImmutableJsonMapping, ImmutableStrMapping
 # Lowered to `uclone_x.core.models` (#1734) and re-exported here under their old spelling.
 from uclone_x.core.models import BASE_MEMORY_TOOLS as BASE_MEMORY_TOOLS
 from uclone_x.core.models import BASE_PERSONA_TOOLS as BASE_PERSONA_TOOLS
+from uclone_x.core.models import BASE_SELF_TOOLS as BASE_SELF_TOOLS
 from uclone_x.core.models import RETIRED_MODEL_TIERS as RETIRED_MODEL_TIERS
 from uclone_x.core.models import AgentLLMConfig as AgentLLMConfig
 from uclone_x.core.models import ModelTier as ModelTier
@@ -23,6 +23,7 @@ from uclone_x.core.models import PersonaDefinition as PersonaDefinition
 from uclone_x.core.models import PlanState as PlanState
 from uclone_x.core.models import PlanStep as PlanStep
 from uclone_x.core.provenance import Provenance
+from uclone_x.core.tool_results import StepRefusalCode
 from uclone_x.errors import ProviderFailureError, ProviderFailureKind
 from uclone_x.llm.models import TokenUsage, ToolCallRequest
 from uclone_x.sandbox.models import (
@@ -128,40 +129,7 @@ class AgentConfig(BaseModel):
         default=50,
         description="Maximum agent execution steps (tool rounds) allowed within a single turn per P4.",
     )
-    max_turns: int = Field(
-        default=50,
-        json_schema_extra={"deprecated": True},
-        description="[Deprecated alias for max_steps] Maximum steps allowed within a single turn.",
-    )
-
-    @model_validator(mode="before")
-    @classmethod
-    def _resolve_step_budget(cls, data: Any) -> Any:
-        if isinstance(data, Mapping):
-            raw = dict(cast(Mapping[str, Any], data))
-            steps = raw.get("max_steps")
-            turns = raw.get("max_turns")
-            if steps is not None and turns is not None:
-                if steps != turns:  # AgentConfig budget conflict check
-                    raise ValueError(
-                        f"Conflicting values for max_steps and deprecated alias max_turns: {steps} != {turns}"
-                    )
-            elif turns is not None and steps is None:
-                raw["max_steps"] = turns
-            elif steps is not None and turns is None:
-                raw["max_turns"] = steps
-            return raw
-        if hasattr(data, "max_steps") and hasattr(data, "max_turns"):
-            steps = data.max_steps
-            turns = data.max_turns
-            if steps is not None and turns is not None and steps != turns:
-                raise ValueError(
-                    f"Conflicting values for max_steps and deprecated alias max_turns: {steps} != {turns}"
-                )
-        return data
-
     max_subagent_depth: int = 2
-    max_concurrent_subagents: int = 5
     workspace_dir: str | Path | None = Field(
         default=None,
         description="Workspace root directory for tool execution boundary.",
@@ -178,6 +146,14 @@ class AgentConfig(BaseModel):
     enable_subagent_tools: bool = True
     hooks: tuple[BaseHook, ...] = Field(default_factory=tuple)
     persona: str | None = None
+    tools_module: str | None = Field(
+        default=None,
+        description=(
+            "How the agent builds its tools layer (#2188): `native`, `pinned` or `bound`. "
+            "`None` takes the provider's default (`select_tools_module`). Read once, when "
+            "the agent is built; a name this build does not have is refused then."
+        ),
+    )
     approval_timeout_seconds: float = Field(
         default=30.0,
         description="Timeout in seconds when waiting for human approval of a tool call.",
@@ -231,38 +207,6 @@ class SubAgentSpec(BaseModel):
         default=20,
         description="Maximum agent execution steps allowed within a single turn per P4.",
     )
-    max_turns: int = Field(
-        default=20,
-        json_schema_extra={"deprecated": True},
-        description="[Deprecated alias for max_steps] Maximum steps allowed within a single turn.",
-    )
-
-    @model_validator(mode="before")
-    @classmethod
-    def _resolve_step_budget(cls, data: Any) -> Any:
-        if isinstance(data, Mapping):
-            raw = dict(cast(Mapping[str, Any], data))
-            steps = raw.get("max_steps")
-            turns = raw.get("max_turns")
-            if steps is not None and turns is not None:
-                if steps != turns:  # SubAgentSpec budget conflict check
-                    raise ValueError(
-                        f"Conflicting values for max_steps and deprecated alias max_turns: {steps} != {turns}"
-                    )
-            elif turns is not None and steps is None:
-                raw["max_steps"] = turns
-            elif steps is not None and turns is None:
-                raw["max_turns"] = steps
-            return raw
-        if hasattr(data, "max_steps") and hasattr(data, "max_turns"):
-            steps = data.max_steps
-            turns = data.max_turns
-            if steps is not None and turns is not None and steps != turns:
-                raise ValueError(
-                    f"Conflicting values for max_steps and deprecated alias max_turns: {steps} != {turns}"
-                )
-        return data
-
     enable_write_tools: bool = False
     enable_subagent_tools: bool = False
 
@@ -301,6 +245,56 @@ class ToolExecutionRecord(BaseModel):
         "the same site and only for a call that succeeded. What lets the runtime read the "
         "conversation's new story from an output without trusting an output's shape.",
     )
+    artifacts: tuple[str, ...] = Field(
+        default=(),
+        description="The workspace files the call says it produced, from the tool's own "
+        "`ToolResult.artifacts`, copied at the one site that ran it and only for a call that "
+        "succeeded (#2085). Read through `produced_paths`, never from the output's shape: "
+        "the image result names its pictures by link only (#2013) and the image tool does "
+        "not declare `writes_files` (#2079), and each of those broke a reader that parsed.",
+    )
+
+    @field_validator("artifacts")
+    @classmethod
+    def _workspace_relative(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        """Each path once, in order, with `/` separators; an absolute path is dropped.
+
+        Here and not on `ToolResult`: the image tools set `artifacts` with `model_copy`,
+        which skips that model's validators. An absolute path names no workspace file, and
+        stripping its root would name a different one.
+        """
+        kept: list[str] = []
+        for raw in value:
+            path = raw.strip().replace("\\", "/")
+            if path and not path.startswith("/") and ":" not in path[:3] and path not in kept:
+                kept.append(path)
+        return tuple(kept)
+
+    @property
+    def produced_paths(self) -> tuple[str, ...]:
+        """The workspace files this call produced: the one answer every reader uses (#2085).
+
+        Nothing for a call that did not succeed. Otherwise the tool's declared `artifacts`;
+        only when it declared none, and only for a tool that declares `writes_files`, the
+        `path` and `paths` its output names -- the shape external MCP tools, peers and the
+        story tools still report by. `file_read` returns a `path` too and declares no
+        writes, so a file it read is never counted as produced.
+        """
+        if self.status is not ToolResultStatus.SUCCESS:
+            return ()
+        if self.artifacts:
+            return self.artifacts
+        if not self.writes_files or not isinstance(self.output, dict):
+            return ()
+        candidates: list[object] = [self.output.get("path")]
+        listed = self.output.get("paths")
+        if isinstance(listed, list):
+            candidates.extend(listed)
+        named: list[str] = []
+        for candidate in candidates:
+            if isinstance(candidate, str) and candidate and candidate not in named:
+                named.append(candidate)
+        return tuple(named)
 
 
 TurnStopReason = Literal[
@@ -324,6 +318,8 @@ TurnStopReason = Literal[
     "provider_unreachable",
     "provider_outage",
     "provider_error",
+    "persona_edit_failed",
+    "tool_call_unreadable",
     "cancelled",
 ]
 """How a turn's step run ended: the vocabulary of `TURN_END.stop_reason` and `TurnResult`.
@@ -359,6 +355,18 @@ is refused the same way, so `turn_refusal` maps it to `RoomTurnRefusal.MODEL_WIT
 `ProviderFailureKind` and spelled the same (#1630). The turn's `provider_failure` carries
 the plain sentence for it. The first two are refusals -- a retired model and a rejected key
 fail every retry until the setting changes -- and the rest are not.
+
+`persona_edit_failed` is a saved persona edit this seat could not apply at the turn's start
+(#1904). The turn did not run, the seat kept its previous definition, and the edit was taken
+off the stage, so it is not tried again. Its `error` is a fixed plain sentence, never the
+cause's text: the cause is in the log. It is not a refusal -- a retry runs, under the
+previous definition.
+
+`tool_call_unreadable` is a ``k_act`` reply holding a ``<tool_call>`` block that does not
+read as a call (#2188, owner ruling 2026-10-04). Nothing of that reply ran or entered
+history, and the turn did not fall back to native tool calling. Its `error` is a fixed
+plain sentence; the reply is in the log's `MODEL_RESPONSE` event. It is not a refusal -- a
+retry samples a new reply.
 """
 
 
@@ -380,6 +388,20 @@ class ProviderFailure(BaseModel):
         default=None,
         description="The provider's display name, e.g. 'Google', so a head can name where "
         "that provider's key is set. None on a record stored before it was carried.",
+    )
+    clone: str | None = Field(
+        default=None,
+        description="The clone whose own model failed, when the failure is that model's "
+        "(model-gateway §3.6). None when the clone follows the system default.",
+    )
+    model_ref: str | None = Field(
+        default=None,
+        description="The clone's own model ref that could not be used, e.g. 'gpu-box/qwen3'.",
+    )
+    action: Literal["use_system_default"] | None = Field(
+        default=None,
+        description="The one action a head offers: 'use_system_default' clears the clone's "
+        "own model so it follows Settings. The turn is never re-run on the default unasked.",
     )
 
     @classmethod
@@ -463,6 +485,13 @@ class TurnResult(BaseModel):
         "(#1775), including on a turn that failed after a step had moved it.",
     )
     error: str | None = None
+    error_code: StepRefusalCode | None = Field(
+        default=None,
+        description="Set, beside `error`, when the turn refused a step (#1862): the key a "
+        "head translates `error` by, so a head writing in the person's language says the "
+        "refusal from its own catalog. `error` stays Core's English sentence. `None` on "
+        "every other turn.",
+    )
     provider_failure: ProviderFailure | None = Field(
         default=None,
         description="Set, beside `error`, when the turn failed on a hosted provider's "

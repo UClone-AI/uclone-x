@@ -14,9 +14,21 @@ import pydantic
 import pydantic_core
 import pytest
 from annotated_types import Predicate
-from pydantic import BaseModel, Field, FilePath, ImportString, ValidationError, field_validator
+from pydantic import (
+    AliasChoices,
+    AliasPath,
+    BaseModel,
+    Field,
+    FilePath,
+    ImportString,
+    ValidationError,
+    create_model,
+    field_validator,
+)
 from pydantic_core import PydanticCustomError
+from typing_extensions import TypeAliasType
 
+from uclone_x.core.provenance import Provenance
 from uclone_x.sandbox.models import IsolationLevel, WorkspaceIsolation
 from uclone_x.tools import (
     BaseTool,
@@ -27,6 +39,7 @@ from uclone_x.tools import (
     FileWriteTool,
     ToolContext,
     ToolRegistry,
+    ToolResult,
     ToolResultStatus,
     create_default_registry,
 )
@@ -84,6 +97,33 @@ class ContextFirstTool(BaseTool[DummyParams]):
 
     def run(self, params: DummyParams, context: ToolContext) -> dict[str, Any]:
         return {"inverted": f"{context.session_id}:{params.message}"}
+
+
+class DirectToolResultTool(BaseTool[DummyParams]):
+    name = "direct_tool_result_tool"
+    description = "Tool returning ToolResult directly"
+
+    async def run(self, params: DummyParams, context: ToolContext) -> ToolResult:
+        return ToolResult(
+            success=True,
+            output={"direct": params.message},
+            provenance=Provenance.primary(provider="test", model="direct_tool_custom"),
+        )
+
+
+@pytest.mark.asyncio
+async def test_basetool_returns_already_instantiated_tool_result_directly(
+    tool_context: ToolContext,
+) -> None:
+    """Killed by: src/uclone_x/tools/base.py :: if isinstance(output, ToolResult):
+    Becomes: if False:
+    """
+    tool = DirectToolResultTool()
+    res = await tool.execute({"message": "direct_msg"}, tool_context)
+    assert isinstance(res, ToolResult)
+    assert res.output == {"direct": "direct_msg"}
+    assert res.provenance is not None
+    assert res.provenance.served_by.model == "direct_tool_custom"
 
 
 @pytest.mark.asyncio
@@ -410,6 +450,29 @@ def test_a_custom_error_the_tool_opted_in_keeps_its_own_message() -> None:
     )
 
 
+class _ReservedNameParams(BaseModel):
+    name: str
+
+    @field_validator("name")
+    @classmethod
+    def _free(cls, value: str) -> str:
+        raise ValueError("that name is already taken.")
+
+
+def test_a_validator_value_error_is_passed_on_as_the_tools_own_sentence() -> None:
+    """A `ValueError` a tool's validator raises is its own sentence: it reaches the model
+    without pydantic's "Value error, " prefix or its trailing full stop doubled (#1570).
+
+    Killed by: src/uclone_x/tools/base.py :: if kind in {"value_error", "assertion_error"} and ctx.get("error") is not None:
+    Becomes: if False:
+    """
+    assert _refusal_for(_ReservedNameParams, {"name": "hero"}) == (
+        "The call to 'picture_tool' was refused because its arguments did not fit: 'name': "
+        "that name is already taken. Nothing was drawn. Call it again with the arguments "
+        "corrected."
+    )
+
+
 class _SequenceParams(BaseModel):
     value: Sequence[str]
 
@@ -476,6 +539,17 @@ def test_no_custom_error_pydantic_raises_starts_with_the_plain_prefix() -> None:
             except (OSError, UnicodeDecodeError):
                 continue
             found |= set(re.findall(r"PydanticCustomError\(\s*['\"]([A-Za-z_]+)", text))
+    for so_file in Path(pydantic_core.__file__).parent.glob("*.so"):
+        try:
+            data = so_file.read_bytes()
+            matches = [
+                m
+                for m in re.findall(b"plain_[a-zA-Z0-9_]+", data)
+                if m != b"plain_function"  # pydantic_core schema validator type, not an error
+            ]
+            found |= {m.decode("ascii") for m in matches}
+        except OSError:
+            pass
 
     assert len(found) > 20, found  # the scan saw pydantic's own raises
     assert not [kind for kind in found if kind.startswith(PLAIN_ERROR_PREFIX)]
@@ -512,6 +586,103 @@ def test_a_union_of_a_value_and_a_model_reads_as_alternatives() -> None:
         "a whole number, or 'count.lines' is missing. Nothing was drawn. It takes: count, "
         "notes. Call it again with the arguments corrected."
     )
+
+
+def test_discriminated_union_missing_tag_refusal() -> None:
+    """A discriminated union given no discriminator tag reports that it is missing (#1606).
+
+    Killed by: src/uclone_x/tools/base.py :: return f"is missing discriminator {ctx['discriminator']}"
+    Becomes: pass
+    """
+
+    class Cat(BaseModel):
+        kind: Literal["cat"]
+        meow: str
+
+    class Dog(BaseModel):
+        kind: Literal["dog"]
+        bark: str
+
+    class PetParams(BaseModel):
+        pet: Annotated[Cat | Dog, Field(discriminator="kind")]
+
+    refusal = _refusal_for(PetParams, {"pet": {}})
+    assert "is missing discriminator 'kind'" in refusal
+
+
+def test_alias_choices_and_alias_path_names_are_retained() -> None:
+    """Field aliases defined via AliasChoices or AliasPath are recognized as argument names
+    and not dropped or discarded as forms (#1606).
+
+    Killed by: src/uclone_x/tools/base.py :: self.arguments.update(_extract_alias_names(alias))
+    Becomes: pass
+    """
+
+    class AliasedModel(BaseModel):
+        count: int = Field(validation_alias=AliasChoices("ChoiceA", AliasPath("choice_b")))
+
+    refusal = _refusal_for(AliasedModel, {"ChoiceA": "bad"})
+    assert "'ChoiceA' should be a whole number" in refusal
+
+
+class _AliasCat(BaseModel):
+    kind: Literal["cat"]
+    meow: str
+
+
+class _AliasDog(BaseModel):
+    kind: Literal["dog"]
+    bark: str
+
+
+_PetUnion = TypeAliasType("_PetUnion", _AliasCat | _AliasDog)
+_PetOwner = create_model("_PetOwner", pet=(_PetUnion, ...))
+
+_TaggedUnion = TypeAliasType("_TaggedUnion", _AliasCat | _AliasDog)
+_TaggedOwner = create_model(
+    "_TaggedOwner", pet=(Annotated[_TaggedUnion, Field(discriminator="kind")], ...)
+)
+
+
+def test_type_alias_type_forms_and_tag_values_are_visited() -> None:
+    """A union wrapped in TypeAliasType has its members' forms and tags visited (#1606).
+
+    Killed by: src/uclone_x/tools/base.py :: self._visit(cast(object, val))
+    Becomes: pass
+    Killed by: src/uclone_x/tools/base.py :: return _tag_values(cast(object, val), discriminator)
+    Becomes: return set()
+    """
+    refusal_union = _refusal_for(_PetOwner, {"pet": {"unknown": 1}})
+    assert "'pet' did not fit any of the forms it can take" in refusal_union
+
+    refusal_tag = _refusal_for(_TaggedOwner, {"pet": {"kind": "cat", "meow": 123}})
+    assert "'pet.meow' should be text" in refusal_tag
+    assert "pet.cat" not in refusal_tag
+
+
+def test_union_tag_sharing_name_with_model_field_is_not_in_argument_path() -> None:
+    """When a model field shares the same name as a union tag value, the tag is sliced out
+    of the location so it does not leak into the argument path (#1606).
+
+    Killed by: src/uclone_x/tools/base.py :: inner_path = _argument_path(loc[form + 1 :], names)
+    Becomes: inner_path = _argument_path(loc, names)
+    """
+
+    class Square(BaseModel):
+        shape: Literal["square"]
+        side: int
+
+    class Circle(BaseModel):
+        shape: Literal["circle"]
+        radius: int
+
+    class DrawingParams(BaseModel):
+        square: str = "default"
+        item: Annotated[Square | Circle, Field(discriminator="shape")]
+
+    refusal = _refusal_for(DrawingParams, {"item": {"shape": "square", "side": "bad"}})
+    assert "'item.side' should be a whole number" in refusal
+    assert "item.square" not in refusal
 
 
 @pytest.mark.asyncio
@@ -1293,7 +1464,7 @@ def test_default_tool_registry_registration() -> None:
 
     # Convenience classmethod
     reg2 = ToolRegistry.with_builtins()
-    assert len(reg2.list_tools()) == 24
+    assert len(reg2.list_tools()) == 26
 
 
 # ======================================================================================
@@ -1533,3 +1704,25 @@ async def test_file_edit_on_a_last_line_without_an_ending(
     )
     assert result.status == ToolResultStatus.SUCCESS, result.error
     assert target.read_bytes() == b"first\r\nnew\r\nextra"
+
+
+@pytest.mark.asyncio
+async def test_a_written_and_an_edited_file_are_declared_as_produced(
+    workspace: Path, tool_context: ToolContext
+) -> None:
+    """Both writers name their file in `ToolResult.artifacts`, the channel every reader of
+    "what did this call make" uses (#2085); reading names nothing.
+
+    Killed by: src/uclone_x/tools/builtin/filesystem.py :: return (path,) if isinstance(path, str) and path else ()
+    Becomes: return ()
+    """
+    wrote = await FileWriteTool().execute({"path": "notes.md", "content": "a\n"}, tool_context)
+    edited = await FileEditTool().execute(
+        {"path": "notes.md", "target_content": "a", "replacement_content": "b"}, tool_context
+    )
+    read = await FileReadTool().execute({"path": "notes.md"}, tool_context)
+
+    assert wrote.artifacts == ("notes.md",)
+    assert edited.artifacts == ("notes.md",)
+    assert read.success is True
+    assert read.artifacts == ()

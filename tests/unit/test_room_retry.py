@@ -255,7 +255,7 @@ class TestRetryRefuses:
     async def test_retry_refuses_when_nothing_failed(self, built: Any) -> None:
         """A room whose last row is an answer has nothing to re-run.
 
-        Killed by: src/uclone_x/room/orchestrator.py :: if failed is None or failed.error is None:
+        Killed by: src/uclone_x/room/orchestrator.py :: if failed is None or (failed.error is None and failed.content.strip() != ""):
         Becomes: if failed is None:
         """
         orch = _orchestrator(built, [ScriptedSelector("s", [speak("scout")])])
@@ -263,6 +263,26 @@ class TestRetryRefuses:
 
         with pytest.raises(NothingToRetryError, match="scout"):
             await orch.retry("r1")
+
+    @pytest.mark.asyncio
+    async def test_retry_reruns_a_silent_turn_with_no_error(self, built: Any) -> None:
+        """A turn that completed with empty content is silent, not finished, and is retryable (#2168).
+
+        Killed by: src/uclone_x/room/orchestrator.py :: or (failed.error is None and failed.content.strip() != ""):
+        Becomes: or failed.error is None:
+        """
+        _, _, agents = built
+        agents["scout"]._reply = ""
+        orch = _orchestrator(built, [ScriptedSelector("s", [speak("scout")])])
+        await orch.post("r1", "alice", "what about caching?")
+
+        agents["scout"]._reply = "recovered answer"
+        state = await orch.retry("r1")
+
+        assert state.transcript[-1].sender_id == "scout"
+        assert state.transcript[-1].content == "recovered answer"
+        assert state.transcript[-1].error is None
+        assert "[alice]: what about caching?" in agents["scout"].prompts[-1]
 
     @pytest.mark.asyncio
     async def test_retry_refuses_when_someone_has_spoken_since_the_failure(

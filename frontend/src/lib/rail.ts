@@ -9,6 +9,8 @@ import { RAIL_WIDTH_PX } from '../components/layout/WorkspaceSidebar';
  * Below it the rail stops taking a share of the workspace row and is drawn *over* the
  * conversation instead (#1062). At a 400px window it used to take 240 of the 400 and leave the
  * conversation -- U0's default state, the one surface with no condition on it -- 160px.
+ *
+ * Exported: tested and asserted by rail.test.ts.
  */
 export const MIN_CONVERSATION_PX = 360;
 
@@ -36,6 +38,8 @@ export const railOverlays = (windowWidth: number): boolean => windowWidth < RAIL
  *
  * In the browser and not in the Core: collapse state is the screen's, and a second head
  * attached to the same Core must not inherit this one's (ui-authoring §3).
+ *
+ * Exported: read and seeded by App.rail.test.tsx and consumer storage helpers.
  */
 export const RAIL_OPEN_KEY = 'uclone-x.rail.open';
 
@@ -85,6 +89,8 @@ export const useWindowWidth = (): number => {
 
 /**
  * Where the user's pinned clones are kept in the browser.
+ *
+ * Exported: read and seeded by tests (e.g. rail.pinned.test.ts) and consumer storage helpers.
  */
 export const PINNED_CLONES_KEY = 'uclone-x.rail.pinned_clones';
 
@@ -121,6 +127,8 @@ export const storePinnedClones = (pinnedIds: string[]): void => {
  *
  * Keeps group chats in the top Group Chats section even while they have 0 or 1 agent seated,
  * so inviting a first clone does not prematurely shift the room into a 1:1 clone session.
+ *
+ * Exported: read and seeded by tests and consumer storage helpers.
  */
 export const GROUP_ROOMS_KEY = 'uclone-x.rail.group_rooms';
 

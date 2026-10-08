@@ -3,10 +3,8 @@
 from __future__ import annotations
 
 import ast
-import ctypes
 import importlib
 import re
-import warnings
 from pathlib import Path
 from typing import Any
 
@@ -40,18 +38,11 @@ def _clean_docstring(raw: str | None) -> str | None:
 def _docstring_node(statement: Any) -> Any:
     """The `string` node a Python statement consists of, or None if it is not a bare string.
 
-    The two grammars this module loads disagree on the shape. The legacy
-    `tree_sitter_languages` bundle wraps a docstring in an `expression_statement`; the
-    tree-sitter-python that `tree-sitter-language-pack` ships puts the `string` directly
-    in the block. Reading only the wrapped form lost every docstring, and the module
-    symbol with them, once the `code-intel` extra switched grammars (#1100).
+    The tree-sitter-python that `tree-sitter-language-pack` ships puts a docstring's
+    `string` directly in the block, not inside an `expression_statement` (#1100).
     """
     if statement.type == "string":
         return statement
-    if statement.type == "expression_statement" and statement.children:
-        first = statement.children[0]
-        if first.type == "string":
-            return first
     return None
 
 
@@ -118,9 +109,7 @@ class ASTParser(ASTParserProtocol):
                 package="tree-sitter",
                 feature=f"Tree-sitter AST parsing for {language}",
             ) from exc
-        if not (
-            module_present("tree_sitter_language_pack") or module_present("tree_sitter_languages")
-        ):
+        if not module_present("tree_sitter_language_pack"):
             raise MissingDependencyError(
                 extra="code-intel",
                 package="tree-sitter-language-pack",
@@ -145,12 +134,7 @@ class ASTParser(ASTParserProtocol):
 
         self._ts_load_attempted[lang_name] = True
 
-        # `tree-sitter-language-pack` first: it is the maintained successor and the only one
-        # of the two with a cp313 wheel (#1100). `tree-sitter-languages` stays as a fallback
-        # so an environment already holding it keeps working without a re-install.
-        parser = self._load_from_language_pack(lang_name) or self._load_from_language_bundle(
-            lang_name
-        )
+        parser = self._load_from_language_pack(lang_name)
         if parser is not None:
             self._ts_parsers[lang_name] = parser
         return parser
@@ -164,53 +148,6 @@ class ASTParser(ASTParserProtocol):
             pack = importlib.import_module("tree_sitter_language_pack")
             get_parser: Any = pack.get_parser
             return get_parser(lang_name)
-        except Exception:
-            return None
-
-    def _load_from_language_bundle(self, lang_name: str) -> Any:
-        """Load a parser out of the legacy `tree_sitter_languages` shared object, or None.
-
-        Kept for environments that already hold the unmaintained bundle; it ships no wheel
-        above cp312, which is why it is no longer what the `code-intel` extra installs.
-        """
-        try:
-            import tree_sitter
-
-            # Imported by name for the same reason as the language pack above, and more so:
-            # no extra installs this distribution any more, so a static import is unresolved
-            # in every environment synced from the lock file (#1100).
-            bundle = importlib.import_module("tree_sitter_languages")
-            # A namespace package has no `__file__`, and then there is no directory to search.
-            if bundle.__file__ is None:
-                return None
-
-            ts_dir = Path(bundle.__file__).parent
-            so_files = (
-                list(ts_dir.glob("*.so"))
-                + list(ts_dir.glob("*.dylib"))
-                + list(ts_dir.glob("*.dll"))
-            )
-            if not so_files:
-                return None
-
-            cdll = ctypes.cdll.LoadLibrary(str(so_files[0]))
-            func_name = f"tree_sitter_{lang_name}"
-            lang_func: Any = getattr(cdll, func_name, None)
-            if lang_func is None:
-                return None
-
-            lang_func.restype = ctypes.c_void_p
-            ptr: int | None = lang_func()
-            if not ptr:
-                return None
-
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", category=DeprecationWarning)
-                ts_language = tree_sitter.Language(ptr)  # pyright: ignore[reportDeprecated]
-
-            parser = tree_sitter.Parser()
-            parser.language = ts_language
-            return parser
         except Exception:
             return None
 

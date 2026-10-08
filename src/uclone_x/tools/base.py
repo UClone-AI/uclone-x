@@ -21,12 +21,15 @@ from typing import (
     get_args,
     get_origin,
 )
-from urllib.parse import quote
+from urllib.parse import parse_qs, quote, urlsplit
 
-from pydantic import BaseModel, ValidationError
+from pydantic import AliasChoices, AliasPath, BaseModel, ValidationError
 
+from uclone_x.core.agent_home import AGENTS_DIR_ENV_VAR
 from uclone_x.core.provenance import Provenance
+from uclone_x.core.session import SESSION_STORAGE_DIR_ENV_VAR
 from uclone_x.errors import PathTraversalError, PlainRefusalError
+from uclone_x.extensions import ProtectedRoot, protected_roots
 from uclone_x.sandbox.path_validator import PathValidator
 from uclone_x.tools.models import ToolContext, ToolResult
 from uclone_x.tools.protocols import ToolProtocol
@@ -82,8 +85,11 @@ def tool_call_writes_files(tool: object, arguments: object) -> bool:
     return not (isinstance(action, str) and action in cast(frozenset[object], declared))
 
 
-def in_story_library(resolved: Path, workspace_root: Path) -> bool:
-    """Whether `resolved`, a path `resolve_safe_path` returned, is in `<workspace>/stories`.
+def in_protected_root(resolved: Path, workspace_root: Path) -> ProtectedRoot | None:
+    """The protected folder `resolved`, a path `resolve_safe_path` returned, is in, if any.
+
+    A protected folder is one an extension declares (`extensions.ProtectedRoot`): the story
+    library, `<workspace>/stories`, is the first (#2205). Each is checked as follows.
 
     Decided by what the path *is*, not how it was spelled (#1583). `resolved` has had its
     symlinks followed already, so a link pointing into the library arrives as the library
@@ -103,14 +109,19 @@ def in_story_library(resolved: Path, workspace_root: Path) -> bool:
     leaves the story's copy unchanged. A new tool that writes a model-chosen path has to do
     the same.
     """
-    # Imported here: `uclone_x.story` imports `uclone_x.tools.models`, which loads this module.
-    from uclone_x.story.schemas import STORIES_DIRNAME
-
     root = workspace_root.resolve()
     parts = resolved.relative_to(root).parts
-    if parts and parts[0].casefold() == STORIES_DIRNAME:
+    for protected in protected_roots():
+        if _in_root(resolved, root, parts, protected.dirname):
+            return protected
+    return None
+
+
+def _in_root(resolved: Path, root: Path, parts: tuple[str, ...], dirname: str) -> bool:
+    """Whether `resolved` is in `<root>/<dirname>`, by any spelling or link (`in_protected_root`)."""
+    if parts and parts[0].casefold() == dirname:
         return True
-    library = root / STORIES_DIRNAME
+    library = root / dirname
     if not library.exists():
         return False
     for folder in (resolved, *resolved.parents):
@@ -131,7 +142,7 @@ def in_personas_dir(resolved: Path, workspace_root: Path) -> bool:
     That folder holds each clone's definition and picture. The head changes them through
     its own routes, and a clone changes its own picture with `set_avatar`, which checks
     whose picture it is. A general writing tool reaching in could instead replace another
-    clone's definition or picture. Decided as `in_story_library` decides: the first two
+    clone's definition or picture. Decided as `in_protected_root` decides: the first two
     components compared after case folding, then every existing folder on the way compared
     by file identity with the personas folder, so another spelling or a link to it is refused.
     """
@@ -150,6 +161,40 @@ def in_personas_dir(resolved: Path, workspace_root: Path) -> bool:
     return False
 
 
+def app_state_roots() -> tuple[Path, ...]:
+    """The folders holding this install's own state: `~/.uclone`, and the agents and session
+    roots when `UCLONE_AGENTS_DIR` / `UCLONE_SESSION_DIR` move them elsewhere.
+
+    Read when asked, so a redirect set after import is honoured.
+    """
+    roots = [Path.home() / ".uclone"]
+    for variable in (AGENTS_DIR_ENV_VAR, SESSION_STORAGE_DIR_ENV_VAR):
+        value = os.environ.get(variable)
+        if value:
+            roots.append(Path(value).expanduser())
+    return tuple(root.resolve() for root in roots)
+
+
+def in_app_state_dir(resolved: Path) -> bool:
+    """Whether `resolved`, a path `resolve_safe_path` returned, is inside `app_state_roots`.
+
+    Those folders hold every clone's definition, memory and picture and every saved
+    conversation (clone-data-scopes §3.6). Each is written only by the store that owns it;
+    a general writing tool reaching in could rewrite another clone. Refused whatever the
+    workspace, so launching from the home folder still keeps `~/.uclone` out of reach while
+    the rest of the home folder stays writable. Every existing folder on the way is also
+    compared by file identity, so another spelling or a link to a root is refused.
+    """
+    roots = app_state_roots()
+    for folder in (resolved, *resolved.parents):
+        for root in roots:
+            if folder == root:
+                return True
+            if folder.exists() and root.exists() and folder.samefile(root):
+                return True
+    return False
+
+
 def artifact_content_url(rel_path: str) -> str:
     """The rooted URL the UI serves a workspace file at -- the one link a reply should carry.
 
@@ -162,6 +207,47 @@ def artifact_content_url(rel_path: str) -> str:
     name cannot end a markdown link early.
     """
     return f"/api/artifacts/content?path={quote(rel_path, safe='/')}"
+
+
+def artifact_path_from_url(url: object) -> str | None:
+    """The workspace path `artifact_content_url` made `url` from, or `None` for any other value.
+
+    The inverse, for a reader of a tool result that names a file by its link only: the
+    image tool's result carries each picture once, as the link a reply embeds (#2013).
+    Only a link of exactly that shape is read; anything else names no path.
+    """
+    if not isinstance(url, str):
+        return None
+    parts = urlsplit(url)
+    if parts.scheme or parts.netloc or parts.path != "/api/artifacts/content":
+        return None
+    values = parse_qs(parts.query, keep_blank_values=True).get("path")
+    if values is None or len(values) != 1 or not values[0]:
+        return None
+    return values[0]
+
+
+def linked_paths(output: object) -> list[str]:
+    """The workspace files a tool result names by link, in order, each once (#2013).
+
+    Read from its `relative_url` and from each of its `images`' `relative_url`, the shape
+    the image tool's result has. A value that is not such a link names nothing.
+    """
+    if not isinstance(output, dict):
+        return []
+    mapping = cast(dict[str, object], output)
+    links: list[object] = [mapping.get("relative_url")]
+    images = mapping.get("images")
+    if isinstance(images, list):
+        for image in cast(list[object], images):
+            if isinstance(image, dict):
+                links.append(cast(dict[str, object], image).get("relative_url"))
+    paths: list[str] = []
+    for link in links:
+        path = artifact_path_from_url(link)
+        if path is not None and path not in paths:
+            paths.append(path)
+    return paths
 
 
 def replace_file(path: Path, data: bytes) -> None:
@@ -230,10 +316,21 @@ def tool_opens_story(tool: object) -> bool:
 
     Declared, and **undeclared means no**: a tool that says nothing cannot move a
     conversation's story. A declaring tool names the story in its output under
-    `uclone_x.story.OPEN_STORY_KEY`, and the runtime reads that key only from a tool that
+    the story extension's `OPEN_STORY_KEY`, and the runtime reads that key only from a tool that
     declares this (#1555) -- the shape of an output is not a capability.
     """
     declared: object = getattr(tool, "opens_story", False)
+    return declared is True
+
+
+def tool_returns_images(tool: object) -> bool:
+    """Whether a result of `tool` can carry a picture (`ToolResult.images`) (#2107).
+
+    Declared, and **undeclared means no**. The runtime asks the provider whether the
+    turn's model takes image input only when a tool in the step declares this, so a step
+    with no such tool costs no listing read.
+    """
+    declared: object = getattr(tool, "returns_images", False)
     return declared is True
 
 
@@ -312,6 +409,19 @@ _UNION_TAGS = frozenset(
 )
 
 
+def _extract_alias_names(alias: object) -> set[str]:
+    if isinstance(alias, str):
+        return {alias}
+    if isinstance(alias, AliasPath):
+        return {str(p) for p in alias.path if isinstance(p, str)}
+    if isinstance(alias, AliasChoices):
+        out: set[str] = set()
+        for choice in alias.choices:
+            out.update(_extract_alias_names(choice))
+        return out
+    return set()
+
+
 class _Names:
     """The names an error's location can hold for `params_model`, gathered from the model.
 
@@ -330,6 +440,10 @@ class _Names:
             self._visit(params_model)
 
     def _visit(self, annotation: object) -> None:
+        val = getattr(annotation, "__value__", None)
+        if val is not None:
+            self._visit(cast(object, val))
+            return
         if isinstance(annotation, type) and issubclass(annotation, BaseModel):
             if annotation in self._seen:
                 return
@@ -338,8 +452,7 @@ class _Names:
             for name, field in annotation.model_fields.items():
                 self.arguments.add(name)
                 for alias in (field.alias, field.validation_alias):
-                    if isinstance(alias, str):
-                        self.arguments.add(alias)
+                    self.arguments.update(_extract_alias_names(alias))
                 if isinstance(field.discriminator, str):
                     self.forms.update(_tag_values(field.annotation, field.discriminator))
                 self._visit(field.annotation)
@@ -360,6 +473,9 @@ class _Names:
 
 def _tag_values(annotation: object, discriminator: str) -> set[str]:
     """The values of `discriminator` that pick a member of the union `annotation`."""
+    val = getattr(annotation, "__value__", None)
+    if val is not None:
+        return _tag_values(cast(object, val), discriminator)
     if isinstance(annotation, type) and issubclass(annotation, BaseModel):
         field = annotation.model_fields.get(discriminator)
         if field is None:
@@ -396,7 +512,7 @@ def _argument_path(loc: Sequence[int | str], names: _Names) -> str:
 def _form_at(loc: Sequence[int | str], names: _Names) -> int | None:
     """Where in `loc` pydantic names the member of a union of models it tried, if it does."""
     for index, part in enumerate(loc):
-        if isinstance(part, str) and part not in names.arguments and part in names.forms:
+        if isinstance(part, str) and part in names.forms:
             return index
     return None
 
@@ -421,6 +537,8 @@ def _expected(error: Mapping[str, Any]) -> str:
     if kind == "union_tag_invalid" and "discriminator" in ctx and "expected_tags" in ctx:
         # The tag the call gave is not repeated; the ones that would do are.
         return f"should have {ctx['discriminator']} set to one of {ctx['expected_tags']}"
+    if kind == "union_tag_not_found" and "discriminator" in ctx:
+        return f"is missing discriminator {ctx['discriminator']}"
     if kind in {"literal_error", "enum"} and "expected" in ctx:
         allowed = str(ctx["expected"])
         if " or " not in allowed:  # one allowed value: a union member's tag, say
@@ -532,9 +650,9 @@ def describe_invalid_arguments(
             members = unions.setdefault(where, {})
             if (True, where) not in order:
                 order.append((True, where))
-            reasons = members.setdefault(str(loc[form]), {}).setdefault(
-                _argument_path(loc, names), []
-            )
+            inner_path = _argument_path(loc[form + 1 :], names)
+            full_where = f"{where}.{inner_path}" if where and inner_path else (where or inner_path)
+            reasons = members.setdefault(str(loc[form]), {}).setdefault(full_where, [])
         if expected not in reasons:
             reasons.append(expected)
     lines: list[str] = []
@@ -599,6 +717,8 @@ class BaseTool(abc.ABC, Generic[TParams]):
     #: Whether the tool is kept out of a turn outside a conversation (a room). See
     #: `tool_needs_room`.
     needs_room: ClassVar[bool] = False
+    #: Whether a result can carry a picture for the model. See `tool_returns_images`.
+    returns_images: ClassVar[bool] = False
     #: The values of the `action` argument that only read, on a tool that writes under its
     #: other actions. See `tool_call_writes_files`.
     read_actions: ClassVar[frozenset[str]] = frozenset()
@@ -677,16 +797,20 @@ class BaseTool(abc.ABC, Generic[TParams]):
 
         Raises:
             PathTraversalError: the path escapes the workspace.
-            PlainRefusalError: the path is in the story library (`in_story_library`), or
-                where clones' definitions and pictures are kept (`in_personas_dir`).
+            PlainRefusalError: the path is in a protected folder such as the story library
+                (`in_protected_root`), in
+                the app's own state (`in_app_state_dir`), or in a workspace's personas
+                folder (`in_personas_dir`).
         """
         resolved = self.resolve_safe_path(target_path, workspace_root)
-        if in_story_library(resolved, workspace_root):
+        protected = in_protected_root(resolved, workspace_root)
+        if protected is not None:
+            raise PlainRefusalError(protected.refusal_for(f"'{target_path}'"))
+        if in_app_state_dir(resolved):
             raise PlainRefusalError(
-                f"'{target_path}' is in the story library, so it was not written. Stories "
-                "are changed with the story tools (story_manuscript, story_outline, "
-                "story_codex), which check which conversation is writing the story and ask "
-                "a person before a codex change. Reading the file is still allowed."
+                f"'{target_path}' is where this app keeps its clones and conversations, so it "
+                "was not written. A clone's memory and picture are changed with its own "
+                "tools, and a person edits a clone from its settings."
             )
         if in_personas_dir(resolved, workspace_root):
             raise PlainRefusalError(
@@ -835,10 +959,14 @@ class BaseTool(abc.ABC, Generic[TParams]):
             else:
                 output = res
 
+            if isinstance(output, ToolResult):
+                return output
+
             elapsed_ms = (time.perf_counter() - start_time) * 1000.0
             return ToolResult(
                 success=True,
                 output=output,
+                artifacts=self.produced_artifacts(output),
                 execution_time_ms=elapsed_ms,
                 isolation_level=actual_context.isolation.level,
                 provenance=Provenance.primary(
@@ -884,6 +1012,15 @@ class BaseTool(abc.ABC, Generic[TParams]):
                     model=tool_identifier,
                 ),
             )
+
+    def produced_artifacts(self, output: Any) -> tuple[str, ...]:
+        """The workspace files a successful `run` produced, as this tool declares them (#2085).
+
+        Copied onto `ToolResult.artifacts`, which every reader of "what did this call make"
+        uses; a tool that writes files names them here rather than leaving readers to guess
+        from its output's shape. Nothing by default.
+        """
+        return ()
 
     @abc.abstractmethod
     def run(self, params: TParams, context: ToolContext) -> Any:

@@ -429,62 +429,10 @@ def run() -> None:
 # =============================================================================
 
 
-def test_the_language_pack_is_preferred_over_the_legacy_bundle(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """`tree-sitter-language-pack` is consulted first; the old bundle is not touched.
-
-    It is the only one of the two with a cp313 wheel, so an environment holding both must
-    resolve through the pack rather than through the shared object the bundle ships.
-
-    Killed by: src/uclone_x/code_intel/ast_parser.py :: parser = self._load_from_language_pack(lang_name) or self._load_from_language_bundle(
-    Becomes: parser = self._load_from_language_bundle(lang_name) or self._load_from_language_pack(
-    """
-    sentinel = object()
-    bundle_calls: list[str] = []
-
-    def from_pack(self: ASTParser, lang: str) -> object:
-        return sentinel
-
-    def from_bundle(self: ASTParser, lang: str) -> object | None:
-        bundle_calls.append(lang)
-        return None
-
-    monkeypatch.setattr(ASTParser, "_load_from_language_pack", from_pack)
-    monkeypatch.setattr(ASTParser, "_load_from_language_bundle", from_bundle)
-
-    parser = ASTParser()
-    assert parser._get_tree_sitter_parser("python") is sentinel  # pyright: ignore[reportPrivateUsage]
-    assert bundle_calls == []
-
-
-def test_the_legacy_bundle_still_answers_when_the_pack_is_absent(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """An environment installed before #1100 keeps working without a re-install.
-
-    Killed by: src/uclone_x/code_intel/ast_parser.py :: parser = self._load_from_language_pack(lang_name) or self._load_from_language_bundle(
-    Becomes: parser = self._load_from_language_pack(lang_name) or self._load_from_language_pack(
-    """
-    sentinel = object()
-
-    def from_pack(self: ASTParser, lang: str) -> object | None:
-        return None
-
-    def from_bundle(self: ASTParser, lang: str) -> object:
-        return sentinel
-
-    monkeypatch.setattr(ASTParser, "_load_from_language_pack", from_pack)
-    monkeypatch.setattr(ASTParser, "_load_from_language_bundle", from_bundle)
-
-    parser = ASTParser()
-    assert parser._get_tree_sitter_parser("go") is sentinel  # pyright: ignore[reportPrivateUsage]
-
-
 def test_a_failing_grammar_source_is_attempted_once_and_then_reported_absent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Neither source available means `None`, cached, without re-importing on every call.
+    """No grammar available means `None`, cached, without re-importing on every call.
 
     Killed by: src/uclone_x/code_intel/ast_parser.py :: self._ts_load_attempted[lang_name] = True
     Becomes: self._ts_load_attempted[lang_name] = False
@@ -495,11 +443,7 @@ def test_a_failing_grammar_source_is_attempted_once_and_then_reported_absent(
         attempts.append(lang)
         return None
 
-    def from_bundle(self: ASTParser, lang: str) -> object | None:
-        return None
-
     monkeypatch.setattr(ASTParser, "_load_from_language_pack", from_pack)
-    monkeypatch.setattr(ASTParser, "_load_from_language_bundle", from_bundle)
 
     parser = ASTParser()
     assert parser.is_tree_sitter_available("rust") is False
@@ -536,21 +480,10 @@ class _Node:
         self.children = list(children)
 
 
-@pytest.mark.parametrize(
-    "statement",
-    [
-        pytest.param(_Node("string"), id="language-pack-grammar"),
-        pytest.param(_Node("expression_statement", _Node("string")), id="legacy-bundle-grammar"),
-    ],
-)
-def test_docstring_is_found_in_either_grammar_shape(statement: _Node) -> None:
-    """Both grammars `ASTParser` loads are read, not only the one the dev venv happens to hold.
-
-    The public CI syncs `tree-sitter-language-pack`, whose tree-sitter-python puts a
-    docstring's `string` directly in the block; the legacy bundle wraps it in an
-    `expression_statement`. Reading only the wrapped form dropped every docstring and the
-    module symbol there, while the suite stayed green wherever the legacy bundle was
-    installed, so the shapes are pinned here without either grammar.
+def test_docstring_is_found_as_a_bare_string_statement() -> None:
+    """`tree-sitter-language-pack`'s tree-sitter-python puts a docstring's `string` directly
+    in the block. Reading only a wrapped form dropped every docstring and the module symbol,
+    so the shape is pinned here without the grammar.
 
     Killed by: src/uclone_x/code_intel/ast_parser.py :: if statement.type == "string":
     Becomes: if statement.type == "strinG":
@@ -559,7 +492,7 @@ def test_docstring_is_found_in_either_grammar_shape(statement: _Node) -> None:
         _docstring_node,  # pyright: ignore[reportPrivateUsage]
     )
 
-    found = _docstring_node(statement)
+    found = _docstring_node(_Node("string"))
     assert found is not None and found.type == "string"
 
 

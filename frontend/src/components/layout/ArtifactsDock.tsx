@@ -10,8 +10,11 @@ import {
   Bot,
   MessageSquare,
   BookOpen,
+  Globe,
 } from 'lucide-react';
 import { DocViewer } from '../artifacts/DocViewer';
+import { BrowserPanel } from '../browser/BrowserPanel';
+import type { BrowserLive } from '../../lib/browserLive';
 import { KnowledgeGraphViewer } from '../artifacts/KnowledgeGraphViewer';
 import { ActivityTimeline } from '../artifacts/ActivityTimeline';
 import { ResourceSummary } from '../artifacts/ResourceSummary';
@@ -22,6 +25,7 @@ import { useCopy } from '../../i18n';
 // quantity that decides whether it fits on screen is the window's own width. The panels
 // *inside* it follow the dock's width instead, through `.dock-scope` (ui-authoring §3).
 import { useWindowWidth } from '../../lib/rail';
+import { cloneIdOf } from '../../lib/cloneLabel';
 import { shownSurface } from '../../lib/developerMode';
 import { TopologyTab } from '../TopologyTab';
 import { LedgerTab } from '../LedgerTab';
@@ -169,8 +173,6 @@ export interface ArtifactsDockProps {
   onCloneModeChange?: (mode: 'view' | 'edit' | 'create') => void;
   /** Available tools from runtime. */
   availableTools?: readonly string[];
-  /** Available models from runtime. */
-  availableModels?: readonly string[];
   /** Whether the workspace directory is writable. */
   canWritePersonas?: boolean;
   /** Handler to persist the persona draft. */
@@ -185,6 +187,13 @@ export interface ArtifactsDockProps {
   onCloneStudioChange?: (studio: boolean) => void;
   onRefresh: () => void;
   isRefreshing: boolean;
+  /**
+   * The open conversation's browser, live (`lib/browserLive.ts`). `App` holds it so the step
+   * lines under a turn read the same socket; without it the Browser tab opens its own.
+   */
+  browserLive?: BrowserLive;
+  /** Open Settings ▸ Browser to connect U0's Chrome. */
+  onConnectBrowser?: () => void;
 }
 
 /**
@@ -220,13 +229,14 @@ export const ArtifactsDock: React.FC<ArtifactsDockProps> = ({
   cloneMode = 'view',
   onCloneModeChange,
   availableTools,
-  availableModels,
   canWritePersonas,
   onSavePersona,
   cloneStudio = false,
   onCloneStudioChange,
   onRefresh,
   isRefreshing,
+  browserLive,
+  onConnectBrowser,
 }) => {
   const [width, setWidth] = useState<number>(readStoredWidth);
   const draggingRef = useRef<boolean>(false);
@@ -252,7 +262,7 @@ export const ArtifactsDock: React.FC<ArtifactsDockProps> = ({
   // The surfaces that read the open conversation. While it is opening, or could not be read,
   // they are replaced by the sentence that says which, rather than each claiming none is open.
   const roomScoped =
-    seatScoped || surface === 'artifacts' || surface === 'topology' || surface === 'resource';
+    seatScoped || surface === 'artifacts' || surface === 'browser' || surface === 'topology' || surface === 'resource';
   const pending = roomId === null && roomScoped ? roomPending : null;
 
   // What is left of the row once the rail has taken its share is what decides whether the
@@ -328,6 +338,12 @@ export const ArtifactsDock: React.FC<ArtifactsDockProps> = ({
       icon: <FileText className="w-3.5 h-3.5" />,
       accent: 'cyan',
     },
+    {
+      id: 'browser',
+      label: t.tabs.browser,
+      icon: <Globe className="w-3.5 h-3.5" />,
+      accent: 'blue',
+    },
     // What the seat remembers, in sentences (#1357). The graph behind it is a developer
     // instrument; this is the everyday reading of the same store.
     {
@@ -367,6 +383,7 @@ export const ArtifactsDock: React.FC<ArtifactsDockProps> = ({
     if (!isActive) return 'text-slate-400 hover:text-slate-200 hover:bg-slate-900';
     const byAccent: Record<string, string> = {
       cyan: 'bg-cyan-600/30 text-cyan-300 border-cyan-500/50',
+      blue: 'bg-blue-600/30 text-blue-300 border-blue-500/50',
       violet: 'bg-violet-600/30 text-violet-300 border-violet-500/50',
       amber: 'bg-amber-600/30 text-amber-300 border-amber-500/50',
       emerald: 'bg-emerald-600/30 text-emerald-300 border-emerald-500/50',
@@ -466,12 +483,12 @@ export const ArtifactsDock: React.FC<ArtifactsDockProps> = ({
           <div className="h-full p-3">
             <CloneProfile
               cloneId={selectedClone}
-              persona={personas.find((p) => p.name === selectedClone)}
+              persona={personas.find((p) => cloneIdOf(p) === selectedClone)}
               onStartConversation={onStartConversation}
               mode={cloneMode}
               onModeChange={onCloneModeChange}
               availableTools={availableTools}
-              availableModels={availableModels}
+              developerMode={developerMode}
               existingNames={personas.map((p) => p.name)}
               canWrite={canWritePersonas}
               onSave={onSavePersona}
@@ -487,6 +504,16 @@ export const ArtifactsDock: React.FC<ArtifactsDockProps> = ({
             roomId={roomId}
             selectedArtifactPath={selectedArtifactPath}
             refreshKey={refreshKey}
+          />
+        )}
+
+        {/* Surface: Browser */}
+        {pending === null && surface === 'browser' && (
+          <BrowserPanel
+            roomId={roomId}
+            room={room && room.room_id === roomId ? room : null}
+            live={browserLive}
+            onConnect={onConnectBrowser}
           />
         )}
 
@@ -507,6 +534,7 @@ export const ArtifactsDock: React.FC<ArtifactsDockProps> = ({
               events={events}
               refreshKey={refreshKey}
               onOpenInDocs={onOpenInDocs}
+              developerMode={developerMode}
             />
           </div>
         )}

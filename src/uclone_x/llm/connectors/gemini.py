@@ -7,7 +7,7 @@ import binascii
 import json
 import logging
 import os
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from typing import Any, cast
 
 import httpx
@@ -37,8 +37,11 @@ from uclone_x.llm.connectors.listing import (
     optional_int,
     optional_str,
 )
+from uclone_x.llm.context_window import LISTED_CONTEXT_WINDOWS, ListedContextWindows
 from uclone_x.llm.models import (
+    IMAGE_UNAVAILABLE_NOTE,
     FinishReason,
+    ImagePart,
     LLMRequest,
     MessageRole,
     ModelResponse,
@@ -49,6 +52,22 @@ from uclone_x.llm.models import (
 )
 
 _logger = logging.getLogger(__name__)
+
+
+def _image_parts(images: Sequence[ImagePart]) -> list[dict[str, Any]]:
+    """`images` as Gemini `inlineData` parts, camelCase as the rest of this body (#2107).
+
+    An image whose bytes this process does not hold goes as a text part holding
+    `IMAGE_UNAVAILABLE_NOTE`, so the model is told one was there rather than sent nothing.
+    """
+    parts: list[dict[str, Any]] = []
+    for image in images:
+        if image.data is None:
+            parts.append({"text": IMAGE_UNAVAILABLE_NOTE})
+        else:
+            parts.append({"inlineData": {"mimeType": image.media_type, "data": image.data}})
+    return parts
+
 
 #: Who the person using the app holds the key with, as a failure names it (#1630).
 _PROVIDER = "Google"
@@ -143,11 +162,16 @@ class GeminiConnector(BaseLLMConnector):
         timeout: float = 60.0,
         http_client: httpx.AsyncClient | None = None,
         model: str | None = None,
+        context_windows: ListedContextWindows | None = None,
     ) -> None:
         """``model`` is what a request naming no model is sent to; see ``resolve_model``."""
         #: The model a request naming none asks for, or ``None``: then such a request is
         #: refused before the network rather than sent to a model id written here.
         self._default_model: str | None = named_model(model)
+        self._windows = context_windows if context_windows is not None else LISTED_CONTEXT_WINDOWS
+        #: Whether this connector has asked for the listing already. Asked at most once, so
+        #: a model the listing does not name costs one request, not one per turn.
+        self._listing_read = False
         resolved_key = (
             api_key
             if api_key is not None
@@ -188,11 +212,37 @@ class GeminiConnector(BaseLLMConnector):
         """
         return resolve_model(request.model, self._default_model, _PROVIDER)
 
+    async def observe_context_window(self, model: str | None = None) -> int | None:
+        """The window Gemini's listing reports for `model` (#1978).
+
+        Read from the listing once, when no figure is held for the model -- the catalogue
+        usually has one already, from Settings -- and never guessed: a model the listing
+        does not name, or a listing that cannot be read, leaves the window unknown.
+        """
+        chosen = named_model(model) or self._default_model
+        if chosen is None:
+            return None
+        held = self._windows.get(self.provider_name, chosen)
+        if held is not None or self._listing_read:
+            return held
+        self._listing_read = True
+        try:
+            self._windows.remember(self.provider_name, await self.list_models())
+        except Exception as exc:  # a window reading must not break a turn
+            _logger.debug("Could not read Gemini's model listing for its windows: %s", exc)
+        return self._windows.get(self.provider_name, chosen)
+
+    @property
+    def context_windows(self) -> ListedContextWindows:
+        """The store this connector records listed windows in, for the agent to read."""
+        return self._windows
+
     async def list_models(self) -> list[CatalogEntry]:
         """The models this key can use, from Gemini's `models.list` (#1631).
 
         Gemini reports each model's input and output token limits and the methods it
-        supports; a model without `generateContent` (an embedding model) cannot chat.
+        supports; a model without `generateContent` (an embedding model) cannot chat. It
+        does not say whether a model reads images, so `accepts_images` stays `False` (#2107).
         """
         entries: list[CatalogEntry] = []
         params: dict[str, str] = {"pageSize": "1000"}
@@ -371,6 +421,9 @@ class GeminiConnector(BaseLLMConnector):
                         }
                     }
                 ]
+                # A tool result's images go in the same `user` content as its
+                # functionResponse, which is where Gemini reads them as the result's (#2107).
+                parts.extend(_image_parts(msg.images))
                 contents.append({"role": "user", "parts": parts})
             elif msg.role == MessageRole.ASSISTANT:
                 parts = []
@@ -402,7 +455,9 @@ class GeminiConnector(BaseLLMConnector):
                         "an empty turn are different inputs to the model and would arrive as "
                         "the same bytes (P6, #380)."
                     )
-                contents.append({"role": "user", "parts": [{"text": msg.content}]})
+                contents.append(
+                    {"role": "user", "parts": [{"text": msg.content}, *_image_parts(msg.images)]}
+                )
 
         gen_config: dict[str, Any] = {"temperature": request.temperature}
         if request.max_tokens is not None:

@@ -49,7 +49,8 @@ class _MockGenerateImageTool(BaseTool[_ImageParams]):
         rel = "artifacts/images/img_real.png"
         return ToolResult(
             success=True,
-            output=f"/api/artifacts/content?path={rel}",
+            # The real tool's shape since #2013: a link only, with the file declared (#2085).
+            output={"status": "success", "relative_url": f"/api/artifacts/content?path={rel}"},
             artifacts=(rel,),
             provenance=_PROV,
         )
@@ -191,3 +192,147 @@ async def test_artifact_hallucination_persists_sanitized_by_tier2_hook(tmp_path:
     assert "img_fake1.png" in result.content
     assert ':missing-image{file="img_fake1.png"}' in result.content
     assert "/api/artifacts/content" not in result.content
+
+
+@pytest.mark.asyncio
+async def test_causal_provenance_nudges_when_prior_turn_image_repeated_without_tool_call(
+    tmp_path: Path,
+) -> None:
+    """When model re-quotes an existing disk image from prior turns without generating it, nudge fires."""
+    # Pre-existing image file from a prior turn
+    prior_file = tmp_path / "artifacts" / "images" / "img_prior.png"
+    prior_file.parent.mkdir(parents=True, exist_ok=True)
+    prior_file.write_bytes(b"PRIOR_PNG")
+
+    # Step 0: Model repeats prior image without calling generate_image
+    resp_step0 = ModelResponse(
+        content="Here is your picture again: ![Prior](/api/artifacts/content?path=artifacts/images/img_prior.png)",
+        finish_reason=FinishReason.STOP,
+        tool_calls=(),
+        usage=_USAGE,
+        provenance=_PROV,
+    )
+    # Step 1 (after nudge): Model calls generate_image
+    resp_step1 = ModelResponse(
+        content=None,
+        finish_reason=FinishReason.TOOL_CALLS,
+        tool_calls=(
+            ToolCallRequest(
+                id="call_img_fresh",
+                name="generate_image",
+                arguments={"prompt": "fresh sunrise"},
+            ),
+        ),
+        usage=_USAGE,
+        provenance=_PROV,
+    )
+    # Step 2: Model outputs the freshly produced image link
+    resp_step2 = ModelResponse(
+        content="Here is the fresh sunrise: ![Sunrise](/api/artifacts/content?path=artifacts/images/img_real.png)",
+        finish_reason=FinishReason.STOP,
+        tool_calls=(),
+        usage=_USAGE,
+        provenance=_PROV,
+    )
+
+    llm = _ScriptedLLM([resp_step0, resp_step1, resp_step2])
+    registry = ToolRegistry()
+    registry.register(_MockGenerateImageTool())
+
+    agent = BaseAgent(
+        config=AgentConfig(
+            agent_id="recovering_artist",
+            name="Recovering Artist",
+            llm_config=AgentLLMConfig(model_name="dummy"),
+        ),
+        llm=llm,
+        tools=registry,
+        context=AgentContext(
+            agent_id="recovering_artist",
+            session_id="sess_recovering",
+            workspace_root=tmp_path,
+        ),
+    )
+
+    result = await agent.execute_turn("Draw a fresh sunrise picture")
+    assert result.is_completed
+
+    artifact_nudges = [e for e in agent.pending_durable_events if e.get("type") == "ARTIFACT_NUDGE"]
+    assert len(artifact_nudges) == 1
+    assert artifact_nudges[0]["missing_artifact"] == "artifacts/images/img_prior.png"
+    assert "artifacts/images/img_real.png" in result.content
+
+
+@pytest.mark.asyncio
+async def test_the_real_image_tools_picture_is_kept_without_a_nudge(tmp_path: Path) -> None:
+    """The picture `generate_image` drew this turn is the one the reply shows (#2085).
+
+    The real tool, not a stand-in: its result names the picture by link only (#2013) and
+    it declares no `writes_files` (#2079). A reader of the output's shape missed it, the
+    nudge said the picture "was not produced", and the reply lost it with its avatar button.
+
+    Killed by: src/uclone_x/agent/tool_execution.py :: artifacts=res.artifacts if res.success else (),
+    Becomes: artifacts=(),
+    """
+    from unittest.mock import AsyncMock
+
+    from uclone_x.tools.builtin.image import (
+        GenerateImageTool,
+        ImageGenerationResult,
+        ImagePipelineDispatcher,
+    )
+
+    dispatcher = AsyncMock(spec=ImagePipelineDispatcher)
+    dispatcher.dispatch.return_value = ImageGenerationResult(
+        image_bytes=b"PNGDATA",
+        seed=7,
+        engine_name="fake",
+        device_info="none",
+        duration_seconds=0.1,
+        width=64,
+        height=64,
+    )
+    link = "/api/artifacts/content?path=artifacts/images/fiona.png"
+    llm = _ScriptedLLM(
+        [
+            ModelResponse(
+                content=None,
+                finish_reason=FinishReason.TOOL_CALLS,
+                tool_calls=(
+                    ToolCallRequest(
+                        id="call_img",
+                        name="generate_image",
+                        arguments={
+                            "prompt": "a self-portrait",
+                            "output_path": "artifacts/images/fiona.png",
+                        },
+                    ),
+                ),
+                usage=_USAGE,
+                provenance=_PROV,
+            ),
+            ModelResponse(
+                content=f"Here I am: ![me]({link})",
+                finish_reason=FinishReason.STOP,
+                tool_calls=(),
+                usage=_USAGE,
+                provenance=_PROV,
+            ),
+        ]
+    )
+    registry = ToolRegistry()
+    registry.register(GenerateImageTool(dispatcher=dispatcher))
+    agent = BaseAgent(
+        config=AgentConfig(
+            agent_id="fiona", name="Fiona", llm_config=AgentLLMConfig(model_name="dummy")
+        ),
+        llm=llm,
+        tools=registry,
+        context=AgentContext(agent_id="fiona", session_id="sess_fiona", workspace_root=tmp_path),
+    )
+
+    result = await agent.execute_turn("Draw who you are")
+
+    assert (tmp_path / "artifacts" / "images" / "fiona.png").is_file()
+    assert [e for e in agent.pending_durable_events if e.get("type") == "ARTIFACT_NUDGE"] == []
+    assert link in result.content

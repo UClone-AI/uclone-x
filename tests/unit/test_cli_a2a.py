@@ -12,6 +12,7 @@ import httpx
 import pytest
 from typer.testing import CliRunner
 
+from tests.support.clones import make_clones
 from uclone_x.a2a.models import AgentCard, TaskMessage, TaskResult, TaskStatus
 from uclone_x.agent.base import BaseAgent
 from uclone_x.agent.models import AgentConfig, TurnResult
@@ -27,6 +28,17 @@ from uclone_x.shells.a2a_server import (
     A2AServer,
     ManagedTaskRecord,
 )
+
+# The agent ids these tests run as. Each is a clone now, since a name no clone carries is
+# refused rather than given a home (clone-data-scopes §3.4); persona-less, so each speaks as
+# the prompt the test gives it.
+_A2A_CLONES = ("dev_agent",)
+
+
+@pytest.fixture(autouse=True)
+def _a2a_clones() -> None:  # pyright: ignore[reportUnusedFunction]
+    make_clones(*_A2A_CLONES)
+
 
 runner = CliRunner()
 
@@ -210,6 +222,45 @@ async def test_a2a_server_task_cancellation(sample_agent_card: AgentCard) -> Non
             assert cancel_again.json()["status"] == "canceled"
     finally:
         await server.stop()
+
+
+async def test_a2a_a_task_that_finishes_while_its_cancel_waits_keeps_its_own_end(
+    sample_agent_card: AgentCard,
+) -> None:
+    """A task that completes during the cancel's wait stays completed, with no `canceled`.
+
+    The cancel waits for the task to handle its cancellation (#1921). A task that finishes
+    instead is already terminal when the wait ends; the cancel answers with that status and
+    does not re-mark it or tell listeners it was cancelled (#1934).
+
+    Killed by: src/uclone_x/shells/a2a_server.py :: if record.is_terminal:  # it ended on its own while the cancel waited
+    Becomes: if False:  # it ended on its own while the cancel waited
+    """
+    started = asyncio.Event()
+
+    async def finishes_anyway(msg: TaskMessage) -> TaskResult:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            pass  # a handler that finishes its work rather than stop
+        return TaskResult(
+            task_id=msg.task_id,
+            status=TaskStatus.COMPLETED,
+            provenance=Provenance.primary("agent"),
+        )
+
+    server = A2AServer(agent_card=sample_agent_card, handler=finishes_anyway, port=0)
+    record = ManagedTaskRecord(task_id="task-finishes", session_id="sess", input_data={})
+    server._tasks[record.task_id] = record  # pyright: ignore[reportPrivateUsage]
+    record.async_task = asyncio.create_task(server._execute_managed_task(record))  # pyright: ignore[reportPrivateUsage]
+    await started.wait()
+
+    answer = await server.cancel_task_endpoint(record.task_id, a2a_version="1.0")
+
+    assert json.loads(bytes(answer.body)) == {"task_id": record.task_id, "status": "completed"}
+    assert record.status is TaskStatus.COMPLETED
+    assert "canceled" not in [e["event"] for e in record.events]
 
 
 async def test_a2a_server_task_not_found_errors(sample_agent_card: AgentCard) -> None:
@@ -992,8 +1043,8 @@ async def test_a2a_context_continues_its_room_and_a_new_context_starts_one(
 
     The `sess_<clone>` session the gateway used before is neither written nor resumed.
 
-    Killed by: src/uclone_x/shells/a2a_server.py :: answering_id, turn_result = await self._run_turn(record.context_id, prompt)
-    Becomes: answering_id, turn_result = await self._run_turn(record.session_id, prompt)
+    Killed by: src/uclone_x/shells/a2a_server.py :: record.context_id, prompt, on_set_aside=record
+    Becomes: record.session_id, prompt, on_set_aside=record
     Killed by: src/uclone_x/cli/commands/a2a.py :: agent.hydrate_session()
     Becomes: pass
     """
@@ -1043,6 +1094,165 @@ async def test_a2a_two_clones_under_one_context_never_share_a_room(
     assert len(rooms.list_room_ids()) == 2
     assert _asked(store, "ada", "ctx") == ["for ada"]
     assert _asked(store, "bo", "ctx") == ["for bo"]
+
+
+async def test_a2a_says_once_that_a_turns_save_kept_a_record_aside(
+    tmp_path: Path, sample_agent_card: AgentCard
+) -> None:
+    """A task whose save kept a newer build's record aside says so, once (#1921).
+
+    Before, A2A set the record aside, recorded its row without the flag and said nothing,
+    while `ucx run`, `ucx loop` and ACP each told the person. The task carries the notice
+    as its `status_message` and one `notice` event, in the words every head uses; its
+    result stays in the artifacts. The room's row carries the flag the app renders.
+
+    Killed by: src/uclone_x/shells/a2a_server.py :: set_aside = self._took_set_aside(context_id, agent)  # this turn's save
+    Becomes: set_aside = False
+    Killed by: src/uclone_x/shells/a2a_server.py :: on_set_aside.status_message = SESSION_SET_ASIDE_NOTICE
+    Becomes: pass
+    Killed by: src/uclone_x/shells/a2a_server.py :: await record.emit_event({"event": "notice", "message": record.status_message})
+    Becomes: pass
+    Killed by: src/uclone_x/cli/commands/a2a.py :: turn = replace(turn, session_set_aside=session_set_aside)
+    Becomes: pass
+    """
+    from uclone_x.cli.commands.a2a import a2a_room_id
+    from uclone_x.core.set_aside import SESSION_SET_ASIDE_NOTICE, set_aside_copies
+    from uclone_x.room.service import participant_session_id
+
+    server, store, rooms = _a2a_room_server(tmp_path, sample_agent_card)
+    first = await _ask(server, "ctx", "one")
+    seat = store.session_path(participant_session_id(a2a_room_id("ada", "ctx"), "ada"))
+    document = json.loads(seat.read_text(encoding="utf-8"))
+    document["a_field_from_a_newer_build"] = True
+    seat.write_text(json.dumps(document), encoding="utf-8")
+
+    second = await _ask(server, "ctx", "two")
+    third = await _ask(server, "ctx", "three")
+
+    assert [r.status for r in (first, second, third)] == [TaskStatus.COMPLETED] * 3
+    assert len(set_aside_copies(seat)) == 1
+    assert [r.to_dict()["status_message"] for r in (first, second, third)] == [
+        None,
+        SESSION_SET_ASIDE_NOTICE,
+        None,
+    ]
+    notices = [
+        [e["message"] for e in r.events if e["event"] == "notice"] for r in (first, second, third)
+    ]
+    assert notices == [[], [SESSION_SET_ASIDE_NOTICE], []]
+    assert second.artifacts == [
+        {"name": "response", "content": second.output_data["result"], "type": "text"}
+    ]
+    room = rooms.load(a2a_room_id("ada", "ctx"))
+    assert room is not None
+    rows = [
+        m.session_set_aside
+        for m in room.transcript
+        if m.sender_id == "ada" and m.kind == "utterance"
+    ]
+    assert rows == [False, True, False]
+
+
+async def _a_context_whose_next_save_sets_its_record_aside(
+    tmp_path: Path, sample_agent_card: AgentCard
+) -> tuple[A2AServer, RoomStore, Path]:
+    """A server whose `ctx` agent is held, with its seat record since written by a newer build."""
+    from uclone_x.cli.commands.a2a import a2a_room_id
+    from uclone_x.room.service import participant_session_id
+
+    server, store, rooms = _a2a_room_server(tmp_path, sample_agent_card)
+    first = await _ask(server, "ctx", "one")
+    assert first.status is TaskStatus.COMPLETED, first.error
+    seat = store.session_path(participant_session_id(a2a_room_id("ada", "ctx"), "ada"))
+    document = json.loads(seat.read_text(encoding="utf-8"))
+    document["a_field_from_a_newer_build"] = True
+    seat.write_text(json.dumps(document), encoding="utf-8")
+    return server, rooms, seat
+
+
+def _last_row_flag(rooms: RoomStore) -> bool:
+    from uclone_x.cli.commands.a2a import a2a_room_id
+
+    room = rooms.load(a2a_room_id("ada", "ctx"))
+    assert room is not None
+    return room.transcript[-1].session_set_aside
+
+
+async def test_a2a_a_failed_turn_still_says_its_save_kept_a_record_aside(
+    tmp_path: Path, sample_agent_card: AgentCard, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A turn that raised is saved and recorded, and the task says so like a completed one.
+
+    Killed by: src/uclone_x/shells/a2a_server.py :: await self._tell_set_aside(record)  # the failed turn's save
+    Becomes: pass
+    """
+    from uclone_x.core.set_aside import SESSION_SET_ASIDE_NOTICE, set_aside_copies
+
+    server, rooms, seat = await _a_context_whose_next_save_sets_its_record_aside(
+        tmp_path, sample_agent_card
+    )
+
+    async def _raises(*_args: object, **_kwargs: object) -> object:
+        raise RuntimeError("the turn broke")
+
+    monkeypatch.setattr(server._context_agents["ctx"], "execute_turn", _raises)  # pyright: ignore[reportPrivateUsage]
+    failed = await _ask(server, "ctx", "two")
+
+    assert failed.status is TaskStatus.FAILED
+    assert len(set_aside_copies(seat)) == 1
+    assert failed.status_message == SESSION_SET_ASIDE_NOTICE
+    assert [e["event"] for e in failed.events][-2:] == ["notice", "error"]
+    assert _last_row_flag(rooms) is True
+
+
+async def test_a2a_a_cancelled_turn_says_it_to_a_live_listener(
+    tmp_path: Path, sample_agent_card: AgentCard, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cancelled turn is saved; a subscriber still listening is told a record was kept aside.
+
+    Before, the cancel closed the listeners before the task had handled its cancellation,
+    so the `notice` reached only the stored events (#1921).
+
+    Killed by: src/uclone_x/shells/a2a_server.py :: await self._tell_set_aside(record)  # the cancelled turn's save
+    Becomes: pass
+    Killed by: src/uclone_x/shells/a2a_server.py :: await asyncio.wait({task}, timeout=CANCEL_SETTLE_SECONDS)
+    Becomes: pass
+    """
+    from uclone_x.core.set_aside import SESSION_SET_ASIDE_NOTICE, set_aside_copies
+
+    server, rooms, seat = await _a_context_whose_next_save_sets_its_record_aside(
+        tmp_path, sample_agent_card
+    )
+    started = asyncio.Event()
+
+    async def _hangs(*_args: object, **_kwargs: object) -> object:
+        started.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr(server._context_agents["ctx"], "execute_turn", _hangs)  # pyright: ignore[reportPrivateUsage]
+    record = ManagedTaskRecord(
+        task_id="task-cancelled",
+        session_id="sess-caller",
+        input_data={"prompt": "two"},
+        context_id="ctx",
+    )
+    heard: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+    record.listeners.append(heard)
+    server._tasks[record.task_id] = record  # pyright: ignore[reportPrivateUsage]
+    record.async_task = asyncio.create_task(server._execute_managed_task(record))  # pyright: ignore[reportPrivateUsage]
+    await started.wait()
+
+    answer = await server.cancel_task_endpoint(record.task_id, a2a_version="1.0")
+
+    assert json.loads(bytes(answer.body)) == {"task_id": record.task_id, "status": "canceled"}
+    live: list[str] = []
+    while (event := heard.get_nowait()) is not None:
+        live.append(event["event"])
+    assert live[-2:] == ["notice", "canceled"]
+    assert record.status_message == SESSION_SET_ASIDE_NOTICE
+    assert len(set_aside_copies(seat)) == 1
+    assert _last_row_flag(rooms) is True
 
 
 def test_a2a_task_request_reads_context_id_and_reports_it() -> None:

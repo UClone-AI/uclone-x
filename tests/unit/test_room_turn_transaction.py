@@ -274,7 +274,7 @@ class TestAFailedTurnLeavesNothingInTheSeat:
 
         Killed by: src/uclone_x/room/orchestrator.py :: rollback_error = None if committed else self._roll_back_seat(agent, speaker, checkpoint)
         Becomes: rollback_error = None
-        Killed by: src/uclone_x/agent/session_lifecycle.py :: live.messages = list(checkpoint.messages)
+        Killed by: src/uclone_x/agent/session_lifecycle.py :: live.restore_history(checkpoint)
         Becomes: pass
         """
         llm = _Script(
@@ -434,13 +434,22 @@ class TestTheAgentDropsAnUnansweredStep:
     ) -> None:
         """Stop in a one-to-one chat: the question stays, the half step goes.
 
-        Killed by: src/uclone_x/agent/turn_executor.py :: del turn_messages[dangling_index:]
+        Killed by: src/uclone_x/agent/turn_executor.py :: turn_live.truncate(dangling_index, cause="tool_step_dropped")
         Becomes: pass
         Killed by: src/uclone_x/agent/turn_executor.py :: return (index, missing) if missing else None
         Becomes: return None
+        Killed by: src/uclone_x/agent/turn_executor.py :: kept_text = outcome == "completed" and bool(asked.content)
+        Becomes: kept_text = bool(asked.content)
         """
         held = _HeldTool()
-        agent = _seat(_Script([_call("c1", "held"), "unused"]), None, held)
+        response = ModelResponse(
+            finish_reason=FinishReason.TOOL_CALLS,
+            content="I am about to call the held tool.",
+            tool_calls=(_call("c1", "held"),),
+            usage=_USAGE,
+            provenance=_PROV,
+        )
+        agent = _seat(_Script([response, "unused"]), None, held)
 
         turn = asyncio.create_task(agent.execute_turn("write it down"))
         await asyncio.wait_for(held.started.wait(), 2.0)
@@ -449,12 +458,14 @@ class TestTheAgentDropsAnUnansweredStep:
             await turn
 
         assert _unanswered(agent.history) == []
+        assert len(agent.history) == 2
         last = agent.history[-1]
         assert last.role is MessageRole.USER and last.content == "write it down"
         dropped = [e for e in agent.pending_durable_events if e["type"] == "TOOL_STEP_DROPPED"]
         assert len(dropped) == 1
         assert dropped[0]["unanswered_tool_call_ids"] == ["c1"]
         assert dropped[0]["outcome"] == "cancelled"
+        assert dropped[0]["assistant_text_kept"] is False
 
     @pytest.mark.asyncio
     async def test_a_step_whose_tools_all_answered_is_kept_when_the_turn_fails_later(
@@ -739,16 +750,16 @@ class TestUndoneCallsAreNotMatchedByProviderIds:
         Killed by: src/uclone_x/agent/turn_executor.py :: : len(all_tool_calls) - withheld_calls
         Becomes: : len(all_tool_calls)
         """
-        from uclone_x.core.tool_results import STEP_OVER_WINDOW_MESSAGE
+        from uclone_x.core.tool_results import StepRefusalCode
 
         llm = _Script([_call("call_0", "memo"), _call("call_0", "note"), "done"])
         agent = _seat(llm, SessionStore(tmp_path / "sessions"), _NoteTool(), _MemoTool())
         steps = 0
 
-        def refuse_the_second_step(*args: Any, **kwargs: Any) -> str | None:
+        def refuse_the_second_step(*args: Any, **kwargs: Any) -> StepRefusalCode | None:
             nonlocal steps
             steps += 1
-            return STEP_OVER_WINDOW_MESSAGE if steps == 2 else None
+            return "step.over_window" if steps == 2 else None
 
         monkeypatch.setattr(agent, "_fit_step_to_window", refuse_the_second_step)
         orch = _room(tmp_path, agent)
@@ -771,7 +782,7 @@ class TestUndoneCallsAreNotMatchedByProviderIds:
         Killed by: src/uclone_x/agent/turn_executor.py :: live.undone_tool_calls.extend(withheld)
         Becomes: live.undone_tool_calls.extend(call for call in withheld if call.id not in {c.id for c in live.undone_tool_calls})
         """
-        from uclone_x.core.tool_results import STEP_OVER_WINDOW_MESSAGE
+        from uclone_x.core.tool_results import StepRefusalCode
 
         llm = _Script(
             [
@@ -784,10 +795,10 @@ class TestUndoneCallsAreNotMatchedByProviderIds:
         agent = _seat(llm, SessionStore(tmp_path / "sessions"), _NoteTool(), _MemoTool())
         steps = 0
 
-        def refuse_the_second_step(*args: Any, **kwargs: Any) -> str | None:
+        def refuse_the_second_step(*args: Any, **kwargs: Any) -> StepRefusalCode | None:
             nonlocal steps
             steps += 1
-            return STEP_OVER_WINDOW_MESSAGE if steps == 2 else None
+            return "step.over_window" if steps == 2 else None
 
         monkeypatch.setattr(agent, "_fit_step_to_window", refuse_the_second_step)
         orch = _room(tmp_path, agent)

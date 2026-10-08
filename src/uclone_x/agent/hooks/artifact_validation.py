@@ -66,7 +66,7 @@ def extract_artifact_rel_path(raw_url: str) -> str | None:
         params = parse_qs(parsed.query)
         path_list = params.get("path")
         if path_list and path_list[0]:
-            return unquote(path_list[0]).strip()
+            return path_list[0].strip()
         return None
 
     unquoted = unquote(clean_url).strip()

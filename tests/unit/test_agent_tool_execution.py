@@ -28,6 +28,7 @@ from uclone_x.agent.tool_invoker import ToolInvoker
 from uclone_x.llm.models import ToolCallRequest
 from uclone_x.tools.models import ToolContext, ToolResultStatus
 from uclone_x.tools.registry import create_default_registry
+from uclone_x.tools.tool_ranking import unknown_tool_message
 
 
 class _BlockingHook(BaseHook):
@@ -48,6 +49,12 @@ class _EmptyInvoker:
 
     def resolve(self, name: str) -> None:
         return None
+
+    def knows_tool(self, name: str) -> bool:
+        return False
+
+    def unknown_tool_result(self, name: str, arguments: dict[str, Any]) -> str:
+        return unknown_tool_message(name, [])
 
 
 @dataclass
@@ -91,34 +98,35 @@ def _ctx(tmp_path: Path) -> ToolContext:
     return ToolContext(agent_id="executor", session_id="s", workspace_root=tmp_path)
 
 
-def test_a_hook_payload_naming_neither_key_is_itself_the_arguments() -> None:
-    """`{"path": ...}` from a hook is the rewritten call's arguments, not "no rewrite".
-
-    Killed by: src/uclone_x/agent/tool_execution.py :: return cast(dict[str, Any], unwrap_immutable(modified_payload))
-    Becomes: return None
-    """
-    assert _modified_arguments({"path": "a.txt"}) == {"path": "a.txt"}
+def test_modified_arguments() -> None:
+    # Killed by: src/uclone_x/agent/tool_execution.py :: return cast(dict[str, Any], unwrap_immutable(cast(Mapping[str, Any], arguments)))
+    # Becomes: return None
+    assert _modified_arguments({"path": "a.txt"}) is None
     assert _modified_arguments({"arguments": {"path": "b.txt"}}) == {"path": "b.txt"}
     assert _modified_arguments({"tool_name": "other"}) is None
     assert _modified_arguments(None) is None
 
 
 @pytest.mark.asyncio
-async def test_a_name_in_range_that_no_catalog_holds_is_reported_not_found(
+async def test_a_name_no_tool_has_is_answered_in_plain_words_and_nothing_runs(
     tmp_path: Path,
 ) -> None:
-    """In range but held nowhere: an error record naming the tool, and nothing runs.
+    """R4 (#2190): an error record whose words are the plain did-you-mean result.
 
-    Killed by: src/uclone_x/agent/tool_execution.py :: err_msg = f"Tool '{effective_tc.name}' not found"
-    Becomes: err_msg = "unavailable"
+    Killed by: src/uclone_x/agent/tool_execution.py :: did_you_mean = self._tool_invoker.unknown_tool_result(effective_tc.name, unwrapped_args)
+    Becomes: did_you_mean = f"Tool '{effective_tc.name}' not found"
     """
     call = ToolCallRequest(id="c1", name="ghost", arguments={})
 
     msg, rec = await _executor(_State()).execute_single_tool(call, _ctx(tmp_path))
 
+    expected = (
+        "There is no tool named 'ghost', so nothing was run. "
+        "Use only the tools listed in this request."
+    )
     assert rec.status == ToolResultStatus.ERROR
-    assert rec.error == "Tool 'ghost' not found"
-    assert msg.content == "Tool 'ghost' not found"
+    assert rec.error == expected
+    assert msg.content == expected
     assert msg.tool_call_id == "c1"
 
 

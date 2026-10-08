@@ -1,0 +1,14 @@
+{
+  "extName": { "message": "UClone-X" },
+  "extDescription": { "message": "Lets your UClone-X clones use tabs in this Chrome, in a tab group you can see." },
+  "title": { "message": "Connect this Chrome to UClone-X" },
+  "intro": { "message": "Paste the pairing code from UClone-X Settings ▸ Browser. Clones then open their tabs here, in a \"UClone-X\" tab group, and Chrome shows a bar while a clone uses a tab. Close that bar to take the tab back." },
+  "codeLabel": { "message": "Pairing code" },
+  "save": { "message": "Connect" },
+  "status_unpaired": { "message": "Not connected yet. Paste the pairing code and press Connect." },
+  "status_connecting": { "message": "Connecting to UClone-X…" },
+  "status_connected": { "message": "Connected. Your clones can use this Chrome." },
+  "status_refused": { "message": "UClone-X did not accept this pairing code. It may have been replaced: copy the code from Settings ▸ Browser again." },
+  "status_unreachable": { "message": "UClone-X did not answer. Check that it is running, then copy the code from Settings ▸ Browser again." },
+  "notACode": { "message": "That is not a pairing code. Copy the whole code from UClone-X Settings ▸ Browser." }
+}

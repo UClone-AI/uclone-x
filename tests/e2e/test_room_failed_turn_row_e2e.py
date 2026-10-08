@@ -413,7 +413,13 @@ async def test_a_retired_model_says_so_on_its_row_and_sends_the_user_to_settings
                 stated = " ".join(
                     (await row.locator("[data-testid='row-error-4']").inner_text()).split()
                 )
-                assert f"couldn't finish this turn. {RETIRED}" in stated, stated
+                # Built in the reader's language from the failure's kind and provider, never
+                # the Core's English sentence (#2167).
+                assert (
+                    "couldn't finish this turn. Google doesn't offer the model this turn asked for."
+                    in stated
+                ), stated
+                assert str(RETIRED) not in stated, stated
                 remedy = (await row.locator("[data-testid='row-remedy-4']").inner_text()).strip()
                 assert remedy == "Choose another model in Settings, then send your message again."
                 assert await row.locator("[data-testid='retry-turn']").count() == 0, (
@@ -442,7 +448,11 @@ async def test_a_spent_quota_says_so_on_its_row_and_keeps_retry(
             stated = " ".join(
                 (await row.locator("[data-testid='row-error-4']").inner_text()).split()
             )
-            assert f"couldn't finish this turn. {SPENT}" in stated, stated
+            assert (
+                "couldn't finish this turn. The usage limit for this key at Anthropic has been "
+                "reached." in stated
+            ), stated
+            assert str(SPENT) not in stated, stated
             assert await row.locator("[data-testid='retry-turn']").count() == 1
             assert await row.locator("[data-testid='row-remedy-4']").count() == 0
         finally:

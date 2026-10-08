@@ -19,8 +19,8 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from fastapi.testclient import TestClient
 
+from tests.support.clones import make_clones
 from uclone_x.agent.session import SessionStore
-from uclone_x.core.agent_home import AgentHome
 from uclone_x.engine.event_bus import EventBus
 from uclone_x.ontology.engine import OntologyEngine
 from uclone_x.ontology.models import OntologyConcept, OntologyTier
@@ -72,8 +72,8 @@ async def test_user_creative_workflow_scenario(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    # 1.3: Session-specific tool output artifact
-    session_tool_dir = workspace_dir / ".sandbox" / "tool_artifacts" / session_id
+    # 1.3: Session-specific artifact
+    session_tool_dir = workspace_dir / "artifacts" / session_id
     session_tool_dir.mkdir(parents=True, exist_ok=True)
     tool_doc = session_tool_dir / "card_balance_analysis.md"
     tool_doc.write_text(
@@ -141,7 +141,7 @@ async def test_user_creative_workflow_scenario(tmp_path: Path) -> None:
     # The clone's own rules engine, the one its seats and chats reason with: the manager
     # keeps no shared engine (clone-knowledge-graph §3.8, #1869). The clone is installed,
     # as the developer-graph routes read only a clone listed here.
-    assert AgentHome.for_username(agent_id).agent_id()
+    make_clones(agent_id)
     session_manager = AgentSessionManager(
         bus=bus,
         storage_dir=storage_dir,
@@ -193,7 +193,7 @@ async def test_user_creative_workflow_scenario(tmp_path: Path) -> None:
 
     artifact_paths = {a["path"] for a in artifacts}
     assert "artifacts/character_concepts.md" in artifact_paths
-    assert f".sandbox/tool_artifacts/{session_id}/card_balance_analysis.md" in artifact_paths
+    assert f"artifacts/{session_id}/card_balance_analysis.md" in artifact_paths
     # A document in the workspace's docs/ is readable, but it is not listed as an artifact.
     assert "docs/design/fantasy_card_game_design.md" not in artifact_paths
 

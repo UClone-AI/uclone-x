@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { render, screen, fireEvent, waitFor, within } from '@testing-library/react';
 import { ActivityTimeline, activityReadFailedSentence } from './ActivityTimeline';
 import { expectPlain } from '../../test/plainCopy';
+import { en } from '../../i18n/en';
 import type { EventEnvelope } from '../../types';
 import type { RoomToolUse, SeatHistory, SeatTurn } from '../../lib/roomDock';
 
@@ -236,7 +237,7 @@ describe('ActivityTimeline, scoped to a room seat (#1353, #1356)', () => {
     answers[HISTORY_A] = history({
       tool_uses: [
         use({ tool_call_id: 'm', tool_name: 'write_to_file', arguments_preview: '{"TargetFile": "src/app.py"}' }),
-        use({ tool_call_id: 'c', tool_name: 'run_command', arguments_preview: '{"CommandLine": "./ucx test check"}' }),
+        use({ tool_call_id: 'c', tool_name: 'bash_run', arguments_preview: '{"CommandLine": "./ucx test check"}' }),
       ],
     });
     render(<ActivityTimeline roomId="room-a" seatId="scout" events={[]} />);
@@ -257,7 +258,7 @@ describe('ActivityTimeline, scoped to a room seat (#1353, #1356)', () => {
   it('expands a row to its input, output and error, and copies the whole record', async () => {
     const failed = use({
       tool_call_id: 'x1',
-      tool_name: 'run_command',
+      tool_name: 'bash_run',
       arguments_preview: '{"CommandLine": "cat missing.txt"}',
       status: 'error',
       error: 'FileNotFoundError: missing.txt',
@@ -265,7 +266,7 @@ describe('ActivityTimeline, scoped to a room seat (#1353, #1356)', () => {
       truncated: true,
     });
     answers[HISTORY_A] = history({ tool_uses: [failed] });
-    render(<ActivityTimeline roomId="room-a" seatId="scout" events={[]} />);
+    render(<ActivityTimeline roomId="room-a" seatId="scout" events={[]} developerMode={true} />);
     fireEvent.click(await screen.findByText('Command: cat missing.txt'));
 
     expect(screen.getByText('Input Parameters')).toBeDefined();
@@ -288,7 +289,7 @@ describe('ActivityTimeline, scoped to a room seat (#1353, #1356)', () => {
 
 /**
  * The registered tool names get the label their behaviour has (#1463). Since #1461 the model
- * is offered `bash_run` and never `run_command`, and the file tools were always `file_write`,
+ * is offered `bash_run`, and the file tools were always `file_write`,
  * `file_edit`, `file_read`, `file_search` and `directory_list`; the classifier matched only
  * other hosts' spellings, so every shell call and every file write read as "Tool Call".
  */
@@ -297,7 +298,7 @@ describe('ActivityTimeline labels the tools this runtime registers (#1463)', () 
 
   // Killed by: frontend/src/lib/toolLabels.ts :: name === 'bash_run' ||
   // Becomes: name === 'bash_rux' ||
-  it('labels a bash_run call "Command", as it labels run_command', async () => {
+  it('labels a bash_run call "Command"', async () => {
     answers[HISTORY_A] = history({
       tool_uses: [
         use({ tool_call_id: 'b1', tool_name: 'bash_run', arguments_preview: '{"command": "ls -la"}' }),
@@ -434,3 +435,69 @@ describe('ActivityTimeline: a failed read shows no transport text (#1435)', () =
     expectPlain(screen.getByTestId('activity-empty-state').textContent);
   });
 });
+
+describe('ActivityTimeline: tool failure display (#1456)', () => {
+  const rawError =
+    "Tool execution failed for 'filesystem_read': FileNotFoundError: [Errno 2] No such file or directory: '/private/etc/shadow'";
+
+  // Killed by: frontend/src/components/artifacts/ActivityTimeline.tsx :: {devMode && (
+  // Becomes: {true && (
+  it('shows plain copy and hides raw error trace in U0 mode (developerMode=false)', async () => {
+    answers[HISTORY_A] = history({
+      tool_uses: [
+        use({
+          tool_call_id: 'err-1',
+          tool_name: 'filesystem_read',
+          status: 'error',
+          error: rawError,
+        }),
+      ],
+    });
+    const { container } = render(
+      <ActivityTimeline roomId="room-a" seatId="scout" events={[]} developerMode={false} />,
+    );
+    const card1 = await screen.findByTestId('activity-card-err-1');
+    fireEvent.click(within(card1).getByRole('button'));
+
+    expect(screen.getByTestId('activity-error-summary-err-1')).toHaveTextContent(
+      en.dock.activity.toolFailed,
+    );
+    expectPlain(screen.getByTestId('activity-error-summary-err-1').textContent);
+
+    expect(screen.queryByTestId('activity-error-trace-err-1')).toBeNull();
+    expect(screen.queryByText(en.dock.activity.errorTrace)).toBeNull();
+    expect(screen.queryByText(/FileNotFoundError/)).toBeNull();
+    expect(screen.queryByText(/\[Errno 2\]/)).toBeNull();
+    expect(screen.queryByText(/\/private\/etc\/shadow/)).toBeNull();
+    expect(container.textContent).not.toContain('FileNotFoundError');
+    expect(container.textContent).not.toContain('[Errno 2]');
+    expect(container.textContent).not.toContain('/private/etc/shadow');
+    expect(container.textContent).not.toContain(en.dock.activity.errorTrace);
+  });
+
+  it('shows plain copy and displays raw error trace in developer mode (developerMode=true)', async () => {
+    answers[HISTORY_A] = history({
+      tool_uses: [
+        use({
+          tool_call_id: 'err-2',
+          tool_name: 'filesystem_read',
+          status: 'error',
+          error: rawError,
+        }),
+      ],
+    });
+    render(
+      <ActivityTimeline roomId="room-a" seatId="scout" events={[]} developerMode={true} />,
+    );
+    const card2 = await screen.findByTestId('activity-card-err-2');
+    fireEvent.click(within(card2).getByRole('button'));
+
+    expect(screen.getByTestId('activity-error-summary-err-2')).toHaveTextContent(
+      en.dock.activity.toolFailed,
+    );
+    expect(screen.getByText(en.dock.activity.errorTrace)).toBeDefined();
+    const trace = screen.getByTestId('activity-error-trace-err-2');
+    expect(trace).toHaveTextContent(rawError);
+  });
+});
+

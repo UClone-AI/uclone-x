@@ -22,6 +22,8 @@ from uclone_x.core.session_store import SessionStoreProtocol
 from uclone_x.core.set_aside import SESSION_SET_ASIDE_NOTICE
 from uclone_x.engine.event_bus import AgentEvent, EventBus, EventSubscription, EventType
 from uclone_x.errors import ProviderFailureKind
+from uclone_x.i18n.refusals import head_language, refusal_text
+from uclone_x.llm.connectors.saved_choice import settings_data
 from uclone_x.shells.acp.models import (
     ACP_PROTOCOL_VERSION,
     INTERNAL_ERROR,
@@ -746,7 +748,7 @@ class ACPServer:
         except _NoRoomForAgentError:
             return make_jsonrpc_error(req_id, INTERNAL_ERROR, TOO_MANY_BUSY_MESSAGE)
         except _AgentBuildError:
-            return make_jsonrpc_error(req_id, INTERNAL_ERROR, CANNOT_START_MESSAGE)
+            return make_jsonrpc_error(req_id, INTERNAL_ERROR, CANNOT_START_MESSAGE)  # build failed
         try:
             agent.persist_session(self.stored_session_id(session_id))
         except Exception:
@@ -926,7 +928,12 @@ class ACPServer:
                 stop_reason = turn_result.stop_reason or ""
                 if stop_reason in _PLAIN_ERROR_STOP_REASONS:
                     remedy = _PLAIN_ERROR_REMEDIES.get(stop_reason)
-                    failure = f"{turn_result.error} {remedy}" if remedy else turn_result.error
+                    error = turn_result.error
+                    if turn_result.error_code is not None:
+                        # A refused step is said in the person's language (#1862).
+                        language = head_language(settings_data())
+                        error = refusal_text(turn_result.error_code, language)
+                    failure = f"{error} {remedy}" if remedy else error
                 else:
                     logger.error(
                         "Turn for ACP session %s failed (%s): %s",

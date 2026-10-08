@@ -1,0 +1,15 @@
+{
+  "zoom": "{name} 크게 보기",
+  "download": "다운로드",
+  "downloadName": "{name} 다운로드",
+  "more": "이 그림의 다른 동작",
+  "openInDocs": "문서에서 열기",
+  "openInTab": "새 탭에서 열기",
+  "gallery": "그림 {count}장",
+  "pick": "{count}장 중 {n}번째 그림",
+  "viewer": "그림 보기",
+  "close": "닫기",
+  "previous": "이전 그림",
+  "next": "다음 그림",
+  "position": "{n} / {count}"
+}

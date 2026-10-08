@@ -31,6 +31,7 @@ from pydantic import BaseModel, Field
 from tests.support.app_clone import app_clone
 from uclone_x.agent.base import BaseAgent
 from uclone_x.agent.models import AgentConfig, PersonaDefinition
+from uclone_x.agent.self_scene import ShowSelfTool
 from uclone_x.core.provenance import Provenance
 from uclone_x.llm.connectors.mock import MockLLMConnector
 from uclone_x.llm.models import LLMRequest, MessageRole, ModelResponse, ToolCallRequest
@@ -337,7 +338,9 @@ def test_the_ruling_s_classification_of_every_shipped_tool() -> None:
         "run_command": True,
         "web_fetch": False,
         "web_search": False,
-        "generate_image": True,
+        "browser": False,
+        # Media artifact generation in workspace artifacts sandbox; does not touch host source (#2079).
+        "generate_image": False,
         # Only the calling clone's own picture, in a folder no general tool can write.
         "set_avatar": False,
         "character_sheet": True,
@@ -349,6 +352,7 @@ def test_the_ruling_s_classification_of_every_shipped_tool() -> None:
         "story_codex": True,
         "story_context": False,
         "story_audit": False,
+        "story_start": True,
         "install_package": True,
         "update_plan": False,
         "delegate_subagent": False,
@@ -366,6 +370,7 @@ def test_the_ruling_s_classification_of_every_shipped_tool() -> None:
             QueryMemoryFactsTool,
             LoadSkillTool,
             ComfyImageGenTool,
+            ShowSelfTool,
         )
     }
     assert agent_local == {
@@ -373,8 +378,30 @@ def test_the_ruling_s_classification_of_every_shipped_tool() -> None:
         "RetractMemoryFactTool": False,
         "QueryMemoryFactsTool": False,
         "LoadSkillTool": False,
-        "ComfyImageGenTool": True,
+        "ComfyImageGenTool": False,
+        # Draws into the image tool's artifact folder, never the host workspace.
+        "ShowSelfTool": False,
     }
+
+
+@pytest.mark.asyncio
+async def test_generate_image_allowed_when_enable_write_tools_is_false() -> None:
+    """A clone with `enable_write_tools = False` (default) can still run `generate_image` (#2079).
+
+    Image generation writes into the room's artifact sandbox (`artifacts/images/`),
+    not general host workspace files, so it does not require host write permissions.
+    """
+    registry = create_default_registry(enable_mcp=False)
+    image_tool = registry.get("generate_image")
+    assert image_tool is not None
+    agent = _agent(image_tool, persona=_persona(enable_write_tools=False))
+
+    # Should not raise PermissionError for enable_write_tools
+    # (it might raise because no prompt was passed or engine mock, but not capability refusal)
+    refusal = agent._capability_refusal(image_tool)
+    assert refusal is None
+    held_names = [t.name for t in agent._tool_invoker.held_tools()]
+    assert "generate_image" in held_names
 
 
 # --- enable_subagent_tools ---------------------------------------------------------------
@@ -462,7 +489,7 @@ def test_the_shipped_guardian_neither_writes_nor_delegates_until_its_settings_al
     them, which is what a small model does. Under guardian's shipped flags (`false`, `false`)
     the file is not written and no helper agent is started -- no request carries a
     sub-agent's prompt. Turning on "Allow file-writing tools" from the editor
-    (`PUT /api/personas/guardian`) reaches the running agent, and the next turn writes.
+    (`PUT /api/clones/guardian`) reaches the running agent, and the next turn writes.
 
     Killed by: src/uclone_x/agent/tool_execution.py :: elif (refusal := self._capability_refusal(tool_inst)) is not None:
     Becomes: elif False:
@@ -513,10 +540,10 @@ def test_the_shipped_guardian_neither_writes_nor_delegates_until_its_settings_al
         assert not target.exists()
         assert not a_helper_was_started()
 
-        listed = {p["name"]: p for p in client.get("/api/personas").json()["personas"]}
+        listed = {p["name"]: p for p in client.get("/api/clones").json()["clones"]}
         edit = {k: v for k, v in listed["guardian"].items() if k in _EDITABLE_KEYS}
         edit["enable_write_tools"] = True
-        res = client.put("/api/personas/guardian", json=edit)
+        res = client.put("/api/clones/guardian", json=edit)
         assert res.status_code == 200, res.text
 
         portal.call(take_turn, "s2", "now fix it")

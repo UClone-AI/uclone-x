@@ -59,7 +59,7 @@ class DummySessionStore:
     def load(self, session_id: str) -> SessionState | None:
         return None
 
-    def delete(self, session_id: str, artifacts_dir: Any = None) -> bool:
+    def delete(self, session_id: str) -> bool:
         return True
 
     def list_session_ids(self) -> tuple[str, ...]:

@@ -12,12 +12,20 @@ from rich.console import Console
 from rich.markup import escape
 
 from uclone_x.agent.base import BaseAgent
-from uclone_x.agent.clone_builder import AppScope, build_clone, local_app_scope, memory_map
+from uclone_x.agent.clone_builder import (
+    AppScope,
+    build_clone,
+    check_tools_module,
+    local_app_scope,
+    memory_map,
+)
 from uclone_x.agent.models import TurnResult
 from uclone_x.agent.persona_registry import get_default_persona_registry
 from uclone_x.agent.persona_store import DEFAULT_PERSONA_NAME
 from uclone_x.agent.session import SessionStore
+from uclone_x.agent.tools_module import UnknownToolsModuleError
 from uclone_x.cli.agent_memory import memory_for_agent_id
+from uclone_x.core.agent_home import seat_id_for
 from uclone_x.engine.event_bus import EventBus
 from uclone_x.llm.connectors.factory import create_llm_connector, saved_choice_notice
 from uclone_x.room.one_seat import (
@@ -191,8 +199,9 @@ def start_acp_server(agent_id: str | None = None, persona: str = DEFAULT_PERSONA
     if persona_def is None:
         console.print(f"[bold red]Unknown --persona:[/bold red] {escape(persona)}")
         raise typer.Exit(code=2)
-    # Named after the persona when no id is given, the id the desktop app uses.
-    clone_id = agent_id or persona_def.name
+    # Named after the persona when no id is given. A handle is resolved to its clone's id,
+    # the key the desktop app seats and remembers the same clone by (clone-data-scopes §4).
+    clone_id = seat_id_for(agent_id or persona_def.name)
     bus = EventBus()
     saved_notice = saved_choice_notice()
     if saved_notice is not None:
@@ -219,6 +228,14 @@ def start_acp_server(agent_id: str | None = None, persona: str = DEFAULT_PERSONA
         # P9: the approved skills in the runtime store; without them there is no `load_skill`.
         skills=asyncio.run(load_runtime_skill_registry()),
     )
+
+    # Each session's seat is built when the session opens; a clone whose file names a
+    # tools module this version lacks is refused now, in its own plain words (#2188).
+    try:
+        check_tools_module(app, clone_id, persona_def.name)
+    except UnknownToolsModuleError as exc:
+        err_console.print(str(exc), markup=False, highlight=False)
+        raise typer.Exit(code=1) from exc
 
     server = one_seat_acp_server(app, clone_id=clone_id, bus=bus, persona=persona_def.name)
 

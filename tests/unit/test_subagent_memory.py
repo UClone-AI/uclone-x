@@ -121,7 +121,7 @@ class TestByDefaultAChildHasNoMemory:
 
         Before the fix the call was permitted and failed only as "not found".
 
-        Killed by: src/uclone_x/agent/base.py :: if name not in BASE_MEMORY_TOOLS
+        Killed by: src/uclone_x/agent/base.py :: if name not in BASE_SELF_TOOLS
         Becomes: if True
         """
         llm = MockLLMConnector(

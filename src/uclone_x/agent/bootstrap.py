@@ -4,6 +4,7 @@ from pathlib import Path
 
 from uclone_x.agent.models import AgentConfig, AgentLLMConfig, PersonaDefinition
 from uclone_x.agent.session import SessionStore
+from uclone_x.core.models import effective_tool_scope
 
 
 def agent_config_for_persona(
@@ -47,9 +48,20 @@ def agent_config_for_persona(
         enable_write_tools=persona.enable_write_tools,
         enable_subagent_tools=persona.enable_subagent_tools,
         persona=persona.name,
+        tools_module=persona.tools_module,
         workspace_dir=workspace_dir,
         read_roots=read_roots,
     )
+
+
+def seat_tool_scope(persona: PersonaDefinition) -> tuple[str, ...]:
+    """The tools a clone seated from `persona` in a chat or a room may run (#1865).
+
+    Resolved by the rule the seated agent applies (`effective_tool_scope`) to the config
+    every head seats it with, so what `/api/skills` reports as hidden from a clone is what
+    that clone's catalog leaves out. An empty result is no restriction.
+    """
+    return effective_tool_scope(agent_config_for_persona(persona).allowed_tools, persona)
 
 
 def bootstrap_session(store: SessionStore, session_id: str, config: AgentConfig) -> AgentConfig:

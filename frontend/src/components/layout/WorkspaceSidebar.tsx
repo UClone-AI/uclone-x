@@ -16,6 +16,7 @@ import {
   conversationListCopy,
 } from '../rooms/ConversationList';
 import { fmt, useCopy, useLocale, type Language, type Messages } from '../../i18n';
+import { cloneLabel } from '../../lib/cloneLabel';
 import { en } from '../../i18n/en';
 import { avatarUrlsOf, pictureOf } from '../../lib/avatarChoice';
 import { Rail } from '../../ui-kit';
@@ -120,9 +121,15 @@ export const WorkspaceSidebar: React.FC<WorkspaceSidebarProps> = (props) => {
     const urls = avatarUrlsOf(personas);
     return (cloneId: string) => pictureOf(cloneId, urls);
   }, [personas]);
+  // Each clone labelled by its display name for this screen's language; the id stays `name`.
+  const labelled = useMemo(
+    () => personas?.map((p) => ({ ...p, label: cloneLabel(p, language) })),
+    [personas, language],
+  );
   return (
     <Rail
       {...props}
+      personas={labelled}
       copy={copy}
       icons={RAIL_ICONS}
       // Bound here for the reason `copy` and `icons` are: where this head keeps a clone's

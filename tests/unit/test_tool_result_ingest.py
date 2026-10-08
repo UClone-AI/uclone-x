@@ -5,6 +5,7 @@ that runs only at a turn start and cuts only on turn boundaries (#1422, #1443).
 from __future__ import annotations
 
 import json
+import math
 import random
 from collections.abc import Sequence
 from pathlib import Path
@@ -15,9 +16,16 @@ import pytest
 
 from uclone_x.agent.base import BaseAgent
 from uclone_x.agent.models import AgentConfig, AgentLLMConfig
-from uclone_x.agent.session import SessionState, SessionStore, reap_orphaned_tool_artifacts
+from uclone_x.agent.request_record import rebuild_epoch_conversations, rebuild_requests
+from uclone_x.agent.session import SessionStore
 from uclone_x.core.provenance import Provenance
-from uclone_x.core.session_log import SessionLogKind
+from uclone_x.core.session_log import (
+    SessionLogKind,
+    SessionLogProvenance,
+    logged_text,
+    new_entry,
+    stored_result_entry,
+)
 from uclone_x.core.tool_results import (
     STEP_EXCERPT_MIN_BYTES,
     STEP_NO_ROOM_MESSAGE,
@@ -25,19 +33,18 @@ from uclone_x.core.tool_results import (
     STEP_NO_ROOM_SETUP_MESSAGE,
     STEP_NO_ROOM_SETUP_REPLY_MESSAGE,
     STEP_OVER_WINDOW_MESSAGE,
+    STEP_REFUSAL_TEXT,
     STEP_REPLY_RESERVE_TOKENS,
     STORED_RESULT_PREFIX,
     TOOL_RESULT_CAP_BYTES,
+    UNAVAILABLE_RESULT_MESSAGE,
     StoredResultNotFoundError,
-    artifacts_dir_for,
     canonical_tool_text,
     handle_in,
     ingest_tool_text,
-    load_tool_result,
     read_tool_result_page,
     result_handle,
     step_result_caps,
-    stub_tool_result,
 )
 from uclone_x.llm.compactor import ContextCompactor
 from uclone_x.llm.connectors.mock import MockLLMConnector
@@ -46,9 +53,11 @@ from uclone_x.llm.models import (
     LLMRequest,
     MessageRole,
     ModelResponse,
+    RenderedFrom,
     ToolCallRequest,
     ToolDefinition,
 )
+from uclone_x.log.reader import read_session_log
 from uclone_x.tools.builtin.subagent import SubagentDelegationTool
 from uclone_x.tools.builtin.tool_results import ToolResultReadTool
 from uclone_x.tools.models import ToolContext, ToolResult
@@ -105,6 +114,38 @@ def _agent(
         ),
         llm=llm,
         tools=registry,
+    )
+
+
+class _Bodies:
+    """A session's kept bodies in memory, by handle: `ResultBodies` for the unit tests."""
+
+    def __init__(self) -> None:
+        self.held: dict[str, str] = {}
+
+    def keep(self, text: str, *, tool_name: str | None) -> str:
+        handle = result_handle(text)
+        self.held[handle] = text
+        return handle
+
+    def read(self, handle: str) -> str | None:
+        return self.held.get(handle)
+
+
+def _excerpt_message(
+    bodies: _Bodies, body: str, *, call_id: str = "c1", readable: bool = True
+) -> ChatMessage:
+    """A tool result ingested as the agent ingests one: an excerpt that records its source."""
+    excerpt = ingest_tool_text(body, bodies=bodies, readable=readable)
+    handle = handle_in(excerpt)
+    assert handle is not None
+    return ChatMessage(
+        role=MessageRole.TOOL,
+        content=excerpt,
+        tool_call_id=call_id,
+        name="t",
+        form="excerpt",
+        rendered_from=RenderedFrom(handle=handle, limit=TOOL_RESULT_CAP_BYTES, readable=readable),
     )
 
 
@@ -177,16 +218,18 @@ def test_sets_and_paths_render_the_same_on_every_run() -> None:
 # ======================================================================================
 
 
-def test_an_under_cap_result_is_kept_whole(tmp_path: Path) -> None:
+def test_an_under_cap_result_is_kept_whole() -> None:
     text = "short"
-    assert ingest_tool_text(text, artifacts_dir=tmp_path, session_id="s1") == text
-    assert not any(tmp_path.iterdir())
+    bodies = _Bodies()
+    assert ingest_tool_text(text, bodies=bodies) == text
+    assert bodies.held == {}
 
 
-def test_an_over_cap_result_is_stored_and_read_back_whole(tmp_path: Path) -> None:
+def test_an_over_cap_result_is_stored_and_read_back_whole() -> None:
     """The history holds an excerpt under the cap; the pages rebuild the exact body."""
     body = _big_text()
-    excerpt = ingest_tool_text(body, artifacts_dir=tmp_path, session_id="s1")
+    bodies = _Bodies()
+    excerpt = ingest_tool_text(body, bodies=bodies)
 
     assert len(excerpt.encode("utf-8")) <= TOOL_RESULT_CAP_BYTES
     handle = handle_in(excerpt)
@@ -199,7 +242,7 @@ def test_an_over_cap_result_is_stored_and_read_back_whole(tmp_path: Path) -> Non
     rebuilt = ""
     offset = 0
     while True:
-        page = read_tool_result_page(tmp_path, "s1", handle, offset)
+        page = read_tool_result_page(bodies, handle, offset)
         assert len(page.encode("utf-8")) <= TOOL_RESULT_CAP_BYTES
         header, _, text = page.partition("\n")
         rebuilt += text
@@ -210,85 +253,105 @@ def test_an_over_cap_result_is_stored_and_read_back_whole(tmp_path: Path) -> Non
     assert rebuilt == body
 
 
-def test_the_excerpt_names_the_offset_where_the_hidden_part_starts(tmp_path: Path) -> None:
+def test_the_excerpt_names_the_offset_where_the_hidden_part_starts() -> None:
     body = _big_text()
-    excerpt = ingest_tool_text(body, artifacts_dir=tmp_path, session_id="s1")
+    bodies = _Bodies()
+    excerpt = ingest_tool_text(body, bodies=bodies)
     handle = handle_in(excerpt)
     assert handle is not None
     head = excerpt.split("\n", 1)[1]
     shown = len(head.split("\n[... characters ", 1)[0])
     assert f"offset={shown})" in excerpt.splitlines()[0]
-    page = read_tool_result_page(tmp_path, "s1", handle, shown)
+    page = read_tool_result_page(bodies, handle, shown)
     assert page.split("\n", 1)[1] == body[shown : shown + len(page.split("\n", 1)[1])]
 
 
-def test_a_result_is_the_same_excerpt_on_every_run(tmp_path: Path) -> None:
+def test_a_result_is_the_same_excerpt_on_every_run() -> None:
     body = _big_text()
-    one = ingest_tool_text(body, artifacts_dir=tmp_path / "a", session_id="s1")
-    two = ingest_tool_text(body, artifacts_dir=tmp_path / "b", session_id="s1")
+    one = ingest_tool_text(body, bodies=_Bodies())
+    two = ingest_tool_text(body, bodies=_Bodies())
     assert one == two
 
 
 def test_with_nowhere_to_store_the_excerpt_says_the_rest_is_gone() -> None:
-    excerpt = ingest_tool_text(_big_text(), artifacts_dir=None, session_id="s1")
+    excerpt = ingest_tool_text(_big_text(), bodies=None)
     assert handle_in(excerpt) is None
     assert "cannot be read back" in excerpt
     assert "tool_result_read" not in excerpt
 
 
-def test_without_the_reader_the_excerpt_does_not_offer_it(tmp_path: Path) -> None:
-    excerpt = ingest_tool_text(_big_text(), artifacts_dir=tmp_path, session_id="s1", readable=False)
+def test_without_the_reader_the_excerpt_does_not_offer_it() -> None:
+    excerpt = ingest_tool_text(_big_text(), bodies=_Bodies(), readable=False)
     assert handle_in(excerpt) is not None
     assert "no tool to read it" in excerpt
     assert "tool_result_read(" not in excerpt
 
 
-def test_credentials_are_redacted_before_the_body_is_stored(tmp_path: Path) -> None:
+def test_credentials_are_redacted_before_the_body_is_stored() -> None:
     secret = "sk-ant-api03-" + "A" * 90
     body = _big_text() + f"\nkey={secret}\n"
-    excerpt = ingest_tool_text(body, artifacts_dir=tmp_path, session_id="s1")
-    stored = next((tmp_path / "s1").iterdir()).read_text(encoding="utf-8")
+    bodies = _Bodies()
+    excerpt = ingest_tool_text(body, bodies=bodies)
+    (stored,) = bodies.held.values()
     assert secret not in stored and secret not in excerpt
+
+
+def test_the_excerpt_is_rendered_from_the_body_it_stores() -> None:
+    """What the model sees and what the handle reads are one text (#1848): the excerpt's
+    head and tail are slices of the stored body, and the handle is that body's digest.
+
+    Killed by: src/uclone_x/core/tool_results.py :: return excerpt_tool_result(body, handle, cap_bytes=cap_bytes, readable=readable)
+    Becomes: return excerpt_tool_result(text, handle, cap_bytes=cap_bytes, readable=readable)
+    """
+    secret = "sk-ant-api03-" + "B" * 90
+    body = f"key={secret}\n" + _big_text() + f"\nkey={secret}\n"
+    bodies = _Bodies()
+    excerpt = ingest_tool_text(body, bodies=bodies)
+    handle = handle_in(excerpt)
+    assert handle is not None
+    stored = bodies.held[handle]
+    assert result_handle(stored) == handle
+    head = excerpt.split("\n", 1)[1].split("\n[... characters ", 1)[0]
+    assert stored.startswith(head)
+    assert secret not in excerpt
 
 
 @pytest.mark.parametrize(
     ("handle", "offset", "length", "expected"),
     [
         ("not-a-handle", 0, None, "not a stored tool result name"),
-        ("tr_0000000000000000", 0, None, "No stored tool result named"),
+        ("tr_0000000000000000", 0, None, UNAVAILABLE_RESULT_MESSAGE),
         (None, -1, None, "must be 0 or more"),
         (None, 0, 0, "must be at least 1"),
         (None, 10**9, None, "past the end of this result"),
     ],
 )
 def test_bad_reads_are_refused_in_plain_words(
-    tmp_path: Path, handle: str | None, offset: int, length: int | None, expected: str
+    handle: str | None, offset: int, length: int | None, expected: str
 ) -> None:
-    stored = handle_in(ingest_tool_text(_big_text(), artifacts_dir=tmp_path, session_id="s1"))
+    bodies = _Bodies()
+    stored = handle_in(ingest_tool_text(_big_text(), bodies=bodies))
     assert stored is not None
     with pytest.raises((StoredResultNotFoundError, ValueError)) as info:
-        read_tool_result_page(tmp_path, "s1", handle or stored, offset, length)
+        read_tool_result_page(bodies, handle or stored, offset, length)
     message = str(info.value)
     assert expected in message
-    assert "Traceback" not in message and str(tmp_path) not in message
+    assert "Traceback" not in message and "Errno" not in message and "/" not in message
 
 
-def test_one_conversation_cannot_read_anothers_results(tmp_path: Path) -> None:
-    handle = handle_in(ingest_tool_text(_big_text(), artifacts_dir=tmp_path, session_id="s1"))
+def test_one_conversation_cannot_read_anothers_results() -> None:
+    handle = handle_in(ingest_tool_text(_big_text(), bodies=_Bodies()))
     assert handle is not None
     with pytest.raises(StoredResultNotFoundError):
-        read_tool_result_page(tmp_path, "s2", handle)
-    with pytest.raises(ValueError):
-        read_tool_result_page(tmp_path, "../s1", handle)
+        read_tool_result_page(_Bodies(), handle)
 
 
 @pytest.mark.asyncio
-async def test_the_reader_tool_reads_within_its_own_session(tmp_path: Path) -> None:
+async def test_the_reader_tool_reads_within_its_own_session() -> None:
     body = _big_text()
-    handle = handle_in(
-        ingest_tool_text(body, artifacts_dir=artifacts_dir_for(tmp_path), session_id="s1")
-    )
-    context = ToolContext(agent_id="a", session_id="s1", trace_id="t", workspace_root=tmp_path)
+    bodies = _Bodies()
+    handle = handle_in(ingest_tool_text(body, bodies=bodies))
+    context = ToolContext(agent_id="a", session_id="s1", trace_id="t", stored_results=bodies)
     result = await ToolResultReadTool().execute({"handle": handle, "offset": 5}, context)
     assert result.success is True
     assert isinstance(result.output, str)
@@ -339,7 +402,7 @@ async def test_an_over_cap_result_reaches_history_as_an_excerpt_and_reads_back(
     assert len(first.content.encode("utf-8")) <= TOOL_RESULT_CAP_BYTES
     assert handle_in(first.content) == handle
     assert 'tool_result_read(handle="' in first.content
-    assert (artifacts_dir_for(tmp_path) / agent.session_id / f"{handle}.txt").is_file()
+    assert not (tmp_path / ".sandbox").exists()
     # The page is appended at the tail, and the excerpt before it is what the model saw.
     assert second.content.split("\n", 1)[1] == body[: len(second.content.split("\n", 1)[1])]
     later_request_tools = _tool_messages(llm.requests[-1].messages)
@@ -482,18 +545,36 @@ async def test_a_step_that_does_not_fit_is_refused_and_earlier_results_are_not_s
 
 @pytest.mark.asyncio
 async def test_a_file_read_again_on_an_8k_window_is_sent_once(tmp_path: Path) -> None:
-    """The #1422 review's reproduction: the full default tool set, an 8K window, one small
-    file read four times. Every read reaches the model, the first verbatim in every later
-    request and each repeat as a back-reference to it (§5.8, Rule 2), so nothing is
+    """The #1422 review's reproduction: default tools with browser (#2116), an 8K window,
+    one small file read four times. Every read reaches the model, the first verbatim in every
+    later request and each repeat as a back-reference to it (§5.8, Rule 2), so nothing is
     compacted and no step is refused.
+
+    Two things are held still so the margin means the same on every run (#2164). The
+    workspace path is in the system prompt and its length depends on the machine and on
+    xdist, so the window is widened by exactly what the path costs. The browser is padded
+    to `BROWSER_DEFINITION_TOKEN_CEILING`, so a browser schema that grows fails its own
+    size test in `test_browser_tool.py` and never this one.
+
+    Two limits bind. The first request -- system prompt and every default tool, no file
+    yet -- must stay under the turn-start compaction threshold, 70% of the window; it is
+    the tighter one, about forty tokens under with the browser at its ceiling, and
+    only trimming a schema or the system prompt widens it. The last request must leave the
+    reply reserve; the file is sized so that leaves over a hundred tokens, where a repeat
+    sent whole instead of as a back-reference costs several hundred.
 
     Killed by: src/uclone_x/core/context_state.py :: earlier = first_with.get(content)
     Becomes: earlier = None
     """
+    from tests.support.browser_budget import (
+        BROWSER_DEFINITION_TOKEN_CEILING,
+        browser_definition_tokens,
+    )
     from uclone_x.core.context_state import back_reference_text
+    from uclone_x.llm.compactor import estimate_text_tokens
     from uclone_x.tools.registry import create_default_registry
 
-    text = "\n".join(f"line {i:05d} " + "x" * 60 for i in range(3_000 // 72))
+    text = "\n".join(f"line {i:05d} " + "x" * 60 for i in range(2_400 // 72))
     (tmp_path / "a.py").write_text(text)
     llm = _ScriptedLLM(
         [
@@ -502,12 +583,25 @@ async def test_a_file_read_again_on_an_8k_window_is_sent_once(tmp_path: Path) ->
         ]
     )
     registry = create_default_registry(workspace_root=tmp_path, enable_mcp=False)
+    browser = registry.get("browser")
+    assert browser is not None
+    short = BROWSER_DEFINITION_TOKEN_CEILING - browser_definition_tokens(browser)
+    assert short >= 0, "the browser is over its ceiling; test_browser_tool.py says so by name"
+    browser.description += " " + "x" * (4 * short - 1) if short else ""  # type: ignore[attr-defined]
+    assert browser_definition_tokens(browser) == BROWSER_DEFINITION_TOKEN_CEILING
+    # The path is in the system prompt; widen the window so the turn-start threshold, the
+    # tighter of the two limits here, rises by exactly what the path costs.
+    path_cost = estimate_text_tokens(str(tmp_path))
+    window = 8_192 + math.ceil(path_cost / ContextCompactor().threshold)
     agent = BaseAgent(
         config=AgentConfig(
             agent_id="ingest",
             name="Ingest",
             workspace_dir=tmp_path,
-            llm_config=AgentLLMConfig(model_name="mock-model", context_limit=8_192),
+            llm_config=AgentLLMConfig(
+                model_name="mock-model",
+                context_limit=window,
+            ),
         ),
         llm=llm,
         tools=registry,
@@ -597,8 +691,8 @@ async def test_a_compaction_at_a_turn_start_is_rebuilt_from_the_request_record(
     contexts = [e for e in events if e.get("type") == "REQUEST_CONTEXT"]
     assert len(contexts) == len(llm.requests) == 4
     # The fourth request diverges where the compaction folded turn 1.
-    third_len = contexts[2]["kept_message_count"] + len(contexts[2]["appended_messages"])
-    assert contexts[3]["kept_message_count"] < third_len
+    third_len = contexts[2]["kept_entry_count"] + len(contexts[2]["appended_entries"])
+    assert contexts[3]["kept_entry_count"] < third_len
 
     rebuilt = rebuild_requests(store, state, events)
     for number, (request, sent) in enumerate(zip(rebuilt, llm.requests, strict=True)):
@@ -723,44 +817,51 @@ async def test_a_single_long_turn_is_pruned_not_summarised_away() -> None:
 
 
 @pytest.mark.asyncio
-async def test_compaction_shrinks_a_stored_excerpt_to_a_stub(tmp_path: Path) -> None:
-    """Killed by: src/uclone_x/llm/compactor.py :: if stub is not None:
+async def test_compaction_shrinks_a_stored_excerpt_to_a_stub() -> None:
+    """The stub is rendered from the kept body (#1848): its text is the body's start.
+
+    Killed by: src/uclone_x/llm/compactor.py :: if kept is not None:
     Becomes: if False:
     """
-    artifacts = artifacts_dir_for(tmp_path)
-    excerpt = ingest_tool_text(_big_text(), artifacts_dir=artifacts, session_id="s1")
+    bodies = _Bodies()
+    body = _big_text()
+    ingested = _excerpt_message(bodies, body)
+    excerpt = ingested.content or ""
     handle = handle_in(excerpt)
     messages = [
         ChatMessage(role=MessageRole.USER, content="go"),
         ChatMessage(role=MessageRole.ASSISTANT, tool_calls=(ToolCallRequest(id="c1", name="t"),)),
-        ChatMessage(role=MessageRole.TOOL, content=excerpt, tool_call_id="c1", name="t"),
+        ingested,
     ]
-    compactor = ContextCompactor(workspace_root=tmp_path, session_id="s1")
+    compactor = ContextCompactor(result_bodies=bodies)
     outcome = await compactor.compact(messages)
     tool_msg = _tool_messages(outcome.messages)[0]
     assert tool_msg.content is not None
     assert tool_msg.content.startswith(f"{STORED_RESULT_PREFIX}{handle}:")
     assert "since the conversation was compacted" in tool_msg.content
+    assert f"{len(body):,} characters" in tool_msg.content
+    assert body.startswith(tool_msg.content.split("\n", 1)[1])
     assert len(tool_msg.content) < len(excerpt)
+    assert tool_msg.form == "stub"
+    assert tool_msg.rendered_from is not None and tool_msg.rendered_from.handle == handle
 
 
 @pytest.mark.asyncio
-async def test_without_the_reader_compaction_does_not_name_it(tmp_path: Path) -> None:
+async def test_without_the_reader_compaction_does_not_name_it() -> None:
     """The stub names `tool_result_read` only when that is offered; otherwise it says so.
 
     Killed by: src/uclone_x/llm/compactor.py :: self.tool_result_reader = tool_result_reader
     Becomes: self.tool_result_reader = True
     """
-    artifacts = artifacts_dir_for(tmp_path)
-    excerpt = ingest_tool_text(
-        _big_text(), artifacts_dir=artifacts, session_id="s1", readable=False
-    )
+    bodies = _Bodies()
+    ingested = _excerpt_message(bodies, _big_text(), readable=False)
+    excerpt = ingested.content or ""
     messages = [
         ChatMessage(role=MessageRole.USER, content="go"),
         ChatMessage(role=MessageRole.ASSISTANT, tool_calls=(ToolCallRequest(id="c1", name="t"),)),
-        ChatMessage(role=MessageRole.TOOL, content=excerpt, tool_call_id="c1", name="t"),
+        ingested,
     ]
-    compactor = ContextCompactor(workspace_root=tmp_path, session_id="s1", tool_result_reader=False)
+    compactor = ContextCompactor(result_bodies=bodies, tool_result_reader=False)
     outcome = await compactor.compact(messages)
     tool_msg = _tool_messages(outcome.messages)[0]
     assert tool_msg.content is not None
@@ -785,32 +886,40 @@ async def test_an_agent_without_the_reader_is_not_told_to_call_it_after_compacti
         assert "tool_result_read" not in (message.content or "")
 
 
-def test_ingest_keeps_an_excerpt_when_the_session_directory_links_outside(
-    tmp_path: Path,
-) -> None:
-    """A symlinked session directory is refused, and the turn keeps an excerpt (P3).
+def test_a_handle_in_the_text_is_not_what_compaction_stubs() -> None:
+    """The handle a stub names is the one its message records, never one in its text (#1848).
 
-    Nothing is written outside the store. The refusal is logged like any other failed
-    write, so the tool's result still reaches the history as an excerpt with no handle.
+    A full result whose text begins with a stored-result header -- a `tool_result_read`
+    page, or output that only looks like one -- names a kept result the session holds, and
+    is still its own text: it is kept as a new result, not replaced by the one it names.
 
-    Killed by: src/uclone_x/core/tool_results.py :: except (OSError, ValueError, PathTraversalError) as exc:
-    Becomes: except (OSError, ValueError) as exc:
+    Killed by: src/uclone_x/llm/compactor.py :: kept = msg.rendered_from.handle if msg.rendered_from is not None else None
+    Becomes: kept = msg.rendered_from.handle if msg.rendered_from is not None else handle_in(msg.content)
     """
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    artifacts = artifacts_dir_for(tmp_path / "ws")
-    artifacts.mkdir(parents=True)
-    (artifacts / "s1").symlink_to(outside, target_is_directory=True)
+    bodies = _Bodies()
+    named = bodies.keep(_big_text(), tool_name="t")
+    looks_stored = f"{STORED_RESULT_PREFIX}{named}: characters 0 to 9 of 9.]\n" + "y" * 5_000
+    compactor = ContextCompactor(result_bodies=bodies, max_tool_output_chars=1_000)
+    message = ChatMessage(role=MessageRole.TOOL, content=looks_stored, tool_call_id="c1", name="t")
+    pruned = compactor.prune_tool_message(message)
+    assert pruned.rendered_from is not None
+    assert pruned.rendered_from.handle == result_handle(looks_stored)
+    assert pruned.rendered_from.handle != named
+    assert bodies.read(pruned.rendered_from.handle) == looks_stored
 
-    excerpt = ingest_tool_text(_big_text(), artifacts_dir=artifacts, session_id="s1")
 
-    assert handle_in(excerpt) is None
-    assert list(outside.iterdir()) == []
+def test_a_form_whose_kept_result_is_gone_is_left_as_it_is() -> None:
+    """A form with no readable kept result is not offloaded as if its text were a result.
 
-
-def test_text_that_only_looks_like_a_stored_result_is_not_stubbed(tmp_path: Path) -> None:
-    forged = f"{STORED_RESULT_PREFIX}tr_0123456789abcdef: …]\n" + "x" * 5_000
-    assert stub_tool_result(forged, tmp_path, "s1", keep_chars=10) is None
+    Killed by: src/uclone_x/llm/compactor.py :: if body is None or msg.content is None:
+    Becomes: if False:
+    """
+    bodies = _Bodies()
+    message = _excerpt_message(bodies, _big_text())
+    bodies.held.clear()
+    compactor = ContextCompactor(result_bodies=bodies, max_tool_output_chars=1_000)
+    assert compactor.prune_tool_message(message) is message
+    assert bodies.held == {}
 
 
 # ======================================================================================
@@ -818,45 +927,220 @@ def test_text_that_only_looks_like_a_stored_result_is_not_stubbed(tmp_path: Path
 # ======================================================================================
 
 
+def _stored_agent(workspace: Path, store: SessionStore, llm: MockLLMConnector) -> BaseAgent:
+    registry = ToolRegistry()
+    for tool in (_returning("dump", _big_text()), ToolResultReadTool()):
+        registry.register(tool)
+    return BaseAgent(
+        config=AgentConfig(
+            agent_id="ingest",
+            name="Ingest",
+            workspace_dir=workspace,
+            llm_config=AgentLLMConfig(model_name="mock-model"),
+        ),
+        llm=llm,
+        tools=registry,
+        store=store,
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_over_cap_result_is_kept_in_the_session_store_not_the_workspace(
+    tmp_path: Path,
+) -> None:
+    """The full text is a body of the session's own log, in its context body store (#1848).
+
+    Killed by: src/uclone_x/agent/session_lifecycle.py :: self.log_entry(logged_text(kind, text, blob=handle))
+    Becomes: pass
+    """
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    store = SessionStore(storage_dir=tmp_path / "sessions")
+    llm = _ScriptedLLM([[ToolCallRequest(id="c1", name="dump", arguments={})]])
+    agent = _stored_agent(workspace, store, llm)
+    await agent.execute_turn("go")
+    agent.persist_session()
+
+    (tool_msg,) = _tool_messages(agent.history)
+    handle = handle_in(tool_msg.content)
+    assert handle is not None
+    state = store.load(agent.session_id)
+    assert state is not None
+    entry = stored_result_entry(state.session_log, handle)
+    assert entry is not None
+    assert entry.kind is SessionLogKind.TOOL_RESULT
+    assert entry.digest.startswith(handle.removeprefix("tr_"))
+    assert store.load_context_body(agent.session_id, entry.digest) == _big_text()
+    assert not (workspace / ".sandbox").exists()
+
+
+@pytest.mark.asyncio
+async def test_a_result_kept_twice_is_logged_once(tmp_path: Path) -> None:
+    """Killed by: src/uclone_x/agent/session_lifecycle.py :: if known is None or known.digest != rendered.digest:
+    Becomes: if True:
+    """
+    store = SessionStore(storage_dir=tmp_path / "sessions")
+    llm = _ScriptedLLM(
+        [
+            [
+                ToolCallRequest(id="c1", name="dump", arguments={}),
+                ToolCallRequest(id="c2", name="dump", arguments={}),
+            ]
+        ]
+    )
+    agent = _stored_agent(tmp_path, store, llm)
+    await agent.execute_turn("go")
+    agent.persist_session()
+    handle = result_handle(_big_text())
+    state = store.load(agent.session_id)
+    assert state is not None
+    full = [e for e in state.session_log if e.blob == handle and e.digest.startswith(handle[3:])]
+    assert len(full) == 1
+
+
 @pytest.mark.asyncio
 async def test_resetting_or_deleting_a_session_removes_its_stored_results(
     tmp_path: Path,
 ) -> None:
-    """Killed by: src/uclone_x/agent/session_lifecycle.py :: cleanup_session_artifacts(artifacts_dir_for(ws_root), sid)
-    Becomes: None
+    """The bodies go with the session's context body store (#1848).
+
+    Killed by: src/uclone_x/agent/session_lifecycle.py :: return self._store.delete(sid)
+    Becomes: return True
     """
     for action in ("reset", "delete"):
-        workspace = tmp_path / action
-        workspace.mkdir()
+        store = SessionStore(storage_dir=tmp_path / action)
         llm = _ScriptedLLM([[ToolCallRequest(id="c1", name="dump", arguments={})]])
-        agent = _agent(workspace, llm, [_returning("dump", _big_text())])
+        agent = _stored_agent(tmp_path, store, llm)
         await agent.execute_turn("go")
-        session_dir = artifacts_dir_for(workspace) / agent.session_id
-        assert any(session_dir.iterdir())
+        agent.persist_session()
+        body_dir = store.context_body_dir(agent.session_id)
+        state = store.load(agent.session_id)
+        assert state is not None
+        entry = stored_result_entry(state.session_log, result_handle(_big_text()))
+        assert entry is not None
+        assert (body_dir / entry.digest).is_file()
         if action == "reset":
             agent.reset_session()
         else:
-            agent.delete_session()
-        assert not session_dir.exists(), action
+            assert agent.delete_session() is True
+        assert not (body_dir / entry.digest).exists(), action
 
 
-def test_the_reaper_spares_a_live_session_and_reaps_an_orphan(tmp_path: Path) -> None:
-    """Killed by: src/uclone_x/agent/session.py :: if is_live is not None and is_live(entry.name):
-    Becomes: if False:
+@pytest.mark.asyncio
+async def test_an_old_handle_is_refused_in_plain_words_through_the_reader(
+    tmp_path: Path,
+) -> None:
+    """A handle from before #1848 names a file this session never logged: the reader
+    says it is gone, with no path, error code or store named, and the old file is left.
+
+    Killed by: src/uclone_x/core/tool_results.py :: raise StoredResultNotFoundError(UNAVAILABLE_RESULT_MESSAGE)
+    Becomes: raise StoredResultNotFoundError(f"{UNAVAILABLE_RESULT_MESSAGE} {bodies!r}")
+    Killed by: src/uclone_x/core/tool_results.py :: class StoredResultNotFoundError(PlainRefusalError, LookupError):
+    Becomes: class StoredResultNotFoundError(LookupError):
     """
-    artifacts = tmp_path / "artifacts"
-    for sid in ("live", "gone"):
-        ingest_tool_text(_big_text(), artifacts_dir=artifacts, session_id=sid)
-    store = SessionStore(storage_dir=tmp_path / "sessions", artifacts_dir=artifacts)
-    store.save(SessionState(session_id="live", agent_id="a"))
-    store.reap_orphaned_temp_files(max_age_seconds=0)
-    assert (artifacts / "live").is_dir()
-    assert not (artifacts / "gone").exists()
+    old_body = _big_text(5_000)
+    old_handle = result_handle(old_body)
+    store = SessionStore(storage_dir=tmp_path / "sessions")
+    llm = _ScriptedLLM(
+        [[ToolCallRequest(id="c1", name="tool_result_read", arguments={"handle": old_handle})]]
+    )
+    agent = _stored_agent(tmp_path, store, llm)
+    # Where a build before #1848 kept this session's result: the reader never looks there.
+    old_root = tmp_path / ".sandbox" / "tool_artifacts"
+    old_files = [
+        old_root / agent.session_id / f"{old_handle}.txt",
+        old_root / f"{old_handle}.txt",
+        old_root / old_handle,
+    ]
+    for old_file in old_files:
+        old_file.parent.mkdir(parents=True, exist_ok=True)
+        old_file.write_text(old_body, encoding="utf-8")
+    await agent.execute_turn("go")
+
+    (tool_msg,) = _tool_messages(agent.history)
+    assert tool_msg.content == UNAVAILABLE_RESULT_MESSAGE
+    for old_file in old_files:
+        assert old_file.read_text(encoding="utf-8") == old_body
 
 
-def test_the_reaper_without_a_liveness_check_keeps_its_old_behaviour(tmp_path: Path) -> None:
-    ingest_tool_text(_big_text(), artifacts_dir=tmp_path, session_id="s1")
-    assert reap_orphaned_tool_artifacts(tmp_path, max_age_seconds=0) == 1
+@pytest.mark.asyncio
+async def test_a_deleted_session_refuses_a_handle_whose_body_was_never_saved(
+    tmp_path: Path,
+) -> None:
+    """A result kept but not yet written goes with a delete, as a written one does (#1848).
+
+    Killed by: src/uclone_x/agent/session_lifecycle.py :: self.pending_bodies.pop(entry.digest, None)
+    Becomes: pass
+    """
+    store = SessionStore(storage_dir=tmp_path / "sessions")
+    llm = _ScriptedLLM([[ToolCallRequest(id="c1", name="dump", arguments={})]])
+    agent = _stored_agent(tmp_path, store, llm)
+    await agent.execute_turn("go")
+    handle = result_handle(_big_text())
+    bodies = agent._result_bodies(agent.session_id)  # pyright: ignore[reportPrivateUsage]
+    assert bodies.read(handle) == _big_text()
+
+    agent.delete_session()
+
+    assert bodies.read(handle) is None
+    agent.persist_session()
+    assert agent._result_bodies(agent.session_id).read(handle) is None  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_a_kept_result_is_logged_as_the_kind_its_tool_gives(tmp_path: Path) -> None:
+    """A search tool's over-cap result is kept as a `retrieval` entry, not a plain one.
+
+    Killed by: src/uclone_x/agent/session_lifecycle.py :: return self.live.keep_result_body(text, kind=tool_result_kind(tool_name))
+    Becomes: return self.live.keep_result_body(text, kind=SessionLogKind.TOOL_RESULT)
+    """
+    store = SessionStore(storage_dir=tmp_path / "sessions")
+    registry = ToolRegistry()
+    registry.register(_returning("web_search", _big_text()))
+    agent = BaseAgent(
+        config=AgentConfig(
+            agent_id="ingest",
+            name="Ingest",
+            workspace_dir=tmp_path,
+            llm_config=AgentLLMConfig(model_name="mock-model"),
+        ),
+        llm=_ScriptedLLM([[ToolCallRequest(id="c1", name="web_search", arguments={})]]),
+        tools=registry,
+        store=store,
+    )
+    await agent.execute_turn("go")
+    agent.persist_session()
+    state = store.load(agent.session_id)
+    assert state is not None
+    entry = stored_result_entry(state.session_log, result_handle(_big_text()))
+    assert entry is not None
+    assert entry.kind is SessionLogKind.RETRIEVAL
+
+
+def test_a_logged_text_that_was_not_kept_as_a_result_is_not_found_by_its_handle() -> None:
+    """Only an entry that names the handle is the result: another entry of the same text
+    whose digest happens to begin with the handle's digits is not (#1848).
+
+    Killed by: src/uclone_x/core/session_log.py :: if entry.digest.startswith(prefix) and (entry.blob == handle or is_result_message(entry)):
+    Becomes: if entry.digest.startswith(prefix):
+    """
+    text = "the text"
+    handle = result_handle(text)
+    unkept = new_entry(
+        0,
+        logged_text(SessionLogKind.MEMORY, text, blob=None),
+        turn=1,
+        provenance=SessionLogProvenance.RECORDED,
+    )
+    assert unkept.digest.startswith(handle[3:])
+    assert stored_result_entry([unkept], handle) is None
+    kept = new_entry(
+        1,
+        logged_text(SessionLogKind.MEMORY, text, blob=handle),
+        turn=1,
+        provenance=SessionLogProvenance.RECORDED,
+    )
+    assert stored_result_entry([unkept, kept], handle) == kept
 
 
 # ======================================================================================
@@ -865,7 +1149,11 @@ def test_the_reaper_without_a_liveness_check_keeps_its_old_behaviour(tmp_path: P
 
 
 def _default_registry_agent(
-    workspace: Path, llm: MockLLMConnector, *, auto_compact: bool = True
+    workspace: Path,
+    llm: MockLLMConnector,
+    *,
+    auto_compact: bool = True,
+    store: SessionStore | None = None,
 ) -> BaseAgent:
     from uclone_x.tools.registry import create_default_registry
 
@@ -880,6 +1168,7 @@ def _default_registry_agent(
         ),
         llm=llm,
         tools=create_default_registry(workspace_root=workspace, enable_mcp=False),
+        store=store,
     )
 
 
@@ -925,9 +1214,18 @@ async def test_a_step_over_the_window_reaches_the_next_request_as_readable_excer
     The next request stays within the window, and every result is in it as an excerpt
     whose handle reads back the whole file.
 
+    Each cut result records the share it was cut to, not the ingest cap, and the text sent
+    is its kept body rendered at that share (#1848): the log keeps the form, not the text,
+    so a record left at the ingest cap would render the result wider than its share.
+
     Killed by: src/uclone_x/agent/turn_executor.py :: step_refusal = self._fit_step_to_window(
     Becomes: step_refusal = None and self._fit_step_to_window(
+    Killed by: src/uclone_x/agent/base.py :: source = RenderedFrom(handle=handle, limit=cap_bytes, readable=readable)
+    Becomes: source = RenderedFrom(handle=handle, limit=TOOL_RESULT_CAP_BYTES, readable=readable)
+    Killed by: src/uclone_x/agent/turn_executor.py :: "rendered_from": shared.rendered_from,
+    Becomes: "rendered_from": history[index].rendered_from,
     """
+    from uclone_x.core.tool_results import excerpt_tool_result
     from uclone_x.llm.compactor import estimate_request_tokens
 
     names = ["a.txt", "b.txt", "c.txt"]
@@ -940,11 +1238,28 @@ async def test_a_step_over_the_window_reaches_the_next_request_as_readable_excer
             ]
         ]
     )
-    agent = _default_registry_agent(tmp_path, llm)
+    store = SessionStore(tmp_path / "store")
+    agent = _default_registry_agent(tmp_path, llm, store=store)
     result = await agent.execute_turn("read all three")
 
     assert result.is_completed, result.error
     assert len(llm.requests) == 2
+    # The cut replaced the step's results in the history, which is read from the log and
+    # the last epoch (#1848): the request that followed is that epoch rendered from the
+    # log alone, byte for byte, and a restart reads the same history back.
+    agent.persist_session()
+    state = store.load(agent.session_id)
+    assert state is not None
+    log = store.event_log_path(agent.session_id)
+    assert log is not None
+    rebuilt = rebuild_requests(store, state, [dict(e) for e in read_session_log(log)])
+    assert [r.request.messages for r in rebuilt] == [r.messages for r in llm.requests]
+    sent = [list(r.layers.conversation) for r in rebuilt if r.layers is not None]
+    assert rebuild_epoch_conversations(store, state)[-1] == sent[-1]
+    assert (
+        _default_registry_agent(tmp_path, llm, store=store).hydrate_session(agent.session_id)
+        is not None
+    )
     second = llm.requests[1]
     assert estimate_request_tokens(second) <= 8_192
     by_id = {m.tool_call_id: m.content for m in _tool_messages(second.messages)}
@@ -956,9 +1271,19 @@ async def test_a_step_over_the_window_reaches_the_next_request_as_readable_excer
         assert handle is not None, content[:200]
         assert "tool_result_read" in content
         # The handle reads back the whole file, from its first line to its last.
-        body = load_tool_result(artifacts_dir_for(tmp_path), agent.session_id, handle)
+        body = agent._result_bodies(agent.session_id).read(handle)  # pyright: ignore[reportPrivateUsage]
+        assert body is not None
         assert texts[name].splitlines()[0] in body
         assert texts[name].splitlines()[-1] in body
+    for message in _tool_messages(second.messages):
+        source = message.rendered_from
+        assert message.form == "excerpt" and source is not None
+        assert source.limit < TOOL_RESULT_CAP_BYTES
+        body = agent._result_bodies(agent.session_id).read(source.handle)  # pyright: ignore[reportPrivateUsage]
+        assert body is not None
+        assert message.content == excerpt_tool_result(
+            body, source.handle, cap_bytes=source.limit, readable=source.readable
+        )
 
 
 @pytest.mark.asyncio
@@ -970,7 +1295,7 @@ async def test_a_step_that_cannot_fit_even_as_excerpts_is_refused_in_plain_words
     The step is refused; the over-window request is never sent, and the refusal says so
     without a path, a handle, a class name or any other internal.
 
-    Killed by: src/uclone_x/agent/turn_executor.py :: error=step_refusal,
+    Killed by: src/uclone_x/agent/turn_executor.py :: error=STEP_REFUSAL_TEXT[step_refusal],
     Becomes: error=repr(step_results[0]),
     """
     names = [f"f{i:02d}.txt" for i in range(40)]
@@ -1002,12 +1327,13 @@ async def test_a_refused_step_leaves_the_history_and_stays_in_the_session_log(
 ) -> None:
     """The refused step's forty results are withheld from the history, not from the log.
 
-    The step is logged as ingested before it is fitted (#1443); nothing after the refusal
-    sees those results again, so that is the only point they can be logged. Compaction
-    is off: its save would log them first and hide whether the step's own call does.
+    The step is logged as it enters the history, before it is fitted (#1443, #1848);
+    nothing after the refusal sees those results again, so that is the only point they
+    can be logged. Compaction is off: its save would hide whether the step's own write
+    logs them.
 
-    Killed by: src/uclone_x/agent/turn_executor.py :: self._active_session.log_history()  # the step as ingested, before any cut
-    Becomes: pass
+    Killed by: src/uclone_x/agent/session_lifecycle.py :: self._log(self._logged(message))
+    Becomes: self._logged(message)
     """
     names = [f"f{i:02d}.txt" for i in range(40)]
     for name in names:
@@ -1083,8 +1409,8 @@ async def test_the_turns_after_a_refused_step_stay_within_the_window(
     turn is told, in its turn context, which calls ran. Every request sent, on every
     turn, stays within the window, and the turns after the refusal answer.
 
-    Killed by: src/uclone_x/agent/turn_executor.py :: del history[start:]
-    Becomes: del history[len(history):]
+    Killed by: src/uclone_x/agent/turn_executor.py :: live.truncate(start, cause="step_refused")
+    Becomes: live.truncate(len(history), cause="step_refused")
     """
     from uclone_x.llm.compactor import estimate_request_tokens
 
@@ -1316,6 +1642,9 @@ async def test_a_step_refused_for_a_full_conversation_does_not_blame_the_tools(
     assert len(llm.requests) == 1
     assert result.stop_reason == "step_results_over_window"
     assert result.error == expected
+    # The code a head translates by names the same refusal (#1862).
+    assert result.error_code is not None
+    assert STEP_REFUSAL_TEXT[result.error_code] == expected
 
 
 @pytest.mark.parametrize("message", [STEP_NO_ROOM_MESSAGE, STEP_NO_ROOM_NO_COMPACTION_MESSAGE])
@@ -1641,116 +1970,54 @@ def test_the_reply_length_refusal_is_plain_and_names_both_fixes() -> None:
 
 
 # ======================================================================================
-# Store hardening (#1653)
+# Reading a body back (#1848)
 # ======================================================================================
 
 
-def test_a_symlink_at_the_old_temporary_name_is_not_written_through(tmp_path: Path) -> None:
-    """The temporary file is created exclusively at an unpredictable name, never followed.
+def test_a_body_that_does_not_hash_to_its_handle_is_not_returned(tmp_path: Path) -> None:
+    """What the reader returns is what the handle names, or nothing.
 
-    Before #1653 the writer used `.<handle>.txt.<pid>.tmp` and `write_text`, so a symlink
-    planted at that name sent the stored body outside the store.
-
-    Killed by: src/uclone_x/core/tool_results.py :: fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
-    Becomes: fd, tmp_name = os.open(path.parent / f".{path.name}.{os.getpid()}.tmp", os.O_WRONLY | os.O_CREAT), str(path.parent / f".{path.name}.{os.getpid()}.tmp")
+    Killed by: src/uclone_x/agent/session_lifecycle.py :: if body is None or result_handle(body) != handle:
+    Becomes: if body is None:
     """
-    import os
-
-    artifacts = tmp_path / "store"
-    body = _big_text()
-    handle = result_handle(body)
-    session_dir = artifacts / "s1"
-    session_dir.mkdir(parents=True)
-    victim = tmp_path / "victim.txt"
-    victim.write_text("untouched", encoding="utf-8")
-    (session_dir / f".{handle}.txt.{os.getpid()}.tmp").symlink_to(victim)
-
-    excerpt = ingest_tool_text(body, artifacts_dir=artifacts, session_id="s1")
-
-    assert victim.read_text(encoding="utf-8") == "untouched"
-    assert handle_in(excerpt) == handle
-    assert load_tool_result(artifacts, "s1", handle) == body
-
-
-def test_a_blob_symlinked_out_of_the_store_is_not_read(tmp_path: Path) -> None:
-    """A planted blob symlink reads as absent, in plain words, not as the file it names.
-
-    Killed by: src/uclone_x/core/tool_results.py :: path = PathValidator().resolve_safe_path(blob, artifacts_dir)
-    Becomes: path = blob
-    """
-    outside = tmp_path / "private.txt"
-    outside.write_text("private text", encoding="utf-8")
-    artifacts = tmp_path / "store"
-    (artifacts / "s1").mkdir(parents=True)
-    handle = "tr_0123456789abcdef"
-    (artifacts / "s1" / f"{handle}.txt").symlink_to(outside)
-
-    with pytest.raises(StoredResultNotFoundError) as info:
-        load_tool_result(artifacts, "s1", handle)
-    assert "No stored tool result named" in str(info.value)
-    assert str(tmp_path) not in str(info.value)
-
-
-def test_ingest_refuses_an_artifact_directory_outside_the_workspace(tmp_path: Path) -> None:
-    """Killed by: src/uclone_x/core/tool_results.py :: artifacts_dir = PathValidator().resolve_safe_path(artifacts_dir, workspace_root)
-    Becomes: pass
-    """
-    workspace = tmp_path / "ws"
-    workspace.mkdir()
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    (workspace / ".sandbox").symlink_to(outside, target_is_directory=True)
-
-    excerpt = ingest_tool_text(
-        _big_text(),
-        artifacts_dir=artifacts_dir_for(workspace),
-        session_id="s1",
-        workspace_root=workspace,
-    )
-
-    assert handle_in(excerpt) is None
-    assert list(outside.iterdir()) == []
+    store = SessionStore(storage_dir=tmp_path / "sessions")
+    agent = _stored_agent(tmp_path, store, _ScriptedLLM([]))
+    bodies = agent._result_bodies(agent.session_id)  # pyright: ignore[reportPrivateUsage]
+    handle = bodies.keep(_big_text(), tool_name="dump")
+    assert bodies.read(handle) == _big_text()
+    agent.persist_session()
+    state = store.load(agent.session_id)
+    assert state is not None
+    entry = stored_result_entry(state.session_log, handle)
+    assert entry is not None
+    (store.context_body_dir(agent.session_id) / entry.digest).write_text("altered")
+    fresh = _stored_agent(tmp_path, store, _ScriptedLLM([]))
+    fresh.hydrate_session(agent.session_id)
+    assert fresh._result_bodies(agent.session_id).read(handle) is None  # pyright: ignore[reportPrivateUsage]
 
 
 @pytest.mark.asyncio
-async def test_the_agent_stores_nothing_through_a_sandbox_linked_outside(tmp_path: Path) -> None:
-    """Killed by: src/uclone_x/agent/base.py :: workspace_root=workspace,
-    Becomes: workspace_root=None,
-    """
-    workspace = tmp_path / "ws"
-    workspace.mkdir()
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    (workspace / ".sandbox").symlink_to(outside, target_is_directory=True)
-    llm = _ScriptedLLM([[ToolCallRequest(id="c1", name="dump", arguments={})]])
-    agent = _agent(workspace, llm, [_returning("dump", _big_text())])
-
-    await agent.execute_turn("go")
-
-    assert not (outside / "tool_artifacts").exists()
-    tool_msg = _tool_messages(agent.history)[0]
-    assert "could not be kept" in (tool_msg.content or "")
+async def test_the_reader_tool_with_no_session_bodies_refuses_in_plain_words() -> None:
+    context = ToolContext(agent_id="a", session_id="s1", trace_id="t")
+    result = await ToolResultReadTool().execute({"handle": "tr_0123456789abcdef"}, context)
+    assert result.success is False
+    assert result.error == UNAVAILABLE_RESULT_MESSAGE
 
 
 @pytest.mark.asyncio
-async def test_a_compactor_with_no_session_truncates_rather_than_storing(tmp_path: Path) -> None:
-    """With no session there is no directory the reader looks in, so nothing is stored.
-
-    Killed by: src/uclone_x/llm/compactor.py :: if self.workspace_root is not None and self.session_id is not None:
-    Becomes: if self.workspace_root is not None:
-    """
+async def test_a_compactor_with_no_session_truncates_rather_than_storing() -> None:
+    """With no session's bodies there is nowhere to keep the text, so it is cut."""
     messages = [
         ChatMessage(role=MessageRole.USER, content="go"),
         ChatMessage(role=MessageRole.ASSISTANT, tool_calls=(ToolCallRequest(id="c1", name="t"),)),
         ChatMessage(role=MessageRole.TOOL, content="r" * 5_000, tool_call_id="c1", name="t"),
     ]
-    compactor = ContextCompactor(workspace_root=tmp_path, max_tool_output_chars=300)
+    compactor = ContextCompactor(max_tool_output_chars=300)
 
     outcome = await compactor.compact(messages)
 
     tool_msg = _tool_messages(outcome.messages)[0]
     assert (tool_msg.content or "").startswith("[Tool Output Truncated")
-    assert not artifacts_dir_for(tmp_path).exists()
 
 
 @pytest.mark.asyncio
@@ -1779,6 +2046,67 @@ async def test_a_result_truncated_for_want_of_a_session_is_recorded_as_an_excerp
     assert message_form(tool_msg) is ContextForm.EXCERPT
 
 
+class _NoSessionCompactor:
+    """A compactor the agent does not recognise as its own: it never gets the session's
+    bodies, so its long tool outputs take the truncate path (#1974)."""
+
+    def __init__(self) -> None:
+        self.inner = ContextCompactor(keep_recent_turns=4, max_tool_output_chars=300)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.inner, name)
+
+
+@pytest.mark.asyncio
+async def test_a_truncation_with_no_kept_result_is_refused_in_plain_words(
+    tmp_path: Path,
+) -> None:
+    """A compactor that truncates for want of a session writes an excerpt that records no
+    result it was cut from. The log cannot keep that as a form, so writing it into the
+    history is refused plainly -- never the log's own error -- and the history is left
+    as it was (#1974).
+
+    Killed by: src/uclone_x/agent/session_lifecycle.py :: if clean.form is not None and clean.rendered_from is None:
+    Becomes: if False:
+    """
+    from uclone_x.errors import FormTextMismatchError
+
+    llm = _ScriptedLLM([[ToolCallRequest(id="c1", name="dump", arguments={})]])
+    agent = _agent(tmp_path, llm, [_returning("dump", "r" * 2_000)])
+    agent._injected_compactor = _NoSessionCompactor()  # pyright: ignore[reportPrivateUsage, reportAttributeAccessIssue]
+    assert (await agent.execute_turn("go")).is_completed
+    before = agent.history
+
+    with pytest.raises(FormTextMismatchError) as raised:
+        await agent.compact_session()
+
+    assert str(raised.value) == (
+        "Part of this conversation could not be saved as it was written, so nothing was changed."
+    )
+    for internal in ("tr_", "excerpt", "form", "rendered_from", "ValueError", "#18", "#19"):
+        assert internal not in str(raised.value)
+    assert "records no result" in raised.value.detail
+    assert agent.history == before
+
+
+def test_ingest_records_the_handle_the_body_was_kept_under() -> None:
+    """The handle an over-cap result's form records is the one `bodies.keep` returned,
+    not one read back out of the excerpt's text (#1974); a result under the cap is its
+    own text and names none.
+    """
+    from uclone_x.core.tool_results import ingest_tool_result
+
+    bodies = _Bodies()
+    text, handle = ingest_tool_result(_big_text(), bodies=bodies)
+    assert handle is not None
+    assert list(bodies.held) == [handle]
+    assert handle in text
+    assert ingest_tool_result("small", bodies=bodies) == ("small", None)
+    unkept, none = ingest_tool_result(_big_text(), bodies=None)
+    assert none is None
+    assert unkept != _big_text()
+
+
 @pytest.mark.asyncio
 async def test_a_reader_outside_allowed_tools_is_not_named_after_compaction(
     tmp_path: Path,
@@ -1801,27 +2129,3 @@ async def test_a_reader_outside_allowed_tools_is_not_named_after_compaction(
     assert any("since the conversation was compacted" in (m.content or "") for m in agent.history)
     for message in agent.history:
         assert "tool_result_read" not in (message.content or "")
-
-
-@pytest.mark.asyncio
-async def test_the_reader_tool_refuses_a_store_linked_outside_the_workspace(
-    tmp_path: Path,
-) -> None:
-    """Killed by: src/uclone_x/tools/builtin/tool_results.py :: contained_artifacts_dir(context.require_workspace()),
-    Becomes: context.require_workspace() / ".sandbox" / "tool_artifacts",
-    """
-    workspace = tmp_path / "ws"
-    workspace.mkdir()
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    body = _big_text()
-    handle = handle_in(
-        ingest_tool_text(body, artifacts_dir=outside / "tool_artifacts", session_id="s1")
-    )
-    (workspace / ".sandbox").symlink_to(outside, target_is_directory=True)
-    context = ToolContext(agent_id="a", session_id="s1", trace_id="t", workspace_root=workspace)
-
-    result = await ToolResultReadTool().execute({"handle": handle}, context)
-
-    assert result.success is False
-    assert body[:40] not in str(result.output)

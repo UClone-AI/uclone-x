@@ -25,6 +25,7 @@ from pydantic import BaseModel, ValidationError
 from typer.testing import CliRunner
 
 from tests.support.app_clone import app_clone
+from tests.support.clones import make_clones
 from uclone_x.agent import BaseAgent
 from uclone_x.agent.base import VALID_TRANSITIONS
 from uclone_x.agent.bootstrap import agent_config_for_persona, bootstrap_session
@@ -45,6 +46,7 @@ from uclone_x.agent.session import (
 from uclone_x.agent.session_lifecycle import SessionLifecycle
 from uclone_x.cli import main as cli_main
 from uclone_x.cli.commands import run as run_module
+from uclone_x.core.agent_home import seat_id_for
 from uclone_x.core.provenance import ExecutionPath, Provenance, ServiceRef
 from uclone_x.engine.event_bus import AgentEvent, EventBus, EventType
 from uclone_x.engine.protocols import EventSubscriptionProtocol
@@ -76,6 +78,22 @@ from uclone_x.room.service import participant_session_id
 from uclone_x.ui.app import AgentSessionManager
 
 SYSTEM_PROMPT = "You are a careful assistant."
+
+# The agent ids these tests run as. Each is a clone now, since a name no clone carries is
+# refused rather than given a home (clone-data-scopes §3.4); persona-less, so each speaks as
+# the prompt the test gives it.
+_SESSION_CLONES = ("a", "agent-a", "agent-b", "cli_bot", "repl_bot")
+
+
+@pytest.fixture(autouse=True)
+def _session_clones() -> None:  # pyright: ignore[reportUnusedFunction]
+    make_clones(*_SESSION_CLONES)
+
+
+def _seat(room_id: str, handle: str) -> str:
+    """The session `ucx run <handle> --session-id <room_id>` keeps: the seat's, keyed by the
+    clone's id and not the handle the command names (clone-data-scopes §4 step 3)."""
+    return participant_session_id(room_id, seat_id_for(handle))
 
 
 def _clone_persona() -> PersonaDefinition:
@@ -800,7 +818,7 @@ def test_on_disk_record_is_a_readable_json_object(tmp_path: Path) -> None:
         # written here as `null` because this record was constructed directly rather than
         # snapshotted from a live session: absent provenance is a real state with its own
         # handling, not a hole. See
-        # `test_a_record_with_no_recorded_provenance_is_left_alone_and_reported` in
+        # `test_a_record_with_no_recorded_provenance_is_left_alone` in
         # `tests/unit/test_agent_base.py` for the upgrade direction.
         "anchor_provenance",
         # Added by #1421: what each turn's requests carried besides the conversation, so a
@@ -808,8 +826,7 @@ def test_on_disk_record_is_a_readable_json_object(tmp_path: Path) -> None:
         # key and loads with none; `tests/unit/test_context_snapshot.py` covers that.
         "context_snapshots",
         # Added by #1443: every message that entered the history, append-only, each naming
-        # its body in the context body store. A record written before it loads with its
-        # messages backfilled as `migrated` entries; `tests/unit/test_session_log.py`.
+        # its body in the context body store; `tests/unit/test_session_log.py`.
         "session_log",
         # Added by #1443 (2 of 3): per epoch, which log entries each request showed and
         # in which form. A record written before it loads with none;
@@ -3170,22 +3187,23 @@ async def test_a_non_active_session_may_still_be_reset_mid_turn() -> None:
 # --------------------------------------------------------------------------------------
 
 
-def test_assigning_history_writes_through_to_the_owning_session() -> None:
-    """Turning the `_history` setter into a silent no-op left the whole suite passing.
+def test_a_write_through_the_session_door_lands_in_the_owning_session() -> None:
+    """A history write lands in the session dict, not in a detached copy (#211, #1848).
 
-    That setter is the exact mechanism cited for "`cli/commands/run.py` still builds
-    unchanged" — `run.py` assigns `agent._history` — so an unpinned no-op would have
-    made the CLI's `/reset` print its banner and change nothing.
+    `_history` is read-only since the writers moved onto the session log: a write goes
+    through the session's door, which logs it, and `_history` is derived from that. The
+    CLI's `/reset` that once assigned it uses `reset_session`.
     """
     agent = _agent("agent-a")
-    replacement = [ChatMessage(role=MessageRole.USER, content="written through")]
+    written = ChatMessage(role=MessageRole.USER, content="written through")
 
-    agent._history = replacement  # pyright: ignore[reportPrivateUsage]
+    agent._active_session.append(written)  # pyright: ignore[reportPrivateUsage]
 
-    assert agent.history == tuple(replacement)
-    assert agent.get_session().messages == tuple(replacement)
-    # And it landed in the session dict, not in a detached copy.
-    assert agent._sessions["sess_agent-a"].messages == replacement  # pyright: ignore[reportPrivateUsage]
+    assert agent.history[-1] == written
+    assert agent.get_session().messages[-1] == written
+    assert agent._sessions["sess_agent-a"].messages[-1] == written  # pyright: ignore[reportPrivateUsage]
+    with pytest.raises(AttributeError):
+        agent._history = ()  # pyright: ignore[reportPrivateUsage, reportAttributeAccessIssue]
 
 
 def test_assigning_the_turn_counter_writes_through_to_the_owning_session() -> None:
@@ -4113,7 +4131,7 @@ def test_cli_session_id_resumes_the_conversation_it_had(
     # does rather than reconstructing it — a reconstruction is what hid the collision.
     store = SessionStore()
     # A run is a one-seat room named by `--session-id`; the clone keeps the seat's session.
-    saved = store.load(participant_session_id("sess_x", "cli_bot"))
+    saved = store.load(_seat("sess_x", "cli_bot"))
     assert saved is not None
     assert saved.turn_counter == 1
     assert any("remember this" == (m.content or "") for m in saved.messages)
@@ -4127,8 +4145,8 @@ def test_cli_reset_flag_clears_the_persisted_session(
     store = SessionStore()
     store.save(
         SessionState(
-            session_id=participant_session_id("sess_y", "cli_bot"),
-            agent_id="cli_bot",
+            session_id=_seat("sess_y", "cli_bot"),
+            agent_id=seat_id_for("cli_bot"),
             messages=_dialogue(),
             turn_counter=7,
         )
@@ -4151,7 +4169,7 @@ def test_cli_reset_flag_clears_the_persisted_session(
 
     assert result.exit_code == 0
     assert "reset" in result.output
-    saved = store.load(participant_session_id("sess_y", "cli_bot"))
+    saved = store.load(_seat("sess_y", "cli_bot"))
     assert saved is not None
     # Reset zeroed it, then the single prompt ran one turn.
     assert saved.turn_counter == 1
@@ -4165,8 +4183,8 @@ def test_cli_compact_flag_runs_a_compaction(
     store = SessionStore()
     store.save(
         SessionState(
-            session_id=participant_session_id("sess_z", "cli_bot"),
-            agent_id="cli_bot",
+            session_id=_seat("sess_z", "cli_bot"),
+            agent_id=seat_id_for("cli_bot"),
             messages=_bulky_dialogue(),
             turn_counter=12,
         )
@@ -4189,7 +4207,7 @@ def test_cli_compact_flag_runs_a_compaction(
 
     assert result.exit_code == 0
     assert "Compacted" in result.output
-    saved = store.load(participant_session_id("sess_z", "cli_bot"))
+    saved = store.load(_seat("sess_z", "cli_bot"))
     assert saved is not None
     assert any(m.compaction_ledger for m in saved.messages)
 
@@ -4229,35 +4247,6 @@ def test_a_cli_core_write_does_not_destroy_the_ui_transcript(
     record = manager.load_session_record("sess_shared")
     assert record is not None, "the CLI Core write destroyed the UI transcript"
     assert record["messages"][0]["content"] == "keep me"
-
-
-def test_a_legacy_root_transcript_is_still_readable_and_never_overwritten(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Installs predating the namespacing have transcripts at the root, and some of
-    those files are Core records or collision hybrids. They are read, never written.
-
-    The write half -- a later `save_session_record` landing under `ui/` and leaving the
-    root file alone -- went with that writer; nothing writes transcripts any more. What
-    remains is that reading one neither moves nor rewrites it.
-    """
-    monkeypatch.setenv(SESSION_STORAGE_DIR_ENV_VAR, str(tmp_path))
-    tmp_path.mkdir(parents=True, exist_ok=True)
-    legacy = tmp_path / "sess_old.json"
-    legacy.write_text(
-        json.dumps({"session_id": "sess_old", "turns": 2, "messages": [{"sender": "user"}]}),
-        encoding="utf-8",
-    )
-    legacy_bytes = legacy.read_bytes()
-    manager = AgentSessionManager(fallback_to_mock=True)
-
-    record = manager.load_session_record("sess_old")
-    assert record is not None
-    assert record["turns"] == 2
-
-    # The legacy file is untouched, and reading it created nothing at the namespaced path.
-    assert legacy.read_bytes() == legacy_bytes
-    assert not (tmp_path / UI_TRANSCRIPT_SUBDIR / "sess_old.json").exists()
 
 
 @pytest.mark.asyncio
@@ -4387,7 +4376,7 @@ def test_the_repl_persists_the_session_on_exit(
     )
 
     assert result.exit_code == 0
-    saved = SessionStore().load(participant_session_id("sess_persist", "repl_bot"))
+    saved = SessionStore().load(_seat("sess_persist", "repl_bot"))
     assert saved is not None, "the REPL exited without persisting its session"
     assert saved.turn_counter == 1
 
@@ -4414,7 +4403,7 @@ def test_the_repl_session_is_durable_before_it_exits(
             observed.append(None)  # first call: no turn has run yet
             return "Hello world"
         # Second call: one turn has completed and the REPL has NOT exited.
-        mid = SessionStore().load(participant_session_id("sess_midflight", "repl_bot"))
+        mid = SessionStore().load(_seat("sess_midflight", "repl_bot"))
         observed.append(None if mid is None else mid.turn_counter)
         return "/exit"
 
@@ -4468,10 +4457,10 @@ def test_a_transient_per_turn_persist_failure_is_recovered_at_exit(
 
     assert result.exit_code == 0
     assert "not saved" in result.output, "the failed per-turn persist was not reported"
+    # Resolved before `undo`, which also unsets the agents root the clone lives under.
+    seat = _seat("sess_transient", "repl_bot")
     monkeypatch.undo()
-    saved = SessionStore(storage_dir=tmp_path / CORE_RECORD_SUBDIR).load(
-        participant_session_id("sess_transient", "repl_bot")
-    )
+    saved = SessionStore(storage_dir=tmp_path / CORE_RECORD_SUBDIR).load(seat)
     assert saved is not None, "the exit persist did not recover the transient failure"
     assert saved.turn_counter == 1
 
@@ -4617,7 +4606,7 @@ def test_the_ui_path_resolvers_delegate_rather_than_reimplement() -> None:
     for node in ast.walk(tree):
         if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
             continue
-        if node.name not in {"get_session_path", "legacy_session_path"}:
+        if node.name != "get_session_path":
             continue
         calls = {
             inner.func.id
@@ -5032,8 +5021,8 @@ def test_the_cli_reports_an_unusable_session_id_instead_of_resuming_another_sess
     one-seat room, so the id that collides is its seat's session.
     """
     monkeypatch.setenv(SESSION_STORAGE_DIR_ENV_VAR, str(tmp_path))
-    record = tmp_path / CORE_RECORD_SUBDIR / f"{participant_session_id('SESSA', 'cli_bot')}.json"
-    _write_raw_record(record, session_id=participant_session_id("SessA", "cli_bot"), turn_counter=9)
+    record = tmp_path / CORE_RECORD_SUBDIR / f"{_seat('SESSA', 'cli_bot')}.json"
+    _write_raw_record(record, session_id=_seat("SessA", "cli_bot"), turn_counter=9)
     runner = CliRunner()
 
     result = runner.invoke(
@@ -5048,7 +5037,7 @@ def test_the_cli_reports_an_unusable_session_id_instead_of_resuming_another_sess
     # The other session's record is untouched, which is the consequence under test.
     on_disk = json.loads(record.read_text("utf-8"))
     assert on_disk["turn_counter"] == 9
-    assert on_disk["session_id"] == participant_session_id("SessA", "cli_bot")
+    assert on_disk["session_id"] == _seat("SessA", "cli_bot")
 
 
 def test_list_session_ids_reports_real_ids_because_nothing_is_encoded(tmp_path: Path) -> None:

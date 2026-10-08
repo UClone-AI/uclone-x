@@ -1,14 +1,14 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useContext, useEffect, useRef, useState } from 'react';
 import ReactMarkdown, { type Components, type Options } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import remarkMath from 'remark-math';
 import rehypeKatex from 'rehype-katex';
 import 'katex/dist/katex.min.css';
-import { Play, ExternalLink, Copy, Check, FileText, ImageOff } from 'lucide-react';
-import { useOpenInDocs } from '../lib/roomDock';
-import { UseAsAvatar } from './avatar/UseAsAvatar';
+import { Play, ExternalLink, Copy, Check, ImageOff } from 'lucide-react';
+import { ArtifactImageCard, ArtifactImageGallery, type ArtifactImage } from './ImageCard';
 import { fmt, useCopy } from '../i18n';
 import { cn } from '../lib/utils';
+import { ArtifactRoomContext, artifactUrlInRoom } from '../lib/artifactRoom';
 
 // Single source of truth for rendering user/agent text (chat messages, logs, tool traces).
 // Markdown via react-markdown + remark-gfm (so bare URLs autolink, tables, checklists work),
@@ -188,7 +188,7 @@ export const findArtifactImage = (href?: string | null): { url: string; name: st
   if (!ARTIFACT_CONTENT_RE.test(href.slice(0, q))) return null;
   const path = new URLSearchParams(href.slice(q + 1)).get('path');
   if (!path || !ARTIFACT_IMAGE_SUFFIX_RE.test(path)) return null;
-  return { url: href, name: path.split('/').pop() || path };
+  return { url: `/api/artifacts/content?path=${encodeURIComponent(path)}`, name: path.split('/').pop() || path };
 };
 
 /**
@@ -206,48 +206,15 @@ export const artifactImageSrc = (src?: string | null): string => {
   return `/api/artifacts/content?path=${encodeURIComponent(src)}`;
 };
 
-export const ArtifactImageCard: React.FC<{ url: string; name: string; alt?: string }> = ({
-  url,
-  name,
-  alt,
-}) => {
-  const openInDocs = useOpenInDocs();
-  const q = url.indexOf('?');
-  const path = q < 0 ? null : new URLSearchParams(url.slice(q + 1)).get('path');
+const RoomArtifactImageCard: React.FC<ArtifactImage> = (image) => {
+  const roomId = useContext(ArtifactRoomContext);
+  return <ArtifactImageCard {...image} url={artifactUrlInRoom(image.url, roomId)} />;
+};
+
+const RoomArtifactImageGallery: React.FC<{ images: ArtifactImage[] }> = ({ images }) => {
+  const roomId = useContext(ArtifactRoomContext);
   return (
-  <span className="my-3 block max-w-xl overflow-hidden rounded-xl border border-slate-800 bg-slate-950">
-    <img
-      src={url}
-      alt={alt || name}
-      data-testid="inline-artifact-image"
-      loading="lazy"
-      className="block max-h-[480px] w-full object-contain"
-    />
-    <span className="flex items-center justify-between gap-3 border-t border-slate-800 px-3 py-2 text-[11px] text-slate-400">
-      <span className="truncate font-mono">{name}</span>
-      <a
-        href={url}
-        target="_blank"
-        rel="noreferrer"
-        className="inline-flex shrink-0 items-center gap-1 text-slate-300 hover:text-slate-100"
-      >
-        Open <ExternalLink size={11} />
-      </a>
-      {openInDocs && path && (
-        <button
-          type="button"
-          data-testid="artifact-open-docs-btn"
-          onClick={() => openInDocs(path)}
-          className="inline-flex shrink-0 items-center gap-1 text-slate-300 hover:text-slate-100"
-        >
-          Open in Docs <FileText size={11} />
-        </button>
-      )}
-    </span>
-    {/* Only for a picture in the workspace, and only inside a clone's message: the
-        component itself renders nothing outside one. */}
-    {path && <UseAsAvatar path={path} />}
-  </span>
+    <ArtifactImageGallery images={images.map((image) => ({ ...image, url: artifactUrlInRoom(image.url, roomId) }))} />
   );
 };
 
@@ -462,8 +429,92 @@ export interface RichTextProps {
  * `ResizeObserver` torn down and re-attached, and a played YouTube card reset to its poster.
  * Nothing here reads props or state, so nothing is lost by building it at module load.
  */
+/**
+ * A set of drawn pictures becomes one gallery card instead of a column of cards.
+ *
+ * The image tool draws several candidates for one request and hands the reply a numbered list
+ * of them (`1. ![..](..)` per picture, its `markdown_gallery`), and a clone passes that on or
+ * writes the pictures one paragraph each. Either is regrouped here, in the tree react-markdown
+ * renders, into a `div` marked `data-ucx-gallery` that the `div` override draws. Only runs of
+ * our own artifact images are grouped: a list with one line of prose in it stays a list.
+ */
+type HastNode = {
+  type: string;
+  tagName?: string;
+  value?: string;
+  properties?: Record<string, unknown>;
+  children?: HastNode[];
+};
+
+const artifactOfImg = (node: HastNode): ArtifactImage | null => {
+  if (node.type !== 'element' || node.tagName !== 'img') return null;
+  const found = findArtifactImage(artifactImageSrc(String(node.properties?.src ?? '')));
+  if (!found) return null;
+  const alt = node.properties?.alt;
+  return { ...found, alt: typeof alt === 'string' && alt ? alt : undefined };
+};
+
+const isFiller = (node: HastNode): boolean =>
+  (node.type === 'text' && !(node.value ?? '').trim()) || (node.type === 'element' && node.tagName === 'br');
+
+/** The artifact images a paragraph, list item or list holds, if it holds nothing else. */
+const picturesOnly = (node: HastNode): HastNode[] | null => {
+  if (artifactOfImg(node)) return [node];
+  if (node.type !== 'element' || !['p', 'li', 'ol', 'ul'].includes(node.tagName ?? '')) return null;
+  const found: HastNode[] = [];
+  for (const child of node.children ?? []) {
+    if (isFiller(child)) continue;
+    const inner = picturesOnly(child);
+    if (!inner) return null;
+    found.push(...inner);
+  }
+  return found.length > 0 ? found : null;
+};
+
+const regroup = (node: HastNode): void => {
+  const children = node.children;
+  if (!children) return;
+  const out: HastNode[] = [];
+  let i = 0;
+  while (i < children.length) {
+    const first = children[i].type === 'element' && children[i].tagName !== 'li' ? picturesOnly(children[i]) : null;
+    if (!first) {
+      regroup(children[i]);
+      out.push(children[i]);
+      i += 1;
+      continue;
+    }
+    // Neighbouring picture-only blocks join, across the blank text between them.
+    const images = [...first];
+    let j = i + 1;
+    let end = i + 1;
+    while (j < children.length) {
+      if (isFiller(children[j])) {
+        j += 1;
+        continue;
+      }
+      const more = children[j].type === 'element' ? picturesOnly(children[j]) : null;
+      if (!more) break;
+      images.push(...more);
+      j += 1;
+      end = j;
+    }
+    if (images.length < 2) {
+      regroup(children[i]);
+      out.push(children[i]);
+      i += 1;
+      continue;
+    }
+    out.push({ type: 'element', tagName: 'div', properties: { dataUcxGallery: '' }, children: images });
+    i = end;
+  }
+  node.children = out;
+};
+
+const rehypeImageGallery = () => (tree: HastNode) => regroup(tree);
+
 const REMARK_PLUGINS: Options['remarkPlugins'] = [remarkGfm, remarkMath];
-const REHYPE_PLUGINS: Options['rehypePlugins'] = [[rehypeKatex, { throwOnError: false }]];
+const REHYPE_PLUGINS: Options['rehypePlugins'] = [[rehypeKatex, { throwOnError: false }], rehypeImageGallery];
 const MARKDOWN_COMPONENTS: Components = {
   pre: PreBlock,
   table: ({ node, ...props }) => (
@@ -471,11 +522,18 @@ const MARKDOWN_COMPONENTS: Components = {
       <table {...props} />
     </TableScroll>
   ),
+  div: ({ node, ...props }) => {
+    if (node?.properties?.dataUcxGallery !== undefined) {
+      const images = (node.children as HastNode[]).map(artifactOfImg).filter((x): x is ArtifactImage => x !== null);
+      return <RoomArtifactImageGallery images={images} />;
+    }
+    return <div {...props} />;
+  },
   img: ({ node, src, alt, ...props }) => {
     const resolvedSrc = artifactImageSrc(src);
     const artifact = findArtifactImage(resolvedSrc);
     if (artifact) {
-      return <ArtifactImageCard url={artifact.url} name={artifact.name} alt={alt} />;
+      return <RoomArtifactImageCard url={artifact.url} name={artifact.name} alt={alt} />;
     }
     return <img src={resolvedSrc} alt={alt} {...props} />;
   },
@@ -489,7 +547,7 @@ const MARKDOWN_COMPONENTS: Components = {
     }
     const artifact = findArtifactImage(href);
     if (artifact) {
-      return <ArtifactImageCard url={artifact.url} name={artifact.name} />;
+      return <RoomArtifactImageCard url={artifact.url} name={artifact.name} />;
     }
     return (
       <a href={href} target="_blank" rel="noopener noreferrer" className="text-indigo-400 hover:underline" {...props}>
@@ -530,5 +588,6 @@ export const RichText = React.memo<RichTextProps>(function RichText({ children, 
   );
 });
 
+export { ArtifactImageCard };
 export const MarkdownRenderer = RichText;
 export default RichText;

@@ -147,7 +147,8 @@ async def test_a_saturated_seat_raises_the_banner_and_shortening_reports_what_th
         # this one exercises the real timing end to end.
         await banner.wait_for(timeout=30000)
         said = await banner.inner_text()
-        assert f"scout reached the {SATURATION_TURNS}-turn limit on context" in said, said
+        # The seat by its display name, not its id.
+        assert f"Scout reached the {SATURATION_TURNS}-turn limit on context" in said, said
 
         await page.click("[data-testid='compact-room']")
 

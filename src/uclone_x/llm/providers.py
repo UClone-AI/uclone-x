@@ -22,9 +22,11 @@ import os
 from dataclasses import dataclass
 
 __all__ = [
+    "IMAGE_ENGINE_KINDS",
     "PROVIDERS",
     "ProviderSpec",
     "canonical_provider",
+    "chat_kind",
     "env_key",
     "env_model",
     "spec_for",
@@ -54,6 +56,10 @@ class ProviderSpec:
     #: How a key for this provider usually starts. Advisory only: a key that does not
     #: match is still saved (a current Gemini key starts ``AQ.``, not ``AIzaSy``).
     key_hint: str | None = None
+    #: What this kind's models can do (model-gateway §3.7.1 ``Kind.capabilities``): hold a
+    #: conversation (``chat``), draw a picture (``image_create``), change one it is given
+    #: (``image_edit``), or read one in a conversation (``image_input``).
+    capabilities: tuple[str, ...] = ("chat",)
 
     @property
     def model_env(self) -> str | None:
@@ -79,6 +85,7 @@ PROVIDERS: dict[str, ProviderSpec] = {
             requires_key=True,
             console_url="https://platform.openai.com/api-keys",
             key_hint="sk-",
+            capabilities=("chat", "image_input"),
         ),
         ProviderSpec(
             id="anthropic",
@@ -90,6 +97,7 @@ PROVIDERS: dict[str, ProviderSpec] = {
             requires_key=True,
             console_url="https://console.anthropic.com/settings/keys",
             key_hint="sk-ant-",
+            capabilities=("chat", "image_input"),
         ),
         ProviderSpec(
             id="gemini",
@@ -101,6 +109,7 @@ PROVIDERS: dict[str, ProviderSpec] = {
             requires_key=True,
             console_url="https://aistudio.google.com/app/apikey",
             key_hint=None,
+            capabilities=("chat", "image_create", "image_edit", "image_input"),
         ),
         ProviderSpec(
             id="ollama",
@@ -110,6 +119,7 @@ PROVIDERS: dict[str, ProviderSpec] = {
             base_url_env="OLLAMA_BASE_URL",
             model_env_vars=("OLLAMA_MODEL", "OLLAMA_INDEPTH_MODEL", "OLLAMA_FAST_MODEL"),
             requires_key=False,
+            capabilities=("chat", "image_input"),
         ),
         ProviderSpec(
             id="vllm",
@@ -119,6 +129,28 @@ PROVIDERS: dict[str, ProviderSpec] = {
             base_url_env="VLLM_BASE_URL",
             model_env_vars=("VLLM_MODEL",),
             requires_key=False,
+        ),
+        # The image engines (model-gateway §3.5, step 5): a server on the person's own
+        # machines that draws pictures and holds no conversation. Neither takes a key.
+        ProviderSpec(
+            id="comfyui",
+            aliases=(),
+            display_name="ComfyUI",
+            key_env_vars=(),
+            base_url_env="UCX_COMFYUI_URL",
+            model_env_vars=(),
+            requires_key=False,
+            capabilities=("image_create",),
+        ),
+        ProviderSpec(
+            id="remote_gpu",
+            aliases=(),
+            display_name="GPU server",
+            key_env_vars=(),
+            base_url_env="UCX_IMAGE_REMOTE_URL",
+            model_env_vars=(),
+            requires_key=False,
+            capabilities=("image_create",),
         ),
         ProviderSpec(
             id="mock",
@@ -148,6 +180,18 @@ def canonical_provider(name: str | None) -> str | None:
     """The id ``name`` means (``google`` gives ``gemini``), or ``None`` for an unknown name."""
     spec = spec_for(name)
     return spec.id if spec is not None else None
+
+
+#: The kinds that only draw pictures: never built as a chat connector, never a chat model.
+IMAGE_ENGINE_KINDS: frozenset[str] = frozenset(
+    spec.id for spec in PROVIDERS.values() if "chat" not in spec.capabilities
+)
+
+
+def chat_kind(name: str | None) -> bool:
+    """Whether ``name`` is a kind whose models hold a conversation (not an image engine)."""
+    spec = spec_for(name)
+    return spec is not None and "chat" in spec.capabilities
 
 
 def _set_variable(names: tuple[str, ...]) -> tuple[str, str] | None:

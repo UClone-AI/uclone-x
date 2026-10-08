@@ -145,7 +145,7 @@ def test_the_list_states_what_it_covers(library: ArtifactLibrary) -> None:
         ("tests/fixtures/stories/x.yaml", False),
     ],
 )
-def test_the_repository_ignores_the_story_library_and_the_archive(path: str, ignored: bool) -> None:
+def test_stories_and_archive_are_ignored_by_git(path: str, ignored: bool) -> None:
     """A workspace at the repository root writes `stories/` and `.archive/` there (#1578).
 
     Anchored, like `/artifacts/`, so a source directory of either name stays tracked. Asked
@@ -159,7 +159,18 @@ def test_the_repository_ignores_the_story_library_and_the_archive(path: str, ign
     """
     root = Path(__file__).resolve().parents[2]
     asked = subprocess.run(
-        ["git", "-C", str(root), "check-ignore", "--no-index", "--quiet", path],
+        [
+            "git",
+            "-C",
+            str(root),
+            "-c",
+            "core.excludesFile=",
+            "check-ignore",
+            "--no-index",
+            "--quiet",
+            path,
+        ],
+        env={**os.environ, "GIT_CONFIG_GLOBAL": "/dev/null"},
         capture_output=True,
         text=True,
         check=False,

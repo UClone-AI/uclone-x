@@ -1,7 +1,8 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { BookOpen, Lightbulb, MoreHorizontal } from 'lucide-react';
 import {
   editMemoryFact,
+  onMemoryChanged,
   roomDockUrls,
   useRoomRead,
   type KnownFact,
@@ -239,6 +240,11 @@ export const RemembersPanel: React.FC<RemembersPanelProps> = ({
   refreshKey,
 }) => {
   const [edits, setEdits] = useState(0);
+  useEffect(() => {
+    return onMemoryChanged(() => {
+      setEdits((n) => n + 1);
+    });
+  }, []);
   // One key for "the conversation moved on" and "a fact was just changed here".
   const readKey = useMemo(() => ({ refreshKey, edits }), [refreshKey, edits]);
   const url = roomId && seatId ? roomDockUrls.knowledge(roomId, seatId) : null;

@@ -30,6 +30,7 @@ import pytest
 from pydantic import BaseModel, Field
 
 from tests.support.app_clone import app_clone
+from tests.support.clones import make_clones
 from uclone_x.agent.base import BaseAgent
 from uclone_x.agent.composition import HostDependencies
 from uclone_x.agent.models import AgentConfig, AgentLLMConfig
@@ -67,6 +68,17 @@ from uclone_x.telemetry.tracer import TelemetryTracer
 from uclone_x.tools.base import BaseTool
 from uclone_x.tools.models import ToolContext
 from uclone_x.tools.registry import ToolRegistry
+
+# The agent ids these tests run as. Each is a clone now, since a name no clone carries is
+# refused rather than given a home (clone-data-scopes §3.4); persona-less, so each speaks as
+# the prompt the test gives it.
+_LOG_CLONES = ("agent-general",)
+
+
+@pytest.fixture(autouse=True)
+def _log_clones() -> None:  # pyright: ignore[reportUnusedFunction]
+    make_clones(*_LOG_CLONES)
+
 
 # A shape `redact_credentials` recognises (see test_log_redaction_credentials.py); not a key.
 _FAKE_KEY = "sk-1234567890123456789012345678901234567890"
@@ -221,7 +233,9 @@ class TestTheStoresTheHeadsBuildWriteEvents:
         assert "TOOL_CALL" in types and "TOOL_RESULT" in types, types
         result = next(e for e in events if e["type"] == "TOOL_RESULT")
         assert result["tool_call_id"] == "call_1"
-        assert result["output"] == "file body"
+        # Named by handle, not copied (#2013): the text is the session's own body.
+        assert "output" not in result
+        assert str(result["result_handle"]).startswith("tr_")
 
     @pytest.mark.asyncio
     async def test_a_default_store_writes_under_the_session_directory_env(
@@ -508,7 +522,9 @@ class TestTheDefaultEventLog:
             agent = app_clone(manager, "agent-general", session_id)
             assert (await agent.execute_turn("read a")).error is None
             agent.persist_session(session_id=session_id)
-            assert "first conversation body" in log_path.read_text()
+            # The user's words are the first conversation's own mark in its events (the
+            # tool's output is in the body store, not the log, since #2013).
+            assert '"read a"' in log_path.read_text()
 
             # Named, as a room names its seat's agent: without it this would test the
             # delete branch instead.
@@ -521,24 +537,27 @@ class TestTheDefaultEventLog:
 
         asyncio.run(conversation())
         text = log_path.read_text()
-        assert "first conversation body" not in text
+        assert '"read a"' not in text
         events = _events(log_path)
         assert events[0]["type"] == "TURN_START" and events[0]["offset"] == 1
         assert _types(events).count("TURN_START") == 1
 
     @pytest.mark.asyncio
-    async def test_a_credential_in_a_tool_output_is_redacted_on_disk(self, tmp_path: Path) -> None:
-        """The writer redacts twice: per string in `write_entry`, then per line in
-        `write_line`. Disabling either one alone survives this test, because the other
-        still redacts, so no single-line kill is declared. Disabling both at once
-        (`clean = line` together with `return payload` in `redact_log_payload`) fails it.
+    async def test_a_credential_in_a_tool_output_never_reaches_the_event_log(
+        self, tmp_path: Path
+    ) -> None:
+        """The event log names a tool's result by handle and holds none of its text
+        (#2013), so a credential in the output is not on disk in it at all. The writer's
+        own redaction is pinned in `test_log_redaction_credentials.py`.
         """
         store = SessionStore(tmp_path)
         await _run_turn(store, tool_steps=1)
         text = _only_log(store).read_text()
         assert "TOOL_RESULT" in text
         assert _FAKE_KEY not in text
-        assert "[REDACTED]" in text
+        results = [e for e in _events(_only_log(store)) if e["type"] == "TOOL_RESULT"]
+        assert results and all("output" not in e for e in results)
+        assert all(str(e["result_handle"]).startswith("tr_") for e in results)
 
 
 # --------------------------------------------------------------------------------------
@@ -605,7 +624,7 @@ class TestRequestContextIsADelta:
         one (276,020 vs 40,430 bytes); the delta makes it 3.1x (53,168 vs 16,950). The
         bound of 5 sits between the two. The count assertion below is the sharper check.
 
-        Killed by: src/uclone_x/agent/prompt_assembler.py :: session.last_conversation = conversation
+        Killed by: src/uclone_x/agent/prompt_assembler.py :: session.last_conversation = shown
         Becomes: session.last_conversation = []
         """
         small_store = SessionStore(tmp_path / "small")
@@ -621,6 +640,6 @@ class TestRequestContextIsADelta:
         # request is recorded once, not once per step it was present in. The system message
         # is not conversation: it is in the snapshot.
         contexts = _request_contexts(large_store)
-        recorded = sum(len(e["appended_messages"]) for e in contexts)
+        recorded = sum(len(e["appended_entries"]) for e in contexts)
         final = [m for m in llm.calls[-1].messages if m.role is not MessageRole.SYSTEM]
         assert recorded == len(final), (recorded, len(final))

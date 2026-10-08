@@ -406,7 +406,7 @@ def test_an_agent_home_written_into_the_real_root_is_reported_as_one(tmp_path: P
     real_root.mkdir()
 
     with watching_session_writes(real_root, label="agent home") as guard:
-        home = AgentHome.for_username("leaky", root=real_root)
+        home = AgentHome.for_legacy_name("leaky", root=real_root)
         home.agent_id()
 
         with pytest.raises(AssertionError) as caught:

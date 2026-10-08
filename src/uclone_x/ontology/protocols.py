@@ -5,11 +5,10 @@ from __future__ import annotations
 from typing import Any, Literal, Protocol, runtime_checkable
 
 from uclone_x.ontology.models import (
-    EntitySchema,
     OntologyAxiom,
-    OntologyInvariant,
-    OntologyValidationResult,
-    RelationSchema,
+    OntologyConcept,
+    OntologyRelation,
+    ValidationResult,
 )
 
 
@@ -21,11 +20,11 @@ class OntologyValidatorProtocol(Protocol):
         self,
         entity_name: str,
         data: dict[str, Any],
-    ) -> OntologyValidationResult:
+    ) -> ValidationResult:
         """Validate an input or output payload against the compiled ontology.
 
         No latency figure here: issue 2026-09-02-009 moved every numeric target to
-        `docs/nfr-performance-budgets.md`, where each is marked unmeasured, so that
+        the performance-budgets document, where each is marked unmeasured, so that
         figures stop being frozen into normative text. A docstring is normative text.
         """
         ...
@@ -35,11 +34,11 @@ class OntologyValidatorProtocol(Protocol):
 class OntologyEngineProtocol(Protocol):
     """Protocol for managing the evolving domain ontology knowledge graph."""
 
-    def register_entity(self, entity: EntitySchema) -> None:
+    def register_entity(self, entity: OntologyConcept) -> None:
         """Register or update an entity schema."""
         ...
 
-    def register_relation(self, relation: RelationSchema) -> None:
+    def register_relation(self, relation: OntologyRelation) -> None:
         """Register a relationship schema."""
         ...
 
@@ -47,11 +46,11 @@ class OntologyEngineProtocol(Protocol):
         """Register an axiom invariant rule."""
         ...
 
-    def get_entity(self, name: str) -> EntitySchema | None:
+    def get_entity(self, name: str) -> OntologyConcept | None:
         """Retrieve entity definition."""
         ...
 
-    def get_concept(self, name: str) -> EntitySchema | None:
+    def get_concept(self, name: str) -> OntologyConcept | None:
         """Retrieve concept definition."""
         ...
 
@@ -63,7 +62,7 @@ class OntologyEngineProtocol(Protocol):
         self,
         domain: str | None = None,
         tier_filter: Literal["asserted", "candidate", "all"] = "asserted",
-    ) -> list[OntologyInvariant]:
+    ) -> list[OntologyAxiom]:
         """Retrieve active invariant rules filtered by domain and ontology tier (P7, P8)."""
         ...
 

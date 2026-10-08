@@ -58,7 +58,9 @@ async def test_tool_execution_suspended_and_approved():
     assert (
         rec.status == "error"
     )  # because write_file is not registered in tools here, but it bypassed the ASK!
-    assert "not found" in (rec.error or "") or "not found" in (msg.content or "")
+    # The plain did-you-mean result for a name no tool has (#2190).
+    assert "There is no tool named 'write_file'" in (rec.error or "")
+    assert msg.content == rec.error
 
     await task
     await agent.stop()
@@ -224,7 +226,7 @@ async def test_approval_response_carries_nested_modified_arguments():
         # *having been modified*, which is what proves the decision survived validation
         # as a plain dict.
         assert rec.status == "error"
-        assert "not found" in (rec.error or "")
+        assert "There is no tool named 'write_file'" in (rec.error or "")
         assert unwrap_immutable(rec.arguments) == modified
     finally:
         await task

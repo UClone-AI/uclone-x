@@ -63,4 +63,19 @@ describe('the Clone surface in the chosen language', () => {
     expect(screen.getByTestId('clone-profile-no-definition')).toHaveTextContent(ko.cloneProfile.noDefinition);
     expect(leftoverEnglish(baseElement, ['cloneProfile'])).toEqual([]);
   });
+
+  // Killed by: frontend/src/components/clones/CloneProfile.tsx :: const label = persona ? cloneLabel(persona, language) : cloneId;
+  // Becomes: const label = cloneId;
+  it('heads the profile with the display name for the chosen language, not the id', () => {
+    const persona = makePersonaInfo({ display_name: { en: 'Sleepyhead', ko: '잠 꾸러기' } });
+    const korean = renderIn('ko-KR', { persona });
+    expect(screen.getByTestId('clone-profile-name')).toHaveTextContent('잠 꾸러기');
+    expect(screen.getByTestId('clone-profile-start')).toHaveAttribute('aria-label', '잠 꾸러기와 대화 시작');
+    korean.unmount();
+
+    renderIn('en-US', { persona });
+    expect(screen.getByTestId('clone-profile-name')).toHaveTextContent('Sleepyhead');
+    // The id is still what the profile is keyed by.
+    expect(screen.getByTestId('clone-profile-reader')).toBeInTheDocument();
+  });
 });

@@ -27,6 +27,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
+from tests.support.clones import make_clone
 from uclone_x.errors import (
     RoomAlreadyExistsError,
     RoomError,
@@ -45,7 +46,11 @@ from uclone_x.room.models import (
     RoomPolicy,
     RoomState,
 )
-from uclone_x.room.service import RoomService
+from uclone_x.room.service import (
+    RoomService,
+    participant_session_id,
+    seat_sessions,
+)
 from uclone_x.room.store import RoomStore
 
 
@@ -138,6 +143,9 @@ class TestCreate:
         assert summaries["room_a"].human_ids == ("alice",)
         # Two joins, and both are in the record.
         assert summaries["room_a"].message_count == 2
+        # Killed by: src/uclone_x/room/service.py :: utterance_count=sum(1 for m in state.transcript if m.is_utterance),
+        # Becomes: utterance_count=len(state.transcript),
+        assert summaries["room_a"].utterance_count == 0
         assert summaries["room_b"].agent_ids == ()
 
     def test_list_rooms_puts_the_most_recently_updated_first(self, tmp_path: Path) -> None:
@@ -465,6 +473,29 @@ class TestMembershipIsRecorded:
 
         assert state.turn_state.agent_turns_since_human == 0
         assert state.turn_state.last_speaker_id is None
+
+    @pytest.mark.usefixtures("builtin_personas_absent")
+    def test_a_clone_made_after_the_registry_loaded_is_seated_by_its_handle(
+        self, service: RoomService
+    ) -> None:
+        """A seat is named from the clone's own file, not the registry's older copy (#1815).
+
+        The registry is a process-wide cache, so a clone created after it loaded is not in
+        it, and a seat named from it showed the clone's `agt_…` id.
+
+        Killed by: src/uclone_x/room/service.py :: fallback_name = handle_of(participant_id) or participant_id
+        Becomes: fallback_name = __import__("uclone_x.agent.persona_registry", fromlist=["_"]).get_default_persona_registry().handle_for(participant_id)
+        """
+        from uclone_x.agent.persona_registry import get_default_persona_registry
+
+        get_default_persona_registry()
+        clone_id = make_clone("latecomer").path.name
+        service.create("Room", room_id="room_late")
+
+        state = service.add_participant("room_late", clone_id)
+
+        assert clone_id.startswith("agt_")
+        assert state.participants[-1].display_name == "latecomer"
 
 
 # --------------------------------------------------------------------------------------
@@ -797,8 +828,8 @@ class TestParticipantIdsTheRosterMustRefuse:
         `    (scout) joined the room as an agent` and every later render of that
         participant showed nothing at all where a name goes.
 
-        Killed by: src/uclone_x/room/service.py :: display_name=display_name.strip() or participant_id,
-        Becomes: display_name=display_name or participant_id,
+        Killed by: src/uclone_x/room/service.py :: display_name=display_name.strip() or fallback_name,
+        Becomes: display_name=display_name or fallback_name,
         """
         service.create("Room", room_id="room_dn")
         state = service.add_participant("room_dn", "scout", display_name="   ")
@@ -919,11 +950,16 @@ def _with_transcript(
     1` — because the reuse that follows from it is half of what is under test.
     """
     state = service.get(room_id)
+    agents = [p.id for p in state.participants if p.kind is ParticipantKind.AGENT]
     transcript = tuple(
-        RoomMessage(seq=index + 1, sender_id=sender, content=content)
+        RoomMessage(
+            seq=index + 1,
+            sender_id=sender,
+            content=content,
+            turn_id=f"t{index + 1}" if sender in agents else None,
+        )
         for index, (sender, content) in enumerate(rows)
     )
-    agents = [p.id for p in state.participants if p.kind is ParticipantKind.AGENT]
     return service._store.save(  # pyright: ignore[reportPrivateUsage]
         state.model_copy(
             update={
@@ -1072,8 +1108,14 @@ class TestTruncateTranscript:
                 update={
                     "transcript": (
                         RoomMessage(seq=1, sender_id="alice", content="hi"),
-                        RoomMessage(seq=2, sender_id="scout", content="", error="provider down"),
-                        RoomMessage(seq=3, sender_id="scout", content="here you go"),
+                        RoomMessage(
+                            seq=2,
+                            sender_id="scout",
+                            turn_id="t2",
+                            content="",
+                            error="provider down",
+                        ),
+                        RoomMessage(seq=3, sender_id="scout", turn_id="t3", content="here you go"),
                     ),
                     "turn_state": pre.turn_state.model_copy(
                         update={"agent_turns_since_human": 1, "last_speaker_id": "scout"}
@@ -1135,6 +1177,7 @@ class TestTruncateTranscript:
                         RoomMessage(
                             seq=2,
                             sender_id="critic",
+                            turn_id="t-critic",
                             content="critic joined the room",
                             kind=RoomMessageKind.JOIN,
                         ),
@@ -1336,7 +1379,7 @@ class TestTheFileRecordOnlyGrows:
         assert seated.clear_transcript("room_hist").file_record.clears == 1
 
 
-_FEATURE_FIELDS = ("tool_uses", "written_files", "file_record", "story_id", "head")
+_FEATURE_FIELDS = ("tool_uses", "written_files", "file_record", "story_id", "head", "workspace")
 
 
 def test_a_default_room_is_saved_without_the_feature_fields(tmp_path: Path) -> None:
@@ -1462,7 +1505,9 @@ def test_nested_records_are_saved_in_the_older_shape(service: RoomService) -> No
     )
     joins = created.transcript
     asked = RoomMessage(seq=len(joins) + 1, sender_id="user", content="what is slow?")
-    answered = RoomMessage(seq=len(joins) + 2, sender_id="scout", content="the join")
+    answered = RoomMessage(
+        seq=len(joins) + 2, sender_id="scout", content="the join", turn_id="t-join"
+    )
     call = RoomToolUse(turn_id="turn_1", participant_id="scout", tool_name="grep", status="ok")
     plain = store.save(
         created.model_copy(update={"transcript": (*joins, asked, answered), "tool_uses": (call,)})
@@ -1475,7 +1520,7 @@ def test_nested_records_are_saved_in_the_older_shape(service: RoomService) -> No
         assert set(row) - _KEYS_AT_1366["RoomMessage"] == set(), row
     assert set(raw["policy"]) - _KEYS_AT_1366["RoomPolicy"] == set()
     assert set(raw["tool_uses"][0]) - _KEYS_AT_1366["RoomToolUse"] == set()
-    assert "turn_id" not in raw["transcript"][-1]
+    assert "turn_id" not in raw["transcript"][-2]  # the human's row carries none
     assert "tools_recorded" not in raw["transcript"][-1]
 
     note = RoomMessage(
@@ -1528,34 +1573,6 @@ def test_a_room_is_created_with_its_seats_in_one_save(service: RoomService) -> N
     assert [p.id for p in service.get(state.room_id).participants] == ["user", "scout"]
 
 
-@pytest.mark.parametrize("head", ["acp", "a2a"])
-def test_a_server_head_still_continues_its_own_room_from_before_the_mark(
-    service: RoomService, head: str
-) -> None:
-    """An ACP session or A2A context begun before rooms were marked goes on (#1885).
-
-    Its id starts with the head's name, which nothing else mints, so the room is the
-    head's own; refusing it would end every such conversation at its next turn. Author's
-    choice: an unmarked room under any other id is the app's, and the head is refused.
-
-    Killed by: src/uclone_x/room/one_seat.py :: return state.head is None and head in ("acp", "a2a") and room_id.startswith(f"{head}_")
-    Becomes: return False
-    Killed by: src/uclone_x/room/one_seat.py :: return state.head is None and head in ("acp", "a2a") and room_id.startswith(f"{head}_")
-    Becomes: return state.head is None and head in ("acp", "a2a")
-    """
-    from uclone_x.room.one_seat import resolve_one_seat_room
-
-    seats = [("user", ParticipantKind.HUMAN), ("scout", ParticipantKind.AGENT)]
-    service.create("scout", room_id=f"{head}_0123abcd", seats=seats)
-    service.create("scout", room_id="room_from_the_app", seats=seats)
-
-    own = resolve_one_seat_room(service, room_id=f"{head}_0123abcd", clone_id="scout", head=head)
-
-    assert own.state is not None
-    with pytest.raises(RoomError, match="belongs to the app"):
-        resolve_one_seat_room(service, room_id="room_from_the_app", clone_id="scout", head=head)
-
-
 _SERVER_HEAD_ID = {"acp": "acp_" + "0a" * 12, "a2a": "a2a_" + "0b" * 12}
 _RESERVED_FOR = {
     "acp": "conversations an editor opens",
@@ -1568,7 +1585,7 @@ _RESERVED_FOR = {
 def test_only_its_head_creates_a_room_under_a_server_head_s_id(
     service: RoomService, head: str, creator: str | None
 ) -> None:
-    """An unmarked room under that id is read as the head's, so nobody else may make one.
+    """Only its head makes a room under that id, since that head alone derives it.
 
     `ucx room create --id acp_<24 hex>` made a room its maker could then neither rename
     nor add to (#1885). Author's choice: another head is refused too, so the shape is one
@@ -1678,7 +1695,7 @@ class TestAHeadRoomIsWrittenOnlyByItsHead:
         assert unguarded == self._EXEMPT, unguarded
 
     @staticmethod
-    def _head_room(service: RoomService, *, marked: bool) -> str:
+    def _head_room(service: RoomService, *, head: str) -> str:
         from uclone_x.room.one_seat import HeadTurn, conversation_room_id, record_head_turn
         from uclone_x.room.store import RoomStore
 
@@ -1687,34 +1704,30 @@ class TestAHeadRoomIsWrittenOnlyByItsHead:
         state = record_head_turn(
             store,
             room_id="room_from_the_terminal"
-            if marked
-            else conversation_room_id("a2a", "scout", "c1"),
+            if head == "run"
+            else conversation_room_id(head, "scout", "c1"),
             clone_id="scout",
             turn=HeadTurn(prompt="what is in the index?", content="three tables"),
-            head="run" if marked else "a2a",
+            head=head,
         )
-        if not marked:
-            state = store.save(state.model_copy(update={"head": None}))
         return state.room_id
 
-    @pytest.mark.parametrize("marked", [True, False])
+    @pytest.mark.parametrize("head", ["run", "a2a"])
     @pytest.mark.parametrize(
         "change",
         ["rename", "add", "remove", "responder", "truncate", "clear", "open_story"],
     )
     def test_each_change_is_refused_plainly_and_nothing_is_saved(
-        self, service: RoomService, change: str, marked: bool
+        self, service: RoomService, change: str, head: str
     ) -> None:
-        """Marked, or an A2A room from before the mark: both are the head's.
+        """A terminal head's room and a server head's: both are the head's alone.
 
-        Killed by: src/uclone_x/room/service.py :: head = room_head(state)
+        Killed by: src/uclone_x/room/service.py :: head = state.head
         Becomes: head = None
-        Killed by: src/uclone_x/room/models.py :: return unmarked.group(1) if unmarked is not None else None
-        Becomes: return None
         """
         from uclone_x.errors import HeadRoomWriteError
 
-        room_id = self._head_room(service, marked=marked)
+        room_id = self._head_room(service, head=head)
         before = service.get(room_id)
         calls = {
             "rename": lambda: service.rename(room_id, "Mine now"),
@@ -1729,22 +1742,152 @@ class TestAHeadRoomIsWrittenOnlyByItsHead:
         with pytest.raises(HeadRoomWriteError) as refused:
             calls[change]()
 
-        keeper = "ucx run" if marked else "the agent that called this clone"
+        keeper = "ucx run" if head == "run" else "the agent that called this clone"
         assert str(refused.value) == (
             f"This conversation belongs to {keeper}, so only {keeper} can continue it. "
             "You can read it here."
         )
         assert service.get(room_id) == before
 
-    def test_a_room_id_that_only_looks_like_a_head_s_is_the_app_s(
-        self, service: RoomService
-    ) -> None:
-        """Only the exact server shape counts: `run`/`loop` ids are `room_` ids like the app's.
 
-        Killed by: src/uclone_x/room/models.py :: _SERVER_HEAD_ROOM_ID = re.compile(r"(acp|a2a)_[0-9a-f]{24}")
-        Becomes: _SERVER_HEAD_ROOM_ID = re.compile(r"(acp|a2a|room)_[0-9a-f]{12,24}")
+class TestDeleteRoom:
+    def test_seat_sessions_lists_roster_and_departed_agents(self) -> None:
+        """Every seat session used by the room is returned: roster agents first, then departed.
+
+        Human participants are excluded.
+
+        Killed by: src/uclone_x/room/service.py :: _add(participant_session_id(state.room_id, m.sender_id))
+        Becomes: pass
         """
-        from uclone_x.room.models import room_head
+        state = RoomState(
+            room_id="room_seats",
+            title="Seats",
+            participants=(
+                Participant(id="user", display_name="User", kind=ParticipantKind.HUMAN),
+                Participant(
+                    id="alpha",
+                    display_name="Alpha",
+                    kind=ParticipantKind.AGENT,
+                    session_id=participant_session_id("room_seats", "alpha"),
+                ),
+                Participant(
+                    id="beta",
+                    display_name="Beta",
+                    kind=ParticipantKind.AGENT,
+                    session_id=participant_session_id("room_seats", "beta"),
+                ),
+            ),
+            transcript=(
+                RoomMessage(seq=1, sender_id="user", content="hello"),
+                RoomMessage(seq=2, sender_id="alpha", turn_id="t1", content="hi"),
+                RoomMessage(
+                    seq=3,
+                    sender_id="departed_agent",
+                    kind=RoomMessageKind.JOIN,
+                    content="departed joined",
+                ),
+                RoomMessage(
+                    seq=4,
+                    sender_id="departed_agent",
+                    turn_id="t2",
+                    content="departed message",
+                ),
+                RoomMessage(
+                    seq=5,
+                    sender_id="departed_agent",
+                    kind=RoomMessageKind.LEAVE,
+                    content="departed left",
+                ),
+            ),
+        )
 
-        for room_id in ("room_0123456789ab", "acp_notahexid", "a2a_0123"):
-            assert room_head(service.create("Room", room_id=room_id)) is None, room_id
+        sessions = seat_sessions(state)
+        assert sessions == (
+            participant_session_id("room_seats", "alpha"),
+            participant_session_id("room_seats", "beta"),
+            participant_session_id("room_seats", "departed_agent"),
+        )
+
+    def test_deleting_a_room_removes_each_seats_session_record_before_the_room_record(
+        self, tmp_path: Path
+    ) -> None:
+        """Seat session records are deleted before the room record itself.
+
+        Killed by: src/uclone_x/room/service.py :: self._sessions.delete(session_id)
+        Becomes: pass
+        """
+        events: list[str] = []
+
+        class RecordingSessionStore:
+            def delete(self, session_id: str) -> bool:
+                events.append(f"delete_session:{session_id}")
+                return True
+
+        class RecordingRoomStore(RoomStore):
+            def delete(self, room_id: str) -> bool:
+                events.append(f"delete_room:{room_id}")
+                return super().delete(room_id)
+
+        store = RecordingRoomStore(tmp_path / "rooms")
+        session_store = RecordingSessionStore()
+        service = RoomService(store, sessions=session_store)
+
+        state = service.create(
+            "Discussion",
+            room_id="room_del",
+            seats=[("user", ParticipantKind.HUMAN), ("scout", ParticipantKind.AGENT)],
+        )
+
+        assert service.delete(state.room_id) is True
+        scout_session_id = participant_session_id("room_del", "scout")
+        assert events == [
+            f"delete_session:{scout_session_id}",
+            "delete_room:room_del",
+        ]
+
+    def test_deleting_a_room_keeps_the_room_when_seat_session_removal_fails(
+        self, tmp_path: Path
+    ) -> None:
+        """When removing a seat's session fails, RoomError is raised and the room is kept."""
+
+        class FailingSessionStore:
+            def delete(self, session_id: str) -> bool:
+                raise OSError("simulated disk error")
+
+        store = RoomStore(tmp_path / "rooms")
+        service = RoomService(store, sessions=FailingSessionStore())
+
+        state = service.create(
+            "Persistent Room",
+            room_id="room_keep",
+            seats=[("user", ParticipantKind.HUMAN), ("scout", ParticipantKind.AGENT)],
+        )
+
+        with pytest.raises(RoomError, match="could not be deleted because its seat session"):
+            service.delete(state.room_id)
+
+        assert service.get("room_keep").room_id == "room_keep"
+
+
+# --------------------------------------------------------------------------------------
+# Workspace per conversation (clone-data-scopes §3.6)
+# --------------------------------------------------------------------------------------
+
+
+def test_a_workspace_that_is_not_a_folder_or_with_a_story_open_is_refused(
+    service: RoomService, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    room = service.create("Refused")
+    with pytest.raises(RoomError):
+        service.set_workspace(room.room_id, "relative/path")
+    with pytest.raises(RoomError):
+        service.set_workspace(room.room_id, str(tmp_path / "missing"))
+    # Inside the app's own state, which the store writes and no workspace may hold.
+    monkeypatch.setenv("UCLONE_SESSION_DIR", str(tmp_path / "state"))
+    (tmp_path / "state" / "rooms").mkdir(parents=True)
+    with pytest.raises(RoomError):
+        service.set_workspace(room.room_id, str(tmp_path / "state" / "rooms"))
+    service.set_story(room.room_id, "story_1")
+    with pytest.raises(RoomError):
+        service.set_workspace(room.room_id, str(tmp_path))
+    assert service.get(room.room_id).workspace is None

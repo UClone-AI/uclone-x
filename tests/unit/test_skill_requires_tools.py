@@ -323,3 +323,60 @@ def test_api_skills_reports_which_shipped_clones_cannot_use_a_skill(
     assert "artist" not in hidden
     assert "clone" not in hidden
     assert skills["notes"]["hidden_from"] == []
+
+
+def test_hidden_from_follows_the_scope_a_seated_clone_runs_with(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`hidden_from` reads the scope the seated agent resolves, not the persona's list alone.
+
+    Seats get no operator list today, so the two agree; this sets one (as an A2A node's
+    config does) on the one config every head seats a clone with, and `artist`, whose own
+    list holds `generate_image`, must now be reported as lacking it (#1865).
+
+    Killed by: src/uclone_x/ui/app.py :: scopes = {p.name: seat_tool_scope(p) for p in registry.list_personas()}
+    Becomes: scopes = {p.name: p.granted_tools for p in registry.list_personas()}
+    """
+    import uclone_x.agent.bootstrap as bootstrap
+    from uclone_x.agent.models import PersonaDefinition
+
+    seat_config = bootstrap.agent_config_for_persona
+
+    def with_operator_list(persona: PersonaDefinition, **kwargs: Any) -> AgentConfig:
+        config = seat_config(persona, **kwargs)
+        if persona.name != "artist":
+            return config
+        return config.model_copy(update={"allowed_tools": ("web_search",)})
+
+    monkeypatch.setattr(bootstrap, "agent_config_for_persona", with_operator_list)
+    monkeypatch.setenv("LLM_PROVIDER", "mock")
+    monkeypatch.chdir(tmp_path)
+    from uclone_x.ui.app import create_ui_app
+
+    app = create_ui_app(
+        static_dir=tmp_path,
+        storage_dir=tmp_path / "storage",
+        eval_reports_dir=tmp_path / "evals",
+        workspace_dir=tmp_path / "workspace",
+    )
+    with TestClient(app) as client:
+        skill, report = _skill("painter", requires=("generate_image",))
+        app.state.session_manager.skill_registry.register(skill, report)
+        skills = {s["name"]: s for s in client.get("/api/skills").json()["skills"]}
+
+    hidden = {h["persona"]: h["missing_tools"] for h in skills["painter"]["hidden_from"]}
+    assert hidden["artist"] == ["generate_image"]
+
+
+def test_the_seat_scope_is_the_scope_the_seated_agent_resolves() -> None:
+    """One rule, two readers: the agent's own resolution and what Settings is told."""
+    from uclone_x.agent.bootstrap import agent_config_for_persona, seat_tool_scope
+    from uclone_x.agent.models import PersonaDefinition
+
+    for tools in ((), ("generate_image",), ("web_search", "file_read")):
+        persona = PersonaDefinition(name="p1865", role="r", system_prompt="s", allowed_tools=tools)
+        agent = BaseAgent(
+            config=agent_config_for_persona(persona, llm_config=AgentLLMConfig(model_name="mock"))
+        )
+        agent.define_persona(persona)
+        assert agent.config.allowed_tools == seat_tool_scope(persona), tools

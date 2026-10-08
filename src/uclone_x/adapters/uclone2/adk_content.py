@@ -13,19 +13,18 @@ Two measured reasons, both of which the card's literal wording does not survive:
    equivalent)". `uclone_x.adapters.uclone2` is outside that namespace. The same
    principle also says translation belongs in an adapter layer, so the *package* is
    right and only the *import* is forbidden.
-2. **The SDK is not installed in the shared `.venv`.** `google-genai>=0.1.0` is declared
-   in `pyproject.toml` under the **optional** `llm` extra, and that extra is absent from
-   the shared `.venv` (`import google.genai` →
+2. **A user install does not have the SDK.** `google-genai>=0.1.0` is declared
+   only by the `dev` extra in `pyproject.toml` (#2011), so a user install lacks it; it
+   was absent from the shared `.venv` when this was written (`import google.genai` →
    `ModuleNotFoundError: No module named 'google.genai'`; `anthropic` and `openai` are
    absent likewise, which is why every connector under `uclone_x.llm.connectors.*`
    speaks raw HTTP through `httpx` instead of an SDK). With
    `reportMissingImports = true` under Pyright strict, a hard `from google.genai import
    types` would fail the quality gate rather than merely fail at runtime.
 
-   **It is absent, not unavailable.** `uv.lock` already resolves and pins
-   `google-genai` at 2.21.0, so the extra is installable (`uv sync --extra llm`).
+   **It is absent, not unavailable.** `uv sync --extra dev` installs it.
    The mirror is used at runtime to avoid a hard runtime dependency, and verified
-   under `tests/` when the optional `llm` extra is available, in compliance with P5's
+   under `tests/` whenever the `dev` extra is installed, in compliance with P5's
    test-only SDK import exception.
 
 So the ADK side is represented by the local frozen mirror models below — `ADKContent`,
@@ -42,7 +41,7 @@ mirror = ADKContent.from_genai_payload(native.model_dump(exclude_none=True))
 
 **That interop line is verified under tests.** The field names were transcribed from the published
 schema, and are now verified against the installed SDK in `tests/unit/test_adapters_uclone2_adk_content.py`
-when the optional `llm` extra is available, ensuring the shape this module emits and accepts
+when google-genai is installed, ensuring the shape this module emits and accepts
 matches the real SDK.
 
 ## The round-trip contract, including what is lossy
@@ -94,7 +93,8 @@ drops, or coerces — that is the defect class #364 recorded against PR #358, wh
   under `"model"` — none has a single-`ChatMessage` representation.
 * Any `ChatMessage` field with no ADK slot in the chosen role: `name` or `tool_call_id`
   on a non-`TOOL` message, `tool_calls` on a non-`ASSISTANT` message, and `form` (the
-  excerpt or stub a tool result was shortened to, #1854) on any message.
+  excerpt or stub a tool result was shortened to, #1854) or `rendered_from` (what that
+  form was cut from, #1848) on any message.
 * An ADK part carrying anything other than exactly one of `text`, `function_call`,
   `function_response`. `extra="forbid"` on the mirror models makes an unmodelled ADK
   part field (`inline_data`, `code_execution_result`, ...) a loud `ValidationError` at
@@ -218,8 +218,8 @@ class ADKContent(BaseModel):
 
         **That compatibility is verified in tests.** The field names are transcribed
         from the `google.genai.types` published schema, and are verified against an installed
-        SDK in `tests/unit/test_adapters_uclone2_adk_content.py` when the optional `llm`
-        extra is present.
+        SDK in `tests/unit/test_adapters_uclone2_adk_content.py` when google-genai is
+        installed.
 
         `exclude_none=True` matters: the real `Part` has many optional fields this mirror
         does not model, and emitting `{"text": null}` alongside a `function_call` would
@@ -393,11 +393,17 @@ class ADKContentAdapter:
                 f"authored by the model and belongs to role={ADK_ROLE_MODEL!r}."
             )
 
-        if message.form is not None:
+        if message.form is not None or message.rendered_from is not None:
+            # `rendered_from` needs `form`, so the second test is a backstop (#1848).
             raise ADKUnrepresentableMessageError(
                 f"ChatMessage(role={message.role.value!r}) is a tool result shortened to "
-                f"form={message.form!r}; ADK FunctionResponse has no slot for the form, and "
-                "it is not dropped."
+                f"form={message.form!r}; ADK FunctionResponse has no slot for the form or "
+                "what it was cut from, and neither is dropped."
+            )
+        if message.images:
+            raise ADKUnrepresentableMessageError(
+                f"ChatMessage(role={message.role.value!r}) carries {len(message.images)} "
+                "image(s); this adapter maps text only, and an image is not dropped (#2107)."
             )
         if message.role == MessageRole.TOOL:
             if message.name is None:

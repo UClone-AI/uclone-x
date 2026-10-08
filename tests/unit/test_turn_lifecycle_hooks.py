@@ -2,8 +2,8 @@
 
 `BaseAgent` carries a turn's `story_id` to its tool calls but no longer decides how it
 moves: `uclone_x.story.StoryLifecycleHook` does, and every head composes it in through
-`agent/clone_builder.py`. These tests pin the three halves of that: the agent package
-names nothing in `uclone_x.story`, the hook moves the story exactly as `story_after` says,
+`agent/clone_builder.py`, which takes it from the story extension (#2205). These tests pin
+the three halves of that: the agent package names nothing in `uclone_x.story`, the hook moves the story exactly as `story_after` says,
 and both places that compose an agent for a head -- `build_clone` and the peer-call
 handler -- put the hook in.
 """
@@ -23,6 +23,7 @@ from uclone_x.agent.composition import HostDependencies
 from uclone_x.agent.models import PersonaDefinition, ToolExecutionRecord
 from uclone_x.agent.persona_registry import PersonaRegistry
 from uclone_x.agent.session import SessionStore
+from uclone_x.browser.turn import BrowserTurnHook
 from uclone_x.engine.event_bus import EventBus
 from uclone_x.llm.connectors.mock import MockLLMConnector
 from uclone_x.room import a2a_handlers
@@ -51,10 +52,12 @@ def _story_hooks(hooks: tuple[Any, ...]) -> list[Any]:
 
 
 def test_the_agent_package_imports_nothing_from_the_story_domain() -> None:
-    """No module under `agent/` but the shell `clone_builder.py` imports `uclone_x.story` (#1732).
+    """No module under `agent/` imports `uclone_x.story` (#1732).
 
     Checked at every scope, `TYPE_CHECKING` included; a relative import is resolved
-    against its module's package, and `from uclone_x import story` counts too.
+    against its module's package, and `from uclone_x import story` counts too. Since #2205
+    that includes the shell `clone_builder.py`, which takes the story's hooks from the
+    extensions (`uclone_x.extensions`) rather than naming them.
     """
     offenders: list[str] = []
     for path in sorted(AGENT_PACKAGE.rglob("*.py")):
@@ -67,8 +70,7 @@ def test_the_agent_package_imports_nothing_from_the_story_domain() -> None:
             hits = [n for n in names if n == "uclone_x.story" or n.startswith("uclone_x.story.")]
             if hits:
                 offenders.append(f"{path.relative_to(AGENT_PACKAGE)}: {hits[0]}")
-    # `clone_builder.py` is the shell that composes the hook in; it is the one allowed name.
-    assert offenders == ["clone_builder.py: uclone_x.story"]
+    assert offenders == []
 
 
 def test_the_story_hook_moves_the_story_a_declaring_call_names(tmp_path: Path) -> None:
@@ -107,8 +109,8 @@ def test_every_built_clone_runs_with_the_story_hook(tmp_path: Path) -> None:
 
 
 def test_composing_the_app_hooks_twice_adds_the_story_hook_once(tmp_path: Path) -> None:
-    """Killed by: src/uclone_x/agent/clone_builder.py :: if any(isinstance(hook, StoryLifecycleHook) for hook in host.lifecycle_hooks):
-    Becomes: if False:
+    """Killed by: src/uclone_x/agent/clone_builder.py :: if not any(isinstance(have, type(hook)) for have in (*held, *added)):
+    Becomes: if True:
     """
     once = with_app_lifecycle_hooks(_host(tmp_path))
     twice = with_app_lifecycle_hooks(once)
@@ -158,3 +160,95 @@ async def test_a_peer_call_agent_runs_with_the_story_hook(
 
     (host,) = composed
     assert len(_story_hooks(host.lifecycle_hooks)) == 1
+
+
+def test_every_app_lifecycle_hook_implements_after_tool_step(tmp_path: Path) -> None:
+    """Every hook registered by with_app_lifecycle_hooks satisfies TurnLifecycleHookProtocol.
+
+    Killed by: src/uclone_x/agent/clone_builder.py :: added.append(BrowserTurnHook())
+    Becomes: pass
+    """
+    host = with_app_lifecycle_hooks(_host(tmp_path))
+    hooks = host.lifecycle_hooks
+    assert any(isinstance(hook, BrowserTurnHook) for hook in hooks), (
+        "BrowserTurnHook was not registered"
+    )
+
+    context = ToolContext(
+        agent_id="test-agent",
+        session_id="test-session",
+        workspace_root=tmp_path,
+    )
+    record = ToolExecutionRecord(
+        tool_name="dummy_tool",
+        output={"status": "ok"},
+        status=ToolResultStatus.SUCCESS,
+    )
+
+    for hook in hooks:
+        assert hasattr(hook, "after_tool_step"), f"{type(hook).__name__} lacks after_tool_step"
+        next_context = hook.after_tool_step((record,), context)
+        assert isinstance(next_context, ToolContext)
+
+
+def test_broken_lifecycle_hook_is_reported_and_does_not_crash_turn(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A failing lifecycle hook logs an error and does not abort the turn's tool step.
+
+    Killed by: src/uclone_x/agent/base.py :: "Lifecycle hook %r failed in after_tool_step; preserving context",
+    Becomes: "unused log msg",
+    """
+
+    class ExplodingHook:
+        def after_tool_step(self, records: Any, context: ToolContext) -> ToolContext:
+            del records, context
+            raise RuntimeError("hook exploded")
+
+    class TrackingHook:
+        def __init__(self) -> None:
+            self.ran = False
+
+        def after_tool_step(self, records: Any, context: ToolContext) -> ToolContext:
+            del records
+            self.ran = True
+            return context
+
+    tracker = TrackingHook()
+    base = _host(tmp_path)
+    base = HostDependencies(
+        bus=base.bus,
+        llm=base.llm,
+        tools=base.tools,
+        tracer=base.tracer,
+        store=base.store,
+        lifecycle_hooks=(ExplodingHook(), tracker),  # pyright: ignore[reportArgumentType]
+    )
+    app = AppScope(
+        host=base,
+        workspace_root=tmp_path,
+        persona_registry=PersonaRegistry(include_defaults=False),
+    )
+    built = build_clone(app, clone_id="writer", session_id="sess")
+    context = ToolContext(
+        agent_id="writer",
+        session_id="sess",
+        workspace_root=tmp_path,
+        story_id="initial-story",
+    )
+    record = ToolExecutionRecord(
+        tool_name="dummy",
+        output={"ok": True},
+        status=ToolResultStatus.SUCCESS,
+    )
+
+    # Should not raise exception
+    built.agent._after_tool_step((record,), context)  # pyright: ignore[reportPrivateUsage]
+    assert built.agent._turn_story_id == "initial-story"  # pyright: ignore[reportPrivateUsage]
+    assert tracker.ran is True
+    assert any(
+        rec.levelname == "ERROR"
+        and "Lifecycle hook" in rec.message
+        and "failed in after_tool_step" in rec.message
+        for rec in caplog.records
+    )

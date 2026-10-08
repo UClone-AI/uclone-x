@@ -810,7 +810,7 @@ describe('ModelCalls (#1492)', () => {
             },
             {
               tool_call_id: 'call_2',
-              name: 'run_command',
+              name: 'bash_run',
               status: 'error',
               outcome: null,
               output: 'Traceback (most recent call last):\nPermissionError: /etc/shadow',
@@ -829,6 +829,37 @@ describe('ModelCalls (#1492)', () => {
     expect(results[0].textContent).toContain(long);
     expect(results[1]).toHaveTextContent('PermissionError: /etc/shadow');
     expect(results[1]).toHaveTextContent('error');
+  });
+
+  // Killed by: frontend/src/components/layout/ModelCalls.tsx :: {result.output_unavailable
+  // Becomes: {false
+  it('says a result the session no longer holds cannot be shown, not that it had no output', async () => {
+    answers[TRACE_URL] = ok(
+      trace([
+        traceStep({
+          tool_results: [
+            {
+              tool_call_id: 'call_1',
+              name: 'file_read',
+              status: 'success',
+              outcome: 'answered',
+              output: null,
+              output_unavailable: true,
+              duration_ms: 40,
+              at: null,
+            },
+          ],
+        }),
+      ]),
+    );
+    answers[stepUrl(1)] = ok(stepDetail());
+    render(<ModelCalls roomId="room_1" seq={4} />);
+    await expandSection();
+    fireEvent.click(await screen.findByTestId('model-call-toggle-1'));
+    const [shown] = await screen.findAllByTestId('model-call-tool-result');
+    expect(shown).toHaveTextContent(en.modelCalls.outputUnavailable);
+    expect(shown).not.toHaveTextContent(en.modelCalls.noOutput);
+    expect(shown.textContent).not.toMatch(/tr_|digest|body|null/);
   });
 
   // Killed by: frontend/src/components/layout/ModelCalls.tsx :: {trace.subagents_reason ? (

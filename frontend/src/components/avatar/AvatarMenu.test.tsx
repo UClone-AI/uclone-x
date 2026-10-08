@@ -15,7 +15,7 @@ const pictureRoutes = (...replies: Response[]) => {
   vi.stubGlobal(
     'fetch',
     vi.fn(async (url: string, init: RequestInit = {}) => {
-      if (!url.startsWith('/api/personas/')) return answer(200, {});
+      if (!url.startsWith('/api/clones/')) return answer(200, {});
       calls.push([url, init]);
       return replies.shift() ?? answer(200, { status: 'ok' });
     }),
@@ -31,7 +31,7 @@ const choice = (): AvatarChoice => ({
 
 const profile = ({
   value = choice() as AvatarChoice | null,
-  avatarUrl = '/api/personas/reader/avatar?v=1' as string | null,
+  avatarUrl = '/api/clones/reader/avatar?v=1' as string | null,
   avatarChosen = true,
   korean = false,
 } = {}) => (
@@ -69,7 +69,7 @@ describe('the avatar menu on a clone`s profile', () => {
 
     await waitFor(() => expect(screen.getByTestId('clone-avatar-done')).toBeInTheDocument());
     const [url, init] = calls[0];
-    expect(url).toBe('/api/personas/reader/avatar');
+    expect(url).toBe('/api/clones/reader/avatar');
     expect(init.method).toBe('PUT');
     expect((init.headers as Record<string, string>)['Content-Type']).toBe('image/png');
     expect(value.onChanged).toHaveBeenCalledTimes(1);
@@ -203,7 +203,7 @@ describe('the avatar menu on a clone`s profile', () => {
   it('offers no reset for a picture the clone ships with (#1780)', () => {
     // Reset would change nothing there and still claim it had.
     pictureRoutes();
-    renderProfile({ avatarUrl: '/api/personas/reader/avatar?v=shipped', avatarChosen: false });
+    renderProfile({ avatarUrl: '/api/clones/reader/avatar?v=shipped', avatarChosen: false });
 
     openMenu();
     expect(screen.getByTestId('clone-avatar-reset')).toBeDisabled();
@@ -257,7 +257,7 @@ describe('the avatar menu on a clone`s profile', () => {
     expect(value.onChanged).toHaveBeenCalledTimes(2);
   });
 
-  // Killed by: frontend/src/components/avatar/AvatarMenu.tsx :: {fmt(copy.failure[outcome.failure], { name })}
+  // Killed by: frontend/src/components/avatar/AvatarMenu.tsx :: {fmt(copy.failure[outcome.failure], { name: shown })}
   // Becomes: {String(outcome.failure)}
   it('says a failed change in plain words, never the runtime`s', async () => {
     pictureRoutes(answer(500, { detail: 'OSError: [Errno 28] /Users/x/.uclone/personas' }));

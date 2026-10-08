@@ -131,45 +131,55 @@
  * so no width that renders two columns today renders one after this, and the dock's default 520px
  * keeps the two columns `test_a_dock_narrower_than_its_grids_lays_them_out_in_one_column` pins.
  *
- * `grid-cols-4` rows are excluded because the rule above them owns the band it draws -- two
- * columns from 481 to 720px -- and because `[class*='grid-cols-2']` would otherwise match
- * `sm:grid-cols-2 lg:grid-cols-4`, the scorecard's own metric row, and hold it at two columns at
- * every width. What the exclusion does *not* do is give those rows a container answer above
- * 720px: no block here matches them there, so the window decides, and the last paragraph carries
- * what that leaves.
- *
- * That exclusion is a denylist, which is the weakness of this rule and not a hidden one: a dock
- * grid carrying `grid-cols-2` together with a larger count other than four would be pinned at
- * two above 480px. The only such class string in the frontend today is `SettingsModal`'s
- * `grid-cols-2 sm:grid-cols-3 md:grid-cols-5`, and it sits outside every `.dock-scope`: the
- * modal mounts in `App` rather than inside `ArtifactsDock`, and the only `.dock-scope` wrappers
- * inside the modal are its Skills and Diagnostics sections (#1358), which hold `SkillsTab`,
- * `AcpTab` and `EvaluationsTab` and not that grid. When a third band is needed, it wants its own
- * `@container` range like the four-column rule has -- not another `:not()` here.
- *
- * And this rule does not finish #1029's axis correction. It matches `grid-cols-2` only, so the
- * dock's `md:grid-cols-4`, `lg:grid-cols-3` and `sm:grid-cols-3` rows still take their column
- * count from the window below their own breakpoints. #1327 carries those.
- *
- * The exclusion above leaves one more, and it is the row this rule spares rather than some
- * future one: `EvaluationsTab`'s `grid-cols-1 sm:grid-cols-2 lg:grid-cols-4` metric cards. Above
- * a 720px container no `@container` block here matches them, so the window picks between
- * `sm:grid-cols-2` and `lg:grid-cols-4` -- two columns below a 1024px window, four at 1024 and
- * up. It is reachable at one unchanged container width, which is what makes it this defect and
- * not a width nobody has: `overlaid = windowWidth - reservedWidth <= width` (`ArtifactsDock`),
- * and `reservedWidth` is 0 with the rail closed, so an 880px dock is not overlaid at any window
- * wider than itself -- 1000px and 1400px both qualify, and its 879px surface draws two columns
- * at the first and four at the second. (It *is* overlaid at or below 880px, where it renders the
- * window's width instead; overlay is a fact about both numbers, not about the rail alone.) Milder
- * than #1029 -- the panel's `p-3` and three `gap-4` gaps leave four cards 201.8px each there,
- * against the 133-155px of content the cards above were measured needing, so nothing overflows;
- * the cost is a wide dock under-using its width, and the axis still being the window's. Deduced
- * from these three rules and the class string, on the same footing as #1327's own bands, and
- * recorded there.
+ * It also matches `grid-cols-4` rows (`sm:grid-cols-2 lg:grid-cols-4`, the scorecard's metric
+ * row): #1311 excluded them with a `:not()`, a denylist that left them to the window above 720px.
+ * #1327 replaced it with source order -- the four-column rules below have the same specificity
+ * and come later, so they win where they apply, and this rule must stay above them. A count with
+ * no rule of its own (`md:grid-cols-5`, outside every `.dock-scope` today) stays at two here.
  */
 @container (min-width: 481px) {
-  .dock-scope [class*='grid-cols-2']:not([class*='grid-cols-4']) {
+  .dock-scope [class*='grid-cols-2'] {
     grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
+  }
+}
+
+/*
+ * Every other viewport column class, decided by the dock (#1327).
+ *
+ * The three rules above corrected the bands that showed a defect and left the window to decide
+ * the rest. Measured in the dock on Ontology before this rule: its `lg:grid-cols-3` list and
+ * detail was one column in a 519px dock at a 740px window and three at 1280, and one column in
+ * an 879px dock at a 1000px window and three at 1400; its `md:grid-cols-4` cards were one
+ * column of 735px in a 759px dock at a 760px window. In Settings, `SkillsTab`'s
+ * `lg:grid-cols-3` does the same inside the modal's own `.dock-scope`.
+ *
+ * Each count gets the container width the window gave it before, so a wide window renders what
+ * it rendered and only the window stops deciding -- the same reasoning as the 481px floor above:
+ * three columns from 481px (measured at 519px: a 149px list column, nothing overflowing), four
+ * from 721px, where the 481-720 rule above hands them back (measured at 739px: four cards of
+ * 166.75px, nothing overflowing). A class string's largest count wins, by source order: these
+ * come after the two-column rule.
+ *
+ * Spans move with their grid. The list-and-detail rows put the detail in `lg:col-span-2`, which
+ * with only the parent corrected would stay keyed to the window and silently stop spanning in a
+ * three-column grid at a narrow one. The 480px rule above resets spans for one column.
+ *
+ * The colon in the selectors keeps unprefixed counts out: `grid-cols-3` inside an Evaluations
+ * suite card is a fixed three-up figure row, not a layout the window decides.
+ */
+@container (min-width: 481px) {
+  .dock-scope [class*=':grid-cols-3'] {
+    grid-template-columns: repeat(3, minmax(0, 1fr)) !important;
+  }
+
+  .dock-scope [class*=':col-span-2'] {
+    grid-column: span 2 / span 2 !important;
+  }
+}
+
+@container (min-width: 721px) {
+  .dock-scope [class*=':grid-cols-4'] {
+    grid-template-columns: repeat(4, minmax(0, 1fr)) !important;
   }
 }
 

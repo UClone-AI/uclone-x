@@ -37,6 +37,7 @@ from uclone_x.llm.models import ToolCallRequest
 from uclone_x.room.a2a_handlers import (
     _DeferredApprovalRunner,  # pyright: ignore[reportPrivateUsage]
 )
+from uclone_x.story.character import StoryCharacterSheetTool as CharacterSheetTool
 from uclone_x.story.quotes import quote_found
 from uclone_x.story.schemas import Outline, StoryFileError, parse_file
 from uclone_x.story.timeline import assumptions, place_scenes, time_key
@@ -50,7 +51,6 @@ from uclone_x.story.tools import (
     StoryOutlineTool,
 )
 from uclone_x.tools.base import BaseTool, tool_writes_files
-from uclone_x.tools.builtin.character import CharacterSheetTool
 from uclone_x.tools.models import NoIsolation, ToolContext, ToolResult
 from uclone_x.tools.registry import ToolRegistry
 from uclone_x.tools.schema import advertised_tool_parameters
@@ -325,8 +325,8 @@ class TestTheAuditChecksAgainstStoryTime:
     ) -> None:
         """The acceptance of #1557: the same fact, two scenes, two answers.
 
-        Killed by: src/uclone_x/story/audit.py :: snapshot = entry_snapshot(item.entry, placements, scene_id, through_scene=True)
-        Becomes: snapshot = entry_snapshot(item.entry, placements, "ch01.s03", through_scene=True)
+        Killed by: src/uclone_x/story/audit.py :: for row in store.rows_at(store.point(scene_id, ended=True)):
+        Becomes: for row in store.rows_at(store.point("ch01.s03", ended=True)):
         Killed by: src/uclone_x/story/audit.py :: pred, obj = "type", self.class_name(value)
         Becomes: obj = self.class_name(value)
         """
@@ -1414,7 +1414,7 @@ class TestCharacterSheetSaysWhatItLacks:
     async def test_a_broken_workspace_sheet_is_reported_not_taken_for_missing(
         self, tmp_path: Path
     ) -> None:
-        """Killed by: src/uclone_x/tools/builtin/character.py :: result["workspace_sheet_unreadable"] = legacy_problem
+        """Killed by: src/uclone_x/story/character.py :: result["workspace_sheet_unreadable"] = legacy_problem
         Becomes: pass
         """
         story_id, _ = await _timed_story(tmp_path)
@@ -1429,9 +1429,9 @@ class TestCharacterSheetSaysWhatItLacks:
         }
 
     async def test_looks_the_codex_does_not_give_are_not_invented(self, tmp_path: Path) -> None:
-        """Killed by: src/uclone_x/tools/builtin/character.py :: "gender": visual.gender if visual else None,
+        """Killed by: src/uclone_x/story/character.py :: "gender": visual.gender if visual else None,
         Becomes: "gender": (visual.gender if visual else None) or "other",
-        Killed by: src/uclone_x/tools/builtin/character.py :: "default_style": visual.default_style if visual else None,
+        Killed by: src/uclone_x/story/character.py :: "default_style": visual.default_style if visual else None,
         Becomes: "default_style": (visual.default_style if visual else None) or "anime",
         """
         story_id, _ = await _timed_story(tmp_path)
@@ -1443,7 +1443,7 @@ class TestCharacterSheetSaysWhatItLacks:
         assert out["character"]["default_style"] is None
 
     async def test_compose_says_which_characters_brought_no_looks(self, tmp_path: Path) -> None:
-        """Killed by: src/uclone_x/tools/builtin/character.py :: composed["notes"] = notes
+        """Killed by: src/uclone_x/story/character.py :: composed["notes"] = notes
         Becomes: pass
         """
         story_id, _ = await _timed_story(tmp_path)

@@ -184,9 +184,8 @@ class TestARowWrittenBeforeTheFieldsLoadsAsSaved:
     def test_an_old_document_loads_every_row_as_saved_and_keeps_it(self, tmp_path: Path) -> None:
         """A `memory.json` whose rows have no `origin`, `source_room_id` or `source_turn_id`.
 
-        The rows are what `model_dump(mode="json")` wrote before this change. They load with
-        no failure, as `saved` with no room or turn, and a later save keeps every one of them
-        with its original fields.
+        The rows are what `model_dump(mode="json")` wrote before this change. They import with
+        no failure, as `saved` with no room or turn, and keep every field they had.
 
         Killed by: src/uclone_x/memory/models.py :: default="saved",
         Becomes: default="told",
@@ -211,27 +210,15 @@ class TestARowWrittenBeforeTheFieldsLoadsAsSaved:
         }
         path.write_text(json.dumps({"version": "1.0.0", "facts": [old_row]}), encoding="utf-8")
 
-        store = CrossSessionMemory(storage_path=path)
+        store = CrossSessionMemory(storage_path=tmp_path / "knowledge.sqlite3", legacy_path=path)
 
         assert store.load_failure is None
         [fact] = store.list_facts()
         assert (fact.origin, fact.source_room_id, fact.source_turn_id) == ("saved", None, None)
-
-        store.record_fact(
-            subject="project_x",
-            predicate="uses",
-            object_value="Postgres 16",
-            provenance=_provenance(),
-            source_session_id="sess_new",
-        )
-        rows = {
-            row["fact_id"]: row for row in json.loads(path.read_text(encoding="utf-8"))["facts"]
-        }
-        kept = rows["mem_000000000001"]
+        kept = fact.model_dump(mode="json")
         for key, value in old_row.items():
             assert kept[key] == value, key
         assert kept["origin"] == "saved"
-        assert len(rows) == 2
 
 
 class TestACorrectionIsACorrectedFact:
@@ -242,7 +229,7 @@ class TestACorrectionIsACorrectedFact:
     ) -> None:
         """Killed by: src/uclone_x/memory/store.py :: origin="corrected",
         Becomes: origin="saved",
-        Killed by: src/uclone_x/memory/store.py :: "retraction_reason": reason,
+        Killed by: src/uclone_x/memory/graph.py :: "retraction_reason": reason or f"Superseded by fact {by}",
         Becomes: "retraction_reason": "x",
         """
         path = tmp_path / "memory.json"
@@ -270,6 +257,31 @@ class TestACorrectionIsACorrectedFact:
         assert kept.retraction_reason == "corrected by the user"
         assert [f.object_value for f in reloaded.list_facts()] == ["Seoul"]
 
+    def test_correct_fact_with_identical_value_is_noop(self, tmp_path: Path) -> None:
+        """Killed by: src/uclone_x/memory/store.py :: if current.object_value == clean_value:
+        Becomes: if False:
+        """
+        memory = CrossSessionMemory(storage_path=tmp_path / "memory.json")
+        fact = memory.record_fact(
+            subject="Kenny",
+            predicate="lives_in",
+            object_value="Busan",
+            provenance=_provenance(),
+            source_session_id="sess_1",
+            confidence=0.8,
+            origin="saved",
+        )
+
+        returned = memory.correct_fact(fact.fact_id, fact.object_value, _provenance())
+
+        assert returned == fact
+        assert returned.fact_id == fact.fact_id
+        assert returned.confidence == 0.8
+        assert returned.origin == "saved"
+        assert returned.retracted is False
+        assert memory.list_facts() == [fact]
+        assert memory.list_facts(include_retracted=True) == [fact]
+
     def test_a_retracted_unknown_or_blank_correction_is_refused(self, tmp_path: Path) -> None:
         memory = CrossSessionMemory(storage_path=tmp_path / "memory.json")
         fact = memory.record_fact(
@@ -290,13 +302,7 @@ class TestACorrectionIsACorrectedFact:
     def test_a_fact_another_writer_saved_can_be_corrected_and_forgotten(
         self, tmp_path: Path
     ) -> None:
-        """The dashboard's store loaded before a chat saved the fact; the edit still finds it.
-
-        Killed by: src/uclone_x/memory/store.py :: self._absorb_concurrent_writes()  # the fact may be newer than this object
-        Becomes: pass
-        Killed by: src/uclone_x/memory/store.py :: self._absorb_concurrent_writes()  # as retract_fact: find a newer writer's fact
-        Becomes: pass
-        """
+        """The dashboard's store loaded before a chat saved the fact; the edit still finds it."""
         path = tmp_path / "memory.json"
         corrector = CrossSessionMemory(storage_path=path)
         forgetter = CrossSessionMemory(storage_path=path)
@@ -324,26 +330,26 @@ class TestACorrectionIsACorrectedFact:
 
 
 class TestARetryAfterAFailedSaveWrites:
-    """A Forget or Correct whose save raised leaves nothing changed, so the retry saves.
+    """A Forget or Correct whose write raised leaves nothing changed, so the retry writes.
 
-    The dock returns 500 when the save fails and the person presses the button again.
-    Both tests make the first `os.replace` raise, retry, and read the result back from disk.
+    The dock returns 500 when the write fails and the person presses the button again. The
+    write is one transaction, so a failure inside it rolls back whatever it had done.
     """
 
     @staticmethod
-    def _fail_the_next_replace(monkeypatch: pytest.MonkeyPatch) -> None:
-        import os
+    def _fail_once(monkeypatch: pytest.MonkeyPatch, name: str) -> None:
+        import uclone_x.memory.store as store_module
 
-        real_replace = os.replace
+        real = getattr(store_module, name)
         calls = {"n": 0}
 
-        def replace_once_failing(src: str, dst: object) -> None:
+        def failing_once(*args: object, **kwargs: object) -> object:
             calls["n"] += 1
             if calls["n"] == 1:
                 raise OSError(28, "No space left on device")
-            real_replace(src, dst)  # type: ignore[arg-type]
+            return real(*args, **kwargs)
 
-        monkeypatch.setattr(os, "replace", replace_once_failing)
+        monkeypatch.setattr(store_module, name, failing_once)
 
     @staticmethod
     def _told(memory: CrossSessionMemory) -> MemoryFact:
@@ -358,13 +364,13 @@ class TestARetryAfterAFailedSaveWrites:
     def test_a_retried_forget_is_on_disk(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Killed by: src/uclone_x/memory/store.py :: self._facts = held
+        """Killed by: src/uclone_x/memory/store.py :: retract_edge(tx, fact_id, reason=clean_reason, at=now, updated_at=now)
         Becomes: pass
         """
-        path = tmp_path / "memory.json"
+        path = tmp_path / "knowledge.sqlite3"
         memory = CrossSessionMemory(storage_path=path)
         fact = self._told(memory)
-        self._fail_the_next_replace(monkeypatch)
+        self._fail_once(monkeypatch, "retract_edge")
 
         with pytest.raises(OSError):
             memory.retract_fact(fact.fact_id, "forgotten by the user", _provenance())
@@ -374,16 +380,18 @@ class TestARetryAfterAFailedSaveWrites:
         assert kept is not None and kept.retracted
         assert kept.retraction_reason == "forgotten by the user"
 
-    def test_a_retried_correct_is_on_disk(
+    def test_a_retried_correct_is_on_disk_and_the_failed_one_changed_nothing(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Killed by: src/uclone_x/memory/store.py :: self._facts = held
-        Becomes: pass
+        """The failure comes after the old fact was superseded, in the same transaction.
+
+        Killed by: src/uclone_x/knowledge/sqlite_store.py :: conn.execute("ROLLBACK")  # a failed write leaves nothing
+        Becomes: conn.execute("COMMIT")  # a failed write leaves nothing
         """
-        path = tmp_path / "memory.json"
+        path = tmp_path / "knowledge.sqlite3"
         memory = CrossSessionMemory(storage_path=path)
         fact = self._told(memory)
-        self._fail_the_next_replace(monkeypatch)
+        self._fail_once(monkeypatch, "write_fact")
 
         with pytest.raises(OSError):
             memory.correct_fact(fact.fact_id, "Seoul", _provenance())

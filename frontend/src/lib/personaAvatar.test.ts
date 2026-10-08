@@ -11,11 +11,11 @@ import { personaAvatarUrl } from './personaAvatar';
  * as a different route, or as no route at all.
  */
 describe('personaAvatarUrl', () => {
-  // Killed by: frontend/src/lib/personaAvatar.ts :: encodeURIComponent(name)
-  // Becomes: name
+  // Killed by: frontend/src/lib/personaAvatar.ts :: encodeURIComponent(clone)
+  // Becomes: clone
   it('spends a clone name as one path segment, whatever characters are in it', () => {
-    expect(personaAvatarUrl('surveyor')).toBe('/api/personas/surveyor/avatar');
-    expect(personaAvatarUrl('../secrets')).toBe('/api/personas/..%2Fsecrets/avatar');
-    expect(personaAvatarUrl('site surveyor')).toBe('/api/personas/site%20surveyor/avatar');
+    expect(personaAvatarUrl('surveyor')).toBe('/api/clones/surveyor/avatar');
+    expect(personaAvatarUrl('../secrets')).toBe('/api/clones/..%2Fsecrets/avatar');
+    expect(personaAvatarUrl('site surveyor')).toBe('/api/clones/site%20surveyor/avatar');
   });
 });

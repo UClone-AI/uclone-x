@@ -26,7 +26,7 @@ import uuid
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import cast, get_args
+from typing import get_args
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -44,6 +44,7 @@ __all__ = [
     "RoomMessage",
     "RoomMessageKind",
     "RoomFileRecord",
+    "RoomLoop",
     "RoomPolicy",
     "RoomState",
     "RoomToolUse",
@@ -54,12 +55,10 @@ __all__ = [
     "TurnState",
     "head_keeper",
     "head_room_write_refusal",
-    "room_head",
     "server_head_of_id",
     "is_loop_command",
     "is_one_seat",
     "turn_refusal",
-    "with_legacy_loop_rows_as_notes",
 ]
 
 
@@ -116,21 +115,6 @@ class Participant(BaseModel):
         "`SessionStore.save` refuses on its revision precondition. Empty for a human, "
         "who has no agent session.",
         default="",
-    )
-    persona: str = Field(
-        default="",
-        description="Name of registered persona blueprint to hydrate this participant with.",
-    )
-
-    ontology_namespace: str = Field(
-        default="",
-        exclude=True,
-        description="Retired with the per-seat rules engine (clone-knowledge-graph step 6); "
-        "read from a stored room so it still loads, never written and read by nothing. A "
-        "seat once named an engine of its own, `<root>/<room>/<participant>`; the engine is "
-        "now its clone's, named by the clone's id (`clone_builder.clone_namespace`). Kept "
-        "as an excluded field rather than dropped by a `before` validator: on this strict "
-        "model a `before` validator makes JSON arrays fail the tuple fields.",
     )
 
 
@@ -238,8 +222,7 @@ def head_room_write_refusal(head: str) -> str:
 #: The id a server head's room is kept under (`conversation_room_id` in
 #: `room/one_seat.py`): the head's name, then 24 hex digits of a digest. Nothing else mints
 #: one -- the app and `ucx room` mint `room_<hex>`, and `RoomService.create` refuses the
-#: shape to any other creator (#1885) -- so an unmarked room under such an id is that
-#: head's own, stored before rooms were marked (#1890).
+#: shape to any other creator (#1885), so a room under such an id is always that head's.
 _SERVER_HEAD_ROOM_ID = re.compile(r"(acp|a2a)_[0-9a-f]{24}")
 
 
@@ -247,20 +230,6 @@ def server_head_of_id(room_id: str) -> str | None:
     """The server head (`acp` or `a2a`) whose id shape `room_id` has, or None."""
     unmarked = _SERVER_HEAD_ROOM_ID.fullmatch(room_id)
     return unmarked.group(1) if unmarked is not None else None
-
-
-def room_head(state: RoomState) -> str | None:
-    """The head that keeps `state`, or None for a room the app or `ucx room` keeps (#1885).
-
-    The room's mark (`RoomState.head`), or, for a room with none, the head its id names:
-    an ACP or A2A room saved before rooms were marked is still that head's, and a write
-    from anywhere else would make it a second writer (author's choice). A `run` or `loop`
-    room from before the mark cannot be told from the app's by its id, so it stays the
-    app's, as `_seat_in` in `room/one_seat.py` treats it.
-    """
-    if state.head is not None:
-        return state.head
-    return server_head_of_id(state.room_id)
 
 
 def turn_refusal(stop_reason: str | None) -> RoomTurnRefusal | None:
@@ -377,6 +346,16 @@ class RoomMessage(BaseModel):
         "tells the user whether their model was retired, their key refused, or the "
         "provider down. `None` on every other row, and on rows stored before it existed.",
     )
+    persona_edit_dropped: bool = Field(
+        default=False,
+        exclude_if=lambda dropped: not dropped,
+        description="Set, beside `error`, when the turn failed because the changes saved to "
+        "the speaker's persona could not be applied at its start (#1904, `TurnResult."
+        "stop_reason` `persona_edit_failed`). The speaker kept its previous definition and "
+        "the edit was dropped, so a head tells the person to save it again. A flag, not "
+        "text: the cause is in the log. Left out of the saved row while `False`, so a build "
+        "older than this field can still read the room.",
+    )
     completed: bool = Field(
         default=True,
         description="Whether this utterance completed normally. False when the turn "
@@ -390,24 +369,6 @@ class RoomMessage(BaseModel):
         "nothing would present it as durable (P6). Kept apart from `error` because `error` "
         "means the turn failed, which is what `retry` and `last_seen_seq` act on. `None` "
         "on a human's row, a membership row, and a row stored before it existed.",
-    )
-    knowledge_persist_error: str | None = Field(
-        default=None,
-        exclude_if=lambda retired: retired is None,
-        description="Retired with the per-seat knowledge record (clone-knowledge-graph "
-        "step 6); nothing sets it and no head reads it. It said that what the seat had "
-        "learned could not be saved after the turn (#1367). Kept so a row stored before "
-        "step 6 still loads and keeps what it said on disk; left out of every row that "
-        "does not carry it.",
-    )
-    knowledge_set_aside: bool = Field(
-        default=False,
-        exclude_if=lambda retired: not retired,
-        description="Retired with the per-seat knowledge record (clone-knowledge-graph "
-        "step 6); nothing sets it and no head reads it. It said that the seat's knowledge "
-        "record could not be read and was set aside before the turn (#1367). Kept so a row "
-        "stored before step 6 still loads and keeps what it said on disk; left out of every "
-        "row that does not carry it.",
     )
     session_set_aside: bool = Field(
         default=False,
@@ -458,7 +419,33 @@ class RoomMessage(BaseModel):
         description="The id the orchestrator minted for the turn that produced this row, "
         "the same one its `AGENT_REPLY` and `TOOL_CALL` events carry. What joins a row to "
         "`RoomState.tool_uses`: a row number cannot, because a rewind reuses it (#1353). "
-        "`None` on a human's row, a membership row, and a row stored before it existed.",
+        "`None` on a human's row and a membership row; an agent's row without one is refused "
+        "(`RoomState._an_agents_turn_carries_its_id`).",
+    )
+    session_id: str | None = Field(
+        default=None,
+        exclude_if=lambda session: session is None,
+        description="The session of the seat that spoke this row, recorded when it is "
+        "written (clone-data-scopes §4 step 3). The turn's trace is read from it, so a "
+        "seat re-keyed from a handle to a clone id still finds the session its turns ran "
+        "in. `None` on a human's row, a membership row and an agent's row stored before "
+        "it existed, which the trace reads from the seat. Left out of the saved row "
+        "while `None`, so an older build still reads the room.",
+    )
+    image_prompt_added: tuple[str, ...] = Field(
+        default=(),
+        exclude_if=lambda added: not added,
+        description="The tags the image tool added to the prompts of the pictures this turn "
+        "drew, in order, each once (#1865): what the active model's defaults filled in "
+        "beyond what the speaker wrote. Read from the turn's `generate_image` results by "
+        "`room/orchestrator.py::_image_prompt_additions`. Tags, not the tool's sentences, "
+        "which are written for the model. Left out of the saved row while empty.",
+    )
+    image_negative_added: tuple[str, ...] = Field(
+        default=(),
+        exclude_if=lambda added: not added,
+        description="As `image_prompt_added`, for the negative prompt: the tags the image "
+        "tool asked the picture to leave out beyond what the speaker asked (#1865).",
     )
     knowledge_learned: tuple[str, ...] = Field(
         default=(),
@@ -483,8 +470,8 @@ class RoomMessage(BaseModel):
         exclude_if=lambda recorded: not recorded,
         description="True when the tools this turn ran were written to "
         "`RoomState.tool_uses` -- including when it ran none. False on a turn that raised "
-        "or was interrupted, which returns no `TurnResult` and so no account of its tools, "
-        "and on every row stored before the room recorded tools. A reader must not present "
+        "or was interrupted, which returns no `TurnResult` and so no account of its tools. "
+        "A reader must not present "
         "an empty tool list for a row where this is False as 'no tools were used' (P6).",
     )
 
@@ -533,59 +520,6 @@ def is_loop_command(content: str) -> bool:
     """Whether `content` is a typed `/loop` command, as `ui/rooms.py` recognises one."""
     text = content.strip()
     return text == "/loop" or text.startswith("/loop ")
-
-
-def with_legacy_loop_rows_as_notes(state: RoomState) -> RoomState:
-    """Return `state` with the `/loop` rows older builds saved as speech made notes (#1661).
-
-    Two shapes were saved as `UTTERANCE` and belong out of every seat's span:
-
-    *   The application's `/loop` help, status and acknowledgement rows, which builds
-        before #1641 wrote with the sender `system`. The `/loop` route was the only writer
-        of that sender, and `system` is not a participant, so no participant's word is
-        converted. A room that seats a participant called `system` is left as it is.
-    *   The person's typed `/loop ...` command, which builds before #1661 saved as their
-        message. Converted only when a `system` row follows it, which is the one sign that
-        the command was handled as a command and not merely typed as text.
-
-    Applied when a room is read, not by rewriting files: the room is saved in the new
-    shape at its next write. Returns `state` itself when nothing needs converting.
-    """
-    if any(p.id == _LOOP_NOTICE_SENDER for p in state.participants):
-        return state
-    humans = {p.id for p in state.participants if p.kind is ParticipantKind.HUMAN}
-    rows = state.transcript
-
-    def is_notice(index: int) -> bool:
-        row = rows[index]
-        return row.sender_id == _LOOP_NOTICE_SENDER and row.kind in (
-            RoomMessageKind.UTTERANCE,
-            RoomMessageKind.NOTE,
-        )
-
-    converted: list[RoomMessage] = []
-    changed = False
-    for i, row in enumerate(rows):
-        legacy_notice = row.is_utterance and is_notice(i)
-        legacy_command = (
-            row.is_utterance
-            and row.sender_id in humans
-            and is_loop_command(row.content)
-            and i + 1 < len(rows)
-            and is_notice(i + 1)
-        )
-        if legacy_notice or legacy_command:
-            converted.append(row.model_copy(update={"kind": RoomMessageKind.NOTE}))
-            changed = True
-        else:
-            converted.append(row)
-    if not changed:
-        return state
-    return state.model_copy(update={"transcript": tuple(converted)})
-
-
-#: The sender of the application's `/loop` notes. Not a participant: `ui/rooms.py` writes it.
-_LOOP_NOTICE_SENDER = "system"
 
 
 class SelectionVerdict(StrEnum):
@@ -763,21 +697,6 @@ class RoomPolicy(BaseModel):
         "user is actively viewing the room, bounded by a 20-turn safety circuit breaker.",
     )
 
-    @model_validator(mode="before")
-    @classmethod
-    def _drop_the_retired_span_count(cls, data: object) -> object:
-        """Load a policy saved with `max_span_messages`, the count this replaced (#1641).
-
-        `extra="forbid"` would otherwise refuse every room stored before the span was
-        counted in tokens. The count is dropped rather than converted: a message count
-        says nothing about tokens, and the default token ceiling is what such a room
-        would have been given had it been created now.
-        """
-        if not isinstance(data, dict):
-            return data
-        fields = cast(dict[str, object], data)
-        return {k: v for k, v in fields.items() if k != "max_span_messages"}
-
     @model_validator(mode="after")
     def _window_must_outlast_the_turn_ceiling(self) -> RoomPolicy:
         """Refuse a pair of knobs that would starve an address without saying so.
@@ -944,6 +863,37 @@ class RoomFileRecord(BaseModel):
     )
 
 
+class RoomLoop(BaseModel):
+    """A `/loop` running in this room: what it sends, how often, and how it has gone (#1936).
+
+    On the room record rather than only in the server's memory. A loop held only in memory
+    ended with the process that ran it -- `ucx ui --dev` restarts its worker on any change
+    under `src/`, a `git pull` included -- and left nothing behind to say it had existed,
+    when it last ran or why a run failed. Kept here, it is continued by the next process
+    (`RoomStack.resume_room_loops`), and a reader of the room can see it without writing
+    into the conversation, which `/loop list` does.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
+
+    job_id: str
+    sender_id: str = Field(description="The person who typed the command; each run is theirs.")
+    interval_seconds: float
+    prompt: str
+    started_at: str = Field(default_factory=_now_iso)
+    runs: int = Field(default=0, description="Runs that were sent, whether or not they failed.")
+    last_run_at: str | None = None
+    next_run_at: str | None = Field(
+        default=None,
+        description="When the next run is due. A restarted server waits until then, or runs "
+        "at once when it has passed. None before the first run, which is immediate.",
+    )
+    last_error: str | None = Field(
+        default=None,
+        description="Why the most recent run failed, in plain words; None once a run succeeds.",
+    )
+
+
 class RoomState(BaseModel):
     """One room: its roster, its transcript, and its floor state.
 
@@ -953,8 +903,8 @@ class RoomState(BaseModel):
     utterance.
 
     **Forward compatibility (#1885).** The fields added for a feature -- `tool_uses`,
-    `written_files`, `file_record`, `story_id`, `head` -- are left out of the saved record
-    while they hold their default (`exclude_if`), so a room that uses none of those
+    `written_files`, `file_record`, `story_id`, `head`, `loop`, `workspace` -- are left out of the saved
+    record while they hold their default (`exclude_if`), so a room that uses none of those
     features is written in the shape an older build reads. A room that does use one still
     carries it, and an older build refuses that record under `extra="forbid"`. That
     refusal is kept on purpose: an older build that loaded the room while ignoring, say,
@@ -1047,9 +997,21 @@ class RoomState(BaseModel):
         description="The head that keeps this room -- `run`, `loop`, `acp` or `a2a` -- or "
         "None for a room the app or `ucx room` keeps (#1885). A head's room has one writer, "
         "the head, so `RoomOrchestrator` refuses a post or a retry there (`HeadRoomWriteError`). "
-        "Set when a head's first recorded turn creates the room. A room written before this "
-        "field has none and is the app's (author's choice): only an ACP or A2A head, whose "
-        "ids name it, still continues one of its own.",
+        "Set when a head's first recorded turn creates the room.",
+    )
+    loop: RoomLoop | None = Field(
+        default=None,
+        exclude_if=lambda loop: loop is None,
+        description="The `/loop` running in this room, or None (#1936). Cleared when the "
+        "person stops it; kept across a server restart, which continues it.",
+    )
+    workspace: str | None = Field(
+        default=None,
+        exclude_if=lambda workspace: workspace is None,
+        description="The folder this conversation's clones read and write, as an absolute "
+        "path, or None for the server's launch directory (clone-data-scopes §3.6). Every "
+        "seat's turn is bound to it from the next turn on: the file tools, the sandbox and "
+        "the stories all follow it. Changed by `RoomService.set_workspace`.",
     )
     created_at: str = Field(default_factory=_now_iso)
     updated_at: str = Field(default_factory=_now_iso)
@@ -1087,6 +1049,35 @@ class RoomState(BaseModel):
                 f"transcript's single-writer precondition, and the later message is "
                 f"refused rather than merged; a shared room needs a serialisation story "
                 f"that this room does not have. Open one room per person."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _an_agents_turn_carries_its_id(self) -> RoomState:
+        """Refuse an agent's row with no `turn_id`: a shape no current writer makes.
+
+        Every agent row the room writes carries the id its turn was minted with, which is
+        what joins the row to `tool_uses` (#1353). A row without one was saved before the
+        room recorded tools (#1366), so which tools it ran is not known, and a reader that
+        showed its empty tool list would claim "no tools were used" (P6). Such a room is
+        refused whole, and `RoomStore.load` reports it as `UnreadableRoomRecordError`.
+
+        An agent's row is one from a seated agent, or one carrying a speaker decision or a
+        provenance, which only an agent's turn has -- the test that still holds for a seat
+        that has left the roster. A person's row carries none of them, and no id.
+        """
+        agents = {p.id for p in self.participants if p.kind is ParticipantKind.AGENT}
+        unlinked = [
+            m.seq
+            for m in self.transcript
+            if m.is_utterance
+            and m.turn_id is None
+            and (m.sender_id in agents or m.decision is not None or m.provenance is not None)
+        ]
+        if unlinked:
+            raise ValueError(
+                f"Agent rows {unlinked} carry no turn_id; this room was saved before its "
+                f"turns were linked to their tool records."
             )
         return self
 

@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -36,6 +36,14 @@ from uclone_x.agent.hooks import (
     HookContext,
     HookEvent,
     HookRunner,
+)
+from uclone_x.agent.image_set_planner import is_planned_set
+from uclone_x.agent.k_act import (
+    TEXT_CALL_UNREADABLE_MESSAGE,
+    TextCallStream,
+    TextToolCallUnreadableError,
+    text_call_response,
+    text_tools_block,
 )
 from uclone_x.agent.models import (
     AgentConfig,
@@ -51,6 +59,7 @@ from uclone_x.agent.nudges import (
     GROUNDING_REQUIRED_NUDGE_SUFFIX,
     apply_artifact_sanitization,
     evaluate_artifact_nudge,
+    extract_produced_artifact_paths,
     grounding_supports,
     is_evidence_nudge_declined,
 )
@@ -61,6 +70,12 @@ from uclone_x.agent.prompt_assembler import (
     present_sections,
     undone_attempt_section,
 )
+from uclone_x.agent.protocols import (
+    TurnAidHookProtocol,
+    TurnAidProtocol,
+    TurnLifecycleHookProtocol,
+)
+from uclone_x.agent.reply_lines import is_korean, lines_to_add, reply_notes, with_lines
 from uclone_x.agent.request_record import (
     RequestLayers,
     assemble_request_messages,
@@ -84,26 +99,23 @@ from uclone_x.core.provenance import (
     Provenance,
     ServiceRef,
 )
+from uclone_x.core.secrets import redact_credentials
 from uclone_x.core.session_log import (
     LoggedMessage,
     SessionLogEntry,
     SessionLogKind,
     logged_text,
+    result_handle_of,
 )
 from uclone_x.core.tool_results import (
-    STEP_NO_ROOM_MESSAGE,
-    STEP_NO_ROOM_NO_COMPACTION_MESSAGE,
-    STEP_NO_ROOM_SETUP_MESSAGE,
-    STEP_NO_ROOM_SETUP_REPLY_MESSAGE,
-    STEP_OVER_WINDOW_MESSAGE,
+    STEP_REFUSAL_TEXT,
     STEP_REPLY_RESERVE_TOKENS,
     TOOL_RESULT_READ_TOOL,
-    artifacts_dir_for,
+    ResultBodies,
+    StepRefusalCode,
     canonical_tool_text,
-    contained_artifacts_dir,
-    ingest_tool_text,
+    result_handle,
     step_result_caps,
-    store_tool_result,
 )
 from uclone_x.engine.event_bus import (
     AgentEvent,
@@ -121,7 +133,6 @@ from uclone_x.errors import (
     LLMStreamInterruptedError,
     LLMTimeoutError,
     ModelLacksToolSupportError,
-    PathTraversalError,
     ProviderFailureError,
     ProviderFailureKind,
     TokenBudgetExhaustedError,
@@ -147,8 +158,10 @@ from uclone_x.llm.models import (
     aggregate_token_usages,
 )
 from uclone_x.llm.protocols import (
+    ImageInputProbe,
     LLMProviderProtocol,
     TokenBudgetManagerProtocol,
+    request_for_model,
 )
 from uclone_x.llm.router import LLMTier, SemanticModelRouter
 from uclone_x.sandbox.models import (
@@ -159,13 +172,15 @@ from uclone_x.skills.protocols import SkillRegistryProtocol
 from uclone_x.telemetry.models import SpanStatus
 from uclone_x.telemetry.protocols import TracerProtocol
 from uclone_x.telemetry.tracer import FAILOVER_EVENT_SPAN_NAME
-from uclone_x.tools.models import ToolContext
+from uclone_x.tools.base import tool_returns_images
+from uclone_x.tools.models import ToolContext, ToolResultStatus
 from uclone_x.tools.outcome import (
     ToolOutcome,
 )
 from uclone_x.tools.protocols import ToolRegistryProtocol
 
 __all__ = [
+    "PERSONA_EDIT_NOT_APPLIED",
     "StreamProgress",
     "TurnExecutor",
     "TurnScope",
@@ -233,6 +248,27 @@ class StreamProgress:
         return "".join(self.thinking_chunks) if self.thinking_chunks else None
 
 
+#: What a turn whose saved persona edit could not be applied says in `error` (#1904). Fixed,
+#: so no exception text, class name or path from the cause reaches a head; the cause is
+#: logged. Heads word it in the reader's language from `stop_reason` instead.
+PERSONA_EDIT_NOT_APPLIED = (
+    "The changes saved to this clone could not be applied, so it did not answer. "
+    "It kept its previous definition in this conversation; save the changes again to apply them."
+)
+
+
+class _PersonaEditNotApplied(Exception):
+    """A staged persona edit that raised while this turn applied it (#1904).
+
+    Raised from the cause, and carrying only `PERSONA_EDIT_NOT_APPLIED`, so every channel a
+    failed turn reports through -- `error`, the ON_ERROR hook, the failover span -- carries
+    the plain sentence, and the cause stays on `__cause__` for the log.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(PERSONA_EDIT_NOT_APPLIED)
+
+
 _ChainedError = TypeVar("_ChainedError", bound=BaseException)
 
 
@@ -294,6 +330,19 @@ def _turn_failure(
         logger.info("Turn for agent %s failed at the provider: %s", agent_id, provider_failure)
         failure = ProviderFailure.of(provider_failure)
         return _PROVIDER_STOP_REASONS[failure.kind], failure.message, failure
+    if isinstance(exc, TextToolCallUnreadableError):
+        # The model's reply, not a fault in the code: the reply is in the log's
+        # MODEL_RESPONSE event, and the turn ends with the plain sentence (#2188).
+        logger.info("Turn for agent %s refused: a tool call it wrote could not be read", agent_id)
+        return "tool_call_unreadable", TEXT_CALL_UNREADABLE_MESSAGE, None
+    if isinstance(exc, _PersonaEditNotApplied):
+        # The cause is ours, not the provider's, so it is logged in full -- and only there.
+        logger.error(
+            "A saved persona edit could not be applied for agent %s; it was dropped",
+            agent_id,
+            exc_info=exc.__cause__,
+        )
+        return "persona_edit_failed", PERSONA_EDIT_NOT_APPLIED, None
     no_model = _in_cause_chain(exc, LLMModelNotConfiguredError)
     if no_model is not None:
         # A setting left empty, refused before the network: the stop reason is the model
@@ -392,9 +441,23 @@ class TurnSession(BoundToolsSession, Protocol):
     undone_tool_calls: list[ToolCallRequest]
     undone_tool_calls_shown: bool
     recalled_memory: str | None
+    results: dict[str, str]
 
-    def log_history(self) -> None:
-        """Log every message the history gained since the last call (#1443)."""
+    @property
+    def messages(self) -> Sequence[ChatMessage]:
+        """The session's history, each form rendered from its kept result (#1848)."""
+        ...
+
+    def append(self, *messages: ChatMessage) -> None:
+        """Add `messages` to the history, each logged as it enters (#1443, #1848)."""
+        ...
+
+    def replace(self, index: int, message: ChatMessage, *, cause: str) -> None:
+        """Rewrite the history message at `index`, declaring `cause` if it was shown."""
+        ...
+
+    def truncate(self, length: int, *, cause: str) -> None:
+        """Cut the history to `length` messages, declaring `cause` if any was shown."""
         ...
 
     def declare_new_epoch(self, cause: str) -> None:
@@ -439,7 +502,9 @@ class _AutoCompact(Protocol):
 
 
 class _IngestToolMessage(Protocol):
-    def __call__(self, msg: ChatMessage, *, readable: bool) -> ChatMessage: ...
+    def __call__(
+        self, msg: ChatMessage, *, readable: bool, cap_bytes: int = ...
+    ) -> ChatMessage: ...
 
 
 class _ExecuteSingleTool(Protocol):
@@ -472,7 +537,7 @@ class _FitStepToWindow(Protocol):
         extra_sections: Sequence[str],
         *,
         readable: bool,
-    ) -> str | None: ...
+    ) -> StepRefusalCode | None: ...
 
 
 class _ExecuteTools(Protocol):
@@ -533,8 +598,9 @@ class TurnScope:
     publisher: Callable[[], PublisherHandleProtocol | None]
     #: The agent's event bus, or `None`.
     bus: Callable[[], EventBusProtocol | None]
-    #: The active session's history, the list itself (it is appended to in place).
-    history: Callable[[], list[ChatMessage]]
+    #: The active session's history, derived from its log: read-only (#1848). A turn
+    #: writes it through the session's door (`TurnSession.append` and its siblings).
+    history: Callable[[], Sequence[ChatMessage]]
     #: The active session's working copy.
     active_session: Callable[[], TurnSession]
     #: The agent's queue of durable events awaiting the store.
@@ -560,9 +626,12 @@ class TurnScope:
     set_turn_caller_turn_id: Callable[[str | None], None]
     turn_story_id: Callable[[], str | None]
     set_turn_story_id: Callable[[str | None], None]
+    #: Binds the running turn's workspace (`None`: the agent's own).
+    set_turn_workspace_root: Callable[[Path | None], None]
     #: The agent's methods the turn calls back, as getters of the current bound method.
     transition_to: Callable[[], Callable[[AgentState], None]]
     live_session: Callable[[], Callable[[str], TurnSession]]
+    result_bodies: Callable[[], Callable[[str], ResultBodies]]
     active_skill_dirs: Callable[[], Callable[[], tuple[Path, ...]]]
     context_window: Callable[[], Callable[[], int | None]]
     reply_reserve: Callable[[], Callable[[], int]]
@@ -579,6 +648,8 @@ class TurnScope:
     ingest_tool_message: Callable[[], _IngestToolMessage]
     execute_single_tool: Callable[[], _ExecuteSingleTool]
     after_tool_step: Callable[[], Callable[[Sequence[ToolExecutionRecord], ToolContext], None]]
+    #: The agent's lifecycle hooks; those that are `TurnAidHookProtocol` add turn aids.
+    lifecycle_hooks: Callable[[], Sequence[TurnLifecycleHookProtocol]]
     invoke_model: Callable[[], _InvokeModel]
     fit_step_to_window: Callable[[], _FitStepToWindow]
     execute_tools: Callable[[], _ExecuteTools]
@@ -592,6 +663,10 @@ class TurnExecutor:
         self._scope = scope
         #: The running turn's person's names, for its tool calls (#1857).
         self._turn_person_names: tuple[str, ...] = ()
+        #: The running turn's aids, worked out once at its start (#1808).
+        self._turn_aids: tuple[TurnAidProtocol, ...] = ()
+        #: The last tool step's result handles, by call id, for its `TOOL_RESULT` events.
+        self._step_result_handles: dict[str, str] = {}
 
     # -- the agent's state, read through the scope ---------------------------------
 
@@ -668,7 +743,7 @@ class TurnExecutor:
         return self._scope.bus()
 
     @property
-    def _history(self) -> list[ChatMessage]:
+    def _history(self) -> Sequence[ChatMessage]:
         return self._scope.history()
 
     @property
@@ -746,6 +821,10 @@ class TurnExecutor:
         return self._scope.live_session()
 
     @property
+    def _result_bodies(self) -> Callable[[str], ResultBodies]:
+        return self._scope.result_bodies()
+
+    @property
     def active_skill_dirs(self) -> Callable[[], tuple[Path, ...]]:
         return self._scope.active_skill_dirs()
 
@@ -807,42 +886,216 @@ class TurnExecutor:
             turn_live.undone_tool_calls_shown = False
         undone_section = undone_attempt_section(turn_live.undone_tool_calls)
         turn_live.undone_tool_calls_shown = bool(undone_section)
+        self._announce_bound_on_message(turn_live, tool_defs)
         image_set_section, case_section = await self._drawing_sections(message, tool_defs, emit)
         # Recall, once per turn and before compaction counts the request: the clone's
         # facts ranked against this message (clone-knowledge-graph §3.5). Held on the
         # session so every step of the turn sends the same tail.
         turn_live.recalled_memory = await self._prompt_assembler.recall_memory(message)
         self._log_recalled_memory(turn_live)
+        self._turn_aids = self._work_out_turn_aids(message)
         sections = list(present_sections(undone_section, image_set_section, case_section))
+        sections.extend(aid.section for aid in self._turn_aids)
         return sections, image_set_section
+
+    def _announce_bound_on_message(
+        self, turn_live: TurnSession, tool_defs: Sequence[ToolDefinition]
+    ) -> None:
+        """``k_act`` (#2188): describe the tools this message bound on the message itself.
+
+        Appended to the user message the turn just added, which no request has shown yet,
+        so the rewrite declares no epoch: the next request only extends the last one. The
+        description stays in history, so it is sent once and repeated as the same bytes.
+        Nothing happens under another module, or when nothing new was bound.
+        """
+        block = text_tools_block(
+            self._tool_invoker.text_tools_to_announce(tool_defs, turn_live.messages)
+        )
+        history = turn_live.messages
+        if block is None or not history or history[-1].role is not MessageRole.USER:
+            return
+        last = len(history) - 1
+        prompt = history[last]
+        announced = prompt.model_copy(update={"content": f"{prompt.content}\n\n{block}"})
+        turn_live.replace(last, announced, cause="text_tools_bound")
+
+    def _announce_bound_on_call(
+        self,
+        tool_messages: list[ChatMessage],
+        step_executions: Sequence[ToolExecutionRecord],
+        shown_tool_names: set[str],
+    ) -> None:
+        """``k_act`` (#2188): describe a tool bound on the call that named it, on its result.
+
+        A catalog tool the step ran without having been offered (R3, bind on call) is
+        described once, appended to that call's result, before the result enters history.
+        """
+        live = self._live_session(self._context.session_id)
+        bound_now = [
+            d
+            for d in self._tool_invoker.session_tools_layer(live)
+            if d.name not in shown_tool_names
+        ]
+        fresh = self._tool_invoker.text_tools_to_announce(bound_now, live.messages)
+        for index, (message, record) in enumerate(
+            zip(tool_messages, step_executions, strict=False)
+        ):
+            tools = [d for d in fresh if d.name == record.tool_name]
+            block = text_tools_block(tools)
+            if block is not None and message.content is not None:
+                tool_messages[index] = message.model_copy(
+                    update={"content": f"{message.content}\n\n{block}"}
+                )
+                fresh = [d for d in fresh if d.name != record.tool_name]
+
+    def _work_out_turn_aids(self, message: str) -> tuple[TurnAidProtocol, ...]:
+        """The aids the host's `TurnAidHookProtocol` hooks give this turn (#1808).
+
+        Worked out once, before the turn's first request, and kept for every step: the
+        sections go in the turn context, which does not change between steps. A hook that
+        raises is logged and gives nothing; the turn runs without it.
+        """
+        aids: list[TurnAidProtocol] = []
+        tool_names = frozenset(t.name for t in self._tool_invoker.available_tools())
+        story_id, room_id = self._turn_story_id, self._turn_room_id
+        for hook in self._scope.lifecycle_hooks():
+            if not isinstance(hook, TurnAidHookProtocol):
+                continue
+            try:
+                aid = hook.turn_aid(
+                    message=message,
+                    story_id=story_id,
+                    room_id=room_id,
+                    workspace_root=self._resolve_workspace_root(),
+                    tool_names=tool_names,
+                )
+            except Exception:
+                logger.warning(
+                    "Agent %s: a turn aid failed; the turn runs without it",
+                    self.agent_id,
+                    exc_info=True,
+                )
+                continue
+            if aid is not None:
+                aids.append(aid)
+        return tuple(aids)
+
+    def _late_nudge(
+        self,
+        content: str,
+        called_tools: bool,
+        nudged: bool,
+        asked: Collection[str],
+        step: int,
+        durable_events: list[dict[str, Any]],
+        tool_executions: Sequence[ToolExecutionRecord] = (),
+        user_message: str | None = None,
+        advertised_tool_names: Sequence[str] = (),
+    ) -> str | None:
+        """The last nudge a step's answer can get: an empty reply's, or a missing image's.
+
+        Once per turn between them (`nudged` is the turn's latch). A step with no content
+        and no tool call is asked again for a reply (#1808): qwen3:8b ended 3 of 8 Writer
+        turns that way. Only while no nudge of any kind has been sent this turn (`asked`):
+        an empty answer to the evidence or grounding nudge already keeps the first answer. A step cut off by the output limit never gets here (it raises
+        `TokenBudgetExhaustedError`), so an empty reply here had room left to write, and a
+        second one stops the turn as it did before. Otherwise an answer that links an image
+        no tool made is asked to make it (`evaluate_artifact_nudge`). Records the nudge's
+        durable event; returns its text, or `None` when there is none to give.
+        """
+        if not asked and not content and not called_tools:
+            durable_events.append(
+                {"type": "EMPTY_REPLY_NUDGE", "step": step, "turn_index": self._turn_counter}
+            )
+            return nudges.compose_empty_reply_nudge(advertised_tool_names)
+        produced_paths = extract_produced_artifact_paths(tool_executions)
+        art_nudge_info = evaluate_artifact_nudge(
+            content,
+            self._tools,
+            self.workspace_root,
+            nudged,
+            produced_paths=produced_paths,
+            user_message=user_message,
+        )
+        if art_nudge_info is None:
+            return None
+        missing_path, artifact_nudge = art_nudge_info
+        durable_events.append(
+            {
+                "type": "ARTIFACT_NUDGE",
+                "step": step,
+                "turn_index": self._turn_counter,
+                "missing_artifact": missing_path,
+            }
+        )
+        return artifact_nudge
+
+    def _sanitize_turn_artifacts(
+        self,
+        resp_content: str,
+        assistant_msg_idx: int | None,
+    ) -> str:
+        """Sanitize missing image links after the turn completes."""
+        # ``k_act`` (#2188): an answer that ends in a cut-off opening tag loses it.
+        shown = self._tool_invoker.visible_reply(resp_content)
+        sanitized = apply_artifact_sanitization(shown, self.workspace_root)
+        if (
+            sanitized != resp_content
+            and assistant_msg_idx is not None
+            and assistant_msg_idx < len(self._history)
+        ):
+            self._rewrite_answer(assistant_msg_idx, sanitized, "artifact_sanitized")
+        return sanitized
+
+    async def _add_reply_lines(
+        self,
+        content: str,
+        assistant_msg_idx: int | None,
+        message: str,
+        records: Sequence[ToolExecutionRecord],
+        durable_events: list[dict[str, Any]],
+        emit: Callable[[str, dict[str, Any]], Awaitable[None]],
+    ) -> str:
+        """`content` with the lines code adds to a finished turn's reply (#1808).
+
+        Each tool's reply note and each turn aid's line, in the language of `message`,
+        once each and only when the reply does not already hold it (`agent/reply_lines.py`).
+        The history's final answer is rewritten to match, or appended when the turn ended
+        without one, and the added text is streamed as a token, so a streamed reply and the
+        stored one agree.
+        """
+        korean = is_korean(message)
+        wanted = [
+            *reply_notes(records, korean=korean),
+            *(line for aid in self._turn_aids for line in aid.reply_lines(records, korean=korean)),
+        ]
+        added = lines_to_add(content, wanted)
+        if not added:
+            return content
+        full = with_lines(content, added)
+        history = self._history
+        if content and assistant_msg_idx is not None and assistant_msg_idx < len(history):
+            self._rewrite_answer(assistant_msg_idx, full, "reply_lines")
+        else:
+            self._active_session.append(ChatMessage(role=MessageRole.ASSISTANT, content=full))
+        durable_events.append({"type": "REPLY_LINES_ADDED", "lines": added})
+        await emit("token", {"content": full[len(content) :]})
+        return full
 
     def _log_recalled_memory(self, turn_live: TurnSession) -> None:
         """Log the memory section this turn recalled as a `memory` entry (#1849).
 
         The section is sent in every request of the turn, in the `[Turn Context]` tail,
-        and is not a history message, so nothing else logs it. It is also stored in the
-        tool-result store, so `tool_result_read` reads it by the entry's `tr_` handle
-        after the turn that sent it. What the requests send is unchanged: the section is
-        not rewritten and no handle is added to it. Without a workspace, or when the
-        write fails, the entry is logged without a handle.
+        and is not a history message, so nothing else logs it. The entry's body is the
+        section itself and its handle names that body (#1848), so `tool_result_read`
+        reads it back after the turn that sent it, from the session's own store. What the
+        requests send is unchanged: the section is not rewritten and no handle is added
+        to it.
         """
         section = turn_live.recalled_memory
         if not section:
             return
-        handle: str | None = None
-        workspace = self._resolve_workspace_root()
-        if workspace is not None:
-            try:
-                handle = store_tool_result(
-                    contained_artifacts_dir(workspace), self._context.session_id, section
-                )
-            except (OSError, ValueError, PathTraversalError) as exc:
-                logger.warning(
-                    "Could not store the recalled memory section for session %r; it is "
-                    "logged without a handle: %s",
-                    self._context.session_id,
-                    exc,
-                )
+        handle = result_handle(redact_credentials(section))
         turn_live.log_entry(logged_text(SessionLogKind.MEMORY, section, blob=handle))
 
     async def _drawing_sections(
@@ -856,13 +1109,14 @@ class TurnExecutor:
         Both go at the tail, after the user's message, so the prefix stays cacheable.
         The plan is kept until `generate_image` has run: a first step that reads a
         character sheet must not cost it. The case skills stay for every step of the
-        turn. A planned set carries its own prompts, so it is not routed as well.
+        turn. A planned set carries its own prompts, so it is not routed as well; a failed
+        plan's fallback note carries none, so its turn is routed as one with no set would be.
         Kept out of the turn loop, whose body is at the type checker's complexity limit.
         """
         image_set_section = await self._image_set_section(message, tool_defs, emit=emit)
-        if image_set_section:
+        if image_set_section is not None and is_planned_set(image_set_section):
             return image_set_section, None
-        return None, await self._case_skill_section(message, tool_defs)
+        return image_set_section, await self._case_skill_section(message, tool_defs)
 
     @property
     def _auto_compact_if_needed(self) -> _AutoCompact:
@@ -880,11 +1134,18 @@ class TurnExecutor:
         and tool scope without applying either; the epoch is declared next; and only then
         does the returned step assign. A raise at any point before that leaves the seat on
         its old definition with no epoch opened, never the new prompt under the old tools.
+
+        A raise is re-raised as `_PersonaEditNotApplied`, so the failed turn is named
+        `persona_edit_failed` and tells the person who saved the edit in plain words, never
+        in the cause's text (#1904).
         """
-        apply_edit = self._scope.take_staged_persona()()
-        if apply_edit is not None:
-            self._active_session.declare_new_epoch(EPOCH_PERSONA_EDITED)
-            apply_edit()
+        try:
+            apply_edit = self._scope.take_staged_persona()()
+            if apply_edit is not None:
+                self._active_session.declare_new_epoch(EPOCH_PERSONA_EDITED)
+                apply_edit()
+        except Exception as exc:
+            raise _PersonaEditNotApplied from exc
 
     @property
     def _ingest_tool_message(self) -> _IngestToolMessage:
@@ -911,6 +1172,26 @@ class TurnExecutor:
     @property
     def _execute_tools(self) -> _ExecuteTools:
         return self._scope.execute_tools()
+
+    def _append_step_results(
+        self, step_results: Sequence[ChatMessage], reader_offered: bool
+    ) -> None:
+        """Append a step's redacted results to the history, each held to the cap (#1422).
+
+        Notes the handle each result is read by, by call id: the log's `TOOL_RESULT`
+        event names the result by it and holds no second copy of the text (#2013).
+        """
+        ingested = [self._ingest_tool_message(m, readable=reader_offered) for m in step_results]
+        self._active_session.append(*ingested)
+        self._step_result_handles = {
+            m.tool_call_id: result_handle_of(m) for m in ingested if m.tool_call_id
+        }
+
+    def _result_handle_of(self, record: ToolExecutionRecord) -> str | None:
+        """The handle the step's result for `record` is read by, or `None` (#2013)."""
+        if record.tool_call_id is None:
+            return None
+        return self._step_result_handles.get(record.tool_call_id)
 
     # -- the turn ------------------------------------------------------------------
 
@@ -942,6 +1223,11 @@ class TurnExecutor:
         """
         if self._budget is not None:
             self._budget.enforce_budget(self._context.session_id, provider=llm.provider_name)
+
+        # Every step's request passes here -- a 1:1 turn, a room seat's, a retry's, and the
+        # history a compaction left -- so a model that cannot see is never sent the images
+        # an earlier model was shown (#2123). The stored history keeps them.
+        req = await request_for_model(llm, req)
 
         if stream_callback is not None and hasattr(llm, "stream"):
             # What was asked for: the request's model, else the one the connector says it
@@ -1192,10 +1478,16 @@ class TurnExecutor:
         started_at = _now_iso()
         is_streamed = stream_callback is not None and hasattr(llm, "stream")
         progress = StreamProgress()
+        # ``k_act`` (#2188): the reply's calls are its text, which a person never watches.
+        text_calls = self._tool_invoker.tools_module == "k_act"
+        if text_calls and stream_callback is not None:
+            stream_callback = TextCallStream(stream_callback)
         try:
             resp = await self._invoke_model(
                 llm, req, stream_callback=stream_callback, progress=progress
             )
+            if isinstance(stream_callback, TextCallStream):
+                await stream_callback.flush()
         except (Exception, asyncio.CancelledError) as invoke_exc:
             ended_at = _now_iso()
             partial_content = getattr(invoke_exc, "partial_content", None)
@@ -1274,6 +1566,10 @@ class TurnExecutor:
                 ),
             }
         )
+        if text_calls:
+            # Recorded above as the model wrote it; read here. A reply whose call cannot be
+            # read raises the plain refusal, and nothing of it enters history (#2188).
+            resp = text_call_response(resp)
         return resp
 
     async def execute_turn(
@@ -1285,6 +1581,7 @@ class TurnExecutor:
         room_id: str | None = None,
         story_id: str | None = None,
         person_names: tuple[str, ...] = (),
+        workspace_root: Path | None = None,
     ) -> TurnResult:
         """Run one reasoning turn; see `BaseAgent.execute_turn`, which delegates here."""
         llm = self._llm
@@ -1343,6 +1640,8 @@ class TurnExecutor:
             # Set under the turn lock, so a clone seated in two rooms never reads the
             # other room's person (#1857).
             self._turn_person_names = person_names
+            # Under the lock too: a turn queued behind this one cannot move its sandbox.
+            self._scope.set_turn_workspace_root(workspace_root)
             self.transition_to(AgentState.INGESTING)
 
             # The `try` opens here, not after the REASONING transition. Ingestion and
@@ -1465,7 +1764,7 @@ class TurnExecutor:
                     ChatMessage(role=MessageRole.USER, content=content_input)
                 )
                 if not _repeats_unanswered_prompt(self._history, user_prompt):
-                    self._history.append(user_prompt)
+                    self._active_session.append(user_prompt)
                 durable_events.append(
                     {
                         "type": "USER_MESSAGE",
@@ -1508,7 +1807,7 @@ class TurnExecutor:
                 req = LLMRequest(
                     model=self._config.llm_config.model_name or None,
                     messages=tuple(turn_messages),
-                    tools=tuple(tool_defs),
+                    tools=self._tool_invoker.declared_tools(tool_defs),
                     temperature=self._config.llm_config.temperature,
                     max_tokens=self._config.llm_config.max_tokens,
                     auto_compact=self._config.llm_config.auto_compact,
@@ -1601,6 +1900,7 @@ class TurnExecutor:
                 # it would ground them and the check would disarm itself one step after
                 # firing.
                 injected_nudges: set[str] = set()
+                tools_disallowed = False
                 while True:
                     step = self._run_steps + 1
                     if step > self._config.max_steps:
@@ -1616,7 +1916,7 @@ class TurnExecutor:
                         return TurnResult(
                             turn_index=self._turn_counter,
                             steps_taken=self._run_steps,
-                            content=resp_content,
+                            content=self._tool_invoker.visible_reply(resp_content),
                             tool_calls=tuple(all_tool_calls),
                             tool_executions=tuple(tool_executions),
                             is_completed=False,
@@ -1700,24 +2000,22 @@ class TurnExecutor:
                             and self._history
                             and self._history[-1] is superseded
                         ):
-                            self._history.pop()
+                            self._active_session.truncate(len(self._history) - 1, cause="retry")
                             self._active_session.declare_new_epoch("retry")
                         superseded = None
                         assistant_msg_idx = len(self._history)
-                        self._history.append(
-                            redact_message(
-                                ChatMessage(
-                                    role=MessageRole.ASSISTANT,
-                                    content=resp_content or None,
-                                    # This step's calls only. The message is the record of one
-                                    # invocation; the turn's accumulation belongs on TurnResult.
-                                    tool_calls=tool_calls,
-                                )
+                        # Logged as it enters, after the prompt: a retry, a declined nudge
+                        # or a post-turn hook can take it out of the history again, not
+                        # out of the log (#1443).
+                        self._active_session.append(
+                            ChatMessage(
+                                role=MessageRole.ASSISTANT,
+                                content=resp_content or None,
+                                # This step's calls only. The message is the record of one
+                                # invocation; the turn's accumulation belongs on TurnResult.
+                                tool_calls=tool_calls,
                             )
                         )
-                        # Logged now, with the prompt before it: a retry, a declined nudge
-                        # or a post-turn hook can take it out again (#1443).
-                        self._active_session.log_history()
                         if resp_content:
                             durable_events.append(
                                 {
@@ -1841,15 +2139,19 @@ class TurnExecutor:
                                 if assistant_msg_idx is not None and assistant_msg_idx < len(
                                     self._history
                                 ):
-                                    self._history[assistant_msg_idx] = first_assistant_msg
+                                    self._active_session.replace(
+                                        assistant_msg_idx, first_assistant_msg, cause="retry"
+                                    )
                                 else:
                                     assistant_msg_idx = len(self._history)
-                                    self._history.append(first_assistant_msg)
+                                    self._active_session.append(first_assistant_msg)
                             elif assistant_msg_idx is not None and assistant_msg_idx < len(
                                 self._history
                             ):
                                 # The first answer was empty and so never entered history.
-                                self._history.pop(assistant_msg_idx)
+                                # The retry's answer is the step's last message: this step
+                                # made no calls, or it would not be a final answer.
+                                self._active_session.truncate(assistant_msg_idx, cause="retry")
                                 assistant_msg_idx = None
 
                         # What the answer asserts that nothing this turn read contains.
@@ -1902,22 +2204,22 @@ class TurnExecutor:
                             )
                             continue
 
-                        # Missing artifact image hallucination check (Tier 1 Nudge):
-                        art_nudge_info = evaluate_artifact_nudge(
-                            resp_content, self._tools, self.workspace_root, artifact_nudged
+                        # Missing artifact image hallucination check (Tier 1 Nudge), or an
+                        # empty reply asked again (#1808): one of the two, once per turn.
+                        artifact_nudge = self._late_nudge(
+                            resp_content,
+                            bool(tool_calls),
+                            artifact_nudged,
+                            injected_nudges,
+                            step,
+                            durable_events,
+                            tool_executions,
+                            content_input,
+                            advertised_tool_names=[d.name for d in tool_defs],
                         )
-                        if art_nudge_info is not None:
+                        if artifact_nudge is not None:
                             artifact_nudged = True
-                            missing_path, artifact_nudge = art_nudge_info
                             injected_nudges.add(artifact_nudge)
-                            durable_events.append(
-                                {
-                                    "type": "ARTIFACT_NUDGE",
-                                    "step": step,
-                                    "turn_index": self._turn_counter,
-                                    "missing_artifact": missing_path,
-                                }
-                            )
                             msg_to_supersede = (
                                 self._history[assistant_msg_idx]
                                 if resp_content and assistant_msg_idx is not None
@@ -1935,7 +2237,7 @@ class TurnExecutor:
                             stop_reason = "model_stopped_after_both_nudges"
                         elif grounding_nudged:
                             stop_reason = "model_stopped_after_grounding_nudge"
-                        elif evidence_nudged or artifact_nudged:
+                        elif evidence_nudged or artifact_nudged or tools_disallowed:
                             stop_reason = "model_stopped_after_nudge"
                         elif tool_executions and nothing_found:
                             stop_reason = "model_stopped_after_unproductive_tools"
@@ -1949,20 +2251,23 @@ class TurnExecutor:
                     tools_unreported = True
                     # Only what this request advertised runs (F12): a provider may pass a
                     # call to an undeclared name through, and the model was never shown it.
-                    tool_messages, step_executions = await self._execute_tools(
+                    tool_messages, step_executions, guarded = await self._execute_step_tools(
                         tool_calls,
-                        stream_callback=stream_callback,
-                        advertised=frozenset(shown_tool_names),
+                        tool_executions,
+                        req,
+                        tool_defs,
+                        stream_callback,
+                        shown_tool_names,
                     )
+                    if guarded:
+                        tools_disallowed = True
                     # Redacted, then held to the result cap (#1422): an over-cap result is
                     # stored in full and the history keeps an excerpt naming it. Decided
                     # here, once; later steps render the same excerpt.
                     reader_offered = any(d.name == TOOL_RESULT_READ_TOOL for d in tool_defs)
                     step_results = [redact_message(m) for m in tool_messages]
                     drop_once_drawn(turn_extra_sections, image_set_section, step_executions)
-                    self._history.extend(
-                        self._ingest_tool_message(m, readable=reader_offered) for m in step_results
-                    )
+                    self._append_step_results(step_results, reader_offered)
                     tool_executions.extend(step_executions)
                     tools_unreported = False
                     for tr in step_executions:
@@ -1971,7 +2276,7 @@ class TurnExecutor:
                                 "type": "TOOL_RESULT",
                                 "tool_call_id": tr.tool_call_id,
                                 "name": tr.tool_name,
-                                "output": canonical_tool_text(tr.output),
+                                "result_handle": self._result_handle_of(tr),
                                 # `status` alone cannot tell a search that answered from
                                 # one that matched nothing -- both are "success" (#698).
                                 # Without this the log shows a healthy call before a turn
@@ -2014,7 +2319,8 @@ class TurnExecutor:
                             tool_executions=tuple(tool_executions),
                             is_completed=False,
                             text_emitted_tool_calls=tuple(text_emitted),
-                            error=step_refusal,
+                            error=STEP_REFUSAL_TEXT[step_refusal],
+                            error_code=step_refusal,
                             stop_reason=stop_reason,
                             correlation_id=correlation_id,
                             provenance=None,
@@ -2052,6 +2358,8 @@ class TurnExecutor:
                         "turn_index": self._turn_counter,
                         "tool_calls_count": len(tool_calls),
                         "tool_executions_count": len(tool_executions),
+                        "workspace_root": str(self.workspace_root) if self.workspace_root else None,
+                        "user_message": content_input,
                     },
                 )
                 post_turn_decision = await self._hook_runner.run_hooks(
@@ -2064,28 +2372,21 @@ class TurnExecutor:
                     if "content" in post_turn_decision.modified_payload:
                         resp_content = str(post_turn_decision.modified_payload["content"])
                         if assistant_msg_idx is not None and assistant_msg_idx < len(self._history):
-                            self._declare_rewrite(assistant_msg_idx, "post_turn_hook")
-                            orig_msg = self._history[assistant_msg_idx]
-                            self._history[assistant_msg_idx] = redact_message(
-                                ChatMessage(
-                                    role=MessageRole.ASSISTANT,
-                                    content=resp_content or None,
-                                    tool_calls=orig_msg.tool_calls,
-                                )
-                            )
+                            self._rewrite_answer(assistant_msg_idx, resp_content, "post_turn_hook")
                         elif resp_content:
                             assistant_msg_idx = len(self._history)
-                            self._history.append(
-                                redact_message(
-                                    ChatMessage(
-                                        role=MessageRole.ASSISTANT,
-                                        content=resp_content,
-                                    )
-                                )
+                            self._active_session.append(
+                                ChatMessage(role=MessageRole.ASSISTANT, content=resp_content)
                             )
 
-                resp_content = apply_artifact_sanitization(
-                    resp_content, self.workspace_root, self._history, assistant_msg_idx
+                resp_content = self._sanitize_turn_artifacts(resp_content, assistant_msg_idx)
+                resp_content = await self._add_reply_lines(
+                    resp_content,
+                    assistant_msg_idx,
+                    content_input,
+                    tool_executions,
+                    durable_events,
+                    _emit_stream,
                 )
 
                 # P6: the connector's attribution is propagated verbatim, including
@@ -2378,13 +2679,19 @@ class TurnExecutor:
                     dangling_index, unanswered_ids = dangling
                     asked = turn_messages[dangling_index]
                     kept_text = outcome == "completed" and bool(asked.content)
+                    # Through the session's door: what leaves stays in the log, and a
+                    # request that showed the step makes the next one open an epoch.
                     if kept_text:
                         dropped_count = len(turn_messages) - dangling_index - 1
-                        turn_messages[dangling_index] = asked.model_copy(update={"tool_calls": ()})
-                        del turn_messages[dangling_index + 1 :]
+                        turn_live.truncate(dangling_index + 1, cause="tool_step_dropped")
+                        turn_live.replace(
+                            dangling_index,
+                            asked.model_copy(update={"tool_calls": ()}),
+                            cause="tool_step_dropped",
+                        )
                     else:
                         dropped_count = len(turn_messages) - dangling_index
-                        del turn_messages[dangling_index:]
+                        turn_live.truncate(dangling_index, cause="tool_step_dropped")
                     logger.warning(
                         "Dropped an unanswered tool step (%d message(s), calls %s, text "
                         "kept: %s) from session %s of agent %s after the turn ended %s",
@@ -2414,16 +2721,25 @@ class TurnExecutor:
                     event["session_id"] = turn_session_id
                 self._pending_durable_events.extend(durable_events)
 
-    def _declare_rewrite(self, index: int, cause: str) -> None:
-        """Declare `cause` for rewriting the history message at `index`, if it needs it.
+    def _rewrite_answer(self, index: int, content: str, cause: str) -> None:
+        """Rewrite the answer at `index` of the history to `content`, keeping its calls.
 
-        Rewriting a message a request of this epoch already showed breaks Rule 1, so the
-        next request opens an epoch that names `cause`. Rewriting the final answer no
-        request has shown yet does not: the next request only appends it, and a cause
-        declared for it would label the next epoch -- a compaction's -- with it (#1854).
+        Through the session's door (`replace`), which logs the new text and declares
+        `cause` only when a request of this epoch showed the message: rewriting a message
+        a request showed breaks Rule 1, so the next request opens an epoch naming `cause`.
+        Rewriting the final answer no request has shown yet does not: the next request
+        only appends it, and a cause declared for it would label the next epoch -- a
+        compaction's -- with it (#1854).
         """
-        if self._active_session.shown_in_epoch(index):
-            self._active_session.declare_new_epoch(cause)
+        self._active_session.replace(
+            index,
+            ChatMessage(
+                role=MessageRole.ASSISTANT,
+                content=content or None,
+                tool_calls=self._history[index].tool_calls,
+            ),
+            cause=cause,
+        )
 
     def fit_step_to_window(
         self,
@@ -2432,7 +2748,7 @@ class TurnExecutor:
         extra_sections: Sequence[str],
         *,
         readable: bool,
-    ) -> str | None:
+    ) -> StepRefusalCode | None:
         """Cut the step that just ran to fit the window, or say why it cannot (#1480).
 
         `step_results` are the step's results before the cap, in the order appended; the
@@ -2445,20 +2761,22 @@ class TurnExecutor:
         its share: an excerpt whose full body stays readable with `tool_result_read`.
         Nothing a request has shown is rewritten: the model has not seen this step yet.
 
-        `None` when the next request fits. Otherwise the plain refusal the turn ends
-        with: `STEP_NO_ROOM_MESSAGE` when the request leaves no room for the step at
+        `None` when the next request fits. Otherwise the code of the plain refusal the
+        turn ends with (`STEP_REFUSAL_TEXT` holds each one's sentence, #1862):
+        `step.no_room` when the request leaves no room for the step at
         all, so the conversation and not the tools is the cause (#1509);
-        `STEP_NO_ROOM_SETUP_MESSAGE` when the system turn and the tool schemas alone
+        `step.no_room_setup` when the system turn and the tool schemas alone
         leave none, so no shortening would help (#1866), or
-        `STEP_NO_ROOM_SETUP_REPLY_MESSAGE` when a shorter reply length would (#1875); and
-        `STEP_OVER_WINDOW_MESSAGE` when the step cannot fit even as excerpts or the
+        `step.no_room_setup_reply` when a shorter reply length would (#1875); and
+        `step.over_window` when the step cannot fit even as excerpts or the
         fitted request is still over. Without a known window there is nothing to fit
         against, and the per-result cap is the only bound.
 
-        The step is logged first, as ingested (#1443): cutting it to shares or refusing it
-        takes results out of the history, never out of the session log.
+        The step was logged as it entered, as ingested (#1443): cutting it to shares or
+        refusing it takes results out of the history, never out of the session log. A
+        result cut to its share is written through the session's door, so the cut text is
+        logged too; no request has shown the step, so nothing is declared.
         """
-        self._active_session.log_history()  # the step as ingested, before any cut
         window = self._context_window()
         if window is None:
             return None
@@ -2482,7 +2800,7 @@ class TurnExecutor:
                 for i, m in zip(tail, step_results, strict=False)
             )
         ):
-            return STEP_OVER_WINDOW_MESSAGE
+            return "step.over_window"
         # `total` counts the conversation as the request renders it, a repeated result as
         # its one-line back-reference (§5.8, Rule 2); what is taken out of it here must be
         # counted the same way, or a step holding a back-reference looks smaller outside
@@ -2511,11 +2829,11 @@ class TurnExecutor:
                 # A reply length above the default is the other cause: when the setup
                 # leaves room for a reply of the default size, a shorter one fits (#1875).
                 if fixed + STEP_REPLY_RESERVE_TOKENS < window:
-                    return STEP_NO_ROOM_SETUP_REPLY_MESSAGE
-                return STEP_NO_ROOM_SETUP_MESSAGE
+                    return "step.no_room_setup_reply"
+                return "step.no_room_setup"
             if self._config.llm_config.auto_compact:
-                return STEP_NO_ROOM_MESSAGE
-            return STEP_NO_ROOM_NO_COMPACTION_MESSAGE
+                return "step.no_room"
+            return "step.no_room_no_compaction"
         # A result sent as a back-reference is not shared out: it costs its one line
         # whatever its size, and cutting it would send an excerpt in its place.
         shared_out = [i for i in tail if refers[i] is None]
@@ -2533,32 +2851,40 @@ class TurnExecutor:
                 window,
                 budget,
             )
-            return STEP_OVER_WINDOW_MESSAGE
-        workspace = self._resolve_workspace_root()
+            return "step.over_window"
         raw_of = dict(zip(tail, step_results, strict=True))
         cut: dict[int, ChatMessage] = {}
         for index, content, cap in zip(shared_out, current, caps, strict=True):
             raw = raw_of[index]
             if raw.content is None or len(content.encode("utf-8")) <= cap:
                 continue
-            shared = ingest_tool_text(
-                raw.content,
-                artifacts_dir=artifacts_dir_for(workspace) if workspace is not None else None,
-                session_id=self._context.session_id,
-                readable=readable,
-                cap_bytes=cap,
+            shared = self._ingest_tool_message(raw, readable=readable, cap_bytes=cap)
+            # The form and what it was cut from are the new excerpt's, cap included: the
+            # log keeps the form, not its text, so a `rendered_from` left at the ingest cap
+            # would render the result uncut on the wire (#1848).
+            cut[index] = history[index].model_copy(
+                update={
+                    "content": shared.content,
+                    "form": shared.form or ContextForm.EXCERPT.value,
+                    "rendered_from": shared.rendered_from,
+                }
             )
-            history[index] = history[index].model_copy(
-                update={"content": shared, "form": ContextForm.EXCERPT.value}
-            )
-            cut[index] = history[index]
+            self._active_session.replace(index, cut[index], cause="step_cut")
         # A later result of the step that referred back to one just cut still carries the
-        # text it was the same as; given the cut text too, it stays a back-reference.
+        # text it was the same as; given the cut form too, it stays a back-reference.
         for index in tail:
             earlier = refers[index]
             if earlier is not None and earlier in cut:
-                history[index] = history[index].model_copy(
-                    update={"content": cut[earlier].content, "form": ContextForm.EXCERPT.value}
+                self._active_session.replace(
+                    index,
+                    history[index].model_copy(
+                        update={
+                            "content": cut[earlier].content,
+                            "form": cut[earlier].form,
+                            "rendered_from": cut[earlier].rendered_from,
+                        }
+                    ),
+                    cause="step_cut",
                 )
         fitted = request_tokens()
         if fitted + reserve > window:
@@ -2570,7 +2896,7 @@ class TurnExecutor:
                 window,
                 reserve,
             )
-            return STEP_OVER_WINDOW_MESSAGE
+            return "step.over_window"
         return None
 
     def _withhold_refused_step(self, live: TurnSession) -> int:
@@ -2598,7 +2924,8 @@ class TurnExecutor:
         withheld = history[start].tool_calls
         live.undone_tool_calls.extend(withheld)
         live.undone_tool_calls_shown = False
-        del history[start:]
+        # Nothing here was shown, so the cut declares nothing (`truncate`).
+        live.truncate(start, cause="step_refused")
         live.updated_at = _now_iso()
         logger.warning(
             "Withheld a refused step (%d tool calls) from session %s of agent %s",
@@ -2607,6 +2934,118 @@ class TurnExecutor:
             self.agent_id,
         )
         return len(withheld)
+
+    def _evaluate_tool_guardrail(
+        self,
+        tool_calls: Sequence[ToolCallRequest],
+        prior_executions: Sequence[ToolExecutionRecord],
+        req: LLMRequest,
+    ) -> str | None:
+        """Check whether tool execution should be intercepted to prevent loops or context overflow."""
+        called_names = {tc.name for tc in tool_calls}
+        has_prior_image_gen = any(
+            rec.tool_name == "generate_image" and rec.status == ToolResultStatus.SUCCESS
+            for rec in prior_executions
+        )
+        if "generate_image" in called_names and has_prior_image_gen:
+            return (
+                "Images have already been generated in this turn. Further image generation in the same "
+                "turn is restricted to prevent duplicate generation loops. Do not call any further tools; "
+                "immediately conclude your final response displaying the images generated so far, each "
+                "embedded by the relative_url its result returned."
+            )
+
+        window = self._context_window()
+        reserve = self._reply_reserve()
+        if window is not None and prior_executions:
+            current_tokens = estimate_request_tokens(
+                LLMRequest(messages=tuple(req.messages), tools=tuple(req.tools))
+            )
+            is_image_call = "generate_image" in called_names
+            threshold = window - 512 if is_image_call else window
+            if current_tokens + reserve >= threshold:
+                return (
+                    "Context token limit is approaching. Further tool calls in this turn are restricted "
+                    "to prevent context overflow. Do not call any further tools; immediately conclude "
+                    "your final response using the tool results obtained so far."
+                )
+
+        return None
+
+    def _synthesize_guarded_tool_results(
+        self,
+        tool_calls: Sequence[ToolCallRequest],
+        notice: str,
+    ) -> tuple[list[ChatMessage], list[ToolExecutionRecord]]:
+        """Synthesize skipped tool result messages to satisfy protocol and nudge model."""
+        messages: list[ChatMessage] = []
+        executions: list[ToolExecutionRecord] = []
+        for tc in tool_calls:
+            guard_payload: Any = {"status": "skipped", "notice": notice}
+            messages.append(
+                ChatMessage(
+                    role=MessageRole.TOOL,
+                    content=canonical_tool_text(guard_payload),
+                    name=tc.name,
+                    tool_call_id=tc.id,
+                )
+            )
+            executions.append(
+                ToolExecutionRecord(
+                    tool_name=tc.name,
+                    arguments=cast(dict[str, Any], unwrap_immutable(tc.arguments)),
+                    output=guard_payload,
+                    status=ToolResultStatus.SUCCESS,
+                    error=None,
+                    duration_ms=0.0,
+                    tool_call_id=tc.id,
+                )
+            )
+        return messages, executions
+
+    async def _execute_step_tools(
+        self,
+        tool_calls: tuple[ToolCallRequest, ...] | list[ToolCallRequest],
+        tool_executions: Sequence[ToolExecutionRecord],
+        req: LLMRequest,
+        tool_defs: list[ToolDefinition],
+        stream_callback: Callable[[str, dict[str, Any]], Awaitable[None] | None] | None,
+        shown_tool_names: set[str],
+    ) -> tuple[list[ChatMessage], list[ToolExecutionRecord], bool]:
+        """Execute or intercept tool calls, applying loop and budget guardrails."""
+        guard_notice = self._evaluate_tool_guardrail(tool_calls, tool_executions, req)
+        if guard_notice is not None:
+            tool_messages, step_executions = self._synthesize_guarded_tool_results(
+                tool_calls, guard_notice
+            )
+            tool_defs.clear()
+            shown_tool_names.clear()
+            return tool_messages, step_executions, True
+
+        tool_messages, step_executions = await self._execute_tools(
+            tuple(tool_calls),
+            stream_callback=stream_callback,
+            advertised=frozenset(shown_tool_names),
+        )
+        if self._tool_invoker.tools_module == "k_act":
+            self._announce_bound_on_call(tool_messages, step_executions, shown_tool_names)
+        return tool_messages, step_executions, False
+
+    async def _model_accepts_images(
+        self, tool_calls: tuple[ToolCallRequest, ...] | list[ToolCallRequest]
+    ) -> bool:
+        """Whether this turn's model takes image input, for a tool that can return one.
+
+        Asked only when a called tool declares `returns_images`, so an ordinary step reads
+        no listing. A provider that cannot say answers False, so a tool returns text
+        rather than a picture the model would be sent and could not read (#2107).
+        """
+        llm = self._llm
+        if not isinstance(llm, ImageInputProbe):
+            return False
+        if not any(tool_returns_images(self._tool_invoker.resolve(tc.name)) for tc in tool_calls):
+            return False
+        return await llm.accepts_images(self._config.llm_config.model_name or None)
 
     async def execute_tools(
         self,
@@ -2637,10 +3076,17 @@ class TurnExecutor:
             isolation=isolation,
             turn_index=self._turn_counter,
             agent_delegate=self._agent_delegate,
+            stored_results=self._result_bodies(self._context.session_id),
             room_id=self._turn_room_id,
             turn_id=self._turn_caller_turn_id,
             story_id=self._turn_story_id,
             person_names=self._turn_person_names,
+            # The clone's own names, so `record_memory_fact` files a fact about it under
+            # `self` (#2016). A name it shares with the person stays the person's.
+            clone_names=tuple(n for n in (self.agent_id, self._config.name) if n),
+            # The clone's own picture model, so a picture it asks for uses it (§3.4).
+            image_model=self._config.llm_config.image_model,
+            accepts_images=await self._model_accepts_images(tool_calls),
         )
 
         if len(tool_calls) == 1:

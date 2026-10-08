@@ -56,8 +56,7 @@ DEFAULT_SESSION_STORAGE_DIR = Path.home() / ".uclone" / "sessions"
 # should share **one** Core record for a session — that is what P8's single store means
 # — not hold isolated copies. They now both resolve to `<root>/core/<id>.json`. The
 # transcript, which is genuinely a different artifact with a different schema, gets its
-# own `<root>/ui/`. Files already at the root are legacy: read for hydration, never
-# overwritten.
+# own `<root>/ui/`. Nothing reads or writes a record at the root itself.
 CORE_RECORD_SUBDIR = "core"
 UI_TRANSCRIPT_SUBDIR = "ui"
 

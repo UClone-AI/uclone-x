@@ -8,22 +8,38 @@
  * fixed sentence the caller chooses, rather than shown (P0). The caller logs the raw error, so
  * the cause is kept for whoever reads the console (P6).
  */
-import { detailOf } from './useApiRead';
-
-/** A non-2xx answer, and the Core's own `detail` string if it gave one. */
+/**
+ * A non-2xx answer, the Core's own `detail` string if it gave one, and its `code` if it gave
+ * one: a stable name a surface may render in the reader's language instead of `detail`.
+ */
 export class CoreFailure extends Error {
   constructor(
     readonly status: number,
     readonly coreDetail: string | null,
+    readonly coreCode: string | null = null,
   ) {
     super(coreDetail ?? `HTTP ${status}`);
     this.name = 'CoreFailure';
   }
 }
 
-/** The failure a non-2xx answer stands for, with its `detail` read from the body. */
-export const failureOf = async (res: Response): Promise<CoreFailure> =>
-  new CoreFailure(res.status, await detailOf(res));
+/** A non-empty string field of a JSON object body, or `null`. */
+const textField = (body: unknown, key: string): string | null => {
+  if (typeof body !== 'object' || body === null || !(key in body)) return null;
+  const value = (body as Record<string, unknown>)[key];
+  return typeof value === 'string' && value.trim() !== '' ? value : null;
+};
+
+/** The failure a non-2xx answer stands for, with its `detail` and `code` read from the body. */
+export async function failureOf(res: Response): Promise<CoreFailure> {
+  let body: unknown = null;
+  try {
+    body = await res.json();
+  } catch {
+    // A body that is not JSON carries no detail; the status still says what happened.
+  }
+  return new CoreFailure(res.status, textField(body, 'detail'), textField(body, 'code'));
+}
 
 const asSentence = (text: string): string => {
   const trimmed = text.trim();

@@ -1,7 +1,7 @@
 /**
  * The rule that keeps principle numbers off the screen (#1027).
  *
- * `swarm/skills/ui-authoring/SKILL.md` forbids `P6`, `P9` and their neighbours in copy a user
+ * `.claude/skills/ui-authoring/SKILL.md` forbids `P6`, `P9` and their neighbours in copy a user
  * reads: they are this repository's internal grammar, and to the person who installs the
  * product and does not read its code they are noise. `../copy.test.ts` applies this to every
  * source under `src` and holds the exemptions; a fitness check in the Python suite enforces
@@ -21,10 +21,14 @@
 const BLOCK_COMMENT = /\/\*[\s\S]*?\*\//g;
 const LINE_COMMENT = /(?<!:)\/\//;
 
+/** Pattern matching principle numbers (e.g. P6, P9); exported and exercised by copy.test.ts. */
 export const PRINCIPLE_NUMBER = /\bP[0-9]\b/;
-export const VITEST_FILE = /\.test\.tsx?$/;
+const VITEST_FILE = /\.test\.tsx?$/;
 
-/** An exemption is a site, not a string: each file maps to the lines allowed *in it*. */
+/**
+ * An exemption is a site, not a string: each file maps to the lines allowed *in it*.
+ * Exported and exercised by copy.test.ts.
+ */
 export type Exemptions = ReadonlyMap<string, ReadonlySet<string>>;
 
 /**
@@ -32,6 +36,8 @@ export type Exemptions = ReadonlyMap<string, ReadonlySet<string>>;
  *
  * A `//` preceded by `:` is a URL, not a comment. Erring here can only make the scan read
  * less than it should, never more, so a miss is a weaker check and not a false accusation.
+ *
+ * Exported: imported and exercised by copy.test.ts and dockAbsenceClaims.test.tsx.
  */
 export const copyLines = (source: string): string[] =>
   source
@@ -47,11 +53,16 @@ export const copyLines = (source: string): string[] =>
  *
  * `exempt` was a bare set of lines, which made every exempt line exempt everywhere: PR #1025's
  * reviewer pasted a ledger `<option>` verbatim into `SkillsTab.tsx` and the guard passed.
+ *
+ * Internal helper for principleNumberOffences (#1295).
  */
-export const isExempt = (exempt: Exemptions, path: string, line: string): boolean =>
+const isExempt = (exempt: Exemptions, path: string, line: string): boolean =>
   exempt.get(path)?.has(line.trim()) === true;
 
-/** Whether the scan reads `path` at all. A test renders nothing, so it is not a screen. */
+/**
+ * Whether the scan reads `path` at all. A test renders nothing, so it is not a screen.
+ * Exported: imported and exercised by copy.test.ts.
+ */
 export const isScanned = (path: string): boolean => !VITEST_FILE.test(path);
 
 /**
@@ -60,6 +71,8 @@ export const isScanned = (path: string): boolean => !VITEST_FILE.test(path);
  * Taking the sources and the exemptions as arguments is what makes the file-keying testable:
  * the live scan passes Vite's glob of the real tree, and the case in `copy.test.ts` passes two
  * files holding the same exempt line.
+ *
+ * Exported: imported and exercised by copy.test.ts.
  */
 export const principleNumberOffences = (
   sources: Record<string, string>,
@@ -75,7 +88,10 @@ export const principleNumberOffences = (
       ),
     );
 
-/** Every exempt line that its own file no longer holds -- an exemption outliving its site. */
+/**
+ * Every exempt line that its own file no longer holds -- an exemption outliving its site.
+ * Exported: imported and exercised by copy.test.ts.
+ */
 export const staleExemptions = (sources: Record<string, string>, exempt: Exemptions): string[] =>
   [...exempt].flatMap(([path, lines]) =>
     [...lines]

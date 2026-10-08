@@ -90,11 +90,12 @@ describe('ArtifactsDock', () => {
     });
   });
 
-  it('renders the six user surface tabs in the primary row, Remembers among them', () => {
+  it('renders the user surface tabs in the primary row, Remembers and Browser among them', () => {
     render(<ArtifactsDock {...baseProps} />);
     expect(screen.getByTestId('tab-clone')).toBeDefined();
     expect(screen.getByTestId('tab-turn')).toBeDefined();
     expect(screen.getByTestId('tab-artifacts')).toBeDefined();
+    expect(screen.getByTestId('tab-browser')).toBeDefined();
     expect(screen.getByTestId('tab-remembers')).toHaveTextContent('Remembers');
     expect(screen.getByTestId('tab-activity')).toBeDefined();
     expect(screen.getByTestId('tab-resource')).toBeDefined();
@@ -412,7 +413,7 @@ describe('ArtifactsDock', () => {
     // file is at rail 0 (`overlays a window exactly its own width, and not one a pixel wider`),
     // which any mutation that vanishes at 0 passes untouched.
     //
-    // This is the width `docs/ui-dashboard-architecture.md` §3 records as the one that changed
+    // This is the width the dashboard architecture document records as the one that changed
     // side when the row's arithmetic replaced the window-only rule.
     window.localStorage.setItem('uclone-x.dock.width', '520');
 
@@ -626,6 +627,7 @@ describe('ArtifactsDock: scoped to the conversation on screen (#1356)', () => {
 describe('ArtifactsDock: a conversation still opening, or unreadable (#1389)', () => {
   it.each([
     'artifacts',
+    'browser',
     'activity',
     'remembers',
     'resource',
@@ -649,6 +651,7 @@ describe('ArtifactsDock: a conversation still opening, or unreadable (#1389)', (
 
   it.each([
     'artifacts',
+    'browser',
     'activity',
     'remembers',
     'resource',

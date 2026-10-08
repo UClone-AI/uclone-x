@@ -2,14 +2,32 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import ClassVar
 
 import httpx
 
 from uclone_x.errors import LLMProviderNotConfiguredError
-from uclone_x.llm.connectors.openai import OpenAIConnector, named_model
+from uclone_x.llm.catalog import CatalogEntry
+from uclone_x.llm.connectors.base import named_model as _named_model
+from uclone_x.llm.connectors.listing import from_unix, get_listing_page, listed_items, optional_str
+from uclone_x.llm.connectors.openai import (
+    _NOT_CHAT_FRAGMENTS,  # pyright: ignore[reportPrivateUsage]
+    OpenAIConnector,
+)
+from uclone_x.llm.context_window import LISTED_CONTEXT_WINDOWS, ListedContextWindows
 from uclone_x.llm.models import LLMRequest
+
+logger = logging.getLogger(__name__)
+
+
+def named_model(target: LLMRequest | str | None) -> str | None:
+    """The model named by `target` (a request or model string), or None when blank or default."""
+    if isinstance(target, LLMRequest):
+        return _named_model(target.model)
+    return _named_model(target)
+
 
 VLLM_ENDPOINT_ENV_VARS: tuple[str, ...] = ("VLLM_BASE_URL",)
 """Environment variables that name a vLLM endpoint, in precedence order.
@@ -194,6 +212,7 @@ class VLLMConnector(OpenAIConnector):
         timeout: float = 60.0,
         http_client: httpx.AsyncClient | None = None,
         model: str | None = None,
+        context_windows: ListedContextWindows | None = None,
     ) -> None:
         super().__init__(
             api_key=api_key,
@@ -202,10 +221,76 @@ class VLLMConnector(OpenAIConnector):
             http_client=http_client,
             model=model,
         )
+        self._windows = context_windows if context_windows is not None else LISTED_CONTEXT_WINDOWS
+        self._listing_read = False
+
+    @property
+    def context_windows(self) -> ListedContextWindows:
+        """The store this connector records listed windows in, for the agent to read."""
+        return self._windows
 
     @property
     def provider_name(self) -> str:
         return "vllm"
+
+    async def list_models(self) -> list[CatalogEntry]:
+        """The models this vLLM server serves, from `/models` (#1983).
+
+        vLLM reports each model's `max_model_len`, which is the context window the server
+        was configured with. A window of zero or a negative value is treated as absent.
+        It does not say whether a model reads images, so `accepts_images` stays `False`
+        (#2107).
+        """
+        page = await get_listing_page(
+            self,
+            provider=self._display_name,
+            url=f"{self.base_url}/models",
+            headers=self._auth_headers(),
+        )
+        entries: list[CatalogEntry] = []
+        for item in listed_items(page, "data"):
+            model_id = optional_str(item.get("id"))
+            if model_id is None:
+                continue
+            max_model_len = item.get("max_model_len")
+            if (
+                isinstance(max_model_len, int)
+                and not isinstance(max_model_len, bool)
+                and max_model_len > 0
+            ):
+                window: int | None = max_model_len
+            else:
+                window = None
+            lowered = model_id.lower()
+            entries.append(
+                CatalogEntry(
+                    id=model_id,
+                    context_window=window,
+                    chat_capable=not any(fragment in lowered for fragment in _NOT_CHAT_FRAGMENTS),
+                    created_at=from_unix(item.get("created")),
+                )
+            )
+        return entries
+
+    async def observe_context_window(self, model: str | None = None) -> int | None:
+        """The window vLLM's listing reports for `model` (#1983).
+
+        Read from the listing once, when no figure is held for the model -- the catalogue
+        usually has one already, from Settings -- and never guessed: a model the listing
+        does not name, or a listing that cannot be read, leaves the window unknown.
+        """
+        chosen = named_model(model) or self._default_model or resolve_vllm_model()
+        if chosen is None:
+            return None
+        held = self._windows.get(self.provider_name, chosen)
+        if held is not None or self._listing_read:
+            return held
+        self._listing_read = True
+        try:
+            self._windows.remember(self.provider_name, await self.list_models())
+        except Exception as exc:
+            logger.debug("Could not read vLLM's model listing for its windows: %s", exc)
+        return self._windows.get(self.provider_name, chosen)
 
     def _resolve_request_model(self, request: LLMRequest) -> str:
         """The model to ask for: the caller's, else the connector's, else `VLLM_MODEL`.

@@ -32,10 +32,7 @@ from uclone_x.core.log_inspector import (
     parse_log_line,
     read_logs,
 )
-from uclone_x.core.logging_setup import (
-    JsonLogFormatter,
-    setup_application_logging,
-)
+from uclone_x.core.logging_setup import JsonLogFormatter
 from uclone_x.core.provenance import (
     AttemptRecord,
     ExecutionPath,
@@ -61,6 +58,5 @@ __all__ = [
     "parse_log_line",
     "read_logs",
     "require_provenance",
-    "setup_application_logging",
     "unwrap_immutable",
 ]

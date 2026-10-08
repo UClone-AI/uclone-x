@@ -46,6 +46,7 @@ from uclone_x.tools.tool_binder import (
     ToolBinder,
     tool_binder_for,
 )
+from uclone_x.tools.tool_ranking import closest_tool_names, unknown_tool_message
 
 # One axis per catalog tool. `file_read` is in the base set, so it is never embedded.
 _AXES = ("alpha_image", "beta_mail", "delta_web", "epsilon_note", "gamma_calc")
@@ -114,6 +115,22 @@ def _tool(tool_name: str, ran: list[str]) -> BaseTool[_Params]:
     return _Named()
 
 
+def _room_tool(ran: list[str]) -> BaseTool[_Params]:
+    """A held tool that a turn outside a room is not offered (`needs_room`): the case F12
+    still refuses once a binding agent binds on call (#2190)."""
+
+    class _RoomOnly(BaseTool[_Params]):
+        name = "zeta_room"
+        description = "The zeta_room tool."
+        needs_room = True
+
+        def run(self, params: _Params, context: ToolContext) -> str:
+            ran.append("zeta_room")
+            return "zeta_room ran"
+
+    return _RoomOnly()
+
+
 def _registry(ran: list[str]) -> ToolRegistry:
     registry = ToolRegistry()
     for name in ("file_read", *_AXES):
@@ -159,6 +176,7 @@ def _agent(
     allowed: tuple[str, ...] = (),
     hooks: tuple[BaseHook, ...] = (),
     store: SessionStore | None = None,
+    registry: ToolRegistry | None = None,
 ) -> BaseAgent:
     return BaseAgent(
         config=AgentConfig(
@@ -169,7 +187,7 @@ def _agent(
             hooks=hooks,
         ),
         llm=wire,
-        tools=_registry(ran),
+        tools=registry if registry is not None else _registry(ran),
         context=AgentContext(session_id="sess_binder", agent_id="binder"),
         tool_binder=binder,
         store=store,
@@ -193,8 +211,8 @@ def _call(name: str, call_id: str = "c1") -> tuple[ToolCallRequest, ...]:
 async def test_each_binding_appends_its_new_tools_sorted_by_name_not_by_score() -> None:
     """`delta_web` scores higher, and still follows `alpha_image`: the append is sorted.
 
-    Killed by: src/uclone_x/agent/tool_invoker.py :: live.bound_tools.extend(sorted(set(hits) - set(live.bound_tools)))
-    Becomes: live.bound_tools.extend(h for h in hits if h not in live.bound_tools)
+    Killed by: src/uclone_x/agent/tools_module.py :: added = sorted(set(hits) - set(bound) - set(held))
+    Becomes: added = [h for h in hits if h not in bound and h not in held]
     """
     embedder = _FakeEmbedder({"web and pictures": _toward({"delta_web": 0.8, "alpha_image": 0.5})})
     wire = _Scripted(["ok"])
@@ -209,8 +227,8 @@ async def test_each_binding_appends_its_new_tools_sorted_by_name_not_by_score() 
 async def test_the_bound_set_only_grows_across_user_messages() -> None:
     """A later message appends; what an earlier one bound stays, in its place.
 
-    Killed by: src/uclone_x/agent/tool_invoker.py :: live.bound_tools.extend(sorted(set(hits) - set(live.bound_tools)))
-    Becomes: live.bound_tools[:] = sorted(set(hits))
+    Killed by: src/uclone_x/agent/tools_module.py :: bound.extend(added)
+    Becomes: bound[:] = added
     """
     embedder = _FakeEmbedder(
         {
@@ -241,8 +259,8 @@ async def test_a_multi_step_turn_sends_one_tools_list_and_a_byte_identical_prefi
     The second step's request extends the first's byte for byte: same tools, and the first
     request's messages as its prefix. The message is embedded once for the whole turn.
 
-    Killed by: src/uclone_x/agent/tool_invoker.py :: return req.model_copy(update={"messages": tuple(messages), "tools": tuple(tool_defs)})
-    Becomes: return req.model_copy(update={"messages": tuple(messages), "tools": tuple(self.advertised_tool_definitions())})
+    Killed by: src/uclone_x/agent/tool_invoker.py :: tools = self.declared_tools(tool_defs)
+    Becomes: tools = self.declared_tools(self.advertised_tool_definitions())
     """
     embedder = _FakeEmbedder({"draw it": _toward({"alpha_image": 0.9})})
     ran: list[str] = []
@@ -586,28 +604,32 @@ async def test_with_no_binder_every_held_tool_is_pinned_in_canonical_order() -> 
 
 @pytest.mark.asyncio
 async def test_a_call_to_a_tool_the_request_did_not_declare_is_refused_in_plain_words() -> None:
-    """`gamma_calc` is held and allowed but not bound, so it was never shown: it does not run.
+    """`zeta_room` is held and allowed but not offered outside a room, so it was never
+    shown, and it is no binding catalog tool either: it does not run.
 
     Killed by: src/uclone_x/agent/tool_execution.py :: and tc.name not in advertised
     Becomes: and tc.name in ()
     """
     embedder = _FakeEmbedder({"draw it": _toward({"alpha_image": 0.9})})
     ran: list[str] = []
-    wire = _Scripted([_call("gamma_calc"), "sorry"])
-    agent = _agent(wire, ToolBinder(embedder), ran)
+    registry = _registry(ran)
+    registry.register(_room_tool(ran))
+    wire = _Scripted([_call("zeta_room"), "sorry"])
+    agent = _agent(wire, ToolBinder(embedder), ran, registry=registry)
 
     result = await agent.execute_turn("draw it")
 
-    assert "gamma_calc" not in _names(wire.requests[0])
+    assert "zeta_room" not in _names(wire.requests[0])
     assert ran == []
     (record,) = result.tool_executions
     assert record.status is ToolResultStatus.ERROR
-    assert record.error == unadvertised_tool_message("gamma_calc")
+    assert record.error == unadvertised_tool_message("zeta_room")
     tool_message = next(m for m in wire.requests[1].messages if m.tool_call_id == "c1")
     text = tool_message.content or ""
     assert "not available this turn" in text
     for internal in ("Traceback", "binder", "allowed_tools", "Error", "sess_"):
         assert internal not in text
+    assert _names(wire.requests[1]) == _names(wire.requests[0])
 
 
 class _PreToolRecorder(BaseHook):
@@ -631,13 +653,15 @@ async def test_an_unadvertised_call_is_refused_before_any_pre_tool_hook_sees_it(
     """
     embedder = _FakeEmbedder({"draw it": _toward({"alpha_image": 0.9})})
     ran: list[str] = []
+    registry = _registry(ran)
+    registry.register(_room_tool(ran))
     recorder = _PreToolRecorder()
     calls = (
-        ToolCallRequest(id="c1", name="gamma_calc", arguments={"text": "x"}),
+        ToolCallRequest(id="c1", name="zeta_room", arguments={"text": "x"}),
         ToolCallRequest(id="c2", name="alpha_image", arguments={"text": "x"}),
     )
     wire = _Scripted([calls, "done"])
-    agent = _agent(wire, ToolBinder(embedder), ran, hooks=(recorder,))
+    agent = _agent(wire, ToolBinder(embedder), ran, hooks=(recorder,), registry=registry)
 
     await agent.execute_turn("draw it")
 
@@ -741,8 +765,9 @@ async def test_a_search_hit_stays_bound_for_the_next_user_message() -> None:
 
 
 @pytest.mark.asyncio
-async def test_a_call_made_beside_the_search_that_found_it_is_still_refused() -> None:
-    """F12 holds: a name the step's own request did not declare does not run."""
+async def test_a_call_made_beside_the_search_that_found_it_is_bound_on_that_call() -> None:
+    """R3 (#2190): the search's hit is a catalog tool in range, so the call beside it runs
+    instead of being refused, and the hit is declared once, from the next request."""
     embedder = _FakeEmbedder({"go": _toward({}), "send mail": _toward({"beta_mail": 0.9})})
     ran: list[str] = []
     both = (*_search("send mail"), *_call("beta_mail", "c2"))
@@ -751,9 +776,10 @@ async def test_a_call_made_beside_the_search_that_found_it_is_still_refused() ->
 
     result = await agent.execute_turn("go")
 
-    assert ran == []
-    refused = next(r for r in result.tool_executions if r.tool_name == "beta_mail")
-    assert refused.error == unadvertised_tool_message("beta_mail")
+    assert ran == ["beta_mail"]
+    ran_record = next(r for r in result.tool_executions if r.tool_name == "beta_mail")
+    assert ran_record.status is ToolResultStatus.SUCCESS
+    assert _names(wire.requests[1]) == ["file_read", "search_tools", "beta_mail"]
 
 
 @pytest.mark.asyncio
@@ -956,3 +982,404 @@ async def test_a_restored_session_of_a_pinning_agent_binds_nothing() -> None:
     await agent.execute_turn("again")
 
     assert _names(wire.requests[0]) == sorted(["file_read", *_AXES])
+
+
+def test_is_short_follow_up_identifies_retry_and_continuation_patterns() -> None:
+    """Short retry/continue directives are recognized in Korean and English (#2168).
+
+    Killed by: src/uclone_x/agent/tool_invoker.py :: return len(cleaned) <= 30 and bool(_FOLLOW_UP_SHORT_PATTERNS.match(cleaned))
+    Becomes: return False
+    """
+    from uclone_x.agent.tool_invoker import is_short_follow_up
+
+    # Positive matches
+    assert is_short_follow_up("다시")
+    assert is_short_follow_up("다시 해봐")
+    assert is_short_follow_up("다시 해줘!")
+    assert is_short_follow_up("다시 그려줘")
+    assert is_short_follow_up("계속해줘")
+    assert is_short_follow_up("재시도")
+    assert is_short_follow_up("한번 더")
+    assert is_short_follow_up("redo")
+    assert is_short_follow_up("retry")
+    assert is_short_follow_up("again!")
+    assert is_short_follow_up("try again")
+
+    # Negative non-matches
+    assert not is_short_follow_up("해변에서 피오나는 비키니를 입고있었어")
+    assert not is_short_follow_up("피오나가 탐정인데 살인사건을 조사하는 스토리는 어떄?")
+    assert not is_short_follow_up("what is the weather today in seoul?")
+
+
+@pytest.mark.asyncio
+async def test_tools_for_turn_retains_last_turn_tool_on_short_follow_up() -> None:
+    """When a short follow-up arrives, tools from last_turn_tool_calls are retained (#2168).
+
+    Killed by: src/uclone_x/agent/tool_invoker.py :: if is_short_follow_up(message):
+    Becomes: if False:
+    """
+    wire = _Scripted(["drawn", "done"])
+    ran: list[str] = []
+    agent = _agent(wire, ToolBinder(_FakeEmbedder({"again": _toward({})})), ran)
+
+    # In room turns, checkpoint_turn clears last_turn_tool_calls to []; the previous turn's
+    # assistant message in history retains the tool call (#2168).
+    call = ToolCallRequest(id="c1", name="alpha_image", arguments={})
+    agent.load_history(
+        [
+            ChatMessage(role=MessageRole.USER, content="draw a cat"),
+            ChatMessage(role=MessageRole.ASSISTANT, content="", tool_calls=(call,)),
+        ],
+        session_id="sess_binder",
+    )
+    live = agent._live_session("sess_binder")  # pyright: ignore[reportPrivateUsage]
+    live.last_turn_tool_calls = []
+    live.bound_tools.clear()
+
+    # "다시 해봐" produces 0 embedding hits, but retains alpha_image from recent messages
+    defs = await agent._tool_invoker.tools_for_turn("다시 해봐", live)  # pyright: ignore[reportPrivateUsage]
+
+    names = [d.name for d in defs]
+    assert "alpha_image" in names
+    assert "alpha_image" in live.bound_tools
+
+
+@pytest.mark.asyncio
+async def test_reseed_bound_tools_post_compaction_retains_recent_catalog_calls() -> None:
+    """Post-compaction reseeding keeps tools from recent turns and drops older ones (#2168).
+
+    Killed by: src/uclone_x/agent/tool_invoker.py :: turn_count > keep_recent_turns:
+    Becomes: turn_count > 0:
+    """
+    wire = _Scripted(["ok"])
+    ran: list[str] = []
+    agent = _agent(wire, ToolBinder(_FakeEmbedder({})), ran)
+
+    def msg_with_call(role: MessageRole, name: str) -> ChatMessage:
+        return ChatMessage(
+            role=role,
+            content=None,
+            tool_calls=(ToolCallRequest(id="c", name=name, arguments={}),),
+        )
+
+    messages = [
+        ChatMessage(role=MessageRole.USER, content="turn 1 (old)"),
+        msg_with_call(MessageRole.ASSISTANT, "gamma_calc"),
+        ChatMessage(role=MessageRole.USER, content="turn 2"),
+        ChatMessage(role=MessageRole.ASSISTANT, content="ok"),
+        ChatMessage(role=MessageRole.USER, content="turn 3"),
+        msg_with_call(MessageRole.ASSISTANT, "alpha_image"),
+        ChatMessage(role=MessageRole.USER, content="turn 4 (recent)"),
+        ChatMessage(role=MessageRole.ASSISTANT, content="ok"),
+    ]
+    agent.load_history(messages, session_id="sess_binder")
+    live = agent._live_session("sess_binder")  # pyright: ignore[reportPrivateUsage]
+    live.bound_tools.clear()
+
+    # Reseed with keep_recent_turns=2: only alpha_image is within the last 2 user turns
+    agent._tool_invoker.reseed_bound_tools_post_compaction(live, keep_recent_turns=2)  # pyright: ignore[reportPrivateUsage]
+
+    assert live.bound_tools == ["alpha_image"]
+    assert "gamma_calc" not in live.bound_tools
+
+
+# --------------------------------------------------------------------------------------
+# Binding recall (#2190): clauses, hybrid ranking, dedupe, bind on call, did-you-mean
+# --------------------------------------------------------------------------------------
+
+
+def _catalog(*names: str) -> list[ToolDefinition]:
+    return [ToolDefinition(name=n, description=f"The {n} tool.", parameters={}) for n in names]
+
+
+@pytest.mark.asyncio
+async def test_each_clause_of_a_two_part_request_binds_its_own_tools() -> None:
+    """R1: the whole message leans to pictures and web and would bind three of those; the
+    mail clause binds `beta_mail` anyway, the web clause binds its top two (not three), and
+    the whole message adds its first. The three queries are embedded in one call.
+
+    Killed by: src/uclone_x/tools/tool_binder.py :: return tuple(dedupe(interleave([*lists, whole[:1]]), message))
+    Becomes: return tuple(dedupe(whole, message)[: self._top_k])
+    """
+    message = "look up the weather, then send a mail"
+    embedder = _FakeEmbedder(
+        {
+            message: _toward({"alpha_image": 0.8, "delta_web": 0.4, "gamma_calc": 0.36}),
+            "look up the weather": _toward(
+                {"delta_web": 0.8, "epsilon_note": 0.4, "gamma_calc": 0.36}
+            ),
+            "send a mail": _toward({"beta_mail": 0.9}),
+        }
+    )
+    binder = ToolBinder(embedder)
+
+    bound = await binder.bind(message, _catalog(*_AXES))
+
+    assert bound == ("delta_web", "beta_mail", "alpha_image", "epsilon_note")
+    assert embedder.query_calls == 3
+
+
+@pytest.mark.asyncio
+async def test_a_clause_binds_at_most_its_per_clause_budget() -> None:
+    """Killed by: src/uclone_x/tools/tool_binder.py :: dedupe(self._fused(clause, vector, catalog), clause)[: self._per_clause]
+    Becomes: dedupe(self._fused(clause, vector, catalog), clause)
+    """
+    message = "look up the weather, then send a mail"
+    embedder = _FakeEmbedder(
+        {
+            message: _toward({"beta_mail": 0.5}),
+            "look up the weather": _toward(
+                {"delta_web": 0.7, "epsilon_note": 0.5, "gamma_calc": 0.45}
+            ),
+            "send a mail": _toward({"beta_mail": 0.9}),
+        }
+    )
+
+    bound = await ToolBinder(embedder).bind(message, _catalog(*_AXES))
+
+    assert bound == ("delta_web", "beta_mail", "epsilon_note")
+
+
+@pytest.mark.asyncio
+async def test_bm25_reorders_the_tools_the_embedding_already_found() -> None:
+    """R1 hybrid: `delta_web` is a little closer by embedding, but only `alpha_image` shares
+    a word with the message, so fusion puts it first.
+
+    Killed by: src/uclone_x/tools/tool_binder.py :: return [name for name in rrf([dense, lexical]) if name in eligible]
+    Becomes: return dense
+    """
+    embedder = _FakeEmbedder({"an alpha sketch": _toward({"delta_web": 0.62, "alpha_image": 0.6})})
+
+    bound = await ToolBinder(embedder, top_k=1).bind("an alpha sketch", _catalog(*_AXES))
+
+    assert bound == ("alpha_image",)
+
+
+@pytest.mark.asyncio
+async def test_bm25_never_binds_a_tool_the_embedding_left_below_the_floor() -> None:
+    """A shared word does not make a tool eligible: restraint stays the embedding's.
+
+    Killed by: src/uclone_x/tools/tool_binder.py :: return [name for name in rrf([dense, lexical]) if name in eligible]
+    Becomes: return rrf([dense, lexical])
+    """
+    embedder = _FakeEmbedder({"alpha and beta, thanks": _toward({"delta_web": 0.5})})
+
+    bound = await ToolBinder(embedder).bind("alpha and beta, thanks", _catalog(*_AXES))
+
+    assert bound == ("delta_web",)
+
+
+class _NamedEmbedder:
+    """Embeds a tool's text by its name and a message by table, over named axes."""
+
+    def __init__(self, axes: Sequence[str], queries: dict[str, dict[str, float]]) -> None:
+        self.axes = tuple(axes)
+        self.queries = queries
+
+    @property
+    def model_name(self) -> str:
+        return "fake-embed"
+
+    @property
+    def dimensions(self) -> int:
+        return len(self.axes) + 1
+
+    async def embed(self, texts: Sequence[str]) -> tuple[tuple[float, ...], ...]:
+        out: list[tuple[float, ...]] = []
+        for text in texts:
+            if text in self.queries:
+                scores = self.queries[text]
+                vector = [scores.get(a, 0.0) for a in self.axes]
+                out.append((*vector, math.sqrt(1.0 - sum(v * v for v in vector))))
+            else:
+                name = text.split(":", 1)[0]
+                out.append((*(1.0 if a == name else 0.0 for a in self.axes), 0.0))
+        return tuple(out)
+
+
+_ISSUES = ("mcp__github__create_issue", "mcp__gitlab__create_issue", "mcp__email__send")
+
+
+@pytest.mark.asyncio
+async def test_one_tool_per_action_across_servers_unless_the_message_names_the_server() -> None:
+    """R2: GitLab's `create_issue` would take a slot from the mail tool; it is bound only
+    when the message names GitLab.
+
+    Killed by: src/uclone_x/tools/tool_binder.py :: return tuple(dedupe(whole, message)[: self._top_k])
+    Becomes: return tuple(whole[: self._top_k])
+    """
+    leaning = {_ISSUES[0]: 0.6, _ISSUES[1]: 0.59, _ISSUES[2]: 0.5}
+    plain, named = "file it for acme", "file it on github and gitlab"
+    embedder = _NamedEmbedder(_ISSUES, {plain: leaning, named: leaning})
+    catalog = _catalog(*_ISSUES)
+
+    assert await ToolBinder(embedder, top_k=2).bind(plain, catalog) == (
+        "mcp__github__create_issue",
+        "mcp__email__send",
+    )
+    assert await ToolBinder(embedder, top_k=2).bind(named, catalog) == _ISSUES[:2]
+
+
+@pytest.mark.asyncio
+async def test_a_catalog_tool_binding_missed_is_bound_on_the_call_and_runs() -> None:
+    """R3: `gamma_calc` is held, in range and not bound; the call that names it runs it,
+    and its schema is appended after everything the turn already sent.
+
+    Killed by: src/uclone_x/agent/tool_execution.py :: and not self._tool_invoker.bind_on_call(tc.name, tool_ctx.session_id)
+    Becomes: and True
+    """
+    embedder = _FakeEmbedder({"draw it": _toward({"alpha_image": 0.9})})
+    ran: list[str] = []
+    wire = _Scripted([_call("gamma_calc"), "done"])
+    agent = _agent(wire, ToolBinder(embedder), ran)
+
+    result = await agent.execute_turn("draw it")
+
+    assert ran == ["gamma_calc"]
+    (record,) = result.tool_executions
+    assert record.status is ToolResultStatus.SUCCESS
+    first, second = (_names(r) for r in wire.requests)
+    assert first == ["file_read", "search_tools", "alpha_image"]
+    assert second == [*first, "gamma_calc"]
+    head = wire.requests[1].messages[: len(wire.requests[0].messages)]
+    assert [m.model_dump_json() for m in head] == [
+        m.model_dump_json() for m in wire.requests[0].messages
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_tool_bound_on_a_call_is_declared_from_the_next_step() -> None:
+    """Killed by: src/uclone_x/agent/tool_invoker.py :: if searched or bound_on_call:
+    Becomes: if searched:
+    """
+    embedder = _FakeEmbedder({"draw it": _toward({"alpha_image": 0.9}), "and?": _toward({})})
+    wire = _Scripted([_call("gamma_calc"), _call("gamma_calc", "c2"), "done", "ok"])
+    ran: list[str] = []
+    agent = _agent(wire, ToolBinder(embedder), ran)
+
+    await agent.execute_turn("draw it")
+    await agent.execute_turn("and?")
+
+    expected = ["file_read", "search_tools", "alpha_image", "gamma_calc"]
+    assert [_names(r) for r in wire.requests[1:]] == [expected] * 3
+    assert ran == ["gamma_calc", "gamma_calc"]
+
+
+@pytest.mark.asyncio
+async def test_a_call_outside_the_range_is_refused_and_binds_nothing() -> None:
+    """R3 binds only inside the clone's range: `gamma_calc` is registered but not allowed,
+    so the call is refused by the range check, nothing runs and nothing is bound.
+
+    Killed by: src/uclone_x/agent/tool_invoker.py :: if name not in {d.name for d in catalog}:
+    Becomes: if False:
+    """
+    embedder = _FakeEmbedder({"draw it": _toward({"alpha_image": 0.9})})
+    ran: list[str] = []
+    wire = _Scripted([_call("gamma_calc"), "sorry"])
+    agent = _agent(
+        wire, ToolBinder(embedder), ran, allowed=("file_read", "alpha_image", "beta_mail")
+    )
+
+    result = await agent.execute_turn("draw it")
+
+    assert ran == []
+    (record,) = result.tool_executions
+    assert record.status is ToolResultStatus.ERROR
+    assert _names(wire.requests[1]) == _names(wire.requests[0])
+    live = agent._live_session("sess_binder")  # pyright: ignore[reportPrivateUsage]
+    assert "gamma_calc" not in live.bound_tools
+    invoker = agent._tool_invoker  # pyright: ignore[reportPrivateUsage]
+    assert invoker.bind_on_call("gamma_calc", "sess_binder") is False
+    assert invoker.bind_on_call("file_read", "sess_binder") is False
+    assert live.bound_tools == ["alpha_image"]
+
+
+@pytest.mark.asyncio
+async def test_an_agent_with_no_binder_binds_nothing_on_a_call() -> None:
+    """With no binder every held tool is declared already, so there is nothing to bind.
+
+    Killed by: src/uclone_x/agent/tool_invoker.py :: if live.tools_pin_all or self._binding is None:
+    Becomes: if live.tools_pin_all:
+    """
+    agent = _agent(_Scripted([]), None, [])
+    live = agent._live_session("sess_binder")  # pyright: ignore[reportPrivateUsage]
+    invoker = agent._tool_invoker  # pyright: ignore[reportPrivateUsage]
+
+    assert invoker.bind_on_call("beta_mail", "sess_binder") is False
+    assert live.bound_tools == []
+
+
+@pytest.mark.asyncio
+async def test_a_misspelled_tool_name_is_told_the_closest_tools_in_plain_words() -> None:
+    """R4: the result names the closest tools the agent may use, best first, and only
+    those: a registered tool outside the range is never suggested.
+
+    Killed by: src/uclone_x/agent/tool_invoker.py :: for d in self.advertised_tool_definitions()
+    Becomes: for d in ()
+    """
+    embedder = _FakeEmbedder({"mail the team": _toward({"beta_mail": 0.9})})
+    ran: list[str] = []
+    wire = _Scripted([_call("beta_mial"), "sorry"])
+    agent = _agent(wire, ToolBinder(embedder), ran, allowed=("file_read", "beta_mail", "delta_web"))
+
+    result = await agent.execute_turn("mail the team")
+
+    (record,) = result.tool_executions
+    assert ran == []
+    assert record.status is ToolResultStatus.ERROR
+    assert record.error == (
+        "There is no tool named 'beta_mial', so nothing was run. "
+        "The closest tools you can use are: beta_mail, delta_web, file_read."
+    )
+    assert _tool_text(wire.requests[1], "c1") == record.error
+
+
+@pytest.mark.asyncio
+async def test_the_did_you_mean_result_carries_no_internals() -> None:
+    """No agent id, session id, permission list, registry or exception text reaches it."""
+    embedder = _FakeEmbedder({"go": _toward({})})
+    wire = _Scripted([_call("mcp__nowhere__lookup"), "sorry"])
+    agent = _agent(wire, ToolBinder(embedder), [], allowed=("file_read", "beta_mail"))
+
+    await agent.execute_turn("go")
+
+    text = _tool_text(wire.requests[1], "c1")
+    assert text.startswith("There is no tool named 'mcp__nowhere__lookup'")
+    for internal in (
+        "binder",
+        "sess_",
+        "allowed_tools",
+        "registry",
+        "Traceback",
+        "Error",
+        "not found",
+        "gamma_calc",
+        "alpha_image",
+    ):
+        assert internal not in text
+
+
+def test_closest_tool_names_reads_the_name_and_the_argument_names() -> None:
+    """Killed by: src/uclone_x/tools/tool_ranking.py :: scored.append((ratio + overlap, index, candidate))
+    Becomes: scored.append((ratio, index, candidate))
+    """
+    candidates = [
+        ("mcp__github__get_pull_request", "Get one pull request.", ["repo", "number"]),
+        ("mcp__email__send", "Send an email.", ["to", "subject", "body"]),
+        ("mcp__email__draft", "Draft an email.", ["to", "subject", "body"]),
+    ]
+
+    assert closest_tool_names("mcp__github__pull_request", [], candidates, 1) == [
+        "mcp__github__get_pull_request"
+    ]
+    # An invented name: by its name part alone `get_pull_request` is closest; the argument
+    # names put the mail tools ahead of it.
+    assert closest_tool_names("lookup", ["subject", "body"], candidates)[-1] == (
+        "mcp__github__get_pull_request"
+    )
+    assert closest_tool_names("lookup", ["repo", "number"], candidates, 1) == [
+        "mcp__github__get_pull_request"
+    ]
+    assert unknown_tool_message("x", []) == (
+        "There is no tool named 'x', so nothing was run. Use only the tools listed in this request."
+    )

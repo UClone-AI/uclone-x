@@ -1,0 +1,14 @@
+{
+  "extName": { "message": "UClone-X" },
+  "extDescription": { "message": "UClone-X 클론이 이 Chrome에서 탭을 사용할 수 있게 합니다. 탭은 눈에 보이는 탭 그룹에 열립니다." },
+  "title": { "message": "이 Chrome을 UClone-X에 연결" },
+  "intro": { "message": "UClone-X 설정 ▸ 브라우저에 있는 연결 코드를 붙여 넣으세요. 그러면 클론이 이 Chrome의 \"UClone-X\" 탭 그룹에 탭을 열고, 클론이 탭을 사용하는 동안 Chrome이 막대를 표시합니다. 그 막대를 닫으면 탭을 되찾습니다." },
+  "codeLabel": { "message": "연결 코드" },
+  "save": { "message": "연결" },
+  "status_unpaired": { "message": "아직 연결되지 않았습니다. 연결 코드를 붙여 넣고 연결을 누르세요." },
+  "status_connecting": { "message": "UClone-X에 연결하는 중입니다…" },
+  "status_connected": { "message": "연결되었습니다. 클론이 이 Chrome을 사용할 수 있습니다." },
+  "status_refused": { "message": "UClone-X가 이 연결 코드를 받아들이지 않았습니다. 코드가 바뀌었을 수 있으니 설정 ▸ 브라우저에서 코드를 다시 복사하세요." },
+  "status_unreachable": { "message": "UClone-X가 응답하지 않았습니다. 실행 중인지 확인한 뒤 설정 ▸ 브라우저에서 코드를 다시 복사하세요." },
+  "notACode": { "message": "연결 코드가 아닙니다. UClone-X 설정 ▸ 브라우저에서 코드 전체를 복사하세요." }
+}

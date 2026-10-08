@@ -23,12 +23,13 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from datetime import UTC, datetime
+from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from uclone_x.core.agent_home import AgentHomeError, refuse_an_unusable_username
+from uclone_x.core.agent_home import AgentHomeError, handle_of, refuse_an_unusable_username
 from uclone_x.core.session import validate_session_id
 from uclone_x.errors import (
     HeadRoomWriteError,
@@ -37,6 +38,7 @@ from uclone_x.errors import (
     RoomError,
     RoomIdError,
     RoomNotFoundError,
+    RoomWorkspaceRefusedError,
     SecondHumanInRoomError,
     UnknownRoomParticipantError,
     UnreadableRoomRecordError,
@@ -50,10 +52,14 @@ from uclone_x.room.models import (
     RoomPolicy,
     RoomState,
     head_room_write_refusal,
-    room_head,
     server_head_of_id,
 )
-from uclone_x.room.protocols import RoomStoreProtocol, StoryLeaseProtocol
+from uclone_x.room.protocols import (
+    RoomStoreProtocol,
+    SeatSessionStoreProtocol,
+    StoryLeaseProtocol,
+)
+from uclone_x.tools.base import in_app_state_dir
 
 __all__ = [
     "SESSION_ID_PREFIX",
@@ -64,6 +70,7 @@ __all__ = [
     "participant_session_id",
     "refuse_an_underivable_id",
     "refuse_another_heads_id",
+    "seat_sessions",
 ]
 
 logger = logging.getLogger(__name__)
@@ -95,6 +102,44 @@ def participant_session_id(room_id: str, participant_id: str) -> str:
     return (
         f"{SESSION_ID_PREFIX}{SESSION_ID_SEPARATOR}{room_id}{SESSION_ID_SEPARATOR}{participant_id}"
     )
+
+
+def seat_sessions(state: RoomState) -> tuple[str, ...]:
+    """Every seat session id this room used: current roster plus departed agents (#1427).
+
+    Preserves order of first appearance: current roster agents first, then departed agents
+    found in the transcript.
+    """
+    seen: set[str] = set()
+    sessions: list[str] = []
+
+    def _add(sid: str) -> None:
+        if sid and sid not in seen:
+            seen.add(sid)
+            sessions.append(sid)
+
+    for p in state.participants:
+        if p.kind is ParticipantKind.AGENT:
+            _add(p.session_id or participant_session_id(state.room_id, p.id))
+
+    human_ids = {p.id for p in state.participants if p.kind is ParticipantKind.HUMAN}
+    for m in state.transcript:
+        if (
+            m.sender_id
+            and m.sender_id not in human_ids
+            and (
+                m.is_utterance
+                or m.decision is not None
+                or m.provenance is not None
+                or m.kind in (RoomMessageKind.JOIN, RoomMessageKind.LEAVE)
+            )
+        ):
+            try:
+                _add(participant_session_id(state.room_id, m.sender_id))
+            except RoomError:
+                pass
+
+    return tuple(sessions)
 
 
 def _refuse_an_id_the_derivation_cannot_carry(label: str, value: str) -> None:
@@ -135,8 +180,9 @@ _SERVER_HEAD_ID_OWNERS = {
 def refuse_another_heads_id(room_id: str, head: str | None, *, label: str = "Room id") -> None:
     """Refuse `room_id` when it has a server head's id shape and `head` is not that head.
 
-    `room_head` reads an unmarked `acp_`/`a2a_` + 24-hex room as that head's (#1890), so
-    only that head may mint one (#1885). Worded for any creator -- `ucx room create --id`,
+    An `acp_`/`a2a_` + 24-hex id is the one that head's `conversation_room_id` derives, so
+    only that head may mint one (#1885): a room another creator made there would be refused
+    to the head at its next turn. Worded for any creator -- `ucx room create --id`,
     another head's `--session-id` -- with no flag in it. `label` names the id as the
     person typed it: `run` and `loop` take it as a session id (#1900). A head checks a new
     id with it before its first turn runs, since the room is written only after that turn.
@@ -252,6 +298,10 @@ class RoomSummary(BaseModel):
     agent_ids: tuple[str, ...]
     human_ids: tuple[str, ...]
     message_count: int = Field(description="Every transcript row, membership rows included.")
+    utterance_count: int = Field(
+        default=0,
+        description="The number of messages in the transcript, membership rows excluded.",
+    )
     updated_at: str = Field(
         description="The room record's last write, as the store stamped it: a message, a "
         "reply, a rename, a roster change, or a composing notice. What `list_rooms` orders by."
@@ -308,15 +358,26 @@ class RoomService:
     """Creates rooms and edits their rosters. The Core half of `ucx room`."""
 
     def __init__(
-        self, store: RoomStoreProtocol, *, stories: StoryLeaseProtocol | None = None
+        self,
+        store: RoomStoreProtocol,
+        *,
+        stories: Callable[[Path | None], StoryLeaseProtocol] | None = None,
+        sessions: SeatSessionStoreProtocol | None = None,
+        import_workspace_personas: Callable[[Path], object] | None = None,
     ) -> None:
         """`stories` gives back a deleted room's lease on its story (#1565).
 
-        Without it, deleting a room that has a story open is refused rather than leaving
-        the lease held by a conversation that no longer exists.
+        It is given the room's workspace (`None` for the server's), since a story lives in
+        the workspace of the conversation that opened it (clone-data-scopes §3.6). Without it, deleting a room that has a story open is refused rather than leaving
+        the lease held by a conversation that no longer exists. `sessions` removes each seat's
+        session record when the room is deleted (#1427).
+        `import_workspace_personas` imports a folder's personas as clones when a room moves
+        to it (§3.8 step 2); it is the agent layer's, so the caller supplies it.
         """
         self._store = store
         self._stories = stories
+        self._sessions = sessions
+        self._import_workspace_personas = import_workspace_personas
 
     # -- rooms -------------------------------------------------------------------------
 
@@ -349,9 +410,7 @@ class RoomService:
                 derivation cannot carry unambiguously.
             RoomAlreadyExistsError: `room_id` already names a stored room.
             RoomError: `room_id` has the shape an ACP or A2A head's room id has
-                (`server_head_of_id`) and `head` is not that head (#1885). An unmarked
-                room under such an id is read as that head's, so a room another creator
-                made there would be refused everywhere, its maker included.
+                (`server_head_of_id`) and `head` is not that head (#1885).
         """
         cleaned = _clean_title(title)
 
@@ -400,7 +459,7 @@ class RoomService:
     def _writable(self, room_id: str) -> RoomState:
         """The room under `room_id`, for a change made from outside it; refused in a head's.
 
-        A room has a single owner (owner ruling). A room a head keeps (`room_head`) is
+        A room has a single owner (owner ruling). A room a head keeps (`RoomState.head`) is
         written by that head alone, so every change a person asks for here -- rename,
         roster, responder, rewind, clear, opening a story -- is refused before anything is
         saved (#1885). Here rather than only in the app's route guard, so `ucx room add`,
@@ -413,7 +472,7 @@ class RoomService:
             HeadRoomWriteError: A head keeps the room.
         """
         state = self.get(room_id)
-        head = room_head(state)
+        head = state.head
         if head is not None:
             raise HeadRoomWriteError(head_room_write_refusal(head))
         return state
@@ -460,6 +519,51 @@ class RoomService:
         state = self.get(room_id) if story_id is None else self._writable(room_id)
         return self._store.save(state.model_copy(update={"story_id": story_id}))
 
+    def set_workspace(self, room_id: str, workspace: str | None) -> RoomState:
+        """Make `workspace` the folder this room's clones work in; None for the server's.
+
+        Applies from each seat's next turn (clone-data-scopes §3.6). Before the change is
+        saved, the personas in the new folder's `.uclone/personas/` are imported as clones
+        (§3.8 step 2), so a persona kept in another project is not lost when it is used.
+
+        Raises:
+            RoomNotFoundError: No room under that id.
+            HeadRoomWriteError: A head keeps the room.
+            RoomWorkspaceRefusedError: The path is not an absolute path to an existing
+                folder, it is at or inside the app's own state folders, or the room has a
+                story open (it lives in the current workspace; close it first). Its `code`
+                says which.
+            StaleRoomWriteError: Another writer moved the room first.
+        """
+        state = self._writable(room_id)
+        resolved: str | None = None
+        if workspace is not None:
+            path = Path(workspace).expanduser()
+            if not path.is_absolute() or not path.is_dir():
+                raise RoomWorkspaceRefusedError(
+                    f"'{workspace}' is not an existing folder given by its full path, so the "
+                    "conversation's workspace was not changed.",
+                    "not_a_folder",
+                )
+            if in_app_state_dir(path.resolve()):
+                raise RoomWorkspaceRefusedError(
+                    f"'{workspace}' holds this app's own clones and conversations, so it "
+                    "cannot be a conversation's workspace.",
+                    "app_state",
+                )
+            resolved = str(path.resolve())
+        if resolved == state.workspace:
+            return state
+        if state.story_id is not None:
+            raise RoomWorkspaceRefusedError(
+                "This conversation has a story open, and the story lives in its current "
+                "workspace. Close the story first, then change the workspace.",
+                "story_open",
+            )
+        if resolved is not None and self._import_workspace_personas is not None:
+            self._import_workspace_personas(Path(resolved))
+        return self._store.save(state.model_copy(update={"workspace": resolved}))
+
     def forget_story(self, story_id: str) -> tuple[str, ...]:
         """Clear `story_id` from every room that has it open; return those rooms' ids.
 
@@ -485,15 +589,17 @@ class RoomService:
     def delete(self, room_id: str) -> bool:
         """Remove the room; return whether one was there to remove.
 
-        The story the room had open is not part of it and stays where it is (#1555). Only
-        its writing lease is given back, so the next conversation to open the story can
-        write it without taking it over (#1565). A record that is there and will not load
-        is removed all the same (#1440); which story it had open cannot be read from it.
+        Seat session records are removed before the room record (#1427). The story the room
+        had open is not part of it and stays where it is (#1555). Only its writing lease is
+        given back, so the next conversation to open the story can write it without taking it
+        over (#1565). A record that is there and will not load is removed all the same (#1440);
+        which story it had open cannot be read from it.
 
         Raises:
             RoomError: The room has a story open and this service was built without
-                `stories`. Nothing was deleted.
+                `stories`. Nothing was deleted. Or a seat session could not be removed.
         """
+        state: RoomState | None = None
         story_id: str | None = None
         try:
             state = self._store.load(room_id)
@@ -506,9 +612,19 @@ class RoomService:
                 "This conversation has a story open, and the story cannot be closed from "
                 "here, so the conversation was not deleted."
             )
+        if state is not None and self._sessions is not None:
+            for session_id in seat_sessions(state):
+                try:
+                    self._sessions.delete(session_id)
+                except Exception as exc:
+                    raise RoomError(
+                        f"The conversation {room_id!r} could not be deleted because its seat "
+                        f"session {session_id!r} could not be removed."
+                    ) from exc
         removed = self._store.delete(room_id)
-        if story_id is not None and self._stories is not None:
-            self._release_story(self._stories, story_id, room_id)
+        if story_id is not None and self._stories is not None and state is not None:
+            workspace = Path(state.workspace) if state.workspace is not None else None
+            self._release_story(self._stories(workspace), story_id, room_id)
         return removed
 
     @staticmethod
@@ -542,7 +658,7 @@ class RoomService:
         **The order is the Core's, not each head's** (#1053). Most recently updated first,
         equal stamps by `room_id` ascending. It is decided here because a second head on
         the same Core needs the same order, and one that sorted for itself would be free
-        to disagree with this one; see `docs/ui-dashboard-architecture.md` §3.
+        to disagree with this one; see the dashboard architecture document.
 
         A room whose document will not validate is skipped rather than raising: one
         unreadable record must not make the listing — the only way to find any of the
@@ -612,6 +728,7 @@ class RoomService:
                         p.id for p in state.participants if p.kind is ParticipantKind.HUMAN
                     ),
                     message_count=len(state.transcript),
+                    utterance_count=sum(1 for m in state.transcript if m.is_utterance),
                     updated_at=state.updated_at,
                 )
             )
@@ -628,7 +745,6 @@ class RoomService:
         display_name: str = "",
         persona_summary: str = "",
         aliases: tuple[str, ...] = (),
-        persona: str = "",
     ) -> RoomState:
         """Seat a participant, deriving its own session and ontology namespace.
 
@@ -652,7 +768,6 @@ class RoomService:
                 display_name=display_name,
                 persona_summary=persona_summary,
                 aliases=aliases,
-                persona=persona,
             )
         )
 
@@ -665,7 +780,6 @@ class RoomService:
         display_name: str = "",
         persona_summary: str = "",
         aliases: tuple[str, ...] = (),
-        persona: str = "",
     ) -> RoomState:
         """`state` with `participant_id` seated and its join row appended; nothing saved.
 
@@ -734,14 +848,21 @@ class RoomService:
                     f"{participant_id!r} cannot be seated in room {room_id!r} as an agent: {exc}"
                 ) from exc
         effective_summary = persona_summary
-        if is_agent and not effective_summary:
-            lookup_key = persona or participant_id
+        fallback_name = participant_id
+        if is_agent:
+            # An agent's seat is its clone's id (clone-data-scopes §4 step 3); the persona
+            # is looked up by it, and a seat named no display name shows the clone's handle,
+            # read from the clone's own file: the registry's copy predates any clone made
+            # after it loaded, and would name the seat by its id.
+            fallback_name = handle_of(participant_id) or participant_id
             try:
                 from uclone_x.agent.persona_registry import get_default_persona_registry
 
-                persona_def = get_default_persona_registry().get_persona(lookup_key)
-                if persona_def is not None:
-                    effective_summary = persona_def.description or persona_def.role
+                registry = get_default_persona_registry()
+                if not effective_summary:
+                    persona_def = registry.get_persona(participant_id)
+                    if persona_def is not None:
+                        effective_summary = persona_def.description or persona_def.role
             except Exception:
                 pass
 
@@ -751,13 +872,12 @@ class RoomService:
             # Stripped, and falling back to the id: `"   "` is truthy, so an all-whitespace
             # name was kept and every render of that participant — the join row included —
             # showed a gap where a name goes.
-            display_name=display_name.strip() or participant_id,
+            display_name=display_name.strip() or fallback_name,
             persona_summary=effective_summary,
             aliases=aliases,
             # A human has no agent session; stamping one would claim a record that nothing
             # writes. An agent's knowledge is its clone's, not the seat's (step 6).
             session_id=participant_session_id(room_id, participant_id) if is_agent else "",
-            persona=persona if is_agent else "",
         )
         note = self._membership_row(
             state,

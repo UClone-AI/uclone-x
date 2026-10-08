@@ -27,7 +27,7 @@ site (as ``src/uclone_x/skills/auditor.py`` now does — see
 for that code-level regression), fixes *this* occurrence but proves nothing about
 whether the *next* field with the same shape is safe.
 
-WHAT THE ONTOLOGY FORM BUYS, AND WHAT IT DOES NOT (docs/ontology-architecture-v2.md,
+WHAT THE ONTOLOGY FORM BUYS, AND WHAT IT DOES NOT (the ontology architecture document,
 issue #138)
 
 Model approval as a class membership *entailed* from two independent facts —

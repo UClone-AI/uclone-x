@@ -65,6 +65,21 @@ def test_parse_loop_command_input_natural_language_korean() -> None:
     assert prompt == "리포트 생성"
 
 
+def test_a_full_stop_after_the_interval_is_not_the_start_of_the_prompt() -> None:
+    r"""`/loop 10분 마다. <prompt>` ran `. <prompt>` every ten minutes (#1936).
+
+    A leading `./path` is still the prompt's: only a `.` standing alone goes.
+
+    Killed by: src/uclone_x/agent/loop/parser.py :: |\.(?=\s|$))+", "", prompt
+    Becomes: )+", "", prompt
+    """
+    assert parse_loop_command_input("10분 마다. 산책하는 장면을 그려줘") == (
+        600.0,
+        "산책하는 장면을 그려줘",
+    )
+    assert parse_loop_command_input("5분마다 ./ucx test check") == (300.0, "./ucx test check")
+
+
 def test_parse_loop_command_input_natural_language_english() -> None:
     seconds, prompt = parse_loop_command_input("every 5 minutes check git log and report")
     assert seconds == 300.0

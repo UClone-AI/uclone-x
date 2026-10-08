@@ -18,7 +18,7 @@ const answer = (status: number, body: unknown = {}) =>
 const pictureRoutes = (...replies: Response[]) => {
   const calls: [string, RequestInit][] = [];
   const fetchMock = vi.fn(async (url: string, init: RequestInit = {}) => {
-    if (!url.startsWith('/api/personas/')) return answer(200, {});
+    if (!url.startsWith('/api/clones/')) return answer(200, {});
     calls.push([url, init]);
     return replies.shift() ?? answer(200, { status: 'ok' });
   });
@@ -55,7 +55,7 @@ afterEach(() => {
 });
 
 describe('Use as avatar, under a drawn picture', () => {
-  // Killed by: frontend/src/components/RichText.tsx :: {path && <UseAsAvatar path={path} />}
+  // Killed by: frontend/src/components/ImageCard.tsx :: {path && <UseAsAvatar path={path} />}
   // Becomes: {false && <UseAsAvatar path={path} />}
   // Killed by: frontend/src/components/avatar/UseAsAvatar.tsx :: onClick={() => void give(author)}
   // Becomes: onClick={() => void give('')}
@@ -68,7 +68,7 @@ describe('Use as avatar, under a drawn picture', () => {
 
     await waitFor(() => expect(screen.getByTestId('use-as-avatar-done')).toBeInTheDocument());
     const [url, init] = calls[0];
-    expect(url).toBe('/api/personas/scout/avatar');
+    expect(url).toBe('/api/clones/scout/avatar');
     expect(JSON.parse(init.body as string)).toEqual({ source_path: PICTURE });
     expect(screen.getByTestId('use-as-avatar-done')).toHaveTextContent('scout');
     expect(value.onChanged).toHaveBeenCalledTimes(1);
@@ -85,7 +85,7 @@ describe('Use as avatar, under a drawn picture', () => {
     fireEvent.click(screen.getByTestId('use-as-avatar-for-critic'));
 
     await waitFor(() => expect(screen.getByTestId('use-as-avatar-done')).toHaveTextContent('critic'));
-    expect(calls[0][0]).toBe('/api/personas/critic/avatar');
+    expect(calls[0][0]).toBe('/api/clones/critic/avatar');
     expect(screen.queryByTestId('use-as-avatar-list')).toBeNull();
   });
 

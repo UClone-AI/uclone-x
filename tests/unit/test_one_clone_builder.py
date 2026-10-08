@@ -18,6 +18,7 @@ from typing import Any, cast
 import pytest
 
 from tests.support.app_clone import app_clone
+from tests.support.clones import make_clones
 from uclone_x.agent.base import BaseAgent
 from uclone_x.llm import MockLLMConnector
 from uclone_x.room.models import ParticipantKind
@@ -35,6 +36,10 @@ def _chat_and_seat(tmp_path: Path, clone_id: str) -> tuple[BaseAgent, BaseAgent]
 
     with pytest.MonkeyPatch.context() as mp:
         mp.setenv(AGENTS_DIR_ENV_VAR, str(tmp_path / "agents"))
+        # A persona-less clone of that handle, which is what an unknown name was before
+        # clones were stored (clone-data-scopes §3.4); `writer` is installed at start.
+        if clone_id != "writer":
+            make_clones(clone_id)
         mgr = AgentSessionManager(
             storage_dir=tmp_path / "sessions",
             llm=MockLLMConnector(),
@@ -123,22 +128,25 @@ def test_a_cli_clone_picks_its_model_as_the_app_does(
     `ucx run` used to pass its saved model as `model_name`, which wins over the persona's
     own: the same clone ran on a different model in the terminal than in the desktop app.
 
-    `run` and `loop` now pass `--model` alone as `model_name` and the saved choice as
-    `saved_models`; this pins what the builder does with the two.
+    `run` and `loop` now pass `--model` alone as `model_name` and their connector and the
+    saved choice as the gateway's default binding (`command_gateway`); a persona's own
+    model ref is served from its connection (model-gateway §3.4). This pins what the
+    builder does with the three.
 
-    Killed by: src/uclone_x/agent/clone_builder.py :: return lambda: (model, None)
-    Becomes: return None
+    Killed by: src/uclone_x/agent/clone_builder.py :: return ModelGateway(default_binding=DefaultBinding(llm, model))
+    Becomes: return ModelGateway()
     """
     from uclone_x.agent.clone_builder import (
         build_clone,
+        command_gateway,
         local_app_scope,
         memory_map,
-        saved_models,
     )
     from uclone_x.agent.models import AgentLLMConfig, PersonaDefinition
     from uclone_x.agent.persona_registry import PersonaRegistry
     from uclone_x.agent.session import SessionStore
     from uclone_x.engine.event_bus import EventBus
+    from uclone_x.llm.connectors.saved_choice import settings_file
     from uclone_x.memory.store import CrossSessionMemory
     from uclone_x.telemetry import TelemetryTracer
     from uclone_x.tools.registry import ToolRegistry
@@ -149,16 +157,20 @@ def test_a_cli_clone_picks_its_model_as_the_app_does(
             name="scribe",
             role="Scribe",
             system_prompt="You write.",
-            llm_config=AgentLLMConfig(model_name="persona-model"),
+            llm_config=AgentLLMConfig(model_name="box/persona-model"),
         )
     )
+    settings = settings_file()
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    settings.write_text('{"connections": [{"id": "box", "kind": "mock"}]}', encoding="utf-8")
+    command_llm = MockLLMConnector()
     app = local_app_scope(
         workspace_root=tmp_path,
-        llm=MockLLMConnector(),
+        llm=command_llm,
         tools=ToolRegistry(),
         persona_registry=registry,
         memory_for=memory_map(lambda cid: CrossSessionMemory(storage_path=tmp_path / cid)),
-        global_models=saved_models("saved-model"),
+        gateway=command_gateway(command_llm, "saved-model"),
         bus=EventBus(),
         tracer=TelemetryTracer(),
         store=SessionStore(tmp_path / "sessions"),
@@ -167,6 +179,8 @@ def test_a_cli_clone_picks_its_model_as_the_app_does(
     agent = build_clone(app, clone_id=clone_id, session_id="s", model_name=asked).agent
 
     assert agent.config.llm_config.model_name == expected
+    # The persona's own ref runs on its own connection; everything else on the command's.
+    assert (agent.llm is command_llm) is (expected != "persona-model")
 
 
 @pytest.mark.parametrize(

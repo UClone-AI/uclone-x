@@ -35,6 +35,7 @@ class MockLLMConnector(BaseLLMConnector):
         streaming_chunk_delay: float = 0.0,
         timeout: float = 60.0,
         model: str | None = None,
+        reads_images: bool = False,
     ) -> None:
         # Accepted and recorded although nothing here waits on a socket, so that
         # `create_llm_connector(provider=..., timeout=...)` means the same thing for every
@@ -52,6 +53,9 @@ class MockLLMConnector(BaseLLMConnector):
         self._default_model = model.strip() if model and model.strip() else default_model
         self.latency_seconds: float = max(0.0, latency_seconds)
         self.streaming_chunk_delay: float = max(0.0, streaming_chunk_delay)
+        #: What `accepts_images` answers: a test that needs a model which reads images
+        #: says so here, since the mock has no listing to read it from (#2107).
+        self.reads_images = reads_images
 
     @property
     def paid(self) -> bool:
@@ -60,6 +64,10 @@ class MockLLMConnector(BaseLLMConnector):
     @property
     def provider_name(self) -> str:
         return "mock"
+
+    async def accepts_images(self, model: str | None = None) -> bool:
+        """`reads_images`, whatever the model: the mock has no listing (#2107)."""
+        return self.reads_images
 
     @property
     def call_count(self) -> int:

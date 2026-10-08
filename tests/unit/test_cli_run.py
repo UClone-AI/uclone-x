@@ -18,6 +18,7 @@ import pytest
 from typer.testing import CliRunner
 
 from tests.support import nonblocking_stdout
+from tests.support.clones import make_clones
 from uclone_x.agent import clone_builder
 from uclone_x.agent.hooks import BaseHook, HookAction, HookContext, HookDecision
 from uclone_x.agent.models import AgentLLMConfig, TurnResult
@@ -25,6 +26,7 @@ from uclone_x.agent.prompts import HONEST_REPORTING
 from uclone_x.agent.session import SessionState, SessionStore, default_session_storage_dir
 from uclone_x.cli import main
 from uclone_x.cli.commands import run
+from uclone_x.core.agent_home import seat_id_for
 from uclone_x.core.provenance import Provenance
 from uclone_x.errors import (
     LLMCredentialsNotConfiguredError,
@@ -51,6 +53,72 @@ from uclone_x.telemetry import TelemetryTracer
 from uclone_x.tools import LocalTool, ToolRegistry
 
 runner = CliRunner()
+
+# The agent names these tests run under. Each is a clone now, since a name no clone
+# carries is refused rather than given a home (clone-data-scopes §3.4); they are
+# persona-less, so each still speaks as the CLI's composed default, as it did before.
+_RUN_CLONES = (
+    "blank-agent",
+    "piped",
+    "pipe-agent",
+    "overflow",
+    "tty-agent",
+    "budgeted",
+    "code-agent",
+    "compactor",
+    "double",
+    "extra-agent",
+    "extra-repl",
+    "failing-agent",
+    "fine-agent",
+    "gemini-agent",
+    "guarded",
+    "guarded-repl",
+    "hangul",
+    "interactive-agent",
+    "irq-agent",
+    "irq-failed",
+    "irq-guarded",
+    "irq-save",
+    "irq-write",
+    "labelled",
+    "marked",
+    "markup-agent",
+    "operator-agent",
+    "own-model",
+    "prompt-agent",
+    "quiet-agent",
+    "raw-agent",
+    "readonly",
+    "refused",
+    "repl-agent",
+    "repl-ctl",
+    "repl-drain",
+    "repl-drop",
+    "repl-irq",
+    "repl-order",
+    "repl-saver",
+    "saver",
+    "spanned",
+    "tag-agent",
+    "test-agent",
+    "tooler",
+    # One-seat room runs (#1897, #1921).
+    "broken",
+    "keeper",
+    "looper",
+    "owner",
+    "quiet",
+    "resumer",
+    "seated",
+    "shown",
+    "visitor",
+)
+
+
+@pytest.fixture(autouse=True)
+def _run_clones() -> None:  # pyright: ignore[reportUnusedFunction]
+    make_clones(*_RUN_CLONES)
 
 
 def test_get_default_llm_and_mock_resolution() -> None:
@@ -380,7 +448,7 @@ async def test_repl_exports_each_span_once_and_leaves_the_buffer_drained(
     assert len(exported) == len(set(exported)), "a span was exported more than once"
     # Drained every turn: an undrained REPL grows for the life of the process.
     assert tracer.get_completed_spans() == ()
-    assert tracer.dropped_span_count == 0
+    assert tracer.buffer_evicted_span_count == 0
 
 
 @pytest.mark.asyncio
@@ -400,7 +468,7 @@ async def test_repl_accounts_for_spans_lost_to_a_failing_exporter(
 
     assert exporter.batches, "the harness never reached the export call"
     assert tracer.get_completed_spans() == ()
-    assert tracer.dropped_span_count > 0, "spans vanished with no accounting"
+    assert tracer.buffer_evicted_span_count > 0, "spans vanished with no accounting"
     assert set(tracer.drop_reasons) == {"cli_export_failed"}
 
 
@@ -494,16 +562,33 @@ def _assistant_texts(store: SessionStore, session_id: str) -> list[str]:
 
 
 def _seat(room_id: str, agent: str) -> str:
-    """The session `agent` keeps in room `room_id` -- where a `--session-id` run saves."""
-    return participant_session_id(room_id, agent)
+    """The session `agent` keeps in room `room_id` -- where a `--session-id` run saves.
+
+    A seat is keyed by the clone's id (clone-data-scopes §4 step 3), so the handle a run
+    names is resolved first.
+    """
+    return participant_session_id(room_id, seat_id_for(agent))
+
+
+def _brought_up_seat(agent: str, workspace: Path) -> str:
+    """`agent`'s seat id once the registry has brought the built-in clones up, as a run does.
+
+    A built-in persona's clone exists only after `get_default_persona_registry` has run
+    (clone-data-scopes §3.8); a room a test seats before the run must use the same id.
+    """
+    from uclone_x.agent.persona_registry import get_default_persona_registry
+
+    get_default_persona_registry(workspace.resolve())
+    return seat_id_for(agent)
 
 
 def _only_seat(store: SessionStore, agent: str) -> str:
     """The one seat session `agent` holds, for a run that started a room of its own."""
+    seat = seat_id_for(agent)
     ids = [
         s
         for s in store.list_session_ids()
-        if s.startswith("sess_room__") and s.endswith(f"__{agent}")
+        if s.startswith("sess_room__") and s.endswith(f"__{seat}")
     ]
     assert len(ids) == 1, ids
     return ids[0]
@@ -639,7 +724,7 @@ def test_a_retired_model_is_reported_with_the_flag_that_changes_it(
 ) -> None:
     """`ucx run` on a model the provider no longer serves names it and says `--model` (#1630).
 
-    Killed by: src/uclone_x/cli/commands/run.py :: "model_unavailable": "Choose a model with --model.",
+    Killed by: src/uclone_x/cli/remedies.py :: "model_unavailable": "Choose a model with --model.",
     Becomes: "model_unavailable_unused": "Choose a model with --model.",
     """
     from uclone_x.errors import ModelNotAvailableError
@@ -759,7 +844,7 @@ def test_a_rejected_key_names_where_that_key_came_from(
     Killed by: src/uclone_x/cli/commands/run.py :: remedy = provider_key_remedy(result.provider_failure.provider)
     Becomes: remedy = provider_key_remedy(None)
 
-    Killed by: src/uclone_x/cli/commands/run.py :: return f"Set a new key in {overriding[1]}."
+    Killed by: src/uclone_x/cli/remedies.py :: return f"Set a new key in {overriding[1]}."
     Becomes: return f"Save a new key with `ucx key set {spec.id}`."
     """
     from uclone_x.agent.models import ProviderFailure
@@ -985,6 +1070,9 @@ def test_a_failed_repl_turn_keeps_the_repl_alive_and_is_not_shown_as_a_reply(
     answered = llm.generate.return_value
     llm.generate = AsyncMock(side_effect=[RuntimeError(_TURN_FAILURE), answered])
     _use_connector(monkeypatch, llm)
+    monkeypatch.setattr(
+        "uclone_x.agent.base.BaseAgent._case_skill_section", AsyncMock(return_value=None)
+    )
     _feed_prompts(monkeypatch, "first question", "second question", "/exit")
 
     result = runner.invoke(main.app, ["run", "repl-agent", "--cwd", str(tmp_path)])
@@ -1158,8 +1246,10 @@ def test_single_shot_notices_name_the_agent_and_session_verbatim_on_stderr(
 
     assert result.exit_code == 0, result.output
     assert result.stdout == "ok\n"
-    assert f"Resumed session {_seat('s[i]', 'markup-agent')} —" in result.stderr
-    assert f"Session '{_seat('s[i]', 'markup-agent')}' reset before start" in result.stderr
+    # Rich wraps at 80 columns, and a seat id carrying the clone's id is long.
+    said = " ".join(result.stderr.split())
+    assert f"Resumed session {_seat('s[i]', 'markup-agent')} —" in said
+    assert f"Session '{_seat('s[i]', 'markup-agent')}' reset before start" in said
     assert "markup-agent:" in result.stderr
 
 
@@ -1237,7 +1327,7 @@ def test_the_repl_prints_replies_history_and_identifiers_verbatim(
     assert f"markup-agent:\n{reply}\n" in out
     assert "[user #1] q[i] asks [/bold]" in out
     assert f"[assistant #2] {reply}" in out
-    assert "Agent ID:          markup-agent" in out
+    assert f"Agent ID:          {seat_id_for('markup-agent')}" in out
     assert f"Session ID:        {_seat('s[i]', 'markup-agent')}" in out
     assert "Agent Domain: markup-agent" in out
     assert f"Session '{_seat('s[i]', 'markup-agent')}' reset" in out
@@ -1307,7 +1397,7 @@ def _collide_session_id(asked: str, stored: str) -> None:
             "collision",
             ["--session-id", "k[i]"],
             2,
-            "Unusable --session-id 'sess_room__k[i]__refused': a session",
+            "Unusable --session-id '{seat}': a session",
         ),
         ("provider", ["--provider", "bad[i]"], 1, "LLM Error: Unsupported LLM provider: bad[i]"),
     ],
@@ -1339,16 +1429,17 @@ def test_startup_refusals_print_the_users_text_verbatim(
     )
 
     assert result.exit_code == exit_code, result.output
-    assert shown in result.output
+    # The seat session carries the clone's id, so the collision line is formatted here.
+    assert shown.format(seat=_seat("k[i]", "refused")) in " ".join(result.output.split())
     if case == "traversal":
         assert "'../x[i]'" in result.output
     if case == "collision":
         # Rich wraps at 80 columns: at a space for the prose, mid-word for a long path.
         words = " ".join(result.output.split())
-        assert "named 'sess_room__K[i]__refused' already occupies" in words
-        assert "identifies session 'sess_room__K[i]__refused'" in words
+        assert f"named '{_seat('K[i]', 'refused')}' already occupies" in words
+        assert f"identifies session '{_seat('K[i]', 'refused')}'" in words
         # Twice: in the headline and in the exception text under it.
-        assert result.output.replace("\n", "").count("sess_room__k[i]__refused.json") == 2
+        assert result.output.replace("\n", "").count(f"{_seat('k[i]', 'refused')}.json") == 2
 
 
 # ======================================================================================
@@ -1470,7 +1561,7 @@ def test_a_hook_blocked_single_shot_turn_exits_1_naming_the_hook_with_nothing_on
     exited 0 -- a mutation PR #955's review showed no test caught. The stderr label names
     the hook: `Execution failed: PII detected in prompt` did not say who refused. The
     persisted session holds only the system message, because the block happens before the
-    prompt is appended; `docs/cli-specification.md` §4 says so.
+    prompt is appended; the CLI reference's exit-status table says so.
 
     Killed by: src/uclone_x/agent/turn_executor.py :: stop_reason = "blocked_by_hook"
     Becomes: stop_reason = "not_started"
@@ -2029,7 +2120,7 @@ def test_a_reply_neither_saved_nor_written_exits_1_and_does_not_claim_the_turn_w
 ) -> None:
     """Both losses at once: stderr names both, and neither report says the turn was kept.
 
-    `docs/cli-specification.md` §4: if the save failed too, both are reported and the status
+    The CLI reference's exit-status table: if the save failed too, both are reported and the status
     is still 1, since no reply reached the script. The note under the unwritten reply
     ("The turn was saved; --session-id resumes it.") is true only when the save succeeded;
     beside a failed save it would send a script to resume a turn that does not exist.
@@ -2192,7 +2283,7 @@ def test_an_interrupt_during_the_save_of_a_hook_blocked_single_shot_turn_still_r
 ) -> None:
     """The hook-block half of the same promise: that report also comes before the save.
 
-    `docs/cli-specification.md` §4's `130` row promises that `✖ Turn blocked by hook`, like
+    The CLI reference's exit-status `130` row promises that `✖ Turn blocked by hook`, like
     `✖ Execution failed`, survives an interrupt inside the save. The test above pins only
     the failed-turn branch. PR #1002's review moved the hook-block report alone back below
     the save and every test passed (#1005). A second Ctrl+C there left `Interrupted by
@@ -2227,12 +2318,11 @@ def test_a_reply_that_overfills_a_non_blocking_pipe_leaves_its_start_on_stdout_a
     non-blocking pipe that nobody reads goes in part-way and then fails with
     `BlockingIOError` (EAGAIN). Those bytes are the reader's; nothing in the process can take
     them back. So the specification is what changed: the row now says a prefix can remain,
-    and this test holds the row to the bytes a real process leaves. The mock connector
-    echoes the prompt, which is sized from this pipe's measured capacity (#1008): a fixed
-    96 KiB fits whole in the 256 KiB or 1 MiB pipe of a 16 or 64 KiB-page Linux kernel.
+    and this test holds the behaviour to the bytes a real process leaves; the row itself is
+    checked where the specification lives. The mock connector echoes the prompt, which is
+    sized from this pipe's measured capacity (#1008): a fixed 96 KiB fits whole in the
+    256 KiB or 1 MiB pipe of a 16 or 64 KiB-page Linux kernel.
 
-    Killed by: docs/cli-specification.md :: can leave the start of the reply on stdout
-    Becomes: leaves nothing on stdout
     Killed by: tests/support/nonblocking_stdout.py :: OVERFILL_MARGIN = 32 * 1024
     Becomes: OVERFILL_MARGIN = -32 * 1024
     """
@@ -2260,11 +2350,6 @@ def test_a_reply_that_overfills_a_non_blocking_pipe_leaves_its_start_on_stdout_a
     reply = f"{replies[0]}\n".encode()
     assert 0 < len(written) < len(reply), (len(written), len(reply))
     assert reply.startswith(written)
-    spec = Path(__file__).resolve().parents[2] / "docs" / "cli-specification.md"
-    row = next(
-        line for line in spec.read_text().splitlines() if "`UNWRITTEN_REPLY_EXIT_CODE`" in line
-    )
-    assert "can leave the start of the reply on stdout" in row
 
 
 def test_reading_the_childs_stdout_to_eof_gives_up_while_a_write_end_is_still_open() -> None:
@@ -2473,7 +2558,7 @@ def test_a_run_is_a_one_seat_room_and_leaves_the_old_session_unresumed(
     assert room is not None
     assert [(p.id, p.kind) for p in room.participants] == [
         (ONE_SEAT_HUMAN_ID, ParticipantKind.HUMAN),
-        ("seated", ParticipantKind.AGENT),
+        (seat_id_for("seated"), ParticipantKind.AGENT),
     ]
     assert room.head == "run"  # the app will not post into it (#1885)
     assert _only_seat(store, "seated") == _seat(rooms[0], "seated")
@@ -2544,10 +2629,10 @@ def test_the_app_opens_a_run_s_room_with_its_turn_in_the_transcript(
     `UCLONE_ROOM_DIR`, so the test fails if the CLI writes its rooms anywhere the app
     does not read them -- which it did, into `~/.uclone/rooms`, until #1837.
 
-    Killed by: src/uclone_x/cli/commands/run.py :: record_in_room(rooms, room_id=room.room_id, clone_id=agent_name, turn=turn, out=out)
+    Killed by: src/uclone_x/cli/commands/run.py :: record_in_room(rooms, room_id=room.room_id, clone_id=clone_id, turn=turn, out=out)
     Becomes: None
-    Killed by: src/uclone_x/room/store.py :: return default_session_root() / ROOMS_SUBDIR
-    Becomes: return Path.home() / ".uclone" / "rooms"
+    Killed by: src/uclone_x/cli/commands/run.py :: rooms = room_store if room_store is not None else RoomStore()
+    Becomes: rooms = room_store if room_store is not None else RoomStore(Path.home() / ".uclone" / "rooms")
     """
     from fastapi.testclient import TestClient
 
@@ -2574,10 +2659,11 @@ def test_the_app_opens_a_run_s_room_with_its_turn_in_the_transcript(
     assert opened.status_code == 200, opened.text
     rows = [r for r in opened.json()["transcript"] if r["kind"] == "utterance"]
     spoken = [(r["sender_id"], r["content"]) for r in rows if r.get("content")]
-    assert spoken[-2:] == [("user", "hi"), ("shown", "hello back")]
+    shown = seat_id_for("shown")  # the seat is keyed by the clone's id (§4 step 3)
+    assert spoken[-2:] == [("user", "hi"), (shown, "hello back")]
     asked, answered = rows[-2], rows[-1]
     assert answered["rendered_through"] == asked["seq"]
-    assert opened.json()["last_seen_seq"] == {"shown": str(asked["seq"])}
+    assert opened.json()["last_seen_seq"] == {shown: str(asked["seq"])}
 
 
 def test_a_run_that_says_nothing_leaves_no_room(
@@ -2623,10 +2709,10 @@ def test_a_failed_run_turn_is_in_the_room_and_left_unseen(
     state = RoomStore().load("oops")
     assert state is not None, "a failed turn left no room"
     reply = state.transcript[-1]
-    assert reply.sender_id == "broken"
+    assert reply.sender_id == seat_id_for("broken")
     assert reply.error is not None
     assert state.transcript[-2].content == "hi"
-    assert "broken" not in state.last_seen_seq
+    assert seat_id_for("broken") not in state.last_seen_seq
 
 
 def test_a_repl_loop_tick_is_saved_to_the_seat_before_the_room_shows_it(
@@ -2717,8 +2803,12 @@ def test_a_room_that_seats_other_clones_too_is_refused(
     rooms = RoomService(RoomStore())
     rooms.create(title="both", room_id="room_multi")
     rooms.add_participant("room_multi", "user", kind=ParticipantKind.HUMAN)
-    rooms.add_participant("room_multi", "writer", kind=ParticipantKind.AGENT)
-    rooms.add_participant("room_multi", "champion", kind=ParticipantKind.AGENT)
+    rooms.add_participant(
+        "room_multi", _brought_up_seat("writer", tmp_path), kind=ParticipantKind.AGENT
+    )
+    rooms.add_participant(
+        "room_multi", _brought_up_seat("champion", tmp_path), kind=ParticipantKind.AGENT
+    )
 
     result = runner.invoke(
         main.app,
@@ -2745,7 +2835,7 @@ def test_a_room_another_writer_keeps_is_refused_plainly(
 
     Killed by: src/uclone_x/room/one_seat.py :: keeper = "the app" if state.head is None else head_keeper(state.head)
     Becomes: keeper = head_keeper(state.head or "")
-    Killed by: src/uclone_x/room/one_seat.py :: if state.head != head and not _unmarked_server_room(state, room_id, head):
+    Killed by: src/uclone_x/room/one_seat.py :: if state.head != head:
     Becomes: if state.head is not None and state.head != head:
     """
     store = _isolated_run_env(monkeypatch, tmp_path)
@@ -2755,7 +2845,10 @@ def test_a_room_another_writer_keeps_is_refused_plainly(
         title="elsewhere",
         room_id="room_elsewhere",
         head=head,
-        seats=[("user", ParticipantKind.HUMAN), ("writer", ParticipantKind.AGENT)],
+        seats=[
+            ("user", ParticipantKind.HUMAN),
+            (_brought_up_seat("writer", tmp_path), ParticipantKind.AGENT),
+        ],
     )
 
     result = runner.invoke(
@@ -2814,6 +2907,95 @@ def test_a_run_says_on_stderr_that_it_kept_a_record_it_could_not_open(
     assert [p.name for p in path.parent.iterdir() if ".unreadable-" in p.name], "nothing set aside"
 
 
+def _a_seat_record_whose_message_is_not_its_entry(store: SessionStore, seat: str) -> Path:
+    """A seat record, as a session saves it, whose one message is not the body of the log
+    entry it names: well formed, and refused only by content (#1985)."""
+    from uclone_x.core.session_log import SessionLogProvenance, logged_message, new_entry
+
+    one, two = (
+        ChatMessage(role=MessageRole.USER, content="one"),
+        ChatMessage(role=MessageRole.USER, content="two"),
+    )
+    log = tuple(
+        new_entry(i, logged_message(m), turn=1, provenance=SessionLogProvenance.RECORDED)
+        for i, m in enumerate((one, two))
+    )
+    record = SessionState(
+        session_id=seat,
+        agent_id="keeper",
+        messages=(one,),
+        session_log=log,
+        history_entries=("e1",),
+        revision=2,
+    )
+    path = store.session_path(seat)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(record.model_dump_json(), encoding="utf-8")
+    return path
+
+
+def test_a_run_over_a_record_whose_message_is_not_its_entry_says_it_kept_it_plainly(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Such a record used to stop every resume of its session with the same refusal, and
+    stay where it was. The run now carries on, keeps the record aside, and says so on
+    stderr in the plain line every kept record gets (#1985).
+
+    Killed by: src/uclone_x/agent/session.py :: mismatch = history_entries_not_their_messages(state)
+    Becomes: mismatch = None
+    """
+    store = _isolated_run_env(monkeypatch, tmp_path)
+    _use_connector(monkeypatch, _answering_llm("the reply"))
+    path = _a_seat_record_whose_message_is_not_its_entry(store, _seat("kept", "keeper"))
+
+    result = runner.invoke(
+        main.app,
+        ["run", "keeper", "--prompt", "hello", "--session-id", "kept", "--cwd", str(tmp_path)],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert run.SESSION_SET_ASIDE_NOTICE in " ".join(result.stderr.split())
+    assert "the reply" in result.stdout
+    assert [p.name for p in path.parent.iterdir() if ".unreadable-" in p.name], "nothing set aside"
+
+
+def test_a_run_over_a_record_whose_message_is_not_its_entry_shows_no_internals(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Why the record was kept aside is for the log, not the person: nothing the run
+    prints names the entry, the log, the record's path or an exception (#1985).
+
+    Killed by: src/uclone_x/agent/session.py :: return None, mismatch
+    Becomes: raise ValueError(mismatch)
+    """
+    store = _isolated_run_env(monkeypatch, tmp_path)
+    _use_connector(monkeypatch, _answering_llm("the reply"))
+    path = _a_seat_record_whose_message_is_not_its_entry(store, _seat("kept", "keeper"))
+
+    result = runner.invoke(
+        main.app,
+        ["run", "keeper", "--prompt", "hello", "--session-id", "kept", "--cwd", str(tmp_path)],
+    )
+
+    said = " ".join(f"{result.stdout} {result.stderr}".split())
+    assert "the reply" in said
+    for internal in (
+        "e0",
+        "e1",
+        "log entry",
+        "not its body",
+        "history_entries",
+        "digest",
+        "Error",
+        "Traceback",
+        "#1985",
+        "#18",
+        path.name,
+        ".unreadable-",
+    ):
+        assert internal not in said, internal
+
+
 def test_a_runs_room_row_says_it_kept_a_record_so_the_app_says_so_too(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -2840,7 +3022,7 @@ def test_a_runs_room_row_says_it_kept_a_record_so_the_app_says_so_too(
     said = [
         row.session_set_aside
         for row in room.transcript
-        if row.sender_id == "keeper" and row.kind == "utterance"
+        if row.sender_id == seat_id_for("keeper") and row.kind == "utterance"
     ]
     assert said == [True, False]  # once, on the turn whose save kept it
 

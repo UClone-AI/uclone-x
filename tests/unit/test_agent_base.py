@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 from collections.abc import AsyncIterator, Sequence, Sized
 from pathlib import Path
 from typing import Any, cast
@@ -13,7 +12,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from pydantic import BaseModel, Field, ValidationError
 
-from uclone_x.agent import BaseAgent, TurnBudgetExceededError
+from uclone_x.agent import BaseAgent, StepBudgetExceededError
 from uclone_x.agent.hooks import (
     BaseHook,
     HookContext,
@@ -136,8 +135,8 @@ async def test_base_agent_populates_persona_on_successful_turn() -> None:
 
 
 @pytest.mark.asyncio
-async def test_base_agent_step_and_run_turn_aliases_populate_persona() -> None:
-    """Verify step and run_turn aliases execute turn and populate persona attribution."""
+async def test_base_agent_run_turn_alias_populates_persona() -> None:
+    """Verify the run_turn alias executes a turn and populates persona attribution."""
     cfg = AgentConfig(
         agent_id="critic",
         name="Critic",
@@ -146,11 +145,7 @@ async def test_base_agent_step_and_run_turn_aliases_populate_persona() -> None:
     connector = MockLLMConnector(default_response="Critic review.")
     agent = BaseAgent(config=cfg, llm=connector)
 
-    step_result = await agent.step("Review this design")
-    assert step_result.is_completed is True
-    assert step_result.persona == "critic"
-
-    turn_result = await agent.run_turn("Review second step")
+    turn_result = await agent.run_turn("Review this design")
     assert turn_result.is_completed is True
     assert turn_result.persona == "critic"
 
@@ -459,10 +454,10 @@ async def test_base_agent_tool_messages_resolve_to_preceding_assistant_tool_call
 
 
 @pytest.mark.asyncio
-async def test_max_turns_does_not_bound_a_conversation() -> None:
+async def test_max_steps_does_not_bound_a_conversation() -> None:
     """A person may keep talking. The ceiling is not measured against them.
 
-    `max_turns` is P4's bounded-execution ceiling: it bounds a run of turns the agent
+    `max_steps` is P4's bounded-execution ceiling: it bounds a run of steps the agent
     takes *without returning to whoever asked*. It was checked against `_turn_counter`,
     a lifetime count incremented once per `execute_turn` and reset only by
     `reset_session` — so with the tool loop living inside a single call and nothing
@@ -481,7 +476,7 @@ async def test_max_turns_does_not_bound_a_conversation() -> None:
         config=AgentConfig(
             agent_id="conversation-agent",
             name="Conversation Agent",
-            max_turns=2,
+            max_steps=2,
             llm_config=AgentLLMConfig(model_name="mock-model"),
         ),
         llm=MockLLMConnector(),
@@ -493,17 +488,16 @@ async def test_max_turns_does_not_bound_a_conversation() -> None:
         assert res.turn_index == i
         assert agent.state == AgentState.IDLE
         # Each request's run costs exactly one step — the answer — and the next request
-        # starts over. Five messages against `max_turns=2` therefore never approach the
+        # starts over. Five messages against `max_steps=2` therefore never approach the
         # ceiling. Asserting `0` here would pin nothing: `0` is also the value the
         # property had when it was assigned once in `__init__` and never updated.
-        assert agent.run_turns == 1, "one answered request is one agent step, every time"
-        assert agent.run_steps == 1
+        assert agent.run_steps == 1, "one answered request is one agent step, every time"
 
     assert agent.turn_counter == 5
 
 
 @pytest.mark.asyncio
-async def test_max_turns_bounds_a_self_driven_run() -> None:
+async def test_max_steps_bounds_a_self_driven_run() -> None:
     """The ceiling fires on the thing P4 names: steps the agent takes without returning.
 
     No `continuation` flag and no protocol change: the step counter is local to one
@@ -512,13 +506,13 @@ async def test_max_turns_bounds_a_self_driven_run() -> None:
     envelope rather than spinning.
 
     Mutations this exists to catch: remove the ceiling; move the counter outside the loop
-    so it stops counting steps; stop mirroring the count onto `run_turns`; or relax the
+    so it stops counting steps; stop reporting the count on `run_steps`; or relax the
     check from `>` to `>=`.
 
-    That last one used to survive. The refusal names `max_turns` in its message either
+    That last one used to survive. The refusal names the ceiling in its message either
     way, and `is_completed is False` is true either way, so nothing distinguished a
     ceiling of 3 that admits 3 steps from one that admits 2 — a whole step of headroom
-    silently gone. The `run_turns` assertion below is what now separates them.
+    silently gone. The `run_steps` assertion below is what now separates them.
     """
 
     class NeverSatisfiedConnector(MockLLMConnector):
@@ -542,7 +536,7 @@ async def test_max_turns_bounds_a_self_driven_run() -> None:
         config=AgentConfig(
             agent_id="runaway",
             name="Runaway",
-            max_turns=3,
+            max_steps=3,
             llm_config=AgentLLMConfig(model_name="mock-model"),
         ),
         llm=NeverSatisfiedConnector(),
@@ -554,11 +548,9 @@ async def test_max_turns_bounds_a_self_driven_run() -> None:
     assert res.error == "Agent step budget exceeded: maximum 3 steps in a single request"
     assert agent.state == AgentState.ERROR
     # The reported count is steps *taken*, so it stops at the ceiling rather than at the
-    # refused fourth attempt. `turns_remaining` therefore bottoms out at exactly zero.
-    assert agent.run_turns == 3
+    # refused fourth attempt. `steps_remaining` therefore bottoms out at exactly zero.
     assert agent.run_steps == 3
     assert agent.steps_remaining == 0
-    assert agent.turns_remaining == 0
 
     # The person can still speak: the ceiling bounded the run, not the conversation.
     agent.transition_to(AgentState.IDLE)
@@ -566,7 +558,7 @@ async def test_max_turns_bounds_a_self_driven_run() -> None:
         config=AgentConfig(
             agent_id="runaway2",
             name="Runaway2",
-            max_turns=3,
+            max_steps=3,
             llm_config=AgentLLMConfig(model_name="mock-model"),
         ),
         llm=MockLLMConnector(),
@@ -575,38 +567,17 @@ async def test_max_turns_bounds_a_self_driven_run() -> None:
         assert (await agent2.execute_turn("hello")).is_completed is True
 
 
-def test_step_budget_error_is_reachable_under_both_names() -> None:
-    """The canonical name must be importable from `uclone_x.agent`, not just the alias.
-
-    `agent/__init__.py` re-exported only the deprecated spelling, so
-    `from uclone_x.agent import StepBudgetExceededError` raised ImportError.
-    """
-    from uclone_x.agent import StepBudgetExceededError as FromAgent
-    from uclone_x.errors import StepBudgetExceededError as FromErrors
-
-    assert FromAgent is FromErrors
-    assert TurnBudgetExceededError is FromErrors
-
-    # Canonical kwargs, canonical attributes.
-    err = FromAgent("boom", max_steps=9, current_steps=9)
-    assert (err.max_steps, err.current_steps) == (9, 9)
-    # Deprecated kwargs land on the same attributes rather than a diverging pair.
-    legacy = FromAgent("boom", max_turns=4, current_turns=3)
-    assert (legacy.max_steps, legacy.current_steps) == (4, 3)
-    assert (legacy.max_turns, legacy.current_turns) == (4, 3)
-
-
-def test_turn_budget_exceeded_error_taxonomy() -> None:
-    """Verify TurnBudgetExceededError taxonomy, attributes, and propagation."""
-    err = TurnBudgetExceededError(
-        "Turn budget exceeded: maximum 5 turns reached",
-        max_turns=5,
-        current_turns=5,
+def test_step_budget_exceeded_error_taxonomy() -> None:
+    """Verify StepBudgetExceededError taxonomy and attributes, imported from `uclone_x.agent`."""
+    err = StepBudgetExceededError(
+        "Step budget exceeded: maximum 5 steps reached",
+        max_steps=5,
+        current_steps=5,
     )
     assert isinstance(err, BudgetExceededError)
-    assert err.max_turns == 5
-    assert err.current_turns == 5
-    assert str(err) == "Turn budget exceeded: maximum 5 turns reached"
+    assert err.max_steps == 5
+    assert err.current_steps == 5
+    assert str(err) == "Step budget exceeded: maximum 5 steps reached"
 
 
 @pytest.mark.asyncio
@@ -657,17 +628,18 @@ async def test_token_ceiling_refuses_a_turn_once_the_session_budget_is_spent() -
 
 
 @pytest.mark.asyncio
-async def test_max_turns_zero_refuses_before_any_model_invocation() -> None:
+async def test_max_steps_zero_refuses_before_any_model_invocation() -> None:
     """A ceiling of zero admits no step at all, and says so.
 
     P4: "If it reaches `max_turns` ... execution must terminate immediately with an
     explicit error or partial result envelope — silent or unbounded spinning is strictly
-    forbidden." `max_turns=0` is the degenerate end of that, and `AgentConfig` carries no
+    forbidden." (P4 still spells the ceiling `max_turns`; the field is `max_steps`.)
+    `max_steps=0` is the degenerate end of that, and `AgentConfig` carries no
     lower bound that rules it out, so it is reachable configuration rather than a
     hypothetical. It had a test before the step loop landed and lost it in the rewrite.
 
     Mutation this exists to catch: guard the check as
-    `if self._config.max_turns > 0 and step > self._config.max_turns`, the reading that
+    `if self._config.max_steps > 0 and step > self._config.max_steps`, the reading that
     treats zero as "unlimited". That is the plausible rewrite here, and it is the one no
     other test can see: every other ceiling in the suite is positive, so the added
     conjunct is true for all of them and the mutant survives everywhere else.
@@ -677,7 +649,7 @@ async def test_max_turns_zero_refuses_before_any_model_invocation() -> None:
         config=AgentConfig(
             agent_id="zero-ceiling",
             name="Zero Ceiling",
-            max_turns=0,
+            max_steps=0,
             llm_config=AgentLLMConfig(model_name="mock-model"),
         ),
         llm=connector,
@@ -689,10 +661,10 @@ async def test_max_turns_zero_refuses_before_any_model_invocation() -> None:
     assert res.error == "Agent step budget exceeded: maximum 0 steps in a single request"
     assert res.content == ""
     assert agent.state == AgentState.ERROR
-    # Weak on its own — `0` is also the constructor's value, and a `max_turns=0` agent can
-    # never have run a step for it to be stale from. `test_max_turns_bounds_a_self_driven_run`
-    # carries the discrimination that `run_turns` stops at the ceiling.
-    assert agent.run_turns == 0, "no step was taken, so none may be reported as taken"
+    # Weak on its own — `0` is also the constructor's value, and a `max_steps=0` agent can
+    # never have run a step for it to be stale from. `test_max_steps_bounds_a_self_driven_run`
+    # carries the discrimination that `run_steps` stops at the ceiling.
+    assert agent.run_steps == 0, "no step was taken, so none may be reported as taken"
     # The refusal is *before* the model, not after it: a ceiling that spends a call and
     # then refuses bounds nothing.
     assert connector.call_count == 0
@@ -941,27 +913,6 @@ async def test_a_stream_without_usage_is_charged_as_a_labelled_estimate() -> Non
     )
 
 
-def test_agent_config_step_budget_aliasing() -> None:
-    """AgentConfig and SubAgentSpec max_steps and max_turns sync transparently."""
-    from uclone_x.agent.models import SubAgentSpec
-
-    cfg1 = AgentConfig(agent_id="a1", name="A1", max_steps=15)
-    assert cfg1.max_steps == 15
-    assert cfg1.max_turns == 15
-
-    cfg2 = AgentConfig(agent_id="a2", name="A2", max_turns=25)
-    assert cfg2.max_steps == 25
-    assert cfg2.max_turns == 25
-
-    spec1 = SubAgentSpec(name="s1", role="worker", system_prompt="p", max_steps=10)
-    assert spec1.max_steps == 10
-    assert spec1.max_turns == 10
-
-    spec2 = SubAgentSpec(name="s2", role="worker", system_prompt="p", max_turns=12)
-    assert spec2.max_steps == 12
-    assert spec2.max_turns == 12
-
-
 def test_dynamic_persona_definition_and_utilization() -> None:
     """A test defines a persona at runtime and asserts that subsequent agent turns/steps utilize it.
 
@@ -1183,8 +1134,8 @@ def test_reset_of_one_session_leaves_another_sessions_pending_events_alone() -> 
 
     Killed by: src/uclone_x/agent/session_lifecycle.py :: if event.get("session_id") != sid
     Becomes: if event.get("session_id") == sid
-    Killed by: src/uclone_x/agent/session_lifecycle.py :: reset, anchor_provenance=self._resolved_persona()
-    Becomes: reset, anchor_provenance=self._resolved_persona()); self._sessions[self._context.session_id] = _LiveSession.from_state(reset, anchor_provenance=self._resolved_persona()
+    Killed by: src/uclone_x/agent/session_lifecycle.py :: reset, load_body=load_body, anchor_provenance=self._resolved_persona()
+    Becomes: reset, load_body=load_body, anchor_provenance=self._resolved_persona()); self._sessions[self._context.session_id] = _LiveSession.from_state(reset, load_body=load_body, anchor_provenance=self._resolved_persona()
     Killed by: src/uclone_x/agent/turn_executor.py :: event["session_id"] = turn_session_id
     Becomes: pass
     """
@@ -1237,7 +1188,7 @@ class _RecordingSessionStore:
             )
         return state
 
-    def delete(self, session_id: str, artifacts_dir: Path | None = None) -> bool:
+    def delete(self, session_id: str) -> bool:
         self.saved_events_by_session.pop(session_id, None)
         return True
 
@@ -2081,8 +2032,8 @@ async def test_a_persona_set_after_construction_restricts_tools_as_well_as_promp
     prompt alone cannot see it: the prompt was already right while the enforcement was
     wrong.
 
-    Killed by: src/uclone_x/agent/base.py :: resolved = persona.granted_tools
-    Becomes: pass
+    Killed by: src/uclone_x/core/models.py :: return persona.granted_tools
+    Becomes: return ()
     """
     agent = _agent_with_both_tools(AgentConfig(agent_id="late", name="Late"))
 
@@ -2114,8 +2065,8 @@ async def test_an_operators_allowed_tools_outranks_a_persona_adopted_later() -> 
     persona's tools rather than the union or the first's, and clearing the persona takes
     the persona's tools away rather than leaving them in force under no persona.
 
-    Killed by: src/uclone_x/agent/base.py :: resolved = self._operator_allowed_tools
-    Becomes: resolved = self._config.allowed_tools
+    Killed by: src/uclone_x/agent/base.py :: resolved = effective_tool_scope(self._operator_allowed_tools, persona)
+    Becomes: resolved = effective_tool_scope(self._config.allowed_tools, persona)
     """
     operator_scoped = _agent_with_both_tools(
         AgentConfig(agent_id="op", name="Op", allowed_tools=("withheld_tool",))
@@ -2239,8 +2190,8 @@ async def test_clearing_a_persona_the_anchor_was_written_under_does_move_the_wir
     `effective_system_prompt` reported the configured one: the same P6 divergence #1081
     exists to close, pointing the other way.
 
-    Killed by: src/uclone_x/agent/session_lifecycle.py :: reset, anchor_provenance=self._resolved_persona()
-    Becomes: reset, anchor_provenance=None
+    Killed by: src/uclone_x/agent/session_lifecycle.py :: reset, load_body=load_body, anchor_provenance=self._resolved_persona()
+    Becomes: reset, load_body=load_body, anchor_provenance=None
     """
     wire = _RecordingConnector(["One"])
     agent = BaseAgent(
@@ -2454,20 +2405,12 @@ async def test_a_store_restored_callers_anchor_is_still_the_callers_after_a_pers
 
 
 @pytest.mark.asyncio
-async def test_a_record_with_no_recorded_provenance_is_left_alone_and_reported(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    """A restored anchor nothing stamped is not re-resolved, and does not pass in silence (P6, #1152).
+async def test_a_record_with_no_recorded_provenance_is_left_alone(tmp_path: Path) -> None:
+    """A restored anchor nothing stamped is not re-resolved (#1152).
 
-    Every record written before `anchor_provenance` existed reads this way, and there are
-    only three things to do with it. Re-resolving it would discard a caller's own text on
-    the strength of a provenance nobody recorded. Refusing the hydration would make every
-    existing record unloadable. Leaving it alone *quietly* is the silent fallback P6
-    forbids: the consequence -- a persona adopted here will not move the system turn the
-    model is sent -- is invisible from the outside and looks exactly like a bug.
-
-    So it is left alone and said out loud. The record is written through the real store and
-    then stripped of the key, which is the shape a legacy record actually has.
+    Re-resolving it would discard a caller's own text on the strength of a provenance
+    nobody recorded. The record is written through the real store and then stripped of
+    the key.
 
     Killed by: src/uclone_x/agent/prompt_assembler.py :: if record is None:
     Becomes: if record is None and False:
@@ -2486,9 +2429,7 @@ async def test_a_record_with_no_recorded_provenance_is_left_alone_and_reported(
     wire = _RecordingConnector(["After"])
     restored = BaseAgent(config=config, llm=wire, store=store)
     restored.define_persona(_scouting_persona())
-    with caplog.at_level(logging.WARNING, logger="uclone_x.agent.session_lifecycle"):
-        assert restored.hydrate_session() is not None
-    assert "no recorded provenance" in caplog.text
+    assert restored.hydrate_session() is not None
 
     restored.persona = "late_scout"
 

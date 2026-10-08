@@ -29,11 +29,13 @@ from uclone_x.skills.auditor import (
 )
 from uclone_x.skills.models import AuditVerdict, SkillAuditReport, SkillOrigin, SkillStatus
 from uclone_x.skills.proposals import (
+    EXTRA_FILES,
     FAILED_CHECK,
     HAS_FILES,
     NOT_ACTIVE,
     NOT_FOUND,
     SEEN_CHANGED,
+    SEEN_CHANGED_TURN_DOWN,
     SHIPPED,
     SkillProposalChangedError,
     SkillProposalError,
@@ -402,7 +404,13 @@ def test_reject_keeps_the_proposal_marked_rejected(root: Path) -> None:
     store = SkillProposalStore(root)
     version = _propose(store)
 
-    store.reject("tidy-notes", version, rejecter="human:settings", reason=None)
+    store.reject(
+        "tidy-notes",
+        version,
+        seen_digest=_shown(store, "tidy-notes", version),
+        rejecter="human:settings",
+        reason=None,
+    )
 
     kept = load_skill_from_dir(root / ".rejected" / "tidy-notes" / version).manifest
     assert kept.status is SkillStatus.REJECTED and kept.rejected_by == "human:settings"
@@ -437,3 +445,88 @@ def test_the_store_scan_skips_the_proposal_folders(root: Path) -> None:
     _propose(SkillProposalStore(root))
     registry = SkillRegistry()
     assert asyncio.run(registry.scan(root)) == ()
+
+
+def test_turn_down_refuses_a_proposal_that_changed_after_it_was_shown(root: Path) -> None:
+    """The person turned down A; a clone swapped in B before the click. B stays pending.
+
+    Killed by: src/uclone_x/skills/proposals.py :: if current_digest != seen_digest:
+    Becomes: if False:
+    """
+    store = SkillProposalStore(root)
+    version = _propose(store)
+    seen = _shown(store, "tidy-notes", version)
+    pending = root / ".pending" / "tidy-notes" / version / "SKILL.md"
+    pending.write_text(
+        pending.read_text(encoding="utf-8").replace("Read the notes.", "Read the mail."),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SkillProposalChangedError) as refused:
+        store.reject("tidy-notes", version, seen_digest=seen, rejecter="p", reason=None)
+
+    assert str(refused.value) == SEEN_CHANGED_TURN_DOWN
+    assert refused.value.decision_code == "seen_changed"
+    assert pending.is_file()
+    assert not (root / ".rejected").exists()
+
+
+@pytest.mark.parametrize("extra", ["notes.txt", "scripts/run.sh"])
+def test_a_proposal_holding_more_than_its_instructions_is_not_approved(
+    root: Path, isolated_ledger: SkillApprovalLedger, extra: str
+) -> None:
+    """Approval installs only SKILL.md, so a folder holding anything else is refused whole.
+
+    The pinned digest then always describes exactly what was installed, and a file the
+    person never saw cannot ride along into the live folder.
+
+    Killed by: src/uclone_x/skills/proposals.py :: if _holds_more_than_instructions(checked_dir):
+    Becomes: if False:
+    """
+    store = SkillProposalStore(root)
+    version = _propose(store)
+    folder = root / ".pending" / "tidy-notes" / version
+    (folder / extra).parent.mkdir(parents=True, exist_ok=True)
+    (folder / extra).write_text("echo hi\n", encoding="utf-8")
+    seen = _shown(store, "tidy-notes", version)
+
+    with pytest.raises(SkillProposalError) as refused:
+        asyncio.run(
+            store.approve(
+                "tidy-notes", version, seen_digest=seen, approver="p", ledger=isolated_ledger
+            )
+        )
+
+    assert str(refused.value) == EXTRA_FILES
+    assert refused.value.decision_code == "extra_files"
+    assert isolated_ledger.read() == {}
+    assert not (root / "tidy-notes").exists()
+    assert (folder / "SKILL.md").is_file()
+
+
+@pytest.mark.parametrize("folder", [".stash", ".pending"])
+def test_a_dot_named_folder_is_never_loaded_even_when_it_holds_an_approved_skill(
+    root: Path, isolated_ledger: SkillApprovalLedger, folder: str
+) -> None:
+    """No dot-named folder is a package, whatever it holds (#1865).
+
+    `.pending/<name>/<v>/` has no SKILL.md at its top, so it would be skipped without the dot
+    check; this places an approved, pinned SKILL.md directly in a dot-named folder, which
+    would otherwise load. So the check is not redundant: without it such a copy loads.
+
+    Killed by: src/uclone_x/skills/auditor.py :: if child.name.startswith(".") or not child.is_dir():
+    Becomes: if not child.is_dir():
+    """
+    store = SkillProposalStore(root)
+    _approve(store, "tidy-notes", _propose(store), isolated_ledger)
+    hidden = root / folder
+    if hidden.exists():
+        shutil.rmtree(hidden)
+    (root / "tidy-notes").rename(hidden)
+
+    registry = SkillRegistry(skills_dir=root)
+    loaded = asyncio.run(registry.reload_approved())
+
+    assert loaded == ()
+    assert registry.get("tidy-notes") is None
+    assert registry.get_summary()["skills"] == []

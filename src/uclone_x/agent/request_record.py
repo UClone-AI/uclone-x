@@ -20,17 +20,40 @@ import hashlib
 import json
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Final, Literal
 
+from uclone_x.agent.k_act import text_call_messages
 from uclone_x.agent.session import ContextSnapshot, SessionState, content_digest
-from uclone_x.core.context_state import ContextEntry, ContextEpoch, render_entries
+from uclone_x.agent.tools_module import (
+    DEFAULT_TOOLS_MODULE,
+    ToolsModuleName,
+    UnknownToolsModuleError,
+    recorded_tools_module,
+)
+from uclone_x.core.context_state import (
+    ContextEntry,
+    ContextEpoch,
+    render_entries,
+    rendered_message,
+)
+from uclone_x.core.session_log import (
+    SessionLogEntry,
+    kept_result_text,
+    stored_result_entry,
+    with_image_data,
+)
 from uclone_x.core.session_store import SessionStoreProtocol
+from uclone_x.core.tool_results import result_handle
 from uclone_x.errors import UCloneXError
 from uclone_x.llm.models import ChatMessage, LLMRequest, MessageRole, ToolDefinition
 
 __all__ = [
     "RebuiltRequest",
     "RequestLayers",
+    "EpochErrorCode",
+    "EpochRecordError",
+    "LogReader",
+    "LogRenderPurpose",
     "RecordErrorCode",
     "RequestRecordError",
     "assemble_request_messages",
@@ -57,6 +80,11 @@ RecordErrorCode = Literal[
     "epoch_mismatch",
 ]
 
+#: The `RecordErrorCode`s rendering one epoch from the session log can raise (#1915): an
+#: entry the log lacks, an entry's body missing or unparseable, or a form that is not its
+#: entry's. The rest name a request's own record, which an epoch never reads.
+EpochErrorCode = Literal["log_entry_missing", "body_missing", "unreadable", "epoch_mismatch"]
+
 
 class RequestRecordError(UCloneXError):
     """A recorded request could not be rebuilt, because part of its record is missing.
@@ -69,6 +97,18 @@ class RequestRecordError(UCloneXError):
         super().__init__(message)
         self.detail = detail
         self.code: RecordErrorCode = code
+
+
+class EpochRecordError(RequestRecordError):
+    """An epoch's conversation could not be rendered from the session log (#1915).
+
+    `epoch_code` is the same code as `code`, typed to the four an epoch can raise, so a
+    caller reporting it promises no more than an epoch can produce.
+    """
+
+    def __init__(self, message: str, *, detail: str, code: EpochErrorCode) -> None:
+        super().__init__(message, detail=detail, code=code)
+        self.epoch_code: EpochErrorCode = code
 
 
 def compose_system_message(identity: str, slow_context: str) -> str:
@@ -113,11 +153,16 @@ class RequestLayers:
     conversation: tuple[ChatMessage, ...]
     turn_context: str
     shown: tuple[ContextEntry, ...] = ()
+    #: Whether the request sends calls as text (the ``k_act`` tools module, #2188): each
+    #: assistant message then goes out as its text alone (`text_call_messages`).
+    text_calls: bool = False
 
 
 def assemble_request_messages(layers: RequestLayers) -> list[ChatMessage]:
     """The messages a request sends, from its layers. The only place they are assembled."""
     messages = list(layers.conversation)
+    if layers.text_calls:
+        messages = text_call_messages(messages)
     if layers.system_message:
         system = compose_system_message(layers.identity, layers.slow_context)
         messages.insert(0, ChatMessage(role=MessageRole.SYSTEM, content=system))
@@ -159,6 +204,8 @@ class RebuiltRequest:
     request: LLMRequest
     verified: bool
     layers: RequestLayers | None = None
+    #: The tools module the request was built under, as its snapshot records it (#2188).
+    tools_module: ToolsModuleName = DEFAULT_TOOLS_MODULE
 
 
 def rebuild_requests(
@@ -175,11 +222,15 @@ def rebuild_requests(
     reads it; the caller reads it, so this module stays below the log adapter.
 
     Each `REQUEST_CONTEXT` event extends the conversation of the one before it in the log
-    by `kept_message_count` and `appended_messages`, and names the snapshot in `state` that
-    holds the rest. An event whose `base_request` is not the request before it in the log
+    by `kept_entry_count` and `appended_entries`, and names the snapshot in `state` that
+    holds the rest. The conversation is recorded as the log entries it showed and their
+    forms, and is rendered from `state.session_log` by the `LogReader` the live request
+    renders through, so the event holds no message text (#2013). An event from before
+    that, which records the messages themselves, is refused as unreadable, not rebuilt
+    from its copy. An event whose `base_request` is not the request before it in the log
     means a request is missing from the log: every request folded on top of the gap would
     be a guess, so none of them is rebuilt. A request that keeps nothing of the one before
-    it (`kept_message_count` 0: after a restart, or the first request after a rollback)
+    it (`kept_entry_count` 0: after a restart, or the first request after a rollback)
     carries its whole conversation, so it starts the chain again and the requests from
     there on rebuild.
 
@@ -215,6 +266,11 @@ def rebuild_requests(
             body_intact[digest] = content_digest(text) == digest
         return bodies[digest]
 
+    reader = LogReader(
+        state.session_log,
+        lambda digest: store.load_context_body(state.session_id, digest),
+        purpose="rebuild",
+    )
     requests = [event for event in events if event.get("type") == "REQUEST_CONTEXT"]
     if select is not None:
         chosen = [i for i, event in enumerate(requests) if select(event)]
@@ -258,7 +314,9 @@ def rebuild_requests(
         try:
             if broken is not None:
                 raise broken
-            rebuilt.append(_rebuild_selected(event, snapshots, conversation, body, body_intact))
+            rebuilt.append(
+                _rebuild_selected(event, snapshots, conversation, body, body_intact, reader)
+            )
         except RequestRecordError as err:
             if on_error is None:
                 raise
@@ -266,62 +324,194 @@ def rebuild_requests(
     return rebuilt
 
 
+#: The two ends a log rendering serves, and how a gap in it is put to the person (#1848).
+#: `rebuild` renders an earlier epoch for the record; `send` renders the request about to
+#: go out, so a gap there stops the conversation rather than a view of it.
+LogRenderPurpose = Literal["rebuild", "send"]
+
+_MISSING: Final[dict[LogRenderPurpose, str]] = {
+    "rebuild": "Part of this conversation's record is missing, so it cannot be rebuilt.",
+    "send": "Part of this conversation's record is missing, so it cannot continue.",
+}
+_UNREADABLE: Final[dict[LogRenderPurpose, str]] = {
+    "rebuild": "Part of this conversation's record could not be read, so it cannot be rebuilt.",
+    "send": "Part of this conversation's record could not be read, so it cannot continue.",
+}
+
+
+class LogReader:
+    """Renders a conversation from one session's log: the one way it is built (#1848).
+
+    The request a turn sends (`PromptAssembler.prepare_turn_layers`) and the log-only
+    rebuild of an epoch (`epoch_renderer`) both render through `render`, over the same
+    entries and forms. They differ only in where a body is read: `load_body` gives the
+    body a digest names -- the live session's pending bodies, then the store, for a
+    request; the store alone for a rebuild. Bodies are content-addressed, so the same
+    digest is the same text on both sides, and what is sent is what the rebuild renders.
+
+    An entry is its body decoded (`message_of`). An `excerpt` or `stub` is logged as its
+    form and what it was cut from, with no text, and is rendered from that result's full
+    body (`result_of`, the log entry its handle names) with the parameters it records
+    (`render_form`, `shown_message`). `decoded` and `results` may be shared across readers of one
+    session: a body decodes to one message, and a handle names one text, whichever reader
+    reads it -- so a kept result is read from the store once per session, not once per
+    request (#1971). A shared `results` is cleared by whoever forgets the bodies.
+    """
+
+    def __init__(
+        self,
+        session_log: Sequence[SessionLogEntry],
+        load_body: Callable[[str], str | None],
+        *,
+        purpose: LogRenderPurpose,
+        decoded: dict[str, ChatMessage] | None = None,
+        results: dict[str, str] | None = None,
+    ) -> None:
+        self._log = session_log
+        self._load = load_body
+        self._purpose: LogRenderPurpose = purpose
+        self._decoded: dict[str, ChatMessage] = {} if decoded is None else decoded
+        self._results: dict[str, str] = {} if results is None else results
+
+    def _error(self, *, missing: bool, detail: str, code: EpochErrorCode) -> EpochRecordError:
+        copy = _MISSING if missing else _UNREADABLE
+        return EpochRecordError(copy[self._purpose], detail=detail, code=code)
+
+    def _body(self, digest: str) -> str | None:
+        """The body `digest` names, `None` when there is none; refused when it will not read.
+
+        A body file that is there and cannot be read -- permissions, bad bytes -- is the
+        record's gap like any other, so it is refused in the same plain words and never
+        reaches a person as the operating system's text (#1974).
+        """
+        try:
+            return self._load(digest)
+        except (OSError, UnicodeDecodeError) as exc:
+            raise self._error(
+                missing=False,
+                detail=f"context body {digest} could not be read ({type(exc).__name__})",
+                code="unreadable",  # a body file that will not read
+            ) from exc
+
+    def result_of(self, handle: str) -> str:
+        """The full body the kept result `handle` names."""
+        if handle in self._results:
+            return self._results[handle]
+        entry = stored_result_entry(self._log, handle)
+        if entry is None:
+            raise self._error(
+                missing=True,
+                detail=f"no log entry for the kept result {handle}",
+                code="log_entry_missing",
+            )
+        text = self._body(entry.digest)
+        if text is None:
+            raise self._error(
+                missing=True,
+                detail=f"no context body {entry.digest}",
+                code="body_missing",  # a kept result's body
+            )
+        if result_handle(text) != handle:
+            raise self._error(
+                missing=False,
+                detail=f"log entry {entry.id} is not the result {handle}",
+                code="unreadable",  # a kept result's body does not hash to its handle
+            )
+        whole = kept_result_text(entry, text)
+        if whole is None:
+            raise self._error(
+                missing=False,
+                detail=f"log entry {entry.id} is not a whole tool result",
+                code="unreadable",  # a message entry a handle names holds no full result
+            )
+        self._results[handle] = whole
+        return whole
+
+    def message_of(self, entry_id: str) -> ChatMessage:
+        """The message log entry `entry_id` is: its body, decoded."""
+        position = int(entry_id[1:]) if entry_id[:1] == "e" and entry_id[1:].isdigit() else -1
+        if not 0 <= position < len(self._log):
+            raise self._error(
+                missing=True,
+                detail=f"no log entry {entry_id}",
+                code="log_entry_missing",  # an entry the epoch names
+            )
+        digest = self._log[position].digest
+        if digest not in self._decoded:
+            text = self._body(digest)
+            if text is None:
+                raise self._error(
+                    missing=True,
+                    detail=f"no context body {digest}",
+                    code="body_missing",  # a log entry's body
+                )
+            try:
+                message = ChatMessage.model_validate_json(text)
+            except ValueError as exc:
+                raise self._error(
+                    missing=False,
+                    detail=f"log entry {entry_id} could not be read ({type(exc).__name__})",
+                    code="unreadable",  # a log entry's body does not parse
+                ) from exc
+            if message.form is not None and (
+                message.rendered_from is None or message.content is not None
+            ):
+                # A form is logged as what it was cut from and no text (`logged_message`);
+                # one that holds text, or records nothing to render from, was written in
+                # an older format, and is not shown as whatever text it carries (#1848).
+                raise self._error(
+                    missing=False,
+                    detail=f"log entry {entry_id} is a {message.form} not recorded as a form",
+                    code="unreadable",  # a form logged as its text
+                )
+            # The body names each image by digest; its bytes are a body of their own
+            # (#2107). One that is gone is sent as unavailable, never refused.
+            self._decoded[digest] = with_image_data(message, self._load)
+        return self._decoded[digest]
+
+    def shown_message(self, entry_id: str) -> ChatMessage:
+        """The message log entry `entry_id` is, with a form's text rendered (#1848)."""
+        return rendered_message(self.message_of(entry_id), self.result_of)
+
+    def render(self, entries: Sequence[ContextEntry], *, what: str) -> list[ChatMessage]:
+        """The conversation `entries` render to; `what` names them in an error's detail."""
+        try:
+            return render_entries(entries, self.message_of, self.result_of)
+        except ValueError as exc:
+            # `render_entries` refuses a message whose form is not its entry's.
+            raise self._error(
+                missing=False,
+                detail=f"{what} does not match its log entries",
+                code="epoch_mismatch",
+            ) from exc
+
+
 def epoch_renderer(
     store: SessionStoreProtocol, state: SessionState
 ) -> Callable[[ContextEpoch], list[ChatMessage]]:
     """A function that renders one epoch's conversation from the session log alone (#1848).
 
-    An epoch lists the entries its last request showed and their forms (§5.8); each
-    entry's message is its body in the context-body store, decoded. No `REQUEST_CONTEXT`
-    event and no `messages` is read, so this is the conversation the log and the context
-    state say was sent -- `render_entries` is what the live request renders through too.
-    Bodies are decoded once across the epochs one renderer renders, and each epoch fails
-    on its own: an unreadable body stops only the epochs that list it.
+    An epoch lists the entries its last request showed and their forms (§5.8); each is
+    rendered by a `LogReader` over the record's log and the context-body store. No
+    `REQUEST_CONTEXT` event and no `messages` is read, so this is the conversation the log
+    and the context state say was sent -- the live request renders through the same
+    `LogReader.render`. Bodies are decoded once across the epochs one renderer renders,
+    and each epoch fails on its own: an unreadable body stops only the epochs that list
+    it. No workspace is read.
 
-    The returned function raises `RequestRecordError` when the epoch names an entry the
-    log does not have, an entry's body is missing or does not parse, or a message's form
-    is not the one its entry records.
+    The returned function raises `EpochRecordError` when the epoch names an entry the
+    log does not have, an entry's body is missing or does not parse, a kept result's
+    entry is missing or its body does not hash to its handle, or a message's form is not
+    the one its entry records.
     """
-    decoded: dict[str, ChatMessage] = {}
-
-    def message_of(entry_id: str) -> ChatMessage:
-        position = int(entry_id[1:]) if entry_id[:1] == "e" and entry_id[1:].isdigit() else -1
-        if not 0 <= position < len(state.session_log):
-            raise RequestRecordError(
-                "Part of this conversation's record is missing, so it cannot be rebuilt.",
-                detail=f"no log entry {entry_id}",
-                code="log_entry_missing",
-            )
-        digest = state.session_log[position].digest
-        if digest not in decoded:
-            text = store.load_context_body(state.session_id, digest)
-            if text is None:
-                raise RequestRecordError(
-                    "Part of this conversation's record is missing, so it cannot be rebuilt.",
-                    detail=f"no context body {digest}",
-                    code="body_missing",  # a log entry's body
-                )
-            try:
-                decoded[digest] = ChatMessage.model_validate_json(text)
-            except ValueError as exc:
-                raise RequestRecordError(
-                    "Part of this conversation's record could not be read, so it cannot be "
-                    "rebuilt.",
-                    detail=f"log entry {entry_id} could not be read ({type(exc).__name__})",
-                    code="unreadable",  # a log entry's body does not parse
-                ) from exc
-        return decoded[digest]
+    reader = LogReader(
+        state.session_log,
+        lambda digest: store.load_context_body(state.session_id, digest),
+        purpose="rebuild",
+    )
 
     def render(epoch: ContextEpoch) -> list[ChatMessage]:
-        try:
-            return render_entries(epoch.entries, message_of)
-        except ValueError as exc:
-            # `render_entries` refuses a message whose form is not its entry's.
-            raise RequestRecordError(
-                "Part of this conversation's record could not be read, so it cannot be rebuilt.",
-                detail=f"epoch {epoch.number} does not match its log entries",
-                code="epoch_mismatch",
-            ) from exc
+        return reader.render(epoch.entries, what=f"epoch {epoch.number}")
 
     return render
 
@@ -334,9 +524,10 @@ def rebuild_epoch_conversations(
     See `epoch_renderer`, which renders one epoch.
 
     Raises:
-        RequestRecordError: An epoch names an entry or a rendering the log does not have,
-            an entry's body is missing or does not parse, or a message's form is not the
-            one its entry records.
+        EpochRecordError: An epoch names an entry or a rendering the log does not have,
+            an entry's body is missing or does not parse, a kept result a form is
+            rendered from is missing or does not match its handle, or a message's form
+            is not the one its entry records.
     """
     render = epoch_renderer(store, state)
     return [render(epoch) for epoch in state.context_epochs]
@@ -354,8 +545,10 @@ def _conversation_delta(
 ) -> tuple[int, list[dict[str, Any]]] | RequestRecordError:
     """What `event` keeps of the conversation before it and what it adds, or why not."""
     try:
-        kept = int(event["kept_message_count"])
-        appended = list(event["appended_messages"])
+        # A pre-#2013 event records `appended_messages`, the text itself, and has no
+        # entries: it is refused here rather than rebuilt from that copy.
+        kept = int(event["kept_entry_count"])
+        appended = list(event["appended_entries"])
     except (KeyError, TypeError, ValueError):
         return RequestRecordError(
             "Part of this conversation's record could not be read, so a request in it "
@@ -372,6 +565,7 @@ def _rebuild_selected(
     conversation: list[dict[str, Any]],
     body: Any,
     body_intact: dict[str, bool],
+    reader: LogReader,
 ) -> RebuiltRequest:
     if event.get("snapshot") is None:
         raise RequestRecordError(
@@ -388,7 +582,7 @@ def _rebuild_selected(
             code="snapshot_missing",
         )
     try:
-        return _rebuild_one(event, snapshot, conversation, body, body_intact)
+        return _rebuild_one(event, snapshot, conversation, body, body_intact, reader)
     except (ValueError, TypeError, KeyError) as exc:
         # A body or a message that does not parse: pydantic's ValidationError and
         # json's JSONDecodeError are both ValueErrors. Named by kind only -- the
@@ -407,14 +601,28 @@ def _rebuild_one(
     conversation: list[dict[str, Any]],
     body: Any,
     body_intact: dict[str, bool],
+    reader: LogReader,
 ) -> RebuiltRequest:
+    try:
+        tools_module = recorded_tools_module(snapshot.tools_module)
+    except UnknownToolsModuleError as exc:
+        # No migration (#2188): a module this build does not know is not read as another.
+        raise RequestRecordError(
+            "Part of this conversation's record could not be read, so a request in it "
+            "cannot be rebuilt.",
+            detail=f"snapshot {snapshot.snapshot_id} names an unknown tools module",
+            code="unreadable",  # a snapshot's tools module this build does not have
+        ) from exc
     tools_text = body(snapshot.tools_digest)
+    shown = tuple(ContextEntry.model_validate_json(json.dumps(e)) for e in conversation)
     layers = RequestLayers(
         identity=body(snapshot.identity_digest),
         slow_context=body(snapshot.slow_context_digest),
         system_message=snapshot.system_message,
-        conversation=tuple(ChatMessage.model_validate_json(json.dumps(m)) for m in conversation),
+        conversation=tuple(reader.render(shown, what=f"request {event.get('request')}")),
         turn_context=body(snapshot.turn_context_digest),
+        shown=shown,
+        text_calls=tools_module == "k_act",
     )
     messages = assemble_request_messages(layers)
     request = LLMRequest(
@@ -447,4 +655,5 @@ def _rebuild_one(
         request=request,
         verified=verified,
         layers=layers,
+        tools_module=tools_module,
     )

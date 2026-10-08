@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
+import functools
 import hashlib
 import ipaddress
 import json
@@ -18,15 +19,15 @@ from collections.abc import (
     Callable,
     Coroutine,
     Iterable,
+    Mapping,
     Sequence,
 )
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, TypeVar, cast
 from urllib.parse import urlparse
 
-import httpx
 from pydantic import ValidationError
 from rich.console import Console
 
@@ -74,6 +75,7 @@ from uclone_x.agent.session import (
     resolve_session_path,
     verify_record_identity,
 )
+from uclone_x.core.agent_home import seat_id_for
 from uclone_x.core.diagnostic_report import (
     issue_url,
     render_report,
@@ -91,8 +93,12 @@ from uclone_x.core.failure_journal import (
     set_consent,
 )
 from uclone_x.core.immutable import unwrap_immutable
+from uclone_x.core.models import BASE_PERSONA_TOOLS
 from uclone_x.core.remote_worker import (
+    COMFYUI_SERVICE_NAME,
     SSHTunnelManager,
+    find_configured_ssh_hosts,
+    is_valid_host,
     probe_remote_host,
 )
 from uclone_x.core.session_diagnostics import (
@@ -112,6 +118,7 @@ from uclone_x.errors import (
     LLMTimeoutError,
     PathTraversalError,
     PlainRefusalError,
+    RoomNotFoundError,
 )
 from uclone_x.evaluation import (
     EvalBackendUnavailableError,
@@ -120,54 +127,61 @@ from uclone_x.evaluation import (
 )
 from uclone_x.i18n import DEFAULT_UI_LANGUAGE, UI_LANGUAGES, UiLanguage, is_ui_language
 from uclone_x.link.uclone2.supervisor import LinkSupervisor
-from uclone_x.llm import create_llm_connector
 from uclone_x.llm.budget import TokenBudgetManager
-from uclone_x.llm.catalog import (
-    CatalogCache,
-    CatalogEntry,
-    CatalogResult,
-    Lister,
-    key_fingerprint,
-    read_catalog,
+from uclone_x.llm.connections import (
+    Connection,
+    ConnectionError_,
+    ModelRef,
+    ModelRefError,
+    image_ref_problem,
+    kind_rows,
+    saved_default_models,
 )
-from uclone_x.llm.connectors.anthropic import AnthropicConnector
-from uclone_x.llm.connectors.base import BaseLLMConnector
-from uclone_x.llm.connectors.factory import bind_image_engine_settings, saved_choice_in_effect
-from uclone_x.llm.connectors.gemini import GeminiConnector
+from uclone_x.llm.connectors.factory import bind_image_engine_settings
 from uclone_x.llm.connectors.ollama import (
     delete_model,
     pull_model,
-    resolve_ollama_base_url,
 )
-from uclone_x.llm.connectors.openai import OpenAIConnector
 from uclone_x.llm.connectors.saved_choice import (
-    LLM_MODEL_FAST_KEY,
     SETTINGS_FILE_NAME,
-    api_key_for,
-    delete_api_key,
-    same_provider,
-    save_api_key,
+    add_connection,
+    remove_connection,
+    save_default_models,
     settings_data,
+    update_connection,
     update_settings_file,
 )
-from uclone_x.llm.connectors.vllm import (
-    has_configured_vllm_endpoint,
-    resolve_vllm_base_url,
+from uclone_x.llm.gateway import (
+    Capability,
+    DefaultBinding,
+    ModelGateway,
+    connection_paid,
+    unsupported_listing,
 )
-from uclone_x.llm.model_policy import recommend
+from uclone_x.llm.model_listing import (
+    fetch_available_models as fetch_available_models,
+)
+from uclone_x.llm.model_listing import (
+    list_local_models as list_local_models,
+)
+from uclone_x.llm.model_listing import (
+    list_ollama_entries as list_ollama_entries,
+)
+from uclone_x.llm.model_listing import (
+    read_provider_catalog as read_provider_catalog,
+)
+from uclone_x.llm.model_listing import (
+    vllm_model_ids as vllm_model_ids,
+)
+from uclone_x.llm.model_listing import (
+    vllm_request_headers as vllm_request_headers,
+)
 from uclone_x.llm.models import (
     ChatMessage,
     LLMRequest,
     MessageRole,
 )
 from uclone_x.llm.protocols import LLMProviderProtocol
-from uclone_x.llm.providers import (
-    PROVIDERS,
-    canonical_provider,
-    env_key,
-    env_model,
-    spec_for,
-)
 from uclone_x.llm.usage.gate import UsageGate
 from uclone_x.llm.usage.store import USAGE_FILE_NAME
 from uclone_x.memory.store import CrossSessionMemory, default_cross_session_memory
@@ -189,24 +203,14 @@ from uclone_x.skills.auditor import (
 from uclone_x.skills.models import skill_hidden_from
 from uclone_x.skills.proposals import (
     SETTINGS_PERSON,
+    SkillDecisionCode,
     SkillProposalChangedError,
     SkillProposalError,
     SkillProposalStore,
 )
 from uclone_x.skills.shipped_pins import SHIPPED_SKILL_PINS
 from uclone_x.telemetry.tracer import TelemetryTracer
-from uclone_x.tools.base import replace_file
-from uclone_x.tools.builtin.comfy_client import (
-    DEFAULT_COMFYUI_BASE_URL,
-    ComfyClient,
-)
-from uclone_x.tools.builtin.comfy_image_tool import ComfyImageGenTool
-from uclone_x.tools.builtin.image import (
-    IMAGE_ENGINE_KEY,
-    IMAGE_MODEL_KEY,
-    parse_image_engine_setting,
-    parse_image_model,
-)
+from uclone_x.tools.base import in_app_state_dir, replace_file
 from uclone_x.tools.mcp_manager import (
     DuplicateServerError,
     MCPServerManager,
@@ -221,6 +225,22 @@ from uclone_x.ui.single_flight import SingleFlight
 
 logger = logging.getLogger(__name__)
 _console = Console()
+
+_T = TypeVar("_T")
+
+#: The connection the remote-GPU tunnel's Ollama is added as (model-gateway G1).
+REMOTE_GPU_CONNECTION_LABEL = "Remote GPU"
+REMOTE_GPU_CONNECTION_ID = "remote-gpu"
+#: The connection the remote-GPU tunnel's ComfyUI is added as (model-gateway §3.5): a
+#: `comfyui` connection beside the others, so its models join the picture set.
+REMOTE_GPU_PICTURES_LABEL = "Remote GPU pictures"
+REMOTE_GPU_PICTURES_ID = "remote-gpu-pictures"
+
+
+def _optional_text(value: object) -> str | None:
+    """A request field as stripped text, or `None` when it is absent or blank."""
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
 
 SERVER_START_TIME: str = datetime.now(UTC).isoformat()
 
@@ -259,206 +279,6 @@ def get_git_commit() -> str:
     except Exception:
         pass
     return "dev"
-
-
-def vllm_request_headers(
-    api_key: str | None = None, *, env_fallback: bool = True
-) -> dict[str, str]:
-    """`Authorization` only when a key exists, because `vllm serve --api-key` is optional.
-
-    An empty bearer is not the same as no header: a server started without `--api-key`
-    accepts the request either way, but one behind a proxy that reads the header rejects
-    `Bearer ` with a 401 that describes a credential nobody configured (#385).
-
-    `env_fallback=False` sends only the key passed in: for an address typed on the form, which
-    must not receive the key held for the saved server (#1666).
-    """
-    env_key = os.getenv("VLLM_API_KEY") if env_fallback else None
-    key = (api_key or env_key or "").strip()
-    return {"Authorization": f"Bearer {key}"} if key else {}
-
-
-def vllm_model_ids(payload: object) -> list[str]:
-    """The `id`s in an OpenAI-compatible `/v1/models` listing, or an empty list.
-
-    vLLM answers `{"object": "list", "data": [{"id": "<the --model argument>", ...}]}`, and
-    that one entry is the model the server was started with — which is why this listing is
-    worth showing at all: for vLLM it is not a catalogue of what *could* be run but a
-    statement of what *is* running. Parsed defensively for the reason the Ollama branch
-    below is: this is another process's JSON, and a gateway in front of it may answer
-    something else entirely.
-    """
-    if not isinstance(payload, dict):
-        return []
-    raw = cast(dict[str, Any], payload).get("data")
-    if not isinstance(raw, list):
-        return []
-    ids: list[str] = []
-    for item in cast(list[object], raw):
-        if isinstance(item, dict):
-            value = cast(dict[str, Any], item).get("id")
-            if value is not None:
-                ids.append(str(value))
-    return ids
-
-
-class LocalKeyRefusedError(Exception):
-    """A local server answered 401 or 403: it is running, and it refused the key (#1672).
-
-    Raised by `list_local_models` only when asked to, so the form can say "the server refused
-    the key" rather than "no model list came back", which sends the user to look for a
-    stopped server that is not stopped.
-    """
-
-
-#: The statuses that mean the server is there and turned the key away.
-_KEY_REFUSED_STATUSES = frozenset({401, 403})
-
-
-async def list_local_models(
-    provider: str,
-    base_url: str | None = None,
-    timeout: float = 3.0,
-    *,
-    vllm_headers: dict[str, str] | None = None,
-    raise_on_refused_key: bool = False,
-) -> list[str] | None:
-    """The models a local server has installed, or None when no listing came back (#1666).
-
-    None and `[]` are different answers, and Settings says different things for them: no
-    listing (nothing answered, or something that is not this server did) names a stopped
-    server or a wrong address, where an empty list names an install
-    the user has not done yet. `fetch_available_models` folds the two together.
-
-    `vllm_headers` replaces the default ones, which carry `VLLM_API_KEY`; see `preview_catalog`.
-    With `raise_on_refused_key`, a vLLM server's 401 or 403 raises `LocalKeyRefusedError`
-    instead of reading as no listing.
-    """
-    clean_provider = provider.strip().lower()
-    if clean_provider == "ollama":
-        ollama_url = (base_url or "").strip() or resolve_ollama_base_url()
-        try:
-            async with httpx.AsyncClient(timeout=timeout) as http_c:
-                resp = await http_c.get(f"{ollama_url.rstrip('/')}/api/tags")
-                if resp.status_code != 200:
-                    return None  # something answered, but not Ollama's listing
-                data_obj: object = resp.json()
-                models: list[str] = []
-                if isinstance(data_obj, dict):
-                    raw_models = cast(dict[str, Any], data_obj).get("models")
-                    if isinstance(raw_models, list):
-                        for item in cast(list[object], raw_models):
-                            if isinstance(item, dict):
-                                name_val = cast(dict[str, Any], item).get("name")
-                                if name_val is not None:
-                                    models.append(str(name_val))
-                return models
-        except Exception as exc:
-            logger.debug("Failed to query Ollama tags from %s: %s", ollama_url, exc)
-            return None
-    if clean_provider == "vllm":
-        if not has_configured_vllm_endpoint(base_url):
-            # An unconfigured endpoint is not an empty inventory. Probing vLLM's documented
-            # default port to fill the dropdown would be this module guessing where the
-            # operator's server is, and reporting a refused connection as "no models" (P6).
-            return None
-        vllm_url = resolve_vllm_base_url(base_url)
-        listing_url = f"{vllm_url.rstrip('/')}/models"
-        refused = False
-        try:
-            async with httpx.AsyncClient(timeout=timeout) as http_c:
-                resp = await http_c.get(
-                    listing_url,
-                    headers=vllm_request_headers() if vllm_headers is None else vllm_headers,
-                )
-                if resp.status_code == 200:
-                    return vllm_model_ids(resp.json())
-                refused = resp.status_code in _KEY_REFUSED_STATUSES
-        except Exception as exc:
-            logger.debug("Failed to query vLLM models from %s: %s", vllm_url, exc)
-            return None
-        if refused and raise_on_refused_key:
-            raise LocalKeyRefusedError(vllm_url)
-        return None
-    if clean_provider == "mock":
-        return ["mock-gpt-4o", "mock-llm"]
-    return None
-
-
-async def fetch_available_models(
-    provider: str,
-    base_url: str | None = None,
-    timeout: float = 3.0,
-) -> list[str]:
-    """Enumerate the models a local server has installed (P0/Recognition over Recall).
-
-    The cloud providers are not answered here: their models come from each provider's own
-    listing, through `read_provider_catalog` (#1631). The remembered lists this function
-    returned for them had retired models in them.
-    """
-    return await list_local_models(provider, base_url, timeout) or []
-
-
-#: The providers whose installed models Settings lists from the server itself (#1666).
-LOCAL_LISTING_PROVIDERS = frozenset({"ollama", "vllm"})
-
-CatalogConnector = type[OpenAIConnector] | type[AnthropicConnector] | type[GeminiConnector]
-
-#: The cloud providers whose own model listing Settings shows (#1631): the settings id, the
-#: connector that reads the listing, and the name the user holds the key with.
-CATALOG_PROVIDERS: dict[str, tuple[str, CatalogConnector, str]] = {
-    "openai": ("openai", OpenAIConnector, "OpenAI"),
-    "anthropic": ("anthropic", AnthropicConnector, "Anthropic"),
-    "gemini": ("gemini", GeminiConnector, "Google"),
-    "google": ("gemini", GeminiConnector, "Google"),
-}
-
-#: A listing takes one request per page; Settings waits for it before the picker fills.
-_CATALOG_TIMEOUT_SECONDS = 10.0
-
-
-async def read_provider_catalog(
-    provider: str,
-    *,
-    base_url: str | None,
-    api_key: str | None,
-    cache: CatalogCache,
-) -> CatalogResult | None:
-    """The provider's own model listing for this key and endpoint, or None for a local server.
-
-    A live listing is reused from `cache` until it expires; anything else is asked again, so
-    a fixed key or network shows on the next open (`CatalogCache`).
-    """
-    spec = CATALOG_PROVIDERS.get(provider.strip().lower())
-    if spec is None:
-        return None
-    settings_id, connector_cls, display_provider = spec
-    endpoint = (base_url or "").strip() or None
-    cache_key = (settings_id, endpoint or "", key_fingerprint(api_key))
-    cached = cache.get(cache_key)
-    if cached is not None:
-        return cached
-
-    lister: Lister | None = None
-    if api_key and api_key.strip():
-        key = api_key.strip()
-
-        async def list_models() -> list[CatalogEntry]:
-            connector = connector_cls(
-                api_key=key, base_url=endpoint, timeout=_CATALOG_TIMEOUT_SECONDS
-            )
-            return await connector.list_models()
-
-        lister = list_models
-
-    result = await read_catalog(
-        provider=settings_id,
-        display_provider=display_provider,
-        lister=lister,
-        recommend=recommend,
-    )
-    cache.put(cache_key, result)
-    return result
 
 
 # Global bus and tracer instances for dashboard event monitoring
@@ -785,29 +605,52 @@ def _persona_payload(registry: PersonaRegistry, persona: PersonaDefinition) -> d
     """
     own_prompt, appended = split_appended_default_prompt(persona.system_prompt)
     builtin = registry.is_builtin(persona.name)
+    clone_id = registry.id_of(persona.name)
+    # A persona with no clone directory (registered in-process) has no id; its handle
+    # stands in, as it does everywhere such a persona is addressed.
+    address = clone_id or persona.name
+    store = PersonaAvatarStore(registry)
     return {
+        # The clone's id: what seats, chats and every route address it by (§4 step 2).
+        "id": address,
+        # The name typed after @ to address it; unique, and changes only by a rename.
+        "handle": persona.name,
+        # The handle again, under the key a persona draft names it by when it is saved.
         "name": persona.name,
+        # What a person reads as its name, per locale.
+        "display_name": dict(persona.display_name),
         "role": persona.role,
         "description": persona.description,
         "system_prompt": own_prompt,
         "append_default_prompt": appended,
         "allowed_tools": list(persona.allowed_tools),
+        "base_tools": [*BASE_PERSONA_TOOLS],
+        # Model refs (`<connection id>/<model id>`) or null for the system default
+        # (model-gateway §3.7.1), flat as a draft names them and grouped as `llm_config`.
         "model_name": persona.llm_config.model_name,
+        "fast_model": persona.llm_config.fast_model,
+        "image_model": persona.llm_config.image_model,
+        "llm_config": {
+            "model_name": persona.llm_config.model_name,
+            "fast_model": persona.llm_config.fast_model,
+            "image_model": persona.llm_config.image_model,
+        },
         "model_tier": str(persona.llm_config.model_tier),
         "temperature": persona.llm_config.temperature,
         "max_tokens": persona.llm_config.max_tokens,
         "enable_write_tools": persona.enable_write_tools,
         "enable_subagent_tools": persona.enable_subagent_tools,
+        # Clone ids, as stored; a head shows each by the peer's own entry in this list.
         "a2a_peers": list(persona.a2a_peers),
         "builtin": builtin,
         "overrides_builtin": not builtin and registry.has_builtin(persona.name),
         # The address to show its picture from; the `?v=` changes whenever the picture does.
-        "avatar_url": avatar_url(persona.name, PersonaAvatarStore(registry).find(persona.name)),
+        "avatar_url": avatar_url(address, store.find(persona.name)),
         # Whether that picture was chosen here rather than shipped: only a chosen one resets.
-        "avatar_chosen": PersonaAvatarStore(registry).chosen(persona.name) is not None,
+        "avatar_chosen": store.chosen(persona.name) is not None,
         # The id of the latest change to that picture, from any tab or the clone itself: a
         # head hides an Undo whose change is no longer the latest.
-        "avatar_change_id": PersonaAvatarStore(registry).latest_change(persona.name),
+        "avatar_change_id": store.latest_change(persona.name),
     }
 
 
@@ -829,7 +672,7 @@ def _required_agent_id(raw: object) -> str:
             status_code=400,
             detail=(
                 "Missing required 'agent_id'. Name the agent this request is for; "
-                "there is no default agent. `GET /api/personas` lists the ones this "
+                "there is no default agent. `GET /api/clones` lists the ones this "
                 "install has."
             ),
         )
@@ -905,21 +748,6 @@ def _extract_markdown_title(path: Path) -> str:
 
 
 #: No key held for a provider: no key, no source, no variable.
-_NO_KEY: tuple[None, None, None] = (None, None, None)
-
-
-class KeyRemovalRefused(ValueError):
-    """A key removal Settings refuses, with a stable `code` a screen can translate.
-
-    `code` is ``"unknown_provider"`` or ``"key_in_use"``; the message is the English
-    sentence for a caller that shows text as it comes.
-    """
-
-    def __init__(self, code: str, message: str) -> None:
-        super().__init__(message)
-        self.code = code
-
-
 class AgentSessionManager:
     """The app's clone scope, settings and session records, for the UI layer.
 
@@ -942,12 +770,14 @@ class AgentSessionManager:
         workspace_dir: Path | None = None,
     ) -> None:
         self._bus = bus if bus is not None else get_ui_event_bus()
-        self._llm = llm
-        #: Told when Settings replaces the connector. A conversation's seats are built and
-        #: cached by the room stack, which this class cannot see; without this they kept
-        #: the connector they were built with -- `None`, for a room first used before a
-        #: model was chosen (#1446).
-        self._llm_listeners: list[Callable[[LLMProviderProtocol | None], None]] = []
+        #: A connector the embedding head handed in (a test's fake, a demo): it answers every
+        #: clone that follows the system default. `None` in the product, where every model
+        #: comes from the gateway's connections.
+        self._given_llm = llm
+        #: Told when the connections or default models change. A conversation's seats are
+        #: built and cached by the room stack, which this class cannot see; without this
+        #: they kept the connector they were built with (#1446).
+        self._models_listeners: list[Callable[[], None]] = []
         self._tools = tools if tools is not None else create_default_registry()
         self._tracer = tracer if tracer is not None else get_ui_tracer()
         self._fallback_to_mock = fallback_to_mock
@@ -1016,15 +846,6 @@ class AgentSessionManager:
         #: pinned. Shared by every clone, so a tool description is embedded once.
         self._tool_binders: dict[tuple[str, str], ToolBinder | None] = {}
         self._session_messages: dict[str, list[dict[str, Any]]] = {}
-        self._configured_provider: str | None = None
-        self._configured_base_url: str | None = None
-        #: The deep model: what a clone's turns run on unless its persona names its own.
-        self._configured_model: str | None = None
-        #: The fast model, for auxiliary calls (room routing); `None` means the deep one.
-        self._configured_model_fast: str | None = None
-        self._configured_comfyui_url: str | None = os.getenv(
-            "COMFYUI_BASE_URL", DEFAULT_COMFYUI_BASE_URL
-        )
         #: Folders outside the workspace that clones may read, as the user entered them.
         self._configured_read_roots: tuple[str, ...] = ()
         #: The language the heads and the CLI write in; `"system"` follows the OS or browser.
@@ -1039,16 +860,24 @@ class AgentSessionManager:
         # booked in its own storage directory, which its Usage panel reads.
         self._usage_file: Path = self._storage_dir / USAGE_FILE_NAME
         self._usage_gate = UsageGate.for_storage(self._settings_file, self._usage_file)
+        #: Every model comes from here: the connections and default models in this
+        #: dashboard's settings file, a connector per ref (model-gateway §3.3).
+        self._gateway = ModelGateway(
+            self._settings_file,
+            usage_gate=self._usage_gate,
+            default_binding=DefaultBinding(llm) if llm is not None else None,
+        )
         self._load_persisted_settings()
-        self._build_initial_llm()
-        # Pictures follow this dashboard's settings file, the chat provider in effect and
-        # the Gemini address the chat uses, all read again on every draw, so a change in
-        # Settings applies to the next one.
+        #: The local port of the remote-GPU tunnel's ComfyUI while it is connected. The
+        #: tunnel belongs to the app (`create_ui_app`), which binds its own answer here.
+        self._gpu_tunnel_comfy_port: Callable[[], int | None] = lambda: None
+        # Pictures follow this dashboard's settings file -- the image connections and the
+        # picture models -- and the remote-GPU tunnel, read again on every draw, so a change
+        # in Settings applies to the next one (model-gateway §3.5).
         bind_image_engine_settings(
             self._tools.get("generate_image"),
             self._settings_file,
-            lambda: self.provider_in_effect,
-            self.gemini_base_url_in_effect,
+            self.gpu_tunnel_comfy_port,
         )
         for entry in self._env_read_root_entries():
             if (problem := _read_root_problem(entry, self._storage_dir)) is not None:
@@ -1094,17 +923,10 @@ class AgentSessionManager:
         """This dashboard's paid-model usage store, in its storage directory."""
         return self._usage_file
 
-    def build_llm(self, **kwargs: Any) -> BaseLLMConnector:
-        """A connector for this dashboard: `create_llm_connector` bound to its storage.
-
-        Every connector the dashboard builds comes from here, so a paid one is held to the
-        limits its Usage panel shows, and a connector resolved from a saved choice uses the
-        choice this dashboard's Settings saved, even when `storage_dir` is not the session
-        root.
-        """
-        return create_llm_connector(
-            usage_gate=self._usage_gate, saved_choice_file=self._settings_file, **kwargs
-        )
+    @property
+    def gateway(self) -> ModelGateway:
+        """The model gateway every clone, room and Settings route here asks for a model."""
+        return self._gateway
 
     @property
     def bus(self) -> EventBus:
@@ -1113,10 +935,6 @@ class AgentSessionManager:
     @property
     def tools(self) -> ToolRegistryProtocol:
         return self._tools
-
-    @property
-    def llm(self) -> LLMProviderProtocol | None:
-        return self._llm
 
     @property
     def tracer(self) -> TelemetryTracer:
@@ -1149,172 +967,17 @@ class AgentSessionManager:
         """Update the directory path containing evaluation reports."""
         self._eval_reports_dir = path.resolve()
 
-    @property
-    def configured_model(self) -> str | None:
-        """The deep model saved in Settings, or `None` when none was."""
-        return self._configured_model
+    def gpu_tunnel_comfy_port(self) -> int | None:
+        """The local port the connected remote-GPU tunnel forwards to its ComfyUI, if any."""
+        return self._gpu_tunnel_comfy_port()
 
-    @property
-    def configured_model_fast(self) -> str | None:
-        """The fast model saved in Settings, or `None` when fast follows deep."""
-        return self._configured_model_fast
+    def bind_gpu_tunnel(self, comfy_port: Callable[[], int | None]) -> None:
+        """Answer `gpu_tunnel_comfy_port` from ``comfy_port``, read on every call."""
+        self._gpu_tunnel_comfy_port = comfy_port
 
-    @property
-    def deep_model(self) -> str | None:
-        """The model a clone's turn runs on when its persona names none.
-
-        The one saved in Settings, else the active provider's model variable. `None` when
-        neither names one: the request is then refused in plain words rather than sent with
-        a model id written in source.
-        """
-        return self._model_state(self.provider_in_effect)[0]
-
-    @property
-    def fast_model(self) -> str | None:
-        """The model auxiliary calls (room routing) run on: the fast one, else deep."""
-        return self._saved_fast_model(self.provider_in_effect) or self.deep_model
-
-    # -- What is in effect: an explicit argument, then the environment, then the file. --
-    #
-    # A variable the operator set wins over a choice saved in Settings, for the provider,
-    # its model and its endpoint as for its key. A saved model or endpoint belongs to the
-    # saved provider: when the environment names another provider, they are not carried
-    # over to it.
-
-    def _provider_state(self) -> tuple[str | None, str, str]:
-        """``(provider, source, variable)``: `LLM_PROVIDER` when it names one, else the file."""
-        from_env = canonical_provider(os.getenv("LLM_PROVIDER"))
-        if from_env is not None:
-            return from_env, "env", "LLM_PROVIDER"
-        if self._configured_provider:
-            return self._configured_provider, "settings", ""
-        return None, "", ""
-
-    def _saved_applies(self, provider: str | None) -> bool:
-        """Whether the model and endpoint saved in the file are ``provider``'s."""
-        return (
-            self._configured_provider is None
-            or provider is None
-            or same_provider(self._configured_provider, provider)
-        )
-
-    def _model_state(self, provider: str | None) -> tuple[str | None, str, str]:
-        """``(model, source, variable)`` for ``provider``: its model variable, else the file."""
-        from_env = env_model(provider)
-        if from_env is not None:
-            return from_env[0], "env", from_env[1]
-        if self._configured_model and self._saved_applies(provider):
-            return self._configured_model, "settings", ""
-        return None, "", ""
-
-    def _saved_fast_model(self, provider: str | None) -> str | None:
-        return self._configured_model_fast if self._saved_applies(provider) else None
-
-    def _base_url_state(self, provider: str | None) -> tuple[str | None, str, str]:
-        """``(endpoint, source, variable)`` for ``provider``: its endpoint variable, else the file."""
-        spec = spec_for(provider)
-        if spec is not None and spec.base_url_env:
-            value = (os.getenv(spec.base_url_env) or "").strip()
-            if value:
-                return value, "env", spec.base_url_env
-        if self._configured_base_url and self._saved_applies(provider):
-            return self._configured_base_url, "settings", ""
-        return None, "", ""
-
-    @property
-    def provider_in_effect(self) -> str | None:
-        """The provider a turn goes to: `LLM_PROVIDER`, else the one saved; `None` if neither."""
-        return self._provider_state()[0]
-
-    def base_url_in_effect(self, provider: str | None) -> str | None:
-        """The endpoint ``provider``'s requests go to, when one is set for it."""
-        return self._base_url_state(provider)[0]
-
-    def gemini_base_url_in_effect(self) -> str | None:
-        """The Gemini address a Gemini chat here goes to, for pictures to reuse (#1769).
-
-        `None` unless Gemini is the chat provider in effect or the one saved: a saved
-        address with no saved provider may belong to another provider's server, and a
-        picture request sent there would carry the Gemini key to it.
-        """
-        if not (
-            same_provider(self.provider_in_effect, "gemini")
-            or same_provider(self._configured_provider, "gemini")
-        ):
-            return None
-        return self.base_url_in_effect("gemini")
-
-    def _build_llm_in_effect(self) -> BaseLLMConnector:
-        provider = self.provider_in_effect
-        return self._build_configured_llm(provider, self.base_url_in_effect(provider))
-
-    def global_models(self) -> tuple[str | None, str | None]:
-        """``(deep, fast)`` as Settings holds them now; read per build, never cached."""
-        return self.deep_model, self.fast_model
-
-    @property
-    def configured_provider(self) -> str | None:
-        """Configured provider override for the UI session manager."""
-        return self._configured_provider
-
-    @property
-    def configured_api_key(self) -> str | None:
-        """The key a request to the configured provider carries, when one is held for it."""
-        return self._api_key_for(self.provider_in_effect)
-
-    def _key_state(self, provider: str | None) -> tuple[str | None, str | None, str | None]:
-        """``(key, source, variable)`` for ``provider``: the environment first, then the file.
-
-        `source` is ``"env"`` or ``"settings"``, and `variable` names the environment
-        variable when that is where the key came from. Read from the file on every call, so
-        a key saved by `ucx key set` while this dashboard runs is seen at once.
-        """
-        from_env = env_key(provider)
-        if from_env is not None:
-            return from_env[0], "env", from_env[1]
-        canonical = canonical_provider(provider)
-        if canonical is None:
-            return _NO_KEY
-        saved = api_key_for(settings_data(self._settings_file), canonical)
-        if saved:
-            return saved, "settings", None
-        return _NO_KEY
-
-    def _api_key_for(self, provider: str | None) -> str | None:
-        """The key held for ``provider`` and only for it, or `None`."""
-        return self._key_state(provider)[0]
-
-    def resolved_api_key(self, provider: str | None) -> str | None:
-        """The key a request to ``provider`` would carry: its own, else the live connector's.
-
-        The live connector's key counts only when that connector is ``provider``'s, so a key
-        is never sent to a provider it was not saved for.
-        """
-        own = self._api_key_for(provider)
-        if own:
-            return own
-        live = self._llm
-        if live is not None and same_provider(getattr(live, "provider_name", None), provider):
-            return cast(str | None, getattr(live, "api_key", None))
-        return None
-
-    def stored_api_key_for(self, provider: str, base_url: str | None = None) -> str | None:
-        """A key already held for ``provider``, and only for it: saved for it, or its env var.
-
-        For a provider the user has picked but not saved (#1657). The live connector's key
-        is not used: it may belong to the provider in use, and must not be sent to another
-        one to preview its models.
-
-        A held key goes only to the provider's own server, or to the endpoint saved with it.
-        An endpoint left on the form from another provider (a vLLM box, a proxy) gets none.
-        """
-        if base_url is not None and not (
-            self._configured_provider is not None
-            and same_provider(self._configured_provider, provider)
-            and base_url.rstrip("/") == (self._configured_base_url or "").rstrip("/")
-        ):
-            return None
-        return self._api_key_for(provider)
+    def _default_deep_connection(self) -> Connection | None:
+        ref = self._gateway.resolve(None, "deep")
+        return self._gateway.connection(ref.connection_id) if ref is not None else None
 
     @staticmethod
     def _mask_key(key: str) -> str:
@@ -1322,51 +985,167 @@ class AgentSessionManager:
         trimmed = key.strip()
         return f"{trimmed[:3]}...{trimmed[-4:]}" if len(trimmed) > 8 else "***"
 
-    def _provider_key_states(self) -> list[dict[str, Any]]:
-        """Every keyed provider's key state, whichever provider is active."""
-        states: list[dict[str, Any]] = []
-        for spec in PROVIDERS.values():
-            if not spec.key_env_vars:
-                continue
-            key, source, variable = self._key_state(spec.id)
-            states.append(
-                {
-                    "id": spec.id,
-                    "key_set": bool(key),
-                    "key_masked": self._mask_key(key) if key else "",
-                    "key_source": source or "",
-                    "key_env_var": variable or "",
-                }
-            )
-        return states
+    def on_models_changed(self, listener: Callable[[], None]) -> None:
+        """Call `listener` whenever the connections or default models change."""
+        self._models_listeners.append(listener)
 
-    @property
-    def configured_base_url(self) -> str | None:
-        """Configured provider base URL override for the UI session manager."""
-        return self._configured_base_url
+    def models_changed(self) -> None:
+        """Tell every open conversation that the connections or default models changed."""
+        for listener in self._models_listeners:
+            listener()
 
-    @property
-    def default_llm(self) -> LLMProviderProtocol | None:
-        """Default or configured LLM provider connector."""
-        return self._llm
+    # -- Connections and default models (model-gateway §3.7.1) --
 
-    def _build_configured_llm(self, provider: str | None, base_url: str | None) -> BaseLLMConnector:
-        """A connector for ``provider`` from explicit values, the deep model as its default.
+    def _write(self, change: Callable[[], _T]) -> _T:
+        """Run ``change`` (a write through the one writer), keeping an unreadable file aside.
 
-        Everything is passed as an argument: nothing is exported into the environment for
-        the connector to find there.
+        A file this build cannot read is refused by the writer with a sentence naming its
+        path, which must not reach the page (#1860). As a Settings save always has, the file
+        is kept aside, unchanged, and replaced with what this dashboard holds; the change is
+        then made in the new file and Settings says the earlier one was kept (#1877).
+
+        Raises:
+            ConnectionError_ | ModelRefError: the change itself is refused, in plain words.
+            OSError: the file could not be kept aside or written.
         """
-        extra: dict[str, Any] = {}
-        deep = self.deep_model
-        if deep:
-            extra["model"] = deep
-        return self.build_llm(
-            provider=provider or None,
-            api_key=self._api_key_for(provider),
-            base_url=base_url or None,
-            fallback_to_mock=self._fallback_to_mock,
-            **extra,
+        try:
+            return change()
+        except PlainRefusalError:
+            raise
+        except ValueError as refusal:
+            aside = update_settings_file(
+                {}, path=self._settings_file, replace_unreadable_with=self._persisted_settings()
+            )
+            if aside is None:
+                raise
+            logger.warning("Settings could not be read before a change was saved: %s", refusal)
+            self._settings_set_aside = True  # and Settings says the earlier file was kept
+        try:
+            return change()
+        except PlainRefusalError:
+            raise
+        except ValueError as exc:  # unreadable again: another writer since it was kept aside
+            raise OSError("the settings file could not be read, so nothing was saved") from exc
+
+    def connection_payload(self, conn: Connection) -> dict[str, Any]:
+        """One connection as `GET /api/connections` reports it (§3.7.1)."""
+        listing = self._gateway.last_listing(conn)
+        if listing is None and conn.unsupported:
+            # Said at once, with no check: a kind this build does not know has nothing to ask.
+            listing = unsupported_listing(conn)
+        status = "unchecked" if listing is None else listing.status
+        if listing is None and conn.kind in ("gemini", "openai", "anthropic") and not conn.key:
+            status = "no_key"
+        return {
+            "id": conn.id,
+            "kind": conn.kind,
+            "label": conn.display_label,
+            "base_url": conn.base_url,
+            "key_set": bool(conn.key),
+            "key_masked": self._mask_key(conn.key) if conn.key else None,
+            "source": conn.source,
+            "env_var": conn.env_var,
+            "key_env_var": conn.key_env_var,
+            "paid": connection_paid(conn),
+            "status": status,
+            "detail": None if listing is None else listing.detail,
+            "model_count": None
+            if listing is None or listing.status != "connected"
+            else len([e for e in listing.entries if e.chat_capable]),
+        }
+
+    def connections_payload(self) -> dict[str, Any]:
+        return {
+            "connections": [self.connection_payload(c) for c in self._gateway.connections()],
+            "kinds": kind_rows(),
+        }
+
+    def _writable_connection(self, conn_id: str) -> Connection:
+        """The saved row ``conn_id`` names; refused when it is unknown or set by a variable."""
+        conn = self._gateway.connection(conn_id)
+        if conn is None:
+            raise ConnectionError_(f"There is no connection called {conn_id!r}.")
+        if conn.source == "env":
+            variable = conn.env_var or "an environment variable"
+            raise ConnectionError_(
+                f"The connection {conn.id} is set by {variable}, so it cannot be changed "
+                f"here. Change or unset the variable instead."
+            )
+        return conn
+
+    async def check_connection(self, conn_id: str) -> dict[str, Any]:
+        """Ask the connection for its models now; return it with what it said."""
+        conn = self._gateway.connection(conn_id)
+        if conn is None:
+            raise ConnectionError_(f"There is no connection called {conn_id!r}.")
+        await self._gateway.listing(conn, refresh=True)
+        return self.connection_payload(conn)
+
+    async def add_connection(
+        self, kind: str, *, label: str | None, base_url: str | None, key: str | None
+    ) -> dict[str, Any]:
+        conn = self._write(
+            lambda: add_connection(
+                kind, label=label, base_url=base_url, key=key, path=self._settings_file
+            )
         )
+        self.models_changed()
+        return await self.check_connection(conn.id)
+
+    async def patch_connection(self, conn_id: str, changes: Mapping[str, Any]) -> dict[str, Any]:
+        self._writable_connection(conn_id)
+        fields = {name: changes[name] for name in ("label", "base_url", "key") if name in changes}
+        self._write(lambda: update_connection(conn_id, path=self._settings_file, **fields))
+        self.models_changed()
+        return await self.check_connection(conn_id)
+
+    def remove_connection(self, conn_id: str) -> None:
+        self._writable_connection(conn_id)
+        self._write(lambda: remove_connection(conn_id, path=self._settings_file))
+        self.models_changed()
+
+    def connection_dependents(self, conn_id: str) -> dict[str, Any]:
+        """The clones and defaults that name ``conn_id`` (§3.6: listed before a removal)."""
+        from uclone_x.agent.persona_registry import get_default_persona_registry
+
+        prefix = f"{conn_id}/"
+        registry = get_default_persona_registry(self._workspace_dir)
+        clones: list[dict[str, Any]] = []
+        for persona in registry.list_personas():
+            cfg = persona.llm_config
+            slots = [
+                slot
+                for slot, value in (
+                    ("model_name", cfg.model_name),
+                    ("fast_model", cfg.fast_model),
+                    ("image_model", cfg.image_model),
+                )
+                if value and value.startswith(prefix)
+            ]
+            if slots:
+                clones.append(
+                    {
+                        "id": registry.id_of(persona.name) or persona.name,
+                        "name": persona.name,
+                        "slots": slots,
+                    }
+                )
+        saved = saved_default_models(settings_data(self._settings_file))
+        defaults = [
+            slot
+            for slot, value in (("deep", saved.deep), ("fast", saved.fast), ("image", saved.image))
+            if value and value.startswith(prefix)
+        ]
+        return {"clones": clones, "defaults": defaults}
+
+    def defaults_payload(self) -> dict[str, Any]:
+        defaults = self._gateway.defaults()
+        return {"deep": defaults.deep, "fast": defaults.fast, "image": defaults.image}
+
+    def save_default_models(self, changes: Mapping[str, str | None]) -> None:
+        """Save the default refs ``changes`` names (S1: the one writer)."""
+        self._write(lambda: save_default_models(changes, path=self._settings_file))
+        self.models_changed()
 
     def _load_persisted_settings(self) -> None:
         """Load persisted settings from storage directory if available.
@@ -1384,20 +1163,8 @@ class AgentSessionManager:
         if not isinstance(data, dict):
             return
         cfg = cast(dict[str, Any], data)
-        if isinstance(cfg.get("llm_provider"), str):
-            raw_provider = cast(str, cfg["llm_provider"]).strip().lower()
-            self._configured_provider = canonical_provider(raw_provider) or raw_provider or None
-        if isinstance(cfg.get("llm_base_url"), str):
-            self._configured_base_url = cast(str, cfg["llm_base_url"]).strip()
-        if isinstance(cfg.get("llm_model"), str):
-            self._configured_model = cast(str, cfg["llm_model"]).strip() or None
-        if isinstance(cfg.get(LLM_MODEL_FAST_KEY), str):
-            self._configured_model_fast = cast(str, cfg[LLM_MODEL_FAST_KEY]).strip() or None
-        if isinstance(cfg.get("comfyui_base_url"), str):
-            self._configured_comfyui_url = cast(str, cfg["comfyui_base_url"]).strip()
-            img_tool = self._tools.get("generate_image")
-            if self._configured_comfyui_url and isinstance(img_tool, ComfyImageGenTool):
-                img_tool.update_base_url(self._configured_comfyui_url)
+        # The connections and default models are not held here: the gateway reads them
+        # from the file on every call (S1), and the pre-gateway `llm_*` keys are never read.
         raw_language: object = cfg.get("ui_language")
         if is_ui_language(raw_language):
             self._configured_ui_language = raw_language
@@ -1409,112 +1176,13 @@ class AgentSessionManager:
                 if isinstance(entry, str) and entry.strip()
             )
 
-    def _build_initial_llm(self) -> None:
-        """Build the connector a dashboard starts with, from whatever names a provider.
-
-        The saved file, or `LLM_PROVIDER` alone: the environment overrides the file and
-        does not need one (settings-single-source S4). Only the file was consulted before,
-        so a dashboard started with `LLM_PROVIDER` and no settings file reported that
-        provider in Settings while every conversation had no model (#1899).
-        """
-        if self._llm is not None:
-            return
-        if not (self.provider_in_effect or self._configured_base_url):
-            return
-        try:
-            self._llm = self._build_llm_in_effect()
-        except Exception as exc:
-            logger.warning(
-                "Failed to initialize the LLM connector (settings file %s): %s",
-                self._settings_file,
-                exc,
-            )
-
-    def _adopt_saved_choice(self) -> None:
-        """Pick up a model choice saved after this dashboard started, while it has none.
-
-        `ucx install` (or `ucx llm use`) can save a choice while a dashboard is already
-        running. That dashboard read the file at start and found nothing; without this it
-        would report no provider, and build nothing from the choice, until restarted. A
-        provider this dashboard was given or saved itself is never replaced, and a choice
-        the environment overrides (`LLM_PROVIDER`, a key, an endpoint) is not adopted --
-        the same test the connector factory applies.
-        """
-        if self._configured_provider:
-            return
-        saved = saved_choice_in_effect(path=self._settings_file)
-        if saved is None:
-            return
-        self._configured_provider = canonical_provider(saved.provider) or saved.provider
-        self._configured_model = self._configured_model or saved.model
-        self._configured_model_fast = self._configured_model_fast or saved.model_fast
-        self._configured_base_url = self._configured_base_url or saved.base_url
-        if self._llm is None:
-            try:
-                adopted = self._build_llm_in_effect()
-            except Exception as exc:
-                logger.warning(
-                    "Failed to initialize the LLM connector saved in %s: %s",
-                    self._settings_file,
-                    exc,
-                )
-                return
-            self._install_llm(adopted)
-
-    def _install_llm(self, new_llm: LLMProviderProtocol) -> None:
-        """Make ``new_llm`` the connector, and hand it to every open room (#1446).
-
-        A Settings save and a choice adopted after startup both go through here, so a room
-        opened before either picks the new connector up the same way. A seat takes the
-        Settings models only in the slots its persona left empty; a persona's own model is
-        never replaced by a Settings save (`RoomAgentResolver.replace_llm`).
-        """
-        self._llm = new_llm
-        for listener in self._llm_listeners:
-            listener(new_llm)
-
-    def _save_key(self, provider: str, key: str, *, held: dict[str, Any]) -> None:
-        """Save `key` for `provider`, first keeping an unreadable settings file aside (#1877).
-
-        `save_api_key` refuses to merge into a file it cannot read, and its refusal names
-        the file's path; that text used to reach Settings as the reason the save failed
-        (#1860). A Settings save states every value Settings holds, so the unreadable file
-        is kept aside and replaced with them, as `_save_persisted_settings` does for a
-        save without a key -- and Settings then says the earlier file was kept. The key is
-        saved into the new file.
-
-        `held` is what Settings held before this save: the new file gets those values, not
-        the ones this save is still trying, which a failed model check takes back.
-
-        Raises:
-            OSError: The unreadable file could not be kept aside, or the key could not be
-                written. Its text is not a `ValueError`'s, so it never becomes the reason
-                Settings shows; the route answers with a failure Settings words itself.
-        """
-        try:
-            save_api_key(provider, key, path=self._settings_file)
-            return
-        except ValueError as exc:
-            refusal = exc
-        aside = update_settings_file({}, path=self._settings_file, replace_unreadable_with=held)
-        if aside is None:
-            raise refusal  # the file was readable: the refusal is about the key, as before
-        logger.warning("Settings could not be read before a key was saved: %s", refusal)
-        self._settings_set_aside = True  # and Settings says so
-        try:
-            save_api_key(provider, key, path=self._settings_file)
-        except ValueError as exc:
-            # Unreadable again: another writer since the file was kept aside.
-            raise OSError("the settings file could not be read, so the key was not saved") from exc
-
     def _persisted_settings(self) -> dict[str, Any]:
-        """Every setting this dashboard holds, as a settings file written whole holds them."""
+        """Every setting this dashboard holds, as a settings file written whole holds them.
+
+        The connections and default models are not held in memory, so a file replaced
+        after it could not be read starts without them (#1860).
+        """
         return {
-            "llm_provider": self._configured_provider,
-            "llm_base_url": self._configured_base_url,
-            "llm_model": self._configured_model,
-            LLM_MODEL_FAST_KEY: self._configured_model_fast,
-            "comfyui_base_url": self._configured_comfyui_url,
             "read_roots": list(self._configured_read_roots),
             "ui_language": self._configured_ui_language,
         }
@@ -1522,11 +1190,9 @@ class AgentSessionManager:
     def _save_persisted_settings(self, changes: dict[str, Any]) -> None:
         """Merge the settings this save changed into the settings file.
 
-        Only `changes` are written: the file is shared with setup and `ucx llm use`, and
-        rewriting it whole from memory put `"llm_provider": null` back over a model saved
-        after this dashboard started. When the file cannot be read, it is replaced with
-        everything this dashboard holds, as a Settings save always did. Keys are not held
-        here, so they are written by `save_api_key` alone.
+        Only `changes` are written: the file is shared with setup, `ucx key` and
+        `ucx llm use`. When the file cannot be read, it is replaced with everything this
+        dashboard holds, as a Settings save always did.
         """
         everything = self._persisted_settings()
         try:
@@ -1538,102 +1204,17 @@ class AgentSessionManager:
         except Exception as exc:
             logger.warning("Failed to write settings file %s: %s", self._settings_file, exc)
 
-    def _active_provider(self) -> str:
-        """The provider Settings reports: `LLM_PROVIDER`, saved, the live connector's, or ollama."""
-        return (
-            self.provider_in_effect
-            or (getattr(self._llm, "provider_name", None) if self._llm else None)
-            or "ollama"
-        )
-
-    def _env_overrides(self, provider: str) -> list[dict[str, str]]:
-        """Each setting an environment variable decides instead of the file, in plain words.
-
-        Saving Settings still writes the file; these say why the saved choice is not the
-        one in use while the variable stays set.
-        """
-        overrides: list[dict[str, str]] = []
-        for field, label, (_, source, variable) in (
-            ("llm_provider", "provider", self._provider_state()),
-            ("llm_model", "model", self._model_state(provider)),
-            ("llm_base_url", "endpoint", self._base_url_state(provider)),
-        ):
-            if source == "env" and variable:
-                overrides.append(
-                    {
-                        "field": field,
-                        "env_var": variable,
-                        "message": (
-                            f"The environment variable {variable} is set, so it is used "
-                            f"instead of the {label} chosen here. Saving still keeps your "
-                            f"choice for when the variable is removed."
-                        ),
-                    }
-                )
-        return overrides
-
     def get_settings(self) -> dict[str, Any]:
-        """Return active endpoints, configurations, and masked credentials."""
-        self._adopt_saved_choice()
-        active_provider = self._active_provider()
-        spec = spec_for(active_provider)
+        """The settings Settings shows, other than the connections and models.
 
-        active_base_url, base_url_source, base_url_var = self._base_url_state(active_provider)
-        if not active_base_url and self._llm and hasattr(self._llm, "base_url"):
-            active_base_url = cast(str | None, getattr(self._llm, "base_url", None))
-        if not active_base_url:
-            if active_provider == "ollama":
-                active_base_url = resolve_ollama_base_url()
-            elif active_provider == "vllm":
-                # `resolve_vllm_base_url` refuses rather than defaults, and the refusal
-                # belongs on a turn, not on opening the panel where the endpoint is typed.
-                active_base_url = resolve_vllm_base_url() if has_configured_vllm_endpoint() else ""
-            elif spec is not None and spec.base_url_env:
-                active_base_url = os.getenv(spec.base_url_env) or ""
-
-        # A cloud model is the one the user or `*_MODEL` named, or none: an unset model is
-        # filled from the provider's listing (`catalog.recommended`), never from a
-        # remembered id, which is how Settings came to show a retired one (#1631).
-        active_model, model_source, model_var = self._model_state(active_provider)
-        _, provider_source, provider_var = self._provider_state()
-
-        key, source, variable = self._key_state(active_provider)
-        if not key:
-            live_key = self.resolved_api_key(active_provider)
-            if live_key:
-                key, source = live_key, "settings"
-
-        comfy_url = self._configured_comfyui_url or os.getenv(
-            "COMFYUI_BASE_URL", DEFAULT_COMFYUI_BASE_URL
-        )
-
-        available_providers = [pid for pid in PROVIDERS if pid != "mock"]
-        if active_provider == "mock":
-            available_providers.append("mock")
-
+        Those have their own routes (`GET /api/connections`, `GET /api/models`), and the
+        pre-gateway `llm_*` fields are gone (model-gateway step 3).
+        """
         return {
-            "llm_provider": active_provider,
-            "llm_base_url": active_base_url or "",
-            "llm_model": active_model or "",
-            "llm_model_fast": self._saved_fast_model(active_provider) or "",
-            "llm_provider_source": provider_source,
-            "llm_provider_env_var": provider_var,
-            "llm_model_source": model_source,
-            "llm_model_env_var": model_var,
-            "llm_base_url_source": base_url_source,
-            "llm_base_url_env_var": base_url_var,
-            "env_overrides": self._env_overrides(active_provider),
             # The words are the page's, in the person's language: this says only that it
             # happened, never where the copy is or why it could not be read (#1860).
             "settings_set_aside": self._settings_set_aside,
-            "llm_api_key_set": bool(key),
-            "llm_api_key_masked": self._mask_key(key) if key else "",
-            "llm_api_key_source": source or "",
-            "llm_api_key_env_var": variable or "",
-            "providers": self._provider_key_states(),
-            "comfyui_base_url": comfy_url,
-            **self._image_settings(),
-            "providers_available": available_providers,
+            "default_models": self.defaults_payload(),
             "workspace_dir": str(self._workspace_dir),
             "ui_language": self._configured_ui_language,
             "read_roots": list(self._configured_read_roots),
@@ -1656,206 +1237,43 @@ class AgentSessionManager:
             ],
         }
 
-    def _image_settings(self) -> dict[str, str]:
-        """``image_engine`` and ``image_model`` as saved, read from the file each time.
-
-        The file is their only home: the dispatcher reads it on every draw, so a copy held
-        here could only disagree with it. A stored value the dispatcher would refuse is
-        shown as saved, with the refusal in ``image_settings_problem``.
-        """
-        data = settings_data(self._settings_file)
-        raw_engine: object = data.get(IMAGE_ENGINE_KEY)
-        raw_model: object = data.get(IMAGE_MODEL_KEY)
-        problem = ""
-        try:
-            engine: str = parse_image_engine_setting(raw_engine)
-        except PlainRefusalError as exc:
-            engine, problem = str(raw_engine), str(exc)
-        try:
-            model = parse_image_model(raw_model)
-        except PlainRefusalError as exc:
-            model, problem = str(raw_model), problem or str(exc)
-        return {"image_engine": engine, "image_model": model, "image_settings_problem": problem}
-
-    def on_llm_replaced(self, listener: Callable[[LLMProviderProtocol | None], None]) -> None:
-        """Call `listener` with the new connector whenever Settings replaces it."""
-        self._llm_listeners.append(listener)
-
-    def remove_api_key(self, provider: str) -> dict[str, Any]:
-        """Remove the key saved for ``provider``; return the settings as they now are.
-
-        The key the active connector is using is not removed: the next turn would fail with
-        no key. The person switches provider first, or pastes a new key over it.
-
-        Raises:
-            KeyRemovalRefused: an unknown provider, or the active provider's key.
-        """
-        canonical = canonical_provider(provider)
-        if canonical is None:
-            raise KeyRemovalRefused("unknown_provider", "That provider is not one Settings knows.")
-        if same_provider(self._active_provider(), canonical) and self._llm is not None:
-            raise KeyRemovalRefused(
-                "key_in_use",
-                "This key is in use. Switch to another provider first, "
-                "or paste a new key to replace it.",
-            )
-        delete_api_key(canonical, path=self._settings_file)
-        return self.get_settings()
-
     def update_settings(
         self,
-        llm_provider: str | None = None,
-        llm_base_url: str | None = None,
-        llm_api_key: str | None = None,
-        llm_model: str | None = None,
-        comfyui_base_url: str | None = None,
         read_roots: list[str] | None = None,
         ui_language: object = None,
-        llm_model_fast: str | None = None,
-        llm_api_key_provider: str | None = None,
-        image_engine: object = None,
-        image_model: object = None,
+        default_models: Mapping[str, str | None] | None = None,
     ) -> dict[str, Any]:
-        """Update configurations, hot-reload LLM connectors and tools across active agents.
+        """Save the fields this request names, each on its own; return the settings.
 
-        Nothing is written into `os.environ`. A key is saved for the provider it names
-        (`llm_api_key_provider`, else the provider this save leaves active) and for no other.
+        Nothing is written into `os.environ`. ``default_models`` is checked against the
+        model set by the route before it reaches here (§3.7.1); a malformed ref is refused
+        here, before anything is changed.
         """
-        self._adopt_saved_choice()
         if ui_language is not None and not is_ui_language(ui_language):
             raise ValueError(
                 f"ui_language must be one of {', '.join(UI_LANGUAGES)}, got {ui_language!r}"
             )
-        # Refused before anything is changed, like `ui_language`: a save carrying an
-        # unknown picture engine changes nothing else either.
-        image_changes: dict[str, str] = {}
-        try:
-            if image_engine is not None:
-                image_changes[IMAGE_ENGINE_KEY] = parse_image_engine_setting(image_engine)
-            if image_model is not None:
-                image_changes[IMAGE_MODEL_KEY] = parse_image_model(image_model)
-        except PlainRefusalError as exc:
-            raise ValueError(str(exc)) from exc
         clean_roots = (
             _validate_read_roots(read_roots, self._storage_dir, self._configured_read_roots)
             if read_roots is not None
             else None
         )
-        state_updates: dict[str, str | None] = {}
-
-        if llm_provider is not None and llm_provider.strip():
-            prov_clean = canonical_provider(llm_provider)
-            if prov_clean is None:
-                raise ValueError(f"Unsupported LLM provider: {llm_provider.strip().lower()}")
-            state_updates["_configured_provider"] = prov_clean
-
-        eff_provider = state_updates.get("_configured_provider", self._configured_provider)
-
-        if llm_base_url is not None:
-            state_updates["_configured_base_url"] = llm_base_url.strip()
-
-        if llm_model is not None and llm_model.strip():
-            state_updates["_configured_model"] = llm_model.strip()
-
-        if llm_model_fast is not None:
-            # Empty is a choice here, not an omission: fast follows deep again.
-            state_updates["_configured_model_fast"] = llm_model_fast.strip() or None
-
-        new_key: tuple[str, str] | None = None
-        if llm_api_key is not None:
-            clean_key = llm_api_key.strip()
-            if clean_key and not clean_key.startswith("***") and "..." not in clean_key:
-                key_for = canonical_provider(llm_api_key_provider) or canonical_provider(
-                    eff_provider
-                    or (getattr(self._llm, "provider_name", None) if self._llm else None)
-                    or os.getenv("LLM_PROVIDER")
-                )
-                if key_for is None:
-                    raise ValueError("Choose which provider this key is for, then save again.")
-                new_key = (key_for, clean_key)
-
-        # A save that names no LLM field (the language control's) keeps the connector: rebuilding
-        # it re-probes the provider, and a failed probe would refuse a language save.
-        reload_llm = any(
-            v is not None
-            for v in (llm_provider, llm_base_url, llm_api_key, llm_model, llm_model_fast)
-        )
-        previous = {attr: getattr(self, attr) for attr in state_updates}
-        held = self._persisted_settings()  # before this save's values, which may be undone
-        for k, v in state_updates.items():
-            setattr(self, k, v)
-        if new_key is not None:
-            # The key is saved before the rebuild reads it, and stays saved if the rebuild
-            # fails: it is the person's key for that provider whatever happens to the probe.
-            self._save_key(*new_key, held=held)
-        new_llm = None
-        if reload_llm:
-            # The provider in effect after this save: `LLM_PROVIDER` still wins over the
-            # one just saved, which is written to the file all the same.
-            eff_provider_for_llm = str(
-                self.provider_in_effect
-                or (getattr(self._llm, "provider_name", None) if self._llm else None)
-                or ""
-            )
-            try:
-                new_llm = self._build_configured_llm(
-                    # Empty means "resolve from configuration". The literal "ollama" here made
-                    # the settings path build a localhost connector for a user who had
-                    # configured nothing, which is the case #533's refusal exists to report.
-                    eff_provider_for_llm or None,
-                    self.base_url_in_effect(eff_provider_for_llm or None),
-                )
-            except Exception:
-                for k, v in previous.items():
-                    setattr(self, k, v)
-                raise
-
-        if new_llm is not None:
-            self._install_llm(new_llm)
-
-            logger.info(
-                "⚙️ [UI Settings] Model/Settings updated: provider=%s, model=%s, fast=%s, base_url=%s",
-                eff_provider,
-                self._configured_model,
-                self._configured_model_fast,
-                self._configured_base_url,
-            )
-            _console.print(
-                f"[bold green]⚙️ [UI Settings] Active model updated:[/bold green] [bold yellow]{self._configured_model}[/bold yellow] "
-                f"(provider: [cyan]{eff_provider}[/cyan])"
-            )
-
-        if comfyui_base_url is not None and comfyui_base_url.strip():
-            clean_comfy = comfyui_base_url.strip()
-            self._configured_comfyui_url = clean_comfy
-            img_tool = self._tools.get("generate_image")
-            if isinstance(img_tool, ComfyImageGenTool):
-                img_tool.update_base_url(clean_comfy)
+        if default_models is not None:
+            self.save_default_models(default_models)
 
         if clean_roots is not None:
             # Every conversation seat reads the list again at its next turn
             # (`RoomAgentResolver.resolve`), so nothing is pushed to a live agent here.
             self._configured_read_roots = clean_roots
 
-        changes: dict[str, Any] = {
-            key: getattr(self, attr)
-            for key, attr in (
-                ("llm_provider", "_configured_provider"),
-                ("llm_base_url", "_configured_base_url"),
-                ("llm_model", "_configured_model"),
-                (LLM_MODEL_FAST_KEY, "_configured_model_fast"),
-            )
-            if attr in state_updates
-        }
-        if comfyui_base_url is not None and comfyui_base_url.strip():
-            changes["comfyui_base_url"] = self._configured_comfyui_url
+        changes: dict[str, Any] = {}
         if clean_roots is not None:
             changes["read_roots"] = list(self._configured_read_roots)
         if ui_language is not None:
             self._configured_ui_language = ui_language
             changes["ui_language"] = ui_language
-        changes.update(image_changes)
-        self._save_persisted_settings(changes)
+        if changes:
+            self._save_persisted_settings(changes)
         return self.get_settings()
 
     def get_session_path(self, session_id: str) -> Path:
@@ -1873,23 +1291,11 @@ class AgentSessionManager:
         """
         return resolve_session_path(self._transcript_dir, session_id)
 
-    def legacy_session_path(self, session_id: str) -> Path:
-        """Resolve the pre-namespacing transcript path, `<root>/<session_id>.json`.
-
-        Read-only. Installs that predate the namespacing have transcripts at the root,
-        and some of those files are Core records or hybrids left by the collision. They
-        are still offered to the transcript hydration path so an existing conversation
-        does not vanish from the UI, and nothing ever writes there again.
-        """
-        return resolve_session_path(self._storage_dir, session_id)
-
     def load_session_record(self, session_id: str) -> dict[str, Any] | None:
-        """Load the UI transcript if present, falling back to the legacy root path.
+        """Load the UI transcript at `<root>/ui/<id>.json`, or `None` if there is none.
 
-        The legacy fallback is read-only and exists so a transcript written before the
-        namespacing does not vanish from the UI. It may also encounter a Core record or
-        a collision hybrid sitting at that path; those simply do not match the shape the
-        transcript reader expects, and it returns `None` rather than pretending.
+        Only the namespaced path is read. A file at the family root is not a transcript
+        this build writes, so it is not consulted.
 
         **A transcript belonging to a different session is refused (#256).** The Core store
         is not the only artifact keyed by a session id in a filename, so it is not the only
@@ -1904,7 +1310,7 @@ class AgentSessionManager:
 
         The check is conditional on the record actually carrying a `session_id` string,
         which is deliberate: it refuses on **positive evidence** of a different owner and
-        stays silent about a legacy file too damaged to name its session, which is already
+        stays silent about a file too damaged to name its session, which is already
         handled by the shape mismatch below.
 
         Raises:
@@ -1913,10 +1319,7 @@ class AgentSessionManager:
         """
         path = self.get_session_path(session_id)
         if not path.is_file():
-            legacy = self.legacy_session_path(session_id)
-            if not legacy.is_file():
-                return None
-            path = legacy
+            return None
         try:
             content = path.read_text(encoding="utf-8")
             raw_data: object = json.loads(content)
@@ -2058,23 +1461,32 @@ class AgentSessionManager:
         """The app scope every clone this manager serves is built from (§5.9.2).
 
         One for a 1:1 chat and one per room, over the same parts: the chat and a room seat
-        of one clone differ only in what the room adds (owner ruling 2026-09-27). `llm` is
-        the connector for a chat agent built before Settings installed one.
+        of one clone differ only in what the room adds (owner ruling 2026-09-27). Each clone
+        gets its own connector from its resolved model ref through the gateway
+        (model-gateway §3.4); `llm` answers clones that follow the default when no default
+        model is saved and none was given at construction.
 
         The persona registry is read afresh, against the live tool inventory -- MCP names
         included -- so `allowed_tools` is checked against what is registered now. The
-        binder is kept per (provider, base URL), so each tool description is embedded once
-        for every clone; the grow-only bound set itself is per session.
+        binder is kept per (provider, base URL) of the default deep model's connection, so
+        each tool description is embedded once for every clone; the grow-only bound set
+        itself is per session.
         """
         from uclone_x.agent.persona_registry import get_default_persona_registry
 
-        settings = self.get_settings()
+        if llm is not None and self._gateway.default_binding is None:
+            self._gateway.set_default_binding(DefaultBinding(llm))
+        default_conn = self._default_deep_connection()
         binder_key = (
-            str(settings.get("llm_provider") or ""),
-            str(settings.get("llm_base_url") or ""),
+            default_conn.kind if default_conn is not None else "",
+            (default_conn.base_url or "") if default_conn is not None else "",
         )
         if binder_key not in self._tool_binders:
             self._tool_binders[binder_key] = provider_tool_binder(*binder_key)
+
+        def default_llm() -> LLMProviderProtocol | None:
+            return self._gateway.default_deep()[0]
+
         scope = AppScope.create(
             workspace_root=self._workspace_dir,
             persona_registry=get_default_persona_registry(
@@ -2082,10 +1494,10 @@ class AgentSessionManager:
                 tool_names=[tool.name for tool in self._tools.list_tools()],
             ),
             memory_for=self.memory_for,
-            global_models=self.global_models,
+            gateway=self._gateway,
             read_roots=lambda: self.read_roots,
             bus=self._bus,
-            llm=self._llm or llm,
+            llm=default_llm(),
             tools=self._tools,
             tracer=self._tracer,
             store=self._core_store,
@@ -2100,10 +1512,10 @@ class AgentSessionManager:
             # story view for codex proposals; owner decision 2026-09-26).
             approvals_answered=False,
         )
-        # A peer a chat clone calls is answered on the connector in effect at the call,
-        # so a model chosen in Settings since reaches the callee too.
+        # A peer a chat clone calls starts from the default connector in effect at the call;
+        # the gateway then binds its own model (`PersonaTaskHandler`).
         return dataclasses.replace(
-            scope, live_host=lambda: dataclasses.replace(scope.host, llm=self._llm or llm)
+            scope, live_host=lambda: dataclasses.replace(scope.host, llm=default_llm())
         )
 
     def ontology_for(self, agent_id: str) -> OntologyEngineProtocol:
@@ -2119,20 +1531,22 @@ class AgentSessionManager:
 
         Public, and the only such map on the manager that serves the head: chat sessions
         are not the only seat an agent takes. `RoomStack` seats the same ids in rooms and
-        must reach *this* map rather than keep one of its own. `CrossSessionMemory.save()` rewrites
-        the whole document, so a second map keyed the same way would be a second
-        whole-document writer over one file, and each side would silently drop the facts
-        the other recorded (P6). The ids collide by design: an install's agents are both
+        must reach *this* map rather than keep one of its own. Writes no longer race (each is one
+        sqlite transaction), but a store also holds the clone's embedding index, built from
+        the facts once per object, so a second map keyed the same way would build and
+        refresh a second index over one file. The ids collide by design: an install's agents are both
         its chat agents and the seats a conversation puts them in.
 
         Get-or-create has no `await` between the read and the write, so two coroutines
         cannot race a second store into being.
         """
-        existing = self._agent_memories.get(agent_id)
+        # Keyed by clone id: a handle is resolved first, so one clone never has two stores.
+        key = seat_id_for(agent_id)
+        existing = self._agent_memories.get(key)
         if existing is not None:
             return existing
-        store = default_cross_session_memory(agent_id)
-        self._agent_memories[agent_id] = store
+        store = default_cross_session_memory(key)
+        self._agent_memories[key] = store
         return store
 
     def _eval_read_error(self, exc: Exception) -> str:
@@ -2254,7 +1668,7 @@ class AgentSessionManager:
     def list_artifacts(self, session_id: str | None = None) -> list[dict[str, Any]]:
         """Enumerate the documents and images the clones generated (RFC §6.1).
 
-        Only the tool-output directories are read. The workspace's own `docs/` and root-level
+        Only the `artifacts/` directories are read. The workspace's own `docs/` and root-level
         Markdown are not artifacts: a clone did not produce them, and listing them put the
         repository's internal playbooks in the Docs & Artifacts tab as if a clone had.
         """
@@ -2300,20 +1714,19 @@ class AgentSessionManager:
             except Exception:
                 pass
 
-        # 1. Session-specific tool output artifacts if session_id provided
+        # 1. The session's own artifacts directory, if session_id provided. Tool results
+        # are not listed: they are kept in the session store (#1848), not the workspace,
+        # and are not documents a clone produced.
         if session_id and session_id.strip():
             clean_sid = session_id.strip()
-            session_tool_dir = root / ".sandbox" / "tool_artifacts" / clean_sid
-            if session_tool_dir.is_dir():
-                for p in sorted(session_tool_dir.rglob("*")):
-                    _add_file(p)
             session_custom_dir = root / "artifacts" / clean_sid
             if session_custom_dir.is_dir():
                 for p in sorted(session_custom_dir.rglob("*")):
                     _add_file(p)
 
-        # 2. Workspace artifacts directory. Not session-scoped yet: the image tool writes
-        # `artifacts/images/img_<seed>_<sid[:6]>.png`, outside any per-session directory.
+        # 2. Workspace artifacts directory. Not session-scoped yet: the image tools now save
+        # under `artifacts/<session id>/images/` (#1390), but pictures saved before that, and
+        # those given an explicit `output_path`, sit outside any per-session directory.
         artifacts_dir = root / "artifacts"
         if artifacts_dir.is_dir():
             for p in sorted(artifacts_dir.rglob("*")):
@@ -2322,8 +1735,14 @@ class AgentSessionManager:
         results.sort(key=lambda x: str(x.get("modified_at", "")), reverse=True)
         return results
 
-    def get_artifact_file(self, path: str, session_id: str | None = None) -> tuple[Path, str]:
-        """Safely retrieve artifact Path and detected MIME type from workspace (P6)."""
+    def get_artifact_file(
+        self, path: str, session_id: str | None = None, *, root: Path | None = None
+    ) -> tuple[Path, str]:
+        """Safely retrieve artifact Path and detected MIME type from workspace (P6).
+
+        `root` is the workspace to read from (a conversation's own, clone-data-scopes §3.6);
+        `None` is the server's.
+        """
         if not path or not path.strip():
             raise PathTraversalError("Path must not be empty.")
         clean_path = path.strip()
@@ -2331,7 +1750,7 @@ class AgentSessionManager:
             raise PathTraversalError("Null byte detected in path.")
 
         validator = PathValidator()
-        resolved = validator.resolve_safe_path(Path(clean_path), self._workspace_dir)
+        resolved = validator.resolve_safe_path(Path(clean_path), root or self._workspace_dir)
 
         if not resolved.is_file():
             raise FileNotFoundError(f"Artifact not found: {clean_path}")
@@ -2505,6 +1924,17 @@ def create_ui_app(
     if eval_reports_dir is not None and session_manager is not None:
         session_mgr.eval_reports_dir = eval_reports_dir
 
+    # Before any route reads a clone (clone-data-scopes §3.8): migrate the agents root,
+    # import the launch directory's personas, install the builtins. A no-op once done.
+    # The package directory is read through the registry module, as the registry reads it.
+    from uclone_x.agent import persona_registry as _registry_module
+    from uclone_x.agent.clone_store import ensure_clone_store
+
+    _package_dir = _registry_module.BUILTIN_PERSONAS_DIR
+    ensure_clone_store(
+        session_mgr.workspace_dir, builtin_dir=_package_dir if _package_dir.is_dir() else None
+    )
+
     # Per app, like the session manager: the user's external MCP servers, whose tools are
     # registered into the same registry every clone's turn reads its tools from.
     mcp_manager = MCPServerManager(
@@ -2513,6 +1943,8 @@ def create_ui_app(
         workspace_root=session_mgr.workspace_dir,
     )
     tunnel_manager = SSHTunnelManager()
+    # Where a picture is drawn reads the tunnel: ComfyUI on its local port is the GPU server.
+    session_mgr.bind_gpu_tunnel(lambda: tunnel_manager.get_status().comfyui_local_port)
     links = link_supervisor if link_supervisor is not None else LinkSupervisor()
     # What a remote-GPU connect overwrote, kept on disk rather than in memory: the tunnel is
     # a child process that dies with this one (or on its own), and a restore held only in
@@ -2545,25 +1977,187 @@ def create_ui_app(
 
         Returns only the fields actually put back.
         """
-        original, applied = _read_remote_restore()
-        cur = session_mgr.get_settings()
+        _original, applied = _read_remote_restore()
         restored: dict[str, str] = {}
-        for field in ("llm_base_url", "comfyui_base_url"):
-            if field in original and str(cur.get(field) or "") == applied.get(field):
-                restored[field] = original[field]
-        # The provider was switched to reach the tunnel's Ollama; it goes back with the
-        # address, never on its own.
-        if "llm_base_url" in restored and "llm_provider" in original:
-            restored["llm_provider"] = original["llm_provider"]
-        if restored:
-            session_mgr.update_settings(
-                llm_provider=restored.get("llm_provider"),
-                llm_base_url=restored.get("llm_base_url"),
-                comfyui_base_url=restored.get("comfyui_base_url"),
-            )
+        # The tunnel's Ollama and ComfyUI were added as connections of their own; each goes
+        # with the tunnel, unless its address was changed by hand since.
+        for conn_id, field in (
+            (REMOTE_GPU_CONNECTION_ID, "connection"),
+            (REMOTE_GPU_PICTURES_ID, "picture_connection"),
+        ):
+            tunnel_conn = session_mgr.gateway.connection(conn_id)
+            if (
+                conn_id in applied
+                and tunnel_conn is not None
+                and tunnel_conn.source == "settings"
+                and tunnel_conn.base_url == applied[conn_id]
+            ):
+                session_mgr.remove_connection(conn_id)
+                restored[field] = conn_id
         with contextlib.suppress(FileNotFoundError):
             remote_restore_path.unlink()
         return restored
+
+    tunnel_manager.add_disconnect_listener(_restore_remote_settings)
+
+    # What the last connect asked for, kept until Disconnect is pressed: a restart (or a dev
+    # reload) ends the tunnel with the process, and the next start makes the same connect.
+    remote_session_path = session_mgr.storage_dir / "remote_gpu_session.json"
+
+    async def _connect_remote_gpu(
+        host: str,
+        *,
+        apply_settings: bool,
+        auto_start_comfyui: bool,
+        sync_llm: bool,
+        timeout: float,
+        ports: dict[str, int] | None = None,
+    ) -> dict[str, Any]:
+        """Open the tunnel, point the saved addresses at it, and remember the request."""
+        ports = ports or {}
+        tunnel_status = await tunnel_manager.connect(
+            host=host,
+            preferred_local_ollama_port=ports.get("ollama"),
+            preferred_local_comfyui_port=ports.get("comfyui"),
+            auto_start_comfyui=auto_start_comfyui,
+            timeout=timeout,
+        )
+        if not tunnel_status.connected:
+            return {
+                "status": "error",
+                "connected": False,
+                "error": tunnel_status.error or "Failed to connect tunnel",
+                "tunnel": tunnel_status.to_dict(),
+                "llm_on_remote": False,
+                "images_on_remote": False,
+            }
+
+        changes: dict[str, Any] = {}
+        llm_skipped: str | None = None  # kept in the reply's shape; a connection never skips
+        if apply_settings:
+            # A reconnect keeps the first record: the current values are the tunnel's own.
+            original, applied = _read_remote_restore()
+
+            for m in tunnel_status.mappings:
+                if m.service_name == "ollama":
+                    if not sync_llm:
+                        continue
+                    # The tunnel's Ollama becomes a connection of its own beside the others
+                    # (model-gateway G1), so its models join the set; nothing else is
+                    # disconnected, and no default model is changed behind the person.
+                    address = f"http://127.0.0.1:{m.local_port}"
+                    existing = session_mgr.gateway.connection(REMOTE_GPU_CONNECTION_ID)
+                    if existing is None:
+                        add_connection(
+                            "ollama",
+                            label=REMOTE_GPU_CONNECTION_LABEL,
+                            base_url=address,
+                            path=session_mgr.settings_file,
+                        )
+                    elif existing.source == "settings":
+                        update_connection(
+                            REMOTE_GPU_CONNECTION_ID,
+                            base_url=address,
+                            path=session_mgr.settings_file,
+                        )
+                    session_mgr.models_changed()
+                    applied[REMOTE_GPU_CONNECTION_ID] = address
+                    original.setdefault(REMOTE_GPU_CONNECTION_ID, "")
+                    changes["connection"] = REMOTE_GPU_CONNECTION_ID
+                elif m.service_name == "comfyui":
+                    # The tunnel's ComfyUI becomes a picture connection of its own (§3.5),
+                    # so its models join the picture set; the person's own ComfyUI, and the
+                    # picture models chosen, are left as they are.
+                    address = f"http://127.0.0.1:{m.local_port}"
+                    existing = session_mgr.gateway.connection(REMOTE_GPU_PICTURES_ID)
+                    if existing is None or existing.source == "settings":
+                        update_connection(
+                            REMOTE_GPU_PICTURES_ID,
+                            kind="comfyui",
+                            create=True,
+                            label=REMOTE_GPU_PICTURES_LABEL,
+                            base_url=address,
+                            path=session_mgr.settings_file,
+                        )
+                    session_mgr.models_changed()
+                    applied[REMOTE_GPU_PICTURES_ID] = address
+                    original.setdefault(REMOTE_GPU_PICTURES_ID, "")
+                    changes["picture_connection"] = REMOTE_GPU_PICTURES_ID
+            if original:
+                remote_restore_path.parent.mkdir(parents=True, exist_ok=True)
+                record = {"original": original, "applied": applied}
+                replace_file(remote_restore_path, json.dumps(record, indent=2).encode())
+
+        # The local ports go in too, so the next start asks for the same ones and the
+        # addresses it writes match the ones this run wrote.
+        session_record = {
+            "host": host,
+            "apply_settings": apply_settings,
+            "auto_start_comfyui": auto_start_comfyui,
+            "sync_llm": sync_llm,
+            "ports": {m.service_name: m.local_port for m in tunnel_status.mappings},
+        }
+        remote_session_path.parent.mkdir(parents=True, exist_ok=True)
+        replace_file(remote_session_path, json.dumps(session_record, indent=2).encode())
+
+        images_on_remote = bool(
+            tunnel_status.connected
+            and any(m.service_name == COMFYUI_SERVICE_NAME for m in tunnel_status.mappings)
+        )
+        llm_on_remote = bool(
+            tunnel_status.connected
+            and any(m.service_name == "ollama" for m in tunnel_status.mappings)
+            and changes.get("connection")
+        )
+
+        return {
+            "status": "ok",
+            "connected": True,
+            "tunnel": tunnel_status.to_dict(),
+            "applied_changes": changes,
+            "llm_skipped": llm_skipped,
+            "llm_on_remote": llm_on_remote,
+            "images_on_remote": images_on_remote,
+        }
+
+    async def _reconnect_remote_gpu() -> None:
+        """Make again the connect the previous run left open; a failure is only logged.
+
+        The record stays when the worker does not answer, so the start after it tries again;
+        only Disconnect forgets it.
+        """
+        try:
+            raw: object = json.loads(remote_session_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        if not isinstance(raw, dict):
+            return
+        record = cast("dict[str, object]", raw)
+        host = record.get("host")
+        if not isinstance(host, str) or not is_valid_host(host):
+            return
+        raw_ports = record.get("ports")
+        ports: dict[str, int] = {}
+        if isinstance(raw_ports, dict):
+            for k, v in cast("dict[object, object]", raw_ports).items():
+                if isinstance(k, str) and isinstance(v, int):
+                    ports[k] = v
+        try:
+            result = await _connect_remote_gpu(
+                host,
+                apply_settings=record.get("apply_settings") is not False,
+                auto_start_comfyui=record.get("auto_start_comfyui") is not False,
+                sync_llm=record.get("sync_llm") is True,
+                timeout=15.0,
+                ports=ports,
+            )
+        except Exception:
+            logger.warning("Remote-GPU reconnect to %s failed", host, exc_info=True)
+            return
+        if result["connected"]:
+            logger.info("Remote-GPU tunnel to %s reconnected at startup", host)
+        else:
+            logger.warning("Remote-GPU reconnect to %s failed: %s", host, result["error"])
 
     @asynccontextmanager
     async def _app_lifespan(app_inst: FastAPI) -> AsyncGenerator[None, None]:
@@ -2580,9 +2174,24 @@ def create_ui_app(
             with contextlib.suppress(Exception):
                 restored = _restore_remote_settings()
                 logger.info("Restored settings a remote-GPU tunnel had replaced: %s", restored)
+        # A connect that was never disconnected is made again, in the background: the probe
+        # and ssh take seconds, and an unreachable worker must not hold the dashboard up.
+        # Until it answers, the addresses just put back are the ones in use.
+        reconnect = asyncio.create_task(_reconnect_remote_gpu())
         # The uClone2 links dial out in the background; a stored link that cannot reach
         # uClone2 retries on its own and never holds the dashboard up.
         await links.start()
+        # A `/loop` the previous process was running is on its room's record; `--dev`
+        # restarts the worker on every change under `src/`, a `git pull` included (#1936).
+        loop_stack = getattr(app_inst.state, "room_stack", None)
+        if loop_stack is not None:
+            try:
+                resumed = loop_stack.resume_room_loops()
+            except Exception:
+                logger.warning("Repeating tasks could not be continued", exc_info=True)
+            else:
+                if resumed:
+                    logger.info("Continued %d repeating task(s) from the room records", resumed)
         yield
         # First, while the event loop is healthy: each session sends `bye{logout}` so
         # uClone2 shows the clone offline at once (bounded at 2 s per session, in parallel).
@@ -2591,6 +2200,9 @@ def create_ui_app(
         mcp_start.cancel()
         with contextlib.suppress(BaseException):
             await mcp_start
+        reconnect.cancel()
+        with contextlib.suppress(BaseException):
+            await reconnect
         # Local servers are child processes; left running they outlive the app.
         await mcp_manager.close()
         with contextlib.suppress(BaseException):
@@ -2646,21 +2258,67 @@ def create_ui_app(
     from uclone_x.ui.rooms import RoomStack, register_room_routes
 
     room_stack = RoomStack(session_mgr)
+    # At start, after the clone store: every stored room still seating clones by handle is
+    # rewritten to their ids, once, as loading it would (clone-data-scopes §4 step 3).
+    room_stack.service.survey_rooms()
     app.state.room_stack = room_stack
-    register_room_routes(app, room_stack)
+    register_room_routes(
+        app,
+        room_stack,
+        # Late-bound: the check is defined further down this function, read per request.
+        refuse_cross_origin=lambda request: _refuse_cross_origin(request),
+    )
 
     from uclone_x.ui.room_dock import register_room_dock_routes
 
     # The dock's reads for the conversation on screen and its selected seat (#1353-#1357).
-    register_room_dock_routes(app, room_stack)
+    register_room_dock_routes(
+        app,
+        room_stack,
+        refuse_cross_origin=lambda request: _refuse_cross_origin(request),
+    )
 
     # This lists what is *installed*, not what is running (#1190; the live-instance
     # `/api/agents` was removed 2026-09-27, #1775). It is handed
     # the room stack as well as the session manager because a clone is running in either
     # seat, and under D1 the conversation seat is the ordinary one.
-    from uclone_x.ui.clones import register_clone_routes
+    from uclone_x.ui.clones import CloneCatalog, register_clone_routes
 
-    register_clone_routes(app, session_mgr, room_stack)
+    def _clone_catalog() -> CloneCatalog:
+        """Every clone's persona fields, and what an editor offers beside the list.
+
+        `/api/clones` absorbed `/api/personas` (clone-data-scopes §3.7): one resource,
+        whose rows carry both what a clone is and whether it is running.
+        """
+        from uclone_x.agent.persona_registry import get_default_persona_registry
+        from uclone_x.core.models import BASE_PERSONA_TOOLS
+
+        # The inventory is passed here too, not only on the agent-creation path: this
+        # route serves the dashboard on load and therefore usually reaches the cached
+        # registry first, which would otherwise pin the process to an unvalidated one.
+        from uclone_x.tools.base import tool_writes_files
+
+        all_tools = session_mgr.tools.list_tools()
+        tool_names = [tool.name for tool in all_tools]
+        write_tools = [tool.name for tool in all_tools if tool_writes_files(tool)]
+        registry = get_default_persona_registry(session_mgr.workspace_dir, tool_names=tool_names)
+        entries = [_persona_payload(registry, p) for p in registry.list_personas()]
+        writable = registry.writable_dir()
+        return entries, {
+            # What an editor offers: the tools a clone can name, and where a save lands.
+            "available_tools": sorted(tool_names),
+            "personas_dir": str(writable) if writable is not None else None,
+            "base_tools": list(BASE_PERSONA_TOOLS),
+            "write_tools": sorted(write_tools),
+        }
+
+    register_clone_routes(
+        app,
+        session_mgr,
+        room_stack,
+        _clone_catalog,
+        refuse_cross_origin=lambda request: _refuse_cross_origin(request),
+    )
 
     # The Files screen: the artifact folders across every conversation, including deleted
     # ones, apart from the room-scoped Docs dock (#1554).
@@ -2673,7 +2331,21 @@ def create_ui_app(
     person_gate = PersonGate()
     app.state.person_gate = person_gate
     register_person_routes(app, person_gate)
-    register_artifact_routes(app, room_stack, person_gate)
+    register_artifact_routes(
+        app,
+        room_stack,
+        person_gate,
+        refuse_cross_origin=lambda request: _refuse_cross_origin(request),
+    )
+    # What extensions add to the head -- the story view, for the story extension (#2205).
+    from uclone_x.ui.extension_routes import register_extension_routes
+
+    register_extension_routes(
+        app,
+        room_stack,
+        person_gate,
+        refuse_cross_origin=lambda request: _refuse_cross_origin(request),
+    )
 
     @app.get("/api/health")
     async def health() -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
@@ -2692,7 +2364,7 @@ def create_ui_app(
             "event_bus_mode": "in_memory_fastpath",
             "absorbed_failures": {
                 "dropped_spans": {
-                    "count": active_tracer.dropped_span_count,
+                    "count": active_tracer.buffer_evicted_span_count,
                     "reasons": dict(active_tracer.drop_reasons),
                     "undelivered": active_tracer.undelivered_span_count,
                 },
@@ -2725,7 +2397,7 @@ def create_ui_app(
             },
             "absorbed_failures": {
                 "dropped_spans": {
-                    "count": active_tracer.dropped_span_count,
+                    "count": active_tracer.buffer_evicted_span_count,
                     "reasons": dict(active_tracer.drop_reasons),
                     "undelivered": active_tracer.undelivered_span_count,
                 },
@@ -2746,134 +2418,182 @@ def create_ui_app(
             },
         }
 
-    catalog_cache = CatalogCache()
-
-    async def _catalog_for(provider: str) -> CatalogResult | None:
-        # Only an endpoint the user set is sent: the listing goes where the turns would.
-        return await read_provider_catalog(
-            provider,
-            base_url=session_mgr.base_url_in_effect(provider),
-            api_key=session_mgr.resolved_api_key(provider),
-            cache=catalog_cache,
-        )
-
-    async def _model_ids(
-        provider: str, settings: dict[str, Any], catalog: CatalogResult | None
-    ) -> list[str]:
-        if catalog is not None:
-            return [entry.id for entry in catalog.entries if entry.chat_capable]
-        return await fetch_available_models(
-            provider=provider,
-            base_url=cast(str | None, settings.get("llm_base_url")) or None,
-        )
-
     @app.get("/api/media/status")
     async def media_status(request: Request) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
-        """Which image engine would draw now, under the `image_engine` setting, and why.
+        """Which picture model would draw now under the default picture model, and why.
 
         The probe `ucx media status` prints, run off the event loop: it makes two local
-        HTTP probes. Gemini is judged by whether its key is there, never by a request.
-        A stored setting the dispatcher would refuse answers 409 with that refusal.
+        HTTP probes. The cloud is judged by whether its connection has a key, never by a
+        request. A chosen model that cannot be used is said in ``resolved.refusal``.
         """
         _refuse_cross_origin(request)
-        from uclone_x.tools.builtin.image_status import probe_image_engines
+        from uclone_x.tools.builtin.image_status import media_status_payload, probe_image_engines
 
         try:
             report = await asyncio.to_thread(
-                probe_image_engines, session_mgr.settings_file, session_mgr.provider_in_effect
+                functools.partial(probe_image_engines, detect_comfyui=True),
+                session_mgr.settings_file,
+                session_mgr.gpu_tunnel_comfy_port(),
             )
         except PlainRefusalError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        return {
-            "ready": report.ready,
-            "engine": report.engine,
-            "setting": report.image_engine,
-            "engines": [
-                {"name": name, "ready": ready, "reason_code": code}
-                for name, ready, code in report.engine_states()
-            ],
-        }
+        return media_status_payload(report)
 
     @app.get("/api/settings")
     async def get_settings(request: Request) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
-        """Retrieve current active endpoints, configurations, and available providers."""
+        """The settings other than connections and models (those have their own routes)."""
         _refuse_cross_origin(request)  # names the folders clones can read, and the workspace
-        settings = session_mgr.get_settings()
-        provider = str(settings.get("llm_provider", "ollama"))
-        catalog = await _catalog_for(provider)
-        settings["catalog"] = catalog.model_dump(mode="json") if catalog else None
-        settings["available_models"] = await _model_ids(provider, settings, catalog)
-        return settings
+        return session_mgr.get_settings()
+
+    #: What a write that failed on the disk says: never the path or the cause (#1860).
+    settings_not_saved = "The settings could not be saved. The reason is in the log."
+
+    def _connection_refusal(exc: Exception, status_code: int = 400) -> JSONResponse:
+        # The plain sentence the refusal was written with; never a class name or a path.
+        if not isinstance(exc, PlainRefusalError):
+            logger.warning("A connection change was not saved: %s", exc)
+            return JSONResponse({"detail": settings_not_saved}, status_code=500)
+        return JSONResponse({"detail": str(exc)}, status_code=status_code)
+
+    @app.get("/api/connections")
+    async def list_connections(request: Request) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
+        """Every connection and the kinds that can be added (model-gateway §3.7.1)."""
+        _refuse_cross_origin(request)  # names the hosts the user reaches and masked keys
+        return session_mgr.connections_payload()
+
+    async def _settings_event(updated: dict[str, Any]) -> None:
+        sys_pub = active_bus.register_publisher(sender_id="ui_settings", source=EventSource.SYSTEM)
+        await sys_pub.publish(
+            AgentEvent(
+                type=EventType.SETTINGS_UPDATED,
+                recipient_id="*",
+                topic="settings",
+                payload=dict(updated),
+            )
+        )
+
+    @app.post("/api/connections")
+    async def add_connection_route(request: Request, req: dict[str, Any]) -> Any:  # pyright: ignore[reportUnusedFunction]
+        """Add a connection and check it at once; answers it as `GET` lists it."""
+        _refuse_cross_origin(request)  # another tab must not add a host to send keys to
+        try:
+            added = await session_mgr.add_connection(
+                str(req.get("kind") or ""),
+                label=_optional_text(req.get("label")),
+                base_url=_optional_text(req.get("base_url")),
+                key=_optional_text(req.get("key")),
+            )
+        except (ConnectionError_, ValueError, OSError) as exc:
+            return _connection_refusal(exc)
+        await _settings_event({"connections": "added", "id": added["id"]})
+        return added
+
+    @app.patch("/api/connections/{conn_id}")
+    async def patch_connection_route(request: Request, conn_id: str, req: dict[str, Any]) -> Any:  # pyright: ignore[reportUnusedFunction]
+        """Change a connection's label, address or key; an empty key removes it."""
+        _refuse_cross_origin(request)
+        try:
+            changed = await session_mgr.patch_connection(conn_id, req)
+        except (ConnectionError_, ValueError, OSError) as exc:
+            return _connection_refusal(exc)
+        await _settings_event({"connections": "changed", "id": conn_id})
+        return changed
+
+    @app.post("/api/connections/{conn_id}/check")
+    async def check_connection_route(request: Request, conn_id: str) -> Any:  # pyright: ignore[reportUnusedFunction]
+        """Ask the connection for its models now (Check connection)."""
+        _refuse_cross_origin(request)  # a check sends the key to the connection's host
+        try:
+            return await session_mgr.check_connection(conn_id)
+        except ConnectionError_ as exc:
+            return _connection_refusal(exc, 404)
+
+    @app.get("/api/connections/{conn_id}/dependents")
+    async def connection_dependents_route(request: Request, conn_id: str) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
+        """The clones and defaults that name this connection, listed before a removal."""
+        _refuse_cross_origin(request)
+        return session_mgr.connection_dependents(conn_id)
+
+    @app.delete("/api/connections/{conn_id}")
+    async def remove_connection_route(request: Request, conn_id: str) -> Any:  # pyright: ignore[reportUnusedFunction]
+        """Remove a saved connection. One set by an environment variable is refused."""
+        _refuse_cross_origin(request)
+        try:
+            session_mgr.remove_connection(conn_id)
+        except (ConnectionError_, ValueError, OSError) as exc:
+            return _connection_refusal(exc)
+        await _settings_event({"connections": "removed", "id": conn_id})
+        return {"removed": conn_id}
 
     @app.get("/api/models")
-    async def get_models(refresh: bool = False) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
-        """Enumerate installed/available models for active provider (P0/Recognition over Recall).
+    async def get_models(  # pyright: ignore[reportUnusedFunction]
+        request: Request, capability: str = "chat", refresh: bool = False
+    ) -> Any:
+        """The model set grouped by connection, with the defaults (model-gateway §3.7.1).
 
         `refresh=1` forgets the kept listings first, for the picker's "Refresh list".
         """
-        if refresh:
-            catalog_cache.clear()  # the saved provider's "Refresh list"
-        settings = session_mgr.get_settings()
-        provider = str(settings.get("llm_provider", "ollama"))
-        catalog = await _catalog_for(provider)
+        _refuse_cross_origin(request)  # it asks every connection with its key
+        wanted: Capability
+        if capability == "chat":
+            wanted = "chat"
+        elif capability == "image":
+            wanted = "image"
+        else:
+            return JSONResponse({"detail": "Choose chat or image models."}, status_code=400)
+        gateway = session_mgr.gateway
+        models = await gateway.model_set(wanted, refresh=refresh)
         return {
-            "provider": provider,
-            "models": await _model_ids(provider, settings, catalog),
-            "current_model": settings.get("llm_model", ""),
-            "catalog": catalog.model_dump(mode="json") if catalog else None,
+            "groups": [group.as_json() for group in models.groups],
+            "defaults": session_mgr.defaults_payload(),
+            "recommended": gateway.recommended(models)
+            if capability == "chat"
+            else {"deep": None, "fast": None},
         }
 
-    @app.post("/api/models/catalog")
-    async def preview_catalog(request: Request, req: dict[str, Any]) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
-        """The model listing for a provider picked on the form, before it is saved (#1657).
+    def _ollama_address(req: dict[str, Any]) -> str | None:
+        """The address of the Ollama connection ``connection_id`` names, else the first one.
 
-        The key and endpoint come from the form, in the body, never the URL. With no key typed,
-        only a key already held for that provider is used (`stored_api_key_for`). A local
-        provider (Ollama, vLLM) answers `catalog: null`, the models its server has installed,
-        and whether anything answered at all (`reachable`, #1666).
+        With no Ollama connection and none named, `None`: the local daemon's own address
+        (`resolve_ollama_base_url`), as `ucx llm pull` uses.
         """
-        _refuse_cross_origin(request)  # a page in another tab must not spend the user's key
-        provider = str(req.get("provider", "")).strip().lower()
-        if not provider:
-            raise HTTPException(status_code=400, detail="provider is required")
-        if req.get("refresh"):
-            catalog_cache.clear()
-        typed_key = str(req.get("api_key") or "").strip()
-        base_url = str(req.get("base_url") or "").strip() or None
-        api_key = typed_key or session_mgr.stored_api_key_for(provider, base_url)
-        catalog = await read_provider_catalog(
-            provider, base_url=base_url, api_key=api_key, cache=catalog_cache
-        )
-        if catalog is None and provider in LOCAL_LISTING_PROVIDERS:
-            # The server's installed models, at the address on the form (#1666). `reachable`
-            # tells a stopped server apart from one with nothing installed.
-            # The address is whatever is typed, fetched with no click: only the typed key, or
-            # one held for this exact saved endpoint, goes with it, never `VLLM_API_KEY`.
-            headers = vllm_request_headers(api_key, env_fallback=False)
-            try:
-                local = await list_local_models(
-                    provider, base_url, vllm_headers=headers, raise_on_refused_key=True
-                )
-            except LocalKeyRefusedError:
-                # Running, and it turned the key away: not "nothing answered" (#1672).
-                return {
-                    "provider": provider,
-                    "models": [],
-                    "reachable": True,
-                    "key_refused": True,
-                    "catalog": None,
-                }
-            return {
-                "provider": provider,
-                "models": local or [],
-                "reachable": local is not None,
-                "catalog": None,
-            }
-        models = [entry.id for entry in catalog.entries if entry.chat_capable] if catalog else []
+        wanted = _optional_text(req.get("connection_id"))
+        ollamas = [c for c in session_mgr.gateway.connections() if c.kind == "ollama"]
+        if wanted is None:
+            return ollamas[0].base_url if ollamas else None
+        chosen = next((c for c in ollamas if c.id == wanted), None)
+        if chosen is None:
+            raise HTTPException(
+                status_code=400, detail=f"There is no Ollama connection called {wanted}."
+            )
+        return chosen.base_url
+
+    @app.get("/api/models/installed")
+    async def installed_models_route(  # pyright: ignore[reportUnusedFunction]
+        request: Request, connection_id: str | None = None
+    ) -> Any:
+        """What one Ollama connection has installed, for Settings' install and remove (#2167).
+
+        Every model, embedders included, each saying whether it can hold a conversation
+        (Ollama's own capabilities, `list_ollama_entries`): an embedder is not offered to
+        chat but can still be removed, so it is listed here and said to be one.
+        `connection_id` names the connection as `POST /api/models/pull` does.
+        """
+        _refuse_cross_origin(request)  # names what the user has installed
+        base_url = _ollama_address({"connection_id": connection_id})
+        entries = await list_ollama_entries(base_url)
+        if entries is None:
+            return JSONResponse(
+                {
+                    "detail": "Couldn't get an answer from Ollama. Check that it is running "
+                    "and that the address is right.",
+                    "code": "unreachable",
+                },
+                status_code=502,
+            )
         return {
-            "provider": provider,
-            "models": models,
-            "catalog": catalog.model_dump(mode="json") if catalog else None,
+            "connection_id": connection_id,
+            "models": [{"id": e.id, "chat": e.chat_capable} for e in entries],
         }
 
     @app.post("/api/models/pull")
@@ -2917,8 +2637,7 @@ def create_ui_app(
         model = str(req.get("model", "")).strip()
         if not model:
             raise HTTPException(status_code=400, detail="model is required")
-        settings = session_mgr.get_settings()
-        base_url = cast(str | None, settings.get("llm_base_url")) or None
+        base_url = _ollama_address(req)
 
         def pull() -> Coroutine[Any, Any, None]:
             return pull_model(model, base_url=base_url)
@@ -2935,7 +2654,9 @@ def create_ui_app(
                 ),
             ) from exc
         except LLMProviderError as exc:
-            raise HTTPException(status_code=502, detail=str(exc)) from exc
+            raise HTTPException(
+                status_code=502, detail=f"Could not pull {model} from Ollama."
+            ) from exc
         return {"status": "ok", "model": model, "joined": not started}
 
     @app.post("/api/models/delete")
@@ -2951,62 +2672,77 @@ def create_ui_app(
         model = str(req.get("model", "")).strip()
         if not model:
             raise HTTPException(status_code=400, detail="model is required")
-        settings = session_mgr.get_settings()
-        base_url = cast(str | None, settings.get("llm_base_url")) or None
         try:
-            await delete_model(model, base_url=base_url)
+            await delete_model(model, base_url=_ollama_address(req))
         except LLMProviderError as exc:
-            raise HTTPException(status_code=502, detail=str(exc)) from exc
+            raise HTTPException(
+                status_code=502, detail=f"Could not delete {model} from Ollama."
+            ) from exc
         return {"status": "ok", "model": model}
 
+    async def _refuse_unlisted_defaults(changes: dict[str, Any]) -> str | None:
+        """Why a default model may not be saved, in plain words; `None` when it may (§3.7.1)."""
+        gateway = session_mgr.gateway
+        for slot, value in changes.items():
+            if value is None or (slot == "image" and value == "auto"):
+                continue
+            if not isinstance(value, str):
+                return "A default model must be a model name."
+            try:
+                ref = ModelRef.parse(value)
+            except ModelRefError as exc:
+                return str(exc)
+            conn = gateway.connection(ref.connection_id)
+            if conn is None:
+                return f"There is no connection called {ref.connection_id}."
+            if slot == "image" and (problem := image_ref_problem(ref, conn)) is not None:
+                return problem
+            capability: Capability = "image" if slot == "image" else "chat"
+            group = (await gateway.model_set(capability)).group(conn.id)
+            if group is None or group.status != "connected":
+                detail = group.detail if group is not None and group.detail else ""
+                return f"{conn.display_label} cannot list its models right now. {detail}".strip()
+            if not any(entry.ref == str(ref) for entry in group.models):
+                return f"{conn.display_label} does not list the model {ref.model}."
+        return None
+
     @app.post("/api/settings")
-    async def update_settings(request: Request, req: dict[str, Any]) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
-        """Update configurations, hot-reload runtime connectors, and broadcast settings.updated event."""
+    async def update_settings(request: Request, req: dict[str, Any]) -> Any:  # pyright: ignore[reportUnusedFunction]
+        """Save the settings the request names, and broadcast settings.updated.
+
+        ``default_models`` (`{deep?, fast?, image?}`) is saved only when each ref is in the
+        current model set; otherwise the refusal names the connection's state (§3.7.1).
+        """
         _refuse_cross_origin(request)  # another tab must not widen read_roots
+        raw_defaults = req.get("default_models")
+        defaults: dict[str, Any] | None = None
+        if raw_defaults is not None:
+            if not isinstance(raw_defaults, dict):
+                return JSONResponse(
+                    {"detail": "default_models must name deep, fast or image."}, status_code=400
+                )
+            defaults = {str(k): v for k, v in cast(dict[object, object], raw_defaults).items()}
+            unknown = [slot for slot in defaults if slot not in ("deep", "fast", "image")]
+            if unknown:
+                return JSONResponse(
+                    {"detail": "default_models must name deep, fast or image."}, status_code=400
+                )
+            refusal = await _refuse_unlisted_defaults(defaults)
+            if refusal is not None:
+                return JSONResponse({"detail": refusal}, status_code=400)
         try:
             updated = session_mgr.update_settings(
-                llm_provider=req.get("llm_provider"),
-                llm_base_url=req.get("llm_base_url"),
-                llm_api_key=req.get("llm_api_key"),
-                llm_model=req.get("llm_model"),
-                comfyui_base_url=req.get("comfyui_base_url"),
                 read_roots=req.get("read_roots"),
                 ui_language=req.get("ui_language"),
-                llm_model_fast=req.get("llm_model_fast"),
-                llm_api_key_provider=req.get("llm_api_key_provider"),
-                image_engine=req.get("image_engine"),
-                image_model=req.get("image_model"),
+                default_models=cast("dict[str, str | None] | None", defaults),
             )
         except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-        # Broadcast settings.updated event across EventBus (Principle 1 & 6)
-        sys_pub = active_bus.register_publisher(
-            sender_id="ui_settings",
-            source=EventSource.SYSTEM,
-        )
-        await sys_pub.publish(
-            AgentEvent(
-                type=EventType.SETTINGS_UPDATED,
-                recipient_id="*",
-                topic="settings",
-                payload=dict(updated),
-            )
-        )
+            raise HTTPException(
+                status_code=400,
+                detail="The settings could not be saved because the configuration is invalid.",
+            ) from exc
+        await _settings_event(updated)
         return updated
-
-    @app.delete("/api/settings/api-keys/{provider}")
-    async def remove_api_key(request: Request, provider: str) -> Any:  # pyright: ignore[reportUnusedFunction]
-        """Remove the key saved for one provider; every other provider's key stays.
-
-        A refusal answers 400 with ``detail`` (English) and ``code``, which the screen
-        translates rather than showing the English text.
-        """
-        _refuse_cross_origin(request)
-        try:
-            return session_mgr.remove_api_key(provider)
-        except KeyRemovalRefused as exc:
-            return JSONResponse({"detail": str(exc), "code": exc.code}, status_code=400)
 
     def _mcp_payload() -> dict[str, Any]:
         return {
@@ -3036,7 +2772,7 @@ def create_ui_app(
     @app.get("/api/mcp/servers")
     async def list_mcp_servers(request: Request) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
         """The user's external MCP servers and their state. Credential values are never sent."""
-        _refuse_unless_local(request)
+        _refuse_unless_local(request, action="read")
         return _mcp_payload()
 
     @app.post("/api/mcp/servers", status_code=201)
@@ -3089,158 +2825,6 @@ def create_ui_app(
         except UnknownServerError as exc:
             raise HTTPException(status_code=404, detail=f"No server named '{name}'") from exc
 
-    @app.post("/api/settings/test")
-    async def test_endpoint_connection(req: dict[str, Any]) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
-        """Test connectivity to specified LLM provider or ComfyUI endpoint."""
-        target = str(req.get("target", "all")).lower()
-        provider = req.get("llm_provider")
-        base_url = req.get("llm_base_url")
-        api_key = req.get("llm_api_key")
-        comfy_url = req.get("comfyui_base_url")
-
-        results: dict[str, Any] = {}
-
-        if target in ("all", "comfyui"):
-            target_comfy = str(comfy_url or session_mgr.get_settings()["comfyui_base_url"]).strip()
-            if target_comfy:
-                try:
-                    client = ComfyClient(base_url=target_comfy, timeout=5.0)
-                    is_alive = await client.alive()
-                    stats: dict[str, Any] = {}
-                    if is_alive:
-                        try:
-                            stats = await client.system_stats()
-                        except Exception:
-                            pass
-                    results["comfyui"] = {
-                        "status": "ok" if is_alive else "unreachable",
-                        "online": is_alive,
-                        "url": target_comfy,
-                        "stats": stats,
-                    }
-                    await client.aclose()
-                except Exception as exc:
-                    results["comfyui"] = {
-                        "status": "error",
-                        "online": False,
-                        "url": target_comfy,
-                        "error": str(exc),
-                    }
-
-        if target in ("all", "llm"):
-            eff_provider = (
-                str(provider or session_mgr.get_settings()["llm_provider"]).strip().lower()
-            )
-            eff_base = (
-                str(base_url).strip() if base_url is not None and str(base_url).strip() else None
-            )
-            eff_key = str(api_key).strip() if api_key is not None and str(api_key).strip() else None
-            try:
-                if eff_provider == "mock":
-                    results["llm"] = {
-                        "status": "ok",
-                        "provider": "mock",
-                        "message": "Mock provider ready",
-                    }
-                elif eff_provider == "ollama":
-                    ollama_url = eff_base or resolve_ollama_base_url()
-                    async with httpx.AsyncClient(timeout=5.0) as http_c:
-                        resp = await http_c.get(f"{ollama_url.rstrip('/')}/api/tags")
-                        if resp.status_code == 200:
-                            data_obj: object = resp.json()
-                            models: list[str] = []
-                            if isinstance(data_obj, dict):
-                                data_dict = cast(dict[str, Any], data_obj)
-                                raw_models = data_dict.get("models")
-                                if isinstance(raw_models, list):
-                                    for item in cast(list[object], raw_models):
-                                        if isinstance(item, dict):
-                                            item_dict = cast(dict[str, Any], item)
-                                            name_val = item_dict.get("name")
-                                            if name_val is not None:
-                                                models.append(str(name_val))
-                            results["llm"] = {
-                                "status": "ok",
-                                "provider": "ollama",
-                                "url": ollama_url,
-                                "models": models,
-                            }
-                        else:
-                            results["llm"] = {
-                                "status": "error",
-                                "provider": "ollama",
-                                "url": ollama_url,
-                                "error": f"Ollama HTTP {resp.status_code}",
-                            }
-                elif eff_provider == "vllm":
-                    if not has_configured_vllm_endpoint(eff_base):
-                        # The one provider whose test can fail before any request: there is
-                        # no endpoint to reach. Saying so names what to fix, where a probe of
-                        # a guessed port would report a refused connection instead (P6).
-                        results["llm"] = {
-                            "status": "error",
-                            "provider": "vllm",
-                            "error": "No vLLM endpoint is configured: set VLLM_BASE_URL or "
-                            "enter the endpoint above (e.g. http://localhost:8000/v1).",
-                        }
-                    else:
-                        vllm_url = resolve_vllm_base_url(eff_base)
-                        # The address may be one just typed: it gets the typed key, or one
-                        # held for this exact saved endpoint, never `VLLM_API_KEY` (#1672).
-                        vllm_key = eff_key or session_mgr.stored_api_key_for("vllm", eff_base)
-                        async with httpx.AsyncClient(timeout=5.0) as http_c:
-                            resp = await http_c.get(
-                                f"{vllm_url.rstrip('/')}/models",
-                                headers=vllm_request_headers(vllm_key, env_fallback=False),
-                            )
-                            if resp.status_code == 200:
-                                results["llm"] = {
-                                    "status": "ok",
-                                    "provider": "vllm",
-                                    "url": vllm_url,
-                                    "models": vllm_model_ids(resp.json()),
-                                }
-                            else:
-                                results["llm"] = {
-                                    "status": "error",
-                                    "provider": "vllm",
-                                    "url": vllm_url,
-                                    "error": f"vLLM HTTP {resp.status_code}",
-                                    "key_refused": resp.status_code in _KEY_REFUSED_STATUSES,
-                                }
-                elif (keyed := spec_for(eff_provider)) is not None and keyed.requires_key:
-                    key_present = bool(eff_key or session_mgr.stored_api_key_for(keyed.id))
-                    if key_present:
-                        results["llm"] = {
-                            "status": "ok",
-                            "provider": eff_provider,
-                            "message": f"{keyed.display_name} key saved",
-                        }
-                    else:
-                        results["llm"] = {
-                            "status": "warning",
-                            "provider": eff_provider,
-                            "message": f"No {keyed.display_name} key is saved yet",
-                        }
-                else:
-                    results["llm"] = {
-                        "status": "error",
-                        "provider": eff_provider,
-                        "error": f"Unknown provider '{eff_provider}'",
-                    }
-            except Exception as exc:
-                results["llm"] = {
-                    "status": "error",
-                    "provider": eff_provider,
-                    "error": str(exc),
-                }
-
-        all_ok = all(v.get("status") == "ok" for v in results.values()) if results else True
-        return {
-            "status": "ok" if all_ok else "error",
-            "results": results,
-        }
-
     @app.post("/api/settings/remote-gpu/probe")
     async def probe_remote_gpu_endpoint(request: Request, req: dict[str, Any]) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
         """Probe an SSH remote host for GPU capabilities and AI services."""
@@ -3272,80 +2856,13 @@ def create_ui_app(
                 status_code=400,
                 detail="Field 'host' is required",
             )
-        tunnel_status = await tunnel_manager.connect(
-            host=host,
+        return await _connect_remote_gpu(
+            host,
+            apply_settings=apply_settings,
             auto_start_comfyui=auto_start_comfyui,
+            sync_llm=sync_llm,
             timeout=timeout,
         )
-        if not tunnel_status.connected:
-            return {
-                "status": "error",
-                "connected": False,
-                "error": tunnel_status.error or "Failed to connect tunnel",
-                "tunnel": tunnel_status.to_dict(),
-            }
-
-        changes: dict[str, Any] = {}
-        llm_skipped: str | None = None
-        if apply_settings:
-            cur = session_mgr.get_settings()
-            # A reconnect keeps the first record: the current values are the tunnel's own.
-            original, applied = _read_remote_restore()
-            current_model = str(cur.get("llm_model") or "").strip()
-
-            for m in tunnel_status.mappings:
-                if m.service_name == "ollama":
-                    if not sync_llm:
-                        continue
-                    remote_models = tunnel_status.ollama_models
-                    current_bare = current_model.split(":")[0].lower()
-                    model_on_remote = (
-                        not current_model
-                        or not remote_models
-                        or any(
-                            rm.lower() == current_model.lower()
-                            or rm.lower().startswith(current_bare + ":")
-                            for rm in remote_models
-                        )
-                    )
-                    if not model_on_remote:
-                        # Switching would 404 every turn with "model not found".
-                        llm_skipped = "model_not_on_remote"
-                        logger.info(
-                            "Preserving local llm_base_url; active model %r not found on remote worker models %r",
-                            current_model,
-                            remote_models,
-                        )
-                        continue
-                    original.setdefault("llm_provider", str(cur.get("llm_provider") or ""))
-                    original.setdefault("llm_base_url", str(cur.get("llm_base_url") or ""))
-                    applied["llm_provider"] = "ollama"
-                    applied["llm_base_url"] = f"http://127.0.0.1:{m.local_port}"
-                    session_mgr.update_settings(
-                        llm_provider="ollama",
-                        llm_base_url=f"http://127.0.0.1:{m.local_port}",
-                    )
-                    changes["llm_provider"] = "ollama"
-                    changes["llm_base_url"] = f"http://127.0.0.1:{m.local_port}"
-                elif m.service_name == "comfyui":
-                    original.setdefault("comfyui_base_url", str(cur.get("comfyui_base_url") or ""))
-                    applied["comfyui_base_url"] = f"http://127.0.0.1:{m.local_port}"
-                    session_mgr.update_settings(
-                        comfyui_base_url=f"http://127.0.0.1:{m.local_port}",
-                    )
-                    changes["comfyui_base_url"] = f"http://127.0.0.1:{m.local_port}"
-            if original:
-                remote_restore_path.parent.mkdir(parents=True, exist_ok=True)
-                record = {"original": original, "applied": applied}
-                replace_file(remote_restore_path, json.dumps(record, indent=2).encode())
-
-        return {
-            "status": "ok",
-            "connected": True,
-            "tunnel": tunnel_status.to_dict(),
-            "applied_changes": changes,
-            "llm_skipped": llm_skipped,
-        }
 
     @app.post("/api/settings/remote-gpu/disconnect")
     async def disconnect_remote_gpu_endpoint(  # pyright: ignore[reportUnusedFunction]
@@ -3354,6 +2871,9 @@ def create_ui_app(
         """Disconnect the active SSH tunnel session and restore previous endpoints."""
         _refuse_unless_local(request)
         await tunnel_manager.disconnect()
+        # Pressed by hand: the next start leaves the worker alone.
+        with contextlib.suppress(FileNotFoundError):
+            remote_session_path.unlink()
         restored: dict[str, Any] = dict(_restore_remote_settings())
 
         return {
@@ -3378,30 +2898,42 @@ def create_ui_app(
         payload = status.to_dict()
         if not status.connected and _read_remote_restore()[0]:
             payload["restored_settings"] = _restore_remote_settings()
+        _, applied_changes = _read_remote_restore()
+        payload["images_on_remote"] = bool(
+            status.connected
+            and any(m.service_name == COMFYUI_SERVICE_NAME for m in status.mappings)
+        )
+        payload["llm_on_remote"] = bool(
+            status.connected
+            and any(m.service_name == "ollama" for m in status.mappings)
+            and applied_changes.get(REMOTE_GPU_CONNECTION_ID)
+        )
         return payload
 
-    @app.get("/api/personas")
-    async def list_personas() -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
-        """Return catalog of available declarative personas discovered by PersonaRegistry."""
-        from uclone_x.agent.persona_registry import get_default_persona_registry
+    @app.get("/api/settings/remote-gpu/hosts")
+    async def get_remote_gpu_hosts(  # pyright: ignore[reportUnusedFunction]
+        request: Request,
+    ) -> dict[str, Any]:
+        """Return configured SSH hosts along with the last-connected host."""
+        _refuse_unless_local(request)
+        last_host: str | None = None
+        try:
+            raw: object = json.loads(remote_session_path.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                h = cast("dict[str, object]", raw).get("host")
+                if isinstance(h, str) and is_valid_host(h):
+                    last_host = h.strip()
+        except (OSError, ValueError):
+            pass
 
-        # The inventory is passed here too, not only on the agent-creation path: this
-        # route serves the dashboard on load and therefore usually reaches the cached
-        # registry first, which would otherwise pin the process to an unvalidated one.
-        registry = get_default_persona_registry(
-            session_mgr.workspace_dir,
-            tool_names=[tool.name for tool in session_mgr.tools.list_tools()],
-        )
-        data = [_persona_payload(registry, p) for p in registry.list_personas()]
-        writable = registry.writable_dir()
-        return {
-            "status": "ok",
-            "personas": data,
-            "count": len(data),
-            # What an editor offers: the tools a persona can name, and where a save lands.
-            "available_tools": sorted(tool.name for tool in session_mgr.tools.list_tools()),
-            "personas_dir": str(writable) if writable is not None else None,
-        }
+        cfg_hosts = find_configured_ssh_hosts()
+        hosts: list[str] = []
+        if last_host:
+            hosts.append(last_host)
+        for h in cfg_hosts:
+            if h not in hosts:
+                hosts.append(h)
+        return {"hosts": hosts}
 
     def _save_persona(req: dict[str, Any], *, create: bool, name: str | None = None) -> Any:
         """Validate a persona payload, write it, and put it in force on live agents.
@@ -3418,24 +2950,59 @@ def create_ui_app(
             get_default_persona_registry,
         )
 
+        # `id` and `handle` are what the entry was listed with; a head may send the entry
+        # back whole. The handle is the draft's `name`, and the id is never written.
+        fields = {
+            key: value for key, value in req.items() if key not in ("id", "handle", "llm_config")
+        }
+        if "name" not in fields and isinstance(req.get("handle"), str):
+            fields["name"] = req["handle"]
+        # The model slots may come grouped, as `llm_config` (model-gateway §3.7.1); a slot
+        # named there wins over the flat field of the same name.
+        grouped = req.get("llm_config")
+        if isinstance(grouped, dict):
+            for slot in ("model_name", "fast_model", "image_model"):
+                if slot in grouped:
+                    fields[slot] = cast(dict[str, Any], grouped)[slot]
         try:
-            draft = PersonaDraft.model_validate(req)
+            draft = PersonaDraft.model_validate(fields)
         except ValidationError as exc:
             raise HTTPException(
                 status_code=422, detail=exc.errors(include_url=False, include_context=False)
             ) from exc
-        if name is not None and draft.name != name:
-            raise HTTPException(
-                status_code=422,
-                detail=(
-                    f"the body names persona {draft.name!r} but the address names {name!r}. "
-                    f"A persona cannot be renamed by an edit; create one under the new name."
-                ),
-            )
+        # A ref naming a connection that does not exist is refused; one whose connection
+        # exists but does not list the model is saved (it may be offline) (§3.7.1).
+        for slot in ("model_name", "fast_model", "image_model"):
+            value = getattr(draft, slot)
+            if not value or (slot == "image_model" and value.strip() == "auto"):
+                continue
+            ref = ModelRef.parse(value)
+            conn_id = ref.connection_id
+            if (conn := session_mgr.gateway.connection(conn_id)) is None:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"There is no connection called {conn_id}. Add it in Settings, "
+                    f"or choose another model.",
+                )
+            # A picture model must be on a connection that draws, and the GPU server takes
+            # only `<id>/auto`: it cannot be told which model to use (§3.5).
+            if slot == "image_model" and (problem := image_ref_problem(ref, conn)) is not None:
+                raise HTTPException(status_code=422, detail=problem)
         registry = get_default_persona_registry(
             session_mgr.workspace_dir,
             tool_names=[tool.name for tool in session_mgr.tools.list_tools()],
         )
+        # The address names the clone by id or by handle; the body by handle.
+        addressed = registry.handle_for(name) if name is not None else None
+        if addressed is not None and draft.name != addressed:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"the body names clone {draft.name!r} but the address names {name!r}. "
+                    f"A clone's handle cannot be changed by this edit; create one under the "
+                    f"new handle."
+                ),
+            )
         try:
             persona = registry.save_persona(draft, create=create)
         except PersonaWriteRefused as exc:
@@ -3471,8 +3038,8 @@ def create_ui_app(
         _refuse_cross_origin(request)  # before anything is read or written
         return _avatar_registry()
 
-    @app.get("/api/personas/{name}/avatar")
-    async def get_persona_avatar(name: str) -> Response:  # pyright: ignore[reportUnusedFunction]
+    @app.get("/api/clones/{ref}/avatar")
+    async def get_clone_avatar(ref: str) -> Response:  # pyright: ignore[reportUnusedFunction]
         """Return one clone's picture, or refuse with what would put a picture there.
 
         A 404 here is an ordinary answer, not a fault: most clones have no picture, and the
@@ -3481,15 +3048,16 @@ def create_ui_app(
         installed. `no-cache` because the persona's `avatar_url` carries a `?v=` that
         changes with the picture, and a cached old face under a new `?v=` would hide that.
         """
-        found = PersonaAvatarStore(_avatar_registry()).find(name)
+        registry = _avatar_registry()
+        name = registry.handle_for(ref)  # the clone's id or its handle
+        found = PersonaAvatarStore(registry).find(name)
         if found is None:
             formats = ", ".join(suffix for suffix, _ in AVATAR_FORMATS)
             raise HTTPException(
                 status_code=404,
                 detail=(
-                    f"No picture is set for '{name}'. Choose one from its profile, or put an "
-                    f"image file beside its definition, named after it and ending in one of "
-                    f"{formats}."
+                    f"No picture is set for '{name}'. Choose one from its profile: an image "
+                    f"file ending in one of {formats}."
                 ),
             )
         return Response(
@@ -3503,27 +3071,20 @@ def create_ui_app(
     ) -> dict[str, Any]:
         """The changed clone, the kept picture that would undo the change, and its id.
 
-        `previous_path` is the workspace path to `PUT` back to undo it; `null` means the
-        clone had no chosen picture before, so undoing is a `DELETE`. Either way the undo
-        carries `change_id` as `undo_of`, and is refused if a later change was made.
+        `previous_path` is the path to `PUT` back to undo it -- the kept picture in the
+        clone's directory, which the `PUT` accepts by name; `null` means the clone had no
+        chosen picture before, so undoing is a `DELETE`. Either way the undo carries
+        `change_id` as `undo_of`, and is refused if a later change was made.
         """
         persona = registry.get_persona(name)
         if persona is None:
-            raise HTTPException(status_code=404, detail=f"There is no clone named '{name}' here.")
+            raise HTTPException(status_code=404, detail=f"There is no clone '{name}' here.")
         return {
             "status": "ok",
             "persona": _persona_payload(registry, persona),
-            "previous_path": _workspace_relative(change.previous),
+            "previous_path": str(change.previous) if change.previous is not None else None,
             "change_id": change.change_id,
         }
-
-    def _workspace_relative(path: Path | None) -> str | None:
-        if path is None:
-            return None
-        try:
-            return path.resolve().relative_to(Path(session_mgr.workspace_dir).resolve()).as_posix()
-        except ValueError:
-            return None
 
     def _avatar_refusal(exc: AvatarRefused) -> JSONResponse:
         """The refusal as `{"detail": <plain words>, "code": <which reason>}`.
@@ -3576,25 +3137,27 @@ def create_ui_app(
             reason_code="no_source",
         )
 
-    @app.put("/api/personas/{name}/avatar")
-    async def put_persona_avatar(name: str, request: Request) -> Any:  # pyright: ignore[reportUnusedFunction]
+    @app.put("/api/clones/{ref}/avatar")
+    async def put_clone_avatar(ref: str, request: Request) -> Any:  # pyright: ignore[reportUnusedFunction]
         """Set one clone's picture from a workspace file or from the image in the body.
 
         The body is either JSON `{"source_path": "<path in the workspace>"}`, normally an
         image a clone just drew, or the picture itself with an `image/*` content type, for
         an upload. Either way the bytes must be a PNG, JPEG, WebP or GIF image; the picture
-        it replaces is kept as `<name>.prev.<ext>`. A JSON body may add `"undo_of": <id>`,
-        the `change_id` of the change it undoes; it is then made only while that change is
-        still the latest, and refused with 409 `stale_change` otherwise.
+        it replaces is kept as `avatar.prev.<ext>` in the clone's directory. A JSON body may
+        add `"undo_of": <id>`, the `change_id` of the change it undoes; it is then made only
+        while that change is still the latest, and refused with 409 `stale_change` otherwise.
         """
         registry = _registry_for_a_picture_change(request)
+        name = registry.handle_for(ref)  # the clone's id or its handle
         store = PersonaAvatarStore(registry)
         content_type = request.headers.get("content-type", "").split(";")[0].strip().lower()
         try:
             if content_type == "application/json":
                 body = await _avatar_json(request)
                 undo_of = _undo_of_body(body)
-                change = store.set_from_path(name, _avatar_source(body), undo_of=undo_of)
+                source = _avatar_source(store, name, body)
+                change = store.set_from_path(name, source, undo_of=undo_of)
             elif content_type.startswith("image/"):
                 change = store.set(name, await _avatar_upload(request))
             else:
@@ -3626,11 +3189,14 @@ def create_ui_app(
             return None
         return int(raw) if raw.isascii() and raw.isdigit() else 0
 
-    def _avatar_source(body: object) -> Path:
-        """The workspace file a `PUT` names, resolved as tools resolve a path."""
+    def _avatar_source(store: PersonaAvatarStore, name: str, body: object) -> Path:
+        """The file a `PUT` names: the clone's kept picture, or one in the workspace."""
         raw = cast(dict[str, object], body).get("source_path") if isinstance(body, dict) else None
         if not isinstance(raw, str) or raw.strip() == "":
             raise _avatar_no_source()
+        kept = store.named_previous(name, raw)
+        if kept is not None:
+            return kept
         try:
             return PathValidator().resolve_safe_path(Path(raw), session_mgr.workspace_dir)
         except PathTraversalError as exc:
@@ -3640,30 +3206,28 @@ def create_ui_app(
                 reason_code="outside_workspace",
             ) from exc
 
-    @app.delete("/api/personas/{name}/avatar")
-    async def delete_persona_avatar(name: str, request: Request) -> Any:  # pyright: ignore[reportUnusedFunction]
+    @app.delete("/api/clones/{ref}/avatar")
+    async def delete_clone_avatar(ref: str, request: Request) -> Any:  # pyright: ignore[reportUnusedFunction]
         """Put a clone's chosen picture aside, so it shows its shipped one or the default.
 
         `?undo_of=<id>` makes it the undo of that change, refused as `PUT`'s is.
         """
         registry = _registry_for_a_picture_change(request)
+        name = registry.handle_for(ref)  # the clone's id or its handle
         try:
             change = PersonaAvatarStore(registry).reset(name, undo_of=_undo_of_query(request))
         except AvatarRefused as exc:
             return _avatar_refusal(exc)
         return _avatar_answer(registry, name, change)
 
-    @app.post("/api/personas")
-    async def create_persona(req: dict[str, Any]) -> Any:  # pyright: ignore[reportUnusedFunction]
-        """Create a persona as a YAML file in the workspace personas directory."""
+    @app.post("/api/clones")
+    async def create_clone(req: dict[str, Any]) -> Any:  # pyright: ignore[reportUnusedFunction]
+        """Create a clone: its handle, display name and persona fields, in one directory."""
         return _save_persona(req, create=True)
 
-    @app.put("/api/personas/{name}")
-    async def update_persona(name: str, req: dict[str, Any]) -> Any:  # pyright: ignore[reportUnusedFunction]
-        """Edit a persona; a built-in is edited by an override file in the workspace."""
-        return _save_persona(req, create=False, name=name)
-
-    @app.post("/api/personas/synthesize")
+    # Declared before `/api/clones/{ref}`, which would otherwise read `synthesize` as a
+    # clone's handle for every method it serves.
+    @app.post("/api/clones/synthesize")
     async def synthesize_persona_prompt(req: dict[str, Any]) -> Any:  # pyright: ignore[reportUnusedFunction]
         """Draft a clone's instructions from its name, role, description and tools.
 
@@ -3690,18 +3254,14 @@ def create_ui_app(
             )
 
         try:
-            draft_provider = session_mgr.provider_in_effect
-            llm = session_mgr.default_llm or session_mgr.build_llm(
-                provider=draft_provider,
-                api_key=session_mgr.resolved_api_key(draft_provider),
-                base_url=session_mgr.base_url_in_effect(draft_provider),
-                fallback_to_mock=False,
-                **({"model": session_mgr.deep_model} if session_mgr.deep_model else {}),
-            )
+            # On the person's behalf, owned by no clone: the default deep model (§3.4).
+            llm, draft_model = session_mgr.gateway.default_deep()
+            if llm is None:
+                raise ValueError("no default model is saved")
             response = await asyncio.wait_for(
                 llm.generate(
                     LLMRequest(
-                        model=session_mgr.deep_model,
+                        model=draft_model,
                         messages=(
                             ChatMessage(role=MessageRole.SYSTEM, content=_PERSONA_DRAFT_SYSTEM),
                             ChatMessage(
@@ -3733,9 +3293,25 @@ def create_ui_app(
                 "fallback_reason": reason,
             }
 
+    @app.get("/api/clones/{ref}")
+    async def get_clone(ref: str, request: Request) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
+        """One clone's entry, addressed by its id or its handle."""
+        _refuse_cross_origin(request)
+        registry = _avatar_registry()
+        persona = registry.get_persona(ref)
+        if persona is None:
+            raise HTTPException(status_code=404, detail=f"There is no clone '{ref}' here.")
+        return {"status": "ok", "persona": _persona_payload(registry, persona)}
+
+    @app.put("/api/clones/{ref}")
+    async def update_clone(ref: str, req: dict[str, Any]) -> Any:  # pyright: ignore[reportUnusedFunction]
+        """Edit a clone, addressed by its id or its handle; a builtin's file is rewritten too."""
+        return _save_persona(req, create=False, name=ref)
+
     @app.get("/api/sessions")
-    async def list_sessions() -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
+    async def list_sessions(request: Request) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
         """Return list of active and stored sessions from Core session store (FR-13.2)."""
+        _refuse_cross_origin(request)  # another site must not list sessions (#2146)
         session_ids = session_mgr.core_store.list_session_ids()
         sessions: list[dict[str, Any]] = []
         for sid in session_ids:
@@ -3836,23 +3412,25 @@ def create_ui_app(
             raise HTTPException(status_code=400, detail="Name the clone to read with agent_id.")
         # The listing does show a folder whose name no clone can have (`Bad Name`), marked
         # unreadable; skipping unreadable rows refuses that name as well as a damaged home.
-        readable = (
-            clone.name
-            for clone in clone_listing(session_mgr, room_stack).clones
-            if clone.status is not CloneStatus.UNREADABLE
-        )
-        if agent_id not in readable:
-            raise HTTPException(status_code=404, detail="There is no clone with that name here.")
-        return agent_id
+        # A head names the clone by its id (clone-data-scopes §4 step 2); a handle is read
+        # too. The engines are keyed by id, so either reaches the same one.
+        for clone in clone_listing(session_mgr, room_stack).clones:
+            if clone.status is CloneStatus.UNREADABLE:
+                continue
+            if agent_id in (clone.id, clone.name):
+                return clone.id or clone.name
+        raise HTTPException(status_code=404, detail="There is no clone with that name here.")
 
     @app.get("/api/ontology")
-    async def get_ontology(agent_id: str | None = None) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
+    async def get_ontology(request: Request, agent_id: str | None = None) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
         """The concepts, relations, axioms and tier counts of clone `agent_id`'s rules engine."""
+        _refuse_cross_origin(request)
         return session_mgr.ontology_for(_developer_graph_clone(agent_id)).export_graph()
 
     @app.get("/api/artifacts")
-    async def get_artifacts(session_id: str | None = None) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
+    async def get_artifacts(request: Request, session_id: str | None = None) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
         """Enumerate the documents and images the clones generated (RFC §6.1)."""
+        _refuse_cross_origin(request)  # another site must not list artifacts (#2146)
         artifacts = session_mgr.list_artifacts(session_id=session_id)
         return {"artifacts": artifacts, "total": len(artifacts)}
 
@@ -3861,16 +3439,35 @@ def create_ui_app(
         request: Request,
         path: str = "",
         session_id: str | None = None,
+        room_id: str | None = None,
     ) -> Response:
-        """Return artifact file content safely (markdown text or raw image bytes) (P6 security invariant, RFC §6.1)."""
+        """Return artifact file content safely (markdown text or raw image bytes) (P6 security invariant, RFC §6.1).
+
+        With `room_id`, `path` is read in that conversation's workspace, where its seats
+        wrote it (clone-data-scopes §3.6); without, in the server's. Either workspace can be
+        any folder a person picked, so a read is refused to another site's page, and never
+        reaches into the app's own state folders (#2143).
+        """
+        _refuse_cross_origin(request)  # another site must not read a workspace's files
         try:
-            resolved_path, mime = session_mgr.get_artifact_file(path=path, session_id=session_id)
+            root = room_stack.workspace_of(room_id) if room_id else None
+            resolved_path, mime = session_mgr.get_artifact_file(
+                path=path, session_id=session_id, root=root
+            )
+        except RoomNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
         except PathTraversalError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except Exception as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if in_app_state_dir(resolved_path):
+            raise HTTPException(
+                status_code=403,
+                detail="That file is in this app's own clones and conversations, "
+                "which a workspace folder does not show.",
+            )
 
         if mime.startswith("image/"):
             return Response(
@@ -3890,10 +3487,12 @@ def create_ui_app(
 
     @app.get("/api/knowledge-graph")
     async def get_knowledge_graph(  # pyright: ignore[reportUnusedFunction]
+        request: Request,
         session_id: str | None = None,
         agent_id: str | None = None,
     ) -> dict[str, Any]:
         """Clone `agent_id`'s triples, nodes and edges, optionally one session's (RFC §6.1)."""
+        _refuse_cross_origin(request)
         return session_mgr.get_knowledge_graph(
             _developer_graph_clone(agent_id), session_id=session_id
         )
@@ -3906,6 +3505,7 @@ def create_ui_app(
         skill requires, and which tools (#1826), so the panel can say why a clone is not
         offered it rather than letting the skill vanish from that clone in silence.
         """
+        from uclone_x.agent.bootstrap import seat_tool_scope
         from uclone_x.agent.persona_registry import get_default_persona_registry
 
         summary = session_mgr.skill_registry.get_summary()
@@ -3913,7 +3513,9 @@ def create_ui_app(
             session_mgr.workspace_dir,
             tool_names=[tool.name for tool in session_mgr.tools.list_tools()],
         )
-        scopes = {p.name: p.granted_tools for p in registry.list_personas()}
+        # The scope a seated clone runs with, by the agent's own rule (#1865), not the
+        # persona's list read separately: the two agree only while no operator list is set.
+        scopes = {p.name: seat_tool_scope(p) for p in registry.list_personas()}
         for entry in summary["skills"]:
             entry["hidden_from"] = skill_hidden_from(entry.get("requires_tools", []), scopes)
             # Settings offers Revoke only for a skill that did not ship (#1827).
@@ -3932,11 +3534,31 @@ def create_ui_app(
     _SKILLS_NO_STORE = "There is no skill folder for this project, so there is nothing to change."
     _SKILLS_NOT_CHANGED = "The skill could not be changed. Try again."
 
+    class _SkillDecisionRefused(Exception):
+        """A refused skill decision: the English sentence, and the code the head localizes."""
+
+        def __init__(self, status: int, detail: str, code: SkillDecisionCode) -> None:
+            super().__init__(detail)
+            self.status = status
+            self.detail = detail
+            self.code = code
+
+    def _refused(exc: _SkillDecisionRefused) -> JSONResponse:
+        # `detail` is the plain English sentence; `code` names the reason, so a window in
+        # another language shows the same refusal in its own words (#1865). The code is
+        # never put into the sentence.
+        return JSONResponse({"detail": exc.detail, "code": exc.code}, status_code=exc.status)
+
     def _proposal_store() -> SkillProposalStore:
         root = session_mgr.skill_registry.store_root
         if root is None or not root.is_dir():
-            raise HTTPException(status_code=404, detail=_SKILLS_NO_STORE)
+            raise _SkillDecisionRefused(404, _SKILLS_NO_STORE, "no_store")
         return SkillProposalStore(root)
+
+    def _decision_refusal(exc: SkillProposalError) -> _SkillDecisionRefused:
+        # 412 when the proposal is not the one shown, so Settings can show it again.
+        status = 409 if not isinstance(exc, SkillProposalChangedError) else 412
+        return _SkillDecisionRefused(status, str(exc), exc.decision_code or "not_changed")
 
     async def _skill_proposals() -> list[dict[str, Any]]:
         root = session_mgr.skill_registry.store_root
@@ -3949,18 +3571,23 @@ def create_ui_app(
             return []
         return [proposal.to_dict() for proposal in proposals]
 
-    async def _skill_body_text(request: Request, key: str, missing: str) -> str:
+    async def _skill_body_text(
+        request: Request, key: str, missing: str, code: SkillDecisionCode
+    ) -> str:
         try:
             payload: object = await request.json()
         except ValueError:
             payload = None
         value = payload.get(key) if isinstance(payload, dict) else None  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
         if not isinstance(value, str) or not value:
-            raise HTTPException(status_code=400, detail=missing)
+            # Coded like every other refusal, so a Korean window does not show English.
+            raise _SkillDecisionRefused(400, missing, code)
         return value
 
     async def _skill_version(request: Request) -> str:
-        return await _skill_body_text(request, "version", "Say which version of the skill.")
+        return await _skill_body_text(
+            request, "version", "Say which version of the skill.", "no_version"
+        )
 
     async def _after_skill_change() -> dict[str, Any]:
         # The registry reloads from the store, so `load_skill` and new sessions see the
@@ -3975,66 +3602,80 @@ def create_ui_app(
         _refuse_cross_origin(decision)
         person_gate.require(decision)
 
-    @app.post("/api/skills/{name}/approve")
-    async def approve_skill_proposal(name: str, request: Request) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
+    @app.post("/api/skills/{name}/approve", response_model=None)
+    async def approve_skill_proposal(name: str, request: Request) -> dict[str, Any] | JSONResponse:  # pyright: ignore[reportUnusedFunction]
         """Approve a clone's proposal: audit, install as the active version, pin its digest."""
         _a_person_decides(request)
-        version = await _skill_version(request)
-        # The digest of the proposal as Settings showed it: approval installs exactly that
-        # text or nothing, even if a clone's file tools rewrote it since (#1827).
-        seen_digest = await _skill_body_text(
-            request, "seen_digest", "Look at the proposal again, then approve it."
-        )
-        store = _proposal_store()
         try:
-            await store.approve(
+            version = await _skill_version(request)
+            # The digest of the proposal as Settings showed it: approval installs exactly
+            # that text or nothing, even if a clone's file tools rewrote it since (#1827).
+            seen_digest = await _skill_body_text(
+                request, "seen_digest", "Look at the proposal again, then approve it.", "not_seen"
+            )
+            await _proposal_store().approve(
                 name,
                 version,
                 seen_digest=seen_digest,
                 approver=SETTINGS_PERSON,
                 ledger=SkillApprovalLedger(),
             )
-        except SkillProposalChangedError as exc:
-            # 412, so Settings can say this in the person's language and show it again.
-            raise HTTPException(status_code=412, detail=str(exc)) from exc
+        except _SkillDecisionRefused as exc:
+            return _refused(exc)
         except SkillProposalError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
+            return _refused(_decision_refusal(exc))
         except Exception as exc:  # the person gets one plain sentence; the log gets the rest
             logger.warning("Approving the skill proposal '%s' failed: %s", name, exc)
-            raise HTTPException(status_code=500, detail=_SKILLS_NOT_CHANGED) from exc
+            return _refused(_SkillDecisionRefused(500, _SKILLS_NOT_CHANGED, "not_changed"))
         return await _after_skill_change()
 
-    @app.post("/api/skills/{name}/reject")
-    async def reject_skill_proposal(name: str, request: Request) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
-        """Turn down a clone's proposal; it is kept under `.rejected/`."""
+    @app.post("/api/skills/{name}/reject", response_model=None)
+    async def reject_skill_proposal(name: str, request: Request) -> dict[str, Any] | JSONResponse:  # pyright: ignore[reportUnusedFunction]
+        """Turn down a clone's proposal; it is kept under `.rejected/`.
+
+        Bound to the digest Settings showed, as approve is (#1865): a proposal that changed
+        since is refused with 412 and stays pending.
+        """
         _a_person_decides(request)
-        version = await _skill_version(request)
-        store = _proposal_store()
         try:
-            await asyncio.to_thread(
-                store.reject, name, version, rejecter=SETTINGS_PERSON, reason=None
+            version = await _skill_version(request)
+            seen_digest = await _skill_body_text(
+                request, "seen_digest", "Look at the proposal again, then decide.", "not_seen"
             )
+            store = _proposal_store()
+            await asyncio.to_thread(
+                store.reject,
+                name,
+                version,
+                seen_digest=seen_digest,
+                rejecter=SETTINGS_PERSON,
+                reason=None,
+            )
+        except _SkillDecisionRefused as exc:
+            return _refused(exc)
         except SkillProposalError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
+            return _refused(_decision_refusal(exc))
         except Exception as exc:
             logger.warning("Turning down the skill proposal '%s' failed: %s", name, exc)
-            raise HTTPException(status_code=500, detail=_SKILLS_NOT_CHANGED) from exc
+            return _refused(_SkillDecisionRefused(500, _SKILLS_NOT_CHANGED, "not_changed"))
         return await _after_skill_change()
 
-    @app.post("/api/skills/{name}/revoke")
-    async def revoke_skill(name: str, request: Request) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
+    @app.post("/api/skills/{name}/revoke", response_model=None)
+    async def revoke_skill(name: str, request: Request) -> dict[str, Any] | JSONResponse:  # pyright: ignore[reportUnusedFunction]
         """Stop using an approved skill: remove its pin and mark it rejected."""
         _a_person_decides(request)
-        store = _proposal_store()
         try:
+            store = _proposal_store()
             await asyncio.to_thread(
                 store.revoke, name, revoker=SETTINGS_PERSON, ledger=SkillApprovalLedger()
             )
+        except _SkillDecisionRefused as exc:
+            return _refused(exc)
         except SkillProposalError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
+            return _refused(_decision_refusal(exc))
         except Exception as exc:
             logger.warning("Revoking the skill '%s' failed: %s", name, exc)
-            raise HTTPException(status_code=500, detail=_SKILLS_NOT_CHANGED) from exc
+            return _refused(_SkillDecisionRefused(500, _SKILLS_NOT_CHANGED, "not_changed"))
         return await _after_skill_change()
 
     @app.get("/api/acp/status")
@@ -4110,27 +3751,31 @@ def create_ui_app(
             ),
         )
 
-    def _refuse_unless_local(request: Request) -> None:
+    def _refuse_unless_local(request: Request, *, action: str = "change") -> None:
         """`_refuse_cross_origin`, and also refuse a request addressed to a non-loopback name.
 
-        For routes that start a program on this machine. The origin check alone passes a
-        DNS-rebinding page: its `Origin` and `Host` both name the attacker's domain, which
-        now resolves to 127.0.0.1, so they match. That page cannot make the browser send a
-        `Host` of `localhost`, and this refuses every other name.
+        For routes that inspect or start a program on this machine (#1462). The origin check
+        alone passes a DNS-rebinding page: its `Origin` and `Host` both name the attacker's
+        domain, which now resolves to 127.0.0.1, so they match. That page cannot make the
+        browser send a `Host` of `localhost`, and this refuses every other name.
 
         On a loopback-bound server `LoopbackHostGuard` already refuses those names for every
         route (#1413). This check is what still holds on a server exposed with `ucx ui
         --host 0.0.0.0`: others on the network may use the dashboard, but only this computer
-        may start programs on it.
+        may inspect or start programs on it.
         """
         _refuse_cross_origin(request)
         if _host_header_hostname(request.headers.get("host", "")) not in _LOOPBACK_HOSTS:
-            raise HTTPException(
-                status_code=403,
-                detail=(
+            if action == "read":
+                detail = "Tool servers can only be viewed on the machine running the app."
+            else:
+                detail = (
                     "Tool servers can only be changed from this computer. "
                     "Open the app at http://localhost to change them."
-                ),
+                )
+            raise HTTPException(
+                status_code=403,
+                detail=detail,
             )
 
     from uclone_x.ui.usage import register_usage_routes
@@ -4162,6 +3807,22 @@ def create_ui_app(
         supervisor=links,
         local_clone_names=_local_clone_names,
         refuse_cross_origin=_refuse_cross_origin,
+    )
+
+    # Settings ▸ Browser and the extension's link (`browser-agent.md` §3.6): the process's
+    # hub, so the browser tool's tabs go to the Chrome paired here.
+    from uclone_x.browser.extension import default_extension_hub
+    from uclone_x.ui.browser import register_browser_routes, saved_pairing_token
+
+    browser_settings = session_mgr.settings_file
+    extension_hub = default_extension_hub()
+    extension_hub.use_token(lambda: saved_pairing_token(browser_settings))
+    register_browser_routes(
+        app,
+        hub=extension_hub,
+        settings_file=browser_settings,
+        refuse_cross_origin=_refuse_cross_origin,
+        on_stop=room_stack.stop,
     )
 
     @app.get("/api/diagnostics/consent")
@@ -4261,6 +3922,7 @@ def create_ui_app(
         request: Request, max_events: int | None = None
     ) -> Response:
         """Server-Sent Events (SSE) endpoint streaming live A2A and engine events."""
+        _refuse_cross_origin(request)  # another site must not tap the event stream (#2146)
 
         async def event_generator() -> AsyncIterator[str]:
             # Initial connection notification

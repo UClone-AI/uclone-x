@@ -137,7 +137,7 @@ export function OntologyTab({ ontology, onRefresh, isLoading }: OntologyTabProps
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         {/* Concepts List */}
         <div className="p-5 bg-slate-900/80 border border-slate-800 rounded-2xl shadow-lg space-y-3">
-          <div className="flex items-center justify-between pb-3 border-b border-slate-800">
+          <div className="flex flex-wrap items-center justify-between gap-x-2 pb-3 border-b border-slate-800">
             <h3 className="text-sm font-semibold text-white flex items-center gap-2">
               <Layers className="w-4 h-4 text-cyan-400" />
               LinkML Concept Registry

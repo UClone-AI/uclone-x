@@ -230,7 +230,7 @@ def preflight_probes(workspace_root: Path) -> tuple[tuple[str, dict[str, Any]], 
 
 #: Tools withheld from the measured agent. Giving the agent a workspace (#666) also gave it
 #: write access to the tree its own answers are checked against, and the first live run used
-#: it: `qwen3:1.7b` renamed a row in `docs/nfr-performance-budgets.md` mid-run. That is not a
+#: it: `qwen3:1.7b` renamed a row in the performance-budgets document mid-run. That is not a
 #: capability finding, it is the benchmark editing its own ground truth -- every later
 #: problem about that file is then asking about a tree the run itself changed.
 #:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterator
 from contextlib import AbstractContextManager
 from pathlib import Path
@@ -17,6 +18,7 @@ from uclone_x.tools.builtin.image import (
     CheckpointState,
     LocalDiffusersImageEngine,
 )
+from uclone_x.tools.builtin.image_status import KnownModel, media_status_payload
 
 
 def _report(
@@ -510,3 +512,60 @@ def test_media_status_does_not_mark_the_local_checkpoint_when_comfyui_would_run(
     out = capsys.readouterr().out
     assert "b.safetensors" in out
     assert "→" not in out
+
+
+def _known_report() -> ImageEngineReport:
+    """In-process engine ready, loading a registered model."""
+    return _report(deps_ok=True, checkpoint="/models/anillustrious_v4.safetensors")._replace(
+        in_process_model=KnownModel("anillustrious_v4", "Illustrious-XL v4 (Anime SDXL)")
+    )
+
+
+def test_media_status_json_prints_the_object_the_dashboard_reads(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """`--json` is `/api/media/status`'s object, `resolved` included, from one builder.
+
+    Killed by: src/uclone_x/cli/commands/media.py :: typer.echo(json.dumps(media_status_payload(report), indent=2))
+    Becomes: typer.echo(json.dumps({"ready": report.ready}, indent=2))
+    """
+    report = _known_report()
+    with patch.object(media, "probe_image_engines", return_value=report):
+        media.media_status(as_json=True)
+
+    printed = json.loads(capsys.readouterr().out)
+    assert printed == json.loads(json.dumps(media_status_payload(report)))
+    assert printed["resolved"]["create"] == {
+        "engine": "diffusers-sdxl",
+        "model_id": "anillustrious_v4",
+        "label": "Illustrious-XL v4 (Anime SDXL)",
+        "where": "this_computer",
+    }
+
+
+def test_media_status_json_exits_nonzero_when_nothing_is_ready(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A script reading `--json` gets the failing exit code too, with the reason in the object."""
+    with patch.object(media, "probe_image_engines", return_value=_report()):
+        with pytest.raises(typer.Exit) as exit_info:
+            media.media_status(as_json=True)
+
+    assert exit_info.value.exit_code == 1
+    printed = json.loads(capsys.readouterr().out)
+    assert printed["resolved"] == {"create": None, "reason_code": "no_image_model", "refusal": None}
+
+
+def test_media_status_names_the_model_and_where_it_draws(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The human listing says which model draws, by its display name, and where."""
+    with (
+        patch.object(media, "probe_image_engines", return_value=_known_report()),
+        _resolution("present", "/models/anillustrious_v4.safetensors"),
+        patch.object(media, "local_checkpoints", return_value=[]),
+    ):
+        media.media_status()
+
+    out = " ".join(capsys.readouterr().out.split())
+    assert "Draws with: Illustrious-XL v4 (Anime SDXL) · This computer" in out

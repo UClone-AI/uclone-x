@@ -2,7 +2,8 @@
 """One clone's picture, what happens when it has none (#1300), and how it is changed.
 
 Pictures only: nothing here draws a face from a clone's name. A clone either has an image
-file installed beside its definition or it gets the single default the head ships, so the
+file in its clone directory (imported from beside its workspace definition, 2026-09-27) or
+a shipped one, or it gets the single default the head ships, so the
 same clone looks the same on every head rather than depending on a generator's version.
 
 The route is therefore allowed to refuse, and most clones will make it refuse. What these
@@ -24,6 +25,7 @@ from fastapi.testclient import TestClient
 
 from uclone_x.agent.persona_avatar import MAX_AVATAR_BYTES
 from uclone_x.agent.persona_registry import BUILTIN_PERSONAS_DIR
+from uclone_x.core.agent_home import AgentHome
 from uclone_x.llm.connectors.mock import MockLLMConnector
 from uclone_x.tools.registry import ToolRegistry, create_default_registry
 from uclone_x.ui.app import create_ui_app
@@ -93,7 +95,7 @@ def test_a_clone_with_a_picture_beside_it_serves_that_picture(tmp_path: Path) ->
     definition = _install(tmp_path, "surveyor")
     definition.with_suffix(".png").write_bytes(ONE_PIXEL_PNG)
 
-    response = _client(tmp_path).get("/api/personas/surveyor/avatar")
+    response = _client(tmp_path).get("/api/clones/surveyor/avatar")
 
     assert response.status_code == 200
     assert response.content == ONE_PIXEL_PNG
@@ -111,7 +113,7 @@ def test_a_clone_with_no_picture_says_what_would_put_one_there(tmp_path: Path) -
     """
     _install(tmp_path, "surveyor")
 
-    response = _client(tmp_path).get("/api/personas/surveyor/avatar")
+    response = _client(tmp_path).get("/api/clones/surveyor/avatar")
 
     assert response.status_code == 404
     detail = response.json()["detail"]
@@ -123,16 +125,17 @@ def test_one_format_is_chosen_when_a_clone_has_more_than_one(tmp_path: Path) -> 
     """Two files, one answer, and the same answer on every machine.
 
     A directory listing is not ordered, so "whichever comes first" would differ between
-    installs. `AVATAR_FORMATS` decides, and PNG is ahead of JPEG in it.
+    installs. A clone keeps one picture, taken when its persona is imported, and
+    `AVATAR_SUFFIXES` decides which: PNG is ahead of JPEG in it.
 
-    Killed by: src/uclone_x/agent/persona_avatar.py :: for suffix, mime in AVATAR_FORMATS:
-    Becomes: for suffix, mime in reversed(AVATAR_FORMATS):
+    Killed by: src/uclone_x/agent/clone_store.py :: for suffix in AVATAR_SUFFIXES:
+    Becomes: for suffix in reversed(AVATAR_SUFFIXES):
     """
     definition = _install(tmp_path, "surveyor")
     definition.with_suffix(".png").write_bytes(ONE_PIXEL_PNG)
     definition.with_suffix(".jpg").write_bytes(b"not a png")
 
-    response = _client(tmp_path).get("/api/personas/surveyor/avatar")
+    response = _client(tmp_path).get("/api/clones/surveyor/avatar")
 
     assert response.status_code == 200
     assert response.headers["content-type"] == "image/png"
@@ -154,7 +157,7 @@ def test_a_name_no_clone_carries_reaches_no_file(tmp_path: Path) -> None:
     outside = tmp_path / "elsewhere.png"
     outside.write_bytes(ONE_PIXEL_PNG)
 
-    response = _client(tmp_path).get(f"/api/personas/{outside.stem}/avatar")
+    response = _client(tmp_path).get(f"/api/clones/{outside.stem}/avatar")
 
     assert response.status_code == 404
     assert response.content != ONE_PIXEL_PNG
@@ -163,7 +166,7 @@ def test_a_name_no_clone_carries_reaches_no_file(tmp_path: Path) -> None:
 @pytest.mark.parametrize("name", ["clone", "artist", "guardian", "pioneer", "scout", "writer"])
 def test_shipped_builtin_clones_serve_default_avatar(tmp_path: Path, name: str) -> None:
     """Each shipped built-in clone carries a cute pastel avatar served as PNG."""
-    response = _client(tmp_path).get(f"/api/personas/{name}/avatar")
+    response = _client(tmp_path).get(f"/api/clones/{name}/avatar")
 
     assert response.status_code == 200
     assert response.headers["content-type"] == "image/png"
@@ -179,34 +182,39 @@ def test_the_picture_is_sent_as_what_it_is_and_never_from_a_stale_cache(tmp_path
     definition = _install(tmp_path, "surveyor")
     definition.with_suffix(".png").write_bytes(ONE_PIXEL_PNG)
 
-    response = _client(tmp_path).get("/api/personas/surveyor/avatar")
+    response = _client(tmp_path).get("/api/clones/surveyor/avatar")
 
     assert response.headers["x-content-type-options"] == "nosniff"
     assert response.headers["cache-control"] == "no-cache"
 
 
 def _payload(client: TestClient, name: str) -> dict[str, object]:
-    personas = client.get("/api/personas").json()["personas"]
+    personas = client.get("/api/clones").json()["clones"]
     return next(p for p in personas if p["name"] == name)
 
 
 def test_the_persona_payload_says_where_its_picture_is_shown_from(tmp_path: Path) -> None:
-    """Killed by: src/uclone_x/ui/app.py :: "avatar_url": avatar_url(persona.name, PersonaAvatarStore(registry).find(persona.name)),
+    """The address names the clone by its id, so it survives a handle rename.
+
+    Killed by: src/uclone_x/ui/app.py :: "avatar_url": avatar_url(address, store.find(persona.name)),
     Becomes: "avatar_url": None,
     """
     _install(tmp_path, "surveyor")
     client = _client(tmp_path)
 
     assert _payload(client, "surveyor")["avatar_url"] is None
-    shipped = _payload(client, "artist")["avatar_url"]
-    assert isinstance(shipped, str) and shipped.startswith("/api/personas/artist/avatar?v=")
+    artist = _payload(client, "artist")
+    clone_id = artist["id"]
+    assert isinstance(clone_id, str) and clone_id.startswith("agt_")
+    shipped = artist["avatar_url"]
+    assert isinstance(shipped, str) and shipped.startswith(f"/api/clones/{clone_id}/avatar?v=")
     assert client.get(shipped).content == (BUILTIN_PERSONAS_DIR / "artist.png").read_bytes()
 
 
 def test_put_with_a_workspace_path_sets_the_picture(tmp_path: Path) -> None:
     """The route a head calls when the user clicks Use as avatar under a drawn image.
 
-    Killed by: src/uclone_x/ui/app.py :: change = store.set_from_path(name, _avatar_source(body), undo_of=undo_of)
+    Killed by: src/uclone_x/ui/app.py :: change = store.set_from_path(name, source, undo_of=undo_of)
     Becomes: change = AvatarChange(change_id=0, previous=None)
     """
     _install(tmp_path, "surveyor")
@@ -216,7 +224,7 @@ def test_put_with_a_workspace_path_sets_the_picture(tmp_path: Path) -> None:
     client = _client(tmp_path)
 
     response = client.put(
-        "/api/personas/surveyor/avatar", json={"source_path": "artifacts/images/img_1.png"}
+        "/api/clones/surveyor/avatar", json={"source_path": "artifacts/images/img_1.png"}
     )
 
     assert response.status_code == 200, response.text
@@ -235,13 +243,13 @@ def test_put_with_the_image_itself_sets_the_picture(tmp_path: Path) -> None:
     client = _client(tmp_path)
 
     response = client.put(
-        "/api/personas/surveyor/avatar",
+        "/api/clones/surveyor/avatar",
         content=ONE_PIXEL_PNG,
         headers={"content-type": "image/png"},
     )
 
     assert response.status_code == 200, response.text
-    assert client.get("/api/personas/surveyor/avatar").content == ONE_PIXEL_PNG
+    assert client.get("/api/clones/surveyor/avatar").content == ONE_PIXEL_PNG
 
 
 @pytest.mark.parametrize(
@@ -257,7 +265,7 @@ def test_put_refuses_what_is_not_a_picture_in_plain_words(
 ) -> None:
     _install(tmp_path, "surveyor")
 
-    response = _client(tmp_path).put("/api/personas/surveyor/avatar", content=body, headers=headers)
+    response = _client(tmp_path).put("/api/clones/surveyor/avatar", content=body, headers=headers)
 
     assert response.status_code == 422
     detail = response.json()["detail"]
@@ -277,11 +285,11 @@ def test_put_refuses_a_source_path_outside_the_workspace(tmp_path: Path) -> None
     outside.write_bytes(ONE_PIXEL_PNG)
     client = _client(workspace)
 
-    response = client.put("/api/personas/surveyor/avatar", json={"source_path": str(outside)})
+    response = client.put("/api/clones/surveyor/avatar", json={"source_path": str(outside)})
 
     assert response.status_code == 422
     assert "outside the workspace" in response.json()["detail"]
-    assert client.get("/api/personas/surveyor/avatar").status_code == 404
+    assert client.get("/api/clones/surveyor/avatar").status_code == 404
 
 
 def test_a_chunked_upload_is_read_no_further_than_the_cap(tmp_path: Path) -> None:
@@ -314,8 +322,8 @@ def test_a_chunked_upload_is_read_no_further_than_the_cap(tmp_path: Path) -> Non
         "http_version": "1.1",
         "method": "PUT",
         "scheme": "http",
-        "path": "/api/personas/surveyor/avatar",
-        "raw_path": b"/api/personas/surveyor/avatar",
+        "path": "/api/clones/surveyor/avatar",
+        "raw_path": b"/api/clones/surveyor/avatar",
         "query_string": b"",
         "root_path": "",
         "headers": [(b"host", b"127.0.0.1"), (b"content-type", b"image/png")],
@@ -341,7 +349,7 @@ def test_a_body_that_is_not_json_is_refused_in_plain_words(tmp_path: Path) -> No
     _install(tmp_path, "surveyor")
 
     response = _client(tmp_path).put(
-        "/api/personas/surveyor/avatar",
+        "/api/clones/surveyor/avatar",
         content=b"{not json",
         headers={"content-type": "application/json"},
     )
@@ -366,7 +374,7 @@ def test_each_refusal_says_which_reason_it_is(tmp_path: Path) -> None:
     outside = tmp_path / "outside.png"
     outside.write_bytes(ONE_PIXEL_PNG)
     client = _client(workspace)
-    url = "/api/personas/surveyor/avatar"
+    url = "/api/clones/surveyor/avatar"
 
     def code(response: Any) -> object:
         return response.json()["code"]
@@ -381,7 +389,7 @@ def test_each_refusal_says_which_reason_it_is(tmp_path: Path) -> None:
     assert (
         code(
             client.put(
-                "/api/personas/nobody/avatar",
+                "/api/clones/nobody/avatar",
                 content=ONE_PIXEL_PNG,
                 headers={"content-type": "image/png"},
             )
@@ -392,7 +400,7 @@ def test_each_refusal_says_which_reason_it_is(tmp_path: Path) -> None:
 
 def test_put_for_a_name_no_clone_carries_is_404(tmp_path: Path) -> None:
     response = _client(tmp_path).put(
-        "/api/personas/nobody/avatar", content=ONE_PIXEL_PNG, headers={"content-type": "image/png"}
+        "/api/clones/nobody/avatar", content=ONE_PIXEL_PNG, headers={"content-type": "image/png"}
     )
 
     assert response.status_code == 404
@@ -406,13 +414,13 @@ def test_delete_goes_back_to_the_shipped_picture(tmp_path: Path) -> None:
     """
     client = _client(tmp_path)
     client.put(
-        "/api/personas/artist/avatar",
+        "/api/clones/artist/avatar",
         content=ONE_PIXEL_PNG + b"\x00",
         headers={"content-type": "image/png"},
     )
-    assert client.get("/api/personas/artist/avatar").content == ONE_PIXEL_PNG + b"\x00"
+    assert client.get("/api/clones/artist/avatar").content == ONE_PIXEL_PNG + b"\x00"
 
-    response = client.delete("/api/personas/artist/avatar")
+    response = client.delete("/api/clones/artist/avatar")
 
     assert response.status_code == 200, response.text
     shipped = (BUILTIN_PERSONAS_DIR / "artist.png").read_bytes()
@@ -422,20 +430,20 @@ def test_delete_goes_back_to_the_shipped_picture(tmp_path: Path) -> None:
 def test_a_shipped_picture_is_not_reported_as_chosen(tmp_path: Path) -> None:
     """The head offers Reset only for a chosen picture; a shipped one has nothing to reset (#1780).
 
-    Killed by: src/uclone_x/ui/app.py :: "avatar_chosen": PersonaAvatarStore(registry).chosen(persona.name) is not None,
+    Killed by: src/uclone_x/ui/app.py :: "avatar_chosen": store.chosen(persona.name) is not None,
     Becomes: "avatar_chosen": True,
     """
     client = _client(tmp_path)
 
     def artist() -> dict[str, object]:
-        personas: list[dict[str, object]] = client.get("/api/personas").json()["personas"]
+        personas: list[dict[str, object]] = client.get("/api/clones").json()["clones"]
         return next(p for p in personas if p["name"] == "artist")
 
     assert artist()["avatar_url"] is not None
     assert artist()["avatar_chosen"] is False
 
     changed = client.put(
-        "/api/personas/artist/avatar", content=ONE_PIXEL_PNG, headers={"content-type": "image/png"}
+        "/api/clones/artist/avatar", content=ONE_PIXEL_PNG, headers={"content-type": "image/png"}
     )
 
     assert changed.json()["persona"]["avatar_chosen"] is True
@@ -451,27 +459,27 @@ def test_another_site_cannot_change_a_clones_picture(tmp_path: Path, method: str
     """
     client = _client(tmp_path)
     client.put(
-        "/api/personas/artist/avatar", content=ONE_PIXEL_PNG, headers={"content-type": "image/png"}
+        "/api/clones/artist/avatar", content=ONE_PIXEL_PNG, headers={"content-type": "image/png"}
     )
     hostile = {"origin": "https://example.invalid"}
 
     if method == "put":
         response = client.put(
-            "/api/personas/artist/avatar",
+            "/api/clones/artist/avatar",
             content=ONE_PIXEL_PNG + b"\x00",
             headers={**hostile, "content-type": "image/png"},
         )
     else:
-        response = client.delete("/api/personas/artist/avatar", headers=hostile)
+        response = client.delete("/api/clones/artist/avatar", headers=hostile)
 
     assert response.status_code == 403
-    assert client.get("/api/personas/artist/avatar").content == ONE_PIXEL_PNG
+    assert client.get("/api/clones/artist/avatar").content == ONE_PIXEL_PNG
 
 
 def test_a_change_answers_with_the_picture_that_undoes_it(tmp_path: Path) -> None:
     """The head's Undo puts back what `previous_path` names, or resets when it is null.
 
-    Killed by: src/uclone_x/ui/app.py :: "previous_path": _workspace_relative(change.previous),
+    Killed by: src/uclone_x/ui/app.py :: "previous_path": str(change.previous) if change.previous is not None else None,
     Becomes: "previous_path": None,
     """
     _install(tmp_path, "surveyor")
@@ -480,20 +488,20 @@ def test_a_change_answers_with_the_picture_that_undoes_it(tmp_path: Path) -> Non
     second = ONE_PIXEL_PNG + b"\x00"
 
     initial = client.put(
-        "/api/personas/surveyor/avatar", content=first, headers={"content-type": "image/png"}
+        "/api/clones/surveyor/avatar", content=first, headers={"content-type": "image/png"}
     )
     assert initial.json()["previous_path"] is None
 
     replaced = client.put(
-        "/api/personas/surveyor/avatar", content=second, headers={"content-type": "image/png"}
+        "/api/clones/surveyor/avatar", content=second, headers={"content-type": "image/png"}
     )
     previous = replaced.json()["previous_path"]
-    assert previous == ".uclone/personas/surveyor.prev.png"
+    assert previous == str(AgentHome.for_handle("surveyor").path / "avatar.prev.png")
 
-    undone = client.put("/api/personas/surveyor/avatar", json={"source_path": previous})
+    undone = client.put("/api/clones/surveyor/avatar", json={"source_path": previous})
 
     assert undone.status_code == 200, undone.text
-    assert client.get("/api/personas/surveyor/avatar").content == first
+    assert client.get("/api/clones/surveyor/avatar").content == first
 
 
 def test_a_reset_answers_with_the_picture_it_put_aside(tmp_path: Path) -> None:
@@ -505,24 +513,24 @@ def test_a_reset_answers_with_the_picture_it_put_aside(tmp_path: Path) -> None:
     _install(tmp_path, "surveyor")
     client = _client(tmp_path)
     client.put(
-        "/api/personas/surveyor/avatar",
+        "/api/clones/surveyor/avatar",
         content=ONE_PIXEL_PNG,
         headers={"content-type": "image/png"},
     )
 
-    reset = client.delete("/api/personas/surveyor/avatar")
+    reset = client.delete("/api/clones/surveyor/avatar")
     kept = reset.json()["previous_path"]
     assert reset.json()["persona"]["avatar_url"] is None
-    assert kept == ".uclone/personas/surveyor.prev.png"
+    assert kept == str(AgentHome.for_handle("surveyor").path / "avatar.prev.png")
 
-    client.put("/api/personas/surveyor/avatar", json={"source_path": kept})
+    client.put("/api/clones/surveyor/avatar", json={"source_path": kept})
 
-    assert client.get("/api/personas/surveyor/avatar").content == ONE_PIXEL_PNG
+    assert client.get("/api/clones/surveyor/avatar").content == ONE_PIXEL_PNG
 
 
 def _upload(client: TestClient, data: bytes) -> dict[str, Any]:
     response = client.put(
-        "/api/personas/surveyor/avatar", content=data, headers={"content-type": "image/png"}
+        "/api/clones/surveyor/avatar", content=data, headers={"content-type": "image/png"}
     )
     assert response.status_code == 200, response.text
     body: dict[str, Any] = response.json()
@@ -545,14 +553,14 @@ def test_a_stale_undo_is_refused_with_409_and_changes_nothing(tmp_path: Path) ->
     _upload(client, third)  # another tab
 
     response = client.put(
-        "/api/personas/surveyor/avatar",
+        "/api/clones/surveyor/avatar",
         json={"source_path": mine["previous_path"], "undo_of": mine["change_id"]},
     )
 
     assert response.status_code == 409
     assert response.json()["code"] == "stale_change"
-    assert client.get("/api/personas/surveyor/avatar").content == third
-    assert (tmp_path / PERSONAS_SUBDIR / "surveyor.prev.png").read_bytes() == second
+    assert client.get("/api/clones/surveyor/avatar").content == third
+    assert (AgentHome.for_handle("surveyor").path / "avatar.prev.png").read_bytes() == second
 
 
 def test_a_stale_undo_by_reset_is_refused_and_keeps_the_newer_choice(tmp_path: Path) -> None:
@@ -568,11 +576,11 @@ def test_a_stale_undo_by_reset_is_refused_and_keeps_the_newer_choice(tmp_path: P
     newer = ONE_PIXEL_PNG + b"\x00"
     _upload(client, newer)
 
-    response = client.delete(f"/api/personas/surveyor/avatar?undo_of={mine['change_id']}")
+    response = client.delete(f"/api/clones/surveyor/avatar?undo_of={mine['change_id']}")
 
     assert response.status_code == 409
     assert response.json()["code"] == "stale_change"
-    assert client.get("/api/personas/surveyor/avatar").content == newer
+    assert client.get("/api/clones/surveyor/avatar").content == newer
 
 
 def test_an_undo_id_in_non_ascii_digits_is_stale_not_a_server_error(tmp_path: Path) -> None:
@@ -585,15 +593,15 @@ def test_an_undo_id_in_non_ascii_digits_is_stale_not_a_server_error(tmp_path: Pa
     client = _client(tmp_path)
     _upload(client, ONE_PIXEL_PNG)
 
-    response = client.delete("/api/personas/surveyor/avatar?undo_of=%C2%B2")
+    response = client.delete("/api/clones/surveyor/avatar?undo_of=%C2%B2")
 
     assert response.status_code == 409
     assert response.json()["code"] == "stale_change"
-    assert client.get("/api/personas/surveyor/avatar").content == ONE_PIXEL_PNG
+    assert client.get("/api/clones/surveyor/avatar").content == ONE_PIXEL_PNG
 
 
 def test_a_fresh_undo_is_made_and_the_listing_carries_the_latest_change(tmp_path: Path) -> None:
-    """Killed by: src/uclone_x/ui/app.py :: "avatar_change_id": PersonaAvatarStore(registry).latest_change(persona.name),
+    """Killed by: src/uclone_x/ui/app.py :: "avatar_change_id": store.latest_change(persona.name),
     Becomes: "avatar_change_id": 0,
     """
     _install(tmp_path, "surveyor")
@@ -603,11 +611,37 @@ def test_a_fresh_undo_is_made_and_the_listing_carries_the_latest_change(tmp_path
     assert _payload(client, "surveyor")["avatar_change_id"] == mine["change_id"]
 
     response = client.put(
-        "/api/personas/surveyor/avatar",
+        "/api/clones/surveyor/avatar",
         json={"source_path": mine["previous_path"], "undo_of": mine["change_id"]},
     )
 
     assert response.status_code == 200, response.text
     assert response.json()["change_id"] == mine["change_id"] + 1
     assert _payload(client, "surveyor")["avatar_change_id"] == mine["change_id"] + 1
-    assert client.get("/api/personas/surveyor/avatar").content == ONE_PIXEL_PNG
+    assert client.get("/api/clones/surveyor/avatar").content == ONE_PIXEL_PNG
+
+
+def test_only_the_clones_own_kept_picture_is_taken_from_outside_the_workspace(
+    tmp_path: Path,
+) -> None:
+    """The kept picture is outside the workspace; another clone's is still refused.
+
+    Killed by: src/uclone_x/agent/persona_avatar.py :: return kept if same else None
+    Becomes: return kept
+    """
+    _install(tmp_path, "surveyor")
+    client = _client(tmp_path)
+    for data in (ONE_PIXEL_PNG, ONE_PIXEL_PNG + b"\x00"):
+        client.put("/api/clones/artist/avatar", content=data, headers={"content-type": "image/png"})
+    for data in (ONE_PIXEL_PNG + b"\x01", ONE_PIXEL_PNG + b"\x02"):
+        client.put(
+            "/api/clones/surveyor/avatar", content=data, headers={"content-type": "image/png"}
+        )
+    artists_kept = AgentHome.for_handle("artist").path / "avatar.prev.png"
+    assert artists_kept.read_bytes() == ONE_PIXEL_PNG
+
+    response = client.put("/api/clones/surveyor/avatar", json={"source_path": str(artists_kept)})
+
+    assert response.status_code == 422
+    assert "outside the workspace" in response.json()["detail"]
+    assert client.get("/api/clones/surveyor/avatar").content == ONE_PIXEL_PNG + b"\x02"

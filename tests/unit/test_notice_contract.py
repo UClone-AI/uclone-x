@@ -54,8 +54,10 @@ def test_the_stored_english_fallback_is_the_english_catalog_sentence() -> None:
 def test_the_fallback_fills_every_placeholder_its_sentence_uses() -> None:
     """Each code's fallback, filled with the params the Core sends, leaves no `{marker}`."""
     params: dict[str, NoticeParams] = {
-        "loop.active": {"job_id": "j", "interval_seconds": 300.0, "prompt": "p"},
+        "loop.active": {"job_id": "j", "interval_seconds": 300.0, "prompt": "p", "runs": 2},
         "loop.registered": {"job_id": "j", "interval_seconds": 30.0, "prompt": "p"},
+        "loop.resumed": {"job_id": "j", "interval_seconds": 30.0, "prompt": "p"},
+        "loop.run_failed": {"job_id": "j", "run": 3, "reason": "r", "interval_seconds": 60.0},
         "loop.interval_too_short": {"interval_seconds": 1.0},
     }
     for code in get_args(NoticeCode):

@@ -27,7 +27,16 @@ import pytest
 import yaml
 
 from uclone_x.agent.avatar_tool import SetAvatarTool
+from uclone_x.agent.models import PersonaDefinition
 from uclone_x.agent.persona_registry import BUILTIN_PERSONAS_DIR
+from uclone_x.agent.persona_store import persona_from_mapping
+from uclone_x.core.agent_home import AgentHome, default_agents_root
+from uclone_x.skills.auditor import (
+    RUNTIME_SKILL_STORE_DIRNAME,
+    manifest_from_dict,
+    parse_skill_markdown,
+)
+from uclone_x.skills.models import missing_required_tools
 from uclone_x.tools.builtin.image import (
     NO_IMAGE_ENGINE_TEXT,
     CheckpointResolution,
@@ -41,6 +50,7 @@ from uclone_x.tools.models import NoIsolation, ToolContext
 from uclone_x.tools.registry import create_default_registry
 
 PERSONAS = Path(".uclone") / "personas"
+AVATAR_SKILL_DIR = Path(__file__).resolve().parents[2] / RUNTIME_SKILL_STORE_DIRNAME / "avatar"
 
 PNG = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk"
@@ -64,6 +74,11 @@ def _install(workspace: Path, name: str) -> None:
         ),
         encoding="utf-8",
     )
+
+
+def _home(name: str) -> Path:
+    """The clone directory of `name`, where its chosen and kept pictures are."""
+    return AgentHome.for_handle(name).path
 
 
 def _ctx(workspace: Path, *, persona: str | None, agent_id: str = "surveyor") -> ToolContext:
@@ -102,9 +117,12 @@ class TestWhosePicture:
         assert result.success, result.error
         assert isinstance(result.output, dict)
         url = result.output["avatar_url"]
-        assert isinstance(url, str) and url.startswith("/api/personas/surveyor/avatar?v=")
-        assert (tmp_path / PERSONAS / "surveyor.png").read_bytes() == PNG
-        assert not (tmp_path / PERSONAS / "seat-7.png").exists()
+        # The address names the clone by its id, not by the handle it was set through.
+        surveyor_id = _home("surveyor").name
+        assert surveyor_id.startswith("agt_")
+        assert isinstance(url, str) and url.startswith(f"/api/clones/{surveyor_id}/avatar?v=")
+        assert (_home("surveyor") / "avatar.png").read_bytes() == PNG
+        assert not (_home("seat-7") / "avatar.png").exists()
 
     async def test_with_no_clone_running_it_refuses_in_plain_words(self, tmp_path: Path) -> None:
         """Killed by: src/uclone_x/agent/avatar_tool.py :: if not isinstance(persona, str) or not persona:
@@ -118,7 +136,7 @@ class TestWhosePicture:
         assert result.success is False
         assert result.error is not None
         assert result.error.startswith("Only a clone can change its own picture")
-        assert not (tmp_path / PERSONAS / "surveyor.png").exists()
+        assert not list(default_agents_root().glob("*/avatar.*"))
 
     async def test_a_path_outside_the_workspace_is_refused_in_plain_words(
         self, tmp_path: Path
@@ -136,7 +154,7 @@ class TestWhosePicture:
         assert result.error is not None
         assert "outside the workspace" in result.error
         assert "Error" not in result.error
-        assert not (workspace / PERSONAS / "surveyor.png").exists()
+        assert not (_home("surveyor") / "avatar.png").exists()
 
 
 class TestUndo:
@@ -154,12 +172,12 @@ class TestUndo:
         second = await tool.execute({"image_path": _image(tmp_path, "b.png", OTHER_PNG)}, ctx)
         assert isinstance(second.output, dict)
         previous = second.output["previous_path"]
-        assert previous == ".uclone/personas/surveyor.prev.png"
+        assert previous == str(_home("surveyor") / "avatar.prev.png")
 
         undone = await tool.execute({"image_path": previous}, ctx)
 
         assert undone.success, undone.error
-        assert (tmp_path / PERSONAS / "surveyor.png").read_bytes() == PNG
+        assert (_home("surveyor") / "avatar.png").read_bytes() == PNG
 
     async def test_each_call_returns_its_change_id_and_an_undo_passes_it_back(
         self, tmp_path: Path
@@ -183,7 +201,7 @@ class TestUndo:
         assert undone.success, undone.error
         assert isinstance(undone.output, dict)
         assert undone.output["change_id"] == 3
-        assert (tmp_path / PERSONAS / "surveyor.png").read_bytes() == PNG
+        assert (_home("surveyor") / "avatar.png").read_bytes() == PNG
 
     async def test_an_undo_after_a_later_change_is_refused_and_changes_nothing(
         self, tmp_path: Path
@@ -209,7 +227,7 @@ class TestUndo:
         assert undone.success is False
         assert undone.output == {"reason_code": "stale_change"}
         assert undone.error is not None and "changed again" in undone.error
-        assert (tmp_path / PERSONAS / "surveyor.png").read_bytes() == later
+        assert (_home("surveyor") / "avatar.png").read_bytes() == later
 
     async def test_a_reset_undo_after_a_later_change_is_refused(self, tmp_path: Path) -> None:
         """Killed by: src/uclone_x/agent/avatar_tool.py :: change = store.reset(persona, undo_of=params.undo_of)
@@ -225,7 +243,7 @@ class TestUndo:
         undone = await tool.execute({"reset": True, "undo_of": mine.output["change_id"]}, ctx)
 
         assert undone.success is False
-        assert (tmp_path / PERSONAS / "surveyor.png").read_bytes() == OTHER_PNG
+        assert (_home("surveyor") / "avatar.png").read_bytes() == OTHER_PNG
 
     async def test_reset_goes_back_to_the_shipped_picture(self, tmp_path: Path) -> None:
         ctx = _ctx(tmp_path, persona="artist")
@@ -235,8 +253,8 @@ class TestUndo:
 
         assert result.success, result.error
         assert isinstance(result.output, dict)
-        assert result.output["previous_path"] == ".uclone/personas/artist.prev.png"
-        assert not (tmp_path / PERSONAS / "artist.png").exists()
+        assert result.output["previous_path"] == str(_home("artist") / "avatar.prev.png")
+        assert not (_home("artist") / "avatar.png").exists()
         assert (BUILTIN_PERSONAS_DIR / "artist.png").is_file()
 
     @pytest.mark.parametrize("args", [{}, {"image_path": "a.png", "reset": True}])
@@ -259,11 +277,41 @@ class TestBinding:
         assert isinstance(tool, SetAvatarTool)
         assert SetAvatarTool.writes_files is False
 
-    @pytest.mark.parametrize("name", ["artist", "guardian", "pioneer", "scout", "writer"])
-    def test_every_shipped_clone_with_a_tool_list_names_it(self, name: str) -> None:
-        data = yaml.safe_load((BUILTIN_PERSONAS_DIR / f"{name}.yaml").read_text(encoding="utf-8"))
+    def test_a_list_written_before_the_tool_existed_is_still_given_it(self) -> None:
+        """An imported, edited copy of a built-in keeps its own list (#2160).
 
-        assert "set_avatar" in data["allowed_tools"]
+        The installed artist examined held only `generate_image` and `file_read`; the tool
+        comes with the base set rather than with each list.
+
+        Killed by: src/uclone_x/core/models.py :: BASE_SELF_TOOLS: tuple[str, ...] = (*BASE_MEMORY_TOOLS, "set_avatar")
+        Becomes: BASE_SELF_TOOLS: tuple[str, ...] = (*BASE_MEMORY_TOOLS,)
+        """
+        persona = PersonaDefinition(
+            name="artist",
+            role="Artist",
+            system_prompt="Draw.",
+            allowed_tools=("generate_image", "file_read"),
+        )
+
+        assert "set_avatar" in persona.granted_tools
+
+    @pytest.mark.parametrize("name", ["artist", "guardian", "pioneer", "scout", "writer"])
+    def test_the_avatar_skill_is_offered_to_every_shipped_clone(self, name: str) -> None:
+        """Including those that cannot draw: its "When you cannot draw" step is for them.
+
+        Before #2160 the skill required `generate_image` as well, so #1826 hid it from
+        pioneer, guardian, scout and writer, and pioneer invented a picture path instead.
+
+        Killed by: ucx-agent-skills/avatar/SKILL.md ::   - set_avatar
+        Becomes:   - generate_image
+        """
+        path = BUILTIN_PERSONAS_DIR / f"{name}.yaml"
+        persona = persona_from_mapping(yaml.safe_load(path.read_text(encoding="utf-8")), path)
+        manifest = manifest_from_dict(
+            parse_skill_markdown((AVATAR_SKILL_DIR / "SKILL.md").read_text(encoding="utf-8"))[0]
+        )
+
+        assert missing_required_tools(manifest, persona.granted_tools) == ()
 
 
 def _no_engine_dispatcher() -> ImagePipelineDispatcher:
@@ -309,6 +357,6 @@ class TestNoImageModel:
             "Tool execution failed",
         ):
             assert internal not in result.error
-        assert "Settings › Images" in result.error
+        assert "Settings › Models" in result.error
         assert "upload a picture" in result.error
         assert list(tmp_path.rglob("*.png")) == []

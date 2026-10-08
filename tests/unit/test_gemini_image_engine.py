@@ -1,4 +1,4 @@
-"""The Gemini image engine and the `image_engine` setting that decides when it draws.
+"""The Gemini image engine, and the picture model that decides when it draws (model-gateway §3.5).
 
 Every Gemini request here goes to an `httpx.MockTransport`; nothing reaches the network.
 """
@@ -17,9 +17,11 @@ from unittest.mock import AsyncMock, patch
 import httpx
 import pytest
 
+from uclone_x.core.remote_worker import PortMapping, SSHTunnelManager, TunnelSessionStatus
 from uclone_x.errors import ImageNotReturnedError
 from uclone_x.llm.connectors.factory import image_engine_choice
 from uclone_x.llm.connectors.gemini import GeminiConnector
+from uclone_x.tools.base import artifact_path_from_url, linked_paths
 from uclone_x.tools.builtin.image import (
     ComfyUIImageEngine,
     GenerateImageParams,
@@ -29,17 +31,43 @@ from uclone_x.tools.builtin.image import (
     ImageGenerationError,
     ImageGenerationResult,
     ImagePipelineDispatcher,
+    ImageWhere,
     LocalDiffusersImageEngine,
     RemoteCudaImageEngine,
+    gemini_profile,
     image_extension_for,
+    image_where,
     jpeg_dimensions,
     picture_path_for,
+    sidecar_path_for,
     sniff_picture,
     webp_dimensions,
 )
-from uclone_x.tools.builtin.image_status import ImageEngineReport, probe_image_engines
+from uclone_x.tools.builtin.image_status import (
+    ImageEngineReport,
+    KnownModel,
+    media_status_payload,
+    probe_image_engines,
+    resolve_image_choice,
+)
+from uclone_x.tools.builtin.media_registry import ModelProfile, PromptFamily
 from uclone_x.tools.models import ToolContext
 from uclone_x.ui.app import AgentSessionManager, create_ui_app
+
+
+def _picture_rel(url: object) -> str:
+    """The workspace path a result's picture link serves; fails the test if it names none."""
+    rel = artifact_path_from_url(url)
+    assert rel is not None, f"not a picture link: {url!r}"
+    return rel
+
+
+def _sidecar(workspace: Path, url: object) -> dict[str, Any]:
+    """The recipe sidecar saved beside the picture a result links to."""
+    side: dict[str, Any] = json.loads(
+        (workspace / sidecar_path_for(_picture_rel(url))).read_text(encoding="utf-8")
+    )
+    return side
 
 
 def _png(width: int, height: int) -> bytes:
@@ -152,7 +180,7 @@ def _dispatcher(choice: ImageEngineChoice, *, local_ready: bool) -> ImagePipelin
         remote_engine=remote,
         comfy_engine=comfy,
         local_engine=local,
-        engine_settings=lambda: choice,
+        engine_settings=lambda _own: choice,
     )
 
 
@@ -166,9 +194,30 @@ class _FakeGeminiSending:
         return self._reply
 
 
+def _pinned_gemini(gemini: Any, model: str = "gemini-2.5-flash-image") -> ImageEngineChoice:
+    """The choice a picture model ref on a Google connection resolves to."""
+    return ImageEngineChoice(
+        chosen=f"gemini/{model}",
+        pin="gemini",
+        from_connections=True,
+        gemini=gemini,
+        gemini_model=model,
+        gemini_connection="gemini",
+    )
+
+
+def _auto(gemini: Any = None, model: str | None = "gemini-2.5-flash-image") -> ImageEngineChoice:
+    """`auto`, with ``gemini`` as the cloud model on a connection that has a key."""
+    return ImageEngineChoice(
+        gemini=gemini,
+        gemini_model=model if gemini is not None else None,
+        gemini_connection="gemini" if gemini is not None else None,
+    )
+
+
 def _gemini_tool(data: bytes, mime: str) -> GenerateImageTool:
     gemini = _FakeGeminiSending(data, mime)
-    choice = ImageEngineChoice(setting="gemini", model="gemini-3.1-flash-image", gemini=gemini)
+    choice = _pinned_gemini(gemini, "gemini-3.1-flash-image")
     return GenerateImageTool(dispatcher=_dispatcher(choice, local_ready=False))
 
 
@@ -246,46 +295,42 @@ async def test_a_reply_without_an_image_part_raises_rather_than_returning_nothin
 
 
 @pytest.mark.asyncio
-async def test_auto_draws_with_gemini_only_for_a_gemini_chat_with_a_key() -> None:
-    """With no local engine ready, `auto` needs both a Gemini chat and a key to use Gemini.
+async def test_auto_draws_with_the_cloud_model_on_a_connection_with_a_key() -> None:
+    """With no own engine ready, `auto` uses the cloud model a keyed connection offers.
 
-    Killed by: src/uclone_x/tools/builtin/image.py :: return self.chat_provider == GEMINI_ENGINE_NAME and self.gemini is not None
-    Becomes: return self.gemini is not None
+    It no longer asks what the chat model is (model-gateway §3.5): a cloud model on a
+    connection with a key is enough, and without one nothing is drawn.
+
+    Killed by: src/uclone_x/tools/builtin/image.py :: return self.pin is None and self.gemini is not None and self.gemini_model is not None
+    Becomes: return False
     """
     gemini = _FakeGemini()
-    drawn = await _draw(
-        _dispatcher(ImageEngineChoice(chat_provider="gemini", gemini=gemini), local_ready=False)
-    )
+    drawn = await _draw(_dispatcher(_auto(gemini), local_ready=False))
     assert drawn.engine_name == "gemini"
     assert drawn.width == 1024
-    assert gemini.calls[0][1] == "16:9"
-
-    other_chat = _FakeGemini()
-    with pytest.raises(ImageGenerationError):
-        await _draw(
-            _dispatcher(
-                ImageEngineChoice(chat_provider="openai", gemini=other_chat), local_ready=False
-            )
-        )
-    assert other_chat.calls == []
+    assert gemini.calls[0][1:] == ("16:9", "gemini-2.5-flash-image")
+    assert drawn.drawn_with == (
+        "Drawn with Gemini 2.5 Flash Image in the cloud (Google) (picked automatically)."
+    )
 
     with pytest.raises(ImageGenerationError):
-        await _draw(_dispatcher(ImageEngineChoice(chat_provider="gemini"), local_ready=False))
+        await _draw(_dispatcher(_auto(), local_ready=False))
 
 
 @pytest.mark.asyncio
 async def test_auto_prefers_a_ready_local_engine_over_gemini() -> None:
-    """Gemini is the fallback under `auto`, not the first choice.
+    """The cloud is the fallback under `auto`, not the first choice.
 
-    Killed by: src/uclone_x/tools/builtin/image.py :: return not await self._any_local_ready()
+    Killed by: src/uclone_x/tools/builtin/image.py :: return not await self._any_local_ready(choice)
     Becomes: return True
     """
     gemini = _FakeGemini()
-    drawn = await _draw(
-        _dispatcher(ImageEngineChoice(chat_provider="gemini", gemini=gemini), local_ready=True)
-    )
+    drawn = await _draw(_dispatcher(_auto(gemini), local_ready=True))
     assert drawn.engine_name == "diffusers-sdxl"
     assert gemini.calls == []
+    assert drawn.drawn_with is not None and drawn.drawn_with.endswith(
+        "on this computer (picked automatically)."
+    )
 
 
 @pytest.mark.asyncio
@@ -294,8 +339,8 @@ async def test_under_auto_the_description_names_the_engine_that_then_draws(tmp_p
 
     Killed by: src/uclone_x/tools/builtin/image.py :: parts = [self.GEMINI_BASE_DESCRIPTION if gemini else self.BASE_DESCRIPTION]
     Becomes: parts = [self.BASE_DESCRIPTION]
-    Killed by: src/uclone_x/tools/builtin/image.py :: if probe is not None and time.monotonic() - probe[0] < LOCAL_PROBE_TTL_SECONDS:
-    Becomes: if False:
+    Killed by: src/uclone_x/tools/builtin/image.py :: and probe[0] == self._probe_key(choice)
+    Becomes: and False
     """
     gemini = _FakeGemini()
     remote, comfy, local = _locals(ready=False)
@@ -303,7 +348,7 @@ async def test_under_auto_the_description_names_the_engine_that_then_draws(tmp_p
         remote_engine=remote,
         comfy_engine=comfy,
         local_engine=local,
-        engine_settings=lambda: ImageEngineChoice(chat_provider="gemini", gemini=gemini),
+        engine_settings=lambda _own: _auto(gemini),
     )
     tool = GenerateImageTool(dispatcher=dispatcher)
 
@@ -315,7 +360,7 @@ async def test_under_auto_the_description_names_the_engine_that_then_draws(tmp_p
 
     assert description.startswith(GenerateImageTool.GEMINI_BASE_DESCRIPTION)
     assert "never on a paid cloud service" not in description
-    assert result["engine"] == "gemini"
+    assert _sidecar(tmp_path, result["relative_url"])["engine"] == "gemini"
     # One look served the description and the draw.
     assert local.is_available.await_count == 1
 
@@ -327,20 +372,22 @@ async def test_a_stale_look_does_not_hold_up_the_description(tmp_path: Path) -> 
     The description is read inside a turn; looking at the engines there, after the cache
     has expired, would hold the loop for as long as the probes take to time out.
 
-    Killed by: src/uclone_x/tools/builtin/image.py :: if last is None:
+    Killed by: src/uclone_x/tools/builtin/image.py :: if last is None or last[0] != key:
     Becomes: if True:
     """
     gemini = _FakeGemini()
     remote, comfy, local = _locals(ready=False)
+    choice = _auto(gemini)
     dispatcher = ImagePipelineDispatcher(
         remote_engine=remote,
         comfy_engine=comfy,
         local_engine=local,
-        engine_settings=lambda: ImageEngineChoice(chat_provider="gemini", gemini=gemini),
+        engine_settings=lambda _own: choice,
     )
     tool = GenerateImageTool(dispatcher=dispatcher)
     # A look long past its time, which found no local engine.
-    dispatcher._local_probe = (time.monotonic() - 3600, False)  # pyright: ignore[reportPrivateUsage]
+    key = dispatcher._probe_key(choice)  # pyright: ignore[reportPrivateUsage]
+    dispatcher._local_probe = (key, time.monotonic() - 3600, False)  # pyright: ignore[reportPrivateUsage]
 
     description = tool.description
 
@@ -352,27 +399,28 @@ async def test_a_stale_look_does_not_hold_up_the_description(tmp_path: Path) -> 
         GenerateImageParams(prompt="a lighthouse at dawn"),
         ToolContext(agent_id="a", session_id="s", workspace_root=tmp_path),
     )
-    assert result["engine"] == "gemini"
+    assert _sidecar(tmp_path, result["relative_url"])["engine"] == "gemini"
     assert local.is_available.await_count == 1
     fresh = dispatcher._local_probe  # pyright: ignore[reportPrivateUsage]
-    assert fresh is not None and time.monotonic() - fresh[0] < 60
+    assert fresh is not None and time.monotonic() - fresh[1] < 60
 
 
-# -- `gemini` and `local` -------------------------------------------------------------------
+# -- A cloud model chosen by name ----------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_gemini_setting_draws_with_gemini_and_records_it(tmp_path: Path) -> None:
-    """`gemini` draws there even with a local engine ready, and the sidecar says so.
+async def test_a_chosen_cloud_model_draws_there_and_records_it(tmp_path: Path) -> None:
+    """A Google picture model chosen by name draws there even with a local engine ready.
 
-    Killed by: src/uclone_x/tools/builtin/image.py :: return gemini_profile(choice.model)
+    Killed by: src/uclone_x/tools/builtin/image.py :: return self._cloud_profile(choice.gemini_model or DEFAULT_IMAGE_MODEL)
     Becomes: return self._local_profile()
     Killed by: src/uclone_x/tools/builtin/image.py :: engine_name=GEMINI_ENGINE_NAME,
     Becomes: engine_name="diffusers-sdxl",
     """
     gemini = _FakeGemini()
-    choice = ImageEngineChoice(setting="gemini", model="gemini-test-image", gemini=gemini)
-    tool = GenerateImageTool(dispatcher=_dispatcher(choice, local_ready=True))
+    tool = GenerateImageTool(
+        dispatcher=_dispatcher(_pinned_gemini(gemini, "gemini-test-image"), local_ready=True)
+    )
 
     description = tool.description
     result = await tool.run(
@@ -383,9 +431,13 @@ async def test_gemini_setting_draws_with_gemini_and_records_it(tmp_path: Path) -
     # The profile `load_skill` routes the prompt rules by; the description names no model.
     assert tool.active_profile().model_id == "gemini-test-image"
     assert "gemini-test-image" not in description
-    assert result["engine"] == "gemini"
-    sidecar = json.loads((tmp_path / result["meta_path"]).read_text())
+    assert "engine" not in result
+    sidecar = _sidecar(tmp_path, result["relative_url"])
     assert sidecar["engine"] == "gemini"
+    assert sidecar["drawn_with"] == result["drawn_with"]
+    assert result["drawn_with"] == (
+        "Drawn with gemini-test-image in the cloud (Google) (the picture model chosen in Settings)."
+    )
     assert gemini.calls[0][1:] == ("3:4", "gemini-test-image")
 
 
@@ -393,14 +445,15 @@ async def test_gemini_setting_draws_with_gemini_and_records_it(tmp_path: Path) -
 async def test_a_negative_gemini_cannot_use_is_reported_in_the_result(tmp_path: Path) -> None:
     """Gemini takes no negative prompt; the result says it went unused (P6, #1723).
 
-    Killed by: src/uclone_x/tools/builtin/image.py ::             return replace(drawn, prompt_changes=gemini_fill.changes)
-    Becomes:             return drawn
+    Killed by: src/uclone_x/tools/builtin/image.py ::                 prompt_changes=gemini_fill.changes,
+    Becomes:                 prompt_changes=(),
     """
     from uclone_x.tools.builtin.media_registry import NEGATIVE_NOT_USED
 
     gemini = _FakeGemini()
-    choice = ImageEngineChoice(setting="gemini", model="gemini-test-image", gemini=gemini)
-    tool = GenerateImageTool(dispatcher=_dispatcher(choice, local_ready=False))
+    tool = GenerateImageTool(
+        dispatcher=_dispatcher(_pinned_gemini(gemini, "gemini-test-image"), local_ready=False)
+    )
 
     result = await tool.run(
         GenerateImageParams(prompt="a lighthouse at dawn", negative_prompt="people"),
@@ -419,8 +472,7 @@ def test_the_gemini_description_tells_the_model_where_the_notes_are() -> None:
     """
     tool = GenerateImageTool(
         dispatcher=_dispatcher(
-            ImageEngineChoice(setting="gemini", model="gemini-test-image", gemini=_FakeGemini()),
-            local_ready=False,
+            _pinned_gemini(_FakeGemini(), "gemini-test-image"), local_ready=False
         )
     )
 
@@ -429,68 +481,73 @@ def test_the_gemini_description_tells_the_model_where_the_notes_are() -> None:
 
 
 @pytest.mark.asyncio
-async def test_local_setting_never_sends_a_picture_request(tmp_path: Path) -> None:
-    """`local` builds no Gemini client from a saved key, and draws nothing over the network.
+async def test_a_chosen_own_model_never_sends_a_picture_request_to_the_cloud() -> None:
+    """A ComfyUI model chosen by name: a ready cloud client is never used in its place.
 
-    Killed by: src/uclone_x/llm/connectors/factory.py :: if setting == "local" or not gemini_key_available(data):
-    Becomes: if not gemini_key_available(data):
-    Killed by: src/uclone_x/tools/builtin/image.py :: return choice.setting == GEMINI_ENGINE_NAME
+    Killed by: src/uclone_x/tools/builtin/image.py :: return choice.pin == "gemini"
     Becomes: return True
     """
-    settings = tmp_path / "settings.json"
-    settings.write_text(
-        json.dumps({"image_engine": "local", "llm_api_keys": {"gemini": "saved-key"}})
-    )
     recorder = _Recorder(_image_reply(_png(8, 8)))
-
-    choice = image_engine_choice(settings, "gemini", http_client=recorder.client())
-    assert choice.setting == "local"
-    assert choice.gemini is None
-
-    # Even handed a client, the dispatcher under `local` does not use it.
     armed = ImageEngineChoice(
-        setting="local",
-        chat_provider="gemini",
+        chosen="comfyui/anillustrious_v4",
+        pin="comfyui",
+        pinned_profile="anillustrious_v4",
+        from_connections=True,
+        comfyui_base_url="http://127.0.0.1:1",
         gemini=GeminiConnector(api_key="k", http_client=recorder.client()),
+        gemini_model="gemini-2.5-flash-image",
     )
     with pytest.raises(ImageGenerationError):
-        await _draw(_dispatcher(armed, local_ready=False))
+        await _draw(_dispatcher(armed, local_ready=True))
     assert recorder.requests == []
 
 
-def test_the_saved_gemini_key_builds_the_client_for_auto(tmp_path: Path) -> None:
-    """The key comes from settings.json's `llm_api_keys`, the one place keys are saved."""
-    settings = tmp_path / "settings.json"
-    settings.write_text(json.dumps({"llm_api_keys": {"gemini": "saved-key"}}))
-
-    choice = image_engine_choice(settings, "google")
-
-    assert choice.setting == "auto"
-    assert choice.model == "gemini-2.5-flash-image"
-    assert choice.chat_provider == "gemini"
-    assert isinstance(choice.gemini, GeminiConnector)
-    assert choice.gemini.api_key == "saved-key"
-    assert image_engine_choice(tmp_path / "absent.json", "gemini").gemini is None
+#: A settings file holding only a Gemini connection with its key.
+_GEMINI_KEY_SAVED: dict[str, Any] = {
+    "connections": [{"id": "gemini", "kind": "gemini", "key": "saved-key"}]
+}
 
 
-def test_pictures_go_to_the_gemini_address_the_chat_uses(
+def test_the_saved_gemini_key_builds_the_client_for_auto(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A saved Gemini base URL is the pictures' address too, in the dashboard (#1769).
+    """The key comes from the Gemini connection in settings.json, where keys are saved."""
+    for name in ("GEMINI_API_KEY", "GOOGLE_API_KEY", "LLM_PROVIDER"):
+        monkeypatch.delenv(name, raising=False)
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps(_GEMINI_KEY_SAVED))
 
-    Killed by: src/uclone_x/llm/connectors/factory.py :: api_key=resolve_api_key("gemini", None, data), base_url=base_url, http_client=http_client
-    Becomes: api_key=resolve_api_key("gemini", None, data), http_client=http_client
-    Killed by: src/uclone_x/ui/app.py :: self.gemini_base_url_in_effect,
-    Becomes: None,
+    choice = image_engine_choice(settings)
+
+    assert (choice.chosen, choice.pin) == ("auto", None)
+    assert choice.gemini_model == "gemini-2.5-flash-image"
+    assert isinstance(choice.gemini, GeminiConnector)
+    assert choice.gemini.api_key == "saved-key"
+    assert image_engine_choice(tmp_path / "absent.json").gemini is None
+
+
+def test_pictures_go_to_the_gemini_connections_address(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A Google connection's saved address is the pictures' address too, in the dashboard (#1769).
+
+    Killed by: src/uclone_x/llm/connectors/factory.py :: api_key=cloud.key, base_url=cloud.base_url, http_client=http_client
+    Becomes: api_key=cloud.key, http_client=http_client
     """
     for name in ("GEMINI_BASE_URL", "LLM_PROVIDER", "GEMINI_API_KEY", "GOOGLE_API_KEY"):
         monkeypatch.delenv(name, raising=False)
     (tmp_path / "settings.json").write_text(
         json.dumps(
             {
-                "llm_provider": "gemini",
-                "llm_base_url": "https://gemini-proxy.example/v1beta",
-                "llm_api_keys": {"gemini": "saved-key"},
+                "connections": [
+                    {
+                        "id": "gemini",
+                        "kind": "gemini",
+                        "base_url": "https://gemini-proxy.example/v1beta",
+                        "key": "saved-key",
+                    }
+                ],
+                "default_models": {"deep": "gemini/gemini-2.5-pro"},
             }
         )
     )
@@ -502,78 +559,6 @@ def test_pictures_go_to_the_gemini_address_the_chat_uses(
 
     assert isinstance(choice.gemini, GeminiConnector)
     assert choice.gemini.base_url == "https://gemini-proxy.example/v1beta"
-
-
-def test_a_saved_address_with_no_saved_provider_is_not_sent_the_gemini_key(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """An address saved for no provider may be another server's; pictures keep Google's.
-
-    Killed by: src/uclone_x/ui/app.py :: or same_provider(self._configured_provider, "gemini")
-    Becomes: or True
-    """
-    for name in ("GEMINI_BASE_URL", "LLM_PROVIDER", "GEMINI_API_KEY", "GOOGLE_API_KEY"):
-        monkeypatch.delenv(name, raising=False)
-    (tmp_path / "settings.json").write_text(
-        json.dumps(
-            {
-                "llm_base_url": "http://127.0.0.1:11434",
-                "image_engine": "gemini",
-                "llm_api_keys": {"gemini": "saved-key"},
-            }
-        )
-    )
-    mgr = AgentSessionManager(storage_dir=tmp_path, fallback_to_mock=True)
-
-    assert mgr.gemini_base_url_in_effect() is None
-
-
-# -- Settings ---------------------------------------------------------------------------------
-
-
-def test_settings_accept_known_values_and_refuse_unknown_ones(tmp_path: Path) -> None:
-    """Both fields are validated before anything is written; a refusal changes nothing.
-
-    Killed by: src/uclone_x/tools/builtin/image.py :: if value == setting:
-    Becomes: if True:
-    Killed by: src/uclone_x/tools/builtin/image.py :: if isinstance(value, str) and _IMAGE_MODEL_ID.fullmatch(value):
-    Becomes: if isinstance(value, str):
-    Killed by: src/uclone_x/ui/app.py :: changes.update(image_changes)
-    Becomes: pass
-    """
-    mgr = AgentSessionManager(storage_dir=tmp_path, fallback_to_mock=True)
-    assert mgr.get_settings()["image_engine"] == "auto"
-    assert mgr.get_settings()["image_model"] == "gemini-2.5-flash-image"
-
-    updated = mgr.update_settings(image_engine="gemini", image_model="gemini-3-pro-image")
-    assert updated["image_engine"] == "gemini"
-    assert updated["image_model"] == "gemini-3-pro-image"
-    saved = json.loads(mgr.settings_file.read_text())
-    assert saved["image_engine"] == "gemini"
-
-    with pytest.raises(ValueError, match="auto, local or gemini"):
-        mgr.update_settings(image_engine="cloud", ui_language="en")
-    with pytest.raises(ValueError, match="Gemini model id"):
-        mgr.update_settings(image_model="../../v1/files")
-    assert json.loads(mgr.settings_file.read_text()) == saved
-
-
-@pytest.mark.asyncio
-async def test_the_settings_endpoint_refuses_an_unknown_engine_plainly(tmp_path: Path) -> None:
-    """`POST /api/settings` answers 400 with the refusal, and takes a known value."""
-    mgr = AgentSessionManager(storage_dir=tmp_path, fallback_to_mock=True)
-    app = create_ui_app(static_dir=tmp_path, session_manager=mgr, storage_dir=tmp_path)
-    async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
-    ) as client:
-        bad = await client.post("/api/settings", json={"image_engine": "cloud"})
-        good = await client.post("/api/settings", json={"image_engine": "local"})
-        read = await client.get("/api/settings")
-
-    assert bad.status_code == 400
-    assert "auto, local or gemini" in bad.json()["detail"]
-    assert good.status_code == 200
-    assert read.json()["image_engine"] == "local"
 
 
 # -- Status -----------------------------------------------------------------------------------
@@ -592,45 +577,54 @@ def _report(**overrides: Any) -> ImageEngineReport:
     return ImageEngineReport(**fields)
 
 
-def test_the_report_counts_gemini_as_the_dispatcher_does() -> None:
-    """Ready and engine follow the `image_engine` rule, with a reason for each engine.
+def test_the_report_counts_the_cloud_as_the_dispatcher_does() -> None:
+    """Ready and engine follow the `auto` rule and the pins, with a reason for each engine.
 
-    Killed by: src/uclone_x/tools/builtin/image_status.py :: return self.local_ready or self.gemini_ready
-    Becomes: return self.local_ready
-    Killed by: src/uclone_x/tools/builtin/image_status.py :: gemini = (False, "chat_provider_not_gemini")
-    Becomes: gemini = (True, "ready")
+    Killed by: src/uclone_x/tools/builtin/image_status.py :: if self.pin is not None and pinned[self.pin] != name:
+    Becomes: if False:
     """
-    auto = _report(chat_provider="gemini", gemini_key=True)
+    auto = _report(gemini_model="gemini-2.5-flash-image")
     assert auto.ready and auto.engine == "gemini"
 
-    other_chat = _report(chat_provider="openai", gemini_key=True)
-    assert not other_chat.ready and other_chat.engine == "none"
-    assert other_chat.engine_states()[-1] == ("gemini", False, "chat_provider_not_gemini")
+    no_key = _report()
+    assert not no_key.ready and no_key.engine == "none"
+    assert no_key.engine_states()[-1] == ("gemini", False, "no_key")
 
-    local = _report(image_engine="local", chat_provider="gemini", gemini_key=True, checkpoint="x")
-    assert local.engine == "diffusers-sdxl"
-    assert local.engine_states()[-1] == ("gemini", False, "disabled_by_setting")
+    pinned = _report(
+        pin="comfyui", comfy_alive=False, gemini_model="gemini-2.5-flash-image", checkpoint="x"
+    )
+    assert pinned.engine == "none"
+    assert pinned.engine_states()[-1] == ("gemini", False, "disabled_by_setting")
+    assert pinned.engine_states()[2] == ("diffusers-sdxl", False, "disabled_by_setting")
 
-    only_gemini = _report(image_engine="gemini", gemini_key=True, checkpoint="x")
+    only_gemini = _report(pin="gemini", gemini_model="gemini-x", checkpoint="x")
     assert only_gemini.engine == "gemini"
-    assert only_gemini.engine_states()[2] == ("diffusers-sdxl", False, "disabled_by_setting")
 
 
-def test_the_probe_reads_the_picture_settings_and_the_key(tmp_path: Path) -> None:
-    """The probe `ucx media status` prints includes the Gemini engine, from the settings file."""
+def test_the_probe_reads_the_picture_model_and_the_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The probe `ucx media status` prints includes the cloud model, from the settings file."""
+    for name in ("GEMINI_API_KEY", "GOOGLE_API_KEY", "LLM_PROVIDER"):
+        monkeypatch.delenv(name, raising=False)
     settings = tmp_path / "settings.json"
     settings.write_text(
-        json.dumps({"image_engine": "gemini", "llm_api_keys": {"gemini": "saved-key"}})
+        json.dumps(
+            {**_GEMINI_KEY_SAVED, "default_models": {"image": "gemini/gemini-2.5-flash-image"}}
+        )
     )
-    with (
-        patch.object(ComfyUIImageEngine, "is_available", AsyncMock(return_value=False)),
-        patch.object(LocalDiffusersImageEngine, "resolve_checkpoint", return_value=None),
-    ):
-        report = probe_image_engines(settings, "gemini")
+    with patch.object(LocalDiffusersImageEngine, "resolve_checkpoint", return_value=None):
+        report = probe_image_engines(settings)
 
-    assert report.image_engine == "gemini"
-    assert report.gemini_key
+    assert (report.setting, report.pin) == ("gemini/gemini-2.5-flash-image", "gemini")
+    assert report.gemini_model == "gemini-2.5-flash-image"
     assert report.engine == "gemini"
+    assert resolve_image_choice(report)["create"] == {
+        "engine": "gemini",
+        "model_id": "gemini-2.5-flash-image",
+        "label": "Gemini 2.5 Flash Image",
+        "where": "cloud",
+    }
 
 
 @pytest.mark.asyncio
@@ -639,8 +633,8 @@ async def test_media_status_answers_without_the_cli_extra(
 ) -> None:
     """A server installed without `cli` (no `rich`) still answers the status route (#1769).
 
-    Killed by: src/uclone_x/ui/app.py :: from uclone_x.tools.builtin.image_status import probe_image_engines
-    Becomes: from uclone_x.cli.commands.bootstrap import probe_image_engines
+    Killed by: src/uclone_x/ui/app.py :: from uclone_x.tools.builtin.image_status import media_status_payload, probe_image_engines
+    Becomes: from uclone_x.cli.commands.bootstrap import media_status_payload, probe_image_engines
     """
     monkeypatch.delenv("UCX_IMAGE_REMOTE_URL", raising=False)
     monkeypatch.delenv("UCX_MEDIA_REMOTE_URL", raising=False)
@@ -670,7 +664,7 @@ async def test_media_status_endpoint_shape(tmp_path: Path) -> None:
     """`GET /api/media/status` gives the probe's verdict and one entry per engine."""
     mgr = AgentSessionManager(storage_dir=tmp_path, fallback_to_mock=True)
     app = create_ui_app(static_dir=tmp_path, session_manager=mgr, storage_dir=tmp_path)
-    report = _report(chat_provider="gemini", gemini_key=True)
+    report = _report(gemini_model="gemini-2.5-flash-image")
     with patch(
         "uclone_x.tools.builtin.image_status.probe_image_engines", return_value=report
     ) as probe:
@@ -759,14 +753,13 @@ async def test_a_gemini_jpeg_is_saved_as_a_jpg_that_its_sidecar_and_address_name
 
     result = await tool.run(GenerateImageParams(prompt="a friendly face"), _ctx(tmp_path))
 
-    assert re.fullmatch(r"artifacts/images/img_[0-9a-f]{6}\.jpg", result["path"])
-    assert (tmp_path / result["path"]).read_bytes() == _JPEG_5X3
+    picture = _picture_rel(result["relative_url"])
+    assert re.fullmatch(r"artifacts/s/images/img_[0-9a-f]{6}\.jpg", picture)
+    assert (tmp_path / picture).read_bytes() == _JPEG_5X3
     assert list((tmp_path / "artifacts/images").glob("*.png")) == []
-    assert (result["width"], result["height"]) == (5, 3)
-    assert result["mime_type"] == "image/jpeg"
-    assert result["relative_url"] == f"/api/artifacts/content?path={result['path']}"
-    sidecar = json.loads((tmp_path / result["meta_path"]).read_text())
-    assert sidecar["image_path"] == result["path"]
+    assert result["relative_url"] == f"/api/artifacts/content?path={picture}"
+    sidecar = _sidecar(tmp_path, result["relative_url"])
+    assert sidecar["image_path"] == picture
     assert sidecar["mime_type"] == "image/jpeg"
     assert (sidecar["width"], sidecar["height"]) == (5, 3)
 
@@ -784,12 +777,12 @@ async def test_a_batch_of_gemini_jpegs_is_saved_and_shown_as_jpgs(tmp_path: Path
 
     assert len(result["images"]) == 2
     for img in result["images"]:
-        assert re.fullmatch(r"artifacts/images/img_[0-9a-f]{6}_[12]\.jpg", img["path"])
-        assert (tmp_path / img["path"]).read_bytes() == _JPEG_5X3
-        assert img["relative_url"] in result["markdown_gallery"]
+        picture = _picture_rel(img["relative_url"])
+        assert re.fullmatch(r"artifacts/s/images/img_[0-9a-f]{6}_[12]\.jpg", picture)
+        assert (tmp_path / picture).read_bytes() == _JPEG_5X3
         assert img["relative_url"].endswith(".jpg")
-        sidecar = json.loads((tmp_path / img["meta_path"]).read_text())
-        assert sidecar["image_path"] == img["path"]
+        sidecar = _sidecar(tmp_path, img["relative_url"])
+        assert sidecar["image_path"] == picture
         assert sidecar["mime_type"] == "image/jpeg"
     assert list((tmp_path / "artifacts/images").glob("*.png")) == []
 
@@ -808,9 +801,10 @@ async def test_a_jpeg_asked_for_under_a_png_name_is_written_as_a_jpg(tmp_path: P
         _ctx(tmp_path),
     )
 
-    assert result["path"] == "artifacts/images/face.jpg"
+    assert _picture_rel(result["relative_url"]) == "artifacts/images/face.jpg"
     assert not (tmp_path / "artifacts/images/face.png").exists()
-    assert result["meta_path"] == "artifacts/images/face.json"
+    side = json.loads((tmp_path / "artifacts/images/face.json").read_text())
+    assert side["image_path"] == "artifacts/images/face.jpg"
 
 
 @pytest.mark.asyncio
@@ -824,8 +818,8 @@ async def test_the_bytes_not_the_label_decide_the_format(tmp_path: Path) -> None
 
     result = await tool.run(GenerateImageParams(prompt="a friendly face"), _ctx(tmp_path))
 
-    assert result["path"].endswith(".jpg")
-    assert result["mime_type"] == "image/jpeg"
+    assert _picture_rel(result["relative_url"]).endswith(".jpg")
+    assert _sidecar(tmp_path, result["relative_url"])["mime_type"] == "image/jpeg"
 
 
 @pytest.mark.asyncio
@@ -939,8 +933,11 @@ async def test_a_chosen_name_for_a_png_gets_a_png_suffix_and_a_sidecar_beside_it
         GenerateImageParams(prompt="a friendly face", output_path=asked), _ctx(tmp_path)
     )
 
-    assert (result["path"], result["meta_path"]) == (picture, sidecar)
+    assert _picture_rel(result["relative_url"]) == picture
+    assert sidecar_path_for(picture) == sidecar
     assert json.loads((tmp_path / sidecar).read_text())["image_path"] == picture
+    written = sorted(str(p.relative_to(tmp_path)) for p in (tmp_path / "art").glob("*.json"))
+    assert written == [sidecar]
     assert not (tmp_path / asked).exists() or asked == picture
 
 
@@ -958,22 +955,37 @@ async def test_a_batch_sidecar_is_named_after_its_final_picture(tmp_path: Path) 
         _ctx(tmp_path),
     )
 
-    assert result["paths"] == ["art/notes_1.txt.png", "art/notes_2.txt.png"]
-    assert result["meta_paths"] == ["art/notes_1.txt.json", "art/notes_2.txt.json"]
+    pictures = ["art/notes_1.txt.png", "art/notes_2.txt.png"]
+    sidecars = ["art/notes_1.txt.json", "art/notes_2.txt.json"]
+    assert linked_paths(result) == pictures
+    assert "meta_paths" not in result
+    for picture, sidecar in zip(pictures, sidecars, strict=True):
+        assert json.loads((tmp_path / sidecar).read_text())["image_path"] == picture
+    written = sorted(str(p.relative_to(tmp_path)) for p in (tmp_path / "art").glob("*.json"))
+    assert written == sidecars
 
 
-@pytest.mark.parametrize("asked", ["artifacts/images/", "artifacts/images/.png"])
+@pytest.mark.parametrize(
+    "asked",
+    [
+        "artifacts/images/",
+        "artifacts/images/.png",
+        "artifacts/images/.",
+        "artifacts/images/..",
+        "a/.",
+    ],
+)
 @pytest.mark.asyncio
 async def test_a_name_with_no_file_in_it_is_refused_before_drawing(
     tmp_path: Path, asked: str
 ) -> None:
     r"""A folder, or a bare `.png`, names no file: refused in plain words, nothing drawn.
 
-    Killed by: src/uclone_x/tools/builtin/image.py :: return rel.endswith(("/", "\\")) or Path(rel).name.lower() in _NO_FILE_NAMES
+    Killed by: src/uclone_x/tools/builtin/image.py :: return rel.endswith(("/", "\\")) or last in _NO_FILE_NAMES
     Becomes: return False
     """
     gemini = AsyncMock()
-    choice = ImageEngineChoice(setting="gemini", model="gemini-3.1-flash-image", gemini=gemini)
+    choice = _pinned_gemini(gemini, "gemini-3.1-flash-image")
     tool = GenerateImageTool(dispatcher=_dispatcher(choice, local_ready=False))
     gemini.generate_image.return_value = (_JPEG_5X3, "image/jpeg")
 
@@ -985,3 +997,324 @@ async def test_a_name_with_no_file_in_it_is_refused_before_drawing(
         "Give a file name, such as 'artifacts/images/face.png'.",
     )
     gemini.generate_image.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_a_batch_name_with_no_file_in_it_is_refused_before_drawing(
+    tmp_path: Path,
+) -> None:
+    """A batch output path naming no file is refused before drawing."""
+    gemini = AsyncMock()
+    choice = _pinned_gemini(gemini, "gemini-3.1-flash-image")
+    tool = GenerateImageTool(dispatcher=_dispatcher(choice, local_ready=False))
+    gemini.generate_image.return_value = (_JPEG_5X3, "image/jpeg")
+
+    result = await tool.execute(
+        {"prompt": "a friendly face", "output_path": "artifacts/images/.", "count": 2},
+        _ctx(tmp_path),
+    )
+
+    assert (result.success, result.error) == (
+        False,
+        "'artifacts/images/.' has no file name, so no picture was made. "
+        "Give a file name, such as 'artifacts/images/face.png'.",
+    )
+    gemini.generate_image.assert_not_called()
+
+
+# -- Where each engine draws -------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("engine", "url", "tunnel_port", "where"),
+    [
+        ("remote-cuda", None, None, "gpu_server"),
+        ("gemini", None, None, "cloud"),
+        ("diffusers-sdxl", None, None, "this_computer"),
+        ("comfyui-local", "http://127.0.0.1:8188", None, "this_computer"),
+        ("comfyui-local", "http://[::1]:8188", None, "this_computer"),
+        ("comfyui-local", "http://localhost:8188", None, "this_computer"),
+        ("comfyui-local", "http://LOCALHOST:8188", None, "this_computer"),
+        ("comfyui-local", "http://192.168.1.20:8188", None, "gpu_server"),
+        ("comfyui-local", "http://gpu-box.lan:8188", None, "gpu_server"),
+        # The connected tunnel's own port is the GPU server; another loopback port is not.
+        ("comfyui-local", "http://127.0.0.1:8188", 8188, "gpu_server"),
+        ("comfyui-local", "http://[::1]:8190", 8190, "gpu_server"),
+        ("comfyui-local", "http://localhost:8190", 8188, "this_computer"),
+        # No port in the address is the scheme's default.
+        ("comfyui-local", "http://127.0.0.1", 80, "gpu_server"),
+        # A tunnel made by hand (`ssh -L 8188:...`) is not the connected one.
+        ("comfyui-local", "http://127.0.0.1:8188", None, "this_computer"),
+    ],
+)
+def test_where_each_engine_draws(
+    engine: Any, url: str | None, tunnel_port: int | None, where: ImageWhere
+) -> None:
+    """One table for every engine (design §3.1).
+
+    Killed by: src/uclone_x/tools/builtin/image.py :: if gpu_tunnel_comfy_port is not None and port == gpu_tunnel_comfy_port:
+    Becomes: if False:
+    Killed by: src/uclone_x/tools/builtin/image.py :: return ipaddress.ip_address(host).is_loopback
+    Becomes: return host == "127.0.0.1"
+    Killed by: src/uclone_x/tools/builtin/image.py :: if host.lower() == "localhost":
+    Becomes: if False:
+    """
+    assert image_where(engine, url, tunnel_port) == where
+
+
+def test_a_comfyui_address_with_no_host_is_an_error() -> None:
+    """An address naming no host is a caller's mistake, not a place to guess."""
+    with pytest.raises(ValueError, match="names no host"):
+        image_where("comfyui-local", "not a url")
+
+
+def test_the_tunnel_status_names_its_comfyui_port_only_while_connected() -> None:
+    """The ui head's tunnel port comes from the connected tunnel's ComfyUI forward.
+
+    Killed by: src/uclone_x/core/remote_worker.py :: if mapping.service_name == COMFYUI_SERVICE_NAME:
+    Becomes: if True:
+    """
+    mappings = [PortMapping("ollama", 11434, 11435), PortMapping("comfyui", 8188, 8190)]
+    assert TunnelSessionStatus("gpu", True, mappings=mappings).comfyui_local_port == 8190
+    assert TunnelSessionStatus("gpu", False, mappings=mappings).comfyui_local_port is None
+    assert TunnelSessionStatus("gpu", True, mappings=mappings[:1]).comfyui_local_port is None
+
+
+def test_the_dashboard_reads_the_tunnel_port_from_the_tunnel(tmp_path: Path) -> None:
+    """The dashboard's picture settings carry the connected tunnel's ComfyUI port.
+
+    Killed by: src/uclone_x/ui/app.py :: session_mgr.bind_gpu_tunnel(lambda: tunnel_manager.get_status().comfyui_local_port)
+    Becomes: pass
+    """
+    status = TunnelSessionStatus("gpu", True, mappings=[PortMapping("comfyui", 8188, 8190)])
+    mgr = AgentSessionManager(storage_dir=tmp_path, fallback_to_mock=True)
+    assert mgr.gpu_tunnel_comfy_port() is None
+    with patch.object(SSHTunnelManager, "get_status", return_value=status):
+        create_ui_app(static_dir=tmp_path, session_manager=mgr, storage_dir=tmp_path)
+        assert mgr.gpu_tunnel_comfy_port() == 8190
+
+
+# -- Results carry where and which model ------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_gemini_picture_records_the_cloud_and_its_model(tmp_path: Path) -> None:
+    """Result and sidecar name where the picture was drawn and the model, single and batch.
+
+    Killed by: src/uclone_x/tools/builtin/image.py :: model_id=cloud_model,
+    Becomes: model_id=None,
+    """
+    choice = _pinned_gemini(_FakeGemini())
+    tool = GenerateImageTool(dispatcher=_dispatcher(choice, local_ready=False))
+    ctx = ToolContext(agent_id="a", session_id="s", workspace_root=tmp_path)
+
+    single = await tool.run(GenerateImageParams(prompt="a boat"), ctx)
+    assert (single["where"], single["model_id"]) == ("cloud", "gemini-2.5-flash-image")
+    sidecar = _sidecar(tmp_path, single["relative_url"])
+    assert (sidecar["where"], sidecar["model_id"]) == ("cloud", "gemini-2.5-flash-image")
+
+    # A batch says what its pictures share once, at the top (#2013).
+    batch = await tool.run(GenerateImageParams(prompt="a boat", count=2), ctx)
+    assert (batch["where"], batch["model_id"]) == ("cloud", "gemini-2.5-flash-image")
+    for img in batch["images"]:
+        entry = _sidecar(tmp_path, img["relative_url"])
+        assert (entry["where"], entry["model_id"]) == ("cloud", "gemini-2.5-flash-image")
+
+
+def _comfy_dispatcher(tunnel_port: int | None) -> ImagePipelineDispatcher:
+    """A dispatcher whose ComfyUI daemon on 127.0.0.1:8188 answers and loads a known model."""
+    remote, comfy, local = _locals(ready=False)
+    comfy.is_available.return_value = True
+    comfy.checkpoint = "anillustrious_v4.safetensors"
+    comfy.generate.return_value = ImageGenerationResult(
+        image_bytes=b"comfy",
+        seed=1,
+        engine_name="comfyui-local",
+        device_info="ComfyUI",
+        duration_seconds=0.1,
+        width=1024,
+        height=1024,
+    )
+    choice = ImageEngineChoice(gpu_tunnel_comfy_port=tunnel_port)
+    return ImagePipelineDispatcher(
+        remote_engine=remote,
+        comfy_engine=comfy,
+        local_engine=local,
+        engine_settings=lambda _own: choice,
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_comfyui_picture_records_its_place_and_registered_model() -> None:
+    """ComfyUI on the tunnel's port is the GPU server; elsewhere on loopback, this computer."""
+    tunnelled = await _draw(_comfy_dispatcher(8188))
+    assert (tunnelled.where, tunnelled.model_id) == ("gpu_server", "anillustrious_v4")
+
+    here = await _draw(_comfy_dispatcher(None))
+    assert (here.where, here.model_id) == ("this_computer", "anillustrious_v4")
+
+
+@pytest.mark.asyncio
+async def test_an_unregistered_checkpoint_and_the_remote_worker_report_no_model() -> None:
+    """The generic fallback is no model to name, and the remote worker reports none.
+
+    Killed by: src/uclone_x/tools/builtin/image.py :: return profile.model_id if is_registered_profile(profile) else None
+    Becomes: return profile.model_id
+    """
+    choice = ImageEngineChoice()
+    remote, comfy, local = _locals(ready=True)
+    local.resolve_checkpoint.return_value = "/models/mystery_mix.safetensors"
+    in_process = await _draw(
+        ImagePipelineDispatcher(
+            remote_engine=remote,
+            comfy_engine=comfy,
+            local_engine=local,
+            engine_settings=lambda _own: choice,
+        )
+    )
+    assert (in_process.where, in_process.model_id) == ("this_computer", None)
+
+    remote, comfy, local = _locals(ready=False)
+    remote.is_available.return_value = True
+    remote.generate.return_value = ImageGenerationResult(
+        image_bytes=b"remote",
+        seed=1,
+        engine_name="remote-cuda",
+        device_info="cuda",
+        duration_seconds=0.1,
+        width=1024,
+        height=1024,
+    )
+    worker = await _draw(
+        ImagePipelineDispatcher(
+            remote_engine=remote,
+            comfy_engine=comfy,
+            local_engine=local,
+            engine_settings=lambda _own: choice,
+        )
+    )
+    assert (worker.where, worker.model_id) == ("gpu_server", None)
+
+
+# -- The resolved model in the status ----------------------------------------------------
+
+
+def test_the_status_resolves_the_model_and_the_place() -> None:
+    """`resolved.create` names the engine, the model, a display label and where.
+
+    Killed by: src/uclone_x/tools/builtin/image_status.py :: where = image_where("comfyui-local", report.comfy_url, report.gpu_tunnel_comfy_port)
+    Becomes: where = image_where("comfyui-local", report.comfy_url)
+    """
+    known = KnownModel("anillustrious_v4", "Illustrious-XL v4 (Anime SDXL)")
+    comfy = resolve_image_choice(
+        _report(comfy_alive=True, comfy_model=known, gpu_tunnel_comfy_port=8188)
+    )
+    assert comfy == {
+        "create": {
+            "engine": "comfyui-local",
+            "model_id": "anillustrious_v4",
+            "label": "Illustrious-XL v4 (Anime SDXL)",
+            "where": "gpu_server",
+        },
+        "reason_code": None,
+        "refusal": None,
+    }
+
+    gemini = resolve_image_choice(_report(gemini_model="gemini-2.5-flash-image"))
+    assert gemini["create"] is not None
+    assert gemini["create"]["where"] == "cloud"
+    assert gemini["create"]["model_id"] == "gemini-2.5-flash-image"
+
+    remote = resolve_image_choice(_report(remote_url="http://gpu:9000", remote_alive=True))
+    assert remote["create"] == {
+        "engine": "remote-cuda",
+        "model_id": None,
+        "label": None,
+        "where": "gpu_server",
+    }
+
+
+@pytest.mark.parametrize(
+    ("pin", "reason"),
+    [(None, "no_image_model"), ("comfyui", "chosen_not_ready"), ("gemini", "chosen_not_ready")],
+)
+def test_nothing_resolves_with_a_reason_for_auto_and_for_a_chosen_model(
+    pin: str | None, reason: str
+) -> None:
+    """With nothing to draw, ``create`` is null, and a chosen model says it is not ready.
+
+    Killed by: src/uclone_x/tools/builtin/image_status.py :: reason: ResolveReasonCode = "no_image_model" if report.pin is None else "chosen_not_ready"
+    Becomes: reason: ResolveReasonCode = "no_image_model"
+    """
+    assert resolve_image_choice(_report(pin=pin)) == {
+        "create": None,
+        "reason_code": reason,
+        "refusal": None,
+    }
+
+
+@pytest.mark.asyncio
+async def test_the_endpoint_answers_the_resolved_model(tmp_path: Path) -> None:
+    """`/api/media/status` carries `resolved`, the same object the CLI's `--json` prints."""
+    mgr = AgentSessionManager(storage_dir=tmp_path, fallback_to_mock=True)
+    app = create_ui_app(static_dir=tmp_path, session_manager=mgr, storage_dir=tmp_path)
+    known = KnownModel("anillustrious_v4", "Illustrious-XL v4 (Anime SDXL)")
+    report = _report(comfy_alive=True, comfy_model=known)
+    with patch("uclone_x.tools.builtin.image_status.probe_image_engines", return_value=report):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1"
+        ) as client:
+            response = await client.get("/api/media/status")
+
+    body = response.json()
+    assert body == json.loads(json.dumps(media_status_payload(report)))
+    assert body["resolved"]["create"]["label"] == "Illustrious-XL v4 (Anime SDXL)"
+    assert body["resolved"]["create"]["where"] == "this_computer"
+
+
+def test_the_probe_names_the_registered_model_comfyui_loads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The label is the profile's display name, never the checkpoint file or engine name."""
+    monkeypatch.delenv("UCX_COMFYUI_URL", raising=False)
+    monkeypatch.setenv("UCX_COMFYUI_CHECKPOINT", "anillustrious_v4.safetensors")
+    settings = tmp_path / "settings.json"
+    settings.write_text(
+        json.dumps(
+            {
+                "connections": [
+                    {"id": "comfyui", "kind": "comfyui", "base_url": "http://127.0.0.1:1"}
+                ]
+            }
+        )
+    )
+    with (
+        patch.object(ComfyUIImageEngine, "is_available", AsyncMock(return_value=True)),
+        patch.object(LocalDiffusersImageEngine, "resolve_checkpoint", return_value=None),
+    ):
+        report = probe_image_engines(settings)
+
+    assert report.comfy_model == KnownModel("anillustrious_v4", "Illustrious-XL v4 (Anime SDXL)")
+
+
+# -- Model profiles ---------------------------------------------------------------------
+
+
+def test_profiles_say_what_they_can_do_and_gemini_is_its_own_engine() -> None:
+    """A profile draws by default; a YAML list of capabilities is accepted.
+
+    Killed by: src/uclone_x/tools/builtin/image.py :: engine_type="gemini",
+    Becomes: engine_type="auto",
+    """
+    plain = ModelProfile(model_id="m", display_name="M", family=PromptFamily.GENERIC)
+    assert plain.capabilities == ("create",)
+    both = ModelProfile.model_validate(
+        {
+            "model_id": "m",
+            "display_name": "M",
+            "family": "generic",
+            "capabilities": ["create", "edit"],
+        }
+    )
+    assert both.capabilities == ("create", "edit")
+    assert gemini_profile("gemini-2.5-flash-image").engine_type == "gemini"

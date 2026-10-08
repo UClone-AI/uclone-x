@@ -4,9 +4,14 @@ import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+import pytest
 from typer.testing import CliRunner
 
+from uclone_x.agent.clone_builder import clone_ontology
+from uclone_x.agent.persona_store import DEFAULT_PERSONA_NAME
 from uclone_x.cli.main import app
+from uclone_x.core.agent_home import AgentHome, default_agents_root, resolve_handle
+from uclone_x.ontology.engine import OntologyEngine
 
 runner = CliRunner()
 
@@ -423,3 +428,114 @@ def test_cli_ontology_list_with_hyphenated_candidate_filter() -> None:
         )
         assert res.exit_code == 0
         assert "HyphenConcept" in res.stdout
+
+
+def test_teach_without_dir_writes_the_default_clones_own_rules(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`ucx ontology teach` with no `--dir` writes the builtin clone's `ontology.yaml`, and
+    the engine every head composes that clone with holds what was taught (#1817).
+
+    Killed by: src/uclone_x/agent/clone_builder.py :: engine.load_from_yaml(path)
+    Becomes: pass
+    """
+    monkeypatch.chdir(tmp_path)  # not a repository: no `ontology/` to import
+    res = runner.invoke(app, ["ontology", "teach", "--axiom", "PortBound:Microservice:port:8080"])
+    assert "Taught asserted axiom" in res.stdout, res.stdout
+
+    clone_id = resolve_handle(DEFAULT_PERSONA_NAME)
+    assert AgentHome.for_clone(clone_id).ontology_path.is_file()
+    assert not (tmp_path / "ontology").exists()
+    assert clone_ontology(clone_id).get_axiom("PortBound") is not None
+
+
+def test_a_repository_ontology_file_is_merged_into_the_clone_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """clone-data-scopes §3.8 step 5: `<repo>/ontology/<handle>.yaml` is merged into that
+    clone's rules once per file digest; an axiom the clone holds differently is reported
+    and the clone's own is kept.
+
+    Killed by: src/uclone_x/agent/clone_builder.py :: if own_axiom is None:
+    Becomes: if True:
+
+    Killed by: src/uclone_x/agent/clone_builder.py :: if read_imports(folder).get(source_key) == digest:
+    Becomes: if False:
+    """
+    monkeypatch.chdir(tmp_path)
+    taught = runner.invoke(app, ["ontology", "teach", "--axiom", "Shared:Service:port:1"])
+    assert "Taught asserted axiom" in taught.stdout, taught.stdout
+
+    old = OntologyEngine()
+    old.teach_axiom(name="Shared", subject_entity="Service", predicate="port", object_value="2")
+    old.teach_axiom(name="FromRepo", subject_entity="Service", predicate="tier", object_value="db")
+    old.save_to_yaml(tmp_path / "ontology" / f"{DEFAULT_PERSONA_NAME}.yaml")
+
+    for _ in range(2):
+        runner.invoke(app, ["ontology", "list"])
+
+    clone_id = resolve_handle(DEFAULT_PERSONA_NAME)
+    rules = clone_ontology(clone_id)
+    assert rules.get_axiom("FromRepo") is not None
+    shared = rules.get_axiom("Shared")
+    assert shared is not None and shared.object_value == "1"
+
+    log = "".join(p.read_text() for p in default_agents_root().glob(".migration-*.log"))
+    imported = [line for line in log.splitlines() if "rule(s) from" in line]
+    assert len(imported) == 1, log
+    assert "axiom Shared" in imported[0]
+
+
+_CORRUPT = "concepts: [CONTENT-TOKEN-2134 unclosed\n"
+
+
+def test_a_corrupt_clone_ontology_file_starts_the_clone_with_no_rules(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A hand-corrupted `agents/<id>/ontology.yaml` is logged and the clone's engine starts
+    empty, as the import treats the same file; composing the clone never raises (#2134).
+    The warning names the file and the error type, never the file's contents (#2136).
+
+    Killed by: src/uclone_x/agent/clone_builder.py :: except (OSError, UnicodeDecodeError, yaml.YAMLError, ValidationError) as exc:
+    Becomes: except () as exc:
+
+    Killed by: src/uclone_x/agent/clone_builder.py :: "%s was not loaded, so the clone has no rules: %s", path, type(exc).__name__
+    Becomes: "%s was not loaded, so the clone has no rules: %s", path, exc
+    """
+    monkeypatch.chdir(tmp_path)
+    taught = runner.invoke(app, ["ontology", "teach", "--axiom", "PortBound:Service:port:1"])
+    assert "Taught asserted axiom" in taught.stdout, taught.stdout
+
+    clone_id = resolve_handle(DEFAULT_PERSONA_NAME)
+    path = AgentHome.for_clone(clone_id).ontology_path
+    path.write_text(_CORRUPT, encoding="utf-8")
+
+    with caplog.at_level("WARNING", logger="uclone_x.agent.clone_builder"):
+        rules = clone_ontology(clone_id)
+
+    assert isinstance(rules, OntologyEngine)
+    assert rules.list_axioms() == [] and rules.list_concepts() == []
+    assert str(path) in caplog.text and "ParserError" in caplog.text
+    assert "CONTENT-TOKEN-2134" not in caplog.text  # the file's contents stay out of the log
+    assert path.read_text(encoding="utf-8") == _CORRUPT  # never rewritten
+
+
+def test_an_unknown_agent_is_refused_and_gets_no_clone_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`ucx ontology --agent <name no clone carries>` is refused with a plain message and
+    no clone directory is created for the name (#2134, #1817 review).
+
+    Killed by: src/uclone_x/cli/commands/ontology.py :: agent_id = clone_id_of(agent_name)
+    Becomes: agent_id = agent_name
+    """
+    monkeypatch.chdir(tmp_path)
+    runner.invoke(app, ["ontology", "list"])  # brings the clone store up first
+    homes = sorted(p.name for p in default_agents_root().iterdir())
+
+    for name in ("nobody", "../../etc"):
+        res = runner.invoke(app, ["ontology", "list", "--agent", name])
+        assert isinstance(res.exception, SystemExit) and res.exit_code == 1  # not a crash
+        assert "✖" in res.stdout and f"'{name}'" in res.stdout, res.stdout
+
+    assert sorted(p.name for p in default_agents_root().iterdir()) == homes

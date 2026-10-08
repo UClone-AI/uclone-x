@@ -1036,6 +1036,34 @@ class ImageSetup(NamedTuple):
         return f"setup image: unavailable reason={self.reason or 'unknown'}"
 
 
+def offer_detected_comfyui(address: str, *, interactive: bool, assume_yes: bool) -> bool:
+    """Offer a ComfyUI found on this machine as a picture connection; add it on a yes.
+
+    Detect, never seize (agent-assisted-installation, rung 1): the daemon is somebody's, so
+    it is used only once the person agrees, and then through a `comfyui` connection saved by
+    the settings file's one writer (model-gateway §3.5). Nothing is started or re-ported.
+    """
+    from uclone_x.llm.connectors.saved_choice import add_connection
+
+    agreed = ask_consent(
+        f"A ComfyUI is running on this computer at {address}. Use it to draw pictures?",
+        interactive=interactive,
+        assume_yes=assume_yes,
+        default=True,
+    )
+    if not agreed:
+        console.print(
+            "[dim]ComfyUI left alone. Add it later in Settings › Models (Add connection).[/dim]"
+        )
+        return False
+    add_connection("comfyui", base_url=address)
+    console.print(
+        f"[bold green]✔ ComfyUI at[/bold green] [cyan]{address}[/cyan] added as a picture "
+        "connection."
+    )
+    return True
+
+
 def setup_local_image(
     interactive: bool = True,
     assume_yes: bool = False,
@@ -1056,7 +1084,7 @@ def setup_local_image(
     from here — on a machine that runs one for another project, seizing its port or its
     lifetime is not ours to do.
     """
-    report = probe_image_engines()
+    report = probe_image_engines(detect_comfyui=True)
 
     if report.remote_ready:
         console.print(
@@ -1078,6 +1106,11 @@ def setup_local_image(
             " — using it for image generation."
         )
         return ImageSetup(True, "comfyui-local")
+
+    if report.detected_comfyui is not None and offer_detected_comfyui(
+        report.detected_comfyui, interactive=interactive, assume_yes=assume_yes
+    ):
+        return ImageSetup(ready=True, engine="comfyui-local")  # found here, and allowed
 
     if report.in_process_ready:
         console.print(

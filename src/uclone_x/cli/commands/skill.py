@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import logging
 import tempfile
 from pathlib import Path
 from typing import Annotated, TextIO
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
 
 from uclone_x.errors import SkillAuditError
@@ -21,6 +23,7 @@ from uclone_x.skills.auditor import (
     compute_skill_sha256,
     copy_skill_package,
     load_skill_from_dir,
+    parse_skill_markdown,
     runtime_skill_store_dir,
     save_skill,
 )
@@ -54,11 +57,45 @@ def _skills_dir(custom_path: Path | None = None) -> Path:
     return path
 
 
+logger = logging.getLogger(__name__)
+
 #: What `skill list` says about a skill folder it may list but not look inside (#1824).
 LIST_FOLDER_UNOPENED = (
     "The skill folder '{name}' could not be opened, so it is not listed. Check that you "
     "may open it."
 )
+
+#: What `skill list` says about a skill folder whose SKILL.md it could not read (#1865), and
+#: the plain reasons it names. The error itself is logged, never printed.
+LIST_FOLDER_UNREADABLE = (
+    "The skill folder '{name}' could not be read, so it is not listed: {reason}."
+)
+UNREADABLE_NOT_OPENED = "its SKILL.md could not be opened. Check that you may open it."
+UNREADABLE_NOT_TEXT = "its SKILL.md is not plain text."
+UNREADABLE_NO_HEADER = (
+    "its SKILL.md does not begin with a header between two '---' lines that can be read."
+)
+UNREADABLE_BAD_FIELD = "a field in its SKILL.md header is missing, unknown or not valid."
+
+
+def _unreadable_reason(folder: Path, exc: Exception) -> str:
+    """Why `load_skill_from_dir(folder)` raised `exc`, in plain words."""
+    if isinstance(exc, UnicodeDecodeError):
+        return UNREADABLE_NOT_TEXT
+    if isinstance(exc, OSError):
+        return UNREADABLE_NOT_OPENED
+    try:
+        text = (folder / "SKILL.md").read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return UNREADABLE_NOT_TEXT
+    except OSError:
+        return UNREADABLE_NOT_OPENED
+    try:
+        parse_skill_markdown(text)
+    except Exception:
+        return UNREADABLE_NO_HEADER
+    return UNREADABLE_BAD_FIELD
+
 
 #: What `skill approve` says when there is no terminal to ask the person at (#1589).
 APPROVE_NEEDS_TERMINAL = (
@@ -184,10 +221,15 @@ def skill_list(
     table.add_column("Description")
 
     shown = 0
+    unreadable: list[tuple[str, str]] = []
     for folder in skill_folders:
         try:
             skill = load_skill_from_dir(folder)
-        except Exception:
+        except Exception as exc:
+            # Debug, not warning: with no logging set up, Python prints a warning to the
+            # terminal, path and all, beside the plain line below.
+            logger.debug("The skill folder '%s' could not be read: %s", folder.name, exc)
+            unreadable.append((folder.name, _unreadable_reason(folder, exc)))
             continue
 
         manifest = skill.manifest
@@ -227,6 +269,9 @@ def skill_list(
             manifest.description,
         )
 
+    for folder_name, reason in unreadable:
+        line = LIST_FOLDER_UNREADABLE.format(name=folder_name, reason=reason)
+        console.print(f"[yellow]{escape(line)}[/yellow]")
     if shown == 0:
         if pending_only:
             console.print("[green]No pending skills awaiting review.[/green]")
@@ -556,7 +601,11 @@ def skill_synthesize(
         typer.Option(
             "--policy",
             "-p",
-            help="Auto-approval policy to evaluate against: safe_only | never | always",
+            help=(
+                "Audit verdict for a clean skill in the printed report: safe_only | always"
+                " (approve) or never (require_human_review). It approves nothing: the"
+                " package stays pending."
+            ),
         ),
     ] = "safe_only",
 ) -> None:

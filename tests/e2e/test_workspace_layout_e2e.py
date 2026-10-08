@@ -525,6 +525,92 @@ async def test_a_dock_narrower_than_its_grids_lays_them_out_in_one_column(
             await browser.close()
 
 
+#: Ontology's two viewport-keyed grids and its detail card's span, read by the class each sets
+#: its columns with: the four-up tier cards (`md:grid-cols-4`) and the list-and-detail row
+#: (`lg:grid-cols-3`, the detail in `lg:col-span-2`).
+_ONTOLOGY_GRIDS = """() => {
+    const surface = document.querySelector("[data-testid='dock-surface']");
+    if (!surface) return null;
+    const count = (g) => g ? getComputedStyle(g).gridTemplateColumns.split(' ').length : null;
+    const row = surface.querySelector("[class*='lg:grid-cols-3']");
+    const detail = row && row.querySelector(":scope > [class*='lg:col-span-2']");
+    return {
+        surface: Math.round(surface.getBoundingClientRect().width),
+        cards: count(surface.querySelector("[class*='md:grid-cols-4']")),
+        row: count(row),
+        span: detail ? getComputedStyle(detail).gridColumnEnd : null,
+    };
+}"""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stored", "windows", "expected"),
+    [
+        (520, (740, 1280), {"cards": 2, "row": 3, "span": "span 2"}),
+        (880, (1000, 1400), {"cards": 4, "row": 3, "span": "span 2"}),
+        (900, (760, 1280), {"cards": 4, "row": 3, "span": "span 2"}),
+    ],
+)
+async def test_a_dock_panel_takes_its_column_count_from_the_dock_not_the_window(
+    ui_test_server: str, stored: int, windows: tuple[int, int], expected: dict[str, object]
+) -> None:
+    """#1327: one dock width, two windows, one layout -- the one the dock has room for.
+
+    `index.css` corrected only the bands that had shown a defect, so everywhere else the window
+    still decided. Measured on Ontology before this: the `lg:grid-cols-3` list and detail was
+    one column in a 519px dock at a 740px window and three at 1280, and one column in an 879px
+    dock at a 1000px window and three at 1400; the `md:grid-cols-4` cards were one column in a
+    759px overlaid dock at a 760px window and four at 1280. Each pair straddles the class's own
+    viewport breakpoint at one unchanged dock width, which is what makes it the window deciding.
+    The expected counts are asserted, not only the agreement: both cells collapsing to one would
+    agree and lose the columns the dock has room for. The detail's span is asserted with them,
+    because a parent moved onto the container with its child's `lg:col-span-2` left on the window
+    is a three-column row whose wide card silently stops spanning at a narrow window.
+
+    The 900px dock at a 760px window is drawn over the workspace at the window's width (#1019),
+    so its surface is the window's (759px), not the stored width; the surface is asserted above
+    the band's floor rather than equal to anything.
+
+    Mutation-checked by hand with a real `vite build` on each side, because the ratchet runs a
+    browser test against the committed bundle and so reads a declaration naming `frontend/src`
+    as escaped. Each fails the narrower-window cell of the rows it names and nothing else here:
+    `Killed by:` frontend/src/index.css :: `.dock-scope [class*=':grid-cols-3'] {` becoming
+    `.dock-scope [class*=':grid-cols-9'] {` -- all three rows, `row` at the narrow window.
+    `Killed by:` frontend/src/index.css :: `.dock-scope [class*=':grid-cols-4'] {` becoming
+    `.dock-scope [class*=':grid-cols-9'] {` -- the 900 row only, `cards`: at a 1000px window
+    `md:` gives the 880 row its four anyway.
+    `Killed by:` frontend/src/index.css :: `.dock-scope [class*=':col-span-2'] {` becoming
+    `.dock-scope [class*=':col-span-9'] {` -- all three rows, `span`.
+    """
+    measured: dict[int, dict[str, object]] = {}
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        try:
+            for width in windows:
+                page: Page = await browser.new_page(viewport={"width": width, "height": 900})
+                await page.add_init_script(
+                    f"try {{ localStorage.setItem('uclone-x.dock.width', '{stored}') }} "
+                    "catch (e) {}"
+                )
+                await page.goto(ui_test_server, wait_until="commit")
+                await page.wait_for_selector("[data-testid='room-composer']", timeout=20000)
+                await set_the_rail(page, "closed")
+                await turn_on_developer_mode(page)
+                await _open_the_dock(page)
+                await _show_surface(page, "ontology")
+                grids = await page.evaluate(_ONTOLOGY_GRIDS)
+                assert grids is not None and grids["row"] is not None, grids
+                assert grids["surface"] > (720 if expected["cards"] == 4 else 480), grids
+                measured[width] = {k: grids[k] for k in expected}
+                await page.close()
+        finally:
+            await browser.close()
+    assert all(m == expected for m in measured.values()), (
+        f"a {stored}px dock lays Ontology out by the window: {measured}, expected {expected}"
+    )
+
+
 @pytest.mark.asyncio
 async def test_the_topology_grid_is_measured_after_its_read_not_while_it_is_out(
     ui_test_server: str,
@@ -1087,7 +1173,7 @@ _MOVED_TO_SETTINGS = ("acp", "skills", "evaluations")
 
 #: How many text nodes on the page carry the drawer's label, not counting the dock surface's own
 #: content. The surface is excluded because Docs & Artifacts renders the workspace's Markdown, and
-#: `docs/ui-dashboard-architecture.md` names the drawer: when it is the document on show, a
+#: the dashboard architecture document names the drawer: when it is the document on show, a
 #: page-wide text search finds the label in prose about the drawer. That is a reader's document,
 #: not the dock offering the drawer, so it is the dock's chrome that is searched.
 _DRAWER_LABEL_OUTSIDE_THE_SURFACE = """() => {

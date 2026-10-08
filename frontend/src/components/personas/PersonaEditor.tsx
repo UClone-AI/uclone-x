@@ -1,10 +1,16 @@
 import React, { useState } from 'react';
 import type { PersonaModelTier } from '../../types';
+import type { Messages } from '../../i18n';
+import { AUTO_IMAGE, findModel, modelName, type ModelSet } from '../../lib/modelGateway';
+import { ModelRefSelect } from '../settings/ModelRefSelect';
+import { pickerWords } from '../settings/gatewayWords';
 import {
   MODEL_TIERS,
+  cloneLabel,
   draftProblem,
   fmt,
   plural,
+  withDisplayName,
   type PersonaDraft,
   type PersonaEditMode,
   type PersonaEditorCopy,
@@ -17,8 +23,9 @@ import {
  * new draft through `onChange`. Nothing here fetches or saves.
  *
  * Choices are offered, not recalled: tools are pills drawn from the runtime's own tool
- * list, the model is a dropdown of the models the runtime detected (with an escape hatch
- * for one it has not), and the tier is a dropdown. Only the name, role and prose are typed.
+ * list, the conversation and picture models are chosen from the model set grouped by
+ * connection, each starting on the system default (model-gateway.md §3.7), and the tier is a
+ * dropdown. Only the name, role and prose are typed.
  */
 
 export type IconComponent = React.ComponentType<{ className?: string }>;
@@ -36,13 +43,26 @@ export interface PersonaEditorProps {
   /** Names already in the catalogue, so create can say a name is taken before saving. */
   existingNames: readonly string[];
   availableTools: readonly string[];
-  availableModels: readonly string[];
+  baseTools?: readonly string[];
+  writeTools?: readonly string[];
+  /** The chat model set, `null` until it has been read. */
+  chatModels: ModelSet | null;
+  /** The picture model set, `null` until it has been read. */
+  imageModels: ModelSet | null;
+  /** Whether reading either set failed. */
+  modelsFailed?: boolean;
+  /** Developer mode: the clone's own fast model is offered only then (decision 3). */
+  developerMode?: boolean;
+  /** The model pickers' words (the `gateway` catalog). */
+  modelCopy: Messages['gateway'];
   /** The persona being edited ships with the app; saving writes an override instead. */
   isBuiltin: boolean;
   saving: boolean;
   /** The last refusal, as the server worded it. */
   error: string | null;
   copy: PersonaEditorCopy;
+  /** The screen's language: the display name field edits this language's entry only. */
+  language?: string;
   icons: PersonaEditorIcons;
   onChange: (draft: PersonaDraft) => void;
   onSubmit: () => void;
@@ -53,22 +73,120 @@ export interface PersonaEditorProps {
   onToggleStudio?: () => void;
 }
 
+const DEFAULT_WRITE_TOOLS: readonly string[] = [
+  'file_write',
+  'file_edit',
+  'bash_run',
+  'run_command',
+  'install_package',
+  'a2a_call',
+  'story_library',
+  'story_outline',
+  'story_manuscript',
+  'story_codex',
+  'story_start',
+  'character_sheet',
+];
+
 const inputClass =
   'w-full bg-slate-950/90 border border-slate-800 rounded-xl px-3 py-2 text-xs text-white placeholder-slate-600 focus:outline-none focus:border-cyan-500/80 transition-colors';
 const labelClass = 'block text-xs font-medium text-slate-300 mb-1.5';
-const OTHER_MODEL = '__other__';
-const DEFAULT_MODEL = '';
+/** The pickers' spelling of "follow the system default", saved as `null`. */
+const SYSTEM_DEFAULT = '';
+
+type CloneSlot = 'model_name' | 'fast_model' | 'image_model';
+
+/**
+ * One of the clone's model pickers: the system default first, naming what it is now, then
+ * the model set. A saved ref no connection lists is said to be unavailable, with one action,
+ * Use system default, which clears the slot (§3.6). Nothing is ever switched for the person.
+ */
+const CloneModelPicker: React.FC<{
+  slot: CloneSlot;
+  label: string;
+  value: string | null;
+  set: ModelSet | null;
+  failed: boolean;
+  /** The default's own value now, from the set: a ref, `auto`, or `null` for none chosen. */
+  defaultNow: string | null;
+  allowAuto: boolean;
+  hint?: string;
+  copy: Messages['gateway'];
+  onChange: (value: string | null) => void;
+}> = ({ slot, label, value, set, failed, defaultNow, allowAuto, hint, copy, onChange }) => {
+  const id = `persona-${slot.replace('_', '-')}`;
+  if (set === null) {
+    return (
+      <div data-testid={`${id}-pending`}>
+        <span className={labelClass}>{label}</span>
+        <p className="text-[11px] text-slate-500" role={failed ? 'alert' : 'status'}>
+          {failed ? copy.clone.loadFailed : copy.clone.loading}
+        </p>
+      </div>
+    );
+  }
+  const defaultLabel =
+    defaultNow === null
+      ? copy.clone.systemDefaultNone
+      : defaultNow === AUTO_IMAGE
+        ? copy.clone.systemDefaultAuto
+        : fmt(copy.clone.systemDefault, { model: modelName(set, defaultNow) });
+  const leading = [
+    { value: SYSTEM_DEFAULT, label: defaultLabel },
+    ...(allowAuto ? [{ value: AUTO_IMAGE, label: copy.clone.auto }] : []),
+  ];
+  const own = value ?? SYSTEM_DEFAULT;
+  const unavailable = value !== null && value !== AUTO_IMAGE && findModel(set, value) === null;
+  return (
+    <div>
+      <ModelRefSelect
+        id={id}
+        testId={id}
+        label={label}
+        value={own}
+        set={set}
+        leading={leading}
+        words={pickerWords(copy, '')}
+        onChange={(next) => onChange(next === SYSTEM_DEFAULT ? null : next)}
+      />
+      {unavailable && (
+        <div
+          data-testid={`${id}-unavailable`}
+          role="alert"
+          className="mt-1.5 flex flex-wrap items-center gap-2 text-[11px] text-amber-300"
+        >
+          <span>{fmt(copy.clone.unavailable, { model: value })}</span>
+          <button
+            type="button"
+            onClick={() => onChange(null)}
+            className="rounded-md border border-amber-500/40 px-2 py-0.5 text-amber-200 hover:bg-amber-500/10 transition-colors"
+          >
+            {copy.clone.useSystemDefault}
+          </button>
+        </div>
+      )}
+      {hint && <p className="text-[10px] text-slate-500 mt-1">{hint}</p>}
+    </div>
+  );
+};
 
 export const PersonaEditor: React.FC<PersonaEditorProps> = ({
   draft,
   mode,
   existingNames,
   availableTools,
-  availableModels,
+  baseTools,
+  writeTools,
+  chatModels,
+  imageModels,
+  modelsFailed = false,
+  developerMode = false,
+  modelCopy,
   isBuiltin,
   saving,
   error,
   copy,
+  language = 'en',
   icons,
   onChange,
   onSubmit,
@@ -92,30 +210,30 @@ export const PersonaEditor: React.FC<PersonaEditorProps> = ({
     onChange({ ...draft, [key]: value });
   };
 
-  // A model the runtime did not detect is still a valid choice; it is shown as "other"
-  // with its tag in the text field, rather than silently replaced by a detected one.
-  const [choseOther, setChoseOther] = useState<boolean>(
-    draft.model_name !== null && !availableModels.includes(draft.model_name),
-  );
-  const modelValue = choseOther
-    ? OTHER_MODEL
-    : draft.model_name === null
-      ? DEFAULT_MODEL
-      : draft.model_name;
-
   // Tools the persona lists but the runtime no longer offers stay visible, so saving does
   // not drop them unseen; the server will name them if they are refused.
   const toolChoices = [
     ...availableTools,
     ...draft.allowed_tools.filter((tool) => !availableTools.includes(tool)),
   ];
-  const toggleTool = (tool: string) =>
-    set(
-      'allowed_tools',
-      draft.allowed_tools.includes(tool)
-        ? draft.allowed_tools.filter((t) => t !== tool)
-        : [...draft.allowed_tools, tool],
-    );
+  const baseList = baseTools ?? [];
+  const writeList = writeTools && writeTools.length > 0 ? writeTools : DEFAULT_WRITE_TOOLS;
+  const toggleTool = (tool: string) => {
+    const isAdding = !draft.allowed_tools.includes(tool);
+    const nextAllowed = draft.allowed_tools.includes(tool)
+      ? draft.allowed_tools.filter((t) => t !== tool)
+      : [...draft.allowed_tools, tool];
+    if (isAdding && writeList.includes(tool) && !draft.enable_write_tools) {
+      setTouched(true);
+      onChange({
+        ...draft,
+        allowed_tools: nextAllowed,
+        enable_write_tools: true,
+      });
+      return;
+    }
+    set('allowed_tools', nextAllowed);
+  };
 
   const problem = draftProblem(draft, mode, existingNames, copy);
   const SaveIcon = saving ? icons.spinner : icons.save;
@@ -134,7 +252,7 @@ export const PersonaEditor: React.FC<PersonaEditorProps> = ({
       <div className="flex items-center justify-between gap-2 border-b border-slate-800 pb-3">
         <div>
           <h3 className="text-sm font-semibold text-white">
-            {mode === 'create' ? copy.createTitle : fmt(copy.editTitle, { name: draft.name })}
+            {mode === 'create' ? copy.createTitle : fmt(copy.editTitle, { name: cloneLabel(draft, language) })}
           </h3>
           {mode === 'edit' && isBuiltin ? (
             <p data-testid="persona-builtin-note" className="text-[11px] text-slate-400 mt-0.5">
@@ -157,6 +275,23 @@ export const PersonaEditor: React.FC<PersonaEditorProps> = ({
       </div>
 
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
+        <div>
+          <label className={labelClass} htmlFor="persona-display-name">
+            {copy.fields.displayName}
+          </label>
+          <input
+            id="persona-display-name"
+            data-testid="persona-display-name"
+            className={inputClass}
+            value={draft.display_name[language] ?? ''}
+            maxLength={64}
+            onChange={(e) => {
+              setTouched(true);
+              onChange(withDisplayName(draft, language, e.target.value));
+            }}
+          />
+          <p className="text-[11px] text-slate-500 mt-1">{copy.fields.displayNameHint}</p>
+        </div>
         <div>
           <label className={labelClass} htmlFor="persona-name">
             {copy.fields.name}
@@ -297,7 +432,7 @@ export const PersonaEditor: React.FC<PersonaEditorProps> = ({
                   data-testid="persona-tools-mode-badge"
                   className="px-2 py-0.5 rounded-full text-[10px] font-medium bg-emerald-950/60 border border-emerald-800/60 text-emerald-300 flex items-center gap-1.5"
                 >
-                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 inline-block animate-pulse" />
+                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 inline-block" />
                   {copy.fields.toolsAllAllowedBadge ?? 'All tools allowed'}
                 </span>
               ) : (
@@ -360,60 +495,95 @@ export const PersonaEditor: React.FC<PersonaEditorProps> = ({
             className="flex items-center gap-1.5 text-[11px] text-slate-400 bg-slate-900/50 border border-slate-800/80 px-2.5 py-1.5 rounded-lg mt-1.5"
           >
             <span className="text-emerald-400 text-xs">✓</span>
-            <span>{copy.noToolsSelected}</span>
+            <span>{copy.fields.toolsAllAllowedNotice ?? copy.noToolsSelected}</span>
           </p>
         ) : draft.allowed_tools.length > 0 ? (
-          <p
-            data-testid="persona-restricted-tools-cause"
-            className="flex items-center gap-1.5 text-[11px] text-amber-300/90 bg-amber-950/30 border border-amber-900/50 px-2.5 py-1.5 rounded-lg mt-1.5"
-          >
-            <span className="text-amber-400 text-xs">🔒</span>
-            <span>
-              {copy.fields.toolsRestrictedNotice
-                ? plural(copy.fields.toolsRestrictedNotice, draft.allowed_tools.length)
-                : `Restricted mode: Only the ${draft.allowed_tools.length} selected tool(s) will be available. All other tools are disabled.`}
-            </span>
-          </p>
+          <div className="space-y-1.5 mt-1.5">
+            <p
+              data-testid="persona-restricted-tools-cause"
+              className="flex items-center gap-1.5 text-[11px] text-amber-300/90 bg-amber-950/30 border border-amber-900/50 px-2.5 py-1.5 rounded-lg"
+            >
+              <span className="text-amber-400 text-xs">🔒</span>
+              <span>
+                {copy.fields.toolsRestrictedNotice
+                  ? plural(copy.fields.toolsRestrictedNotice, draft.allowed_tools.length)
+                  : `Restricted mode: The ${draft.allowed_tools.length} selected tool(s) plus the base tools will be available.`}
+              </span>
+            </p>
+            {draft.allowed_tools.some((t) => writeList.includes(t)) && !draft.enable_write_tools && (
+              <div
+                data-testid="persona-write-tools-warning"
+                className="flex items-center justify-between gap-2 p-2 rounded-lg bg-amber-950/40 border border-amber-800/60 text-amber-200 text-xs"
+              >
+                <span>⚠️ {copy.fields.writeToolsDisabledWarning ?? 'Some selected tools require file-writing permission to work.'}</span>
+                <button
+                  type="button"
+                  onClick={() => set('enable_write_tools', true)}
+                  className="px-2 py-0.5 bg-amber-800/80 hover:bg-amber-700 text-amber-100 rounded text-[11px] font-medium whitespace-nowrap cursor-pointer"
+                >
+                  {copy.fields.enableWriteToolsAction ?? 'Allow file-writing tools'}
+                </button>
+              </div>
+            )}
+          </div>
         ) : null}
+
+        {baseList.length > 0 && (
+          <div data-testid="persona-base-tools" className="space-y-1 pt-1">
+            <div className="text-[10px] text-slate-400 font-medium font-sans">
+              {copy.fields.baseTools ?? 'Base tools (always included)'}
+            </div>
+            <p className="text-[10px] text-slate-500">
+              {copy.fields.baseToolsHint ?? 'These tools are included for every clone and do not need to be saved in the persona.'}
+            </p>
+            <div className="flex flex-wrap gap-1" data-testid="persona-base-tool-pills">
+              {baseList.map((tool) => (
+                <span key={tool} className="px-1.5 py-0.5 rounded bg-slate-900 border border-slate-800 text-slate-400 font-mono text-[10px]">
+                  {tool}
+                </span>
+              ))}
+            </div>
+          </div>
+        )}
       </fieldset>
 
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
-        <div>
-          <label className={labelClass} htmlFor="persona-model">
-            {copy.fields.model}
-          </label>
-          <select
-            id="persona-model"
-            className={`${inputClass} font-mono cursor-pointer`}
-            value={modelValue}
-            onChange={(e) => {
-              const value = e.target.value;
-              if (value === OTHER_MODEL) {
-                setChoseOther(true);
-                return;
-              }
-              setChoseOther(false);
-              set('model_name', value === DEFAULT_MODEL ? null : value);
-            }}
-          >
-            <option value={DEFAULT_MODEL}>{copy.fields.modelDefault}</option>
-            {availableModels.map((m) => (
-              <option key={m} value={m}>
-                {m}
-              </option>
-            ))}
-            <option value={OTHER_MODEL}>{copy.fields.modelOther}</option>
-          </select>
-          {choseOther ? (
-            <input
-              aria-label={copy.fields.modelOther}
-              className={`${inputClass} font-mono mt-1.5`}
-              value={draft.model_name ?? ''}
-              placeholder={copy.fields.modelOtherPlaceholder}
-              onChange={(e) => set('model_name', e.target.value.trim() ? e.target.value : null)}
-            />
-          ) : null}
-        </div>
+        <CloneModelPicker
+          slot="model_name"
+          label={modelCopy.clone.conversation}
+          value={draft.model_name}
+          set={chatModels}
+          failed={modelsFailed}
+          defaultNow={chatModels?.defaults.deep ?? null}
+          allowAuto={false}
+          copy={modelCopy}
+          onChange={(next) => set('model_name', next)}
+        />
+        <CloneModelPicker
+          slot="image_model"
+          label={modelCopy.clone.picture}
+          value={draft.image_model}
+          set={imageModels}
+          failed={modelsFailed}
+          defaultNow={imageModels?.defaults.image ?? AUTO_IMAGE}
+          allowAuto
+          copy={modelCopy}
+          onChange={(next) => set('image_model', next)}
+        />
+        {developerMode && (
+          <CloneModelPicker
+            slot="fast_model"
+            label={modelCopy.clone.fast}
+            value={draft.fast_model}
+            set={chatModels}
+            failed={modelsFailed}
+            defaultNow={chatModels ? (chatModels.defaults.fast ?? chatModels.defaults.deep) : null}
+            allowAuto={false}
+            hint={modelCopy.clone.fastHint}
+            copy={modelCopy}
+            onChange={(next) => set('fast_model', next)}
+          />
+        )}
         <div>
           <label className={labelClass} htmlFor="persona-tier">
             {copy.fields.tier}

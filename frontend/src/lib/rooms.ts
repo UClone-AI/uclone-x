@@ -36,6 +36,8 @@ export class RoomsApiError extends Error {
     message: string,
     readonly status: number,
     readonly coreDetail: string | null,
+    /** Which refusal it is, when the route names one (the workspace route does). */
+    readonly code: string | null = null,
   ) {
     super(message);
     this.name = 'RoomsApiError';
@@ -67,8 +69,10 @@ async function ask(url: string, init?: RequestInit): Promise<Response> {
 async function readOrThrow(res: Response): Promise<any> {
   if (!res.ok) {
     let detail: string | null = null;
+    let code: string | null = null;
     try {
       const body = await res.json();
+      if (typeof body?.code === 'string') code = body.code;
       // A string only. FastAPI's own request validation answers `detail` as a list of
       // objects, which `String()` renders as "[object Object]" -- not a reason, and not
       // the Core's words either.
@@ -76,7 +80,7 @@ async function readOrThrow(res: Response): Promise<any> {
     } catch {
       // A refusal with no JSON body keeps the status line, which is still a reason.
     }
-    throw new RoomsApiError(detail ?? `${res.status} ${res.statusText}`, res.status, detail);
+    throw new RoomsApiError(detail ?? `${res.status} ${res.statusText}`, res.status, detail, code);
   }
   return res.status === 204 ? null : res.json();
 }
@@ -284,6 +288,19 @@ export const roomsApi = {
     await readOrThrow(await ask(`/api/rooms/${roomId}/typing`, { method: 'POST' }));
   },
 
+  /** Point the conversation at a folder, or back at the server's with `null`. */
+  setWorkspace: async (
+    roomId: string,
+    workspace: string | null,
+  ): Promise<{ workspace: string | null; default_workspace: string }> =>
+    readOrThrow(
+      await ask(`/api/rooms/${roomId}/workspace`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ workspace }),
+      }),
+    ),
+
   setAutonomous: async (roomId: string, enabled: boolean): Promise<RoomState> =>
     readOrThrow(
       await ask(`/api/rooms/${roomId}/autonomous`, {
@@ -397,6 +414,8 @@ export function senderOf(
  * object itself as a React child threw `Objects are not valid as a React child` and took
  * the whole conversation down on the first agent reply -- and `tsc` could not see it,
  * because the row was typed with the flattened chat shape.
+ *
+ * Exported: imported and exercised by rooms.test.ts.
  */
 export function serviceRefLabel(ref: RoomServiceRef | null | undefined): string | null {
   if (!ref || !ref.provider) return null;
@@ -594,6 +613,8 @@ const MENTION_TRAILING = /[.-]+$/;
  * A transcription of `selectors.py`'s `MENTION_PATTERN` -- `(?<![\w@/])@(\w[\w.\-]*)` --
  * without the lookbehind, which Safari only learned in 16.4. The head reads addresses the
  * same way the Core does or it promises answers the Core will not give.
+ *
+ * Exported: imported and exercised by rooms.test.ts.
  */
 export function mentionTokens(draft: string): string[] {
   const tokens: string[] = [];
@@ -610,10 +631,12 @@ export function mentionTokens(draft: string): string[] {
 /**
  * The participant a token addresses, resolved the way `MentionSelector._resolve` does.
  *
- * Ids before aliases, case-insensitively on both sides, and the token retried once with
- * trailing `.`/`-` removed. **No regex is built from the id.** It used to be -- a
+ * Ids, then a clone's handle, then aliases, case-insensitively on both sides, and the token
+ * retried once with trailing `.`/`-` removed. **No regex is built from the id.** It used to be -- a
  * participant id the Core permits, such as `a(`, made `new RegExp()` throw a
  * `SyntaxError` during render and took the screen with it.
+ *
+ * Exported: imported and exercised by rooms.test.ts.
  */
 export function resolveMention(
   participants: readonly RoomParticipant[],
@@ -625,6 +648,10 @@ export function resolveMention(
     const lowered = candidate.toLowerCase();
     const byId = participants.find((p) => p.id.toLowerCase() === lowered);
     if (byId) return byId;
+    const byHandle = participants.find(
+      (p) => p.kind === 'agent' && p.handle !== undefined && p.handle.toLowerCase() === lowered,
+    );
+    if (byHandle) return byHandle;
     const byAlias = participants.find((p) =>
       (p.aliases ?? []).some((alias) => alias.toLowerCase() === lowered),
     );
@@ -671,6 +698,11 @@ export function seededTitle(room: RoomState, firstMessage: string): string | nul
   const cut = line.slice(0, SEEDED_TITLE_MAX - 1);
   const atWord = cut.lastIndexOf(' ');
   return `${(atWord > 0 ? cut.slice(0, atWord) : cut).trimEnd()}…`;
+}
+
+/** What `@` inserts to address a participant: a clone's handle, else its seat id. */
+export function mentionToken(participant: RoomParticipant): string {
+  return participant.handle || participant.id;
 }
 
 /** How a participant is named on screen: the roster's name, else the raw id. */
@@ -876,6 +908,7 @@ export function mentionCandidates(
     if (p.kind !== 'agent') return false;
     if (lowered === '') return true;
     if (p.id.toLowerCase().startsWith(lowered)) return true;
+    if (p.handle?.toLowerCase().startsWith(lowered)) return true;
     return (p.aliases ?? []).some((alias) => alias.toLowerCase().startsWith(lowered));
   });
 }

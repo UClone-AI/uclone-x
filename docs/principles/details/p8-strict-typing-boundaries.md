@@ -15,5 +15,5 @@
   - All reasoning spans and A2A events must natively emit standard **OpenTelemetry (OTel)** telemetry.
 
 * **Why**: Guarantees compile-time safety, architectural integrity, zero runtime schema bugs, and ensures the Core remains 100% headless, testable, and autonomous.
-* **Implementation Reference**: `docs/cli-specification.md`, `docs/ui-dashboard-architecture.md`
+* **Implementation Reference**: [`docs/public/cli.md`](../../public/cli.md), [`docs/public/overview.md`](../../public/overview.md)
 

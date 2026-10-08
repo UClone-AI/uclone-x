@@ -241,7 +241,7 @@ def test_api_add_list_remove_round_trip(api: TestClient) -> None:
     listed = api.get("/api/mcp/servers").json()
     assert [s["name"] for s in listed["servers"]] == ["web"]
     # Clones see it: the persona editor offers the new tools by name.
-    assert "web__search" in api.get("/api/personas").json()["available_tools"]
+    assert "web__search" in api.get("/api/clones").json()["available_tools"]
     assert api.delete("/api/mcp/servers/web").json() == {"status": "ok"}
     assert api.delete("/api/mcp/servers/web").status_code == 404
 
@@ -316,6 +316,25 @@ def test_api_refuses_a_dns_rebinding_page(tmp_path: Path) -> None:
     assert add.status_code == 403
     assert "this computer" in add.json()["detail"]
     assert api.get("/api/mcp/servers").json()["servers"] == []
+
+
+def test_api_refuses_remote_mcp_list_read(tmp_path: Path) -> None:
+    """`GET /api/mcp/servers` refuses a non-loopback Host with a read-specific sentence (#1462).
+
+    Killed by: src/uclone_x/ui/app.py :: detail = "Tool servers can only be viewed on the machine running the app."
+    Becomes: detail = "Tool servers can only be viewed on the machine running the app. UNUSED"
+    """
+    app = create_ui_app(static_dir=tmp_path, storage_dir=tmp_path / "store", bind_host="0.0.0.0")
+    api = TestClient(app, base_url="http://localhost")
+    remote = {"Host": "remote.example:8000"}
+    res = api.get("/api/mcp/servers", headers=remote)
+    assert res.status_code == 403
+    detail = res.json()["detail"]
+    assert detail == "Tool servers can only be viewed on the machine running the app."
+    # _assert_plain checks: no localhost instruction, no technical exceptions/internals
+    assert "localhost" not in detail
+    assert "changed" not in detail
+    assert "this computer" not in detail
 
 
 def test_header_with_a_line_break_is_refused_without_quoting_it() -> None:

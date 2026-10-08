@@ -35,7 +35,6 @@ from uclone_x.tools.builtin.image_set_intent import (
 )
 
 __all__ = [
-    "IMAGE_SET_PERSONAS",
     "MAX_IMAGES",
     "QUALITY_TAGS",
     "ImageSetPlan",
@@ -44,14 +43,13 @@ __all__ = [
     "assemble_prompts",
     "bad_entries",
     "detect_image_set",
+    "fallback_image_set_note",
     "image_set_note",
+    "is_planned_set",
     "plan_image_set",
     "plan_schema",
     "repeated_locations",
 ]
-
-IMAGE_SET_PERSONAS = frozenset({"artist"})
-"""Personas whose turns are planned. Only the one the measurement covered."""
 
 QUALITY_TAGS = ("masterpiece", "best quality", "newest")
 """Appended to every assembled prompt, last: the first tags cut when CLIP truncates."""
@@ -361,11 +359,16 @@ async def plan_image_set(
     return prompts
 
 
+#: The first line of `image_set_note`, and only of it: a section that opens with it carries
+#: the planned prompts (`is_planned_set`).
+_PLAN_HEADING = "[Image Set Plan]\n"
+
+
 def image_set_note(prompts: Sequence[str]) -> str:
     """The turn-context section that hands the planned prompts to the model."""
     listing = "\n".join(f"{i}. {p}" for i, p in enumerate(prompts, 1))
     return (
-        "[Image Set Plan]\n"
+        f"{_PLAN_HEADING}"
         f"The user asked for {len(prompts)} different images, and the runtime planned one "
         f"prompt per image:\n{listing}\n"
         f"Call generate_image once with prompts set to exactly these {len(prompts)} prompts, "
@@ -373,3 +376,23 @@ def image_set_note(prompts: Sequence[str]) -> str:
         "style.\n"
         f"prompts={json.dumps(list(prompts), ensure_ascii=False)}"
     )
+
+
+def fallback_image_set_note(count: int) -> str:
+    """The turn-context guidance when automated planning cannot complete."""
+    return (
+        f"[Image Set Request ({count} images)]\n"
+        f"The user requested {count} different images or scenes. You must produce {count} distinct images.\n"
+        f"- Do NOT use count={count} with a single prompt; count only produces random seed variations of one scene.\n"
+        f"- Compose {count} distinct English prompts with varied poses, actions, or settings.\n"
+        f"- Call generate_image with prompts=[...] passing all {count} distinct prompts in a single call."
+    )
+
+
+def is_planned_set(section: str) -> bool:
+    """Whether `section` is a planned set (`image_set_note`), not `fallback_image_set_note`.
+
+    A plan names every prompt, so a turn that has one is not routed to case skills as well;
+    the fallback names none, so its turn still is.
+    """
+    return section.startswith(_PLAN_HEADING)

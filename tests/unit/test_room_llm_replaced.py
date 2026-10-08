@@ -1,18 +1,18 @@
-"""A model chosen in Settings reaches the conversations already open (#1446).
+"""A model chosen in Settings reaches the conversations already open (#1446, model-gateway §3.3).
 
-A conversation's seats and its routing model are built once per room and cached, from the
-connector of that moment. Settings replaced the session manager's connector and reloaded
-the chat agents, and said "applied", while every open conversation kept the old one --
-`None`, for a room first used before a model was chosen, so it kept failing with "a
-problem in the agent runtime" after the user had done exactly what would fix it.
+A conversation's seats and its routing model are built once per room and cached. Settings
+used to replace the session manager's one connector while every open conversation kept the
+old one. With the gateway, a change to the connections or default models re-binds every
+open seat and the routing chain (`AgentSessionManager.models_changed`).
 
-Each test goes through `AgentSessionManager.update_settings`, the path the Settings route
-calls, with the `mock` provider so that no model server is needed.
+Each test saves through `AgentSessionManager.save_default_models`, the path `POST
+/api/settings` takes, over `mock` connections so that no model server is needed.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 from typing import Any, cast
 
@@ -21,6 +21,7 @@ import pytest
 from uclone_x.agent.base import BaseAgent
 from uclone_x.agent.composition import MissingCapabilityError
 from uclone_x.llm import MockLLMConnector
+from uclone_x.llm.connections import ModelRef
 from uclone_x.room.models import ParticipantKind, RoomPolicy
 from uclone_x.ui.app import create_ui_app
 from uclone_x.ui.rooms import (
@@ -30,9 +31,10 @@ from uclone_x.ui.rooms import (
     reader_facing_reason,
 )
 
-#: Every variable `update_settings` writes for these arguments. Touched through
-#: `monkeypatch` first so that it puts back whatever the machine had.
 _SETTINGS_ENV = ("LLM_PROVIDER", "LLM_MODEL")
+
+#: Two connections of the `mock` kind: each builds its own `MockLLMConnector`.
+_CONNECTIONS = {"connections": [{"id": "mock", "kind": "mock"}, {"id": "box", "kind": "mock"}]}
 
 
 @pytest.fixture(autouse=True)
@@ -43,8 +45,11 @@ def _restore_settings_env(  # pyright: ignore[reportUnusedFunction]
         monkeypatch.delenv(name, raising=False)
 
 
-def _stack(tmp_path: Path, llm: Any) -> tuple[RoomStack, Any]:
-    app = create_ui_app(static_dir=tmp_path, storage_dir=tmp_path / "sessions", llm=llm)
+def _stack(tmp_path: Path, llm: Any = None, settings: Any = None) -> tuple[RoomStack, Any]:
+    storage = tmp_path / "sessions"
+    storage.mkdir(parents=True, exist_ok=True)
+    (storage / "settings.json").write_text(json.dumps(settings or _CONNECTIONS), encoding="utf-8")
+    app = create_ui_app(static_dir=tmp_path, storage_dir=storage, llm=llm)
     return cast(RoomStack, app.state.room_stack), app.state.session_manager
 
 
@@ -62,6 +67,10 @@ def _seat(stack: RoomStack, room_id: str) -> BaseAgent:
     return asyncio.run(stack.resolve_agent(state, participant))
 
 
+def _connector(mgr: Any, ref: str) -> Any:
+    return mgr.gateway.connector_for(ModelRef.parse(ref))
+
+
 def test_a_conversation_first_used_with_no_model_answers_once_one_is_chosen(
     tmp_path: Path,
 ) -> None:
@@ -69,68 +78,74 @@ def test_a_conversation_first_used_with_no_model_answers_once_one_is_chosen(
 
     Killed by: src/uclone_x/agent/composition.py :: missing=tuple(missing),
     Becomes:
-    Killed by: src/uclone_x/ui/app.py :: listener(new_llm)
-    Becomes: pass
-    Killed by: src/uclone_x/room/resolver.py :: self._app = self._app.with_llm(llm)
+    Killed by: src/uclone_x/agent/clone_builder.py :: host = dataclasses.replace(host, llm=seat.llm)
     Becomes: pass
     """
-    stack, mgr = _stack(tmp_path, llm=None)
+    stack, mgr = _stack(tmp_path)
     room_id = _room(stack)
 
     with pytest.raises(MissingCapabilityError) as refused:
         _seat(stack, room_id)
     assert reader_facing_reason(refused.value) == NO_MODEL_REASON
 
-    mgr.update_settings(llm_provider="mock", llm_model="mock-model")
+    mgr.save_default_models({"deep": "mock/mock-model"})
 
     agent = _seat(stack, room_id)
-    assert agent.llm is mgr.llm
-    assert agent.llm is not None
+    assert agent.llm is _connector(mgr, "mock/mock-model")
+    assert agent.config.llm_config.model_name == "mock-model"
 
 
-def test_a_seat_already_speaking_moves_to_the_new_connector(tmp_path: Path) -> None:
-    """A seat built before the change is the same live agent afterwards, on the new connector.
+def test_a_seat_already_speaking_moves_to_the_new_default(tmp_path: Path) -> None:
+    """A seat built before the change is the same live agent afterwards, on the new connection.
 
-    Killed by: src/uclone_x/room/resolver.py :: agent.hot_reload_llm(
-    Becomes: (lambda *_a, **_k: None)(
+    Killed by: src/uclone_x/room/resolver.py :: seat = gateway.bind(own)
+    Becomes: continue
     """
-    first = MockLLMConnector()
-    stack, mgr = _stack(tmp_path, llm=first)
+    stack, mgr = _stack(tmp_path, settings={**_CONNECTIONS, "default_models": {"deep": "mock/a"}})
     room_id = _room(stack)
     agent = _seat(stack, room_id)
-    assert agent.llm is first
+    assert agent.llm is _connector(mgr, "mock/a")
 
-    mgr.update_settings(llm_provider="mock", llm_model="mock-model")
+    mgr.save_default_models({"deep": "box/b"})
 
-    assert mgr.llm is not first
     assert _seat(stack, room_id) is agent, "the seat was rebuilt rather than reloaded"
-    assert agent.llm is mgr.llm
+    assert agent.llm is _connector(mgr, "box/b")
+    assert agent.config.llm_config.model_name == "b"
 
 
-def test_a_conversation_that_routes_by_model_routes_with_the_new_one(tmp_path: Path) -> None:
-    """The routing model is built from the connector too, and has to follow it.
+def test_routing_runs_on_the_default_fast_model_and_follows_it(tmp_path: Path) -> None:
+    """Room routing belongs to no clone: always the default fast model (§3.4, decision 5).
 
-    Killed by: src/uclone_x/ui/rooms.py :: state.policy, provider=llm, default_model=self._session_mgr.fast_model
-    Becomes: state.policy, provider=None, default_model=self._session_mgr.fast_model
+    Killed by: src/uclone_x/ui/rooms.py :: provider, model = self._session_mgr.gateway.default_fast()
+    Becomes: provider, model = self._session_mgr.gateway.default_deep()
     """
-    first = MockLLMConnector()
-    stack, mgr = _stack(tmp_path, llm=first)
+    stack, mgr = _stack(
+        tmp_path,
+        settings={**_CONNECTIONS, "default_models": {"deep": "mock/deep", "fast": "box/fast"}},
+    )
     room_id = _room(stack, RoomPolicy(auto_routing=True))
     _seat(stack, room_id)
     orchestrator = stack.orchestrator(cast(Any, stack.store.load(room_id)))
 
     def providers() -> list[Any]:
         # The chain is private and has no reader; which connector a selector asks is the
-        # whole question, and asking it through a routed turn needs two agents and a
-        # scripted reply from each connector for no more information than this.
+        # whole question.
         chain = cast(tuple[Any, ...], orchestrator._selectors)  # pyright: ignore[reportPrivateUsage]
         return [s._provider for s in chain if hasattr(s, "_provider")]
 
-    assert providers() == [first]
+    assert providers() == [_connector(mgr, "box/fast")]
 
-    mgr.update_settings(llm_provider="mock", llm_model="mock-model")
+    mgr.save_default_models({"fast": "mock/quick"})
 
-    assert providers() == [mgr.llm]
+    assert providers() == [_connector(mgr, "mock/quick")]
+
+
+def test_a_given_connector_answers_a_clone_that_follows_the_default(tmp_path: Path) -> None:
+    """A head that hands in its own connector (a test's fake) still gets it for followers."""
+    given = MockLLMConnector()
+    stack, _ = _stack(tmp_path, llm=given)
+    agent = _seat(stack, _room(stack))
+    assert agent.llm is given
 
 
 class TestNoModelRefusal:

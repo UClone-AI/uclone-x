@@ -233,7 +233,8 @@ SECRET_ENV_PATTERNS: tuple[str, ...] = (
 )
 """Environment-variable name patterns treated as secrets by default.
 
-From `docs/security-threat-model.md` D1 control 1. A name matching one of these is not
+From the threat model's default-isolation control "environment allowlist, deny-by-default
+for secrets". A name matching one of these is not
 copied into a child environment merely because it was allowlisted; it has to be passed
 explicitly, so that granting a tool a credential is a visible act at the call site.
 """

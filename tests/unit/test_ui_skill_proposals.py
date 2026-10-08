@@ -17,10 +17,13 @@ from tests.support.person import confirm_window
 from uclone_x.skills.approvals import SkillApprovalLedger
 from uclone_x.skills.auditor import SkillRegistry, compute_skill_sha256
 from uclone_x.skills.proposals import (
+    EXTRA_FILES,
     FAILED_CHECK,
     NOT_ACTIVE,
     NOT_FOUND,
     SEEN_CHANGED,
+    SEEN_CHANGED_TURN_DOWN,
+    SKILL_DECISION_CODES,
     SkillProposalStore,
 )
 from uclone_x.ui.app import create_ui_app
@@ -187,7 +190,7 @@ def test_reject_moves_the_proposal_aside(
     version = _propose(root)
     client = _client(tmp_path, registry, confirmed=True)
 
-    rejected = client.post("/api/skills/tidy-notes/reject", json={"version": version})
+    rejected = client.post("/api/skills/tidy-notes/reject", json=_as_shown(client, version))
 
     assert rejected.status_code == 200, rejected.text
     assert client.get("/api/skills").json()["proposals"] == []
@@ -209,12 +212,16 @@ def test_refusals_are_plain_sentences_without_internals(
 
     assert failed.status_code == 409
     assert _plain(failed.json()["detail"]) == FAILED_CHECK
+    assert failed.json()["code"] == "failed_check"
+    assert missing.json()["code"] == "not_found"
     assert _plain(missing.json()["detail"]) == NOT_FOUND
     assert _plain(traversal.json()["detail"]) == NOT_FOUND
     assert no_version.status_code == 400
     _plain(no_version.json()["detail"])
+    assert no_version.json()["code"] == "no_version"
     assert no_digest.status_code == 400
     _plain(no_digest.json()["detail"])
+    assert no_digest.json()["code"] == "not_seen"
     assert (root / ".pending" / "tidy-notes" / unsafe / "SKILL.md").is_file()
 
 
@@ -260,3 +267,58 @@ def test_each_skill_says_whether_it_shipped(
     monkeypatch.setattr("uclone_x.ui.app.SHIPPED_SKILL_PINS", {"tidy-notes": "x"})
     (entry,) = client.get("/api/skills").json()["skills"]
     assert entry["shipped"] is True
+
+
+def test_turn_down_refuses_a_proposal_that_changed_after_it_was_shown(
+    tmp_path: Path, root: Path, registry: SkillRegistry
+) -> None:
+    """Turning down is bound to what the person saw, as approving is (#1865)."""
+    version = _propose(root)
+    client = _client(tmp_path, registry, confirmed=True)
+    body = _as_shown(client, version)
+    pending = root / ".pending" / "tidy-notes" / version / "SKILL.md"
+    pending.write_text(
+        pending.read_text(encoding="utf-8").replace("Read the notes.", "Read the mail."),
+        encoding="utf-8",
+    )
+
+    refused = client.post("/api/skills/tidy-notes/reject", json=body)
+    unseen = client.post("/api/skills/tidy-notes/reject", json={"version": version})
+
+    assert refused.status_code == 412
+    assert _plain(refused.json()["detail"]) == SEEN_CHANGED_TURN_DOWN
+    assert refused.json()["code"] == "seen_changed"
+    assert unseen.status_code == 400
+    _plain(unseen.json()["detail"])
+    assert unseen.json()["code"] == "not_seen"
+    assert pending.is_file()
+    assert not (root / ".rejected").exists()
+
+
+def test_a_proposal_with_extra_files_is_refused_in_plain_words(
+    tmp_path: Path, root: Path, registry: SkillRegistry, isolated_ledger: SkillApprovalLedger
+) -> None:
+    version = _propose(root)
+    (root / ".pending" / "tidy-notes" / version / "run.sh").write_text("echo hi\n")
+    client = _client(tmp_path, registry, confirmed=True)
+
+    refused = client.post("/api/skills/tidy-notes/approve", json=_as_shown(client, version))
+
+    assert refused.status_code == 409
+    assert _plain(refused.json()["detail"]) == EXTRA_FILES
+    assert refused.json()["code"] == "extra_files"
+    assert isolated_ledger.read() == {}
+
+
+def test_every_refusal_code_is_a_key_in_both_catalogs() -> None:
+    """Settings shows a 409's copy by its code, so every code needs en and ko copy."""
+    import json
+
+    locales = Path(__file__).resolve().parents[2] / "frontend" / "src" / "i18n" / "locales"
+    for lang in ("en", "ko"):
+        refusals = json.loads((locales / lang / "skills.json").read_text(encoding="utf-8"))[
+            "refusals"
+        ]
+        assert set(refusals) == set(SKILL_DECISION_CODES), lang
+        for text in refusals.values():
+            _plain(text)

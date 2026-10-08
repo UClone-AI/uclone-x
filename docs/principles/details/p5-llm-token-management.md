@@ -16,7 +16,7 @@
     - No provider-native type (e.g. `anthropic.types.Message`, `openai.types.*`) may
       appear in an engine, agent, or tool function/method signature. Only the
       normalized `LLMRequest`, `ChatMessage`, and `TokenUsage` types defined in
-      `docs/llm-agnostic-interface.md` cross that
+      [`src/uclone_x/llm/models.py`](../../../src/uclone_x/llm/models.py) cross that
       boundary.
     - All tool schemas, function-calling payloads, and streaming outputs are
       translated to and from provider-native shapes inside the adapter layer.
@@ -57,7 +57,7 @@
   `TID251`/`flake8-tidy-imports` banned-import rule, or an import-linter contract)
   forbidding provider-SDK imports outside `uclone_x.llm.connectors.*`. Until that
   check lands, this rule is enforced by review.
-* **Implementation Reference**: `docs/llm-agnostic-interface.md`
+* **Implementation Reference**: [`docs/public/overview.md`](../../public/overview.md)
 
 ## Amendment Log
 

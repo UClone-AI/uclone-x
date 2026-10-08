@@ -18,12 +18,13 @@ from typing import cast
 
 import pytest
 
+from uclone_x.agent.avatar_tool import SetAvatarTool
 from uclone_x.agent.base import BaseAgent
 from uclone_x.agent.bootstrap import agent_config_for_persona
 from uclone_x.agent.composition import HostDependencies
 from uclone_x.agent.models import (
-    BASE_MEMORY_TOOLS,
     BASE_PERSONA_TOOLS,
+    BASE_SELF_TOOLS,
     AgentConfig,
     AgentContext,
     AgentLLMConfig,
@@ -54,6 +55,7 @@ _BASE_CLASSES = (
     RecordMemoryFactTool,
     QueryMemoryFactsTool,
     RetractMemoryFactTool,
+    SetAvatarTool,
     FileReadTool,
     FileSearchTool,
     DirectoryListTool,
@@ -84,13 +86,13 @@ class _RecordingConnector(MockLLMConnector):
         return await super().generate(request)
 
 
-def _seat(participant_id: str, persona: str) -> Participant:
+def _seat(participant_id: str) -> Participant:
+    """A seat is its clone: the persona is found by the seat's id."""
     return Participant(
         id=participant_id,
         kind=ParticipantKind.AGENT,
         display_name=participant_id,
         session_id=f"sess_room__r1__{participant_id}",
-        persona=persona,
     )
 
 
@@ -114,7 +116,7 @@ class TestTheBaseSet:
         assert len(BASE_PERSONA_TOOLS) == len(set(BASE_PERSONA_TOOLS))
 
     def test_nothing_in_it_writes_a_file_or_starts_an_agent(self) -> None:
-        """The rule for membership: no effect outside the agent's own memory."""
+        """The rule for membership: no effect outside the agent's own state."""
         for cls in _BASE_CLASSES:
             assert not tool_writes_files(cls), cls.name
             assert not tool_spawns_subagents(cls), cls.name
@@ -123,7 +125,8 @@ class TestTheBaseSet:
         """Shell, write, install, network, image, plan and sub-agent tools stay per persona.
 
         The read-only four: the three file tools, and `tool_result_read`, which reads back
-        this conversation's own shortened results (#1422).
+        this conversation's own shortened results (#1422). And `set_avatar`, which changes
+        only the calling clone's own picture (#2160).
         """
         default_names = {
             tool.name for tool in create_default_registry(enable_mcp=False).list_tools()
@@ -133,6 +136,7 @@ class TestTheBaseSet:
             "file_search",
             "directory_list",
             "tool_result_read",
+            "set_avatar",
         }
 
 
@@ -169,8 +173,8 @@ class TestEveryWayToTakeOnAPersona:
     def test_a_builtin_persona_agent_is_scoped_to_its_list_plus_the_base(self, name: str) -> None:
         """The chat head: an agent resolving its persona's list itself (#892).
 
-        Killed by: src/uclone_x/agent/base.py :: resolved = persona.granted_tools
-        Becomes: resolved = persona.allowed_tools
+        Killed by: src/uclone_x/core/models.py :: return persona.granted_tools
+        Becomes: return persona.allowed_tools
         """
         persona = PersonaRegistry().get_persona(name)
         assert persona is not None and persona.allowed_tools
@@ -224,7 +228,7 @@ class TestEveryWayToTakeOnAPersona:
             memory_factory=_memory_factory(tmp_path, {}),
             persona_registry=PersonaRegistry(),
         )
-        agent = cast("BaseAgent", await resolver.resolve(_seat(name, name)))
+        agent = cast("BaseAgent", await resolver.resolve(_seat(name)))
 
         assert set(BASE_PERSONA_TOOLS) <= set(agent.config.allowed_tools)
         await agent.execute_turn("Hello")
@@ -249,7 +253,13 @@ class TestEveryWayToTakeOnAPersona:
 
     @pytest.mark.asyncio
     async def test_a_sub_agent_inherits_the_base_less_the_memory_tools(self) -> None:
-        """A child holds its parent's resolved list, less the memory tools (#1431)."""
+        """A child holds its parent's resolved list, less its own state (#1431, #2160).
+
+        A child has no persona of its own, so it is not offered the parent's picture either.
+
+        Killed by: src/uclone_x/agent/base.py :: if name not in BASE_SELF_TOOLS
+        Becomes: if name not in BASE_SELF_TOOLS[:3]
+        """
         parent = BaseAgent(
             config=AgentConfig(agent_id="lead", name="lead", enable_subagent_tools=True),
             tools=ToolRegistry(),
@@ -267,8 +277,9 @@ class TestEveryWayToTakeOnAPersona:
         child = await parent.spawn_subagent(role="helper", goal="help")
         assert set(child.config.allowed_tools) == {
             "web_search",
-            *(name for name in BASE_PERSONA_TOOLS if name not in BASE_MEMORY_TOOLS),
+            *(name for name in BASE_PERSONA_TOOLS if name not in BASE_SELF_TOOLS),
         }
+        assert "set_avatar" not in child.config.allowed_tools
 
 
 class TestABuiltinPersonaCanRemember:
@@ -301,7 +312,7 @@ class TestABuiltinPersonaCanRemember:
             memory_factory=_memory_factory(tmp_path, stores),
             persona_registry=PersonaRegistry(),
         )
-        agent = cast("BaseAgent", await resolver.resolve(_seat(name, name)))
+        agent = cast("BaseAgent", await resolver.resolve(_seat(name)))
 
         result = await agent.run_turn("Remember that my favourite colour is teal.")
 

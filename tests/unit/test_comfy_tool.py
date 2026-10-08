@@ -645,6 +645,11 @@ def test_tool_registry_registration() -> None:
 
 @pytest.mark.asyncio
 async def test_tool_successful_execution(tool_context: ToolContext) -> None:
+    """The picture is saved in the session's own directory, which the listing reads (#1390).
+
+    Killed by: src/uclone_x/tools/builtin/comfy_image_tool.py :: session_dir = f"artifacts/{context.session_id or 'sess_default'}"
+    Becomes: session_dir = f"artifacts"
+    """
     test_png_bytes = b"\x89PNG\r\ntest-image-content"
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -702,6 +707,7 @@ async def test_tool_successful_execution(tool_context: ToolContext) -> None:
     rel_path = str(result.output["path"])
     assert len(result.artifacts) == 1
     assert result.artifacts[0] == rel_path
+    assert rel_path.startswith("artifacts/test_session/images/")
 
     # Verify saved file content on filesystem
     saved_file = tool_context.require_workspace() / rel_path

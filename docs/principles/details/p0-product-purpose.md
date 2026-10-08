@@ -19,4 +19,4 @@
 
 * **Why**: P1–P9 govern the runtime's internals, and every one of them is satisfiable by a system that only its own authors can install and run. Without a stated purpose at the head of the list, "who this is for" is decided implicitly, one commit at a time, by whoever is optimising the gate that week. Placing it first makes the audience a design input rather than an afterthought — while the precedence rule above keeps it from becoming a warrant to disable the safety laws that are *how* a non-expert's trust is earned.
 
-* **Implementation Reference**: [`docs/cli-specification.md`](../../cli-specification.md), [`docs/ui-dashboard-architecture.md`](../../ui-dashboard-architecture.md), [`docs/skill-system-architecture.md`](../../skill-system-architecture.md)
+* **Implementation Reference**: [`docs/public/cli.md`](../../public/cli.md), [`docs/public/overview.md`](../../public/overview.md)

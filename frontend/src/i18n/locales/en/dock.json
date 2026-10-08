@@ -5,7 +5,8 @@
     "artifacts": "Docs & Artifacts",
     "remembers": "Remembers",
     "activity": "Activity & Tools",
-    "resource": "Resource"
+    "resource": "Resource",
+    "browser": "Browser"
   },
   "chrome": {
     "resize": "Drag to resize workspace dock",
@@ -101,7 +102,8 @@
     "copyJson": "Copy JSON",
     "outputPayload": "Output Payload",
     "truncated": "This output was cut to fit; the clone received all of it.",
-    "errorTrace": "Execution Error Trace"
+    "errorTrace": "Execution Error Trace",
+    "toolFailed": "This tool did not finish."
   },
   "docs": {
     "filesReadFailed": "This conversation's files could not be listed.",
@@ -188,6 +190,7 @@
     "toolResults": "Tool results, in full",
     "statusNotRecorded": "status not recorded",
     "noOutput": "The log holds no output for this call.",
+    "outputUnavailable": "This call's output is no longer stored, so it cannot be shown.",
     "failure": {
       "unreachable": "The runtime did not answer:",
       "notJson": "The runtime answered with something that is not JSON.",
@@ -218,10 +221,7 @@
       },
       "details": {
         "body_missing": "Part of its record is missing.",
-        "snapshot_missing": "A context snapshot it needs is missing.",
         "log_entry_missing": "The session log lacks an entry it names.",
-        "chain_broken": "A request it builds on is missing from the session log.",
-        "before_capture": "It was recorded before requests were captured (#1421).",
         "unreadable": "Part of its record could not be read.",
         "epoch_mismatch": "Its entries do not match the session log."
       }
@@ -258,6 +258,7 @@
     "historyGaps": "Turns may be missing from this graph because:",
     "historyComplete": "No turn is known to be missing from this graph.",
     "toolCallGaps": "Tool calls may be missing from the turns shown because:",
+    "unknownReason": "This conversation's graph is not drawn. The runtime's reason:",
     "reasons": {
       "no_seat": "No agent is seated in this conversation."
     },
@@ -272,10 +273,6 @@
       "uncounted": "some turns were taken before this conversation counted turns as they started"
     },
     "toolCallGapReasons": {
-      "saved_without_tools": {
-        "one": "{count} turn was saved without a record of its tools",
-        "other": "{count} turns were saved without a record of their tools"
-      },
       "unreported": {
         "one": "{count} turn ended before reporting its tools",
         "other": "{count} turns ended before reporting their tools"
@@ -302,6 +299,178 @@
       "success": "success",
       "running": "running",
       "error": "error"
+    }
+  },
+  "story": {
+    "back": "Back to the files",
+    "refresh": "Refresh the story",
+    "loading": "Loading the story…",
+    "loadFailed": "The story could not be shown.",
+    "tryAgain": "Try again",
+    "decideFailed": "The decision could not be saved.",
+    "waiting": "Waiting for your decision",
+    "noneWaiting": "No change is waiting for a decision: none was proposed, or every one was decided.",
+    "outline": "Outline",
+    "sceneOrder": "Scene order",
+    "readingOrder": "In reading order",
+    "storyOrder": "In the order it happens",
+    "codex": "Codex",
+    "noEntries": "No {label} are in the codex yet.",
+    "looks": "looks: {looks}",
+    "unreadable": "These files could not be read, so they are not shown:",
+    "codexUnreadable": "These files or folders could not be read, so they are not shown:",
+    "decided": "Decided",
+    "noneDecided": "No change has been decided yet.",
+    "proposedIn": "Proposed in “{title}”",
+    "proposedInUnreadable": "Proposed in a conversation that could not be read",
+    "proposedInGone": "Proposed in a conversation that no longer exists",
+    "from": "Because the story says",
+    "quoteGone": "This passage is no longer in the scene.",
+    "quoteUnchecked": "The scene has no text yet, so this passage cannot be checked.",
+    "notSet": "not set",
+    "fromStart": "from the start",
+    "after": "after “{scene}”",
+    "unplaced": "This scene is not in the outline, so “now” is how the entry starts.",
+    "what": "What",
+    "when": "When",
+    "now": "Now",
+    "ifApproved": "If approved",
+    "fileChange": "The entry file, now and if approved",
+    "approve": "Approve",
+    "reject": "Reject",
+    "rejectReason": "Why, if you want to say (optional)",
+    "confirmReject": "Reject this change",
+    "keep": "Keep deciding",
+    "openConfirmed": "Open a confirmed window",
+    "windowOpened": "A confirmed window opened in your browser. Decide there.",
+    "windowFailed": "No confirmed window could be opened.",
+    "applied": "The change to {name} was applied.",
+    "rejected": "The change to {name} was rejected.",
+    "appliedHere": "Applied here",
+    "appliedInConversation": "Applied in a conversation",
+    "appliedElsewhere": "Applied",
+    "rejectedHere": "Rejected here",
+    "rejectedInConversation": "Rejected in a conversation",
+    "rejectedElsewhere": "Rejected",
+    "unwritten": "not written yet",
+    "kinds": {
+      "characters": "Characters",
+      "places": "Places",
+      "items": "Items",
+      "threads": "Threads"
+    },
+    "board": {
+      "written": "written",
+      "planned": "planned",
+      "twist": "Twist revealed",
+      "climax": "Conflict decided",
+      "functions": {
+        "setup": "Setup",
+        "complication": "Complication",
+        "escalation": "Escalation",
+        "reversal": "Reversal",
+        "climax": "Climax",
+        "resolution": "Resolution"
+      },
+      "inScene": "In this scene",
+      "how": {
+        "mentioned": "named",
+        "planted": "planted here",
+        "paid_off": "paid off here"
+      },
+      "notInCodex": "{name} (not in the codex yet)",
+      "showInCodex": "Show {name} in the codex",
+      "changesHere": "The codex records here",
+      "looksAdded": "looks: + {looks}",
+      "looksRemoved": "looks: − {looks}",
+      "findings": "Disagrees with the codex",
+      "checkedClean": "Checked after writing: nothing it read disagreed with the codex.",
+      "unread": "The check after writing could not read this scene.",
+      "waiting": {
+        "one": "{count} change waiting for your decision",
+        "other": "{count} changes waiting for your decision"
+      }
+    },
+    "notes": {
+      "no_writer": "No conversation is writing “{title}”, so a decision cannot be saved. Open the story in a conversation, then decide here.",
+      "writer_gone": "The conversation that was writing “{title}” no longer exists, so a decision cannot be saved. Open the story in a conversation, then decide here.",
+      "start_unreadable": "The record of how this story was started could not be read, so the board does not show what each chapter does or what the check after writing found.",
+      "no_outline": "This story has no outline yet.",
+      "outline_unreadable": "The outline could not be read."
+    },
+    "refusals": {
+      "story_gone": "This story is no longer in the files. Go back to the files to see the stories there are.",
+      "no_writer": "No conversation is writing this story, so the decision was not saved. Open the story in a conversation, then decide here.",
+      "writer_gone": "The conversation that was writing this story no longer exists, so the decision was not saved. Open the story in a conversation, then decide here.",
+      "writer_busy": "The conversation writing this story is answering right now, so the decision was not saved. Wait for the answer to finish, then try again."
+    }
+  },
+  "browser": {
+    "title": "Browser",
+    "noRoom": "No conversation is open. Open one from the rail to use the browser.",
+    "noTabs": "No tabs open",
+    "addressPlaceholder": "Search or enter address",
+    "takeOver": "Take over",
+    "giveBack": "Give back to {name}",
+    "handTo": "Hand to…",
+    "newTab": "New tab",
+    "stop": "Stop",
+    "getChrome": "Get Chrome",
+    "addToChrome": "Add to Chrome",
+    "restart": "Restart",
+    "lastStep": "Last step: {step}",
+    "lastStepNone": "No actions taken yet",
+    "banner": {
+      "acting": "{name} is using the browser",
+      "idle": "Idle — {name} finished",
+      "userControl": "You have control",
+      "askedUser": "{name} needs you to sign in to {site}",
+      "chromeMissing": "Google Chrome isn't installed. Clones need it to use the browser.",
+      "extensionMissing": "Connect your Chrome: add the UClone-X extension",
+      "crashed": "The browser stopped unexpectedly.",
+      "none": "No browser is open in this conversation. When a clone opens a web page, you can watch it here.",
+      "closed": "The browser was closed. It opens again the next time a clone uses it."
+    },
+    "tabsLabel": "Open tabs",
+    "tabName": "{name} · {title}",
+    "untitled": "New tab",
+    "address": "Page address",
+    "connecting": "Connecting to the browser…",
+    "lost": "The live view is not connected. Trying again…",
+    "connect": {
+      "hint": "Clones use a separate Chrome window that UClone-X opens. To have them use your own Chrome, connect it.",
+      "action": "Connect your Chrome"
+    },
+    "view": {
+      "label": "Live view of {name}'s tab",
+      "paused": "The page is not shown while this tab is hidden.",
+      "waiting": "Waiting for the page to appear…"
+    },
+    "steps": {
+      "open": "Opened a page",
+      "snapshot": "Looked at the page",
+      "read": "Read the page",
+      "find": "Searched the page",
+      "click": "Clicked",
+      "clickOn": "Clicked \"{element}\"",
+      "type": "Typed into a field",
+      "typeOn": "Typed into \"{element}\"",
+      "select": "Chose an option",
+      "selectOn": "Chose an option in \"{element}\"",
+      "check": "Toggled a checkbox",
+      "checkOn": "Toggled \"{element}\"",
+      "press": "Pressed a key",
+      "scroll": "Scrolled the page",
+      "upload": "Chose a file",
+      "uploadOn": "Chose a file for \"{element}\"",
+      "wait": "Waited for the page",
+      "back": "Went back",
+      "forward": "Went forward",
+      "reload": "Reloaded the page",
+      "tab": "Switched tabs",
+      "other": "Used the browser",
+      "failed": "{step} — did not work",
+      "show": "Show in the Browser tab"
     }
   }
 }

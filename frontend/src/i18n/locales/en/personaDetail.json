@@ -4,6 +4,7 @@
   "maxTokens": "Max tokens",
   "tools": "Tools",
   "notSet": "not set",
+  "systemDefault": "System default",
   "noTools": "No tool list — this clone can use every tool the runtime has.",
   "writeAccess": {
     "on": "Can write files",

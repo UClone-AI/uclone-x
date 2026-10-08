@@ -19,7 +19,7 @@ from pydantic import BaseModel, Field
 from uclone_x.agent.base import BaseAgent
 from uclone_x.agent.models import AgentConfig, AgentContext, AgentLLMConfig
 from uclone_x.agent.request_record import (
-    RecordErrorCode,
+    EpochErrorCode,
     RequestRecordError,
     rebuild_requests,
 )
@@ -40,15 +40,24 @@ from uclone_x.agent.turn_trace import (
     ResponseReasonCode,
     StepNotFoundError,
     TurnNotLinkedError,
+    _extract_subagents,  # pyright: ignore[reportPrivateUsage]
     trace_step,
     trace_turn,
 )
 from uclone_x.core.context_state import ContextEpoch
 from uclone_x.core.provenance import ExecutionPath, Provenance, ServiceRef
+from uclone_x.core.session_log import (
+    SessionLogEntry,
+    SessionLogProvenance,
+    logged_message,
+    new_entry,
+)
 from uclone_x.llm.connectors.base import BaseLLMConnector
 from uclone_x.llm.models import (
+    ChatMessage,
     FinishReason,
     LLMRequest,
+    MessageRole,
     ModelResponse,
     StreamChunk,
     TokenCountSource,
@@ -133,6 +142,20 @@ class _ScriptedTraceLLM(BaseLLMConnector):
 
     async def stream(self, request: LLMRequest) -> AsyncIterator[StreamChunk]:
         yield StreamChunk(delta_content="unused")
+
+
+def _logged_users(store: SessionStore, sid: str, *texts: str) -> tuple[SessionLogEntry, ...]:
+    """A session log of one user message per text, `e0` onward, with each body stored.
+
+    A `REQUEST_CONTEXT` event names its conversation by these entries (#2013), and a
+    rebuild renders it from them.
+    """
+    log: list[SessionLogEntry] = []
+    for position, text in enumerate(texts):
+        logged = logged_message(ChatMessage(role=MessageRole.USER, content=text))
+        store.save_context_body(sid, logged.digest, logged.body)
+        log.append(new_entry(position, logged, turn=1, provenance=SessionLogProvenance.RECORDED))
+    return tuple(log)
 
 
 def _make_snapshot(
@@ -244,8 +267,8 @@ def test_rebuild_requests_d1_pre_1472_error(tmp_path: Path) -> None:
             "type": "REQUEST_CONTEXT",
             "step": 1,
             "message_count": 2,
-            "kept_message_count": 0,
-            "appended_messages": [{"role": "user", "content": "hi"}],
+            "kept_entry_count": 0,
+            "appended_entries": [{"entry": "e0", "form": "full"}],
             "digest": "abc",
         }
     ]
@@ -282,7 +305,12 @@ def test_rebuild_requests_select(tmp_path: Path) -> None:
         turn_context_digest=turn_d,
         model="gpt-4o",
     )
-    state = SessionState(session_id=sid, agent_id="test_agent", context_snapshots=(snap,))
+    state = SessionState(
+        session_id=sid,
+        agent_id="test_agent",
+        context_snapshots=(snap,),
+        session_log=_logged_users(store, sid, "msg 1", "msg 2"),
+    )
 
     events = [
         {
@@ -292,8 +320,8 @@ def test_rebuild_requests_select(tmp_path: Path) -> None:
             "request": 1,
             "base_request": None,
             "message_count": 1,
-            "kept_message_count": 0,
-            "appended_messages": [{"role": "user", "content": "msg 1"}],
+            "kept_entry_count": 0,
+            "appended_entries": [{"entry": "e0", "form": "full"}],
             "digest": "d1",
         },
         {
@@ -303,8 +331,8 @@ def test_rebuild_requests_select(tmp_path: Path) -> None:
             "request": 2,
             "base_request": 1,
             "message_count": 2,
-            "kept_message_count": 1,
-            "appended_messages": [{"role": "user", "content": "msg 2"}],
+            "kept_entry_count": 1,
+            "appended_entries": [{"entry": "e1", "form": "full"}],
             "digest": "d2",
         },
     ]
@@ -349,7 +377,12 @@ def test_trace_step_detail(tmp_path: Path) -> None:
         temperature=0.7,
         max_tokens=2048,
     )
-    state = SessionState(session_id=sid, agent_id="test_agent", context_snapshots=(snap,))
+    state = SessionState(
+        session_id=sid,
+        agent_id="test_agent",
+        context_snapshots=(snap,),
+        session_log=_logged_users(store, sid, "query"),
+    )
 
     events: list[dict[str, Any]] = [
         {"type": "TURN_START", "turn_index": 1, "caller_turn_id": "turn_sd"},
@@ -360,8 +393,8 @@ def test_trace_step_detail(tmp_path: Path) -> None:
             "request": 1,
             "base_request": None,
             "message_count": 2,
-            "kept_message_count": 0,
-            "appended_messages": [{"role": "user", "content": "query"}],
+            "kept_entry_count": 0,
+            "appended_entries": [{"entry": "e0", "form": "full"}],
             "digest": "digest_val",
         },
         {
@@ -722,7 +755,7 @@ async def test_a_gap_makes_only_the_requests_built_on_it_unavailable(tmp_path: P
     state = store.load(_SID)
     assert state is not None
     events = _events(store)
-    assert _request_of(events, 2)["kept_message_count"] > 0
+    assert _request_of(events, 2)["kept_entry_count"] > 0
 
     gap_before = _without(events, {"type": "REQUEST_CONTEXT", "request": 1})
     trace = trace_turn(store, state, gap_before, caller_turn_id="t2")
@@ -822,13 +855,16 @@ def test_every_reason_code_the_core_sends_has_a_sentence_in_the_head(language: s
     Becomes: RecordErrorCode = Literal["renamed",
     Killed by: src/uclone_x/agent/turn_trace.py :: ResponseReasonCode = Literal["not_recorded"]
     Becomes: ResponseReasonCode = Literal["not_recorded", "renamed"]
+    Killed by: src/uclone_x/agent/request_record.py :: EpochErrorCode = Literal["log_entry_missing",
+    Becomes: EpochErrorCode = Literal["snapshot_missing", "log_entry_missing",
     """
     words = _model_calls(language)
     assert set(get_args(RequestReasonCode)) == set(words["requestReasons"])
     assert set(get_args(ResponseReasonCode)) == set(words["responseReasons"])
     assert set(get_args(FromLogCode)) == set(words["fromLog"]["reasons"])
-    # The kind of gap behind `epoch_unreadable` (#1911).
-    assert set(get_args(RecordErrorCode)) == set(words["fromLog"]["details"])
+    # The kind of gap behind `epoch_unreadable` (#1911): only the codes an epoch can raise
+    # (#1915), so the catalog holds no sentence this field can never select.
+    assert set(get_args(EpochErrorCode)) == set(words["fromLog"]["details"])
 
 
 class _Watched(dict[str, Any]):
@@ -896,7 +932,7 @@ async def test_a_request_that_keeps_nothing_rebuilds_past_a_gap(tmp_path: Path) 
     first_request = next(e for e in events if e["type"] == "REQUEST_CONTEXT")
     events = [e for e in events if e is not first_request]
     restated = [e for e in events if e["type"] == "REQUEST_CONTEXT"][-1]
-    assert restated["base_request"] is None and restated["kept_message_count"] == 0
+    assert restated["base_request"] is None and restated["kept_entry_count"] == 0
 
     reasons: list[tuple[int, str | None]] = []
     rebuilt = rebuild_requests(
@@ -931,19 +967,75 @@ async def test_nudges_are_read_from_the_turn(tmp_path: Path) -> None:
     assert [s.step for s in trace.steps] == [1, 2]
 
 
+class _DelegateTool(BaseTool[_NoteParams]):
+    """Answers as a delegation does: its result names the helper that ran."""
+
+    name = "delegate"
+    description = "Asks a helper"
+
+    def run(self, params: _NoteParams, context: ToolContext) -> dict[str, Any]:
+        return {"response": "found it", "subagent_id": "sub_child_1"}
+
+
 @pytest.mark.asyncio
-async def test_helpers_are_read_from_the_canonical_text_of_a_tool_result(
+async def test_helpers_are_read_from_the_result_the_event_names(tmp_path: Path) -> None:
+    """A `TOOL_RESULT` names its result by handle, and the trace reads it (#2013).
+
+    The event holds no copy of the text; the trace's output and the helpers it lists are
+    read from the session's own bodies, as `tool_result_read` reads them.
+
+    Killed by: src/uclone_x/agent/turn_trace.py :: output = read(ev.get("result_handle"))
+    Becomes: output = None
+    Killed by: src/uclone_x/agent/turn_trace.py :: text = read(ev.get("result_handle"))
+    Becomes: text = None
+    Killed by: src/uclone_x/agent/turn_trace.py :: if '"subagent_id"' not in text:
+    Becomes: if True:
+    """
+    store = SessionStore(storage_dir=tmp_path / "sessions")
+    agent = _seat(_Script([_call("c1", "delegate"), "done"]), store, _DelegateTool())
+    await agent.start()
+    assert (await agent.execute_turn("first", caller_turn_id="t1")).is_completed
+    agent.persist_session()
+    state = store.load(_SID)
+    assert state is not None
+    events = _events(store)
+    result = next(e for e in events if e["type"] == "TOOL_RESULT")
+    assert "output" not in result
+    assert str(result["result_handle"]).startswith("tr_")
+
+    trace = trace_turn(store, state, events, caller_turn_id="t1")
+    assert trace.subagents == ["sub_child_1"]
+    assert trace.subagents_reason is None
+    shown = trace.steps[0].tool_results[0]
+    assert json.loads(str(shown.output)) == {"response": "found it", "subagent_id": "sub_child_1"}
+    assert shown.output_unavailable is False
+
+
+def test_a_helper_named_in_a_result_that_does_not_parse_is_stated() -> None:
+    """One that names a helper and does not parse is stated on the trace, not skipped.
+
+    Killed by: src/uclone_x/agent/turn_trace.py :: reason = SUBAGENT_UNREADABLE  # a result that names a helper and does not parse
+    Becomes: pass  # a result that names a helper and does not parse
+    """
+    events = [{"type": "TOOL_RESULT", "result_handle": "tr_0123456789abcdef"}]
+    cut = '{"response":"found it","subagent_id":"sub_chi'
+    assert _extract_subagents(events, lambda _h: cut) == ([], SUBAGENT_UNREADABLE)
+
+
+@pytest.mark.asyncio
+async def test_a_result_the_session_no_longer_holds_is_said_to_be_unavailable(
     tmp_path: Path,
 ) -> None:
-    """Should-fix (e): `TOOL_RESULT.output` is the result's canonical text, a string.
+    """A handle that resolves to nothing -- or an event from before results were named
+    by handle -- shows no output and says so; it is never shown as an empty result
+    (#2013). The helper list says it may be short.
 
-    A delegation's result names its helper in that text; one that names a helper and
-    does not parse is stated on the trace, not skipped.
-
-    Killed by: src/uclone_x/agent/turn_trace.py :: parsed = json.loads(output)
-    Becomes: parsed = output
-    Killed by: src/uclone_x/agent/turn_trace.py :: reason = SUBAGENT_UNREADABLE
-    Becomes: pass
+    Killed by: src/uclone_x/agent/turn_trace.py :: output_unavailable=output is None,
+    Becomes: output_unavailable=False,
+    Killed by: src/uclone_x/agent/turn_trace.py :: if body is None or result_handle(body) != handle:
+    Becomes: if body is None:
+    Killed by: src/uclone_x/agent/turn_trace.py :: reason = SUBAGENT_UNREADABLE  # a result the session no longer holds
+    Becomes: pass  # a result the session no longer holds
     """
     store = SessionStore(storage_dir=tmp_path / "sessions")
     await _turns(store, _Script([_call("c1"), "done"]), "first")
@@ -951,19 +1043,23 @@ async def test_helpers_are_read_from_the_canonical_text_of_a_tool_result(
     assert state is not None
     events = _events(store)
     result = next(e for e in events if e["type"] == "TOOL_RESULT")
-    assert isinstance(result["output"], str)
+    handle = str(result["result_handle"])
+    assert trace_turn(store, state, events, caller_turn_id="t1").steps[0].tool_results[0].output
 
-    result["output"] = json.dumps(
-        {"response": "found it", "subagent_id": "sub_child_1"}, separators=(",", ":")
-    )
-    trace = trace_turn(store, state, events, caller_turn_id="t1")
-    assert trace.subagents == ["sub_child_1"]
-    assert trace.subagents_reason is None
-
-    result["output"] = '{"response":"found it","subagent_id":"sub_chi'
-    trace = trace_turn(store, state, events, caller_turn_id="t1")
-    assert trace.subagents == []
-    assert trace.subagents_reason == SUBAGENT_UNREADABLE
+    # The body the handle names is replaced by another whole tool result: it still reads
+    # as one, but no longer hashes to the handle, so it is not this call's output.
+    entry = next(e for e in state.session_log if e.digest.startswith(handle[3:]))
+    body_path = store.context_body_dir(_SID) / entry.digest
+    other = json.loads(body_path.read_text(encoding="utf-8"))
+    other["content"] = "tampered"
+    body_path.write_text(json.dumps(other, sort_keys=True), encoding="utf-8")
+    for event in (result, {k: v for k, v in result.items() if k != "result_handle"}):
+        rest = [event if e is result else e for e in events]
+        trace = trace_turn(store, state, rest, caller_turn_id="t1")
+        shown = trace.steps[0].tool_results[0]
+        assert shown.output is None
+        assert shown.output_unavailable is True
+        assert trace.subagents_reason == SUBAGENT_UNREADABLE
 
 
 @pytest.mark.asyncio
@@ -1053,9 +1149,9 @@ async def test_a_missing_log_body_leaves_the_check_unknown_and_the_trace_intact(
     """A body the step's epoch needs is missing: rendering that epoch raises, the trace
     says why on the step and still returns the requests it rebuilt.
 
-    Killed by: src/uclone_x/agent/turn_trace.py :: except RequestRecordError as err:
+    Killed by: src/uclone_x/agent/turn_trace.py :: except EpochRecordError as err:
     Becomes: except KeyError as err:
-    Killed by: src/uclone_x/agent/turn_trace.py :: return _unchecked("epoch_unreadable", rendered.detail, rendered.code)
+    Killed by: src/uclone_x/agent/turn_trace.py :: return _unchecked("epoch_unreadable", rendered.detail, rendered.epoch_code)
     Becomes: return _unchecked("epoch_unreadable", rendered.detail)
     """
     store = SessionStore(tmp_path / "store")
@@ -1083,6 +1179,34 @@ async def test_a_missing_log_body_leaves_the_check_unknown_and_the_trace_intact(
     assert (detail.from_log_code, detail.from_log_detail_code) == (
         "epoch_unreadable",
         "body_missing",
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_unparseable_log_body_is_reported_with_its_own_code(tmp_path: Path) -> None:
+    """The detail code is the epoch's own gap, not a fixed one (#1915).
+
+    Killed by: src/uclone_x/agent/turn_trace.py :: return _unchecked("epoch_unreadable", rendered.detail, rendered.epoch_code)
+    Becomes: return _unchecked("epoch_unreadable", rendered.detail, "body_missing")
+    """
+    store = SessionStore(tmp_path / "store")
+    await _turns(store, _Script(["one", "two"]), "first", "second")
+    state = store.load(_SID)
+    assert state is not None
+    later = [
+        entry.digest
+        for entry in state.session_log
+        if '"second"' in (store.load_context_body(_SID, entry.digest) or "")
+    ]
+    assert len(later) == 1
+    (store.context_body_dir(_SID) / later[0]).write_text("not a message", encoding="utf-8")
+
+    trace = trace_turn(store, state, _events(store), caller_turn_id="t1")
+
+    assert [s.from_log for s in trace.steps] == [None]
+    assert (trace.steps[0].from_log_code, trace.steps[0].from_log_detail_code) == (
+        "epoch_unreadable",
+        "unreadable",
     )
 
 
@@ -1286,7 +1410,12 @@ def test_trace_turn_synthetic_1000_turns_benchmark(tmp_path: Path) -> None:
         turn_context_digest=turn_d,
         model="gpt-4o",
     )
-    state = SessionState(session_id=sid, agent_id="test_agent", context_snapshots=(snap,))
+    state = SessionState(
+        session_id=sid,
+        agent_id="test_agent",
+        context_snapshots=(snap,),
+        session_log=_logged_users(store, sid, *(f"msg_{t}" for t in range(1, 1001))),
+    )
 
     events: list[dict[str, Any]] = []
     prev_req: int | None = None
@@ -1311,8 +1440,8 @@ def test_trace_turn_synthetic_1000_turns_benchmark(tmp_path: Path) -> None:
                 "request": req_num,
                 "base_request": prev_req,
                 "message_count": t + 1,
-                "kept_message_count": t - 1 if t > 1 else 0,
-                "appended_messages": [{"role": "user", "content": f"msg_{t}"}],
+                "kept_entry_count": t - 1 if t > 1 else 0,
+                "appended_entries": [{"entry": f"e{t - 1}", "form": "full"}],
                 "digest": f"digest_{t}",
             }
         )

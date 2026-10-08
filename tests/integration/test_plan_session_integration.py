@@ -64,7 +64,7 @@ async def test_full_round_trip_plan_session_integration(tmp_path: Path) -> None:
 
     # Add messages to force compaction
     for i in range(15):
-        agent2._history.append(ChatMessage(role=MessageRole.USER, content=f"msg {i}"))  # type: ignore[reportPrivateUsage]
+        agent2._active_session.append(ChatMessage(role=MessageRole.USER, content=f"msg {i}"))  # type: ignore[reportPrivateUsage]
 
     await agent2.compact_session()
 

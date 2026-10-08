@@ -18,7 +18,7 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
-from playwright.async_api import Locator, Page, async_playwright
+from playwright.async_api import Locator, Page, async_playwright, expect
 
 pytestmark = pytest.mark.e2e
 
@@ -127,16 +127,18 @@ async def test_deleting_the_open_conversation_by_keyboard_asks_first_and_leaves_
         await dialog.wait_for(timeout=10000)
         said = await dialog.inner_text()
         assert "Throwaway draft" in said
-        assert "scout" in said
+        # Who was in it, by name: the seat is the clone's id, which nobody reads.
+        assert "Scout" in said, said
+        assert "agt_" not in said, said
         assert "cannot be undone" in said
 
         # Escape keeps everything.
         await page.keyboard.press("Escape")
         await dialog.wait_for(state="detached", timeout=10000)
         assert (await page.request.get(f"{ui_test_server}/api/rooms/{room_id}")).status == 200
+        await expect(delete).to_be_focused()
 
         # Cancel holds the focus, so it takes a deliberate Tab to reach Delete.
-        await delete.focus()
         await page.keyboard.press("Enter")
         await dialog.wait_for(timeout=10000)
         await page.keyboard.press("Tab")

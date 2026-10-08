@@ -14,22 +14,42 @@ import type { RuntimeSettings } from '../types';
  */
 
 const settings: RuntimeSettings = {
-  llm_provider: 'ollama',
-  llm_base_url: 'http://localhost:11434',
-  llm_model: 'qwen3:8b',
-  llm_api_key_set: false,
-  llm_api_key_masked: '',
-  comfyui_base_url: 'http://127.0.0.1:8188',
-  providers_available: ['ollama'],
-  available_models: ['qwen3:8b'],
   ui_language: 'en',
+};
+
+/** One connection that lists models and one that cannot, so both kinds of line are drawn. */
+const connections = {
+  connections: [
+    {
+      id: 'ollama', kind: 'ollama', label: 'Ollama', base_url: 'http://127.0.0.1:11434', key_set: false,
+      key_masked: null, source: 'settings', paid: false, status: 'connected', detail: null, model_count: 1,
+    },
+    {
+      id: 'gemini', kind: 'gemini', label: 'Google Gemini', base_url: null, key_set: false, key_masked: null,
+      source: 'env', env_var: 'GEMINI_API_KEY', paid: true, status: 'no_key', detail: 'No API key is set', model_count: null,
+    },
+  ],
+  kinds: [],
+};
+const modelSet = {
+  groups: [
+    {
+      connection_id: 'ollama', label: 'Ollama', kind: 'ollama', status: 'connected', detail: null,
+      models: [{ ref: 'ollama/qwen3:8b', id: 'qwen3:8b', display_name: 'qwen3:8b', capabilities: ['chat'], context_window: null }],
+    },
+    { connection_id: 'gemini', label: 'Google Gemini', kind: 'gemini', status: 'no_key', detail: 'No API key is set', models: [] },
+  ],
+  defaults: { deep: null, fast: null, image: 'auto' },
+  recommended: { deep: 'ollama/qwen3:8b', fast: null },
 };
 
 const answer = (body: unknown) => ({ ok: true, status: 200, json: async () => body });
 
 const routes = (url: string) => {
   if (url.includes('/api/settings')) return settings;
-  if (url.includes('/api/personas')) return { personas: [], available_tools: [], personas_dir: null };
+  if (url.includes('/api/connections')) return connections;
+  if (url.includes('/api/models')) return modelSet;
+  if (url.includes('/api/clones')) return { clones: [], available_tools: [], personas_dir: null };
   if (url.includes('/api/diagnostics/consent')) return { state: 'unasked', error: null, journal: '' };
   if (url.includes('/api/diagnostics/report'))
     return { state: 'unasked', available: true, error: null, unreadable_lines: 0, count: 0, distinct: 0 };
@@ -51,6 +71,8 @@ const englishOnly = (() => {
     .map((s) => s.trim())
     .filter((s) => s.length > 3 && !korean.has(s) && /[a-z]{3}/.test(s));
 })();
+
+const shownText = (root: HTMLElement) => root.textContent ?? '';
 
 const visibleWords = (root: HTMLElement) => {
   const attributes = Array.from(root.querySelectorAll('[placeholder],[aria-label],[title]')).flatMap((el) =>
@@ -83,7 +105,11 @@ describe('Settings in the chosen language', () => {
 
     await waitFor(() => expect(screen.getByText(ko.settings.header.title)).toBeTruthy());
     expect(screen.getByText(ko.settings.tabs.llm)).toBeTruthy();
-    expect(screen.getByText(ko.settings.footer.save)).toBeTruthy();
+    expect(screen.getByText(ko.settings.footer.close)).toBeTruthy();
+    // The model sections are drawn in Korean too, and never with the Core's English detail.
+    expect(await screen.findByText(ko.gateway.connections.title)).toBeTruthy();
+    expect(screen.getByTestId('connection-status-gemini')).toHaveTextContent(ko.gateway.status.no_key);
+    expect(shownText(baseElement)).not.toContain('No API key is set');
     expect(document.documentElement.lang).toBe('ko');
 
     const shown = visibleWords(baseElement);
@@ -91,7 +117,9 @@ describe('Settings in the chosen language', () => {
     const standsAlone = (sentence: string) =>
       new RegExp(`(?<![A-Za-z])${sentence.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![A-Za-z])`).test(shown);
     expect(englishOnly.filter((sentence) => shown.includes(sentence)).filter(standsAlone)).toEqual([]);
-  });
+    // Renders the whole window twice and searches it for every English sentence: under 2 s on
+    // a quiet machine, past the 5 s default under a parallel gate, where it timed out.
+  }, 20_000);
 
   it('keeps what the user typed when the language changes', async () => {
     render(
@@ -99,12 +127,12 @@ describe('Settings in the chosen language', () => {
         <SettingsModal developerMode={false} onDeveloperModeChange={() => {}} isOpen onClose={() => {}} />
       </LocaleProvider>,
     );
-    const endpoint = (await screen.findByDisplayValue('http://localhost:11434')) as HTMLInputElement;
-    fireEvent.change(endpoint, { target: { value: 'http://gpu.lan:11434' } });
+    const folder = (await screen.findByLabelText(en.settings.folders.addLabel)) as HTMLInputElement;
+    fireEvent.change(folder, { target: { value: '~/notes' } });
 
     fireEvent.change(screen.getByTestId('settings-language-select'), { target: { value: 'ko' } });
 
     await waitFor(() => expect(screen.getByText(ko.settings.header.title)).toBeTruthy());
-    expect(endpoint.value).toBe('http://gpu.lan:11434');
-  });
+    expect(folder.value).toBe('~/notes');
+  }, 20_000);
 });

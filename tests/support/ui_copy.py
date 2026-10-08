@@ -35,7 +35,7 @@ def _docstring_ids(tree: ast.Module) -> set[int]:
     """The `id()` of every docstring constant in `tree`.
 
     A docstring is developer text. FastAPI puts endpoint docstrings in its own `/docs`, which
-    is not a surface `docs/PRD.md` §1.3 gives a user, and no dashboard screen renders one.
+    is not a surface the product requirements give a user, and no dashboard screen renders one.
     """
     found: set[int] = set()
     for node in ast.walk(tree):

@@ -15,24 +15,38 @@ import { fmt, type Plural } from '../i18n/format';
 
 /** Re-exported so the editor components fill their sentences without importing `i18n`. */
 export { fmt, plural } from '../i18n/format';
+/** Re-exported so the editor components label a clone without importing outside this module. */
+export { cloneLabel } from './cloneLabel';
 import type { PersonaInfo, PersonaModelTier } from '../types';
 
-/** What `POST /api/personas` and `PUT /api/personas/{name}` accept, field for field. */
+/**
+ * What `POST /api/clones` and `PUT /api/clones/{id}` accept, field for field, and the id an
+ * edit addresses. `name` is the handle, which an edit cannot change.
+ */
 export interface PersonaDraft {
+  /** The clone an edit saves to; absent for one not created yet. Not sent in the body. */
+  id?: string;
   name: string;
   role: string;
   description: string;
   system_prompt: string;
   append_default_prompt: boolean;
   allowed_tools: string[];
+  /** The clone's conversation model: a model ref (`<connection>/<model>`), `null` for the system default. */
   model_name: string | null;
+  /** Its own fast model, for its own summaries; `null` follows the default. Developer mode only. */
+  fast_model: string | null;
+  /** Its picture model: a ref or `auto`; `null` follows the default picture model. */
+  image_model: string | null;
   model_tier: PersonaModelTier;
   temperature: number;
   max_tokens: number | null;
   enable_write_tools: boolean;
   enable_subagent_tools: boolean;
-  /** Not editable here; carried so an edit does not drop who the persona may call. */
+  /** Not editable here, by clone id; carried so an edit does not drop who it may call. */
   a2a_peers: string[];
+  /** The name a person reads, per locale; the editor changes only the screen's language. */
+  display_name: Record<string, string>;
 }
 
 export type PersonaEditMode = 'create' | 'edit';
@@ -56,16 +70,20 @@ export const emptyPersonaDraft = (): PersonaDraft => ({
   append_default_prompt: false,
   allowed_tools: [],
   model_name: null,
+  fast_model: null,
+  image_model: null,
   model_tier: 'inherit',
   temperature: 0.7,
   max_tokens: null,
   enable_write_tools: false,
   enable_subagent_tools: false,
   a2a_peers: [],
+  display_name: {},
 });
 
 /** The draft an edit starts from: exactly what the catalogue says the persona is. */
 export const draftFromPersona = (persona: PersonaInfo): PersonaDraft => ({
+  ...(persona.id ? { id: persona.id } : {}),
   name: persona.name,
   role: persona.role ?? '',
   description: persona.description ?? '',
@@ -73,13 +91,27 @@ export const draftFromPersona = (persona: PersonaInfo): PersonaDraft => ({
   append_default_prompt: persona.append_default_prompt ?? false,
   allowed_tools: [...(persona.allowed_tools ?? [])],
   model_name: persona.model_name ?? null,
+  fast_model: persona.fast_model ?? null,
+  image_model: persona.image_model ?? null,
   model_tier: knownTier(persona.model_tier),
   temperature: persona.temperature ?? 0.7,
   max_tokens: persona.max_tokens ?? null,
   enable_write_tools: persona.enable_write_tools ?? false,
   enable_subagent_tools: persona.enable_subagent_tools ?? false,
   a2a_peers: [...(persona.a2a_peers ?? [])],
+  display_name: { ...(persona.display_name ?? {}) },
 });
+
+/**
+ * `draft` with its display name for `language` set to `text`, other languages kept. An empty
+ * text removes that language's entry, so a cleared field falls back instead of saving blank.
+ */
+export const withDisplayName = (draft: PersonaDraft, language: string, text: string): PersonaDraft => {
+  const display_name = { ...draft.display_name };
+  if (text.trim()) display_name[language] = text;
+  else delete display_name[language];
+  return { ...draft, display_name };
+};
 
 /**
  * The loader's name rule (`refuse_an_unusable_username`): the name is a file name and the
@@ -112,7 +144,7 @@ interface ValidationIssue {
 }
 
 /** A refusal's `detail` as one sentence: the server's own, or its field errors joined. */
-export const describeRefusal = (detail: unknown, status: number, copy: PersonaEditorCopy): string => {
+export const describeRefusal = (detail: unknown, _status: number, copy: PersonaEditorCopy): string => {
   if (typeof detail === 'string' && detail) return detail;
   if (Array.isArray(detail) && detail.length > 0) {
     const fields = (detail as ValidationIssue[]).map((issue) => {
@@ -121,7 +153,7 @@ export const describeRefusal = (detail: unknown, status: number, copy: PersonaEd
     });
     return fmt(copy.fieldsRefused, { fields: fields.join('; ') });
   }
-  return fmt(copy.saveFailed, { status });
+  return copy.saveFailed;
 };
 
 /** Every word the persona editor shows. Passed in, so the components carry none of their own. */
@@ -144,6 +176,8 @@ export interface PersonaEditorCopy {
   fields: {
     name: string;
     nameHint: string;
+    displayName: string;
+    displayNameHint: string;
     role: string;
     description: string;
     systemPrompt: string;
@@ -154,10 +188,12 @@ export interface PersonaEditorCopy {
     toolsRestrictedBadge?: string;
     toolsResetToAll?: string;
     toolsRestrictedNotice?: Plural;
-    model: string;
-    modelDefault: string;
-    modelOther: string;
-    modelOtherPlaceholder: string;
+    toolsAllAllowedNotice?: string;
+    toolsAllReadAllowedNotice?: string;
+    writeToolsDisabledWarning?: string;
+    enableWriteToolsAction?: string;
+    baseTools?: string;
+    baseToolsHint?: string;
     tier: string;
     temperature: string;
     temperaturePresets?: {

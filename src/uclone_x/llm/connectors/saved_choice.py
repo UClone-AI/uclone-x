@@ -1,39 +1,30 @@
-"""The model choice a person saved, read by every head from one file.
+"""The settings file every head reads, its one writer, and the default model it names.
 
-The dashboard's Settings panel has always kept its provider/model selection in
-``settings.json`` under the session root (``default_session_root()``, which honours
-``UCLONE_SESSION_DIR``). The terminal commands never read it: ``ucx install --yes`` ended
-with ``setup llm: ready model=qwen3:8b ...`` and the very next ``ucx run --prompt ...``
-refused with "No LLM provider is configured", because the factory looked only at
-arguments and environment variables. The install had set nothing any of them read.
+The dashboard's Settings panel, ``ucx run``, ``ucx room``, ``ucx loop`` and setup all keep
+their choices in ``settings.json`` under the session root (``default_session_root()``,
+which honours ``UCLONE_SESSION_DIR``):
 
-This module is the one reader and the one first-time writer of that choice, so the
-dashboard, ``ucx run``, ``ucx room`` and ``ucx loop`` agree on it:
+* :func:`update_settings_file` is the one writer (settings-single-source S1): it locks,
+  re-reads and merges, so no writer erases keys it did not set.
+* The model choice is the file's ``connections`` and ``default_models``
+  (``uclone_x.llm.connections``, model-gateway §3.2). :func:`read_saved_choice` reads the
+  default deep model's connection as a :class:`SavedChoice`, which is what a terminal
+  command builds its one connector from.
+* :func:`remember_choice_if_unset` fills in a first connection and default model **only
+  where none is saved** (setup); :func:`save_choice` sets them on request (``ucx llm use``).
+* :func:`save_api_key` / :func:`delete_api_key` keep one key per *connection* (S3 as
+  revised): saving one connection's key never touches another's.
 
-* :func:`read_saved_choice` returns what was saved, or ``None``.
-* :func:`remember_choice_if_unset` fills in a choice **only where none is saved**,
-  keeping every other key in the file. It is what setup calls: a model the person picked
-  in Settings is theirs, and a later install must not replace it.
-* :func:`save_choice` replaces it on the person's instruction (``ucx llm use``).
-* :func:`update_settings_file` is the one writer underneath both, and the dashboard's:
-  it re-reads the file and merges, so no writer erases keys it did not set.
-* :func:`save_api_key` / :func:`delete_api_key` keep one API key per provider under
-  ``llm_api_keys``; :func:`api_key_for` reads the one saved for a provider. Saving one
-  provider's key never touches another's, and switching provider never deletes a key.
+The pre-gateway keys (``llm_provider``, ``llm_model``, ``llm_model_fast``, ``llm_base_url``,
+``llm_api_keys``) are never read (owner ruling 2026-09-28: no users yet, no migration). A
+file holding only them reads as having no model saved.
 
-Keys live in this file and nowhere else: not in ``.env``, not in the OS keychain. A second
-store is a second source of truth, and which of two stores a request used used to depend
-on load order. Environment variables still override the file (a CI job has to be able to),
-but nothing here writes one.
-
-A file written before keys were kept per provider has a single ``llm_api_key``, tagged
-with ``llm_api_key_provider`` or, before that, belonging to the ``llm_provider`` saved with
-it. It is read as that provider's key, and the first write moves it into ``llm_api_keys``
-and removes both old fields. A key with no owner at all stays under ``llm_api_key`` and is
-sent to no provider until the person saves it for one.
+Keys live in this file and nowhere else: not in ``.env``, not in the OS keychain.
+Environment variables still override the file (a CI job has to be able to), but nothing
+here writes one.
 
 Reading a saved choice is configuration, not substitution (P6): the person, or setup on
-their behalf, named this provider. What stays the caller's job is saying so -- a head that
+their behalf, named this model. What stays the caller's job is saying so -- a head that
 acts on a saved choice reports that it came from here, via :func:`describe_saved_choice`.
 """
 
@@ -43,14 +34,31 @@ import json
 import logging
 import os
 import tempfile
-from collections.abc import Generator, Mapping
+from collections.abc import Callable, Generator, Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Final, cast
 
 from uclone_x.core.set_aside import set_aside_unreadable
-from uclone_x.llm.providers import PROVIDERS, canonical_provider
+from uclone_x.llm.connections import (
+    ADDABLE_KINDS,
+    CONNECTIONS_KEY,
+    DEFAULT_COMFYUI_ADDRESS,
+    DEFAULT_MODELS_KEY,
+    DEFAULT_OLLAMA_ADDRESS,
+    SLOTS,
+    Connection,
+    ConnectionError_,
+    ModelRef,
+    ModelRefError,
+    connection_file_rows,
+    refuse_bare_model,
+    saved_connections,
+    saved_default_models,
+    slug_connection_id,
+)
+from uclone_x.llm.providers import PROVIDERS, canonical_provider, chat_kind
 
 logger = logging.getLogger(__name__)
 
@@ -71,34 +79,32 @@ SETTINGS_FILE_NAME = "settings.json"
 #: Anything else is refused by the factory, naming the file, rather than ignored -- an
 #: ignored choice would read as "none saved".
 SAVED_PROVIDERS: frozenset[str] = frozenset(
-    name for spec in PROVIDERS.values() for name in (spec.id, *spec.aliases)
+    name
+    for spec in PROVIDERS.values()
+    if "chat" in spec.capabilities
+    for name in (spec.id, *spec.aliases)
 )
-
-#: The field holding one API key per provider id: ``{"gemini": "...", "openai": "..."}``.
-LLM_API_KEYS_KEY = "llm_api_keys"
-
-#: The field naming the fast model (routing, summaries, compaction). Empty means the
-#: deep model, ``llm_model``, is used for those calls too.
-LLM_MODEL_FAST_KEY = "llm_model_fast"
-
-#: The single-key fields files kept before :data:`LLM_API_KEYS_KEY`. Read, never written.
-_LEGACY_KEY = "llm_api_key"
-_LEGACY_KEY_PROVIDER = "llm_api_key_provider"
 
 
 @dataclass(frozen=True)
 class SavedChoice:
-    """One saved provider selection, with the file it came from."""
+    """The default deep model as a terminal command builds from it: its connection and model.
+
+    Read from ``default_models.deep`` and the connection its ref names. ``provider`` is the
+    connection's kind, ``model`` the model id on it.
+    """
 
     provider: str
     model: str | None
     base_url: str | None
     path: Path
     #: Kept out of ``repr`` so a logged or printed choice never carries the credential.
-    #: Only a key saved *for this provider*; see :func:`api_key_for`.
+    #: Only the key saved *for this connection*.
     api_key: str | None = field(default=None, repr=False)
-    #: The fast model, or ``None`` when fast follows the deep model (``model``).
+    #: The default fast model's id, when it is on the same connection; else ``None``.
     model_fast: str | None = None
+    #: The connection's id (``gemini``, ``gpu-box``).
+    connection_id: str | None = None
 
 
 def _provider_id(provider: str) -> str:
@@ -116,51 +122,32 @@ def same_provider(first: str | None, second: str | None) -> bool:
     )
 
 
-def key_owner(data: Mapping[str, Any]) -> str | None:
-    """The provider a file's single, pre-per-provider ``llm_api_key`` was saved for.
-
-    ``llm_api_key_provider`` says so. A key saved before that field existed belongs to the
-    provider saved alongside it, which is the only provider it can have been saved for.
-    An empty-string tag is this module's own mark for "no owner": it is written when a key
-    that had no owner would otherwise gain one from a provider saved later.
-    """
-    tag = data.get(_LEGACY_KEY_PROVIDER)
-    if isinstance(tag, str) and not tag.strip():
-        return None
-    return _clean(tag) or _clean(data.get("llm_provider"))
-
-
 def api_keys(data: Mapping[str, Any]) -> dict[str, str]:
-    """Every provider's saved key, by provider id, from a settings file's contents.
+    """Every saved connection's key, by connection id (S3: one key per connection)."""
 
-    ``llm_api_keys`` first; a legacy single key is added under its owner
-    (:func:`key_owner`) when that provider has no key there. A legacy key with no owner is
-    not in the result: it belongs to no provider, so none may be sent it.
-    """
-    keys: dict[str, str] = {}
-    stored = data.get(LLM_API_KEYS_KEY)
-    if isinstance(stored, Mapping):
-        for name, value in cast(Mapping[object, object], stored).items():
-            key = _clean(value)
-            if isinstance(name, str) and name.strip() and key is not None:
-                keys[_provider_id(name)] = key
-    legacy = _clean(data.get(_LEGACY_KEY))
-    owner = key_owner(data)
-    if legacy is not None and owner is not None:
-        keys.setdefault(_provider_id(owner), legacy)
-    return keys
+    return {conn.id: conn.key for conn in saved_connections(data) if conn.key}
 
 
 def api_key_for(data: Mapping[str, Any], provider: str | None) -> str | None:
-    """The key saved for ``provider``, else ``None``; never another provider's key."""
+    """The key saved for the connection ``provider`` names, else ``None``.
+
+    ``provider`` is a connection id, or a kind: a kind finds only the row whose id is that
+    kind (S3). Never another row's key, of another kind or of the same one: a second row of
+    a kind has its own address, and its key is its own.
+    """
+
     if provider is None or not provider.strip():
         return None
-    return api_keys(data).get(_provider_id(provider))
-
-
-def key_belongs_to(data: Mapping[str, Any], provider: str | None) -> str | None:
-    """The saved API key for ``provider``, else ``None`` -- :func:`api_key_for`, by its old name."""
-    return api_key_for(data, provider)
+    name = provider.strip()
+    rows = saved_connections(data)
+    by_id = next((conn for conn in rows if conn.id == name), None)
+    if by_id is not None:
+        return by_id.key
+    kind = canonical_provider(name)
+    if kind is None:
+        return None
+    exact = next((conn for conn in rows if conn.id == kind), None)
+    return exact.key if exact is not None and exact.kind == kind else None
 
 
 def settings_file() -> Path:
@@ -206,26 +193,34 @@ def _clean(value: object) -> str | None:
 
 
 def read_saved_choice(path: Path | None = None) -> SavedChoice | None:
-    """The saved choice, or ``None`` when no provider is saved.
+    """The saved default deep model and its connection, or ``None`` when there is none.
 
-    ``None`` covers a missing file, one that cannot be parsed, and one the dashboard wrote
-    before anything was selected (``"llm_provider": null``). :func:`saved_choice_note`
-    tells those apart for the refusal message.
+    ``None`` covers a missing or unreadable file, no ``default_models.deep``, and a deep ref
+    whose connection is not saved. Only saved rows are read: the environment's overrides
+    are the factory's precedence steps, not a saved choice. :func:`saved_choice_note`
+    tells the cases apart for the refusal message.
     """
+
     target = path if path is not None else settings_file()
     data = _read_settings(target)
     if data is None:
         return None
-    provider = _clean(data.get("llm_provider"))
-    if provider is None:
+    defaults = saved_default_models(data)
+    if defaults.deep is None:
         return None
+    deep = ModelRef.parse(defaults.deep)
+    conn = next((c for c in saved_connections(data) if c.id == deep.connection_id), None)
+    if conn is None:
+        return None
+    fast = ModelRef.parse(defaults.fast) if defaults.fast else None
     return SavedChoice(
-        provider=provider.lower(),
-        model=_clean(data.get("llm_model")),
-        base_url=_clean(data.get("llm_base_url")),
+        provider=conn.kind,
+        model=deep.model,
+        base_url=conn.base_url,
         path=target,
-        api_key=api_key_for(data, provider),
-        model_fast=_clean(data.get(LLM_MODEL_FAST_KEY)),
+        api_key=conn.key,
+        model_fast=fast.model if fast is not None and fast.connection_id == conn.id else None,
+        connection_id=conn.id,
     )
 
 
@@ -236,7 +231,7 @@ def saved_choice_note(path: Path | None = None) -> str:
         return f"No model has been saved yet (setup and Settings save one to {target})."
     if _read_settings(target) is None:
         return f"The saved settings at {target} could not be read."
-    return f"The saved settings at {target} do not name a model yet."
+    return f"The saved settings at {target} do not name a default model on a saved connection yet."
 
 
 def describe_saved_choice(
@@ -316,48 +311,9 @@ def _set_aside_settings(target: Path) -> Path:
     return aside
 
 
-def _fold_legacy_key(data: dict[str, Any], *, replace: bool) -> None:
-    """Move a single legacy ``llm_api_key`` into ``llm_api_keys`` under its owner, in place.
-
-    Both legacy fields are removed once the key has an owner. ``replace`` says whether the
-    legacy key wins over a key already saved for that provider: it does not when folding
-    what the file held (``llm_api_keys`` was written later), and it does when a writer
-    passed the legacy field itself, which is that writer saving a key now. A key with no
-    owner is left where it is, tagged with an empty owner so that a provider saved later
-    cannot claim it.
-    """
-    legacy = _clean(data.get(_LEGACY_KEY))
-    if legacy is None:
-        data.pop(_LEGACY_KEY, None)
-        data.pop(_LEGACY_KEY_PROVIDER, None)
-        return
-    owner = key_owner(data)
-    if owner is None:
-        data[_LEGACY_KEY_PROVIDER] = ""
-        return
-    keys = api_keys({LLM_API_KEYS_KEY: data.get(LLM_API_KEYS_KEY)})
-    provider_id = _provider_id(owner)
-    if replace or provider_id not in keys:
-        keys[provider_id] = legacy
-    data[LLM_API_KEYS_KEY] = keys
-    del data[_LEGACY_KEY]
-    data.pop(_LEGACY_KEY_PROVIDER, None)
-
-
 def _merge(target: Path, data: dict[str, Any], updates: Mapping[str, Any]) -> None:
-    """Write ``data`` with ``updates`` applied, atomically. The caller holds the lock.
-
-    The file's legacy key is folded into ``llm_api_keys`` *before* ``updates`` apply: a key
-    saved before keys were tagged belongs to the provider saved with it, and that has to be
-    recorded before the provider changes, or the key would silently follow the new
-    provider -- and be sent to a service it was never meant for.
-    """
-    _fold_legacy_key(data, replace=False)
+    """Write ``data`` with ``updates`` applied, atomically. The caller holds the lock."""
     data.update(updates)
-    if _LEGACY_KEY in updates or _LEGACY_KEY_PROVIDER in updates:
-        # A writer still using the single-key fields (a dashboard from before this file
-        # kept keys per provider) is saving a key now; it lands under its owner.
-        _fold_legacy_key(data, replace=_LEGACY_KEY in updates)
     fd, temp = tempfile.mkstemp(dir=target.parent, prefix=".settings-", suffix=".json")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
@@ -369,7 +325,7 @@ def _merge(target: Path, data: dict[str, Any], updates: Mapping[str, Any]) -> No
 
 
 def update_settings_file(
-    updates: Mapping[str, Any],
+    updates: Mapping[str, Any] | Callable[[Mapping[str, Any]], Mapping[str, Any]],
     *,
     path: Path | None = None,
     replace_unreadable_with: Mapping[str, Any] | None = None,
@@ -389,6 +345,11 @@ def update_settings_file(
     time>`` beside it, so its contents are kept rather than written over; that new path is
     returned, so the caller can tell the person (#1860). ``None`` when nothing was set aside.
     Raises ``OSError`` when the file cannot be written or set aside.
+
+    ``updates`` may be a function of the file's current contents, called under the lock: a
+    writer that changes one row of a list (a connection) computes the new list from what is
+    in the file at that moment, so a row another process saved meanwhile is kept. An
+    exception it raises leaves the file as it is.
     """
     target = path if path is not None else settings_file()
     with _locked(target):
@@ -400,122 +361,289 @@ def update_settings_file(
                 raise
             aside = _set_aside_settings(target)
             current = dict(replace_unreadable_with)
-        _merge(target, current, updates)
+        _merge(target, current, updates(current) if callable(updates) else updates)
         return aside
 
 
 def remember_choice_if_unset(
     *, provider: str, model: str | None, base_url: str | None, path: Path | None = None
 ) -> tuple[bool, SavedChoice | None]:
-    """Save a first choice, filling in only what is not saved yet.
+    """Save a first connection and default model, filling in only what is not saved yet.
 
     Returns ``(written, before)``: whether anything was written, and the choice saved
-    before this call (``None`` when no provider was saved). Nothing a person saved is
-    replaced:
+    before this call (``None`` when no default deep model was saved). Nothing a person saved
+    is replaced:
 
-    * no provider saved -- ``provider`` is saved, and ``model``/``base_url`` wherever the
-      file has none;
-    * the same provider saved -- only an empty model or address is filled in;
-    * another provider saved -- nothing is written.
+    * no connection whose id is ``provider``'s kind -- one is added, at ``base_url``;
+    * no default deep model -- ``<kind>/<model>`` becomes it, when ``model`` is given;
+    * otherwise nothing is written.
 
-    Every other key in the file (the dashboard keeps read roots and the ComfyUI address
-    there) survives. Raises ``OSError`` when the file cannot be written and ``ValueError``
-    when it exists but cannot be read; it is left as it is then, because replacing a file
-    this code cannot parse would discard whatever the person had in it.
+    Every other key in the file survives. Raises ``OSError`` when the file cannot be written
+    and ``ValueError`` when it exists but cannot be read; it is left as it is then.
     """
     target = path if path is not None else settings_file()
+    kind = _known_provider(provider)
+    before = read_saved_choice(target)
+    written: list[bool] = []
+
+    def change(current: Mapping[str, Any]) -> dict[str, Any]:
+
+        updates: dict[str, Any] = {}
+        rows = saved_connections(current)
+        if not any(row.id == kind for row in rows):
+            added = Connection(id=kind, kind=kind, base_url=_clean(base_url))
+            updates[CONNECTIONS_KEY] = connection_file_rows([*rows, added], current)
+        if model is not None and saved_default_models(current).deep is None:
+            raw = current.get(DEFAULT_MODELS_KEY)
+            stored = dict(cast(Mapping[str, Any], raw)) if isinstance(raw, Mapping) else {}
+            stored["deep"] = f"{kind}/{model.strip()}"
+            updates[DEFAULT_MODELS_KEY] = stored
+        written.append(bool(updates))
+        return updates
+
     # Decided without the lock first: when there is nothing to fill in (the common case on
     # a re-install), setup writes nothing and so touches neither the file nor its lock,
     # which a read-only or root-owned session directory would refuse.
-    _, pending, before = _fill_empty(target, provider, model, base_url)
-    if not pending:
+    if not change(_current(target)):
         return False, before
-    with _locked(target):
-        # Decided again under the lock: another writer may have saved since the first read.
-        current, updates, before = _fill_empty(target, provider, model, base_url)
-        if not updates:
-            return False, before
-        _merge(target, current, updates)
-        return True, before
-
-
-def _fill_empty(
-    target: Path, provider: str, model: str | None, base_url: str | None
-) -> tuple[dict[str, Any], dict[str, Any], SavedChoice | None]:
-    """The file's contents, what :func:`remember_choice_if_unset` would add, and the choice before."""
-    current = _current(target)
-    before = read_saved_choice(target)
-    if before is not None and before.provider != provider.lower():
-        return current, {}, before
-    # Each field is judged on its own: a model or address saved without a provider
-    # (the dashboard can write one before a provider is picked) is still the person's.
-    updates: dict[str, Any] = {}
-    if before is None:
-        updates["llm_provider"] = provider
-    if model is not None and _clean(current.get("llm_model")) is None:
-        updates["llm_model"] = model
-    if base_url is not None and _clean(current.get("llm_base_url")) is None:
-        updates["llm_base_url"] = base_url
-    return current, updates, before
+    written.clear()
+    update_settings_file(change, path=target)
+    return written[-1], before
 
 
 def save_choice(
     *, provider: str, model: str, base_url: str | None, path: Path | None = None
 ) -> None:
-    """Replace the saved choice outright -- what ``ucx llm use`` does on request.
+    """Make ``<kind>/<model>`` the default deep model -- what ``ucx llm use`` does on request.
 
-    Unlike :func:`remember_choice_if_unset`, this is the person's own instruction, so it
-    overwrites the provider, model and address. Every saved API key is kept, under the
-    provider it was saved for (:func:`api_key_for`): switching to Ollama and back to
-    OpenAI finds the OpenAI key again, and no other provider is ever sent it.
+    The connection whose id is the kind is added, or its address replaced; its key and
+    every other connection are kept (S3).
     """
-    update_settings_file(
-        {"llm_provider": provider, "llm_model": model, "llm_base_url": base_url}, path=path
-    )
+    kind = _known_provider(provider)
+
+    def change(current: Mapping[str, Any]) -> dict[str, Any]:
+
+        rows = saved_connections(current)
+        found = next((row for row in rows if row.id == kind), None)
+        if found is not None:
+            _refuse_unsupported(found)
+        if found is None:
+            rows.append(Connection(id=kind, kind=kind, base_url=_clean(base_url)))
+        else:
+            rows = [
+                replace(row, base_url=_clean(base_url)) if row.id == kind else row for row in rows
+            ]
+        raw = current.get(DEFAULT_MODELS_KEY)
+        stored = dict(cast(Mapping[str, Any], raw)) if isinstance(raw, Mapping) else {}
+        stored["deep"] = f"{kind}/{model.strip()}"
+        return {CONNECTIONS_KEY: connection_file_rows(rows, current), DEFAULT_MODELS_KEY: stored}
+
+    update_settings_file(change, path=path)
 
 
 def _known_provider(provider: str) -> str:
     """``provider``'s id; ``ValueError`` naming it when the provider table does not know it."""
     provider_id = canonical_provider(provider)
-    if provider_id is None:
-        known = ", ".join(sorted(PROVIDERS))
+    if provider_id is None or not chat_kind(provider_id):
+        # An image engine (`comfyui`) is a connection too, but it holds no conversation
+        # and takes no key, so it is never a chat choice or a key's home.
+        known = ", ".join(sorted(p for p in PROVIDERS if chat_kind(p)))
         raise ValueError(f"There is no provider called {provider.strip()!r}. Known: {known}.")
     return provider_id
 
 
-def _change_keys(target: Path, provider_id: str, key: str | None) -> None:
-    """Set (or, with ``None``, remove) one provider's key, under the lock, keeping the rest."""
-    with _locked(target):
-        data = _current(target)
-        # `api_keys` counts a legacy key under its owner, as `_merge` folds it; so the
-        # legacy key is kept (or, for its owner, removed) like every other.
-        keys = api_keys(data)
-        if key is None:
-            keys.pop(provider_id, None)
-        else:
-            keys[provider_id] = key
-        _merge(target, data, {LLM_API_KEYS_KEY: keys})
+def _connection_for_key(data: Mapping[str, Any], name: str) -> tuple[str, str]:
+    """``(connection id, kind)`` a key saved under ``name`` goes to.
+
+    ``name`` is a saved connection's id, or a kind: a kind names the row whose id is that
+    kind, made when ``ucx key set`` is the first to name it.
+    """
+
+    clean = name.strip()
+    found = next((row for row in saved_connections(data) if row.id == clean), None)
+    if found is not None:
+        return found.id, found.kind
+    kind = _known_provider(clean)
+    return kind, kind
+
+
+def _change_key(target: Path, name: str, key: str | None) -> None:
+    """Set (or, with ``None``, remove) one connection's key, keeping every other row."""
+
+    def change(current: Mapping[str, Any]) -> dict[str, Any]:
+
+        conn_id, kind = _connection_for_key(current, name)
+        rows = saved_connections(current)
+        if not any(row.id == conn_id for row in rows):
+            if key is None:
+                return {}
+            rows.append(Connection(id=conn_id, kind=kind))
+        for row in rows:
+            if row.id == conn_id:
+                _refuse_unsupported(row)
+        rows = [replace(row, key=key) if row.id == conn_id else row for row in rows]
+        return {CONNECTIONS_KEY: connection_file_rows(rows, current)}
+
+    update_settings_file(change, path=target)
 
 
 def save_api_key(provider: str, key: str, *, path: Path | None = None) -> None:
-    """Save ``key`` as ``provider``'s API key, leaving every other provider's key as it is.
+    """Save ``key`` as one connection's key, leaving every other connection's key as it is.
 
-    ``provider`` may be an alias (``google`` saves under ``gemini``). The active provider
-    is not changed: saving a key is not choosing a model. Raises ``ValueError`` for an
-    empty key or a provider the table does not know, and when the file exists but cannot
-    be read (it is left as it is); ``OSError`` when it cannot be written.
+    ``provider`` is a saved connection's id, or a kind (``google`` saves under ``gemini``),
+    which names the row whose id is that kind and adds it when there is none. Saving a key
+    is not choosing a model. Raises ``ValueError`` for an empty key or a name that is
+    neither, and when the file exists but cannot be read (it is left as it is);
+    ``OSError`` when it cannot be written.
     """
-    provider_id = _known_provider(provider)
     clean = _clean(key)
     if clean is None:
         raise ValueError("The key is empty, so nothing was saved.")
-    _change_keys(settings_file() if path is None else path, provider_id, clean)
+    _change_key(settings_file() if path is None else path, provider, clean)
 
 
 def delete_api_key(provider: str, *, path: Path | None = None) -> None:
-    """Remove ``provider``'s saved API key, leaving every other provider's key as it is.
+    """Remove one connection's saved key, leaving every other connection's key as it is.
 
     Removing a key that is not saved is not an error. A key set in the environment is not
     touched: the environment is read, never written.
     """
-    _change_keys(settings_file() if path is None else path, _known_provider(provider), None)
+    _change_key(settings_file() if path is None else path, provider, None)
+
+
+# -- Connections and default models (model-gateway §3.2), through the one writer above. --
+
+
+def _refuse_unsupported(conn: Connection) -> None:
+    """Refuse a change to a row of a kind this build does not know: it is kept as written."""
+    if conn.unsupported:
+        raise ConnectionError_(
+            f"The connection {conn.id} is of a kind this version does not support "
+            f"({conn.kind!r}), so it cannot be changed here. Remove it in "
+            f"Settings and add it again, or use a version that supports it."
+        )
+
+
+def add_connection(
+    kind: str,
+    *,
+    label: str | None = None,
+    base_url: str | None = None,
+    key: str | None = None,
+    path: Path | None = None,
+) -> Connection:
+    """Save a new connection and return it with its id (§3.1).
+
+    The first connection of a kind takes the kind as its id; another takes its label (or
+    the kind) slugged and made unique. Refuses a kind the person cannot add.
+    """
+    clean_kind = canonical_provider(kind)
+    if clean_kind is None or clean_kind not in ADDABLE_KINDS:
+        raise ConnectionError_(
+            f"There is no kind of connection called {kind.strip()!r}. "
+            f"Choose one of: {', '.join(ADDABLE_KINDS)}."
+        )
+    clean_base = _clean(base_url)
+    if clean_kind == "vllm" and clean_base is None:
+        raise ConnectionError_("A vLLM connection needs the server's address.")
+    if clean_kind == "remote_gpu" and clean_base is None:
+        raise ConnectionError_("A GPU server connection needs the worker's address.")
+    if clean_kind == "ollama" and clean_base is None:
+        clean_base = DEFAULT_OLLAMA_ADDRESS
+    if clean_kind == "comfyui" and clean_base is None:
+        clean_base = DEFAULT_COMFYUI_ADDRESS
+    created: list[Connection] = []
+
+    def change(current: Mapping[str, Any]) -> dict[str, Any]:
+        rows = saved_connections(current)
+        taken = [row.id for row in rows]
+        conn_id = (
+            clean_kind
+            if clean_kind not in taken and not _clean(label)
+            else slug_connection_id(_clean(label) or clean_kind, taken)
+        )
+        conn = Connection(
+            id=conn_id, kind=clean_kind, base_url=clean_base, key=_clean(key), label=_clean(label)
+        )
+        created.append(conn)
+        return {CONNECTIONS_KEY: connection_file_rows([*rows, conn], current)}
+
+    update_settings_file(change, path=path)
+    return created[0]
+
+
+_UNCHANGED: Final = object()
+
+
+def update_connection(
+    conn_id: str,
+    *,
+    label: object = _UNCHANGED,
+    base_url: object = _UNCHANGED,
+    key: object = _UNCHANGED,
+    kind: str | None = None,
+    create: bool = False,
+    path: Path | None = None,
+) -> Connection:
+    """Change one saved row's label, address or key; every other row is left as it is.
+
+    An empty string clears a field. With ``create``, a row of ``kind`` is made under
+    ``conn_id`` when none is saved (``ucx key set gemini``). Saving one connection's key
+    never touches another's (S3).
+    """
+    changed: list[Connection] = []
+
+    def change(current: Mapping[str, Any]) -> dict[str, Any]:
+        rows = saved_connections(current)
+        index = next((i for i, row in enumerate(rows) if row.id == conn_id), None)
+        if index is None:
+            if not create or kind is None:
+                raise ConnectionError_(f"There is no connection called {conn_id!r}.")
+            rows.append(Connection(id=conn_id, kind=kind))
+            index = len(rows) - 1
+        _refuse_unsupported(rows[index])
+        updates: dict[str, Any] = {}
+        for name, value in (("label", label), ("base_url", base_url), ("key", key)):
+            if value is not _UNCHANGED:
+                updates[name] = _clean(value)
+        rows[index] = replace(rows[index], **updates)
+        changed.append(rows[index])
+        return {CONNECTIONS_KEY: connection_file_rows(rows, current)}
+
+    update_settings_file(change, path=path)
+    return changed[0]
+
+
+def remove_connection(conn_id: str, *, path: Path | None = None) -> None:
+    """Remove one saved row. Removing a row that is not saved is refused, naming it."""
+
+    def change(current: Mapping[str, Any]) -> dict[str, Any]:
+        rows = saved_connections(current)
+        kept = [row for row in rows if row.id != conn_id]
+        if len(kept) == len(rows):
+            raise ConnectionError_(f"There is no connection called {conn_id!r}.")
+        return {CONNECTIONS_KEY: connection_file_rows(kept, current)}
+
+    update_settings_file(change, path=path)
+
+
+def save_default_models(changes: Mapping[str, str | None], *, path: Path | None = None) -> None:
+    """Set the default refs ``changes`` names, keeping the others; ``None`` clears a slot."""
+    for slot, value in changes.items():
+        if slot not in SLOTS:
+            raise ModelRefError(f"There is no default model called {slot!r}.")
+        refuse_bare_model(value, slot=slot, allow_auto=slot == "image")
+
+    def change(current: Mapping[str, Any]) -> dict[str, Any]:
+        raw = current.get(DEFAULT_MODELS_KEY)
+        stored: dict[str, Any] = (
+            dict(cast(Mapping[str, Any], raw)) if isinstance(raw, Mapping) else {}
+        )
+        for slot, value in changes.items():
+            if value is None:
+                stored.pop(slot, None)
+            else:
+                stored[slot] = value.strip()
+        return {DEFAULT_MODELS_KEY: stored}
+
+    update_settings_file(change, path=path)

@@ -45,11 +45,9 @@ export const classifyTool = (
     };
   }
 
-  // Command Execution. `bash_run` is the one shell the model is offered since #1461;
-  // `run_command` is its unadvertised alias, still resolvable from stored calls (#1463).
+  // Command Execution. `bash_run` is the one shell the model is offered since #1461.
   if (
     name === 'bash_run' ||
-    name.includes('run_command') ||
     name === 'bash' ||
     name === 'sh' ||
     name.includes('exec')

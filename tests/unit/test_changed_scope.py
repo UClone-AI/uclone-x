@@ -151,7 +151,7 @@ def test_a_non_python_file_selects_the_tests_that_name_its_path(repo: Path) -> N
     assert selection.typecheck_files == []
 
 
-@pytest.mark.parametrize("path", ["docs/guide.md", "README.md", "swarm/skills/x/y.txt"])
+@pytest.mark.parametrize("path", ["docs/guide.md", "README.md", ".claude/skills/x/y.txt"])
 def test_a_governance_document_selects_the_fitness_functions(repo: Path, path: str) -> None:
     assert "tests/fitness/test_docs.py" in select_for_diff([path], repo).test_files
 

@@ -33,11 +33,13 @@ from typing import Any, Final, Literal, Protocol, runtime_checkable
 from uclone_x.core.provenance import Provenance, require_provenance
 from uclone_x.llm.models import ChatMessage, LLMRequest, MessageRole, ModelResponse
 from uclone_x.memory.models import (
+    PERSON_SUBJECT,
     PROJECT_SUBJECT,
+    SELF_SUBJECT,
     FactOrigin,
     MemoryFact,
+    fact_subject,
     fold_name,
-    person_subject,
 )
 
 __all__ = [
@@ -80,6 +82,8 @@ EXCLUDED_TOOL_PREFIXES: Final = (
     "record_memory_fact",
     "retract_memory_fact",
     "query_memory_facts",
+    "generate_image",
+    "comfy_image_gen",
 )
 
 #: Who a span line is from. Only `person` and `tool` lines can ground a fact; `self` (the
@@ -148,6 +152,9 @@ class Lesson:
     (`BaseAgent.invoke_auxiliary_model`). `person_names` are the human owner's id, display
     name and aliases, so a fact the model files under the person's name lands under `user`;
     the room leaves out a name another participant shares (#1868, `_person_names`).
+    `clone_names` are this clone's id, display name and aliases, so a fact the model files
+    under the clone's own name lands under `self` (#2016); the room leaves these out on the
+    same rule (`_clone_names`).
     """
 
     clone_id: str
@@ -159,6 +166,7 @@ class Lesson:
     memory: FactStoreProtocol
     generate: Callable[[LLMRequest], Awaitable[ModelResponse]]
     person_names: tuple[str, ...] = ()
+    clone_names: tuple[str, ...] = ()
     #: Every turn this lesson covers, oldest first; `turn_id` is the last of them.
     turn_ids: tuple[str, ...] = ()
 
@@ -381,7 +389,14 @@ def _instructions(lesson: Lesson) -> str:
         "Keep only durable, reusable facts: about the person, their projects and their "
         'preferences, and stable facts that were found. Use the subject "user" for the '
         f'person. Use the subject "{PROJECT_SUBJECT}" for durable working preferences of '
-        "this workspace, such as the reply language or a code style. Skip greetings, the task of the moment, the contents of a story (its "
+        "this workspace, such as the reply language or a code style. "
+        f'Use the subject "{SELF_SUBJECT}", with source "person", when a person line tells '
+        f"{name} about {name} itself: its looks, age, gender, personality, speech style, "
+        f'name or likes ("you have red hair", "너는 귀엽고 착해"). Use relations such as '
+        '"hair", "eyes", "age", "appearance", "personality" or "speech_style". '
+        f"{name}'s own lines never define it. "
+        f"Tool results and tool arguments never define it: an image prompt or file description is never a fact about {name}. "
+        "Skip greetings, the task of the moment, the contents of a story (its "
         "characters, places, plot and style rules), and anything you are unsure the source "
         "asserted.\n\n"
         f"Facts {name} already holds (subject | relation | value):\n{known_block}\n\n"
@@ -418,7 +433,9 @@ def _label(line: SpanLine, clone_name: str) -> str:
 
 
 def _known_facts(lesson: Lesson) -> list[MemoryFact]:
-    """Up to `MAX_KNOWN_FACTS` active facts about the person or a subject the span names.
+    """Up to `MAX_KNOWN_FACTS` active facts about the person, the clone itself, or a subject
+    the span names. The clone's own facts are shown so that "no, blue hair" reuses the
+    relation "red hair" was filed under, and supersedes it.
 
     Both sides are folded (`fold_name`), so a subject stored decomposed is found in a span
     that writes it composed, and the reverse (#1899).
@@ -427,7 +444,7 @@ def _known_facts(lesson: Lesson) -> list[MemoryFact]:
     known = [
         fact
         for fact in lesson.memory.list_facts()
-        if (subject := fold_name(fact.subject)) == "user" or subject in text
+        if (subject := fold_name(fact.subject)) in (PERSON_SUBJECT, SELF_SUBJECT) or subject in text
     ]
     known.sort(key=lambda fact: (fact.created_at, fact.fact_id), reverse=True)
     return known[:MAX_KNOWN_FACTS]
@@ -505,7 +522,14 @@ def _curate(candidates: Sequence[_Candidate], kinds: set[str], lesson: Lesson) -
                 candidate.source,
             )
             continue
-        subject = person_subject(candidate.subject, lesson.person_names)
+        subject = fact_subject(candidate.subject, lesson.person_names, lesson.clone_names)
+        if subject == SELF_SUBJECT and candidate.source != "person":
+            logger.info(
+                "Clone %s: self fact dropped; self facts can only be grounded in person speech, not %r",
+                lesson.clone_id,
+                candidate.source,
+            )
+            continue
         relation = "_".join(candidate.relation.casefold().split())
         value = " ".join(candidate.value.split())
         keys = (subject.casefold(), relation, _value_key(value))

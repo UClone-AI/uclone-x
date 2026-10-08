@@ -81,7 +81,7 @@ STRUCTURES_DIRNAME = "structures"
 MUSE_DIRNAME = "muse"
 #: Where a skill package keeps its story data: `<skill>/resources/story/structures/*.yaml`
 #: and `<skill>/resources/story/muse/*.yaml`. `resources/` is the package folder
-#: `docs/skill-system-architecture.md` §2 names for templates. Kept as parts, not a relative
+#: the skill system architecture document names for templates. Kept as parts, not a relative
 #: `Path`, because it only ever means something joined onto a skill's own folder.
 SKILL_DATA_PARTS: tuple[str, ...] = ("resources", "story")
 

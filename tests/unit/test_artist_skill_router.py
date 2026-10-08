@@ -7,6 +7,7 @@ facts and records every request, so what is asserted is the request the model sa
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from collections.abc import AsyncIterator
@@ -17,11 +18,14 @@ from pydantic import BaseModel
 
 from uclone_x.agent.artist_skill_router import (
     CASE_SKILL_HEADER,
-    CASE_SKILLS,
+    CASE_SKILL_NAMES,
+    ROUTED_SKILL_TAG,
     RequestFacts,
     case_skill_section,
+    case_skill_texts,
     grounded_facts,
     is_follow_up,
+    latest_span_message,
     route_first_turn,
     route_follow_up,
 )
@@ -40,9 +44,18 @@ from uclone_x.llm.models import (
     TokenUsage,
     ToolCallRequest,
 )
+from uclone_x.skills.auditor import SkillRegistry, load_runtime_skill_registry
 from uclone_x.tools.base import BaseTool
+from uclone_x.tools.builtin.skill_loader import LoadSkillParams, LoadSkillTool
 from uclone_x.tools.models import ToolContext
 from uclone_x.tools.registry import ToolRegistry
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+#: The shipped skill store, loaded the way a head loads it: audited, and each package
+#: admitted only while its bytes match its pin in `SHIPPED_SKILL_PINS`.
+_STORE: SkillRegistry = asyncio.run(load_runtime_skill_registry(REPO_ROOT / "ucx-agent-skills"))
+CASE_SKILLS = case_skill_texts(_STORE)
 
 _PROV = Provenance(
     path=ExecutionPath.PRIMARY,
@@ -164,13 +177,66 @@ def test_each_culture_keeps_its_own_vocabulary_line() -> None:
     assert "hanfu" in chinese and "kimono" not in chinese and "hanbok" not in chinese
 
 
+def test_every_case_skill_is_read_from_the_pinned_store() -> None:
+    """The texts are store packages (#1865): all five load, pinned, and are tagged routed.
+
+    Killed by: src/uclone_x/agent/artist_skill_router.py ::         if skill is not None and skill.manifest.status is SkillStatus.ACTIVE:
+    Becomes:         if skill is not None and skill.manifest.status is not SkillStatus.ACTIVE:
+    """
+    assert tuple(CASE_SKILLS) == CASE_SKILL_NAMES
+    for name in CASE_SKILL_NAMES:
+        skill = _STORE.get(name)
+        assert skill is not None
+        assert skill.manifest.requires_tools == ("generate_image",)
+        assert ROUTED_SKILL_TAG in skill.manifest.tags
+        assert CASE_SKILLS[name] and not CASE_SKILLS[name].startswith("---")
+    assert case_skill_texts(None) == {}
+
+
+def test_the_literal_spec_leaves_the_negative_prompt_to_the_tool() -> None:
+    """H5 regression (#1865): without this line, 4 of 10 qwen3:8b runs at 50ec13fa stopped
+    at the 1500-token length cap with no tool call; with it, 10 of 10 called
+    (`docs/eval/runs/2026-09-28-artist-case-routing-judged/h5_ab_*.jsonl`).
+    """
+    text = CASE_SKILLS["art-literal-spec"]
+    assert (
+        "Leave negative_prompt empty unless the person asked for something to be left out" in text
+    )
+
+
+@pytest.mark.parametrize("name", CASE_SKILL_NAMES)
+def test_load_skill_refuses_a_case_routed_skill_in_plain_words(name: str) -> None:
+    """A case skill is handed over by code; the model cannot pull one in by name (#1865).
+
+    Killed by: src/uclone_x/tools/builtin/skill_loader.py ::         if ROUTED_SKILL_TAG in skill.manifest.tags:
+    Becomes:         if False:
+    """
+    tool = LoadSkillTool(_STORE, tool_scope=lambda: ("generate_image",))
+    context = ToolContext(agent_id="artist", session_id="s", workspace_root=Path("/tmp"))
+
+    with pytest.raises(ValueError) as refused:
+        asyncio.run(tool.run(LoadSkillParams(skill_name=name), context))
+    message = str(refused.value)
+    assert message == (
+        f"Skill '{name}' is added automatically when a request needs it, "
+        "so it cannot be loaded by name."
+    )
+    assert CASE_SKILLS[name] not in message
+    # An unrouted skill in the same store still loads under the same scope.
+    plain = _STORE.get("remote_gpu_recovery")
+    assert plain is not None
+    loaded = asyncio.run(tool.run(LoadSkillParams(skill_name="remote_gpu_recovery"), context))
+    assert loaded == plain.instructions_markdown
+
+
 def test_the_section_names_each_skill_and_says_the_person_wins() -> None:
-    section = case_skill_section(("art-literal-spec",))
+    section = case_skill_section(("art-literal-spec",), CASE_SKILLS)
 
     assert section.startswith(CASE_SKILL_HEADER)
     assert "[art-literal-spec]" in section and CASE_SKILLS["art-literal-spec"] in section
     assert "always wins" in section
-    assert case_skill_section(()) == ""
+    assert case_skill_section((), CASE_SKILLS) == ""
+    assert case_skill_section(("art-literal-spec",), {}) == ""
 
 
 # ------------------------------------------------------------------ in a turn
@@ -225,7 +291,13 @@ class _RoutingLLM(BaseLLMConnector):
         )
 
 
-def _agent(llm: BaseLLMConnector, tmp_path: Path, persona: str = "artist") -> BaseAgent:
+def _agent(
+    llm: BaseLLMConnector,
+    tmp_path: Path,
+    persona: str = "artist",
+    *,
+    skills: SkillRegistry | None = _STORE,
+) -> BaseAgent:
     registry = ToolRegistry()
     registry.register(_FakeGenerateImage())
     return BaseAgent(
@@ -238,16 +310,23 @@ def _agent(llm: BaseLLMConnector, tmp_path: Path, persona: str = "artist") -> Ba
         ),
         llm=llm,
         tools=registry,
+        skills=skills,
         context=AgentContext(agent_id="artist", session_id="s1", workspace_root=tmp_path),
-        personas=tuple(
+        personas=(
+            *(
+                PersonaDefinition(
+                    name=name,
+                    role=name,
+                    system_prompt=name,
+                    allowed_tools=("generate_image",),
+                    enable_write_tools=True,
+                )
+                for name in ("artist", "writer")
+            ),
+            # A clone whose range does not reach `generate_image`: never offered it.
             PersonaDefinition(
-                name=name,
-                role=name,
-                system_prompt=name,
-                allowed_tools=("generate_image",),
-                enable_write_tools=True,
-            )
-            for name in ("artist", "writer")
+                name="critic", role="critic", system_prompt="critic", allowed_tools=("file_read",)
+            ),
         ),
     )
 
@@ -277,6 +356,8 @@ async def test_the_skill_follows_the_latest_user_message_and_the_prefix_is_uncha
 
     Killed by: src/uclone_x/agent/turn_executor.py ::                     present_sections(undone_section, image_set_section, case_section)
     Becomes:                     present_sections(undone_section, image_set_section)
+    Killed by: src/uclone_x/agent/prompt_assembler.py ::             and ROUTED_SKILL_TAG not in s.manifest.tags
+    Becomes:             and True
     """
     routed = _RoutingLLM(_FACTS)
     unrouted = _RoutingLLM(LLMProviderError("connection refused"))
@@ -288,6 +369,9 @@ async def test_the_skill_follows_the_latest_user_message_and_the_prefix_is_uncha
     system, tools = _prefix(first)
     assert all(CASE_SKILL_HEADER not in s for s in system)
     assert all("art-literal-spec" not in d for _, d in tools)
+    # The store's other skills are listed; the case-routed ones are not (#1865).
+    assert any("media-character" in s for s in system)
+    assert all(name not in s for name in CASE_SKILL_NAMES for s in system)
 
     last = first.messages[-1]
     assert last.role is MessageRole.USER
@@ -332,7 +416,7 @@ async def test_a_second_turn_after_a_drawn_image_is_an_edit_without_extraction(
 @pytest.mark.asyncio
 async def test_a_failed_extraction_leaves_the_turn_as_it_was(tmp_path: Path) -> None:
     """Killed by: src/uclone_x/agent/base.py ::                 return None  # an unread request is drawn unrouted
-    Becomes:                 return case_skill_section(("art-brief-expansion",))
+    Becomes:                 return case_skill_section(("art-brief-expansion",), texts)
     """
     llm = _RoutingLLM(LLMProviderError("connection refused at 127.0.0.1:11434"))
     result = await _agent(llm, tmp_path).execute_turn("고양이 그려줘")
@@ -344,12 +428,197 @@ async def test_a_failed_extraction_leaves_the_turn_as_it_was(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
-async def test_other_personas_are_not_routed(tmp_path: Path) -> None:
-    """Killed by: src/uclone_x/agent/base.py ::         if llm is None or self._persona not in CASE_SKILL_PERSONAS:
-    Becomes:         if llm is None:
+async def test_another_clone_offered_generate_image_is_routed_and_not_told_it_is_artist(
+    tmp_path: Path,
+) -> None:
+    """Any clone offered `generate_image` gets the case skills, under a neutral header (#2091).
+
+    Killed by: src/uclone_x/agent/base.py ::         if llm is None:  # any clone offered generate_image is routed, not only the Artist
+    Becomes:         if llm is None or self._persona != "artist":
+    Killed by: src/uclone_x/agent/artist_skill_router.py :: CASE_SKILL_HEADER = "[Drawing Case Skills]"
+    Becomes: CASE_SKILL_HEADER = "[Artist Case Skills]"
     """
     llm = _RoutingLLM(_FACTS)
     await _agent(llm, tmp_path, persona="writer").execute_turn(_DETAILED)
 
+    assert len(llm.structured) == 1
+    content = llm.turns[0].messages[-1].content or ""
+    section = content[content.index(CASE_SKILL_HEADER) :]
+    assert "[art-literal-spec]" in section
+    assert "artist" not in section.lower()
+
+
+@pytest.mark.asyncio
+async def test_a_clone_not_offered_generate_image_is_not_routed(tmp_path: Path) -> None:
+    """With the persona gate gone, the offered tool is what decides: no extraction call.
+
+    Killed by: src/uclone_x/agent/base.py ::         if not any(tool.name == "generate_image" for tool in tool_defs):  # nothing to route for
+    Becomes:         if False:
+    """
+    llm = _RoutingLLM(_FACTS)
+    await _agent(llm, tmp_path, persona="critic").execute_turn(_DETAILED)
+
+    assert "generate_image" not in [d.name for d in llm.turns[0].tools]
     assert llm.structured == []
     assert all(CASE_SKILL_HEADER not in (m.content or "") for m in llm.turns[0].messages)
+
+
+@pytest.mark.asyncio
+async def test_an_agent_without_the_skill_store_is_not_routed(tmp_path: Path) -> None:
+    """No store, no case texts: no extraction call is spent on a section that cannot exist.
+
+    Killed by: src/uclone_x/agent/base.py ::         if not texts:
+    Becomes:         if False:
+    """
+    llm = _RoutingLLM(_FACTS)
+    await _agent(llm, tmp_path, skills=None).execute_turn(_DETAILED)
+
+    assert llm.structured == []
+    assert all(CASE_SKILL_HEADER not in (m.content or "") for m in llm.turns[0].messages)
+
+
+# ------------------------------------------------------------------ in a room
+
+
+def test_the_latest_message_of_a_room_span_is_read_without_its_sender() -> None:
+    span = (
+        "[...2 earlier messages in this room are not shown]\n"
+        "[critic]: 금발에 파란 눈이면 좋겠어요\n"
+        "[user]: 고양이 그려줘\n배경은 하얗게"
+    )
+
+    assert latest_span_message(span) == "고양이 그려줘\n배경은 하얗게"
+    assert latest_span_message("고양이 그려줘") == "고양이 그려줘"
+
+
+def test_the_latest_message_of_a_room_span_reads_the_newest_user_message_even_when_another_clone_spoke_after() -> (
+    None
+):
+    """In a room, another clone's message does not steer routing (#1865).
+
+    Killed by: src/uclone_x/agent/artist_skill_router.py :: if _is_person(sender):
+    Becomes: if False:
+    """
+    span = (
+        "[...2 earlier messages in this room are not shown]\n"
+        "[user]: 고양이 그려줘\n배경은 하얗게\n"
+        "[critic]: 금발에 파란 눈이면 좋겠어요"
+    )
+    assert latest_span_message(span) == "고양이 그려줘\n배경은 하얗게"
+    assert latest_span_message(span, person_names=("user",)) == "고양이 그려줘\n배경은 하얗게"
+    assert latest_span_message(span, person_names=("kenny",)) == "금발에 파란 눈이면 좋겠어요"
+
+    span_with_custom_name = (
+        "[...2 earlier messages in this room are not shown]\n"
+        "[kenny]: 강아지 그려줘\n"
+        "[critic]: 고양이 그려줘"
+    )
+    assert latest_span_message(span_with_custom_name, person_names=("kenny",)) == "강아지 그려줘"
+
+
+@pytest.mark.asyncio
+async def test_in_a_room_only_the_latest_message_grounds_the_route(tmp_path: Path) -> None:
+    """An earlier speaker's details are not this request's (#1865).
+
+    The span holds a critic's line with every quoted detail; the latest message is a
+    two-word brief. Grounded against the whole span, five details survive and the turn
+    is routed as a detailed specification; against the latest message, none do.
+
+    Killed by: src/uclone_x/agent/base.py ::             message = latest_span_message(message, self._turn_person_names)
+    Becomes:             message = message
+    """
+    span = f"[critic]: {_DETAILED}\n[user]: 고양이 그려줘"
+    llm = _RoutingLLM(_FACTS)
+    await _agent(llm, tmp_path).execute_turn(span, room_id="room-1")
+
+    assert [m.content for m in llm.structured[0].messages][-1] == "고양이 그려줘"
+    content = llm.turns[0].messages[-1].content or ""
+    assert "[art-brief-expansion]" in content
+    assert "[art-literal-spec]" not in content
+
+
+@pytest.mark.asyncio
+async def test_in_a_room_another_clone_speaking_after_user_does_not_steer_routing(
+    tmp_path: Path,
+) -> None:
+    """An intervening clone's words do not decide which case skill gets routed (#1865)."""
+    span = f"[user]: 고양이 그려줘\n[critic]: {_DETAILED}"
+    llm = _RoutingLLM(_FACTS)
+    await _agent(llm, tmp_path).execute_turn(span, room_id="room-1")
+    assert [m.content for m in llm.structured[0].messages][-1] == "고양이 그려줘"
+
+
+# ------------------------------------------------------------------ beside an image set
+
+
+class _SetLLM(_RoutingLLM):
+    """`_RoutingLLM`, with the image-set planning call answered by `plan` (or raising)."""
+
+    def __init__(self, plan: str | Exception) -> None:
+        super().__init__(_FACTS)
+        self._plan = plan
+        self.plans = 0
+
+    async def generate(self, request: LLMRequest) -> ModelResponse:
+        schema = request.response_schema
+        if schema is not None and "medium_quote" not in str(schema.get("properties")):
+            self.plans += 1
+            if isinstance(self._plan, Exception):
+                raise self._plan
+            return _reply(self._plan)
+        return await super().generate(request)
+
+
+_SET_ASK = "고양이로 다양한 포즈 3장 그려줘"
+_SET_PLAN = json.dumps(
+    {
+        "shared": ["cat"],
+        "style": ["anime coloring"],
+        "variants": [
+            {
+                "subject": [],
+                "action": [f"pose {i}"],
+                "expression": ["calm"],
+                "location": ["garden"],
+                "camera": ["full body"],
+            }
+            for i in range(3)
+        ],
+    }
+)
+
+
+@pytest.mark.asyncio
+async def test_a_failed_plan_still_routes_the_case_skills(tmp_path: Path) -> None:
+    """Review of #1966: a failed plan's note names no prompts, so it must not cost the routing.
+
+    Killed by: src/uclone_x/agent/turn_executor.py :: if image_set_section is not None and is_planned_set(image_set_section):
+    Becomes: if image_set_section:
+    """
+    llm = _SetLLM(LLMProviderError("connection refused at 127.0.0.1:11434"))
+    result = await _agent(llm, tmp_path).execute_turn(_SET_ASK)
+
+    assert result.is_completed and result.error is None
+    assert llm.plans == 1
+    assert len(llm.structured) == 1  # the extraction ran as well
+    content = llm.turns[0].messages[-1].content or ""
+    assert "[Image Set Request (3 images)]" in content
+    assert "[art-brief-expansion]" in content
+
+
+@pytest.mark.asyncio
+async def test_a_planned_set_is_not_routed_as_well(tmp_path: Path) -> None:
+    """A plan carries its own prompts; routing it too would spend an extraction call on it.
+
+    Killed by: src/uclone_x/agent/image_set_planner.py ::     return section.startswith(_PLAN_HEADING)
+    Becomes:     return False
+    """
+    llm = _SetLLM(_SET_PLAN)
+    result = await _agent(llm, tmp_path).execute_turn(_SET_ASK)
+
+    assert result.is_completed and result.error is None
+    assert llm.plans == 1
+    assert llm.structured == []
+    content = llm.turns[0].messages[-1].content or ""
+    assert "[Image Set Plan]" in content
+    assert CASE_SKILL_HEADER not in content

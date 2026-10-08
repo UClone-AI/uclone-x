@@ -14,11 +14,17 @@
  * `Killed by:` declaration must be able to name one of these lines exactly once.
  */
 
-/** The kit's root, as Vite's glob keys paths relative to `src`. */
+/**
+ * The kit's root, as Vite's glob keys paths relative to `src`.
+ * Exported: checked by tests asserting paths within the kit boundary (ui-kit.test.ts).
+ */
 export const KIT_ROOT = './ui-kit/';
 
-/** The one package the kit may import. Exact: `react-dom` or `react/jsx-runtime` is not it. */
-export const KIT_ALLOWED_PACKAGES: ReadonlySet<string> = new Set(['react']);
+/**
+ * The one package the kit may import. Exact: `react-dom` or `react/jsx-runtime` is not it.
+ * Internal to kitBoundary: used by isAllowedImport (#1295).
+ */
+const KIT_ALLOWED_PACKAGES: ReadonlySet<string> = new Set(['react']);
 
 const BLOCK_COMMENT = /\/\*[\s\S]*?\*\//g;
 const LINE_COMMENT = /(?<!:)\/\/.*$/gm;
@@ -41,18 +47,27 @@ const SPECIFIER_FORMS: readonly RegExp[] = [
  */
 const UNREADABLE_FORMS: readonly RegExp[] = [/\bimport\s*\(\s*(?!['"])/, /\bimport\.meta\b/];
 
-/** `source` with its comments removed, so a comment that mentions an import is not one. */
-export const withoutComments = (source: string): string =>
+/**
+ * `source` with its comments removed, so a comment that mentions an import is not one.
+ * Internal helper for importSpecifiers and kitBoundaryOffences (#1295).
+ */
+const withoutComments = (source: string): string =>
   source.replace(BLOCK_COMMENT, '').replace(LINE_COMMENT, '');
 
-/** Every module specifier `source` names, in the order the forms find them. */
+/**
+ * Every module specifier `source` names, in the order the forms find them.
+ * Exported: imported and exercised by ui-kit.test.ts.
+ */
 export const importSpecifiers = (source: string): string[] => {
   const code = withoutComments(source);
   return SPECIFIER_FORMS.flatMap((form) => [...code.matchAll(form)].map((match) => match[1]));
 };
 
-/** `spec`, relative to the file at `path`, as a normalised `./`-rooted path. */
-export const resolveRelative = (path: string, spec: string): string => {
+/**
+ * `spec`, relative to the file at `path`, as a normalised `./`-rooted path.
+ * Internal helper for isAllowedImport (#1295).
+ */
+const resolveRelative = (path: string, spec: string): string => {
   const parts = path.split('/').slice(0, -1);
   for (const segment of spec.split('/')) {
     if (segment === '..') parts.pop();
@@ -61,7 +76,10 @@ export const resolveRelative = (path: string, spec: string): string => {
   return `${parts.join('/')}/`.replace(/^(?!\.\/)/, './');
 };
 
-/** Whether the file at `path` may import `spec`. */
+/**
+ * Whether the file at `path` may import `spec`.
+ * Exported: imported and exercised by ui-kit.test.ts.
+ */
 export const isAllowedImport = (path: string, spec: string): boolean => {
   if (KIT_ALLOWED_PACKAGES.has(spec)) return true;
   if (!spec.startsWith('.')) return false;
@@ -73,6 +91,8 @@ export const isAllowedImport = (path: string, spec: string): boolean => {
  *
  * Taking the sources as an argument is what lets the rule be tested on planted files: the live
  * scan passes Vite's glob of the real kit, and the cases in `ui-kit.test.ts` pass fixtures.
+ *
+ * Exported: imported and exercised by ui-kit.test.ts.
  */
 export const kitBoundaryOffences = (sources: Record<string, string>): string[] =>
   Object.entries(sources)

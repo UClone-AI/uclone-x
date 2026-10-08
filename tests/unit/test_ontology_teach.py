@@ -13,7 +13,6 @@ from uclone_x.ontology.engine import OntologyEngine
 from uclone_x.ontology.models import (
     OntologyAxiom,
     OntologyConcept,
-    OntologyInvariant,
     OntologyRelation,
     OntologyTier,
 )
@@ -22,11 +21,11 @@ runner = CliRunner()
 
 
 def test_teach_directive_structured_constraint_grpc_mtls() -> None:
-    """Structured constraint directive parses into an OntologyInvariant / OntologyAxiom without junk concepts."""
+    """Structured constraint directive parses into an OntologyAxiom without junk concepts."""
     engine = OntologyEngine(agent_id="agt_sec")
     result = engine.teach_directive("all internal gRPC calls must use mTLS encryption")
 
-    assert isinstance(result, OntologyInvariant)
+    assert isinstance(result, OntologyAxiom)
     assert isinstance(result, OntologyAxiom)
     assert result.name == "all_internal_grpc_calls_must_use_mtls_encryption"
     assert result.subject_entity == "internal gRPC calls"
@@ -47,7 +46,7 @@ def test_teach_directive_whenever_trigger() -> None:
     engine = OntologyEngine()
     result = engine.teach_directive("whenever token expires, refresh token")
 
-    assert isinstance(result, OntologyInvariant)
+    assert isinstance(result, OntologyAxiom)
     assert result.name == "whenever_token_expires_refresh_token"
     assert result.subject_entity == "token expires"
     assert result.predicate == "triggers"
@@ -61,7 +60,7 @@ def test_teach_directive_requires_rule() -> None:
     engine = OntologyEngine()
     result = engine.teach_directive("Deployment requires replicas")
 
-    assert isinstance(result, OntologyInvariant)
+    assert isinstance(result, OntologyAxiom)
     assert result.name == "deployment_requires_replicas"
     assert result.subject_entity == "Deployment"
     assert result.predicate == "requires"

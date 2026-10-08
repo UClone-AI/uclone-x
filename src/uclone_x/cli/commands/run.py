@@ -28,9 +28,12 @@ from uclone_x.agent.models import (
     AgentState,
     TurnResult,
 )
+from uclone_x.agent.persona_store import DEFAULT_PERSONA_NAME
 from uclone_x.agent.prompts import compose_system_prompt
 from uclone_x.agent.session import SessionStore
-from uclone_x.core.agent_home import AgentHomeError
+from uclone_x.agent.tools_module import UnknownToolsModuleError
+from uclone_x.cli.remedies import PROVIDER_FAILURE_REMEDIES, provider_key_remedy
+from uclone_x.core.agent_home import AgentHomeError, seat_id_for
 from uclone_x.core.failure_journal import record_failure
 from uclone_x.core.set_aside import SESSION_SET_ASIDE_NOTICE
 from uclone_x.engine.event_bus import EventBus
@@ -41,16 +44,16 @@ from uclone_x.errors import (
     RoomError,
     SessionIdCollisionError,
 )
+from uclone_x.i18n.refusals import head_language, refusal_text
 from uclone_x.llm.connectors.factory import (
     bind_image_engine_settings,
     create_llm_connector,
     model_env_override,
     saved_choice_in_effect,
 )
-from uclone_x.llm.connectors.saved_choice import describe_saved_choice
+from uclone_x.llm.connectors.saved_choice import describe_saved_choice, settings_data
 from uclone_x.llm.models import MessageRole
 from uclone_x.llm.protocols import LLMProviderProtocol
-from uclone_x.llm.providers import PROVIDERS, env_key
 from uclone_x.room.one_seat import HeadTurn, open_head_room, record_head_turn
 from uclone_x.room.store import RoomStore
 from uclone_x.sandbox.models import NoIsolation, WorkspaceIsolation
@@ -78,7 +81,7 @@ FAILED_TURN_EXIT_CODE = 1
 """Exit status of `ucx run --prompt` when the turn failed (#953).
 
 The same status the command already used for an LLM setup error, and the one the room
-commands use for a refusal. Documented in `docs/cli-specification.md`.
+commands use for a refusal. Documented in `docs/public/cli.md`.
 """
 
 UNSAVED_SESSION_EXIT_CODE = 3
@@ -132,37 +135,22 @@ def _blocked_by_hook(result: TurnResult) -> bool:
     return result.stop_reason == "blocked_by_hook"
 
 
-#: Where to act on a model without tool support, on the command line. The Core's sentence
-#: says which model to pick and leaves where to the head (P8); here it is the flag.
-MODEL_WITHOUT_TOOLS_REMEDY = "Choose it with --model."
+def turn_error_text(result: TurnResult) -> str | None:
+    """The turn's error in the person's language (#1862).
 
-#: Where to act on a hosted provider's failure, on the command line (#1630). The Core's
-#: sentence says what stopped and whose side it is on; this says where to change it.
-PROVIDER_FAILURE_REMEDIES: dict[str, str] = {
-    "model_without_tools": MODEL_WITHOUT_TOOLS_REMEDY,
-    # Worded for both a model the provider no longer serves and one never chosen.
-    "model_unavailable": "Choose a model with --model.",
-    "provider_auth": "Save a new key with `ucx key set <provider>`.",
-    "provider_unreachable": "If you set a custom endpoint, check that address too.",
-}
-
-
-def provider_key_remedy(provider: str | None) -> str:
-    """Where to put a new key for `provider` (a display name, as failures carry it).
-
-    A rejected key is the case the connector's own "no key" error never reaches -- the key
-    is set, just wrong -- so the remedy names where *this* key came from: the variable,
-    when one is set (it outranks the saved key, so saving another would change nothing),
-    else the command that saves one for this provider. The provider is looked up in the
-    provider table by its display name.
+    A refused step carries a code, and is said from the catalog of the language the saved
+    `ui_language` choice resolves to here. Every other error is Core's sentence, unchanged.
     """
-    spec = next((s for s in PROVIDERS.values() if s.display_name == provider), None)
-    if spec is None or not spec.key_env_vars:
-        return PROVIDER_FAILURE_REMEDIES["provider_auth"]
-    overriding = env_key(spec.id)
-    if overriding is not None:
-        return f"Set a new key in {overriding[1]}."
-    return f"Save a new key with `ucx key set {spec.id}`."
+    if result.error_code is None:
+        return result.error
+    return refusal_text(result.error_code, head_language(settings_data()))
+
+
+def tick_error_text(tick: LoopTickResult) -> str | None:
+    """A loop tick's error, translated as `turn_error_text` translates a turn's."""
+    if tick.turn is not None and tick.turn.error_code is not None:
+        return turn_error_text(tick.turn)
+    return tick.error
 
 
 def _turn_failure(result: TurnResult) -> str | None:
@@ -170,9 +158,10 @@ def _turn_failure(result: TurnResult) -> str | None:
     remedy = PROVIDER_FAILURE_REMEDIES.get(result.stop_reason or "")
     if result.stop_reason == "provider_auth" and result.provider_failure is not None:
         remedy = provider_key_remedy(result.provider_failure.provider)
-    if result.error is not None and remedy is not None:
-        return f"{result.error} {remedy}"
-    return result.error
+    error = turn_error_text(result)
+    if error is not None and remedy is not None:
+        return f"{error} {remedy}"
+    return error
 
 
 def report_set_aside(store: SessionStore, session_id: str, out: Console) -> bool:
@@ -436,7 +425,7 @@ def own_model_notice(agent_name: str, sent: str | None, saved: str | None) -> st
 
 
 async def run_agent_repl_async(
-    agent_name: str = "default",
+    agent_name: str = DEFAULT_PERSONA_NAME,
     provider: str | None = None,
     model: str | None = None,
     system_prompt: str | None = None,
@@ -473,15 +462,9 @@ async def run_agent_repl_async(
         notices.print(f"[dim]{escape(saved_notice)}[/dim]")
     llm = create_llm_connector(provider=provider, model=model, fallback_to_mock=False)
     active_tools = tools if tools is not None else create_default_registry()
-    # The session root's picture settings; under `auto`, Gemini draws only when this
-    # run's chat provider is Gemini and no local engine is ready.
-    # A Gemini chat's address is the pictures' address too (#1769).
-    bind_image_engine_settings(
-        active_tools.get("generate_image"),
-        None,
-        llm.provider_name,
-        llm.base_url if llm.provider_name == "gemini" else None,
-    )
+    # The session root's picture connections and models (model-gateway §3.5): under
+    # `auto`, the cloud draws only when no own engine is ready, whatever this run chats with.
+    bind_image_engine_settings(active_tools.get("generate_image"), None)
     exporter = create_telemetry_exporter()
     tracer = TelemetryTracer()
 
@@ -512,11 +495,16 @@ async def run_agent_repl_async(
     effective_workspace = (
         Path(workspace_dir).resolve() if workspace_dir is not None else Path.cwd().resolve()
     )
-    from uclone_x.agent.clone_builder import build_clone, local_app_scope, saved_models
+    from uclone_x.agent.clone_builder import build_clone, command_gateway, local_app_scope
+    from uclone_x.agent.persona_registry import get_default_persona_registry
     from uclone_x.skills.auditor import load_runtime_skill_registry
 
     rooms = room_store if room_store is not None else RoomStore()
-    room = open_head_room(agent_name, session_id, head="run", store=rooms)
+    # `--agent` is a handle; the seat and the memory are keyed by its clone's id (§4 step
+    # 3). The registry brings the clones up first (clone-data-scopes §3.8).
+    get_default_persona_registry(effective_workspace)
+    clone_id = seat_id_for(agent_name)
+    room = open_head_room(clone_id, session_id, head="run", store=rooms)
     if room.created and session_id is None:
         notices.print(
             f"[dim]New conversation [bold]{escape(room.room_id)}[/bold]; "
@@ -524,7 +512,7 @@ async def run_agent_repl_async(
         )
 
     def _record(turn: HeadTurn, out: Console) -> None:
-        record_in_room(rooms, room_id=room.room_id, clone_id=agent_name, turn=turn, out=out)
+        record_in_room(rooms, room_id=room.room_id, clone_id=clone_id, turn=turn, out=out)
 
     # Built as the desktop app builds the same clone (#1731): an agent name that is a
     # persona answers as that persona, with its memory, its tools and host binding.
@@ -533,7 +521,7 @@ async def run_agent_repl_async(
             workspace_root=effective_workspace,
             llm=llm,
             tools=active_tools,
-            global_models=saved_models(effective_model),
+            gateway=command_gateway(llm, effective_model),
             bus=bus,
             tracer=tracer,
             store=session_store,
@@ -541,10 +529,10 @@ async def run_agent_repl_async(
             # has no `load_skill`, and the skills the image tools name cannot be read.
             skills=await load_runtime_skill_registry(),
         ),
-        clone_id=agent_name,
+        clone_id=clone_id,
         session_id=room.session_id,
         # `--model` wins over a persona's own model, as a model asked for in the app does;
-        # the saved choice only fills what the persona leaves empty (`saved_models`).
+        # the saved choice only fills what the persona leaves empty (`command_gateway`).
         model_name=model,
         fallback_prompt=default_system,
         config_update={"isolation": isolation_policy},
@@ -726,7 +714,7 @@ async def run_agent_repl_async(
             )
         else:
             console.print(
-                f"[{status_color}]✖ Error: {escape(result.error or 'unknown error')}[/{status_color}]"
+                f"[{status_color}]✖ Error: {escape(tick_error_text(result) or 'unknown error')}[/{status_color}]"
             )
         if job.status == LoopStatus.COMPLETED:
             console.print(f"[bold green]✔ Loop '{escape(job.job_id)}' completed.[/bold green]")
@@ -1061,7 +1049,7 @@ async def run_agent_repl_async(
 
 
 def run_agent_repl(
-    agent_name: str = "default",
+    agent_name: str = DEFAULT_PERSONA_NAME,
     provider: str | None = None,
     model: str | None = None,
     system_prompt: str | None = None,
@@ -1126,6 +1114,11 @@ def run_agent_repl(
             f"[dim]{escape(str(exc))}[/dim]"
         )
         raise typer.Exit(code=2) from exc
+    except UnknownToolsModuleError as exc:
+        # The clone's file names a tools module this version lacks (#2188). Its sentence
+        # is written for the person; the class, the paths and the frames are not.
+        err_console.print(str(exc), markup=False, highlight=False)
+        raise typer.Exit(code=1) from exc
     except LLMError as exc:
         # `LLMError`, not `LLMProviderError`: those two are **siblings**, and a missing
         # credential raises `LLMCredentialsNotConfiguredError`. Catching only the

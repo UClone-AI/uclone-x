@@ -2,15 +2,15 @@
 
 What these pin:
 
-* **Lookup order**: a picture chosen in the workspace wins; otherwise the one beside the
-  loaded definition; otherwise the one shipped beside the built-in of that name. The last
-  is what keeps an edited built-in's picture: editing moves its definition into the
-  workspace, and the picture used to be looked for only beside the definition.
+* **Lookup order**: a picture chosen in the clone's directory wins; otherwise the one
+  shipped beside the built-in of that handle. The last is what keeps an edited built-in's
+  picture: a workspace edit of a built-in is imported as a clone of its own (2026-09-27,
+  clone-data-scopes §3.8 step 2), and it still shows the shipped face.
 * **Only pictures**: the bytes decide, not the name. SVG and an HTML page named `.png` are
   refused, and so is anything over 10 MiB.
 * **One picture per clone**: setting a picture in another format removes the old one, so
-  lookup order cannot bring it back; the replaced one is kept as `<name>.prev.<ext>`, one
-  deep.
+  lookup order cannot bring it back; the replaced one is kept as `avatar.prev.<ext>` in the
+  clone's directory, one deep.
 * **Reset** puts the chosen picture aside and the shipped one shows again.
 * **Version** changes when the picture does, so the head's `?v=` address changes.
 * **Change order** is the store's (#1809): every change gets the next id, counted on disk so
@@ -41,7 +41,8 @@ from uclone_x.agent.persona_avatar import (
     sniff_image_format,
 )
 from uclone_x.agent.persona_registry import BUILTIN_PERSONAS_DIR, PersonaRegistry
-from uclone_x.agent.persona_store import PersonaLoadError
+from uclone_x.agent.persona_store import PersonaLoadError, persona_from_mapping
+from uclone_x.core.agent_home import AgentHome, default_agents_root
 from uclone_x.tools.builtin.filesystem import FileWriteTool
 from uclone_x.tools.builtin.image import GenerateImageTool, ImagePipelineDispatcher
 from uclone_x.tools.models import NoIsolation, ToolContext
@@ -80,12 +81,17 @@ def _store(workspace: Path) -> PersonaAvatarStore:
     return PersonaAvatarStore(PersonaRegistry(workspace_root=workspace))
 
 
+def _home(name: str) -> Path:
+    """The clone directory of `name`, where its chosen and replaced pictures are kept."""
+    return AgentHome.for_handle(name).path
+
+
 class TestLookup:
     def test_an_edited_builtin_keeps_its_shipped_picture(self, tmp_path: Path) -> None:
-        """D1: the override moves the definition to the workspace; the picture stays shipped.
+        """D1: the workspace edit is imported as its own clone; the picture stays shipped.
 
-        Killed by: src/uclone_x/agent/persona_avatar.py :: folders.append((BUILTIN_PERSONAS_DIR, name))
-        Becomes: folders.append((source.parent, name))
+        Killed by: src/uclone_x/agent/persona_avatar.py :: template = record.template or (name if self._registry.has_builtin(name) else None)
+        Becomes: template = record.template
         """
         _install(tmp_path, "writer")
 
@@ -104,7 +110,7 @@ class TestLookup:
         found = store.find("artist")
 
         assert found is not None
-        assert found.path == tmp_path / PERSONAS / "artist.jpg"
+        assert found.path == _home("artist") / "avatar.jpg"
         assert found.path.read_bytes() == JPEG
 
     def test_a_name_no_clone_carries_has_no_picture(self, tmp_path: Path) -> None:
@@ -114,25 +120,36 @@ class TestLookup:
 
         assert _store(tmp_path).find("nobody") is None
 
-    def test_a_name_that_climbs_out_of_the_folder_writes_nothing(self, tmp_path: Path) -> None:
-        """A path is built from a name only once the name is a loaded clone (#1772).
+    def test_a_name_that_climbs_out_of_the_folder_writes_nothing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A path is built only inside a clone's own directory, never from a name (#1772).
 
-        Killed by: src/uclone_x/agent/persona_avatar.py :: if self._registry.source_of(name) is None:  # only a loaded clone's name makes a path
-        Becomes: if False:
+        Since 2026-09-27 the folder is the one the clone record names, so a name no clone
+        carries has no folder at all.
+
+        Killed by: src/uclone_x/agent/persona_avatar.py :: return record.path if record is not None else None
+        Becomes: return record.path if record is not None else Path(name)
         """
         _install(tmp_path, "surveyor")
         store = _store(tmp_path)
+        (tmp_path / "here").mkdir()
+        monkeypatch.chdir(tmp_path / "here")
 
         with pytest.raises(AvatarPersonaNotFound) as refused:
             store.set("../escape", PNG)
 
         assert refused.value.reason_code == "no_clone"
         assert not (tmp_path / ".uclone" / "escape.png").exists()
+        assert not (tmp_path / "escape").exists()
+        assert not list(default_agents_root().glob("avatar.*"))
 
     def test_a_kept_picture_cannot_be_taken_for_another_clone(self, tmp_path: Path) -> None:
         """`writer.prev.png` is writer's kept picture, never a clone named `writer.prev` (#1772).
 
         The loader refuses a name with a dot, so no clone can be named after a kept copy.
+        Since 2026-09-27 a workspace file is imported rather than loaded in place, and a
+        refused one is reported, not raised: the registry simply has no such clone.
 
         Killed by: src/uclone_x/agent/persona_store.py :: refuse_an_unusable_username(persona_name)
         Becomes: pass
@@ -141,11 +158,12 @@ class TestLookup:
         store = _store(tmp_path)
         store.set("surveyor", PNG)
         store.set("surveyor", JPEG)
-        assert store.previous("surveyor") == tmp_path / PERSONAS / "surveyor.prev.png"
+        assert store.previous("surveyor") == _home("surveyor") / "avatar.prev.png"
 
-        _install(tmp_path, "surveyor.prev")
+        definition = _install(tmp_path, "surveyor.prev")
         with pytest.raises(PersonaLoadError, match="surveyor.prev"):
-            PersonaRegistry(workspace_root=tmp_path).get_persona("surveyor.prev")
+            persona_from_mapping(yaml.safe_load(definition.read_text()), definition)
+        assert PersonaRegistry(workspace_root=tmp_path).get_persona("surveyor.prev") is None
 
     def test_the_url_carries_the_version_and_is_null_without_a_picture(
         self, tmp_path: Path
@@ -157,7 +175,7 @@ class TestLookup:
         store.set("surveyor", PNG)
         record = store.find("surveyor")
         assert record is not None
-        assert avatar_url("surveyor", record) == f"/api/personas/surveyor/avatar?v={record.version}"
+        assert avatar_url("surveyor", record) == f"/api/clones/surveyor/avatar?v={record.version}"
 
 
 class TestSet:
@@ -224,7 +242,7 @@ class TestSet:
         found = store.find("surveyor")
         assert found is not None
         assert (found.mime, found.path.read_bytes()) == ("image/jpeg", JPEG)
-        assert not (tmp_path / PERSONAS / "surveyor.png").exists()
+        assert not (_home("surveyor") / "avatar.png").exists()
 
     def test_the_replaced_picture_is_kept_one_deep(self, tmp_path: Path) -> None:
         """Killed by: src/uclone_x/agent/persona_avatar.py :: replaced = self._keep_previous(name, current[0]) if current else None
@@ -236,13 +254,13 @@ class TestSet:
         store = _store(tmp_path)
         store.set("surveyor", PNG)
         store.set("surveyor", JPEG)
-        assert store.previous("surveyor") == tmp_path / PERSONAS / "surveyor.prev.png"
+        assert store.previous("surveyor") == _home("surveyor") / "avatar.prev.png"
 
         store.set("surveyor", GIF)
 
-        kept = sorted(p.name for p in (tmp_path / PERSONAS).glob("surveyor.prev.*"))
-        assert kept == ["surveyor.prev.jpg"]
-        assert (tmp_path / PERSONAS / "surveyor.prev.jpg").read_bytes() == JPEG
+        kept = sorted(p.name for p in _home("surveyor").glob("avatar.prev.*"))
+        assert kept == ["avatar.prev.jpg"]
+        assert (_home("surveyor") / "avatar.prev.jpg").read_bytes() == JPEG
 
     def test_the_version_changes_when_the_picture_does(self, tmp_path: Path) -> None:
         """Killed by: src/uclone_x/agent/persona_avatar.py :: version=f"{stat.st_mtime_ns}-{stat.st_size}"
@@ -291,8 +309,8 @@ class TestChangeOrder:
     def test_the_count_survives_a_new_store(self, tmp_path: Path) -> None:
         """A restart builds a new store; the ids go on rather than starting again.
 
-        Killed by: src/uclone_x/agent/persona_avatar.py :: replace_file(_change_file(folder, name),
-        Becomes: (_change_file(folder, name),
+        Killed by: src/uclone_x/agent/persona_avatar.py :: replace_file(_change_file(folder),
+        Becomes: (_change_file(folder),
         """
         _install(tmp_path, "surveyor")
         _store(tmp_path).set("surveyor", PNG)
@@ -309,8 +327,8 @@ class TestChangeOrder:
         """The id is counted before the picture is written, so a write that fails (or a crash)
         after `.prev` moved cannot leave an older Undo matching a picture it no longer describes.
 
-        Killed by: src/uclone_x/agent/persona_avatar.py :: replace_file(_change_file(folder, name),
-        Becomes: (_change_file(folder, name),
+        Killed by: src/uclone_x/agent/persona_avatar.py :: replace_file(_change_file(folder),
+        Becomes: (_change_file(folder),
         """
         _install(tmp_path, "surveyor")
         store = _store(tmp_path)
@@ -409,7 +427,7 @@ class TestReset:
 
         kept = store.reset("artist").previous
 
-        assert kept == tmp_path / PERSONAS / "artist.prev.jpg"
+        assert kept == _home("artist") / "avatar.prev.jpg"
         assert kept is not None and kept.read_bytes() == JPEG
         found = store.find("artist")
         assert found is not None

@@ -1,12 +1,13 @@
 """The single source for what UClone-X answers of the Agent Client Protocol.
 
-`docs/acp-protocol-spec.md` §3.3 states the requirement this module exists to meet:
+The ACP protocol specification (summarised in `docs/public/protocols.md`) states the
+conformance requirement this module exists to meet:
 
 > A hardcoded capability block is the mechanism by which a conformance claim becomes false
 > without anyone editing a document — so the capability response must be derived from the
 > same source as this table, not written in parallel with it.
 
-So the table in §2 and §4 of that document and this registry are checked against each other
+So that document's method tables and this registry are checked against each other
 by `tests/unit/test_acp_conformance.py`, and `initialize` will derive its capability response
 from `implemented()` rather than from a literal. A row cannot become *Implemented* here
 without the document saying so in the same change, and vice versa.
@@ -99,7 +100,7 @@ class AcpMethod(BaseModel):
     )
     note: str = ""
     spec_section: str | None = Field(
-        default=None, description="Section of docs/acp-protocol-spec.md that governs this row."
+        default=None, description="Section of the ACP protocol specification that governs this row."
     )
 
     @model_validator(mode="after")

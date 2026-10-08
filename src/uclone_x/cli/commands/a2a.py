@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any
 
@@ -10,6 +11,7 @@ import typer
 from rich.console import Console
 
 from uclone_x.a2a.models import AgentCard
+from uclone_x.agent.persona_store import DEFAULT_PERSONA_NAME
 from uclone_x.engine.event_bus import EventBus
 
 if TYPE_CHECKING:
@@ -78,12 +80,19 @@ def a2a_turn_recorder(clone_id: str, room_store: RoomStore | None = None) -> A2A
 
     store = room_store if room_store is not None else RoomStore()
 
-    def record(context_id: str, prompt: str, outcome: TurnResult | A2ATurnFailure) -> None:
+    def record(
+        context_id: str,
+        prompt: str,
+        outcome: TurnResult | A2ATurnFailure,
+        session_set_aside: bool = False,
+    ) -> None:
         turn = (
             HeadTurn.failed(prompt, outcome.cause, completed=outcome.completed)
             if isinstance(outcome, A2ATurnFailure)
             else HeadTurn.from_result(prompt, outcome)
         )
+        # The row says its save kept a record aside, as `ucx run`/`loop`/ACP rows do (#1921).
+        turn = replace(turn, session_set_aside=session_set_aside)
         record_head_turn(
             store,
             room_id=a2a_room_id(clone_id, context_id),
@@ -112,7 +121,7 @@ def a2a_person_names(clone_id: str, room_store: RoomStore | None = None) -> A2AP
 def start_a2a_server(
     host: str = "127.0.0.1",
     port: int = 8080,
-    agent_id: str = "default",
+    agent_id: str = DEFAULT_PERSONA_NAME,
     agent_card_path: Path | None = None,
     dev: bool = False,
 ) -> None:
@@ -161,9 +170,11 @@ def start_a2a_server(
             feature="A2A gateway server (ucx a2a serve)",
         ) from exc
 
-    from uclone_x.agent.clone_builder import local_app_scope, memory_map
+    from uclone_x.agent.clone_builder import check_tools_module, local_app_scope, memory_map
     from uclone_x.agent.session import SessionStore
+    from uclone_x.agent.tools_module import UnknownToolsModuleError
     from uclone_x.cli.agent_memory import memory_for_agent_id
+    from uclone_x.core.agent_home import seat_id_for
     from uclone_x.llm.connectors.factory import create_llm_connector, saved_choice_notice
     from uclone_x.shells.a2a_server import A2AServer
     from uclone_x.skills.auditor import load_runtime_skill_registry
@@ -175,9 +186,7 @@ def start_a2a_server(
         # stderr, as ACP does: what the server says to its caller stays on its own channel.
         Console(stderr=True).print(saved_notice, markup=False, highlight=False)
     llm = create_llm_connector(fallback_to_mock=True)
-    # One store per clone id, opened now so a bad `--agent-id` exits 2.
     memory_for = memory_map(memory_for_agent_id)
-    memory_for(agent_id)
 
     # Built as the desktop app builds the same clone (#1731): an id that names a persona
     # answers as it. Any other id is a generic federated node.
@@ -192,9 +201,22 @@ def start_a2a_server(
         # P9: the approved skills in the runtime store; without them there is no `load_skill`.
         skills=asyncio.run(load_runtime_skill_registry()),
     )
+    # One store per clone id, opened now so a bad `--agent-id` exits 2. After the scope,
+    # whose registry brings the clones up (clone-data-scopes §3.8), so a fresh install's
+    # `clone` is there to be found.
+    # A handle is resolved to its clone's id, the key its seats and memory go by (§4 step 3).
+    clone_id = seat_id_for(agent_id)
+    memory_for(clone_id)
+    # Each conversation's seat is built when it opens; a clone whose file names a tools
+    # module this version lacks is refused now, in its own plain words (#2188).
+    try:
+        check_tools_module(app, clone_id)
+    except UnknownToolsModuleError as exc:
+        Console(stderr=True).print(str(exc), markup=False, highlight=False)
+        raise typer.Exit(code=1) from exc
     node = (
         None
-        if app.persona_registry.get_persona(agent_id) is not None
+        if app.persona_registry.get_persona(clone_id) is not None
         else {
             "name": f"Agent-{agent_id}",
             "role": "A2A Federated Agent",
@@ -211,12 +233,12 @@ def start_a2a_server(
         port=port,
         context_agent_factory=context_agent_factory(
             app,
-            clone_id=agent_id,
+            clone_id=clone_id,
             fallback_prompt="You are a federated UClone-X A2A agent node.",
             config_update=node,
         ),
-        turn_recorder=a2a_turn_recorder(agent_id),
-        person_names=a2a_person_names(agent_id),
+        turn_recorder=a2a_turn_recorder(clone_id),
+        person_names=a2a_person_names(clone_id),
     )
 
     if dev:
@@ -250,7 +272,9 @@ def start_a2a_server(
 def a2a_serve(
     host: Annotated[str, typer.Option("--host", "-h", help="Host address to bind")] = "127.0.0.1",
     port: Annotated[int, typer.Option("--port", "-p", help="Port to bind")] = 8080,
-    agent_id: Annotated[str, typer.Option("--agent-id", help="Local agent identifier")] = "default",
+    agent_id: Annotated[
+        str, typer.Option("--agent-id", help="Clone to serve (default: the builtin clone)")
+    ] = DEFAULT_PERSONA_NAME,
     agent_card: Annotated[
         Path | None,
         typer.Option("--agent-card", help="Path to JSON AgentCard configuration file"),

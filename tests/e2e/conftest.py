@@ -26,6 +26,8 @@ import pytest
 import uvicorn
 from playwright.async_api import Locator, Page
 
+from uclone_x.agent.clone_store import ensure_clone_store
+from uclone_x.agent.persona_store import BUILTIN_PERSONAS_DIR
 from uclone_x.engine.event_bus import EventBus
 from uclone_x.link.uclone2.supervisor import LinkSupervisor
 from uclone_x.llm.budget import TokenBudgetManager
@@ -172,6 +174,21 @@ SURFACE_OVERFLOW = """(selector) => {
     }
     return problems;
 }"""
+
+
+async def clone_id(page: Page, server: str, handle: str) -> str:
+    """The id (`agt_…`) of the clone whose handle is `handle`, as `GET /api/clones` lists it.
+
+    A room seats a clone by its id, and the head keys every clone element by it
+    (`clone-avatar-{id}`, a seat's `sender_id`), so a test that names a clone by the handle
+    it installed resolves the id here (clone-data-scopes §4 steps 2 and 3).
+    """
+    listed = await page.request.get(f"{server}/api/clones")
+    assert listed.ok, await listed.text()
+    clones: list[dict[str, Any]] = (await listed.json())["clones"]
+    ids = [str(row["id"]) for row in clones if row.get("handle") == handle]
+    assert len(ids) == 1, f"{handle!r} names {len(ids)} clones: {clones}"
+    return ids[0]
 
 
 async def set_the_rail(page: Page, rail: str) -> None:
@@ -465,6 +482,21 @@ def seed_eval_reports(directory: Path) -> Path:
         json.dumps(_SEEDED_EVAL_REPORT), encoding="utf-8"
     )
     return directory
+
+
+@pytest.fixture(autouse=True)
+def _builtin_clones_in_this_tests_root(  # pyright: ignore[reportUnusedFunction]
+    _isolate_agent_homes: Path,
+) -> None:
+    """Install the builtin clones into the agents root this test was given.
+
+    A server installs them once, when it is created -- and `ui_test_server` is created once
+    per module per worker, inside whichever test happened to run first there. Every test gets
+    its own agents root, so each later test would otherwise seat a clone its root has never
+    heard of (`CloneNotFoundError`), and which tests those were depended on how xdist dealt
+    them out. Installing here gives every e2e test what a started server gives the first.
+    """
+    ensure_clone_store(None, builtin_dir=BUILTIN_PERSONAS_DIR, root=_isolate_agent_homes)
 
 
 @pytest.fixture(scope="module")

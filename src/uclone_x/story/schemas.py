@@ -39,6 +39,7 @@ __all__ = [
     "Proposal",
     "ProposalChange",
     "ProposalEvidence",
+    "RelationWord",
     "StoryAxiom",
     "StoryAxioms",
     "VisualChange",
@@ -138,14 +139,22 @@ class Outline(_Shape):
 # -- codex/<kind>/<id>.yaml -------------------------------------------------------------
 
 
-class Progression(_Shape):
-    """A change to an entry's state, in force once the scene `at` has ended.
+#: What one entry is to another, in a word (`parent`, `rival`): a value of `relations`.
+RelationWord = Annotated[str, Field(min_length=1, max_length=80)]
 
-    `set` replaces each named state value; a value of `null` removes it.
+
+class Progression(_Shape):
+    """A change to an entry's state or relations, in force once the scene `at` has ended.
+
+    `set` replaces each named state value; a value of `null` removes it. `relations`
+    does the same for what the entry is to another entry, by that entry's id.
     """
 
     at: EntryId
     set: dict[str, JsonValue] = Field(default_factory=dict[str, JsonValue])
+    relations: dict[EntryId, RelationWord | None] = Field(
+        default_factory=dict[str, RelationWord | None]
+    )
     note: str | None = None
 
 
@@ -180,6 +189,10 @@ class CodexEntry(_Shape):
     #: Put in every scene's context, whether or not the scene mentions it (a world rule).
     always_include: bool = False
     state: dict[str, JsonValue] = Field(default_factory=dict[str, JsonValue])
+    #: What this entry is to another entry, by the other's id: `{harin: parent}` is "this
+    #: entry is Harin's parent". One word per pair. A relation is an edge between two
+    #: entries, never a state key carrying the other's id.
+    relations: dict[EntryId, RelationWord] = Field(default_factory=dict[str, RelationWord])
     progressions: list[Progression] = Field(default_factory=list[Progression])
     notes: str | None = None
 
@@ -293,15 +306,26 @@ class VisualChange(_Shape):
 
 
 class ProposalChange(_Shape):
-    """What a proposal would add to or change in one codex entry."""
+    """What a proposal would add to or change in one codex entry, or the entry it would add.
+
+    `new_entry` is a whole entry file that does not exist yet (#1808): a story the Writer
+    starts has no codex, and no file tool writes one. It is proposed on its own, never
+    together with a change to an entry that is there.
+    """
 
     progression: Progression | None = None
     visual_progression: VisualProgression | None = None
     visual: VisualChange | None = None
+    new_entry: dict[str, JsonValue] | None = None
 
     @model_validator(mode="after")
     def _changes_something(self) -> ProposalChange:
-        if self.progression is None and self.visual_progression is None and self.visual is None:
+        changes = (self.progression, self.visual_progression, self.visual)
+        if self.new_entry is not None:
+            if any(part is not None for part in changes):
+                raise ValueError("a new entry is proposed on its own, with no other change")
+            return self
+        if all(part is None for part in changes):
             raise ValueError("the change is empty")
         return self
 
@@ -330,11 +354,38 @@ class Proposal(_Shape):
     proposed_at: str = Field(min_length=1)
     room_id: str = Field(min_length=1)
     agent_id: str | None = None
-    entry_digest: str = Field(min_length=1)
+    #: `None` only for a new entry, whose file must not exist when it is applied.
+    entry_digest: str | None = Field(default=None, min_length=1)
     decided_at: str | None = None
     #: Where it was decided: in the conversation (`story_codex`), or in the story view.
     decided_in: Literal["conversation", "story_view"] | None = None
     reason: str | None = None
+
+    @model_validator(mode="after")
+    def _names_its_entry(self) -> Proposal:
+        if self.change.new_entry is None:
+            if self.entry_digest is None:
+                raise ValueError("a change to an entry needs the digest of that entry")
+            return self
+        entry = self.new_entry()
+        if entry.id != self.entry_id:
+            raise ValueError(
+                f"the new entry's id '{entry.id}' is not the proposal's '{self.entry_id}'"
+            )
+        return self
+
+    def new_entry(self) -> CodexEntry:
+        """The entry this proposal would add, as its file would read (#1808).
+
+        Raises:
+            ValueError: the proposal is not for a new entry, or the entry does not fit.
+        """
+        if self.change.new_entry is None:
+            raise ValueError("the proposal is not for a new entry")
+        try:
+            return entry_model(self.kind).model_validate(self.change.new_entry)
+        except ValidationError as exc:
+            raise ValueError(describe_invalid("the new entry", exc).rstrip(".")) from exc
 
 
 def changed_entry(entry: CodexEntry, change: ProposalChange) -> dict[str, Any]:

@@ -25,7 +25,7 @@ wrote at `path` in between; a rename moves whatever is there into the copy inste
 deletes that record's older copies beyond the newest three. Without a bound, two builds that
 take turns saving one conversation -- the newer writes a field the older refuses, the older
 sets it aside and saves, and so on -- leave a whole copy per round, and every copy also keeps
-the conversation's tool results alive (`SessionStore._has_record`). The newest copies are
+the conversation's tool results alive (`SessionStore.delete`). The newest copies are
 the ones a build that can read them wants back; a copy older than three later ones is a
 state of the conversation that was superseded three times over. A name that does not parse
 as `<name>.unreadable-<stamp>[-<n>]` was not written here and is never deleted. Deleting is

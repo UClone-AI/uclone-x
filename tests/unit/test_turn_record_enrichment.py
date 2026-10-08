@@ -648,7 +648,6 @@ class TestTurnRecordEnrichment:
             participant_id="bot1",
             kind=ParticipantKind.AGENT,
             display_name="Bot 1",
-            persona="bot1",
         )
 
         class _SimpleResolver:

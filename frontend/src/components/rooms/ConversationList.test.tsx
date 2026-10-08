@@ -1,6 +1,12 @@
 import { afterEach, describe, it, expect, vi } from 'vitest';
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
-import { ConversationList } from './ConversationList';
+import {
+  ConversationList,
+  CONVERSATION_LIST_COPY,
+  CONVERSATION_LIST_ESCAPE,
+  CONVERSATION_LIST_ICONS,
+} from './ConversationList';
+import { ConversationTitleEditor } from '../../ui-kit/rail/ConversationTitleEditor';
 import type { RoomSummary } from '../../types';
 
 const renderList = (over: Partial<React.ComponentProps<typeof ConversationList>> = {}) =>
@@ -223,6 +229,36 @@ describe('ConversationList row actions (#1058)', () => {
     expect(screen.getByTestId('conversation-r1')).toHaveTextContent('Architecture triage');
   });
 
+  it('returns focus to trigger element when title editor is dismissed with Escape', () => {
+    const onCancel = vi.fn();
+    const trigger = document.createElement('button');
+    document.body.appendChild(trigger);
+    trigger.focus();
+    expect(document.activeElement).toBe(trigger);
+
+    const { unmount } = render(
+      <ConversationTitleEditor
+        title="Test"
+        onSave={async () => {}}
+        onCancel={onCancel}
+        copy={CONVERSATION_LIST_COPY.editor}
+        saveIcon={CONVERSATION_LIST_ICONS.saveTitle}
+        cancelIcon={CONVERSATION_LIST_ICONS.cancelRename}
+        useEscape={CONVERSATION_LIST_ESCAPE}
+      />,
+    );
+
+    const input = screen.getByRole('textbox', { name: 'Conversation title' });
+    expect(document.activeElement).toBe(input);
+
+    fireEvent.keyDown(input, { key: 'Escape' });
+    expect(onCancel).toHaveBeenCalledTimes(1);
+
+    unmount();
+    expect(document.activeElement).toBe(trigger);
+    trigger.remove();
+  });
+
   it('confirms a delete in a dialog naming what will be lost, before deleting anything', () => {
     const onDeleteRoom = vi.fn(async () => {});
     renderList({ rooms: [summary()], onDeleteRoom });
@@ -243,15 +279,32 @@ describe('ConversationList row actions (#1058)', () => {
     expect(onDeleteRoom).not.toHaveBeenCalled();
   });
 
-  it('closes the dialog on Escape without deleting', () => {
+  it('omits transcript entries in the delete dialog when the room has 0 utterances', () => {
+    renderList({
+      rooms: [summary({ utterance_count: 0, message_count: 2, agent_ids: ['scout'] })],
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Delete “Architecture triage”' }));
+
+    const dialog = screen.getByRole('alertdialog');
+    expect(dialog).toHaveTextContent(
+      'Its record of who was in it (scout) will be removed, and any reply still being written in it is stopped. This cannot be undone.',
+    );
+    expect(dialog).not.toHaveTextContent('transcript');
+  });
+
+  it('closes the dialog on Escape without deleting and returns focus to the delete button', () => {
     const onDeleteRoom = vi.fn(async () => {});
     renderList({ rooms: [summary()], onDeleteRoom });
 
-    fireEvent.click(screen.getByRole('button', { name: 'Delete “Architecture triage”' }));
+    const deleteButton = screen.getByRole('button', { name: 'Delete “Architecture triage”' });
+    deleteButton.focus();
+    fireEvent.click(deleteButton);
     fireEvent.keyDown(screen.getByRole('alertdialog'), { key: 'Escape' });
 
     expect(screen.queryByRole('alertdialog')).toBeNull();
     expect(onDeleteRoom).not.toHaveBeenCalled();
+    expect(document.activeElement).toBe(deleteButton);
   });
 
   it('deletes on confirmation and closes the dialog', async () => {

@@ -14,10 +14,13 @@ has landed and a route that awaited it would hold one request across several mod
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import uuid
 from collections.abc import Callable, Coroutine, Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -25,19 +28,26 @@ from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
 from uclone_x.a2a.in_memory import A2AInMemoryTransport
+from uclone_x.agent.clone_store import ensure_clone_store
 from uclone_x.agent.composition import MissingCapabilityError
+from uclone_x.artifacts.kinds import FolderLease
+from uclone_x.core.agent_home import seat_id_for
+from uclone_x.core.failure_journal import record_failure
 from uclone_x.core.session_diagnostics import DEFAULT_MAX_CONVERSATION_TURNS
 from uclone_x.errors import (
     BudgetExceededError,
     HeadRoomWriteError,
     NothingToRetryError,
     ParticipantNotResolvableError,
+    PlainRefusalError,
     RoomAlreadyExistsError,
     RoomError,
     RoomNotFoundError,
+    RoomWorkspaceRefusedError,
     SecondHumanInRoomError,
     SessionIdCollisionError,
     SessionMutationDuringTurnError,
+    SpeakerSelectionError,
     StaleRoomWriteError,
     TokenBudgetExhaustedError,
     TurnNotLandedError,
@@ -45,12 +55,14 @@ from uclone_x.errors import (
     UnknownRoomParticipantError,
     UnreadableRoomRecordError,
 )
-from uclone_x.llm.context_window import OLLAMA_CONTEXT_WINDOWS, published_context_window
+from uclone_x.extensions import leased_folder_kinds
+from uclone_x.llm.context_window import OLLAMA_CONTEXT_WINDOWS, hosted_context_window
 from uclone_x.memory.extractor import KnowledgeExtractor
 from uclone_x.room.a2a_handlers import register_persona_handlers
 from uclone_x.room.models import (
     Participant,
     ParticipantKind,
+    RoomLoop,
     RoomMessage,
     RoomMessageKind,
     RoomPolicy,
@@ -60,7 +72,6 @@ from uclone_x.room.models import (
     head_room_write_refusal,
     is_loop_command,
     is_one_seat,
-    room_head,
 )
 from uclone_x.room.notices import NoticeCode, NoticeParams, notice_content
 from uclone_x.room.orchestrator import (
@@ -68,16 +79,13 @@ from uclone_x.room.orchestrator import (
     RoomOrchestrator,
 )
 from uclone_x.room.resolver import RoomAgentResolver
-from uclone_x.room.seat_knowledge_import import SEAT_KNOWLEDGE_SUBDIR, import_seat_knowledge
 from uclone_x.room.selectors import build_selector_chain
 from uclone_x.room.service import RoomService
 from uclone_x.room.store import RoomStore, room_storage_dir_under
-from uclone_x.story.library import StoryLibrary
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle; the app imports this module
     from uclone_x.agent.base import BaseAgent
     from uclone_x.agent.models import PersonaDefinition
-    from uclone_x.llm.protocols import LLMProviderProtocol
     from uclone_x.ui.app import AgentSessionManager
 
 __all__ = ["RoomStack", "register_room_routes", "seated_agents"]
@@ -175,6 +183,11 @@ class _RoomRuntime:
     resolver: RoomAgentResolver
 
 
+def _import_workspace_personas(workspace: Path) -> None:
+    """Import `workspace`'s `.uclone/personas/` as clones; never raises (§3.8 step 2)."""
+    ensure_clone_store(workspace, builtin_dir=None, install=False)
+
+
 class RoomStack:
     """The Core objects a room route needs, assembled once and kept.
 
@@ -192,32 +205,60 @@ class RoomStack:
     def __init__(self, session_mgr: AgentSessionManager) -> None:
         self._session_mgr = session_mgr
         self.store = RoomStore(room_storage_dir_under(session_mgr.storage_dir))
-        self.service = RoomService(self.store, stories=StoryLibrary(session_mgr.workspace_dir))
-        # A seat kept its own knowledge record until clone-knowledge-graph step 6; what a
-        # clone learned is its facts now. Any relation a retired record holds is moved into
-        # its clone's facts once, through the same memory map the seats write through, and
-        # the record is renamed and kept (§3.7). Nothing reads the records after this.
-        # Looked up per clone, only when a record is there to import.
-        import_seat_knowledge(
-            session_mgr.storage_dir / SEAT_KNOWLEDGE_SUBDIR,
-            lambda clone_id: session_mgr.memory_for(clone_id),
+        # The story library is the story extension's leased folder kind (#2205).
+        kinds = leased_folder_kinds()
+        self.service = RoomService(
+            self.store,
+            # A story lives in its conversation's workspace (clone-data-scopes §3.6).
+            stories=(
+                (lambda workspace: FolderLease(kinds[0], workspace or session_mgr.workspace_dir))
+                if kinds
+                else None
+            ),
+            sessions=getattr(session_mgr, "core_store", None),
+            # A switched-to folder's personas become clones before the switch (§3.8 step 2).
+            import_workspace_personas=_import_workspace_personas,
         )
         self._rooms: dict[str, _RoomRuntime] = {}
         #: Live cascades. A *set* per room, not one task: a second send used to overwrite
         #: the entry and leave the first cascade running untracked, so neither a delete
         #: nor a shutdown could reach it. Cancelled by `forget` and by `close`.
         self._running: dict[str, set[asyncio.Task[Any]]] = {}
-        #: Live recurring room loops: room_id -> (job_id, task, interval_seconds, prompt)
-        self._room_loops: dict[str, tuple[str, asyncio.Task[None], float, str]] = {}
-        # A conversation's seats and its routing model are built once per room, from the
-        # connector of the moment. Without this a model chosen in Settings reached new
-        # conversations only, while Settings said it had been applied (#1446).
-        session_mgr.on_llm_replaced(self._llm_replaced)
+        #: The task running each room's `/loop`: room_id -> (job_id, task). The loop itself
+        #: is on the room record (`RoomState.loop`); a shutdown cancels these and leaves
+        #: the records, which the next process continues (#1936).
+        self._room_loops: dict[str, tuple[str, asyncio.Task[None]]] = {}
+        # A conversation's seats and its routing model are built once per room. Without this
+        # a model or connection changed in Settings reached new conversations only, while
+        # Settings said it had been applied (#1446).
+        session_mgr.on_models_changed(self._models_changed)
 
-    def _llm_replaced(self, llm: LLMProviderProtocol | None) -> None:
-        """Hand every open conversation the connector Settings just installed."""
+    @property
+    def default_workspace(self) -> Path:
+        """The server's launch directory: the workspace of a room that names none (§3.6)."""
+        return Path(self._session_mgr.workspace_dir).resolve()
+
+    def workspace_of(self, room_id: str) -> Path:
+        """The folder `room_id`'s clones work in now: its own, else the server's (§3.6).
+
+        Read per call, so a change applies to whatever runs next. A room that cannot be
+        read raises, rather than answering the server's folder in its place.
+        """
+        workspace = self.service.get(room_id).workspace
+        return Path(workspace) if workspace is not None else self.default_workspace
+
+    def _routing_selectors(self, state: RoomState) -> Any:
+        """The room's selector chain, on the default fast model, always (model-gateway §3.4).
+
+        Routing belongs to no one clone, so a clone's own fast model never serves it.
+        """
+        provider, model = self._session_mgr.gateway.default_fast()
+        return build_selector_chain(state.policy, provider=provider, default_model=model)
+
+    def _models_changed(self) -> None:
+        """Re-bind every open conversation's seats and routing after Settings changed models."""
         for room_id, runtime in self._rooms.items():
-            runtime.resolver.replace_llm(llm)
+            runtime.resolver.models_changed()
             try:
                 state = self.store.load(room_id)
             except UnreadableRoomRecordError:
@@ -226,11 +267,7 @@ class RoomStack:
                 logger.warning("Room %s kept its routing model: its record will not load", room_id)
                 continue
             if state is not None:
-                runtime.orchestrator.replace_selectors(
-                    build_selector_chain(
-                        state.policy, provider=llm, default_model=self._session_mgr.fast_model
-                    )
-                )
+                runtime.orchestrator.replace_selectors(self._routing_selectors(state))
 
     def orchestrator(self, state: RoomState) -> RoomOrchestrator:
         """The orchestrator driving this room, built on first use from its policy."""
@@ -257,19 +294,17 @@ class RoomStack:
             # Read per call, so a connector replaced in Settings reaches the callee too.
             host_factory=lambda: resolver.host,
             persona_registry=resolver.persona_registry,
-            workspace_root=resolver.workspace_root,
+            # The room's workspace at the call, not the server's: a callee works where the
+            # conversation that called it does (clone-data-scopes §3.6).
+            workspace_root=lambda: self.workspace_of(state.room_id),
             llm_config=resolver.llm_config,
             read_roots=resolver.read_roots,
-            global_models=self._session_mgr.global_models,
+            gateway=self._session_mgr.gateway,
         )
         built = RoomOrchestrator(
             store=self.store,
-            # Routing is an auxiliary call, so it asks for the fast model.
-            selectors=build_selector_chain(
-                state.policy,
-                provider=self._session_mgr.llm,
-                default_model=self._session_mgr.fast_model,
-            ),
+            # Routing is an auxiliary call no clone owns: the default fast model (§3.4).
+            selectors=self._routing_selectors(state),
             resolver=resolver,
             bus=self._session_mgr.bus,
             extractor=KnowledgeExtractor(),  # learns from each turn, after it (#1404)
@@ -427,30 +462,152 @@ class RoomStack:
         interval_seconds: float,
         prompt: str,
     ) -> str:
-        """Schedule a recurring prompt execution in the room."""
+        """Start a `/loop` in the room, replacing any it had; its first run is immediate.
+
+        Saved on the room record before it starts (#1936), so a restarted server continues
+        it and a reader can see it without typing `/loop list` into the conversation.
+        """
         self.cancel_room_loop(room_id)
-        job_id = f"loop-{uuid.uuid4().hex[:6]}"
+        loop = RoomLoop(
+            job_id=f"loop-{uuid.uuid4().hex[:6]}",
+            sender_id=sender_id,
+            interval_seconds=float(interval_seconds),
+            prompt=prompt,
+        )
+        state = self.store.load(room_id)
+        if state is not None:
+            self.store.save(state.model_copy(update={"loop": loop}))
+        self._start_loop_worker(room_id, loop.job_id, first_delay=0.0)
+        return loop.job_id
+
+    def room_loop(self, room_id: str) -> RoomLoop | None:
+        """The `/loop` saved on this room, or None."""
+        state = self.store.load(room_id)
+        return state.loop if state is not None else None
+
+    def cancel_room_loop(self, room_id: str) -> bool:
+        """Stop this room's `/loop` and take it off the record; whether there was one."""
+        had_task = self._stop_loop_task(room_id)
+        state = self.store.load(room_id)
+        if state is None or state.loop is None:
+            return had_task
+        self.store.save(state.model_copy(update={"loop": None}))
+        return True
+
+    async def stop(self, room_id: str) -> None:
+        """Take the floor back: stop any loop and interrupt any in-flight turn."""
+        state = self.store.load(room_id)
+        if state is None:
+            return
+        if self.cancel_room_loop(room_id):
+            self.append_notice(room_id, "loop.stopped")
+        await self.orchestrator(state).interrupt(room_id)
+
+    def resume_room_loops(self) -> int:
+        """Continue every `/loop` a previous process left on a room record; how many.
+
+        Called once at startup. `ucx ui --dev` restarts its worker whenever a file under
+        `src/` changes, a `git pull` included, and a loop held only in memory ended there
+        without a word (#1936). A continued loop says so in its conversation, because a
+        run the person did not see coming is otherwise indistinguishable from a new one.
+        """
+        resumed = 0
+        for room_id in self.store.list_room_ids():
+            try:
+                state = self.store.load(room_id)
+            except UnreadableRoomRecordError:
+                continue
+            if state is None or state.loop is None or room_id in self._room_loops:
+                continue
+            loop = state.loop
+            delay = 0.0
+            if loop.next_run_at is not None:
+                due = datetime.fromisoformat(loop.next_run_at)
+                delay = max(0.0, (due - datetime.now(UTC)).total_seconds())
+            self.append_notice(
+                room_id,
+                "loop.resumed",
+                {
+                    "job_id": loop.job_id,
+                    "interval_seconds": loop.interval_seconds,
+                    "prompt": loop.prompt,
+                },
+            )
+            self._start_loop_worker(room_id, loop.job_id, first_delay=delay)
+            resumed += 1
+        return resumed
+
+    def append_notice(
+        self, room_id: str, code: NoticeCode, params: NoticeParams | None = None
+    ) -> RoomState:
+        """Append one application notice to the room's transcript, and return the room.
+
+        The note carries `code` and `params` for the head to word in the reader's
+        language, and the English sentence in `content` for everything else.
+        """
+        state = self._require_state(room_id)
+        note = RoomMessage(
+            seq=len(state.transcript) + 1,
+            sender_id="system",
+            content=notice_content(code, params or {}),
+            kind=RoomMessageKind.NOTE,
+            code=code,
+            params=params,
+        )
+        return self.store.save(state.model_copy(update={"transcript": (*state.transcript, note)}))
+
+    def _require_state(self, room_id: str) -> RoomState:
+        state = self.store.load(room_id)
+        if state is None:
+            raise RoomNotFoundError(f"room {room_id!r} does not exist")
+        return state
+
+    def _stop_loop_task(self, room_id: str) -> bool:
+        """Cancel the task running this room's loop, leaving the record; whether one ran."""
+        item = self._room_loops.pop(room_id, None)
+        if item is None:
+            return False
+        _, task = item
+        if not task.done():
+            task.cancel()
+        return True
+
+    def _update_loop(self, room_id: str, job_id: str, **changes: Any) -> RoomLoop | None:
+        """Save `changes` onto the room's loop while it is still `job_id`; the result."""
+        state = self.store.load(room_id)
+        if state is None or state.loop is None or state.loop.job_id != job_id:
+            return None
+        updated = state.loop.model_copy(update=changes)
+        self.store.save(state.model_copy(update={"loop": updated}))
+        return updated
+
+    def _start_loop_worker(self, room_id: str, job_id: str, *, first_delay: float) -> None:
+        """Run the saved loop `job_id` until it is stopped, replaced or its room deleted.
+
+        Each wait reads the record again: a loop the person stopped, or replaced with
+        another, is gone from it, and the worker ends instead of sending one more run.
+        """
 
         async def _loop_worker() -> None:
+            delay = first_delay
             try:
-                first = True
                 while True:
-                    if not first:
-                        await asyncio.sleep(interval_seconds)
-                    first = False
-
-                    state = self.store.load(room_id)
-                    if state is None:
-                        break
-                    orch = self.orchestrator(state)
+                    if delay > 0:
+                        await asyncio.sleep(delay)
                     try:
-                        state = await orch.accept(room_id, sender_id, prompt)
-                        seq = state.transcript[-1].seq
-                        await orch.resume(room_id, seq)
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as exc:
-                        logger.warning("Room loop tick encountered error for %s: %s", room_id, exc)
+                        loop = self.room_loop(room_id)
+                    except UnreadableRoomRecordError:
+                        logger.warning(
+                            "Repeating task %s in room %s ended: its record will not load",
+                            job_id,
+                            room_id,
+                            exc_info=True,
+                        )
+                        break
+                    if loop is None or loop.job_id != job_id:
+                        break
+                    await self._run_loop_once(room_id, loop)
+                    delay = loop.interval_seconds
             except asyncio.CancelledError:
                 pass
             finally:
@@ -459,29 +616,66 @@ class RoomStack:
                     self._room_loops.pop(room_id, None)
 
         task = asyncio.create_task(_loop_worker(), name=f"room-loop-{room_id}-{job_id}")
-        self._room_loops[room_id] = (job_id, task, interval_seconds, prompt)
-        return job_id
+        self._room_loops[room_id] = (job_id, task)
 
-    def cancel_room_loop(self, room_id: str) -> bool:
-        """Cancel any active recurring loop for this room."""
-        item = self._room_loops.pop(room_id, None)
-        if item is not None:
-            _, task, _, _ = item
-            if not task.done():
-                task.cancel()
-            return True
-        return False
+    async def _run_loop_once(self, room_id: str, loop: RoomLoop) -> None:
+        """Send the loop's prompt once and drive the room's turns; record how it went.
 
-    def get_room_loop_info(self, room_id: str) -> tuple[str, float, str] | None:
-        """Return (job_id, interval_seconds, prompt) if an active loop is running."""
-        item = self._room_loops.get(room_id)
-        if item is not None and not item[1].done():
-            return (item[0], item[2], item[3])
-        return None
+        A failure does not end the loop -- the next run may well succeed -- but it is no
+        longer only a log line: it is logged with its traceback, kept in the failure
+        journal, written into the conversation, and saved as the loop's `last_error`.
+        `next_run_at` is saved before the run, so a server stopped mid-run continues on
+        schedule rather than repeating the run at once.
+        """
+        run = loop.runs + 1
+        started = datetime.now(UTC)
+        self._update_loop(
+            room_id,
+            loop.job_id,
+            runs=run,
+            last_run_at=started.isoformat(),
+            next_run_at=(started + timedelta(seconds=loop.interval_seconds)).isoformat(),
+        )
+        error: str | None = None
+        try:
+            state = self._require_state(room_id)
+            orch = self.orchestrator(state)
+            state = await orch.accept(room_id, loop.sender_id, loop.prompt)
+            await orch.resume(room_id, state.transcript[-1].seq)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Room %s: run %d of repeating task %s failed",
+                room_id,
+                run,
+                loop.job_id,
+                exc_info=True,
+            )
+            record_failure(exc, context={"surface": "ui.room_loop", "room_id": room_id, "run": run})
+            error = reader_facing_reason(exc)
+            with contextlib.suppress(Exception):
+                self.append_notice(
+                    room_id,
+                    "loop.run_failed",
+                    {
+                        "job_id": loop.job_id,
+                        "run": run,
+                        "reason": error,
+                        "interval_seconds": loop.interval_seconds,
+                    },
+                )
+        ended = datetime.now(UTC)
+        self._update_loop(
+            room_id,
+            loop.job_id,
+            last_error=error,
+            next_run_at=(ended + timedelta(seconds=loop.interval_seconds)).isoformat(),
+        )
 
     def forget(self, room_id: str) -> None:
         """Drop a deleted room's orchestrator, and every turn it may still be running."""
-        self.cancel_room_loop(room_id)
+        self._stop_loop_task(room_id)
         self._rooms.pop(room_id, None)
         for task in self._running.pop(room_id, set()):
             if not task.done():
@@ -495,8 +689,9 @@ class RoomStack:
         saving it spends the turn, pays for the tokens, and records nothing -- leaving a
         room whose `last_decision` names a speaker with no utterance.
         """
+        # The tasks only: the loops stay on their records for the next process (#1936).
         for room_id in list(self._room_loops.keys()):
-            self.cancel_room_loop(room_id)
+            self._stop_loop_task(room_id)
         tasks = [task for group in self._running.values() for task in group]
         for task in tasks:
             if not task.done():
@@ -600,7 +795,11 @@ def reader_facing_reason(exc: Exception) -> str:
     conversation as copy, which put a Python class name and whatever the exception happened
     to interpolate (a store path, for instance) in front of a non-expert reader.
     """
-    if isinstance(exc, RoomError):
+    if isinstance(exc, SpeakerSelectionError):
+        return "The next speaker could not be chosen. Try sending your message again."
+    if isinstance(exc, RoomError | PlainRefusalError):
+        # `PlainRefusalError` is already worded for a person (#1555): a seat whose clone
+        # names a tools module this version does not have says so (#2188).
         return str(exc)
     if isinstance(exc, MissingCapabilityError) and "llm" in exc.missing:
         # The one missing capability that is the reader's to supply. Reported as "a
@@ -766,7 +965,7 @@ def _head_room_guard(service: RoomService) -> Callable[[Request], Coroutine[Any,
             state = service.get(room_id)
         except (RoomError, UnreadableRoomRecordError):
             return
-        head = room_head(state)
+        head = state.head
         if head is not None:
             raise _http_error(HeadRoomWriteError(head_room_write_refusal(head)))
 
@@ -798,7 +997,12 @@ class _GuardedRoutes:
         return self._app.delete(path, dependencies=self._dependencies, **kwargs)
 
 
-def register_room_routes(app: FastAPI, stack: RoomStack) -> None:
+def register_room_routes(
+    app: FastAPI,
+    stack: RoomStack,
+    *,
+    refuse_cross_origin: Callable[[Request], None],
+) -> None:
     """Mount `/api/rooms` on `app`.
 
     There is deliberately **no** `/api/rooms/{id}/events`. `/api/stream` already
@@ -819,12 +1023,13 @@ def register_room_routes(app: FastAPI, stack: RoomStack) -> None:
             raise _http_error(exc) from exc
 
     @router.get("/api/rooms")
-    async def list_rooms() -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
+    async def list_rooms(request: Request) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
         """Every stored conversation, by title rather than by id.
 
         `unreadable` names the records that are there and will not load (#1440), so the
         head can still show them and offer to delete them.
         """
+        refuse_cross_origin(request)  # another site must not list the conversations (#2143)
         listing = service.survey_rooms()
         return {
             "rooms": [_summary_payload(s) for s in listing.rooms],
@@ -858,7 +1063,8 @@ def register_room_routes(app: FastAPI, stack: RoomStack) -> None:
             else []
         )
         seats = [(human_id, ParticipantKind.HUMAN)]
-        seats += [(agent_id, ParticipantKind.AGENT) for agent_id in agent_ids]
+        # A clone's seat is its id (clone-data-scopes §4 step 3); a handle still seats it.
+        seats += [(seat_id_for(agent_id), ParticipantKind.AGENT) for agent_id in agent_ids]
         try:
             state = service.create(title, policy=policy, seats=seats)
         except Exception as exc:
@@ -866,13 +1072,19 @@ def register_room_routes(app: FastAPI, stack: RoomStack) -> None:
         return state.model_dump(mode="json")
 
     @router.get("/api/rooms/{room_id}")
-    async def get_room(room_id: str) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
+    async def get_room(room_id: str, request: Request) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
         """One conversation, roster and transcript included."""
+        refuse_cross_origin(request)  # names the server's workspace, as /api/settings does
         state = _room(room_id)
         active = stack.get_active_turn(room_id)
-        # `head` as the guard reads it: an ACP or A2A room from before the mark is shown
-        # read-only too, not offered a composer every send of which is refused (#1885).
-        return {**state.model_dump(mode="json"), "head": room_head(state), "active_turn": active}
+        # `head` always, even None: `model_dump` leaves an unset one out (#1885).
+        return {
+            **state.model_dump(mode="json"),
+            "head": state.head,
+            "workspace": state.workspace,
+            "default_workspace": str(stack.default_workspace),
+            "active_turn": active,
+        }
 
     @router.patch("/api/rooms/{room_id}")
     async def rename_room(room_id: str, req: dict[str, Any]) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
@@ -883,6 +1095,32 @@ def register_room_routes(app: FastAPI, stack: RoomStack) -> None:
             ).model_dump(mode="json")
         except Exception as exc:
             raise _http_error(exc) from exc
+
+    @router.patch("/api/rooms/{room_id}/workspace")
+    async def set_room_workspace(  # pyright: ignore[reportUnusedFunction]
+        room_id: str, req: dict[str, Any], request: Request
+    ) -> Any:
+        """Change the folder a conversation's clones work in; `null` for the server's.
+
+        Applies from the next turn. `default_workspace` names the server's, so a head can
+        show which one the conversation uses (clone-data-scopes §3.6).
+        """
+        refuse_cross_origin(request)  # another tab must not move the file tools' write bound
+        workspace = req.get("workspace")
+        if workspace is not None and not isinstance(workspace, str):
+            raise HTTPException(status_code=400, detail="'workspace' must be a path or null.")
+        try:
+            state = service.set_workspace(room_id, workspace or None)
+        except RoomWorkspaceRefusedError as exc:
+            # `code` lets the head word the refusal in the reader's language; `detail` is
+            # the English sentence it falls back to.
+            return JSONResponse({"detail": str(exc), "code": exc.code}, status_code=400)
+        except Exception as exc:
+            raise _http_error(exc) from exc
+        return {
+            "workspace": state.workspace,
+            "default_workspace": str(stack.default_workspace),
+        }
 
     @router.delete("/api/rooms/{room_id}", status_code=204)
     async def delete_room(room_id: str) -> None:  # pyright: ignore[reportUnusedFunction]
@@ -919,6 +1157,8 @@ def register_room_routes(app: FastAPI, stack: RoomStack) -> None:
         if raw_kind not in ("agent", "human"):
             raise HTTPException(status_code=400, detail=_KIND_REFUSAL)
         kind = ParticipantKind.HUMAN if raw_kind == "human" else ParticipantKind.AGENT
+        if kind is ParticipantKind.AGENT:
+            participant_id = seat_id_for(participant_id)  # a handle seats its clone's id
         try:
             state = service.add_participant(room_id, participant_id, kind=kind)
         except Exception as exc:
@@ -928,8 +1168,10 @@ def register_room_routes(app: FastAPI, stack: RoomStack) -> None:
 
     @router.delete("/api/rooms/{room_id}/participants/{participant_id}")
     async def remove_participant(room_id: str, participant_id: str) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
-        """Remove somebody from a conversation."""
-        _room(room_id)
+        """Remove somebody from a conversation, named by seat id or by a clone's handle."""
+        room = _room(room_id)
+        if all(p.id != participant_id for p in room.participants):
+            participant_id = seat_id_for(participant_id)  # a handle names its clone's seat
         try:
             state = service.remove_participant(room_id, participant_id)
         except Exception as exc:
@@ -964,29 +1206,13 @@ def register_room_routes(app: FastAPI, stack: RoomStack) -> None:
             # A note, not the person's message: a seat is not handed the command as
             # something to answer (#1661).
             try:
-                state = await orch.accept_command(room_id, sender_id, content)
+                await orch.accept_command(room_id, sender_id, content)
             except Exception as exc:
                 raise _http_error(exc) from exc
 
             def _notice(code: NoticeCode, params: NoticeParams | None = None) -> JSONResponse:
-                """Append one `/loop` notice to the transcript and answer with its seq.
-
-                The note carries `code` and `params` for the head to word in the reader's
-                language, and the English sentence in `content` for everything else.
-                """
-                nonlocal state
-                values = params or {}
-                note = RoomMessage(
-                    seq=len(state.transcript) + 1,
-                    sender_id="system",
-                    content=notice_content(code, values),
-                    kind=RoomMessageKind.NOTE,
-                    code=code,
-                    params=params,
-                )
-                state = stack.store.save(
-                    state.model_copy(update={"transcript": (*state.transcript, note)})
-                )
+                """Append one `/loop` notice to the transcript and answer with its seq."""
+                state = stack.append_notice(room_id, code, params)
                 return JSONResponse(
                     status_code=202, content={"room_id": room_id, "seq": state.transcript[-1].seq}
                 )
@@ -995,13 +1221,17 @@ def register_room_routes(app: FastAPI, stack: RoomStack) -> None:
                 return _notice("loop.help")
 
             if clean_content == "/loop list":
-                loop_info = stack.get_room_loop_info(room_id)
-                if loop_info is None:
+                loop = stack.room_loop(room_id)
+                if loop is None:
                     return _notice("loop.none_active")
-                job_id, interval, prompt_text = loop_info
                 return _notice(
                     "loop.active",
-                    {"job_id": job_id, "interval_seconds": interval, "prompt": prompt_text},
+                    {
+                        "job_id": loop.job_id,
+                        "interval_seconds": loop.interval_seconds,
+                        "prompt": loop.prompt,
+                        "runs": loop.runs,
+                    },
                 )
 
             if clean_content in ("/loop stop", "/loop stop all") or clean_content.startswith(
@@ -1048,11 +1278,14 @@ def register_room_routes(app: FastAPI, stack: RoomStack) -> None:
 
     @router.post("/api/rooms/{room_id}/stop")
     async def stop_room(room_id: str) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
-        """Take the floor back. The invariant without this control is a claim."""
-        stack.cancel_room_loop(room_id)
-        state = _room(room_id)
+        """Take the floor back. The invariant without this control is a claim.
+
+        It stops the room's `/loop` too, and says so: a loop this ended used to vanish
+        with nothing in the conversation to show it had (#1936).
+        """
+        _room(room_id)
         try:
-            await stack.orchestrator(state).interrupt(room_id)
+            await stack.stop(room_id)
         except Exception as exc:
             raise _http_error(exc) from exc
         return _room(room_id).model_dump(mode="json")
@@ -1109,7 +1342,7 @@ def register_room_routes(app: FastAPI, stack: RoomStack) -> None:
             raise _http_error(exc) from exc
 
     @router.get("/api/rooms/{room_id}/context")
-    async def read_context(room_id: str) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
+    async def read_context(room_id: str, request: Request) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
         """How full each seat's context is, and whether the conversation can still continue.
 
         Deliberately **not** folded into `GET /api/rooms/{room_id}`. That read is re-issued
@@ -1124,7 +1357,8 @@ def register_room_routes(app: FastAPI, stack: RoomStack) -> None:
         the plausible substituted value P6 forbids. What changed is that the other
         candidate stopped being unavailable. `uclone_x.llm.context_window` reads a locally
         served model's window from the daemon that loaded it and a hosted model's from the
-        figure its provider publishes and enforces; where neither answers,
+        figure its provider publishes and enforces -- in its model listing where it reports
+        one, else in the published table; where neither answers,
         `max_context_tokens` is `null` and the surface falls back to turns and says so.
 
         `saturation_threshold` is unaffected and is still the ceiling the Core enforces:
@@ -1145,18 +1379,18 @@ def register_room_routes(app: FastAPI, stack: RoomStack) -> None:
         and the one file they fold onto. A failure with no reason and no remedy is what
         P6 forbids.
         """
+        refuse_cross_origin(request)  # another site must not inspect context occupancy (#2146)
         state = _room(room_id)
         mgr = stack.session_manager()
         # Where this room's answers come from, which is what decides how a window can be
         # known at all. One read per request, not per seat: the daemon's answer covers
         # every model it has loaded, and asking once a seat would ask the same question
         # N times of the same endpoint.
-        settings = mgr.get_settings()
-        provider = str(settings.get("llm_provider") or "").strip().lower()
-        llm_base_url = str(settings.get("llm_base_url") or "").strip()
-        default_model = str(settings.get("llm_model") or "").strip()
-        if provider == "ollama" and llm_base_url:
-            await OLLAMA_CONTEXT_WINDOWS.refresh(llm_base_url)
+        # Each seat may be on its own connection (model-gateway §3.4): the seat's connector
+        # names its provider and address; a seat not built yet would use the default deep.
+        default_llm, default_model_id = mgr.gateway.default_deep()
+        default_model = default_model_id or ""
+        refreshed: set[str] = set()
         seats: list[dict[str, Any]] = []
         for participant in seated_agents(state):
             live = stack.live_agent(room_id, participant.session_id)
@@ -1186,10 +1420,18 @@ def register_room_routes(app: FastAPI, stack: RoomStack) -> None:
             # `served_by` string is what served the *last* turn, and the window belongs to
             # the model that will serve the next one.
             seat_model = default_model
+            seat_llm: object = default_llm
             if live is not None:
                 configured = live.config.llm_config.model_name
                 if configured:
                     seat_model = configured
+                if live.llm is not None:
+                    seat_llm = live.llm
+            provider = str(getattr(seat_llm, "provider_name", "") or "").strip().lower()
+            llm_base_url = str(getattr(seat_llm, "base_url", "") or "").strip()
+            if provider == "ollama" and llm_base_url and llm_base_url not in refreshed:
+                refreshed.add(llm_base_url)
+                await OLLAMA_CONTEXT_WINDOWS.refresh(llm_base_url)
             # A window is reported only where it was measured. `None` here is not a
             # missing feature to paper over with a typical value: it is the daemon not
             # having loaded this model yet, or a model nobody publishes a figure for, and
@@ -1201,7 +1443,9 @@ def register_room_routes(app: FastAPI, stack: RoomStack) -> None:
                 if observed is not None:
                     window_tokens, window_source = observed, "loaded"
             else:
-                declared = published_context_window(provider, seat_model)
+                # The provider's own listing first, then its published table (#1978). Both
+                # are the provider's published figure, so the head's sentence is the same.
+                declared = hosted_context_window(provider, seat_model)
                 if declared is not None:
                     window_tokens, window_source = declared, "published"
             # Active context tokens for the ring's denominator (current context window occupancy),
@@ -1271,7 +1515,8 @@ def register_room_routes(app: FastAPI, stack: RoomStack) -> None:
         seats = seated_agents(state)
         raw = (req or {}).get("participant_id")
         if isinstance(raw, str) and raw:
-            seats = tuple(p for p in seats if p.id == raw)
+            seat = seat_id_for(raw)  # a handle names its clone's seat
+            seats = tuple(p for p in seats if p.id == seat)
             if not seats:
                 raise HTTPException(
                     status_code=400,

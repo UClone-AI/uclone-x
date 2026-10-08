@@ -148,14 +148,16 @@ describe('generated images in a reply (#1208)', () => {
     const img = screen.getByTestId('inline-artifact-image');
     expect(img).toHaveAttribute(
       'src',
-      '/api/artifacts/content?path=artifacts/images/img_3008971970_sess_r.png',
+      '/api/artifacts/content?path=artifacts%2Fimages%2Fimg_3008971970_sess_r.png',
     );
-    // The prose around it survives, and the file stays reachable at full size.
+    // The prose around it survives, and the file stays reachable: kept, under its own name.
     expect(screen.getByText(/Need adjustments/)).toBeInTheDocument();
-    expect(screen.getByRole('link', { name: /Open/ })).toHaveAttribute(
+    const download = screen.getByTestId('artifact-image-download');
+    expect(download).toHaveAttribute(
       'href',
-      '/api/artifacts/content?path=artifacts/images/img_3008971970_sess_r.png',
+      '/api/artifacts/content?path=artifacts%2Fimages%2Fimg_3008971970_sess_r.png',
     );
+    expect(download).toHaveAttribute('download', 'img_3008971970_sess_r.png');
   });
 
   // Killed by: frontend/src/components/RichText.tsx :: if (!ARTIFACT_CONTENT_RE.test(href.slice(0, q))) return null;
@@ -175,8 +177,19 @@ describe('generated images in a reply (#1208)', () => {
   it('leaves a link to a non-image artifact alone', () => {
     expect(findArtifactImage('/api/artifacts/content?path=docs/plan.md')).toBeNull();
     expect(findArtifactImage('/api/artifacts/content?path=a/b.PNG')).toEqual({
-      url: '/api/artifacts/content?path=a/b.PNG',
+      url: '/api/artifacts/content?path=a%2Fb.PNG',
       name: 'b.PNG',
+    });
+  });
+
+  // Killed by: frontend/src/components/RichText.tsx :: return { url: `/api/artifacts/content?path=${encodeURIComponent(path)}`, name: path.split('/').pop() || path };
+  // Becomes: return { url: href, name: path.split('/').pop() || path };
+  it('builds image card url strictly from parsed path ignoring host', () => {
+    expect(
+      findArtifactImage('https://evil-host.com/api/artifacts/content?path=artifacts/images/pic.png'),
+    ).toEqual({
+      url: '/api/artifacts/content?path=artifacts%2Fimages%2Fpic.png',
+      name: 'pic.png',
     });
   });
 
@@ -213,7 +226,7 @@ describe('generated images in a reply (#1208)', () => {
     const img = screen.getByTestId('inline-artifact-image');
     expect(img).toHaveAttribute(
       'src',
-      '/api/artifacts/content?path=artifacts/images/img_2614005732_sess_r.png',
+      '/api/artifacts/content?path=artifacts%2Fimages%2Fimg_2614005732_sess_r.png',
     );
     expect(img).toHaveAttribute('alt', 'Bikini Girl Art');
 
@@ -232,7 +245,7 @@ describe('generated images in a reply (#1208)', () => {
     );
     expect(c1.querySelector('img')).toHaveAttribute(
       'src',
-      '/api/artifacts/content?path=artifacts/images/img_2.png',
+      '/api/artifacts/content?path=artifacts%2Fimages%2Fimg_2.png',
     );
 
     const { container: c2 } = render(
@@ -240,7 +253,7 @@ describe('generated images in a reply (#1208)', () => {
     );
     expect(c2.querySelector('img')).toHaveAttribute(
       'src',
-      '/api/artifacts/content?path=artifacts/images/img_3.png',
+      '/api/artifacts/content?path=artifacts%2Fimages%2Fimg_3.png',
     );
   });
 
@@ -301,7 +314,7 @@ describe('RichText tables (#1015, #1018)', () => {
 });
 
 describe('opening a generated image in Docs (#1354)', () => {
-  // Killed by: frontend/src/components/RichText.tsx :: {openInDocs && path && (
+  // Killed by: frontend/src/components/ImageCard.tsx :: {openInDocs && path && (
   // Becomes: {false && openInDocs && path && (
   it('fronts Docs on the file the picture is, from the picture itself', () => {
     const openInDocs = vi.fn();
@@ -310,13 +323,18 @@ describe('opening a generated image in Docs (#1354)', () => {
         <RichText content={ARTIST_REPLY} />
       </OpenInDocsContext.Provider>,
     );
+    fireEvent.click(screen.getByTestId('artifact-image-more'));
     fireEvent.click(screen.getByTestId('artifact-open-docs-btn'));
     expect(openInDocs).toHaveBeenCalledWith('artifacts/images/img_3008971970_sess_r.png');
+    expect(screen.queryByTestId('artifact-image-menu')).toBeNull();
   });
 
   it('offers no Docs button where there is no dock to open', () => {
     render(<RichText content={ARTIST_REPLY} />);
+    fireEvent.click(screen.getByTestId('artifact-image-more'));
     expect(screen.queryByTestId('artifact-open-docs-btn')).toBeNull();
+    // The browser tab is still offered: the menu is never empty.
+    expect(screen.getByTestId('artifact-open-tab')).toHaveAttribute('target', '_blank');
   });
 });
 
@@ -349,5 +367,138 @@ describe('RichText re-render', () => {
     expect(container.firstElementChild).toHaveClass('two');
     expect(link.isConnected).toBe(true);
     expect(table?.isConnected).toBe(true);
+  });
+});
+
+/**
+ * The list the image tool hands a reply for a batch, as it wrote it on 2026-09-27 (its
+ * `markdown_gallery`, prompts shortened). A clone passes it on as written.
+ */
+const BATCH = [1, 2, 3]
+  .map((n) => `${n}. ![fiona #${n}](/api/artifacts/content?path=artifacts/images/img_9ed3de_${n}.png)`)
+  .join('\n');
+
+describe('a set of drawn pictures', () => {
+  // Killed by: frontend/src/components/RichText.tsx :: if (images.length < 2) {
+  // Becomes: if (true) {
+  it('is one gallery card, not a column of cards', () => {
+    render(<RichText content={`Here are three.\n\n${BATCH}\n\nPick one.`} />);
+
+    expect(screen.getAllByTestId('artifact-image-gallery')).toHaveLength(1);
+    expect(screen.getAllByTestId('artifact-image-thumb')).toHaveLength(3);
+    // One large picture, the first, and the prose on both sides kept.
+    expect(screen.getByTestId('inline-artifact-image')).toHaveAttribute('alt', 'fiona #1');
+    expect(screen.getByText('Here are three.')).toBeInTheDocument();
+    expect(screen.getByText('Pick one.')).toBeInTheDocument();
+    expect(screen.queryByRole('list')).toBeNull();
+  });
+
+  it('groups pictures written one paragraph each, too', () => {
+    const paragraphs = [1, 2]
+      .map((n) => `![p${n}](artifacts/images/img_aa_${n}.png)`)
+      .join('\n\n');
+    render(<RichText content={paragraphs} />);
+    expect(screen.getAllByTestId('artifact-image-thumb')).toHaveLength(2);
+  });
+
+  // Killed by: frontend/src/components/RichText.tsx :: if (!inner) return null;
+  // Becomes: if (!inner) continue;
+  it('leaves a list with prose in it a list', () => {
+    render(<RichText content={`${BATCH}\n4. and a sentence`} />);
+    expect(screen.queryByTestId('artifact-image-gallery')).toBeNull();
+    expect(screen.getByRole('list')).toBeInTheDocument();
+    expect(screen.getAllByTestId('inline-artifact-image')).toHaveLength(3);
+  });
+
+  it('shows the chosen picture large and acts on that one', () => {
+    render(<RichText content={BATCH} />);
+    fireEvent.click(screen.getAllByTestId('artifact-image-thumb')[1]);
+
+    expect(screen.getByTestId('inline-artifact-image')).toHaveAttribute('alt', 'fiona #2');
+    expect(screen.getAllByTestId('artifact-image-thumb')[1]).toHaveAttribute('aria-pressed', 'true');
+    const visible = screen.getAllByTestId('artifact-image-download').filter((el) => !el.closest('[hidden]'));
+    expect(visible).toHaveLength(1);
+    expect(visible[0]).toHaveAttribute('download', 'img_9ed3de_2.png');
+  });
+});
+
+describe('looking at a picture larger', () => {
+  it('opens from the picture and closes on Escape', () => {
+    render(<RichText content={ARTIST_REPLY} />);
+    expect(screen.queryByTestId('image-lightbox')).toBeNull();
+
+    fireEvent.click(screen.getByTestId('artifact-image-zoom'));
+    expect(screen.getByRole('dialog')).toBeInTheDocument();
+    expect(screen.getByTestId('image-lightbox-image')).toHaveAttribute(
+      'src',
+      '/api/artifacts/content?path=artifacts%2Fimages%2Fimg_3008971970_sess_r.png',
+    );
+    // One picture: nothing to step to.
+    expect(screen.queryByTestId('image-lightbox-next')).toBeNull();
+
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(screen.queryByTestId('image-lightbox')).toBeNull();
+  });
+
+  // Killed by: frontend/src/components/ImageCard.tsx :: else if (event.key === 'ArrowRight') onIndex((index + 1) % images.length);
+  // Becomes: else if (event.key === 'ArrowRight') onIndex(index);
+  it('walks a set with the arrow keys, and the card follows', () => {
+    render(<RichText content={BATCH} />);
+    fireEvent.click(screen.getByTestId('artifact-image-zoom'));
+    expect(screen.getByTestId('image-lightbox-position')).toHaveTextContent('1 / 3');
+
+    fireEvent.keyDown(window, { key: 'ArrowRight' });
+    expect(screen.getByTestId('image-lightbox-image')).toHaveAttribute('alt', 'fiona #2');
+    fireEvent.keyDown(window, { key: 'ArrowLeft' });
+    fireEvent.keyDown(window, { key: 'ArrowLeft' });
+    expect(screen.getByTestId('image-lightbox-position')).toHaveTextContent('3 / 3');
+
+    fireEvent.click(screen.getByTestId('image-lightbox-close'));
+    expect(screen.getByTestId('inline-artifact-image')).toHaveAttribute('alt', 'fiona #3');
+  });
+
+  it('closes on a click beside the picture, not on the picture', () => {
+    render(<RichText content={ARTIST_REPLY} />);
+    fireEvent.click(screen.getByTestId('artifact-image-zoom'));
+    fireEvent.click(screen.getByTestId('image-lightbox-image'));
+    expect(screen.getByTestId('image-lightbox')).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId('image-lightbox'));
+    expect(screen.queryByTestId('image-lightbox')).toBeNull();
+  });
+});
+
+describe('the larger view, for keyboard and screen-reader users', () => {
+  it('names the picture on the control that opens it', () => {
+    render(<RichText content={BATCH} />);
+    expect(screen.getByRole('button', { name: /fiona #1/ })).toBe(screen.getByTestId('artifact-image-zoom'));
+  });
+
+  // Killed by: frontend/src/components/ImageCard.tsx :: if (target && (target.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName))) return;
+  // Becomes: if (false) return;
+  it('leaves an arrow typed into a field to the field', () => {
+    render(
+      <>
+        <textarea data-testid="field" />
+        <RichText content={BATCH} />
+      </>,
+    );
+    fireEvent.click(screen.getByTestId('artifact-image-zoom'));
+    fireEvent.keyDown(screen.getByTestId('field'), { key: 'ArrowRight' });
+    fireEvent.keyDown(window, { key: 'ArrowRight', altKey: true });
+    expect(screen.getByTestId('image-lightbox-position')).toHaveTextContent('1 / 3');
+  });
+
+  // Killed by: frontend/src/components/ImageCard.tsx :: event.preventDefault();
+  // Becomes: return;
+  it('keeps Tab inside the viewer', () => {
+    render(<RichText content={BATCH} />);
+    fireEvent.click(screen.getByTestId('artifact-image-zoom'));
+    const close = screen.getByTestId('image-lightbox-close');
+    expect(close).toHaveFocus();
+    const stops = Array.from(screen.getByRole('dialog').querySelectorAll('a[href], button'));
+    // From the last stop, Tab comes round to the first rather than leaving for the page.
+    (stops[stops.length - 1] as HTMLElement).focus();
+    fireEvent.keyDown(window, { key: 'Tab' });
+    expect(stops[0]).toHaveFocus();
   });
 });

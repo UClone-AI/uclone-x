@@ -7,19 +7,16 @@
  * `i18n.test.tsx` compares each Korean sentence's placeholders with the English one's.
  *
  * Wording notes that used to sit beside the sentences, and still bind them:
- * - `settings.models.cancelInstall` is not bare "Cancel": the modal footer already has one,
- *   and it closes Settings.
  * - `personaEditor.fields.enableWriteTools` / `enableSubagentTools` read exactly as
  *   `BaseAgent._capability_refusal` quotes them (#1167); rename all three together.
  * - `settings.failure.*` say only what the reader can see did not happen, never why (#1436).
  * - `skills.plainCause.*` never quote the transport ("Failed to fetch") or a status line (#1369).
- * - `settings.apiKey.notSetAfter` follows the provider's name, which the banner sets in bold;
- *   `diagnostics.panel.intro*` is one sentence split around its emphasised phrase.
+ * - `diagnostics.panel.intro*` is one sentence split around its emphasised phrase.
  * - `mcp.pairs.unnamed` / `duplicate` take `what` from `mcp.pairs.header` / `envVar`, and
  *   `mcp.row.stillSaved` takes it from `mcp.row.checkHttp` / `checkCommand`.
- * - `settings.catalog.*` take `vendor` from `providerRegistry`'s `vendorName` (the company,
- *   "Google"), and are chosen by the Core's catalog `status`, never its English `detail` (#1631).
- *   No sentence names a model: which models exist is the provider's listing's to say.
+ * - `gateway.status.*` and `gateway.picker.*` are chosen by a connection's `status`, never the
+ *   Core's English `detail` (#1631). No sentence names a model: which models exist is each
+ *   connection's listing's to say (model-gateway.md §3.5).
  * - `notices.codes.*` are the Core's stored English fallback word for word (`room/notices.py`'s
  *   `NOTICE_FALLBACK`), so an export reads as an English screen; `test_notice_contract.py`
  *   holds the two equal. Change both together.
@@ -42,8 +39,10 @@ import time from '../locales/en/time.json';
 import toolSteps from '../locales/en/toolSteps.json';
 import usage from '../locales/en/usage.json';
 import avatar from '../locales/en/avatar.json';
-import images from '../locales/en/images.json';
+import imageCard from '../locales/en/imageCard.json';
 import links from '../locales/en/links.json';
+import browser from '../locales/en/browser.json';
+import gateway from '../locales/en/gateway.json';
 
 export const en = {
   settings,
@@ -64,8 +63,10 @@ export const en = {
   notices,
   usage,
   avatar,
-  images,
+  imageCard,
   links,
+  browser,
+  gateway,
 };
 
 export type Messages = typeof en;

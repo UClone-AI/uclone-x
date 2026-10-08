@@ -10,28 +10,25 @@ Provides pure core diagnostic models and functions for:
 from __future__ import annotations
 
 import logging
-import re
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
 from uclone_x.core.session import validate_session_id
+from uclone_x.core.session_log import SessionLogEntry, stored_result_entry
+from uclone_x.core.session_state import SessionState
 from uclone_x.core.session_store import SessionStoreProtocol
-from uclone_x.core.tool_results import ARTIFACT_SUBDIR, handle_in
 from uclone_x.llm.models import ChatMessage, MessageRole
 
 logger = logging.getLogger(__name__)
 
-#: The legacy offload marker's path. Current stored results are named by a `tr_` handle
-#: instead (`handle_in`), and are checked alongside it.
-OFFLOAD_PATH_PATTERN = re.compile(r"saved to '([^']+)'")
 # An advisory threshold on *interaction turns* — how many times a human has gone back and
 # forth with the agent — used only to label a session "saturated" in diagnostics output.
 # It is deliberately unrelated to `AgentConfig.max_steps`, the P4 ceiling on agent steps
 # inside a single turn: nothing here may terminate a conversation, and comparing a turn
 # counter against the step ceiling is the anti-pattern recorded in issue 2026-09-05-001.
-# See `docs/guides/agent-runtime-terminology.md`.
+# See the agent-runtime terminology guide.
 DEFAULT_MAX_CONVERSATION_TURNS = 20
 
 
@@ -121,25 +118,28 @@ def _resolve_session_status(
 
 
 def _list_session_artifacts(
-    workspace_root: Path | None, session_id: str
+    state: SessionState, store: SessionStoreProtocol
 ) -> tuple[int, int, list[str]]:
-    """Enumerate offloaded tool output artifacts for a session."""
-    if workspace_root is None:
-        return 0, 0, []
-    artifacts_dir = workspace_root / ARTIFACT_SUBDIR / session_id
-    if not artifacts_dir.is_dir():
-        return 0, 0, []
+    """The full tool results this session keeps: how many, their bytes, their handles.
 
-    files: list[str] = []
+    Each is a session-log entry whose body is the whole text a `tr_` handle names, in the
+    session's own body store (#1848); one whose body the store no longer holds is not
+    counted. The workspace holds none of them.
+    """
+    # One pass: the latest entry per handle, as `stored_result_entry` picks it.
+    latest: dict[str, tuple[int, SessionLogEntry]] = {}
+    for position, entry in enumerate(state.session_log):
+        handle = entry.blob
+        if handle is not None and stored_result_entry((entry,), handle) is entry:
+            latest[handle] = (position, entry)
+    handles: list[str] = []
     total_bytes = 0
-    try:
-        for entry in sorted(artifacts_dir.iterdir()):
-            if entry.is_file():
-                files.append(entry.name)
-                total_bytes += entry.stat().st_size
-    except OSError as exc:
-        logger.warning("Failed to inspect tool artifacts directory %s: %s", artifacts_dir, exc)
-    return len(files), total_bytes, files
+    for _position, entry in sorted(latest.values(), key=lambda kept: kept[0]):
+        if store.load_context_body(state.session_id, entry.digest) is None:
+            continue
+        handles.append(str(entry.blob))
+        total_bytes += entry.size
+    return len(handles), total_bytes, handles
 
 
 def inspect_session(
@@ -185,7 +185,7 @@ def inspect_session(
         plan_steps_total = len(state.plan.steps)
         plan_steps_completed = sum(1 for s in state.plan.steps if getattr(s, "completed", False))
 
-    art_count, art_bytes, art_files = _list_session_artifacts(workspace_root, session_id)
+    art_count, art_bytes, art_files = _list_session_artifacts(state, store)
 
     summary = SessionSummary(
         session_id=state.session_id,
@@ -270,8 +270,8 @@ def check_session_health(
        - Missing tool_call_id on TOOL messages.
        - Unresolved tool calls (assistant calls tools but conversation proceeds without results).
        - Empty messages (no content and no tool calls).
-    5. Offloaded tool output artifact integrity (referenced file exists on disk), for
-       the legacy `saved to '...'` form and for stored results named by a `tr_` handle.
+    5. Stored tool result integrity: the full text a `tr_` handle names is in the
+       session's store.
     """
     issues: list[SessionHealthIssue] = []
 
@@ -345,7 +345,8 @@ def check_session_health(
         # Empty message check
         has_content = bool(msg.content and msg.content.strip())
         has_calls = bool(msg.tool_calls)
-        if not has_content and not has_calls:
+        # A form is recorded with no text, which is rendered when it is shown (#1848).
+        if not has_content and not has_calls and msg.rendered_from is None:
             issues.append(
                 SessionHealthIssue(
                     severity="warning",
@@ -409,47 +410,24 @@ def check_session_health(
                 )
                 pending_tool_calls.clear()
 
-        # 5. Offloaded artifact reference check
-        if msg.content and "[Tool Output Offloaded" in msg.content:
-            match = OFFLOAD_PATH_PATTERN.search(msg.content)
-            if match:
-                rel_path = match.group(1)
-                target_path: Path | None = None
-                if workspace_root is not None:
-                    target_path = workspace_root / rel_path
-                else:
-                    target_path = Path(rel_path)
-
-                if target_path and not target_path.is_file():
-                    issues.append(
-                        SessionHealthIssue(
-                            severity="warning",
-                            code="MISSING_OFFLOAD_ARTIFACT",
-                            message=(
-                                f"Turn #{idx} references offloaded tool output at '{rel_path}', "
-                                "but the artifact file does not exist on disk."
-                            ),
-                            turn_index=idx,
-                            details={"artifact_path": rel_path},
-                        )
-                    )
-
-        # 5b. A stored tool result (#1422): an excerpt, page or compaction stub names a
-        # `tr_` handle, whose blob lives in the session's own artifact directory (#1653).
-        handle = handle_in(msg.content) if msg.role == MessageRole.TOOL else None
-        if handle is not None and workspace_root is not None:
-            rel_blob = f"{ARTIFACT_SUBDIR}/{session_id}/{handle}.txt"
-            if not (workspace_root / rel_blob).is_file():
+        # 5. A stored tool result (#1422): an excerpt or compaction stub records the
+        # `tr_` handle it is rendered from, whose full text is a body of the session's own
+        # log (#1848). The handle is read from that record, never from the text: output
+        # that quotes a stored-result header is its own full text and needs no kept result.
+        handle: str | None = msg.rendered_from.handle if msg.rendered_from is not None else None
+        if handle is not None:
+            entry = stored_result_entry(state.session_log, handle)
+            if entry is None or store.load_context_body(session_id, entry.digest) is None:
                 issues.append(
                     SessionHealthIssue(
                         severity="warning",
                         code="MISSING_OFFLOAD_ARTIFACT",
                         message=(
-                            f"Turn #{idx} names stored tool result '{handle}', but its file "
-                            f"'{rel_blob}' does not exist on disk."
+                            f"Turn #{idx} names stored tool result '{handle}', but this "
+                            "session no longer holds its full text."
                         ),
                         turn_index=idx,
-                        details={"artifact_path": rel_blob, "handle": handle},
+                        details={"handle": handle},
                     )
                 )
 

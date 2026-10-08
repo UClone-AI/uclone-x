@@ -514,13 +514,15 @@ describe('TurnDetail', () => {
         room={room([message()])}
         summary={defaultSummary({
           error: plain,
-          provider_failure: { kind: 'provider_unreachable', message: plain, retryable: true },
+          provider_failure: { kind: 'provider_unreachable', message: plain, retryable: true, provider: 'Google' },
         })}
       />,
     );
 
     const box = screen.getByTestId('turn-detail-error');
-    expect(box).toHaveTextContent(plain);
+    // Built from the failure's kind and provider, as the room row is (#2167).
+    expect(box).toHaveTextContent("couldn't finish this turn. Google couldn't be reached.");
+    expect(box).not.toHaveTextContent(plain);
     expect(screen.getByTestId('turn-detail-remedy')).toHaveTextContent(
       'If you set a custom endpoint in Settings, check that address too.',
     );
@@ -542,13 +544,15 @@ describe('TurnDetail', () => {
               content: '',
               error: plain,
               refusal: 'model_unavailable',
-              provider_failure: { kind: 'model_unavailable', message: plain, retryable: false },
+              provider_failure: { kind: 'model_unavailable', message: plain, retryable: false, provider: 'Google' },
             }),
           ])}
         />,
       );
 
-      expect(screen.getByTestId('turn-detail-error')).toHaveTextContent(plain);
+      expect(screen.getByTestId('turn-detail-error')).toHaveTextContent(
+        "couldn't finish this turn. Google doesn't offer the model this turn asked for.",
+      );
     } finally {
       vi.unstubAllGlobals();
     }

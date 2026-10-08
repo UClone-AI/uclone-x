@@ -1,8 +1,15 @@
 import { afterEach, beforeEach, describe, it, expect, vi } from 'vitest';
 import { render, screen, waitFor, fireEvent, within } from '@testing-library/react';
-import { StoryView, STORY_COPY } from './StoryView';
+import { StoryView } from './StoryView';
+import { LocaleProvider, fmt } from '../../i18n';
+import { en } from '../../i18n/en';
+import { ko } from '../../i18n/ko';
 import { expectPlain } from '../../test/plainCopy';
-import type { ProposalView, StoryOverview } from '../../lib/artifactLibrary';
+import type { ProposalView, SceneView, StoryOverview } from '../../lib/artifactLibrary';
+
+const STORY = en.dock.story;
+
+const board = { entries: [], changes: [], continuity: null, findings: [], pending: [] } satisfies Partial<SceneView>;
 
 const proposal = (over: Partial<ProposalView> = {}): ProposalView => ({
   id: 'p-001',
@@ -48,6 +55,9 @@ const overview = (over: Partial<StoryOverview> = {}): StoryOverview => ({
         id: 'ch01',
         title: 'Departure',
         act: 'Act I',
+        functions: [],
+        twist: false,
+        climax: false,
         scenes: [
           {
             id: 'ch01.s01',
@@ -57,6 +67,7 @@ const overview = (over: Partial<StoryOverview> = {}): StoryOverview => ({
             characters: [],
             places: [],
             written: true,
+            ...board,
           },
           {
             id: 'ch01.s02',
@@ -66,6 +77,7 @@ const overview = (over: Partial<StoryOverview> = {}): StoryOverview => ({
             characters: [],
             places: [],
             written: true,
+            ...board,
           },
           {
             id: 'ch01.s03',
@@ -75,6 +87,7 @@ const overview = (over: Partial<StoryOverview> = {}): StoryOverview => ({
             characters: [],
             places: [],
             written: false,
+            ...board,
           },
         ],
       },
@@ -83,6 +96,7 @@ const overview = (over: Partial<StoryOverview> = {}): StoryOverview => ({
     assumptions: ['ch01.s02 is placed after ch01.s01.'],
   },
   outline_note: null,
+  board_note: null,
   codex: [
     {
       kind: 'characters',
@@ -185,9 +199,9 @@ describe('StoryView, a story in Files (#1560)', () => {
 
     const quotes = within(card).getAllByTestId('story-evidence');
     expect(quotes[0]).toHaveTextContent('The map slid under the seat.');
-    expect(quotes[0]).not.toHaveTextContent(STORY_COPY.quoteGone);
+    expect(quotes[0]).not.toHaveTextContent(STORY.quoteGone);
     expect(quotes[1]).toHaveTextContent('She had no map now.');
-    expect(quotes[1]).toHaveTextContent(STORY_COPY.quoteGone);
+    expect(quotes[1]).toHaveTextContent(STORY.quoteGone);
 
     const diff = within(card).getByTestId('story-diff');
     expect(diff).toHaveTextContent('+progressions:');
@@ -208,8 +222,8 @@ describe('StoryView, a story in Files (#1560)', () => {
     renderView();
 
     const change = await screen.findByTestId('story-change');
-    expect(within(change).getByTestId('story-change-before')).toHaveTextContent(STORY_COPY.notSet);
-    expect(change).toHaveTextContent(STORY_COPY.unplaced);
+    expect(within(change).getByTestId('story-change-before')).toHaveTextContent(STORY.notSet);
+    expect(change).toHaveTextContent(STORY.unplaced);
   });
 
   it('approves the change as it was shown, says so, and reads the story again', async () => {
@@ -224,10 +238,10 @@ describe('StoryView, a story in Files (#1560)', () => {
     fireEvent.click(await screen.findByTestId('story-approve'));
 
     const notice = await screen.findByTestId('story-view-notice');
-    expect(notice).toHaveTextContent(STORY_COPY.applied('Mara'));
+    expect(notice).toHaveTextContent(fmt(STORY.applied, { name: 'Mara' }));
     expect(notice).toHaveTextContent('the comments it had were not kept');
     expect(posted(APPROVE)).toEqual([{ seen_digest: 'd-shown' }]);
-    expect(await screen.findByText(STORY_COPY.noneWaiting)).toBeInTheDocument();
+    expect(await screen.findByText(STORY.noneWaiting)).toBeInTheDocument();
     expect(posted(REJECT)).toEqual([]);
   });
 
@@ -240,7 +254,7 @@ describe('StoryView, a story in Files (#1560)', () => {
     fireEvent.change(screen.getByTestId('story-reject-reason'), { target: { value: 'She keeps it.' } });
     fireEvent.click(screen.getByTestId('story-confirm-reject'));
 
-    expect(await screen.findByTestId('story-view-notice')).toHaveTextContent(STORY_COPY.rejected('Mara'));
+    expect(await screen.findByTestId('story-view-notice')).toHaveTextContent(fmt(STORY.rejected, { name: 'Mara' }));
     expect(posted(REJECT)).toEqual([{ seen_digest: 'd-shown', reason: 'She keeps it.' }]);
     expect(posted(APPROVE)).toEqual([]);
   });
@@ -265,7 +279,7 @@ describe('StoryView, a story in Files (#1560)', () => {
     fireEvent.click(await screen.findByTestId('story-approve'));
 
     const notice = await screen.findByTestId('story-view-notice');
-    expect(notice).toHaveTextContent(STORY_COPY.decideFailed);
+    expect(notice).toHaveTextContent(STORY.decideFailed);
     expectPlain(notice.textContent);
   });
 
@@ -283,12 +297,12 @@ describe('StoryView, a story in Files (#1560)', () => {
     const notice = await screen.findByTestId('story-view-notice');
     expect(notice).toHaveTextContent(refusal);
     fireEvent.click(within(notice).getByTestId('story-open-confirmed-window'));
-    expect(await screen.findByText(STORY_COPY.windowOpened)).toBeInTheDocument();
+    expect(await screen.findByText(STORY.windowOpened)).toBeInTheDocument();
     expect(calls.filter((c) => c.url === '/api/person/window')).toHaveLength(1);
   });
 
   it('says plainly when no confirmed window could be opened', async () => {
-    // Killed by: frontend/src/components/artifacts/StoryView.tsx :: setNotice([plainFailure(err, STORY_COPY.windowFailed)]);
+    // Killed by: frontend/src/components/artifacts/StoryView.tsx :: setNotice([plainFailure(err, t.windowFailed)]);
     // Becomes: setNotice([String(err)]);
     answers[SHOW] = ok(overview());
     answers[APPROVE] = { status: 403, body: { detail: 'Only you can make this decision.' } };
@@ -298,7 +312,7 @@ describe('StoryView, a story in Files (#1560)', () => {
     fireEvent.click(await screen.findByTestId('story-approve'));
     fireEvent.click(await screen.findByTestId('story-open-confirmed-window'));
 
-    expect(await screen.findByText(STORY_COPY.windowFailed)).toBeInTheDocument();
+    expect(await screen.findByText(STORY.windowFailed)).toBeInTheDocument();
     expectPlain(screen.getByTestId('story-view-notice').textContent);
   });
 
@@ -363,7 +377,7 @@ describe('StoryView, a story in Files (#1560)', () => {
     expect(groups.map((g) => g.getAttribute('data-kind'))).toEqual(['characters', 'places']);
     expect(within(groups[0]).getByTestId('story-entry')).toHaveTextContent('Mara');
     expect(within(groups[0]).getByTestId('story-entry')).toHaveTextContent('has_map: true');
-    expect(groups[1]).toHaveTextContent(STORY_COPY.noEntries('Places'));
+    expect(groups[1]).toHaveTextContent(fmt(STORY.noEntries, { label: 'places' }));
   });
 
   it('states every absence: no outline, nothing waiting, nothing decided, files that do not read', async () => {
@@ -380,17 +394,17 @@ describe('StoryView, a story in Files (#1560)', () => {
     renderView();
 
     expect(await screen.findByTestId('story-outline-note')).toHaveTextContent('This story has no outline yet.');
-    expect(screen.getByTestId('story-pending')).toHaveTextContent(STORY_COPY.noneWaiting);
+    expect(screen.getByTestId('story-pending')).toHaveTextContent(STORY.noneWaiting);
     expect(screen.getByTestId('story-proposals-unreadable')).toHaveTextContent('It is not a proposal.');
-    expect(screen.getByTestId('story-decided')).toHaveTextContent(STORY_COPY.noneDecided);
+    expect(screen.getByTestId('story-decided')).toHaveTextContent(STORY.noneDecided);
     // The codex reports folders as well as files, and its heading says so (#1595). Proposals
     // are only ever files.
-    // Killed by: frontend/src/components/artifacts/StoryView.tsx :: heading={STORY_COPY.codexUnreadable}
-    // Becomes: heading={STORY_COPY.unreadable}
+    // Killed by: frontend/src/components/artifacts/StoryView.tsx :: heading={t.codexUnreadable}
+    // Becomes: heading={t.unreadable}
     const codex = screen.getByTestId('story-codex-unreadable');
-    expect(codex).toHaveTextContent(STORY_COPY.codexUnreadable);
+    expect(codex).toHaveTextContent(STORY.codexUnreadable);
     expect(codex).toHaveTextContent('The folder was not read.');
-    expect(screen.getByTestId('story-proposals-unreadable')).toHaveTextContent(STORY_COPY.unreadable);
+    expect(screen.getByTestId('story-proposals-unreadable')).toHaveTextContent(STORY.unreadable);
   });
 
   it('lists decided changes with where they were decided', async () => {
@@ -422,7 +436,7 @@ describe('StoryView, a story in Files (#1560)', () => {
     renderView();
 
     const alert = await screen.findByRole('alert');
-    expect(alert).toHaveTextContent(STORY_COPY.loadFailed);
+    expect(alert).toHaveTextContent(STORY.loadFailed);
     expectPlain(alert.querySelector('p')?.textContent);
   });
 
@@ -432,5 +446,220 @@ describe('StoryView, a story in Files (#1560)', () => {
 
     fireEvent.click(await screen.findByTestId('story-view-back'));
     await waitFor(() => expect(onBack).toHaveBeenCalled());
+  });
+});
+
+/** A story whose outline is a board: the codex entries, changes, checks and waiting changes of each scene. */
+const boardStory = (): StoryOverview => {
+  const base = overview();
+  const [chapter] = base.outline!.chapters;
+  return overview({
+    outline: {
+      ...base.outline!,
+      chapters: [
+        {
+          ...chapter,
+          functions: ['setup', 'reversal', 'no-such-function'],
+          twist: true,
+          climax: false,
+          scenes: [
+            {
+              ...chapter.scenes[0],
+              entries: [
+                { kind: 'characters', id: 'mara', name: 'Mara', how: 'listed', in_codex: true },
+                { kind: 'characters', id: 'ivo', name: 'Ivo', how: 'listed', in_codex: false },
+              ],
+              continuity: 'checked',
+            },
+            {
+              ...chapter.scenes[1],
+              entries: [{ kind: 'threads', id: 'the-map', name: 'The map', how: 'planted', in_codex: true }],
+              changes: [
+                {
+                  kind: 'characters',
+                  entry_id: 'mara',
+                  entry_name: 'Mara',
+                  set: { has_map: false },
+                  add_looks: ['torn sleeve'],
+                  remove_looks: [],
+                  note: null,
+                },
+              ],
+              continuity: 'checked',
+              findings: [{ quote: 'Her blue coat', note: 'The codex says her coat is red.' }],
+              pending: ['p-001'],
+            },
+            { ...chapter.scenes[2], continuity: 'unread' },
+          ],
+        },
+      ],
+    },
+    codex: [
+      ...base.codex,
+      {
+        kind: 'threads',
+        label: 'Threads',
+        entries: [
+          { id: 'the-map', name: 'The map', aliases: [], profile: '', state: {}, progressions: [], looks: null },
+        ],
+      },
+    ],
+  });
+};
+
+describe('StoryView, the story board (§1.1 row 5)', () => {
+  const scene = (id: string) => {
+    const found = screen.getAllByTestId('story-scene').find((s) => s.getAttribute('data-scene') === id);
+    if (!found) throw new Error(`no scene ${id}`);
+    return found;
+  };
+
+  it("marks each chapter's function and twist, and each scene written or planned", async () => {
+    // Killed by: frontend/src/components/artifacts/StoryView.tsx :: ...chapter.functions.map((f) => functions[f]).filter((f): f is string => Boolean(f)),
+    // Becomes: ...chapter.functions,
+    answers[SHOW] = ok(boardStory());
+    renderView();
+
+    const marks = await screen.findByTestId('story-chapter-marks');
+    expect(marks).toHaveTextContent(STORY.board.functions.setup);
+    expect(marks).toHaveTextContent(STORY.board.functions.reversal);
+    expect(marks).toHaveTextContent(STORY.board.twist);
+    expect(marks).not.toHaveTextContent(STORY.board.climax);
+    // A function the screen has no word for is the arc's code, and is not shown.
+    expect(marks).not.toHaveTextContent('no-such-function');
+    expect(within(scene('ch01.s01')).getByTestId('story-scene-state')).toHaveTextContent(STORY.board.written);
+    expect(within(scene('ch01.s03')).getByTestId('story-scene-state')).toHaveTextContent(STORY.board.planned);
+  });
+
+  it('shows the codex entries in a scene, and an entry clicked there is shown in the codex', async () => {
+    // Killed by: frontend/src/components/artifacts/StoryView.tsx :: const isChosen = chosen !== null && chosen.kind === group.kind && chosen.id === e.id;
+    // Becomes: const isChosen = false;
+    answers[SHOW] = ok(boardStory());
+    renderView();
+
+    await screen.findByTestId('story-board');
+    const chips = within(scene('ch01.s01')).getAllByTestId('story-scene-entry');
+    expect(chips.map((c) => c.textContent)).toEqual(['Mara', fmt(STORY.board.notInCodex, { name: 'Ivo' })]);
+    // An entry only proposed is named, but there is nothing in the codex to show.
+    expect(chips[1].tagName).not.toBe('BUTTON');
+
+    const mapChip = within(scene('ch01.s02')).getByTestId('story-scene-entry');
+    expect(mapChip).toHaveTextContent(`The map · ${STORY.board.how.planted}`);
+    fireEvent.click(mapChip);
+    const chosen = screen
+      .getAllByTestId('story-entry')
+      .filter((e) => e.getAttribute('data-chosen') === 'true')
+      .map((e) => e.getAttribute('data-entry'));
+    expect(chosen).toEqual(['the-map']);
+  });
+
+  it('shows what the codex records at a scene, what the check found, and the changes waiting on it', async () => {
+    answers[SHOW] = ok(boardStory());
+    renderView();
+
+    await screen.findByTestId('story-board');
+    const platform = scene('ch01.s02');
+    expect(within(platform).getByTestId('story-scene-changes')).toHaveTextContent('Mara: has_map: false');
+    expect(within(platform).getByTestId('story-scene-changes')).toHaveTextContent(
+      fmt(STORY.board.looksAdded, { looks: 'torn sleeve' }),
+    );
+    const findings = within(platform).getByTestId('story-scene-findings');
+    expect(findings).toHaveTextContent('Her blue coat');
+    expect(findings).toHaveTextContent('The codex says her coat is red.');
+    // A scene with a finding does not also say it was clean.
+    expect(within(platform).queryByTestId('story-scene-checked')).toBeNull();
+    expect(within(platform).getByTestId('story-scene-waiting')).toHaveTextContent(
+      `${fmt(STORY.board.waiting.one, { count: 1 })}: Mara`,
+    );
+
+    expect(within(scene('ch01.s01')).getByTestId('story-scene-checked')).toHaveTextContent(STORY.board.checkedClean);
+    expect(within(scene('ch01.s03')).getByTestId('story-scene-unread')).toHaveTextContent(STORY.board.unread);
+    expect(within(scene('ch01.s03')).queryByTestId('story-scene-waiting')).toBeNull();
+  });
+
+  it("says when the story's plan could not be read, in the Core's words", async () => {
+    const note = 'The story plan (start.yaml) could not be read, so no scene shows what was checked.';
+    answers[SHOW] = ok({ ...boardStory(), board_note: note });
+    renderView();
+
+    expect(await screen.findByTestId('story-board-note')).toHaveTextContent(note);
+  });
+
+  it('reads Korean when the screen is Korean', async () => {
+    answers[SHOW] = ok(boardStory());
+    render(
+      <LocaleProvider hints={['ko-KR']}>
+        <StoryView storyId="night-train" onBack={() => {}} />
+      </LocaleProvider>,
+    );
+
+    const marks = await screen.findByTestId('story-chapter-marks');
+    expect(marks).toHaveTextContent(ko.dock.story.board.twist);
+    expect(screen.getByTestId('story-pending')).toHaveTextContent(ko.dock.story.waiting);
+    expect(screen.getByTestId('story-view-back')).toHaveTextContent(ko.dock.story.back);
+    expect(screen.queryByText(en.dock.story.waiting)).toBeNull();
+  });
+
+  const renderKorean = () =>
+    render(
+      <LocaleProvider hints={['ko-KR']}>
+        <StoryView storyId="night-train" onBack={() => {}} />
+      </LocaleProvider>,
+    );
+
+  it("words the Core's notes from their codes in Korean, not the Core's English", async () => {
+    // Killed by: frontend/src/components/artifacts/StoryView.tsx :: {noteText(story.board_code, story.board_note, story, t)}
+    // Becomes: {story.board_note}
+    // Killed by: frontend/src/components/artifacts/StoryView.tsx :: {noteText(story.decide_code, story.decide_note, story, t)}
+    // Becomes: {story.decide_note}
+    const english = 'The record of how this story was started could not be read.';
+    answers[SHOW] = ok({
+      ...boardStory(),
+      board_note: english,
+      board_code: 'start_unreadable',
+      writer: null,
+      decide_note: 'No conversation is writing “Night Train”.',
+      decide_code: 'no_writer',
+    });
+    renderKorean();
+
+    const note = await screen.findByTestId('story-board-note');
+    expect(note).toHaveTextContent(ko.dock.story.notes.start_unreadable);
+    expect(note).not.toHaveTextContent(english);
+    const decide = screen.getByTestId('story-decide-note');
+    expect(decide).toHaveTextContent(fmt(ko.dock.story.notes.no_writer, { title: 'Night Train' }));
+    expectPlain(decide.textContent ?? '');
+  });
+
+  it("words the outline's note from its code in Korean", async () => {
+    // Killed by: frontend/src/components/artifacts/StoryView.tsx :: {noteText(story.outline_code, story.outline_note, story, t)}
+    // Becomes: {story.outline_note}
+    answers[SHOW] = ok(overview({ outline: null, outline_note: 'This story has no outline yet.', outline_code: 'no_outline' }));
+    renderKorean();
+
+    expect(await screen.findByTestId('story-outline-note')).toHaveTextContent(ko.dock.story.notes.no_outline);
+  });
+
+  it('shows the English sentence for a note code this head does not know', async () => {
+    const note = 'A newer reason.';
+    answers[SHOW] = ok({ ...boardStory(), board_note: note, board_code: 'from_a_newer_core' });
+    renderKorean();
+
+    expect(await screen.findByTestId('story-board-note')).toHaveTextContent(note);
+  });
+
+  it("words a refused decision from the Core's code in Korean", async () => {
+    // Killed by: frontend/src/components/artifacts/StoryView.tsx :: setNotice([refusalText(err, t.decideFailed, t.refusals)]);
+    // Becomes: setNotice([plainFailure(err, t.decideFailed)]);
+    const english = 'The conversation “Writing room” is answering right now, so the decision was not saved.';
+    answers[SHOW] = ok(overview());
+    answers[APPROVE] = { status: 409, body: { detail: english, code: 'writer_busy' } };
+    renderKorean();
+
+    fireEvent.click(await screen.findByTestId('story-approve'));
+
+    const notice = await screen.findByTestId('story-view-notice');
+    expect(notice).toHaveTextContent(ko.dock.story.refusals.writer_busy);
+    expect(notice).not.toHaveTextContent(english);
   });
 });

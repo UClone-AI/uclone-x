@@ -4,6 +4,7 @@
   "maxTokens": "Max tokens",
   "tools": "도구",
   "notSet": "설정 안 됨",
+  "systemDefault": "시스템 기본값",
   "noTools": "도구 목록이 없습니다. 이 클론은 런타임의 모든 도구를 쓸 수 있습니다.",
   "writeAccess": {
     "on": "파일을 쓸 수 있습니다",

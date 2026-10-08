@@ -1,0 +1,15 @@
+{
+  "zoom": "View {name} larger",
+  "download": "Download",
+  "downloadName": "Download {name}",
+  "more": "More for this picture",
+  "openInDocs": "Open in Docs",
+  "openInTab": "Open in a new tab",
+  "gallery": "{count} pictures",
+  "pick": "Picture {n} of {count}",
+  "viewer": "Picture viewer",
+  "close": "Close",
+  "previous": "Previous picture",
+  "next": "Next picture",
+  "position": "{n} / {count}"
+}

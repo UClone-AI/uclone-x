@@ -15,20 +15,27 @@ Every write goes through `StoryWork.write`, so the lease and the digest checks a
 proposal is applied only to the entry it was made against: its `entry_digest` must still be
 the entry file's digest, so a person never approves a change against a version of the entry
 they did not see.
+
+A proposal can also add an entry that is not there yet (#1808): applying it writes the
+entry's file, which must still not exist, and refuses it when an entry has taken its id,
+name or an alias since it was proposed.
 """
 
 from __future__ import annotations
 
 import difflib
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from pydantic import ValidationError
 
 from uclone_x.story.library import StoryError
+from uclone_x.story.names import CodexNames
+from uclone_x.story.quotes import folded
 from uclone_x.story.schemas import (
+    CODEX_KINDS,
     CharacterEntry,
     CodexEntry,
     CodexKind,
@@ -43,12 +50,14 @@ from uclone_x.story.timeline import Placement, entry_snapshot
 from uclone_x.story.work import StoryWork, entry_file, proposal_file
 
 __all__ = [
+    "KIND_WORDS",
     "AppliedProposal",
     "ChangeLine",
     "DecidedIn",
     "ProposalPreview",
     "apply_proposal",
     "check_applies",
+    "new_entry_clash",
     "pending_proposal",
     "preview_proposal",
     "reject_proposal",
@@ -74,6 +83,65 @@ def check_applies(kind: CodexKind, entry: CodexEntry, proposal: Proposal) -> Cod
         return entry_model(kind).model_validate(data)
     except ValidationError as exc:
         raise StoryError(describe_invalid(entry_file(kind, entry.id), exc)) from exc
+
+
+#: A kind folder's name, as one of its entries is called in a sentence.
+KIND_WORDS: dict[CodexKind, str] = {
+    "characters": "character",
+    "places": "place",
+    "items": "item",
+    "threads": "thread",
+}
+
+
+def new_entry_clash(
+    work: StoryWork,
+    kind: CodexKind,
+    entry: CodexEntry,
+    *,
+    pending: Iterable[Proposal] = (),
+) -> str | None:
+    """Why `entry` cannot be added to the codex as a new `kind` entry, or `None` (#1808).
+
+    Its id, name and aliases are each one key, compared as `CodexNames` compares them, and
+    none may already name an entry of any kind: `story_codex get` by that name would have
+    two answers. An entry file that is there but does not read still holds its id. A
+    new entry in `pending` -- proposed and not yet decided -- holds its keys too.
+    The reason is a clause, in plain words, for the caller to finish.
+    """
+    keys = [entry.id, entry.name, *entry.aliases]
+    names = CodexNames(work.codex())
+    for key in keys:
+        for item in names.matches(key):
+            also = "" if folded(item.entry.name) == folded(key) else f", also called '{key}'"
+            return f"the codex already has the {KIND_WORDS[item.kind]} '{item.entry.name}'{also}"
+    for candidate in CODEX_KINDS:
+        if work.read(entry_file(candidate, entry.id)) is not None:
+            return (
+                f"the codex already has a {KIND_WORDS[candidate]} file for '{entry.id}', "
+                "which could not be read"
+            )
+    wanted = {folded(key) for key in keys}
+    for proposal in pending:
+        if proposal.status != "pending" or proposal.change.new_entry is None:
+            continue
+        try:
+            other = proposal.new_entry()
+        except ValueError:
+            continue
+        if wanted & {folded(k) for k in (other.id, other.name, *other.aliases)}:
+            return (
+                f"proposal '{proposal.id}' already proposes the new {KIND_WORDS[proposal.kind]} "
+                f"'{other.name}', and it waits for a person to decide it"
+            )
+    return None
+
+
+def _new_entry(proposal: Proposal) -> CodexEntry:
+    try:
+        return proposal.new_entry()
+    except ValueError as exc:
+        raise StoryError(f"Proposal '{proposal.id}' was not applied: {exc}.") from exc
 
 
 def pending_proposal(
@@ -132,6 +200,8 @@ def apply_proposal(
         StoryReadOnlyError: `room_id` does not hold the story's lease.
     """
     proposal, proposal_digest = pending_proposal(work, proposal_id, expected_proposal_digest)
+    if proposal.change.new_entry is not None:
+        return _apply_new(work, proposal, proposal_digest, room_id=room_id, decided_in=decided_in)
     current = work.entry(proposal.kind, proposal.entry_id)
     if current is None:
         raise StoryError(
@@ -153,6 +223,41 @@ def apply_proposal(
         notes.append(
             f"{relative} was rewritten with the change, and the comments it had were not kept."
         )
+    notes.extend(_mark_applied(work, proposal, proposal_digest, room_id, decided_in))
+    return AppliedProposal(proposal_id, proposal.kind, proposal.entry_id, relative, notes)
+
+
+def _apply_new(
+    work: StoryWork,
+    proposal: Proposal,
+    proposal_digest: str,
+    *,
+    room_id: str,
+    decided_in: DecidedIn,
+) -> AppliedProposal:
+    """Write the entry `proposal` adds, as a file that must not exist yet (#1808)."""
+    entry = _new_entry(proposal)
+    clash = new_entry_clash(work, proposal.kind, entry)
+    if clash is not None:
+        raise StoryError(
+            f"Proposal '{proposal.id}' was not applied: {clash}. Reject it, and ask for the "
+            "entry again under a name of its own if it is still wanted."
+        )
+    relative = entry_file(proposal.kind, entry.id)
+    work.write(relative, dump_file(entry, compact=True), room_id=room_id, expected_digest=None)
+    notes = _mark_applied(work, proposal, proposal_digest, room_id, decided_in)
+    return AppliedProposal(proposal.id, proposal.kind, entry.id, relative, notes)
+
+
+def _mark_applied(
+    work: StoryWork,
+    proposal: Proposal,
+    proposal_digest: str,
+    room_id: str,
+    decided_in: DecidedIn,
+) -> list[str]:
+    """Record `proposal` as applied; a note when that could not be written."""
+    proposal_id = proposal.id
     decided = proposal.model_copy(
         update={"status": "applied", "decided_at": _now(), "decided_in": decided_in}
     )
@@ -164,10 +269,10 @@ def apply_proposal(
             expected_digest=proposal_digest,
         )
     except StoryError as exc:
-        notes.append(
+        return [
             f"The change was applied, but proposal '{proposal_id}' was not marked as applied: {exc}"
-        )
-    return AppliedProposal(proposal_id, proposal.kind, proposal.entry_id, relative, notes)
+        ]
+    return []
 
 
 def reject_proposal(
@@ -238,13 +343,15 @@ class ProposalPreview:
 
 def _moment(
     entry: CodexEntry, placements: Mapping[str, Placement] | None, at: str
-) -> tuple[dict[str, Any], list[str] | None, bool]:
-    """The entry's state and visual tags once scene `at` has ended, and whether it placed."""
+) -> tuple[dict[str, Any], list[str] | None, bool, dict[str, str]]:
+    """The entry's state and visual tags once scene `at` has ended, whether it placed, and
+    its relations then."""
     if placements is None or at not in placements:
         visual = entry.visual if isinstance(entry, CharacterEntry) else None
-        return dict(entry.state), (list(visual.tags) if visual is not None else None), False
+        tags = list(visual.tags) if visual is not None else None
+        return dict(entry.state), tags, False, dict(entry.relations)
     snapshot = entry_snapshot(entry, placements, at, through_scene=True)
-    return snapshot.state, snapshot.visual_tags, True
+    return snapshot.state, snapshot.visual_tags, True, snapshot.relations
 
 
 def _visual_fields(entry: CodexEntry) -> dict[str, Any]:
@@ -265,12 +372,14 @@ def _change_lines(
     change = proposal.change
     if change.progression is not None:
         at = change.progression.at
-        before, _, placed = _moment(entry, placements, at)
+        before, _, placed, related = _moment(entry, placements, at)
         for key, value in change.progression.set.items():
             lines.append(ChangeLine(key, at, before.get(key), value, placed))
+        for other, word in change.progression.relations.items():
+            lines.append(ChangeLine(f"relation to {other}", at, related.get(other), word, placed))
     if change.visual_progression is not None:
         vp = change.visual_progression
-        _, before_tags, placed = _moment(entry, placements, vp.at)
+        _, before_tags, placed, _ = _moment(entry, placements, vp.at)
         kept = [t for t in before_tags or [] if t not in set(vp.remove_tags)]
         after_tags = kept + [t for t in vp.add_tags if t not in kept]
         lines.append(ChangeLine("looks", vp.at, before_tags, after_tags, placed))
@@ -290,6 +399,8 @@ def preview_proposal(
     `placements` is the outline's story-time order (`place_scenes`), or `None` when the
     story has no outline that reads.
     """
+    if proposal.change.new_entry is not None:
+        return _preview_new(work, proposal)
     relative = entry_file(proposal.kind, proposal.entry_id)
     try:
         current = work.entry(proposal.kind, proposal.entry_id)
@@ -335,3 +446,47 @@ def preview_proposal(
     return ProposalPreview(
         entry.name, relative, _change_lines(proposal, entry, changed, placements), diff, blocked
     )
+
+
+def _new_lines(entry: CodexEntry) -> list[ChangeLine]:
+    """Every value a new entry starts with, each as a value it did not have (#1808)."""
+    lines: list[ChangeLine] = []
+    for key, value in entry.model_dump(mode="json", exclude_defaults=True).items():
+        if key == "id":
+            continue
+        if key == "state" and isinstance(value, dict):
+            state = cast(dict[str, Any], value)
+            lines.extend(ChangeLine(name, None, None, v) for name, v in state.items())
+        elif key == "visual" and isinstance(value, dict):
+            visual = cast(dict[str, Any], value)
+            lines.extend(ChangeLine(f"looks: {name}", None, None, v) for name, v in visual.items())
+        else:
+            lines.append(ChangeLine(key, None, None, value))
+    return lines
+
+
+def _preview_new(work: StoryWork, proposal: Proposal) -> ProposalPreview:
+    """What approving a new entry would write: every line of its file, added (#1808)."""
+    relative = entry_file(proposal.kind, proposal.entry_id)
+    try:
+        entry = proposal.new_entry()
+    except ValueError as exc:
+        return ProposalPreview(None, relative, [], [], f"It cannot be approved: {exc}.")
+    clash = new_entry_clash(work, proposal.kind, entry)
+    blocked = (
+        None
+        if clash is None
+        else f"It cannot be approved: {clash}. Reject it, and ask for the entry again under "
+        "a name of its own if it is still wanted."
+    )
+    diff = list(
+        difflib.unified_diff(
+            [],
+            dump_file(entry, compact=True).splitlines(),
+            fromfile=f"{relative} (now: not there)",
+            tofile=f"{relative} (if approved)",
+            lineterm="",
+            n=2,
+        )
+    )
+    return ProposalPreview(entry.name, relative, _new_lines(entry), diff, blocked)

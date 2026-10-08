@@ -1,10 +1,9 @@
 """Data models for pluggable sandbox execution and path safety.
 
 The isolation configuration is a **discriminated union**, not a flat record with a
-level field. `docs/security-threat-model.md` D1 requires this: `memory_limit_mb`,
-`cpu_shares` and `allow_network` were previously accepted at every level and silently
-discarded at `none` and `workspace`, and "a security control that is accepted and
-silently ignored is precisely what P6 forbids". Under a union, a limit that cannot be
+level field. `memory_limit_mb`, `cpu_shares` and `allow_network` were previously accepted
+at every level and silently discarded at `none` and `workspace`, and a security control
+that is accepted and silently ignored is what P6 forbids. Under a union, a limit that cannot be
 enforced at a level is not a field of that level, so requesting it is a validation
 error rather than a false sense of protection.
 
@@ -135,7 +134,7 @@ IsolationPolicy = Annotated[
 DEFAULT_ISOLATION_LEVEL = IsolationLevel.WORKSPACE
 """P3's mandated default, decided by the project owner on 2026-09-02 (issue 2026-09-02-001).
 
-Recorded as a Tier A amendment in `docs/governance/principle-amendment-policy.md` §5.
+Recorded as a Tier A amendment under the principle amendment policy.
 `none` is retained as an explicit opt-in and "must never be reached by defaulting",
 which is why every field below defaults to a `WorkspaceIsolation()` and none of them
 defaults to `NoIsolation()`.

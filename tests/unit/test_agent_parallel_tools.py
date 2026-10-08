@@ -31,8 +31,15 @@ class SlowAsyncTool(BaseTool[SlowParams]):
     name = "slow_tool"
     description = "Sleeps for a duration"
 
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls: list[tuple[float, float]] = []
+
     async def run(self, params: SlowParams, context: ToolContext) -> str:
+        start = asyncio.get_running_loop().time()
         await asyncio.sleep(params.delay)
+        end = asyncio.get_running_loop().time()
+        self.calls.append((start, end))
         return f"Done {params.tag}"
 
 
@@ -101,13 +108,18 @@ async def test_parallel_tool_execution_benchmark_speedup(tmp_path: Path) -> None
 
     agent = BaseAgent(config=cfg, llm=llm, tools=reg)
 
-    t0 = asyncio.get_running_loop().time()
     res = await agent.execute_turn("Run tools")
-    total_time = asyncio.get_running_loop().time() - t0
 
-    # If sequential, 3 * 0.06s = 0.18s+. If parallel, ~0.06s-0.12s.
-    assert total_time < 0.16, f"Expected parallel execution < 0.16s, got {total_time:.3f}s"
     assert len(res.tool_executions) == 3
+    assert len(slow_tool.calls) == 3
+
+    # Concurrency proof: all calls overlapped, meaning every call started
+    # before the first call finished (impossible under sequential execution).
+    starts = [c[0] for c in slow_tool.calls]
+    ends = [c[1] for c in slow_tool.calls]
+    assert max(starts) < min(ends), (
+        f"Expected overlapping executions, but max start {max(starts)} >= min end {min(ends)}"
+    )
 
     # Assert deterministic ordering matching input tool_calls sequence
     assert res.tool_executions[0].tool_call_id == "call_1"

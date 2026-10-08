@@ -502,8 +502,8 @@ def test_a_decision_on_a_changed_proposal_is_a_400_with_the_plain_sentence(
 def test_a_decision_while_the_writer_answers_is_a_409(
     client: TestClient, workspace: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Killed by: src/uclone_x/ui/artifacts.py :: if isinstance(exc, (StoryInUseError, WriterBusyError, HeadRoomWriteError)):
-    Becomes: if isinstance(exc, (StoryInUseError, HeadRoomWriteError)):
+    """Killed by: src/uclone_x/story/routes.py :: http = http_error(exc, failed=failed, busy=(WriterBusyError,), missing=(StoryNotFoundError,))
+    Becomes: http = http_error(exc, failed=failed, missing=(StoryNotFoundError,))
     """
     story_id, room_id = _story_with_proposal(client, workspace)
     seen = client.get(f"/api/artifacts/library/stories/{story_id}").json()["pending"][0]["digest"]
@@ -524,6 +524,39 @@ def test_a_decision_while_the_writer_answers_is_a_409(
         "The conversation “Writing room” is answering right now, so the decision was not "
         "saved. Wait for the answer to finish, then try again."
     )
+
+
+def test_a_story_view_refusal_carries_the_code_the_head_words_it_from(
+    client: TestClient, workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The English `detail` stays for a head that does not know the code.
+
+    Killed by: src/uclone_x/story/routes.py :: body["code"] = exc.code
+    Becomes: pass
+    """
+    gone = client.get("/api/artifacts/library/stories/night-train")
+    assert (gone.status_code, gone.json()["code"]) == (404, "story_gone")
+
+    story_id, room_id = _story_with_proposal(client, workspace)
+    seen = client.get(f"/api/artifacts/library/stories/{story_id}").json()["pending"][0]["digest"]
+
+    def unlanded(room: str) -> bool:
+        return room == room_id
+
+    monkeypatch.setattr(cast(Any, client.app).state.room_stack, "turn_unlanded", unlanded)
+    busy = client.post(
+        f"/api/artifacts/library/stories/{story_id}/proposals/p001/approve",
+        json={"seen_digest": seen},
+    )
+    assert (busy.status_code, busy.json()["code"]) == (409, "writer_busy")
+    assert busy.json()["detail"].startswith("The conversation “Writing room” is answering")
+    monkeypatch.undo()
+
+    stale = client.post(
+        f"/api/artifacts/library/stories/{story_id}/proposals/p001/reject",
+        json={"seen_digest": "0000", "reason": "no"},
+    )
+    assert stale.status_code == 400 and "code" not in stale.json()
 
 
 def test_an_approval_cannot_carry_anything_but_what_was_seen(
@@ -569,30 +602,28 @@ def test_a_story_view_failure_that_is_not_a_refusal_is_a_plain_500(
     assert failed.json()["detail"] == FILES_FAILURE_DETAIL
 
 
-def _head_room(client: TestClient, *, marked: bool) -> str:
-    """A room a head keeps: marked `run`, or an ACP room from before rooms were marked."""
+def _head_room(client: TestClient, *, head: str) -> str:
+    """A room a head keeps: a terminal head's (`run`) or a server head's (`acp`)."""
     from uclone_x.room.one_seat import HeadTurn, conversation_room_id, record_head_turn
 
     stack = cast(Any, client.app).state.room_stack
-    head = "run" if marked else "acp"
     state = record_head_turn(
         stack.store,
-        room_id="room_from_the_terminal" if marked else conversation_room_id("acp", "scout", "s1"),
+        room_id="room_from_the_terminal"
+        if head == "run"
+        else conversation_room_id(head, "scout", "s1"),
         clone_id="scout",
         turn=HeadTurn(prompt="what is in the index?", content="three tables"),
         head=head,
     )
-    if not marked:
-        state = stack.store.save(state.model_copy(update={"head": None}))
-        assert state.head is None
     return str(state.room_id)
 
 
 @pytest.mark.parametrize(
-    ("marked", "keeper"), [(True, "ucx run"), (False, "the editor that opened it")]
+    ("head", "keeper"), [("run", "ucx run"), ("acp", "the editor that opened it")]
 )
 def test_a_story_is_not_opened_into_a_head_room(
-    client: TestClient, workspace: Path, marked: bool, keeper: str
+    client: TestClient, workspace: Path, head: str, keeper: str
 ) -> None:
     """The room is named in the body, so the route guard on `/api/rooms/{room_id}` misses it.
 
@@ -601,14 +632,14 @@ def test_a_story_is_not_opened_into_a_head_room(
 
     Killed by: src/uclone_x/artifacts/library.py :: if head is not None:
     Becomes: if False:
-    Killed by: src/uclone_x/ui/artifacts.py :: (StoryInUseError, WriterBusyError, HeadRoomWriteError)
-    Becomes: (StoryInUseError, WriterBusyError)
+    Killed by: src/uclone_x/ui/artifacts.py :: (StoryInUseError, HeadRoomWriteError, *busy)
+    Becomes: (StoryInUseError, *busy)
     """
     writer = _room(client, "Writing room")
     stories = StoryLibrary(workspace)
     story_id = stories.create("Night Train", writer).story_id
     client.delete(f"/api/rooms/{writer}")  # gives the lease back
-    room_id = _head_room(client, marked=marked)
+    room_id = _head_room(client, head=head)
     stack = cast(Any, client.app).state.room_stack
     before = stack.service.get(room_id)
     lease = stories.load(story_id).lease

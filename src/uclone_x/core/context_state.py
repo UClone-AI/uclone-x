@@ -28,17 +28,23 @@ and it grows only by appending while the epoch lasts:
 A request's conversation is rendered from its entries (`render_entries`, #1848): each
 entry in its form, read from the session log -- the entry's own body, or the body of the
 rendering its form names -- and a back-reference where the entry records one.
-`SessionState.messages` names which log bodies the history holds and in what order; it is
-a cache of the current rendering, not the record (author's choice, #1848). An entry a new
-epoch carries over keeps the entry, form and rendering the epochs before it recorded
-(`recorded_forms`, `recorded_renderings`, `shown_entries`).
+`SessionState.messages` names which log bodies the history holds and in what order: each
+message as the log holds it, a form with its source and no text, so a saved record is
+never a rendering (#1848). A request's entries are read from the epoch in force alone:
+the last epoch's entries, forms and renderings, or the opening state a turn-boundary
+compaction or a rollback set for the next one, plus what was appended since
+(`opening_entries`, `shown_entries`). No earlier epoch is read.
 
 At a compaction the new epoch's entries are derived from the entries the history showed
 before it and the compactor's account of where each message came from
 (`derive_compacted_forms`): a kept entry keeps its form, the ledger is `summary`, and a
 pruned message is the entry it replaces, shown in the smaller form the compactor gave it,
-which may not rank above the form it had (`FORM_ORDER`). The compactor still writes the
-smaller form's text; the log keeps it as the rendering's body.
+which may not rank above the form it had (`FORM_ORDER`). A smaller form is recorded, not
+written: the log keeps the message with its `form` and what it was cut from
+(`ChatMessage.rendered_from`) and no text, and every reader -- the live request and the
+log-only rebuild alike -- renders the text from the kept full body (`render_form`,
+`rendered_message`, #1848). A form that records nothing to render from is refused, never
+shown as some text of its own.
 """
 
 from __future__ import annotations
@@ -50,12 +56,14 @@ from typing import Final
 
 from pydantic import BaseModel, ConfigDict, Field, SerializerFunctionWrapHandler, model_serializer
 
-from uclone_x.llm.models import ChatMessage, MessageRole
+from uclone_x.core.tool_results import excerpt_tool_result, stored_result_stub
+from uclone_x.llm.models import ChatMessage, MessageRole, RenderedFrom
 
 __all__ = [
     "BACK_REFERENCE_MIN_CHARS",
     "EPOCH_PERSONA_EDITED",
     "EPOCH_RESTORED",
+    "EPOCH_TOOLS_MODULE_CHANGED",
     "EPOCH_UNDECLARED",
     "FORM_ORDER",
     "CompactedForms",
@@ -68,12 +76,12 @@ __all__ = [
     "compacted_entries",
     "derive_compacted_forms",
     "message_form",
-    "recorded_forms",
-    "recorded_renderings",
+    "opening_entries",
     "render_conversation",
     "render_entries",
+    "render_form",
+    "rendered_message",
     "shown_entries",
-    "shown_form",
 ]
 
 #: A tool result shorter than this is sent again rather than back-referenced: the
@@ -95,8 +103,14 @@ EPOCH_PERSONA_EDITED: Final = "persona_edited"
 #: the record and read back beside it (#1848).
 EPOCH_RESTORED: Final = "restored"
 
+#: The cause a request declares when its tools module is not the one the session last sent
+#: under (#2188): a seat rebuilt with another module, after a restart or in a new build of
+#: the clone. Like `persona_edited`, it opens an epoch even when the history only grew,
+#: because the tools layer changed there.
+EPOCH_TOOLS_MODULE_CHANGED: Final = "tools_module_changed"
+
 #: Declared causes that open an epoch even when the request only appended to the last one.
-_EPOCH_FORCING: Final = frozenset({EPOCH_PERSONA_EDITED})
+_EPOCH_FORCING: Final = frozenset({EPOCH_PERSONA_EDITED, EPOCH_TOOLS_MODULE_CHANGED})
 
 
 class ContextForm(StrEnum):
@@ -163,8 +177,8 @@ class ContextEpoch(BaseModel):
     step: int = Field(description="The step of that turn whose request opened it.")
     opened_by: tuple[str, ...] = Field(
         description="What opened it: `start` for a session's first epoch, `compaction`, "
-        "`rollback`, `retry`, `history_replaced`, `restored`, `persona_edited`, or "
-        "`undeclared`."
+        "`rollback`, `retry`, `history_replaced`, `restored`, `persona_edited`, "
+        "`tools_module_changed`, or `undeclared`."
     )
     entries: tuple[ContextEntry, ...]
 
@@ -186,80 +200,41 @@ def message_form(message: ChatMessage) -> ContextForm:
     return ContextForm.FULL
 
 
-def _unrecorded_tool_result(message: ChatMessage) -> bool:
-    """A tool result with no form on it: whole, or shortened before forms were recorded."""
-    return message.role == MessageRole.TOOL and message.form is None
+def opening_entries(
+    epochs: Sequence[ContextEpoch], pending: Mapping[str, ContextEntry]
+) -> dict[str, ContextEntry]:
+    """Per log body of the history, the entry it shows in the epoch in force (#1848).
 
-
-def recorded_forms(epochs: Sequence[ContextEpoch]) -> dict[str, ContextForm]:
-    """Per entry, the `excerpt` or `stub` any of `epochs` recorded its own body in.
-
-    An entry's own body is one text, so the form it is in does not change from one epoch
-    to the next; a compaction's smaller form is a rendering (`recorded_renderings`), and is
-    not counted here. The epochs are where a form was recorded when the message itself
-    carries none: before #1854 the form was read from a result's header, and an epoch of
-    that time says `stub` or `excerpt` for a message written without a form (#1866). Any
-    epoch's record is taken, not only the latest's: one recorded after #1854, and before
-    this, says `full` for that same stub.
-    """
-    forms: dict[str, ContextForm] = {}
-    for epoch in epochs:
-        for shown in epoch.entries:
-            if shown.rendering is None and shown.form in (ContextForm.EXCERPT, ContextForm.STUB):
-                forms.setdefault(shown.entry, shown.form)
-    return forms
-
-
-def recorded_renderings(epochs: Sequence[ContextEpoch]) -> dict[str, ContextEntry]:
-    """Per rendering any of `epochs` showed, the entry and form it renders (#1848).
-
-    Keyed by the rendering's own log entry: that is the body the history holds, so a
-    request that finds it in the history shows the entry it renders, in that form. A
-    rendering is one entry's one form, so the first record of it is its record.
+    Read from the last epoch alone: each rendering it lists, keyed by the rendering's own
+    log entry -- the body the history holds -- with the entry and form it renders.
+    `pending` is the opening state a turn-boundary compaction or a rollback set for the
+    request that opens the next epoch (`compacted_entries`), and it wins. No earlier
+    epoch is read: an epoch opens with every entry it shows, so what one before it
+    recorded is either carried in it or no longer shown.
     """
     renders: dict[str, ContextEntry] = {}
-    for epoch in epochs:
-        for shown in epoch.entries:
+    if epochs:
+        for shown in epochs[-1].entries:
             if shown.rendering is not None:
                 renders.setdefault(shown.rendering, shown.model_copy(update={"same_as": None}))
-    return renders
-
-
-def shown_form(message: ChatMessage, recorded: ContextForm | None = None) -> ContextForm:
-    """The form an entry whose message is `message` is shown in (Rule 3, #1848).
-
-    The form recorded on the message, where one was (`message_form`). A tool result that
-    carries none keeps the `excerpt` or `stub` an earlier epoch `recorded` for its entry:
-    such a message was shortened before forms were recorded on messages, and its text is
-    not parsed to find out (#1866). With nothing recorded, it is `full`. So a new epoch's
-    form for an entry it carries over is derived from the epochs before it, never raised.
-    """
-    if (
-        recorded is not None
-        and recorded in (ContextForm.EXCERPT, ContextForm.STUB)
-        and _unrecorded_tool_result(message)
-    ):
-        return recorded
-    return message_form(message)
+    return {**renders, **pending}
 
 
 def shown_entries(
     logged: Sequence[tuple[str, ChatMessage]],
-    recorded: Mapping[str, ContextForm],
     known: Mapping[str, ContextEntry],
 ) -> tuple[ContextEntry, ...]:
     """What a history shows, per message: the entry, its form, and its back-reference.
 
-    `logged` is the history as the session log holds it, each message with the log entry
-    whose body it is. A body `known` names -- a rendering an epoch recorded
-    (`recorded_renderings`), or what a compaction derived (`compacted_entries`) -- shows
+    `logged` is the history as the session log holds it, each message rendered, with the
+    log entry whose body it is. A body `known` names -- a rendering an epoch recorded
+    (`opening_entries`), or what a compaction derived (`compacted_entries`) -- shows
     the entry `known` gives, in that form. Any other body is its own entry, in the form
-    `shown_form` reads, with the `excerpt` or `stub` earlier epochs `recorded` for it. A
-    tool result that repeats an earlier one's text refers to the entry that one shows
-    (Rule 2, `back_references`).
+    recorded on its message (`message_form`). A tool result that repeats an earlier one's
+    text refers to the entry that one shows (Rule 2, `back_references`).
     """
     bases = [
-        known.get(body) or ContextEntry(entry=body, form=shown_form(message, recorded.get(body)))
+        known.get(body) or ContextEntry(entry=body, form=message_form(message))
         for body, message in logged
     ]
     refers = back_references([message for _body, message in logged])
@@ -331,7 +306,7 @@ def derive_compacted_forms(
             forms.append(previous.form)
             shows.append(previous.entry)
             continue
-        pruned = shown_form(message)
+        pruned = message_form(message)
         if FORM_ORDER.index(pruned) < FORM_ORDER.index(previous.form):
             rising.append(position)
             forms.append(previous.form)
@@ -409,8 +384,55 @@ def back_references(messages: Sequence[ChatMessage]) -> list[int | None]:
     return refers
 
 
+def render_form(form: ContextForm, body: str, source: RenderedFrom) -> str:
+    """The text of `form` rendered from the kept result `body`, as `source` says (#1848).
+
+    The same functions that cut the result where its form was decided: an `excerpt` is
+    `excerpt_tool_result` at the cap `source.limit`, a `stub` is `stored_result_stub`
+    keeping `source.limit` characters of the start. So the text depends only on the body
+    and the recorded parameters.
+
+    Raises:
+        ValueError: `form` is not `excerpt` or `stub`.
+    """
+    if form is ContextForm.EXCERPT:
+        return excerpt_tool_result(
+            body, source.handle, cap_bytes=source.limit, readable=source.readable
+        )
+    if form is ContextForm.STUB:
+        return stored_result_stub(
+            source.handle, body, keep_chars=source.limit, readable=source.readable
+        )
+    raise ValueError(f"a {form.value} is not rendered from a kept result")
+
+
+def rendered_message(message: ChatMessage, result_of: Callable[[str], str]) -> ChatMessage:
+    """`message` with its text, rendered from the kept result its form names (#1848).
+
+    The log keeps an `excerpt` or `stub` as its form and what it was cut from
+    (`ChatMessage.rendered_from`), not as text; this renders the text from the full body
+    `result_of` gives for that handle (`render_form`). Any other message is its own text
+    and is returned as it is.
+
+    Raises:
+        ValueError: `message` has a form but records nothing it was rendered from, so
+            there is no text it could be shown as.
+    """
+    source = message.rendered_from
+    if source is None:
+        if message.form is not None:
+            raise ValueError(
+                f"a tool result in the {message.form} form records no result it was rendered from"
+            )
+        return message
+    text = render_form(message_form(message), result_of(source.handle), source)
+    return message.model_copy(update={"content": text})
+
+
 def render_entries(
-    entries: Sequence[ContextEntry], message_of: Callable[[str], ChatMessage]
+    entries: Sequence[ContextEntry],
+    message_of: Callable[[str], ChatMessage],
+    result_of: Callable[[str], str],
 ) -> list[ChatMessage]:
     """The conversation an epoch's `entries` render to, reading each entry in its form.
 
@@ -418,28 +440,31 @@ def render_entries(
     the body of its `rendering` when a compaction dropped it to a smaller form, and from
     its own body otherwise (`ContextEntry.body`); nothing is read from the history. An
     entry recorded as a back-reference (`same_as`) renders as the line that points at the
-    entry it repeats, earlier in `entries`. The live request and a rebuild from the record
-    both render through this (#1848), so the request is what its entries say.
+    entry it repeats. The live request and a rebuild from the record both render through
+    this (#1848), so the request is what its entries say.
 
-    A tool result with no form on it takes the `excerpt` or `stub` its entry records, as
-    `shown_form` does: an epoch recorded before #1854 read those from the header of a
-    message written without a form, and it renders as it was sent (#1866).
+    An `excerpt` or `stub` is rendered from the full body `result_of` gives for the handle
+    it records (`rendered_message`): the log holds no text for it.
 
     Raises:
-        ValueError: A message's form is not the form its entry records.
+        ValueError: A message's form is not the form its entry records, or it records
+            nothing it was rendered from.
     """
     rendered: list[ChatMessage] = []
     read: dict[str, ChatMessage] = {}
     for shown in entries:
         message = message_of(shown.body)
-        if shown_form(message, shown.form) is not shown.form:
+        if message_form(message) is not shown.form:
             raise ValueError(
                 f"entry {shown.entry} is recorded as {shown.form.value} but its message "
                 f"is {message_form(message).value}"
             )
+        message = rendered_message(message, result_of)
         read.setdefault(shown.entry, message)
         if shown.same_as is not None:
-            earlier = read.get(shown.same_as) or message_of(shown.same_as)
+            earlier = read.get(shown.same_as) or rendered_message(
+                message_of(shown.same_as), result_of
+            )
             message = message.model_copy(update={"content": back_reference_text(earlier)})
         rendered.append(message)
     return rendered
@@ -458,8 +483,9 @@ def advance(
     When `shown` begins with everything the current epoch lists, the epoch is extended
     by the rest (Rule 1). Otherwise a new epoch opens with `shown`, recording `opened_by`,
     or `start` for a session's first, or `EPOCH_UNDECLARED` when nothing was declared.
-    A declared `persona_edited` opens a new epoch even when `shown` extends the current
-    one, so the identity change has a boundary in the log.
+    A declared `persona_edited` or `tools_module_changed` opens a new epoch even when
+    `shown` extends the current one, so the identity or tools change has a boundary in
+    the log.
     """
     shown = tuple(shown)
     if epochs and _EPOCH_FORCING.isdisjoint(opened_by):

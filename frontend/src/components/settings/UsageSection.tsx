@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { Gauge } from 'lucide-react';
 import { fmt, useCopy } from '../../i18n';
 import { detailOf, useApiRead } from '../../lib/useApiRead';
@@ -17,7 +17,8 @@ import {
   type UsageReport,
   type UsageWindowStatus,
 } from '../../lib/usage';
-import { Button } from '../ui/Button';
+import { useAutoSave } from '../../lib/useAutoSave';
+import { FieldStatus } from './FieldStatus';
 import { ReadFailure, ReadLoading } from './ReadState';
 
 /**
@@ -43,8 +44,6 @@ export const UsageSection: React.FC<{
   const [report, setReport] = useState<UsageReport | null>(null);
   const [choice, setChoice] = useState<UsagePresetId | 'custom'>('none');
   const [draft, setDraft] = useState<Record<string, string>>({});
-  const [saving, setSaving] = useState(false);
-  const [saveState, setSaveState] = useState<{ ok: boolean; detail: string | null } | null>(null);
 
   // A fresh read replaces the form: what is shown is what is saved.
   useEffect(() => {
@@ -54,36 +53,43 @@ export const UsageSection: React.FC<{
     setDraft(toDraft(data.limits));
   }, [data]);
 
-  const pick = (id: UsagePresetId | 'custom') => {
-    setChoice(id);
-    setSaveState(null);
-    if (id !== 'custom') setDraft(toDraft(USAGE_PRESETS[id]));
-  };
-
-  const save = async () => {
-    setSaving(true);
-    setSaveState(null);
-    try {
+  // Saved as it is changed (settings-single-source.md §4.1): a preset when it is picked, a
+  // custom number when its box is left. A refused save puts the saved limits back.
+  const savedLimits = report?.limits ?? null;
+  const savedDraft = useMemo(() => (savedLimits === null ? {} : toDraft(savedLimits)), [savedLimits]);
+  const autoSave = useAutoSave<Record<string, string>>({
+    saved: savedDraft,
+    save: async (limits) => {
       const res = await fetch('/api/usage/limits', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(fromDraft(draft)),
+        body: JSON.stringify(fromDraft(limits)),
       });
-      if (!res.ok) {
-        setSaveState({ ok: false, detail: await detailOf(res) });
-        return;
-      }
+      if (!res.ok) throw new RefusedSave(await detailOf(res));
       const next = (await res.json()) as UsageReport;
       setReport(next);
-      setChoice(presetOf(next.limits));
+      setChoice((current) => (current === 'custom' ? current : presetOf(next.limits)));
       setDraft(toDraft(next.limits));
-      setSaveState({ ok: true, detail: null });
       onSaved?.(next);
-    } catch {
-      setSaveState({ ok: false, detail: null });
-    } finally {
-      setSaving(false);
-    }
+    },
+    restore: (limits) => {
+      setDraft(limits);
+      // A refused custom number keeps the boxes open, so it can be corrected.
+      setChoice((current) => (current === 'custom' || savedLimits === null ? current : presetOf(savedLimits)));
+    },
+    describeFailure: (err) =>
+      [copy.saveFailed, err instanceof RefusedSave ? err.detail : null, allCopy.settings.autosave.restored]
+        .filter(Boolean)
+        .join(' '),
+    same: (a, b) => JSON.stringify(fromDraft(a)) === JSON.stringify(fromDraft(b)),
+  });
+
+  const pick = (id: UsagePresetId | 'custom') => {
+    setChoice(id);
+    if (id === 'custom') return;
+    const limits = toDraft(USAGE_PRESETS[id]);
+    setDraft(limits);
+    autoSave.commit(limits);
   };
 
   const consoles = consoleLinks(report);
@@ -163,10 +169,8 @@ export const UsageSection: React.FC<{
                         type="text"
                         inputMode="numeric"
                         value={draft[id] ?? ''}
-                        onChange={(e) => {
-                          setSaveState(null);
-                          setDraft((d) => ({ ...d, [id]: e.target.value }));
-                        }}
+                        onChange={(e) => setDraft((d) => ({ ...d, [id]: e.target.value }))}
+                        onBlur={() => autoSave.commit(draft)}
                         data-testid={`settings-usage-input-${id}`}
                         className="w-full bg-slate-950 border border-slate-800 rounded-lg px-2 py-1.5 text-xs text-slate-200"
                       />
@@ -177,27 +181,7 @@ export const UsageSection: React.FC<{
               </div>
             )}
 
-            <div className="flex items-center gap-2">
-              <Button
-                variant="solid"
-                onClick={() => void save()}
-                disabled={saving}
-                data-testid="settings-usage-save"
-              >
-                {saving ? copy.saving : copy.save}
-              </Button>
-              {saveState?.ok === true && (
-                <span role="status" className="text-[11px] text-emerald-400" data-testid="settings-usage-saved">
-                  {copy.saved}
-                </span>
-              )}
-              {saveState?.ok === false && (
-                <span role="alert" className="text-[11px] text-rose-300" data-testid="settings-usage-save-failed">
-                  {copy.saveFailed}
-                  {saveState.detail ? ` ${saveState.detail}` : ''}
-                </span>
-              )}
-            </div>
+            <FieldStatus status={autoSave.status} testId="settings-usage-save-status" />
           </div>
 
           <div className="space-y-1 text-[11px] text-slate-400" data-testid="settings-usage-providers">
@@ -272,6 +256,13 @@ const WindowBar: React.FC<{ status: UsageWindowStatus; overridden: boolean }> = 
     </div>
   );
 };
+
+/** A save the Core refused, with its reason when it gave one. */
+class RefusedSave extends Error {
+  constructor(readonly detail: string | null) {
+    super(detail ?? 'refused');
+  }
+}
 
 const clockTime = (iso: string): string =>
   new Date(iso).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });

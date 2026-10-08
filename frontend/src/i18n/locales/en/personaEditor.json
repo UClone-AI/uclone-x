@@ -13,8 +13,10 @@
   "editTitle": "Edit {name}",
   "builtinEditNote": "This clone ships with the app. Saving keeps your version in the workspace folder and leaves the original untouched.",
   "fields": {
-    "name": "Name",
-    "nameHint": "Lowercase letters, digits, - and _. It is also the file name.",
+    "name": "Handle",
+    "nameHint": "Lowercase letters, digits, - and _. This is the name used in @mentions and in commands.",
+    "displayName": "Display name (optional)",
+    "displayNameHint": "The name people see, in any characters, up to 64. Saved for the current language; left empty, another language's display name or the handle is shown.",
     "role": "Role",
     "description": "Description",
     "systemPrompt": "Instructions",
@@ -25,13 +27,15 @@
     "toolsRestrictedBadge": "Restricted allowlist ({count}/{total})",
     "toolsResetToAll": "Allow all tools",
     "toolsRestrictedNotice": {
-      "one": "Restricted mode: Only the {count} selected tool will be available. All other tools are disabled.",
-      "other": "Restricted mode: Only the {count} selected tools will be available. All other tools are disabled."
+      "one": "Restricted mode: The {count} selected tool plus the base tools will be available.",
+      "other": "Restricted mode: The {count} selected tools plus the base tools will be available."
     },
-    "model": "Model",
-    "modelDefault": "Use the runtime default",
-    "modelOther": "Other model…",
-    "modelOtherPlaceholder": "Model tag, e.g. qwen3:8b",
+    "toolsAllAllowedNotice": "All runtime tools are available (not only the base set).",
+    "toolsAllReadAllowedNotice": "Read and media creation tools are available. Host file-writing tools can be enabled in Capabilities below.",
+    "writeToolsDisabledWarning": "Some selected tools require file-writing permission to work.",
+    "enableWriteToolsAction": "Allow file-writing tools",
+    "baseTools": "Base tools (always included)",
+    "baseToolsHint": "These tools are included for every clone and do not need to be saved in the persona.",
     "tier": "Tier",
     "temperature": "Temperature",
     "temperaturePresets": {
@@ -69,8 +73,8 @@
   "roleRequired": "The role is empty. Describe what this clone does in a few words.",
   "promptRequired": "The instructions are empty. Write what this clone should do.",
   "fieldsRefused": "The server refused these fields: {fields}. Correct them and save again.",
-  "saveFailed": "The save failed (HTTP {status}). Check the server log, then save again.",
-  "unreachable": "The server could not be reached ({reason}). Check it is running, then save again.",
+  "saveFailed": "The save failed. Check the server log, then save again.",
+  "unreachable": "The server could not be reached. Check it is running, then save again.",
   "saved": "Saved {name}.",
   "savedWithLive": {
     "one": "Saved {name}. {count} open conversation will use it from the next message. A model change applies in a new conversation, and in an open one after UClone-X restarts.",

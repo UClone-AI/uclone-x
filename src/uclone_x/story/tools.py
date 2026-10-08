@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from typing import Any, ClassVar, Literal, cast
 
@@ -20,6 +21,7 @@ from pydantic_core import PydanticCustomError
 
 from uclone_x.story.context import (
     CodexIndex,
+    CodexItem,
     UnreadableFile,
     changed_before_and_named,
     continuity_note,
@@ -27,12 +29,22 @@ from uclone_x.story.context import (
     recap,
     scene_context,
 )
+from uclone_x.story.enrich import SceneModel, grow_scene, growth_note
 from uclone_x.story.library import StoryChangedError, StoryError, StoryLibrary
-from uclone_x.story.proposals import apply_proposal, check_applies, reject_proposal
+from uclone_x.story.names import CodexNames, id_for_name
+from uclone_x.story.proposals import (
+    KIND_WORDS,
+    apply_proposal,
+    check_applies,
+    new_entry_clash,
+    reject_proposal,
+)
+from uclone_x.story.prose import prose_refusal
 from uclone_x.story.quotes import MIN_QUOTE_CHARACTERS, quote_found, quote_too_short
 from uclone_x.story.schemas import (
     CODEX_KINDS,
     ENTRY_ID_PATTERN,
+    CharacterEntry,
     CodexEntry,
     CodexKind,
     Outline,
@@ -56,7 +68,7 @@ from uclone_x.story.work import (
     proposal_file,
 )
 from uclone_x.tools.base import PLAIN_ERROR_PREFIX, BaseTool
-from uclone_x.tools.models import ToolContext
+from uclone_x.tools.models import REPLY_NOTE_KEY, ToolContext
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +80,9 @@ __all__ = [
     "StoryContextTool",
     "StoryManuscriptTool",
     "StoryOutlineTool",
+    "new_entry_draft",
     "propose_visual",
+    "story_characters",
 ]
 
 #: A model's JSON arguments: unknown keys are refused by name; not strict, since a JSON
@@ -447,20 +461,62 @@ def _outline_from(template: StructureTemplate) -> dict[str, Any]:
 # -- story_codex -------------------------------------------------------------------------
 
 
+#: How many new entries one 'create' call proposes: a new story's cast, not a whole world.
+MAX_NEW_ENTRIES = 8
+
+
+class NewEntryParams(BaseModel):
+    """One entry 'create' proposes to add to the codex (#1808)."""
+
+    model_config = _ARGUMENTS
+
+    kind: CodexKind = Field(description="characters, places, items or threads.")
+    name: str = Field(description="What the story calls it, e.g. 'Lord Vane' or '라온'.")
+    id: str | None = Field(
+        default=None,
+        description="Lowercase letters and digits joined by '_'; left out, it is made from "
+        "the name ('라온' becomes 'raon').",
+    )
+    aliases: list[str] = Field(default_factory=list[str], description="Other names it goes by.")
+    profile: str = Field(default="", description="Who or what it is, in a sentence or two.")
+    state: dict[str, JsonValue] = Field(
+        default_factory=dict[str, JsonValue],
+        description='How it starts, e.g. {"status": "alive", "possesses": ["moon_sword"]}.',
+    )
+    relations: dict[str, str] = Field(
+        default_factory=dict[str, str],
+        description="What it is to other entries, by their id, in a word: "
+        '{"harin": "parent"} is "Harin\'s parent".',
+    )
+    appearance: str | None = Field(
+        default=None, description="For a character: how they look, in prose."
+    )
+    gender: Literal["female", "male", "other"] | None = Field(
+        default=None, description="For a character: female, male or other."
+    )
+
+
 class StoryCodexParams(BaseModel):
     """What to look up in the story's codex, or what change to propose, apply or reject."""
 
     model_config = _ARGUMENTS
 
-    action: Literal["get", "search", "proposals", "propose", "apply", "reject"] = Field(
-        description="'get' one entry by 'entry_id'; 'search' the entries by 'query', or list "
-        "them all without one; 'proposals' lists the proposed changes; 'propose' a change to "
-        "an entry that a scene shows ('entry_id', 'at', 'quote', and 'set' or tags); 'apply' "
-        "or 'reject' a proposal by 'proposal_id'. Applying runs only once the person approves "
-        "it when asked; saying it in chat is not approval."
+    action: Literal["get", "search", "proposals", "propose", "create", "apply", "reject"] = Field(
+        description="'get' one entry by 'entry_id'; 'search' the entries by 'query', or "
+        "list them all without one; 'proposals' lists the proposed changes; 'propose' a "
+        "change to an entry that a scene shows ('entry_id', 'at', 'quote', and 'set' or "
+        "tags); 'create' proposes new entries ('entries'), for a story's cast and places "
+        "or someone a scene introduces; 'apply' or 'reject' a proposal by 'proposal_id'. "
+        "Applying runs only once the person approves it when asked; saying it in chat is "
+        "not approval."
+    )
+    entries: list[NewEntryParams] | None = Field(
+        default=None,
+        description=f"For 'create': up to {MAX_NEW_ENTRIES} new entries, each its own proposal.",
     )
     entry_id: str | None = Field(
-        default=None, description="For 'get' and 'propose': the entry's id."
+        default=None,
+        description="For 'get' and 'propose': the entry's id, or its name or an alias.",
     )
     kind: CodexKind | None = Field(
         default=None,
@@ -515,9 +571,10 @@ class StoryCodexTool(BaseTool[StoryCodexParams]):
         "Look up the open story's codex: its characters, places, items and threads, each "
         "kept in the story as its own file. 'get' reads one entry in full; 'search' finds "
         "entries by name, alias or profile. When a scene changes an entry (a death, a lost "
-        "sword, a new scar), 'propose' the change with the quote that shows it; a person "
-        "decides: 'apply' asks them for approval where the app can ask (otherwise they "
-        "decide in the story's view, under Files), and 'reject' drops it."
+        "sword, a new scar), 'propose' the change with the quote that shows it. When a story "
+        "starts, or a scene brings in someone or somewhere new, 'create' proposes the new "
+        "entries. A person decides: 'apply' asks them for approval where the app can ask "
+        "(otherwise they decide in the story's view, under Files), and 'reject' drops it."
     )
     params_type = StoryCodexParams
     writes_files: ClassVar[bool] = True
@@ -534,6 +591,8 @@ class StoryCodexTool(BaseTool[StoryCodexParams]):
     async def run(self, params: StoryCodexParams, context: ToolContext) -> dict[str, Any]:
         if params.action == "propose":
             return self._propose(params, context)
+        if params.action == "create":
+            return self._create(params, context)
         if params.action == "apply":
             return self._apply(params, context)
         if params.action == "reject":
@@ -545,12 +604,15 @@ class StoryCodexTool(BaseTool[StoryCodexParams]):
         if params.action == "get":
             if params.entry_id is None or not params.entry_id.strip():
                 raise StoryError("Say which entry to get, in 'entry_id'.")
-            found = codex.find(params.entry_id.strip(), params.kind)
+            wanted = params.entry_id.strip()
+            found = codex.find(wanted, params.kind)
             if not found:
-                kinds = params.kind or "codex"
-                raise StoryError(
-                    f"The story's {kinds} has no entry '{params.entry_id.strip()}'."
-                    + self._unreadable_hint(codex)
+                found = _named_entries(
+                    codex,
+                    wanted,
+                    params.kind,
+                    done="nothing was read",
+                    unreadable=self._unreadable_hint(codex),
                 )
             result = {
                 "entries": [
@@ -687,6 +749,47 @@ class StoryCodexTool(BaseTool[StoryCodexParams]):
             "next": _DECIDE,
         }
 
+    def _create(self, params: StoryCodexParams, context: ToolContext) -> dict[str, Any]:
+        """Propose each of `params.entries` as a new entry; all of them, or none (#1808).
+
+        A story the Writer starts has no codex, and no file tool writes one, so without
+        this the scene context, the audit and the conflict checks have nothing to read.
+        Each entry is its own proposal, decided as any other; nothing is written into the
+        codex until a person approves it. Every entry is checked before any is saved, so
+        a refusal leaves no half of a cast behind.
+        """
+        work, room_id = _writer(context)
+        wanted = params.entries or []
+        if not wanted:
+            raise StoryError(
+                "Say which new entries to propose, each with its kind and name, so nothing "
+                "was proposed."
+            )
+        if len(wanted) > MAX_NEW_ENTRIES:
+            raise StoryError(
+                f"That is {len(wanted)} new entries; propose at most {MAX_NEW_ENTRIES} at a "
+                "time, so nothing was proposed."
+            )
+        pending = [p for p, _ in work.proposals()[0] if p.status == "pending"]
+        drafts: list[Proposal] = []
+        for asked in wanted:
+            draft = new_entry_draft(asked, room_id=room_id, context=context)
+            entry = draft.new_entry()
+            clash = new_entry_clash(work, draft.kind, entry, pending=[*pending, *drafts])
+            if clash is not None:
+                raise StoryError(
+                    f"'{entry.name}' was not proposed, and nor were the others: {clash}. If "
+                    "it is the same one, use the entry that is there; if not, give the new "
+                    "one a name of its own."
+                )
+            drafts.append(draft)
+        saved = [work.add_proposal(draft, room_id=room_id) for draft in drafts]
+        return {
+            "proposed": [p.id for p in saved],
+            "proposals": [_proposal_line(p) for p in saved],
+            "next": _DECIDE,
+        }
+
     def _apply(self, params: StoryCodexParams, context: ToolContext) -> dict[str, Any]:
         proposal_id = self._proposal_id(params)
         if not context.approved_by_person:
@@ -724,26 +827,67 @@ def _now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
 
 
+#: How many entries a refusal lists when a name matches none, so a large codex is not
+#: pasted whole into the reply.
+_LISTED_CANDIDATES = 12
+
+
+def _candidates(items: list[CodexItem]) -> str:
+    """Entries as `'id' (name)`, for a refusal that asks the Writer to pick one."""
+    shown = ", ".join(
+        f"'{item.entry.id}' ({item.entry.name})" for item in items[:_LISTED_CANDIDATES]
+    )
+    more = len(items) - _LISTED_CANDIDATES
+    return shown + (f", and {more} more" if more > 0 else "")
+
+
+def _named_entries(
+    codex: CodexIndex, name: str, kind: CodexKind | None, *, done: str, unreadable: str = ""
+) -> list[CodexItem]:
+    """The entries `name` names by id, name or alias (#1808); refuses when none does.
+
+    A small model passes the name the prose uses (`도윤`) more often than the entry id: 8
+    of 8 proposals on qwen3:8b were refused for it. Every match is returned, so the caller
+    decides what two matches mean; with none, the refusal lists the entries there are.
+    """
+    found = [item for item in CodexNames(codex).matches(name) if kind is None or item.kind == kind]
+    if found:
+        return found
+    where = f"{kind}" if kind is not None else "codex"
+    listed = [item for item in codex.items if kind is None or item.kind == kind]
+    hint = f" Its entries are: {_candidates(listed)}." if listed else " It has no entries yet."
+    raise StoryError(
+        f"The story's {where} has no entry called '{name}', so {done}.{hint}{unreadable}"
+    )
+
+
 def _one_entry(
     work: StoryWork, entry_id: str, kind: CodexKind | None
 ) -> tuple[CodexKind, CodexEntry, str]:
-    """The one entry `entry_id` (of `kind` when given), with its kind and digest."""
-    if not _ENTRY_ID.fullmatch(entry_id):
-        raise StoryError(
-            f"'{entry_id}' is not an entry id: use lowercase letters and digits, joined by "
-            "'.', '_' or '-'. Nothing was proposed."
-        )
+    """The one entry `entry_id` names (of `kind` when given), with its kind and digest.
+
+    `entry_id` is an entry's id, or its name or an alias (#1808): a name that more than
+    one entry has is refused with the candidates, never guessed.
+    """
     found: list[tuple[CodexKind, CodexEntry, str]] = []
-    for candidate in (kind,) if kind is not None else CODEX_KINDS:
-        loaded = work.entry(candidate, entry_id)
-        if loaded is not None:
-            found.append((candidate, loaded[0], loaded[1]))
+    if _ENTRY_ID.fullmatch(entry_id):
+        for candidate in (kind,) if kind is not None else CODEX_KINDS:
+            loaded = work.entry(candidate, entry_id)
+            if loaded is not None:
+                found.append((candidate, loaded[0], loaded[1]))
     if not found:
-        where = f"{kind}" if kind is not None else "codex"
-        raise StoryError(
-            f"The story's {where} has no entry '{entry_id}', so nothing was proposed. Add the "
-            "entry to the codex first."
-        )
+        named = _named_entries(work.codex(), entry_id, kind, done="nothing was proposed")
+        if len({(item.kind, item.entry.id) for item in named}) > 1:
+            raise StoryError(
+                f"'{entry_id}' names more than one entry: {_candidates(named)}. Say which, "
+                "by its id in 'entry_id', so nothing was proposed."
+            )
+        loaded = work.entry(named[0].kind, named[0].entry.id)
+        if loaded is None:
+            raise StoryError(
+                f"The entry '{named[0].entry.id}' could not be read, so nothing was proposed."
+            )
+        found.append((named[0].kind, loaded[0], loaded[1]))
     if len(found) > 1:
         kinds = ", ".join(k for k, _, _ in found)
         raise StoryError(
@@ -783,6 +927,75 @@ def propose_visual(
         "path": work.workspace_path(proposal_file(saved.id)),
         "next": _DECIDE,
     }
+
+
+def story_characters(context: ToolContext, texts: Sequence[str]) -> list[dict[str, Any]]:
+    """The open story's characters `texts` name, each with its `visual` block (#1808).
+
+    For `a2a_call`, which hands them to the persona it asks (`CharacterLookup`): names are
+    matched as `CodexNames.named_in` matches them, and a character with no `visual` block
+    is left out, since there is nothing to draw it from.
+    """
+    codex = StoryWork.open_in(context).codex()
+    return [
+        {
+            "id": item.entry.id,
+            "name": item.entry.name,
+            "visual": item.entry.visual.model_dump(mode="json", exclude_defaults=True),
+        }
+        for item in CodexNames(codex).named_in(texts)
+        if isinstance(item.entry, CharacterEntry) and item.entry.visual is not None
+    ]
+
+
+def new_entry_draft(asked: NewEntryParams, *, room_id: str, context: ToolContext) -> Proposal:
+    """A proposal to add the entry `asked` describes; one that does not fit is refused."""
+    name = asked.name.strip()
+    if not name:
+        raise StoryError("Every new entry needs a name, so nothing was proposed.")
+    given = (asked.id or "").strip()
+    # An id given as 'Raon' or 'Moon Sword' is written the codex's way, as a name is.
+    entry_id = given if _ENTRY_ID.fullmatch(given) else id_for_name(given or name)
+    if entry_id is None:
+        raise StoryError(
+            f"No id could be made from '{given or name}', so nothing was proposed. Give it "
+            "an id of lowercase letters and digits, such as 'moon_sword'."
+        )
+    looks = {
+        key: value
+        for key, value in (("prose", asked.appearance), ("gender", asked.gender))
+        if value is not None and value != ""
+    }
+    if looks and asked.kind != "characters":
+        raise StoryError(
+            f"'{name}' is a {KIND_WORDS[asked.kind]}, and only a character has an "
+            "appearance or a gender, so nothing was proposed."
+        )
+    entry: dict[str, Any] = {"id": entry_id, "name": name}
+    aliases = [a.strip() for a in asked.aliases if a.strip() and a.strip() != name]
+    if aliases:
+        entry["aliases"] = aliases
+    if asked.profile.strip():
+        entry["profile"] = asked.profile.strip()
+    if asked.state:
+        entry["state"] = dict(asked.state)
+    if asked.relations:
+        entry["relations"] = dict(asked.relations)
+    if looks:
+        entry["visual"] = looks
+    data: dict[str, Any] = {
+        "id": "p000",
+        "kind": asked.kind,
+        "entry_id": entry_id,
+        "change": {"new_entry": entry},
+        "proposed_at": _now(),
+        "room_id": room_id,
+        "agent_id": context.agent_id,
+    }
+    try:
+        return Proposal.model_validate(data)
+    except ValidationError as exc:
+        raise StoryError(f"'{name}' was not proposed: it does not fit a codex entry.") from exc
 
 
 def _draft(
@@ -977,14 +1190,17 @@ class StoryManuscriptTool(BaseTool[StoryManuscriptParams]):
     needs_room: ClassVar[bool] = True
     not_run_note: ClassVar[str] = "No scene was written."
 
-    def __init__(self) -> None:
+    def __init__(self, model_factory: SceneModelFactory | None = None) -> None:
         super().__init__(
             name=self.name, description=self.description, params_type=StoryManuscriptParams
         )
+        self._model_factory = model_factory or scene_model
 
     async def run(self, params: StoryManuscriptParams, context: ToolContext) -> dict[str, Any]:
         if params.action == "write":
-            return self._write(params, context)
+            result = self._write(params, context)
+            await self._grow(result, params, context)
+            return result
         work = StoryWork.open_in(context)
         if params.action == "read":
             scene_id = self._scene_id(params)
@@ -1014,6 +1230,9 @@ class StoryManuscriptTool(BaseTool[StoryManuscriptParams]):
         scene_id = self._scene_id(params)
         if params.text is None or not params.text.strip():
             raise StoryError("Give the scene's text, so nothing was written.")
+        refused = prose_refusal(params.text)
+        if refused is not None:
+            raise StoryError(refused)
         outline, _ = work.require_outline()
         if outline.find(scene_id) is None:
             raise StoryError(
@@ -1059,6 +1278,61 @@ class StoryManuscriptTool(BaseTool[StoryManuscriptParams]):
         if notes:
             result["notes"] = notes
         return result
+
+    async def _grow(
+        self, result: dict[str, Any], params: StoryManuscriptParams, context: ToolContext
+    ) -> None:
+        """The saved scene read for what it adds to the codex, each addition a proposal.
+
+        Runs on every write, so the codex grows whether or not the model thinks to propose
+        (§1.1 row 7). Nothing is applied; a person decides each proposal. With no model
+        to read with (no clone behind the call), nothing is read and `codex_growth` is left
+        out, so a result without it was not read. A failure never fails the saved write:
+        it is noted, and logged.
+        """
+        model = self._model_factory(context)
+        if model is None:
+            logger.info("Codex growth not read for scene %r: no model", result["scene_id"])
+            return
+        try:
+            work, room_id = _writer(context)
+        except (StoryError, StoryFileError):
+            logger.warning("Codex growth not read for scene %r", result["scene_id"], exc_info=True)
+            grown = None
+        else:
+            grown = await grow_scene(
+                work,
+                model=model,
+                scene_id=str(result["scene_id"]),
+                text=params.text or "",
+                room_id=room_id,
+                agent_id=context.agent_id,
+            )
+        if grown is None:
+            notes = cast("list[str]", result.setdefault("notes", []))
+            notes.append(
+                "The scene was saved, but it could not be read for what it adds to the codex."
+            )
+            return
+        result["codex_growth"] = grown.record()
+        note = growth_note(grown)
+        if note is not None:
+            result[REPLY_NOTE_KEY] = note
+
+
+#: What reads a saved scene for the codex: a model for the call, or `None` for none.
+SceneModelFactory = Callable[[ToolContext], "SceneModel | None"]
+
+
+def scene_model(context: ToolContext) -> SceneModel | None:
+    """The calling clone's own model, on its budget (P5); `None` with no clone behind it."""
+    seat = context.agent_delegate
+    if seat is None or not callable(getattr(seat, "invoke_auxiliary_model", None)):
+        return None
+    # story_start imports this module; its model adapter is reached when a call needs it.
+    from uclone_x.story.start import AuxiliaryStoryModel
+
+    return AuxiliaryStoryModel(seat)
 
 
 def _unwritten_scene(scene_id: str, digest: str | None) -> str:

@@ -247,6 +247,8 @@ describe('TopologyTab: the conversation as a graph (#1355)', () => {
   // Becomes:   if (!codes) return [...clauses];
   // Killed by: frontend/src/components/TopologyTab.tsx ::     return clause;
   // Becomes:     return code;
+  // Killed by: frontend/src/components/TopologyTab.tsx ::       {t.unknownReason}{' '}
+  // Becomes:       {' '}
   it('keeps the Core’s English for a code it does not know, or codes that do not line up (#1911)', async () => {
     answers[URL_A] = {
       ...TOPOLOGY,
@@ -275,7 +277,7 @@ describe('TopologyTab: the conversation as a graph (#1355)', () => {
     );
     unmount();
 
-    // An unknown reason code: the Core's English.
+    // An unknown reason code: a Korean sentence, then the Core's English (#1915).
     answers[URL_A] = {
       ...TOPOLOGY,
       nodes: [],
@@ -288,7 +290,9 @@ describe('TopologyTab: the conversation as a graph (#1355)', () => {
         <TopologyTab roomId="room-a" />
       </LocaleProvider>,
     );
-    expect((await screen.findByTestId('topology-reason')).textContent).toBe('A reason from a later Core.');
+    expect((await screen.findByTestId('topology-reason')).textContent).toBe(
+      `${ko.topology.unknownReason} A reason from a later Core.`,
+    );
   });
 
   // Killed by: frontend/src/components/TopologyTab.tsx :: <h2 className="text-xs font-bold text-white">{t.title}</h2>

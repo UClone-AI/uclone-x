@@ -68,7 +68,7 @@ class _Bound(BaseTool[_Params]):
 
 @dataclass
 class _Session:
-    messages: list[ChatMessage] = field(default_factory=list[ChatMessage])
+    recorded: list[ChatMessage] = field(default_factory=list[ChatMessage])
     bound_tools: list[str] = field(default_factory=list[str])
     tools_pin_all: bool = False
 

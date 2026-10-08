@@ -25,9 +25,11 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, Literal, Protocol
 
+from uclone_x.agent.artist_skill_router import ROUTED_SKILL_TAG
 from uclone_x.agent.models import AgentConfig, PersonaDefinition, PlanState, ToolExecutionRecord
 from uclone_x.agent.prompts import adapt_system_prompt
 from uclone_x.agent.request_record import (
+    LogReader,
     RequestLayers,
     compose_system_message,
     messages_digest,
@@ -39,13 +41,17 @@ from uclone_x.agent.session import (
     ContextSnapshot,
     content_digest,
 )
+from uclone_x.agent.tools_module import (
+    DEFAULT_TOOLS_MODULE,
+    ToolsModuleName,
+    recorded_tools_module,
+    snapshot_tools_module,
+)
 from uclone_x.core.context_state import (
+    EPOCH_TOOLS_MODULE_CHANGED,
     ContextEntry,
     ContextEpoch,
-    ContextForm,
-    recorded_forms,
-    recorded_renderings,
-    render_entries,
+    opening_entries,
     shown_entries,
 )
 from uclone_x.core.immutable import unwrap_immutable
@@ -119,11 +125,8 @@ LiveAnchorProvenance = PersonaDefinition | None | AnchorWriter
 def has_anchor(messages: Sequence[ChatMessage]) -> bool:
     """Whether `messages` opens with a `SYSTEM` turn — the anchor the turn builder re-frames.
 
-    One expression for the two places that ask (#1174, #1152): the turn builder, which
-    sends what `effective_system_prompt` reports when there is no anchor, and
-    `hydrate_session`, which only reports missing provenance for a record that actually
-    has an anchor for the provenance to be missing *about*. A record of user-first rows
-    has nothing to re-resolve, so warning about it would be noise.
+    The turn builder sends what `effective_system_prompt` reports when there is no anchor
+    (#1174).
     """
     return bool(messages) and messages[0].role == MessageRole.SYSTEM
 
@@ -365,8 +368,8 @@ class SnapshotSession(Protocol):
     last_conversation: list[dict[str, Any]]
     last_request: int | None
     recalled_memory: str | None
-    #: Per log entry of the history a compaction left, the entry it shows and its form
-    #: (`compacted_entries`, #1848), until the next request records them.
+    #: Per log entry of the history a compaction or a rollback left, the entry it shows
+    #: and its form (`compacted_entries`, #1848), until the next request records them.
     compacted_entries: dict[str, ContextEntry]
 
     @property
@@ -383,6 +386,10 @@ class SnapshotSession(Protocol):
         """Record what a request's conversation showed in the context state (#1443)."""
         ...
 
+    def declare_new_epoch(self, cause: str) -> None:
+        """Say that the next request opens a new epoch, and why (Rule 1)."""
+        ...
+
 
 @dataclass(frozen=True, slots=True)
 class PromptScope:
@@ -397,12 +404,21 @@ class PromptScope:
     current_plan: Callable[[], PlanState | None]
     history: Callable[[], Sequence[ChatMessage]]
     active_session: Callable[[], SnapshotSession]
+    #: What renders the active session's conversation from its log: the `LogReader` the
+    #: log-only rebuild renders an epoch with, over the session's bodies (#1848).
+    log_reader: Callable[[], LogReader]
     turn_counter: Callable[[], int]
     #: Whether the active session's anchor was composed under another persona-axis
     #: position than the one in force now (`BaseAgent._anchor_is_stale`).
     anchor_is_stale: Callable[[], bool]
     system_prompt_base: Callable[[], str]
     effective_system_prompt: Callable[[], str]
+    #: The module the agent builds its tools layer under (#2188), recorded on each
+    #: snapshot. A scope that names none is ``native``.
+    tools_module: Callable[[], ToolsModuleName] = lambda: DEFAULT_TOOLS_MODULE
+    #: The system text that offers the base tools when the module sends tools as text
+    #: (``k_act``, #2188); `None` under every other module.
+    text_tools_section: Callable[[], str | None] = lambda: None
 
 
 class PromptAssembler:
@@ -414,31 +430,6 @@ class PromptAssembler:
 
     def __init__(self, scope: PromptScope) -> None:
         self._scope = scope
-        #: `recorded_forms` and `recorded_renderings` of the epochs they were computed
-        #: from, which are held so a reused `id()` never matches (#1875, item 5). Several
-        #: prepares of one request read the same epochs; a request that records a new one
-        #: replaces the sequence.
-        self._forms_of: tuple[Sequence[ContextEpoch], ContextEpoch | None] | None = None
-        self._forms: dict[str, ContextForm] = {}
-        self._renderings: dict[str, ContextEntry] = {}
-
-    def _recorded(
-        self, epochs: Sequence[ContextEpoch]
-    ) -> tuple[dict[str, ContextForm], dict[str, ContextEntry]]:
-        """`recorded_forms(epochs)` and `recorded_renderings(epochs)`, reused while
-        `epochs` is the sequence they were read from.
-
-        The sequence and its last epoch must both be the same objects: `advance` only ever
-        appends an epoch or replaces the last, so an epoch added or extended in place is
-        read afresh.
-        """
-        last = epochs[-1] if epochs else None
-        cached = self._forms_of
-        if cached is None or cached[0] is not epochs or cached[1] is not last:
-            self._forms = recorded_forms(epochs)
-            self._renderings = recorded_renderings(epochs)
-            self._forms_of = (epochs, last)
-        return self._forms, self._renderings
 
     @property
     def _ontology(self) -> OntologyEngineProtocol | None:
@@ -532,12 +523,15 @@ class PromptAssembler:
         # A skill whose `requires_tools` the agent's tool scope does not grant is left out
         # (#1826): offering it would teach the model a procedure it cannot carry out. The
         # scope is the declared one, so the listing is stable across a session's turns.
+        # A case-routed skill is handed over by code after the user's message
+        # (`artist_skill_router`), so it is not listed here for the model to pick (#1865).
         scope = self._config.allowed_tools
         active_skills = [
             s
             for s in self._skills.list_skills()
             if s.manifest.status == SkillStatus.ACTIVE
             and not missing_required_tools(s.manifest, scope)
+            and ROUTED_SKILL_TAG not in s.manifest.tags
         ]
         if not active_skills:
             return ""
@@ -632,6 +626,7 @@ class PromptAssembler:
             max_tokens=req.max_tokens,
             auto_compact=req.auto_compact,
             compaction_threshold_tokens=req.compaction_threshold_tokens,
+            tools_module=snapshot_tools_module(self._scope.tools_module()),
         )
         for digest, body in bodies.items():
             if digest not in session.stored_bodies:
@@ -646,7 +641,8 @@ class PromptAssembler:
         """The `REQUEST_CONTEXT` event's fields for `req`: its snapshot, and what it added.
 
         The event names the snapshot that holds the tools, identity, slow context, turn
-        context and model settings, and records the conversation as a delta on the
+        context and model settings, and records the conversation -- the log entries it
+        showed and their forms, not their text (#2013) -- as a delta on the
         previous request of this session -- the previous step, or the last step of the
         previous turn. A turn's first step used to record its whole request, so every turn
         re-recorded the conversation so far (#1421). `rebuild_requests` reverses this.
@@ -660,13 +656,17 @@ class PromptAssembler:
         or opens a new one.
         """
         session = self._active_session
+        self._declare_tools_module_change(session)
         snapshot_id = self.record_context_snapshot(req, layers)
         session.record_shown(list(layers.shown), step=step)
-        conversation = [m.model_dump() for m in layers.conversation]
-        kept, appended = request_context_delta(session.last_conversation, conversation)
+        # The conversation is recorded as the log entries it rendered from and their
+        # forms, never as message text: `layers.conversation` is `layers.shown` rendered,
+        # so the entries name the same messages and the text stays in the log (#2013).
+        shown = [entry.model_dump(mode="json") for entry in layers.shown]
+        kept, appended = request_context_delta(session.last_conversation, shown)
         base_request = session.last_request
         request_number = 1 if base_request is None else base_request + 1
-        session.last_conversation = conversation
+        session.last_conversation = shown
         session.last_request = request_number
         return {
             "step": step,
@@ -674,10 +674,28 @@ class PromptAssembler:
             "request": request_number,
             "base_request": base_request,
             "message_count": len(req.messages),
-            "kept_message_count": kept,
-            "appended_messages": appended,
+            "kept_entry_count": kept,
+            "appended_entries": appended,
             "digest": messages_digest([m.model_dump() for m in req.messages]),
         }
+
+    def _declare_tools_module_change(self, session: SnapshotSession) -> None:
+        """Open a new epoch when this request's tools module is not the session's last.
+
+        The module is fixed when the agent is built, so a change shows only on the first
+        request a rebuilt seat sends over a session recorded under another module (#2188).
+        The epoch it opens records `tools_module_changed`, so within an epoch the tools
+        module never changes. A session with no snapshot yet has nothing to change from.
+
+        Raises:
+            UnknownToolsModuleError: The session's last snapshot names a module this build
+                does not have; the turn ends with its plain sentence, and nothing is sent.
+        """
+        if not session.context_snapshots:
+            return
+        previous = recorded_tools_module(session.context_snapshots[-1].tools_module)
+        if previous != self._scope.tools_module():
+            session.declare_new_epoch(EPOCH_TOOLS_MODULE_CHANGED)
 
     def prepare_turn_layers(self, extra_sections: Sequence[str] = ()) -> RequestLayers:
         """Construct turn layers: invariants and skills in the system turn, volatile state at the tail (P7, P8, P9).
@@ -738,6 +756,10 @@ class PromptAssembler:
         rather than salvaged.
         """
         sections: list[str] = []
+        # ``k_act``'s base tools (#2188): the most stable slow context, so first.
+        text_tools = self._scope.text_tools_section()
+        if text_tools:
+            sections.append(text_tools)
         invariants_section = self.get_active_invariants_prompt_section(tier_filter="asserted")
         if invariants_section:
             sections.append(invariants_section)
@@ -807,16 +829,21 @@ class PromptAssembler:
         # names the log bodies and their order; each entry is rendered in its form from
         # the log (#1848) -- its own body, or the rendering a compaction dropped it to --
         # so a rebuild that reads only the log renders the same request.
-        # A body an epoch recorded as a rendering shows the entry it renders; any other
-        # keeps the form the epochs before recorded for it, where its message carries none
-        # (`shown_form`, #1866). After a compaction, the entries it derived from the
-        # history before it are the new epoch's (`compacted_entries`, #1848).
+        # Read from the epoch in force alone (`opening_entries`, #1848): a body the last
+        # epoch recorded as a rendering shows the entry it renders, and any other is its
+        # own entry, in the form recorded on its message (`message_form`). After a
+        # compaction or a rollback, the opening state it set for the next epoch wins
+        # (`compacted_entries`). No earlier epoch is read.
         session = self._active_session
         logged = session.logged_history()[len(messages) - len(history) :]
-        prior, renderings = self._recorded(session.context_epochs)
-        shown = shown_entries(logged, prior, {**renderings, **session.compacted_entries})
-        by_entry = dict(logged)
-        conversation = render_entries(shown, by_entry.__getitem__)
+        shown = shown_entries(
+            logged, opening_entries(session.context_epochs, session.compacted_entries)
+        )
+        # Rendered by the reader the log-only rebuild renders an epoch with, so the
+        # request is that rendering by construction: each entry is its logged body, and an
+        # `excerpt` or `stub` is rendered from its kept result's body, which is the only
+        # text the log holds for it (#1848).
+        conversation = self._scope.log_reader().render(shown, what="the next request")
         return RequestLayers(
             identity=base_sys,
             slow_context=combined_section,
@@ -824,4 +851,5 @@ class PromptAssembler:
             conversation=tuple(conversation),
             turn_context=turn_context,
             shown=shown,
+            text_calls=self._scope.tools_module() == "k_act",
         )

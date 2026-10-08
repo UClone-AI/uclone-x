@@ -7,7 +7,7 @@ import type { UiLanguage } from './i18n/language';
  * conversation one of seven mutually exclusive destinations — so reading the DAG meant leaving
  * the conversation. The conversation is now the centre column and is always present; these are
  * the runtime internals that have no ACP counterpart and therefore stay ours to render
- * (`docs/acp-protocol-spec.md` §2, §4).
+ * (the ACP method tables summarised in `docs/public/protocols.md`).
  */
 export type DockSurface =
   /**
@@ -33,6 +33,7 @@ export type DockSurface =
   | 'knowledge_graph'
   | 'activity'
   | 'resource'
+  | 'browser'
   | 'topology'
   | 'ledger'
   | 'ontology';
@@ -119,16 +120,36 @@ export interface CloneChoice {
 }
 
 export interface PersonaInfo {
+  /**
+   * The clone's id (`agt_…`): what a seat, a room's `agent_ids` and every request name it
+   * by, and what a rename leaves alone. Key a clone with `cloneIdOf`. A clone defined only in
+   * memory has its handle here.
+   */
+  id?: string;
+  /** Its handle, the `@mention` token; the same as `name`. */
+  handle?: string;
+  /** Its handle: what `@` inserts and a command names. A rename changes it. */
   name: string;
+  /**
+   * What a person reads as its name, per locale (`{ en: 'Sleepyhead' }`). Label a clone with
+   * `cloneLabel`, never with `name` directly. Absent from an older Core.
+   */
+  display_name?: Record<string, string>;
   role: string;
   description: string;
   allowed_tools: string[];
-  model_name?: string;
+  base_tools?: string[];
+  /** Its conversation model ref (`<connection>/<model>`); absent or null follows the system default. */
+  model_name?: string | null;
+  /** Its own fast model ref; absent or null follows the default. */
+  fast_model?: string | null;
+  /** Its picture model ref, or `auto`; absent or null follows the default picture model. */
+  image_model?: string | null;
   temperature?: number;
   max_tokens?: number;
   enable_write_tools?: boolean;
   enable_subagent_tools?: boolean;
-  /** Personas this one may call through `a2a_call` (#1558); kept through an edit. */
+  /** The clones this one may call through `a2a_call` (#1558), by id; kept through an edit. */
   a2a_peers?: string[];
   /** The persona's own prompt, without the appended default prompt (#892). */
   system_prompt?: string;
@@ -153,48 +174,15 @@ export interface PersonaInfo {
 /** Which Settings model a persona's turns run on: the deep one (`inherit`) or the fast one. */
 export type PersonaModelTier = 'inherit' | 'fast';
 
-/** `GET /api/personas`: the catalogue, plus what an editor needs to offer choices. */
+/** `GET /api/clones`: the catalogue, plus what an editor needs to offer choices. */
 export interface PersonaCatalog {
   personas: PersonaInfo[];
   /** Every tool name a persona may list; the server refuses any other. */
   available_tools: string[];
   /** Where a save is written, or null when the runtime has no workspace. */
   personas_dir: string | null;
-}
-
-export interface TopologyNode {
-  id: string;
-  label: string;
-  role: string;
-  tier?: string;
-  status?: string;
-  state?: string;
-  isolation_level: string;
-  capabilities?: string[];
-  allowed_tools?: string[];
-  current_task?: string;
-  current_turn?: string;
-  turn_index?: number;
-  max_steps?: number;
-  /** @deprecated alias for max_steps */
-  max_turns?: number;
-  depth?: number;
-  uptime_s?: number;
-  position: { x: number; y: number };
-}
-
-export interface TopologyEdge {
-  id: string;
-  source: string;
-  target: string;
-  type: string;
-  label: string;
-  animated: boolean;
-}
-
-export interface TopologyData {
-  nodes: TopologyNode[];
-  edges: TopologyEdge[];
+  base_tools?: string[];
+  write_tools?: string[];
 }
 
 export interface DurabilityInfo {
@@ -464,53 +452,6 @@ export interface BudgetData {
   compaction_history: CompactionRecord[];
 }
 
-/** One model a cloud provider's own listing returned (#1631). */
-export interface CatalogEntry {
-  id: string;
-  display_name: string | null;
-  /** `null` when the provider did not say. */
-  context_window: number | null;
-  max_output_tokens: number | null;
-  /** False for embedding, speech and image models. */
-  chat_capable: boolean;
-  created_at: string | null;
-}
-
-/**
- * What a cloud provider's model listing said, as the Core read it (#1631).
- *
- * `entries` is empty unless `status` is `live`, and `recommended` is always one of their ids or
- * `null`: the head never recommends a model the provider did not list. For a non-live status,
- * `detail` says why in plain words.
- */
-export interface CatalogResult {
-  provider: string;
-  status: 'live' | 'no_key' | 'key_rejected' | 'unreachable' | 'no_listing';
-  entries: CatalogEntry[];
-  recommended: string | null;
-  fetched_at: string | null;
-  detail: string | null;
-}
-
-/** `GET /api/models`, optionally with `?refresh=1` to ask the provider again. */
-export interface ModelsResponse {
-  provider: string;
-  models: string[];
-  current_model: string;
-  catalog?: CatalogResult | null;
-}
-
-/** `POST /api/models/catalog`: a picked provider's listing, before it is saved (#1657). */
-export interface CatalogPreviewResponse {
-  provider: string;
-  models: string[];
-  /** Local providers only: whether anything answered at the address (#1666). */
-  reachable?: boolean;
-  /** Local providers only: the server answered, and refused the key (#1672). */
-  key_refused?: boolean;
-  catalog: CatalogResult | null;
-}
-
 export interface RemoteGpuInfo {
   name: string;
   total_mb: number;
@@ -533,72 +474,26 @@ export interface RemoteGpuStatus {
   error?: string | null;
   comfyui_autostarted?: boolean;
   ollama_models?: string[];
+  llm_on_remote?: boolean;
+  images_on_remote?: boolean;
+  /** The connections the tunnel had added and Disconnect removed (model-gateway §3.5). */
   restored_settings?: {
-    llm_provider?: string;
-    llm_base_url?: string;
-    comfyui_base_url?: string;
+    connection?: string;
+    picture_connection?: string;
   };
 }
 
-/** One provider's key, as `/api/settings` reports it whichever provider is active. */
-export interface ProviderKeyState {
-  id: string;
-  key_set: boolean;
-  /** The first and last few characters, never the key. Empty when no key is held. */
-  key_masked: string;
-  /** Where the key comes from: saved in Settings, or an environment variable that overrides it. */
-  key_source: 'settings' | 'env' | '';
-  /** The variable carrying it when `key_source` is `'env'`. */
-  key_env_var?: string | null;
-}
-
-/** A setting an environment variable decides while it stays set; the file still saves. */
-export interface EnvOverride {
-  field: 'llm_provider' | 'llm_model' | 'llm_base_url';
-  env_var: string;
-  /** The Core's English sentence; the screen shows its own translation instead. */
-  message?: string;
-}
-
+/**
+ * `GET /api/settings`. Models and connections are not here: they are the model gateway's
+ * (`GET /api/connections`, `GET /api/models`, model-gateway.md §3.7.1).
+ */
 export interface RuntimeSettings {
-  llm_provider: string;
-  llm_base_url: string;
-  /** The chat (deep) model: the one a clone's turn runs on when its persona names none. */
-  llm_model: string;
-  /** The fast model for auxiliary calls; empty means it follows `llm_model`. */
-  llm_model_fast?: string | null;
-  llm_api_key_set: boolean;
-  llm_api_key_masked: string;
-  llm_api_key_source?: 'settings' | 'env' | '';
-  llm_api_key_env_var?: string | null;
-  /** Every provider's key state, so a key never looks lost when another provider is active. */
-  providers?: ProviderKeyState[];
-  /** Where the provider, model and endpoint in use come from; `'env'` wins over the file. */
-  llm_provider_source?: 'settings' | 'env' | '';
-  llm_provider_env_var?: string;
-  llm_model_source?: 'settings' | 'env' | '';
-  llm_model_env_var?: string;
-  llm_base_url_source?: 'settings' | 'env' | '';
-  llm_base_url_env_var?: string;
-  /** Each setting an environment variable decides instead of the saved choice. */
-  env_overrides?: EnvOverride[];
   /**
    * A Settings save found the settings file unreadable and kept it aside, unchanged, before
    * writing a new one (#1860). The keys saved in it are not the ones shown here.
    */
   settings_set_aside?: boolean;
-  comfyui_base_url: string;
-  /** What draws pictures: `auto`, `local` or `gemini`, as saved. */
-  image_engine?: string;
-  /** The Gemini picture model, as saved; the runtime's default when none is. */
-  image_model?: string;
-  /** Why the saved picture choice cannot be used, or `''` when it can. */
-  image_settings_problem?: string;
-  providers_available: string[];
   workspace_dir?: string;
-  available_models?: string[];
-  /** The cloud provider's model listing; `null` for Ollama, vLLM and mock. */
-  catalog?: CatalogResult | null;
   /** Folders outside the workspace that clones may read but never write, as entered. */
   read_roots?: string[];
   /** The subset of `read_roots` that no longer exists on disk. */
@@ -661,19 +556,6 @@ export interface McpServerDraft {
 export interface McpImportResult {
   added: McpServer[];
   skipped: { name: string; reason: string }[];
-}
-
-export interface ConnectionTestResult {
-  status: 'ok' | 'warning' | 'error';
-  message?: string;
-  provider?: string;
-  url?: string;
-  models?: string[];
-  online?: boolean;
-  error?: string;
-  /** vLLM only: the server answered 401 or 403 (#1672). */
-  key_refused?: boolean;
-  stats?: Record<string, unknown>;
 }
 
 export interface EvalProbeResult {
@@ -803,6 +685,7 @@ export interface RoomSummary {
   agent_ids: string[];
   human_ids: string[];
   message_count: number;
+  utterance_count?: number;
   updated_at: string;
 }
 
@@ -821,8 +704,12 @@ export interface RoomParticipant {
    */
   aliases?: string[];
   persona_summary?: string;
-  /** The clone this seat is (`Participant.persona`); the id when the Core sends none. */
-  persona?: string;
+  /**
+   * The clone's handle, which `@` inserts and the Core resolves. **Filled by the head** from
+   * the clone listing (`withCloneNames`), never sent by the Core: a seat is the clone's id
+   * (clone-data-scopes §4 step 3) and a rename changes the handle, not the seat.
+   */
+  handle?: string;
 }
 
 /**
@@ -889,9 +776,9 @@ export type ProviderFailureKind =
   | 'provider_error';
 
 /**
- * `ProviderFailure`: a hosted provider's failure as the Core tells it (#1630). `message` is
- * written to be shown as is -- it names the provider and says whose side the problem is on,
- * with no status code or response body -- unlike the row's `error`.
+ * `ProviderFailure`: a hosted provider's failure as the Core tells it (#1630). `message` is the
+ * Core's English sentence, kept for the log; the row's sentence is built in the reader's
+ * language from `kind`, `provider`, `model_ref` and `action` (`providerFailureSentence`, #2167).
  */
 export interface RoomProviderFailure {
   kind: ProviderFailureKind;
@@ -899,6 +786,13 @@ export interface RoomProviderFailure {
   retryable: boolean;
   /** The provider's display name ("Google"); absent on a row stored before it was carried. */
   provider?: string | null;
+  /**
+   * Set when the turn failed on the clone's own model (model-gateway.md §3.6): the clone, the
+   * ref it names, and the one action offered, `use_system_default`, which clears that slot.
+   */
+  clone?: string | null;
+  model_ref?: string | null;
+  action?: 'use_system_default' | null;
 }
 
 export interface RoomTranscriptMessage {
@@ -928,6 +822,12 @@ export interface RoomTranscriptMessage {
   refusal?: RoomTurnRefusal | null;
   /** Set beside `error` when the turn failed at a hosted provider (#1630). */
   provider_failure?: RoomProviderFailure | null;
+  /**
+   * Set, beside `error`, when the turn failed because the changes saved to the speaker's
+   * persona could not be applied at its start (#1904). The speaker kept its previous
+   * definition and the edit was dropped. A flag: the cause is in the log, never here.
+   */
+  persona_edit_dropped?: boolean;
   completed: boolean;
   /**
    * The last `seq` this utterance's turn actually saw when it started, per
@@ -962,6 +862,13 @@ export interface RoomTranscriptMessage {
    * the reply landed, when the clone has learned from the turn, so a row first arrives without
    * it. Empty, or absent on a row stored before the field existed, when nothing was saved.
    */
+  /**
+   * The tags the image tool added to the prompt of a picture this turn made (#1865), and the
+   * tags it asked the picture to leave out. Tags, not the tool's sentences: those are written
+   * for the model. Absent when the turn drew nothing, or nothing was added.
+   */
+  image_prompt_added?: string[];
+  image_negative_added?: string[];
   knowledge_learned?: string[];
   /**
    * Set when the speaker could not learn from this turn (#1404): a plain sentence, never the
@@ -1065,6 +972,13 @@ export interface RoomState {
    */
   head?: string | null;
   active_turn?: RoomActiveTurn | null;
+  /**
+   * The folder this conversation's clones work in, absent for the server's own
+   * (clone-data-scopes §3.6). `default_workspace` names that one; only `GET
+   * /api/rooms/{id}` and the workspace route carry it.
+   */
+  workspace?: string | null;
+  default_workspace?: string;
 }
 
 /**

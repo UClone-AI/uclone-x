@@ -18,7 +18,10 @@ failures and fails the moment the two disagree:
 * a turn whose provider failed on a real read of a missing file, which `BaseAgent` returns
   as the result's `error` rather than raising;
 * a reply whose seat session could not be written, because the session directory is a
-  file -- a real failing write in the real `SessionStore`.
+  file -- a real failing write in the real `SessionStore`;
+* a turn whose seat could not apply a saved persona edit at its start, because applying it
+  read a missing file (#1904). Its `error` is the Core's fixed sentence, and this module
+  checks that the cause's path and class name are not in it.
 
 `tmp_path` is replaced by `/home/reader/.uclone` rather than by a token without a slash, so
 the head's "no path" check still has a path to catch.
@@ -36,7 +39,8 @@ from typing import Any
 import pytest
 
 from uclone_x.agent.composition import HostDependencies
-from uclone_x.agent.models import TurnResult
+from uclone_x.agent.models import PersonaDefinition, TurnResult
+from uclone_x.agent.persona_registry import PersonaRegistry
 from uclone_x.agent.session import SessionState, SessionStore
 from uclone_x.engine.event_bus import EventBus
 from uclone_x.llm.budget import TokenBudgetManager
@@ -69,7 +73,10 @@ FIELDS = (
     "error",
     "refusal",
     "persist_error",
+    "persona_edit_dropped",
 )
+#: Of `FIELDS`, the ones a row leaves out while unset (`exclude_if`); left out here too.
+UNSET_LEFT_OUT = frozenset({"persona_edit_dropped"})
 
 
 def _seated_room(tmp_path: Path) -> RoomStore:
@@ -153,7 +160,7 @@ async def _last_row(tmp_path: Path, resolver: Any) -> RoomMessage:
 
 def _as_head_reads_it(row: RoomMessage, tmp_path: Path) -> dict[str, Any]:
     dumped = json.loads(row.model_dump_json())
-    text = json.dumps({k: dumped.get(k) for k in FIELDS})
+    text = json.dumps({k: dumped.get(k) for k in FIELDS if k in dumped or k not in UNSET_LEFT_OUT})
     # Both spellings: macOS reports `tmp_path` under `/private/var` and as `/var`.
     for root in sorted({str(tmp_path.resolve()), str(tmp_path)}, key=len, reverse=True):
         text = text.replace(json.dumps(root)[1:-1], READER_HOME)
@@ -192,7 +199,44 @@ async def _failed_rows(tmp_path: Path) -> dict[str, dict[str, Any]]:
     row = await _last_row(case, RoomAgentResolver(host))
     rows["unsaved"] = _as_head_reads_it(row, case)
 
+    case = tmp_path / "persona_edit"
+    case.mkdir()
+    rows["persona_edit"] = _as_head_reads_it(await _persona_edit_dropped_row(case), case)
+
     return rows
+
+
+async def _persona_edit_dropped_row(case: Path) -> RoomMessage:
+    """The row a seat lands when a saved edit to its persona fails to apply (#1904).
+
+    The seat answers once, the edit is saved, and applying it at the next turn start reads
+    a file that is not there -- a real `FileNotFoundError` with a path in it.
+    """
+    registry = PersonaRegistry(workspace_root=case / "workspace", include_defaults=False)
+    before = PersonaDefinition(
+        name=SEAT, role="Researcher", description="Finds things.", system_prompt="You find."
+    )
+    registry.register_persona(before)
+    host = _host(case / "sessions", MockLLMConnector(default_model="mock-gpt-4o"))
+    resolver = RoomAgentResolver(host, persona_registry=registry)
+    orchestrator = RoomOrchestrator(
+        store=_seated_room(case), selectors=(MentionSelector(),), resolver=resolver
+    )
+    await orchestrator.post(ROOM, "user", "@scout go")
+    seated = list(resolver.live_agents())
+    assert len(seated) == 1, seated
+    missing = case / "personas" / "scout.yaml"
+
+    def _apply_reads_a_missing_file(_persona: PersonaDefinition) -> None:
+        missing.read_text(encoding="utf-8")
+
+    vars(seated[0])["_persona_definition_commit"] = _apply_reads_a_missing_file
+    edited = before.model_copy(update={"system_prompt": "You find, and cite."})
+    assert resolver.persona_edited(edited) == 1
+    state = await orchestrator.post(ROOM, "user", "@scout again")
+    row = state.transcript[-1]
+    assert row.sender_id == SEAT, state.transcript
+    return row
 
 
 def _looks_raw(text: str | None) -> bool:
@@ -212,6 +256,9 @@ async def test_the_heads_failed_row_fixture_is_what_real_failures_land(tmp_path:
 
     Killed by: src/uclone_x/room/orchestrator.py :: error = f"{type(exc).__name__}: {exc}"
     Becomes: error = "the turn failed"
+
+    Killed by: src/uclone_x/room/orchestrator.py :: persona_edit_dropped = result.stop_reason == "persona_edit_failed"
+    Becomes: persona_edit_dropped = False
     """
     rows = await _failed_rows(tmp_path)
 
@@ -229,6 +276,14 @@ async def test_the_heads_failed_row_fixture_is_what_real_failures_land(tmp_path:
             "so the head's test that it is not rendered would prove nothing"
         )
         assert READER_HOME in rows[name][field] or "Error" in rows[name][field]
+
+    # The dropped edit's row is the other way round: its `error` is the Core's own fixed
+    # sentence, and the head is held to naming the dropped edit rather than to hiding it.
+    dropped = rows["persona_edit"]
+    assert dropped["persona_edit_dropped"] is True, dropped
+    assert dropped["error"] and not _looks_raw(dropped["error"]), dropped
+    assert "scout.yaml" not in dropped["error"] and "Errno" not in dropped["error"]
+    assert "persona_edit_dropped" not in rows["raised"], "an unset flag was written"
 
     fixture = json.loads(FIXTURE.read_text(encoding="utf-8"))
     assert fixture["rows"] == rows, (

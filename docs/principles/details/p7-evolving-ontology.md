@@ -13,4 +13,4 @@
   - **Semantic Grounding**: Decisions and A2A collaboration must be validated against the agent's active ontology to prevent semantic drift.
 * **Why**: Ontologies eliminate semantic drift, prevent hallucinations, enable deterministic validation of agent states, and provide a self-cleaning, verifiable knowledge substrate for complex multi-agent reasoning.
 
-* **Implementation Reference**: `docs/agent-ontology-architecture.md`
+* **Implementation Reference**: [`docs/public/overview.md`](../../public/overview.md)

@@ -76,6 +76,34 @@ export interface StoryConversation {
   exists: boolean;
 }
 
+/** A codex entry a scene takes part in, on the story board (§1.1 row 5). */
+export interface SceneEntry {
+  kind: string;
+  id: string;
+  name: string;
+  /** Listed by the outline, named in the scene, or a thread planted or paid off there. */
+  how: 'listed' | 'mentioned' | 'planted' | 'paid_off';
+  /** False for an entry the outline lists that is only proposed: shown, not linked. */
+  in_codex: boolean;
+}
+
+/** A change the codex records at a scene, true once the scene has ended. */
+export interface SceneChange {
+  kind: string;
+  entry_id: string;
+  entry_name: string;
+  set: Record<string, JsonValue>;
+  add_looks: string[];
+  remove_looks: string[];
+  note: string | null;
+}
+
+/** A contradiction the check after writing found in the scene. */
+export interface SceneFinding {
+  quote: string;
+  note: string;
+}
+
 export interface SceneView {
   id: string;
   title: string;
@@ -84,6 +112,12 @@ export interface SceneView {
   characters: string[];
   places: string[];
   written: boolean;
+  entries: SceneEntry[];
+  changes: SceneChange[];
+  continuity: 'checked' | 'unread' | null;
+  findings: SceneFinding[];
+  /** Ids of the pending proposals that quote the scene or place a change at it. */
+  pending: string[];
 }
 
 export interface ChapterView {
@@ -91,6 +125,10 @@ export interface ChapterView {
   title: string;
   act: string | null;
   scenes: SceneView[];
+  /** What the arc gave the chapter to do; empty when there is no arc that fits. */
+  functions: string[];
+  twist: boolean;
+  climax: boolean;
 }
 
 export interface OutlineView {
@@ -165,8 +203,17 @@ export interface StoryOverview {
   genre: string | null;
   writer: StoryConversation | null;
   decide_note: string | null;
+  /**
+   * Each note's code (`view.py`'s `StoryNoteCode`): the head words it from
+   * `dock.story.notes` and shows the Core's English sentence only for a code it does not know.
+   */
+  decide_code?: string | null;
   outline: OutlineView | null;
   outline_note: string | null;
+  outline_code?: string | null;
+  /** Why the board shows no chapter functions or continuity notes; the Core's sentence. */
+  board_note: string | null;
+  board_code?: string | null;
   codex: CodexGroup[];
   codex_unreadable: Unreadable[];
   pending: ProposalView[];

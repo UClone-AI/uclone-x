@@ -176,7 +176,9 @@ def parse_loop_command_input(text: str) -> tuple[float, str]:
                     )
                 # Remove matched interval expression to form clean prompt
                 prompt = (clean_text[: match.start()] + clean_text[match.end() :]).strip()
-                prompt = re.sub(r"^(?:간격으로|마다|주기로|[,;\s])+", "", prompt).strip()
+                # A sentence's own full stop after the interval ("10분 마다. <prompt>") is
+                # not part of the prompt; a leading "./path" is, so only a lone "." goes.
+                prompt = re.sub(r"^(?:간격으로|마다|주기로|[,;\s]|\.(?=\s|$))+", "", prompt).strip()
                 prompt = re.sub(r"[,;\s]+$", "", prompt).strip()
                 if not prompt:
                     raise LoopParseError(

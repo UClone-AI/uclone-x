@@ -113,9 +113,7 @@ are written down:
 `session_id`, so no file is renamed, no filename becomes invalid, and no record becomes
 invisible to `list_session_ids`. That is the deliberate contrast with `revision`'s default
 of `0` in #240 — there, a default was needed precisely because existing records lacked the
-field. Legacy records at the family root (see `CORE_RECORD_SUBDIR`) are unaffected for the
-same reason: they are read for hydration under the id they name, and they name it in their
-own contents.
+field.
 
 **This record is NOT interchangeable with the UI's.** An earlier draft of this docstring
 claimed the on-disk key set was aligned with the one `ui.app.AgentSessionManager`
@@ -137,8 +135,9 @@ import re
 import shutil
 import unicodedata
 import uuid
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path
 from typing import Any, cast
 
@@ -158,12 +157,16 @@ from uclone_x.core.session import (
     resolve_session_path,
     validate_session_id,
 )
+from uclone_x.core.session_log import with_image_data
 from uclone_x.core.session_state import (
     AnchorAuthor,
     AnchorProvenance,
     ContextSnapshot,
     SessionState,
     content_digest,
+    history_entries_not_their_messages,
+    log_position,
+    recorded_before_history_entries,
     redact_message,
 )
 from uclone_x.core.set_aside import expire_set_aside, kept_copies, set_aside_unreadable
@@ -174,8 +177,7 @@ from uclone_x.errors import (
     SessionRecordUnreadableError,
     StaleSessionWriteError,
 )
-from uclone_x.llm.models import LedgerSource
-from uclone_x.sandbox.path_validator import PathValidator
+from uclone_x.llm.models import ChatMessage, LedgerSource
 
 logger = logging.getLogger(__name__)
 
@@ -196,13 +198,11 @@ __all__ = [
     "MAX_PID",
     "SESSION_STORAGE_DIR_ENV_VAR",
     "UI_TRANSCRIPT_SUBDIR",
-    "cleanup_session_artifacts",
     "content_digest",
     "default_session_root",
     "default_session_storage_dir",
     "is_pid_alive",
     "reap_orphaned_temp_files",
-    "reap_orphaned_tool_artifacts",
     "redact_message",
     "resolve_session_path",
     "validate_session_id",
@@ -216,9 +216,10 @@ __all__ = [
 # `list_session_ids`, which reads `*.json` at the top level, never sees a log.
 EVENT_LOG_SUBDIR = "events"
 
-# The large layer bodies a `ContextSnapshot` refers to by hash -- tool schemas, identity,
-# slow context -- live at `<storage_dir>/context/<session_id>/<sha256>`, once each. Not
-# under the tool-artifacts directory, whose reaper deletes anything older than an hour.
+# The bodies a session refers to by hash -- context-snapshot layers (tool schemas,
+# identity, slow context), session-log entries, and the full text of every tool result
+# too long to keep whole in the history (#1848) -- live at
+# `<storage_dir>/context/<session_id>/<sha256>`, once each.
 CONTEXT_BODY_SUBDIR = "context"
 
 _SHA256_HEX = re.compile(r"[0-9a-f]{64}")
@@ -314,75 +315,6 @@ def reap_orphaned_temp_files(storage_dir: Path, max_age_seconds: float = 300.0) 
             except OSError as err:
                 logger.warning("Failed to reap orphaned session temp file %s: %s", entry, err)
     return reaped_count
-
-
-def cleanup_session_artifacts(artifacts_dir: Path, session_id: str) -> int:
-    """Clean up all tool artifact files for a given session (P3).
-
-    Returns the number of artifact files unlinked.
-    """
-    if not artifacts_dir.is_dir():
-        return 0
-    validate_session_id(session_id)
-    target_dir = artifacts_dir / session_id
-    safe_target = PathValidator().resolve_safe_path(target_dir, artifacts_dir)
-    if not safe_target.is_dir():
-        return 0
-    deleted_count = 0
-    for child in list(safe_target.iterdir()):
-        if child.is_file():
-            try:
-                child.unlink(missing_ok=True)
-                deleted_count += 1
-            except OSError:
-                pass
-    try:
-        safe_target.rmdir()
-    except OSError:
-        pass
-    return deleted_count
-
-
-def reap_orphaned_tool_artifacts(
-    artifacts_dir: Path,
-    max_age_seconds: float = 3600.0,
-    *,
-    is_live: Callable[[str], bool] | None = None,
-) -> int:
-    """Reap orphaned session tool artifact directories older than max_age_seconds.
-
-    `is_live(session_id)` spares a directory whose session still exists, whatever its
-    age: it holds stored tool results that session's history names by handle (#1422), and
-    an hour-old conversation is not an orphan. Deleting or resetting a session removes
-    them instead.
-
-    Returns the number of artifact files unlinked.
-    """
-    if not artifacts_dir.is_dir():
-        return 0
-    reaped = 0
-    now = datetime.now(UTC).timestamp()
-    for entry in list(artifacts_dir.iterdir()):
-        if entry.is_dir():
-            if is_live is not None and is_live(entry.name):
-                continue
-            try:
-                mtime = entry.stat().st_mtime
-                if (now - mtime) >= max_age_seconds:
-                    for f in list(entry.iterdir()):
-                        if f.is_file():
-                            try:
-                                f.unlink(missing_ok=True)
-                                reaped += 1
-                            except OSError:
-                                pass
-                    try:
-                        entry.rmdir()
-                    except OSError:
-                        pass
-            except OSError:
-                continue
-    return reaped
 
 
 def verify_record_identity(asked_session_id: str, record_session_id: str, path: Path) -> None:
@@ -567,13 +499,11 @@ class SessionStore:
 
     def __init__(
         self,
-        storage_dir: Path | None = None,
-        workspace_root: Path | None = None,
-        artifacts_dir: Path | None = None,
+        storage_dir: str | os.PathLike[str] | None = None,
         log_writer: LogWriterProtocol | None = None,
         log_allocator: LogOffsetAllocatorProtocol | None = None,
     ) -> None:
-        """Build a store rooted at `storage_dir`.
+        """Build a store rooted at `storage_dir`, a `Path` or a path string.
 
         **The durable event log is on by default (#1442).** With neither `log_writer` nor
         `log_allocator` given, each session's turn events are appended to
@@ -593,52 +523,23 @@ class SessionStore:
         #: diagnostics commands) leaves no empty directory behind.
         self._event_log_dir: Path | None = None
         self._storage_dir: Path = (
-            storage_dir.resolve()
+            Path(storage_dir).resolve()
             if storage_dir is not None
             else default_session_storage_dir().resolve()
         )
         self._storage_dir.mkdir(parents=True, exist_ok=True)
-        self._workspace_root: Path | None = (
-            workspace_root.resolve() if workspace_root is not None else None
-        )
-        self._artifacts_dir: Path | None = (
-            artifacts_dir.resolve()
-            if artifacts_dir is not None
-            else (
-                self._workspace_root / ".sandbox" / "tool_artifacts"
-                if self._workspace_root is not None
-                else None
-            )
-        )
         if log_writer is None and log_allocator is None:
             self._event_log_dir = self._storage_dir / EVENT_LOG_SUBDIR
         #: Session ids whose unreadable record `save` moved aside, until `take_set_aside`
         #: reports each one once (#1844).
         self._set_aside: set[str] = set()
         reap_orphaned_temp_files(self._storage_dir)
-        # Before the artifact reaper: a session whose last copy expires here is no longer
-        # live to it, so its tool results go in the same start.
         self._expire_kept_copies()
-        if self._artifacts_dir is not None:
-            reap_orphaned_tool_artifacts(self._artifacts_dir, is_live=self._has_record)
 
     @property
     def storage_dir(self) -> Path:
         """Root directory holding this store's session records."""
         return self._storage_dir
-
-    def _has_record(self, session_id: str) -> bool:
-        """Whether a record exists for `session_id`, or a copy of one was set aside.
-
-        `False` for a name no record can have. A set-aside copy counts (#1844): its tool
-        results are named by handle in its history, and a build that can read it again
-        needs them there. An empty one does not (#1877): it holds no history.
-        """
-        try:
-            path = self.session_path(session_id)
-            return path.is_file() or bool(kept_copies(path))
-        except (PathTraversalError, ValueError, OSError):
-            return False
 
     def session_path(self, session_id: str) -> Path:
         """Resolve `session_id` to its record path, refusing anything that escapes (P3).
@@ -805,13 +706,15 @@ class SessionStore:
             )
         return state
 
-    @staticmethod
-    def _read(session_id: str, path: Path) -> tuple[SessionState | None, str | None]:
+    def _read(self, session_id: str, path: Path) -> tuple[SessionState | None, str | None]:
         """The record at `path`, and why it could not be read, for the log, when it could not.
 
         `(None, None)` when there is no record, including a path too long to exist.
         `(None, cause)` when a file is there and does not load: undecodable, unopenable, or
-        a shape this build refuses -- most often a field a newer build added.
+        a shape this build refuses -- most often a field a newer build added, or a form
+        that holds text, as a record written before forms were recorded does (#1848). No
+        body is read: a form is judged by what it records, so a body the store cannot
+        read never fails the read of the record (#1974).
 
         Raises:
             SessionIdCollisionError: The record loads and identifies a different session.
@@ -832,6 +735,36 @@ class SessionStore:
         # After parsing, not before: an unparseable file has no id to compare, and it is
         # reported unreadable above for a reason that has nothing to do with #256.
         verify_record_identity(session_id, state.session_id, path)
+        # A record an earlier build wrote, whose history is not named by log entry, is
+        # refused like any shape this build does not write (#1848, #1974 item 5).
+        old = recorded_before_history_entries(state)
+        if old is not None:
+            return None, old
+        if state.history_entries and not state.messages:
+            reconstructed: list[ChatMessage] = []
+            for entry_id in state.history_entries:
+                index = log_position(entry_id)
+                if index is None or index >= len(state.session_log):
+                    return None, f"history_entries names {entry_id!r}, not in session_log"
+                digest = state.session_log[index].digest
+                body = self.load_context_body(session_id, digest)
+                if body is None:
+                    return None, f"no context body {digest} for log entry {entry_id}"
+                try:
+                    message = ChatMessage.model_validate_json(body)
+                except ValueError as exc:
+                    return None, f"context body {digest} could not be read: {exc}"
+                # Image bytes are bodies of their own, named by digest (#2107); one that
+                # is gone leaves its image unavailable and does not fail the record.
+                reconstructed.append(
+                    with_image_data(message, partial(self.load_context_body, session_id))
+                )
+            state = state.model_copy(update={"messages": tuple(reconstructed)})
+        # A record whose message is not the entry it names would be refused on every
+        # resume and never set aside; it is refused here instead, like the rest (#1985).
+        mismatch = history_entries_not_their_messages(state)
+        if mismatch is not None:
+            return None, mismatch
         return state, None
 
     def _set_aside_unreadable(self, path: Path, cause: str) -> None:
@@ -886,8 +819,6 @@ class SessionStore:
                 if record.is_file() or kept_copies(record):
                     continue
                 self.clear_event_log(session_id)  # the last copy is gone
-                if self._artifacts_dir is not None:
-                    cleanup_session_artifacts(self._artifacts_dir, session_id)
             except Exception as exc:
                 logger.warning(
                     "Could not remove the history of %r after its last kept copy expired (%s)",
@@ -912,6 +843,14 @@ class SessionStore:
             return bool(kept_copies(path))
         except OSError:
             return True  # cannot tell, so keep what a copy may need
+
+    def keeps_copy_of(self, session_id: str) -> bool:
+        """Whether a copy of `session_id`'s record is set aside; `True` when that cannot be told.
+
+        A reset asks before it clears the session's history (#1921): a kept copy names the
+        same event log, context bodies and tool artifacts, as `delete` knows.
+        """
+        return self._has_kept_copy(self.session_path(session_id))
 
     def take_set_aside(self, session_id: str) -> bool:
         """Whether `save` moved this session's unreadable record aside since last asked; once each."""
@@ -1286,25 +1225,15 @@ class SessionStore:
 
         # The validated payload, not `stamped`: what a caller receives is what `load`
         # will hand back, byte for byte and type for type.
+        if stamped.history_entries and not validated.messages:
+            validated = validated.model_copy(update={"messages": stamped.messages})
         return validated
 
     def reap_orphaned_temp_files(self, max_age_seconds: float = 300.0) -> int:
         """Reap crash-orphaned session temp files under this store's storage directory (#219, #257)."""
-        count = reap_orphaned_temp_files(self._storage_dir, max_age_seconds=max_age_seconds)
-        if self._artifacts_dir is not None:
-            reap_orphaned_tool_artifacts(
-                self._artifacts_dir, max_age_seconds=max_age_seconds, is_live=self._has_record
-            )
-        return count
+        return reap_orphaned_temp_files(self._storage_dir, max_age_seconds=max_age_seconds)
 
-    def cleanup_session_artifacts(self, session_id: str, artifacts_dir: Path | None = None) -> int:
-        """Clean up tool artifacts for a given session."""
-        eff_artifacts = artifacts_dir if artifacts_dir is not None else self._artifacts_dir
-        if eff_artifacts is not None:
-            return cleanup_session_artifacts(eff_artifacts, session_id)
-        return 0
-
-    def delete(self, session_id: str, artifacts_dir: Path | None = None) -> bool:
+    def delete(self, session_id: str) -> bool:
         """Remove a session record. Returns whether a record was actually removed.
 
         `False` covers "no such record", including an ID too long for the filesystem to
@@ -1326,11 +1255,11 @@ class SessionStore:
         clearing it is clearing a conversation this build showed as empty, and the record
         is most often one a newer build wrote. So its name is freed and its bytes are kept.
 
-        **What a kept copy refers to is kept with it (#1860).** A record's event log,
-        context bodies and tool artifacts are found by session id, not by file name, so a
-        copy set aside -- by this delete or by an earlier save -- names the same ones. Removing
-        them would leave a copy that, restored by hand, has lost its tool results: the
-        reason `_has_record` spares them from the reaper. So while any copy of this id is
+        **What a kept copy refers to is kept with it (#1860).** A record's event log and
+        context bodies -- among them the full text of its tool results (#1848) -- are found
+        by session id, not by file name, so a copy set aside -- by this delete or by an
+        earlier save -- names the same ones. Removing them would leave a copy that,
+        restored by hand, has lost its tool results. So while any copy of this id is
         kept, the delete removes the record and nothing it refers to. Kept copies are
         bounded (`uclone_x.core.set_aside.KEEP_SET_ASIDE`), so this is too.
 
@@ -1357,8 +1286,8 @@ class SessionStore:
         else:
             path.unlink(missing_ok=True)
         if self._has_kept_copy(path):
-            # A kept copy names this id's event log, context bodies and tool artifacts;
-            # they stay while it does (#1860).
+            # A kept copy names this id's event log and context bodies, tool results
+            # among them; they stay while it does (#1860).
             logger.info(
                 "Session %r deleted; its event log and tool results are kept for the copy "
                 "set aside beside %s",
@@ -1368,10 +1297,8 @@ class SessionStore:
             return True
         # The event log is this session's history too; deleting the record and keeping
         # every tool output it produced would make "delete" a claim the disk contradicts.
+        # The full tool results are context bodies, so they go with it (#1848).
         self.clear_event_log(session_id)
-        eff_artifacts = artifacts_dir if artifacts_dir is not None else self._artifacts_dir
-        if eff_artifacts is not None:
-            cleanup_session_artifacts(eff_artifacts, session_id)
         return True
 
     def list_session_ids(self) -> tuple[str, ...]:

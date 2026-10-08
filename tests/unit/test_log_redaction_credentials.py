@@ -25,7 +25,7 @@ from uclone_x.agent.session import (
     redact_message,
 )
 from uclone_x.core.log_writer import RedactingLogWriter, redact_log_payload
-from uclone_x.core.logging_setup import JsonLogFormatter, RedactingConsoleFormatter
+from uclone_x.core.logging_setup import JsonLogFormatter
 from uclone_x.core.secrets import (
     REDACTED_PLACEHOLDER,
     contains_credential,
@@ -78,6 +78,22 @@ class TestCredentialPatternRedaction:
         redacted = redact_credentials(f"Prefix {secret} suffix")
         assert expected in redacted
         assert secret not in redacted
+
+    @pytest.mark.parametrize("secret,expected", SAMPLE_CREDENTIALS)
+    def test_redacting_twice_changes_nothing_more(self, secret: str, expected: str) -> None:
+        """`redact_credentials` is idempotent (#1848).
+
+        A kept tool result is redacted at ingest, where its `tr_` handle is taken, and
+        again when the session log writes it as a body; the handle names that body only
+        while the second pass changes nothing.
+        """
+        pem = (
+            "-----BEGIN RSA PRIVATE KEY-----\n"
+            "MIIEowIBAAKCAQEA0Y123456789abcdefghijklmnopqrstuvwxyz\n"
+            "-----END RSA PRIVATE KEY-----"
+        )
+        once = redact_credentials(f"Prefix {secret} suffix\n{pem}\nkey={secret}")
+        assert redact_credentials(once) == once
 
     def test_redact_private_key_pem(self) -> None:
         """Verify PEM private key blocks are replaced with a dedicated redaction marker.
@@ -177,26 +193,7 @@ class TestRedactingLogWriter:
 
 
 class TestLoggingSetupFormatters:
-    """Test suite for JsonLogFormatter and RedactingConsoleFormatter."""
-
-    def test_console_formatter_redacts_credentials(self) -> None:
-        """Console formatter masks credentials in record message.
-
-        Killed by: src/uclone_x/core/logging_setup.py :: class RedactingConsoleFormatter(logging.Formatter):
-        """
-        formatter = RedactingConsoleFormatter("%(levelname)s - %(message)s")
-        record = logging.LogRecord(
-            name="test",
-            level=logging.INFO,
-            pathname=__file__,
-            lineno=10,
-            msg="Connected with token: ghp_123456789012345678901234567890123456",
-            args=(),
-            exc_info=None,
-        )
-        formatted = formatter.format(record)
-        assert "ghp_" not in formatted
-        assert "[REDACTED]" in formatted
+    """Test suite for JsonLogFormatter."""
 
     def test_json_log_formatter_redacts_credentials_and_exc_info(self) -> None:
         """JsonLogFormatter redacts credential shapes from message and exception info."""
@@ -291,18 +288,6 @@ class TestSessionStateCredentialRedaction:
         assert "AKIAIOSFODNN7EXAMPLE" not in str(state.messages[0].content)
         assert "[REDACTED]" in str(state.messages[0].content)
 
-    def test_session_state_append_message(self) -> None:
-        """SessionState.append_message applies redaction on write."""
-        state = SessionState(session_id="test_sess", agent_id="test_agent")
-        new_state = state.append_message(
-            ChatMessage(
-                role=MessageRole.USER,
-                content="Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.token",
-            )
-        )
-        assert len(new_state.messages) == 1
-        assert "Bearer [REDACTED]" in str(new_state.messages[0].content)
-
     def test_session_store_save_persists_redacted_json(self, tmp_path: Path) -> None:
         """SessionStore.save guarantees on-disk json files contain no unmasked credentials."""
         store = SessionStore(storage_dir=tmp_path)
@@ -328,20 +313,26 @@ class TestSessionStateCredentialRedaction:
 class TestCompactorCredentialRedaction:
     """Test suite for compaction and tool offloading credential redaction."""
 
-    def test_compactor_prune_and_offload_redacts_credentials(self, tmp_path: Path) -> None:
-        """Compactor offloading and truncation redact credentials before saving to disk.
+    def test_compactor_prune_and_offload_redacts_credentials(self) -> None:
+        """Compactor offloading redacts credentials before the body is kept.
 
-        The blob is redacted inside `store_tool_result` (#1640); the stub's start is
-        redacted here.
+        The body the session keeps and the stub's start are one redacted text (#1640,
+        #1848).
 
-        Killed by: src/uclone_x/llm/compactor.py :: redact_credentials(msg.content),
-        Becomes: msg.content,
+        Killed by: src/uclone_x/llm/compactor.py :: body = redact_credentials(msg.content)
+        Becomes: body = msg.content
         """
-        compactor = ContextCompactor(
-            workspace_root=tmp_path,
-            max_tool_output_chars=80,
-            session_id="test_compactor_sess",
-        )
+        kept: dict[str, str] = {}
+
+        class _Bodies:
+            def keep(self, text: str, *, tool_name: str | None) -> str:
+                kept["tr_0123456789abcdef"] = text
+                return "tr_0123456789abcdef"
+
+            def read(self, handle: str) -> str | None:
+                return kept.get(handle)
+
+        compactor = ContextCompactor(max_tool_output_chars=80, result_bodies=_Bodies())
         tool_content = (
             "Execution output:\n"
             + "sk-proj-1234567890123456789012345678901234567890\n"
@@ -358,12 +349,7 @@ class TestCompactorCredentialRedaction:
         assert "sk-proj-" not in pruned.content
         assert "[REDACTED]" in pruned.content
 
-        # Inspect the offloaded file on disk:
-        offloaded_files = list(
-            (tmp_path / compactor.artifact_subdir / "test_compactor_sess").glob("*.txt")
-        )
-        assert len(offloaded_files) == 1
-        saved_text = offloaded_files[0].read_text(encoding="utf-8")
+        (saved_text,) = kept.values()
         assert "sk-proj-" not in saved_text
         assert "[REDACTED]" in saved_text
 

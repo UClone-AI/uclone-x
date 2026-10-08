@@ -25,8 +25,6 @@ const settings = {
   llm_model: 'qwen3:8b',
   llm_api_key_set: false,
   llm_api_key_masked: '',
-  comfyui_base_url: 'http://127.0.0.1:8188',
-  providers_available: ['ollama'],
   available_models: ['qwen3:8b'],
   workspace_dir: '/Users/someone/a/long/workspace/path/that/cannot/fit/at/phone/width',
 };
@@ -39,8 +37,8 @@ describe('SettingsModal header at narrow widths (#1416)', () => {
       'fetch',
       vi.fn(async (url: string) => {
         if (url.includes('/api/settings')) return { ok: true, json: async () => settings } as Response;
-        if (url.includes('/api/personas')) {
-          return { ok: true, json: async () => ({ personas: [], personas_dir: '' }) } as Response;
+        if (url.includes('/api/clones')) {
+          return { ok: true, json: async () => ({ clones: [], personas_dir: '' }) } as Response;
         }
         return { ok: true, json: async () => ({}) } as Response;
       }),
@@ -70,12 +68,5 @@ describe('SettingsModal header at narrow widths (#1416)', () => {
     const close = within(header).getByTitle('Close');
     expect(close.parentElement).toBe(header);
     expect(classesOf(close)).toContain('shrink-0');
-  });
-
-  it('wraps the badge under the title rather than widening the row', async () => {
-    render(<SettingsModal isOpen onClose={() => {}} developerMode={false} onDeveloperModeChange={() => {}} />);
-    const title = await screen.findByRole('heading', { name: /Runtime Settings/ });
-
-    expect(classesOf(title)).toContain('flex-wrap');
   });
 });

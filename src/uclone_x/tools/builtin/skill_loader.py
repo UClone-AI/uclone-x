@@ -10,7 +10,7 @@ from typing import ClassVar
 from pydantic import BaseModel, ConfigDict, Field
 
 from uclone_x.errors import PlainRefusalError
-from uclone_x.skills.models import SkillStatus, missing_required_tools
+from uclone_x.skills.models import ROUTED_SKILL_TAG, SkillStatus, missing_required_tools
 from uclone_x.skills.protocols import SkillProtocol, SkillRegistryProtocol
 from uclone_x.tools.base import BaseTool
 from uclone_x.tools.builtin.media_registry import ModelProfile, PromptFamily
@@ -142,6 +142,13 @@ class LoadSkillTool(BaseTool[LoadSkillParams]):
         skill = self._registry.get(name)
         if skill is None or skill.manifest.status != SkillStatus.ACTIVE:
             raise ValueError(f"Skill '{name}' is not found or has not been approved.")
+        # A case-routed skill is handed over by code for the request it fits (#1865); the
+        # catalog leaves it out, and this closes the path of a name the model recalls.
+        if ROUTED_SKILL_TAG in skill.manifest.tags:
+            raise ValueError(
+                f"Skill '{name}' is added automatically when a request needs it, "
+                "so it cannot be loaded by name."
+            )
         return skill
 
     def _require_scope(self, skill: SkillProtocol) -> None:

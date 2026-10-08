@@ -7,6 +7,7 @@ import logging
 from collections.abc import Collection, Sequence
 from pathlib import Path
 
+from uclone_x.agent.clone_store import CloneDirectoryPersonaStore, CloneRecord, ensure_clone_store
 from uclone_x.agent.models import PersonaDefinition
 from uclone_x.agent.persona_store import (
     BUILTIN_PERSONAS_DIR,
@@ -24,6 +25,8 @@ from uclone_x.agent.persona_store import (
     YamlFilePersonaStore,
     split_appended_default_prompt,
 )
+from uclone_x.core.agent_home import peer_handles
+from uclone_x.core.models import AGENT_COMPOSED_TOOLS
 
 logger = logging.getLogger(__name__)
 
@@ -50,8 +53,9 @@ __all__ = [
 class PersonaRegistry:
     """Catalog and discovery engine for agent persona blueprints (Principle 0).
 
-    Discovers personas from package built-in YAML files and workspace directories,
-    enabling zero-code agent extensibility without modifying core code.
+    Serves the clones under the agents root, one directory each (clone-data-scopes §3.2),
+    after importing the workspace's `.uclone/personas/` files and installing the package's
+    builtins as clones, enabling zero-code agent extensibility without modifying core code.
     """
 
     def __init__(
@@ -69,9 +73,10 @@ class PersonaRegistry:
         #: that knows only what the caller pointed it at.
         self._include_defaults = include_defaults
         #: Tool inventory `allowed_tools` is checked against. `None` disables the check --
-        #: see `_validate_tools` for why that is a stated position and not a default.
+        #: see `_validate_tools` for why that is a stated position and not a default. The
+        #: tools an agent composes itself are added here, once, for every store it builds.
         self._tool_names: frozenset[str] | None = (
-            frozenset(tool_names) if tool_names is not None else None
+            frozenset(tool_names) | AGENT_COMPOSED_TOOLS if tool_names is not None else None
         )
         self._custom_store = store
         self._store: PersonaStoreProtocol
@@ -79,6 +84,8 @@ class PersonaRegistry:
         #: Names the package's own directory defines, whether or not a later file overrides
         #: them -- what lets the head say an edited built-in is an override.
         self._builtin_names: frozenset[str] = frozenset()
+        self._clone_store: CloneDirectoryPersonaStore | None = None
+        self._package: YamlFilePersonaStore | None = None
         self.reload()
 
     @property
@@ -114,18 +121,20 @@ class PersonaRegistry:
                 self._builtin_names = frozenset()
             return
 
-        stores: list[PersonaStoreProtocol] = []
-        writable_store: YamlFilePersonaStore | None = None
+        # Before anything reads a clone: migrate, import this workspace's personas, and
+        # install the package's (clone-data-scopes §3.8). A no-op once done. The package
+        # directory is read here, at call time, so a test that swaps it is honoured.
+        package_dir: Path = BUILTIN_PERSONAS_DIR
+        ensure_clone_store(
+            self._workspace_root,
+            builtin_dir=package_dir if package_dir.is_dir() else None,
+            install=self._include_defaults,
+        )
 
-        # 1. Workspace store (.uclone/personas/)
-        if self._workspace_root:
-            ws_personas_dir = self._workspace_root / DEFAULT_WORKSPACE_PERSONAS_SUBDIR
-            writable_store = YamlFilePersonaStore(
-                ws_personas_dir,
-                tool_names=self._tool_names,
-                read_only=False,
-            )
-            stores.append(writable_store)
+        # 1. The clones: one directory each under the agents root, the only writable store.
+        clone_store = CloneDirectoryPersonaStore(tool_names=self._tool_names)
+        self._clone_store = clone_store
+        stores: list[PersonaStoreProtocol] = [clone_store]
 
         # 2. Extra specified directories
         for ed in self._extra_dirs:
@@ -138,22 +147,20 @@ class PersonaRegistry:
                     )
                 )
 
-        # 3. Built-in package YAML personas (src/uclone_x/personas/)
-        if self._include_defaults and BUILTIN_PERSONAS_DIR.is_dir():
-            builtin_store = YamlFilePersonaStore(
-                BUILTIN_PERSONAS_DIR,
-                tool_names=self._tool_names,
-                read_only=True,
-            )
-            stores.append(builtin_store)
-            self._builtin_names = frozenset(p.name for p in builtin_store.list_personas())
+        # 3. The package's own definitions: no longer served directly, since each is
+        # installed as a clone, but kept to say whether a clone is still its builtin.
+        if self._include_defaults and package_dir.is_dir():
+            package = YamlFilePersonaStore(package_dir, read_only=True)
+            self._package = package
+            self._builtin_names = frozenset(p.name for p in package.list_personas())
         else:
+            self._package = None
             self._builtin_names = frozenset()
 
         self._store = CompositePersonaStore(
             stores=stores,
-            writable_store=writable_store,
-            overridable_dirs=[BUILTIN_PERSONAS_DIR],
+            writable_store=clone_store,
+            overridable_dirs=[],
         )
 
     def _validate_tools(self, persona: PersonaDefinition, *, source: Path | str) -> None:
@@ -190,11 +197,26 @@ class PersonaRegistry:
             key=lambda p: (0 if p.name == DEFAULT_PERSONA_NAME else 1, p.name),
         )
 
+    def handle_for(self, ref: str) -> str:
+        """`ref` as the name a persona goes by: a clone id is read back to its handle.
+
+        Seats and chats are keyed by clone id (clone-data-scopes §4 step 3) while a
+        persona is named by its clone's handle; every lookup here takes either.
+        """
+        if self._clone_store is not None:
+            return self._clone_store.handle_for(ref)
+        return ref
+
+    def id_of(self, name: str) -> str | None:
+        """The clone id behind the persona `name` (a handle or an id), or None for one without."""
+        record = self.clone_record(name)
+        return record.agent_id if record is not None else None
+
     def get_persona(self, name: str) -> PersonaDefinition | None:
-        """Get persona definition by unique name."""
+        """Get a persona definition by its name, or by its clone's id."""
         if name in self._dynamic_personas:
             return self._dynamic_personas[name]
-        return self._store.get_persona(name)
+        return self._store.get_persona(self.handle_for(name))
 
     def register_persona(self, persona: PersonaDefinition) -> None:
         """Dynamically register or override a persona definition in memory."""
@@ -205,37 +227,64 @@ class PersonaRegistry:
         """The file a persona was loaded from, or `None` for one registered in memory."""
         if name in self._dynamic_personas:
             return None
-        source = self._store.source_of(name)
+        source = self._store.source_of(self.handle_for(name))
         return source if isinstance(source, Path) else None
 
     def is_builtin(self, name: str) -> bool:
-        """Whether the persona in force comes from the package's own directory."""
-        source = self.source_of(name)
-        return source is not None and source.parent == BUILTIN_PERSONAS_DIR
+        """Whether the clone `name` is still the package's builtin, unchanged.
+
+        True when it was installed from the package persona of the same name and its
+        definition still equals that one, peers compared by handle. An edited builtin is
+        a clone of its own, which `has_builtin` still reports as overriding the package's.
+        """
+        name = self.handle_for(name)
+        record = self.clone_record(name)
+        package = self._package
+        if record is None or package is None or record.template != name:
+            return False
+        shipped = package.get_persona(name)
+        held = self.get_persona(name)
+        if shipped is None or held is None or name in self._dynamic_personas:
+            return False
+        root = self._clone_store.root if self._clone_store is not None else None
+        return held.model_copy(
+            update={"a2a_peers": peer_handles(held.a2a_peers, root)}
+        ) == shipped.model_copy(update={"a2a_peers": peer_handles(shipped.a2a_peers, root)})
 
     def has_builtin(self, name: str) -> bool:
         """Whether the package ships a persona of this name, whether or not it is in force."""
         return name in self._builtin_names
 
-    def writable_dir(self) -> Path | None:
-        """The directory a head's writes go to: `<workspace>/.uclone/personas/`.
+    def package_dir(self) -> Path | None:
+        """The package's own personas directory, when this registry reads it."""
+        return self._package.directory if self._package is not None else None
 
-        It is the workspace directory `reload` reads, and the one whose files win over the
-        package's -- which is what makes a file written there an override of a built-in. A
-        registry with no workspace has nowhere to write.
-        """
-        if self._workspace_root is None:
+    def clone_record(self, name: str) -> CloneRecord | None:
+        """The clone directory behind the persona `name`, or None for one without."""
+        if name in self._dynamic_personas or self._clone_store is None:
             return None
-        return self._workspace_root / DEFAULT_WORKSPACE_PERSONAS_SUBDIR
+        return self._clone_store.record_of(name)
+
+    def display_name_of(self, name: str) -> dict[str, str]:
+        """The clone's display name per locale; empty when it has none."""
+        record = self.clone_record(name)
+        return dict(record.display_name) if record is not None else {}
+
+    def writable_dir(self) -> Path | None:
+        """The agents root a head's writes go to: one directory per clone beneath it.
+
+        None for a registry over a caller's own store, which has no clone directories.
+        """
+        if self._clone_store is None:
+            return None
+        return self._clone_store.root
 
     def save_persona(self, draft: PersonaDraft, *, create: bool) -> PersonaDefinition:
-        """Write a persona to the workspace directory and put it in force in this registry.
+        """Write a persona as a clone and put it in force in this registry.
 
-        Create never replaces an existing persona, and an edit never invents one. An edit
-        rewrites the file the persona was loaded from. For a built-in, that file is the
-        package's, so the edit becomes `<name>.yaml` in the workspace directory instead:
-        the loader already lets that file win, and the shipped one stays for the next
-        upgrade to replace.
+        Create never replaces an existing persona, and an edit never invents one. A create
+        makes the clone's directory in one step; an edit rewrites its `clone.yaml`, a
+        builtin's included, whose package file stays for the next upgrade to replace.
         """
         return self._store.save_persona(draft, create=create)
 
@@ -253,7 +302,7 @@ def get_default_persona_registry(
     inventory to a cached registry that has none. Without that second condition the
     validation `tool_names` buys is decided by call order rather than by configuration:
     whichever caller reaches the singleton first fixes it for the process, and the
-    unvalidated caller is the likelier one to arrive first -- `GET /api/personas` serves
+    unvalidated caller is the likelier one to arrive first -- `GET /api/clones` serves
     the dashboard on load, before any chat has created an agent. The check would then be
     configured, passing its own tests, and silently never run in the assembled product.
 

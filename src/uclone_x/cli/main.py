@@ -50,6 +50,7 @@ from uclone_x.cli.quality_gate import (
     snapshot_committed_tree,
 )
 from uclone_x.core.failure_journal import install_excepthook
+from uclone_x.core.logging_setup import log_to_file_not_terminal
 
 PRE_COMMIT_HOOK = """#!/usr/bin/env bash
 # UClone-X automated pre-commit quality gate
@@ -414,6 +415,22 @@ test_app = typer.Typer(
     help="Automated quality gates and test suites",
     no_args_is_help=True,
 )
+
+
+@app.callback()
+def keep_logs_off_the_terminal(ctx: typer.Context) -> None:
+    """Send log records to `ucx.log` for the whole command, not to the terminal (#1934).
+
+    `ucx` sets no log handler of its own, so a WARNING -- a session save that kept an
+    unreadable record aside, with the record's path and the parser's text -- reached
+    stderr through Python's last-resort handler. Every command now writes its records to
+    the log a notice points to; what a person reads is the command's own plain output.
+    Author's choice: one callback on the root app, so a command added later is covered
+    without asking for it, rather than one per command group (#1921 did `ucx key` alone).
+    """
+    ctx.with_resource(log_to_file_not_terminal())
+
+
 app.add_typer(agent_app, name="agent")
 app.add_typer(a2a_app, name="a2a")
 app.add_typer(acp_app, name="acp")
@@ -500,7 +517,9 @@ def setup() -> None:
 @app.command()
 @agent_app.command("run")
 def run(
-    agent_name: str = typer.Argument("default", help="Name of the agent or swarm to run"),
+    agent_name: str = typer.Argument(
+        DEFAULT_PERSONA_NAME, help="Name of the clone to run (default: the builtin clone)"
+    ),
     provider: str | None = typer.Option(
         None,
         "--provider",
@@ -685,12 +704,6 @@ def test_check(
     check_frontend: bool = typer.Option(
         False, "--check-frontend", "-fe", help="Run frontend TypeScript build check"
     ),
-    all_tests: bool = typer.Option(
-        False,
-        "--all",
-        "-a",
-        help="Deprecated: E2E is now included by default. Retained as a no-op synonym.",
-    ),
     fast: bool = typer.Option(
         False,
         "--fast",
@@ -720,15 +733,15 @@ def test_check(
     The pytest selection includes the E2E Playwright suite, planned per diff: all of it when
     the diff can change what the browser renders (`tests/scope-rules.toml`) or no full pass on
     main is fresh, else only the browser test files the diff changes. The plan and its reason
-    are printed before the run. `--fast` drops the suite; `--all` is a no-op synonym for the
-    default. One full gate runs at a time per machine; a second waits and says so.
+    are printed before the run. `--fast` drops the suite. One full gate runs at a time per
+    machine; a second waits and says so.
     """
     # Reported here rather than inside `run_quality_gate`: this is presentation, not a
     # verification step, and putting a git call inside the gate changed the subprocess
     # accounting its own tests assert on.
     for line in describe_installed_hook_drift():
         console.print(line)
-    # `--all` is a no-op synonym now that `gate` includes E2E; `--fast` drops it.
+    # `gate` includes E2E; `--fast` drops it.
     test_scope = "fast" if fast else "gate"
     # The tree is inspected before the run as well as after: a record claims the gate ran on
     # exactly this commit, and a tree that was dirty while the suite ran and clean afterwards

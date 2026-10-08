@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from pathlib import Path
 from typing import Any, cast
 
 import pytest
@@ -930,8 +931,8 @@ class TestAHeadRoomIsTheHeadsToDrive:
         )
 
     @pytest.mark.asyncio
-    async def test_an_unmarked_room_takes_a_post_as_before(self, built: Any) -> None:
-        """Old head rooms carry no mark and are served as they were (author's choice).
+    async def test_a_room_no_head_keeps_takes_a_post(self, built: Any) -> None:
+        """A room with no head mark is the app's, and takes a post.
 
         Killed by: src/uclone_x/room/orchestrator.py :: if head is not None:
         Becomes: if True:
@@ -984,7 +985,7 @@ class TestStoreContainment:
 
         # Still a containment refusal for anything treating that class as a boundary, and
         # now worded for the caller that asked about a room rather than a session.
-        assert "room id" in str(excinfo.value).lower()
+        assert "conversation identifier" in str(excinfo.value).lower()
 
     def test_save_advances_updated_at(self, tmp_path: Any) -> None:
         from uclone_x.room.store import RoomStore
@@ -1117,6 +1118,39 @@ class TestProvenanceReachesTheTranscript:
         assert reloaded is not None
         assert reloaded.transcript[-1].provenance is not None
         assert reloaded.transcript[-1].decision is not None
+
+
+class TestRoomWorkspaceReachesTheTurn:
+    @pytest.mark.asyncio
+    async def test_a_room_with_a_workspace_runs_its_turns_there(
+        self, built: Any, tmp_path: Path
+    ) -> None:
+        """The room's folder is what its seat's turn works in (clone-data-scopes §3.6).
+
+        Killed by: src/uclone_x/room/orchestrator.py :: workspace_root=Path(state.workspace) if state.workspace is not None else None,
+        Becomes: workspace_root=None,
+        """
+        store, _, agents = built
+        roots: list[Any] = []
+
+        class Recording(FakeAgent):
+            async def execute_turn(
+                self, prompt: str, *, stream_callback: Any = None, **kwargs: Any
+            ) -> Any:
+                from uclone_x.agent.models import TurnResult
+
+                roots.append(kwargs.get("workspace_root"))
+                return TurnResult(turn_index=1, content="answered", provenance=None)
+
+        agents["scout"] = Recording("scout", SCOUT.session_id)
+        state = store.load("r1")
+        assert state is not None
+        store.save(state.model_copy(update={"workspace": str(tmp_path)}))
+        orch = _orchestrator(built, [ScriptedSelector("s", [speak("scout")])])
+
+        await orch.post("r1", "alice", "hi")
+
+        assert roots == [tmp_path]
 
 
 class TestRenderedSpan:
@@ -1453,7 +1487,17 @@ class TestRosterChangesUnderTheLoop:
                 promoted = ALICE.model_copy(
                     update={"kind": ParticipantKind.AGENT, "session_id": "sess_room__r1__alice"}
                 )
-                store.save(state.model_copy(update={"participants": (promoted, SCOUT, CRITIC)}))
+                # A seated agent's row must carry a turn id or the room will not load, so
+                # the promotion stamps alice's rows too: what is under test is selection.
+                rows = tuple(
+                    m.model_copy(update={"turn_id": f"t{m.seq}"}) if m.sender_id == "alice" else m
+                    for m in state.transcript
+                )
+                store.save(
+                    state.model_copy(
+                        update={"participants": (promoted, SCOUT, CRITIC), "transcript": rows}
+                    )
+                )
                 return await super().select(request)
 
         orch = _orchestrator(built, [Promoting("promote", [speak("alice")])])
@@ -2021,16 +2065,6 @@ class TestTheSpanIsBounded:
         assert span_token_budget(state, Windowed(None)) == 8_000
         assert span_token_budget(state, object()) == 8_000
 
-    def test_a_policy_saved_with_the_retired_message_count_still_loads(self) -> None:
-        """`max_span_messages` is on disk in rooms saved before #1641; loading must not fail."""
-        from uclone_x.room.models import DEFAULT_MAX_SPAN_TOKENS
-
-        policy = RoomPolicy.model_validate({"max_span_messages": 40, "transcript_window": 20})
-
-        assert policy.max_span_tokens == DEFAULT_MAX_SPAN_TOKENS
-        assert policy.transcript_window == 20
-        assert "max_span_messages" not in policy.model_dump()
-
     @pytest.mark.asyncio
     async def test_a_short_span_is_untouched_and_unannotated(self, built: Any) -> None:
         _, _, agents = built
@@ -2073,16 +2107,6 @@ class TestANoteIsNotConversation:
         state = self._with_note(RoomState(room_id="r1"), "LOOP-STATUS")
 
         assert not RoomOrchestrator._interjected(state, 0)  # pyright: ignore[reportPrivateUsage]
-
-    def test_a_note_is_not_a_legacy_agent_turn(self) -> None:
-        """The dock counted a `system` note as an agent turn saved without a tool record."""
-        from uclone_x.ui.room_dock import (
-            _legacy_agent_turns,  # pyright: ignore[reportPrivateUsage]
-        )
-
-        state = self._with_note(RoomState(room_id="r1", participants=(ALICE,)), "LOOP-STATUS")
-
-        assert _legacy_agent_turns(state) == 0
 
     @pytest.mark.asyncio
     async def test_a_typed_command_is_a_note_no_seat_is_handed(self, built: Any) -> None:
@@ -2139,74 +2163,6 @@ class TestANoteIsNotConversation:
             await orch.accept_command("r1", "scout", "/loop list")
         with pytest.raises(UnknownRoomParticipantError):
             await orch.accept_command("r1", "nobody", "/loop list")
-
-    @staticmethod
-    def _legacy_room(*rows: tuple[str, str], seat: Participant | None = None) -> RoomState:
-        """A room holding `rows` as speech, the way builds before notes saved them."""
-        from uclone_x.room.models import RoomMessage
-
-        transcript = tuple(
-            RoomMessage(seq=i, sender_id=sender, content=content)
-            for i, (sender, content) in enumerate(rows, start=1)
-        )
-        roster = (ALICE, SCOUT) if seat is None else (ALICE, SCOUT, seat)
-        return RoomState(room_id="r1", participants=roster, transcript=transcript)
-
-    def test_a_room_saved_before_notes_reads_its_loop_rows_as_notes(self, tmp_path: Any) -> None:
-        """Rooms saved before #1641 kept `system` rows, and the command before them, as speech.
-
-        A `/loop` the person typed with no `system` row after it was never handled as a
-        command, and stays their message.
-
-        Killed by: src/uclone_x/room/models.py :: legacy_notice = row.is_utterance and is_notice(i)
-        Becomes: legacy_notice = False
-        Killed by: src/uclone_x/room/models.py :: and is_notice(i + 1)
-        Becomes: and True
-        Killed by: src/uclone_x/room/store.py :: return with_legacy_loop_rows_as_notes(state)
-        Becomes: return state
-        """
-        from uclone_x.room.models import RoomMessageKind
-        from uclone_x.room.store import RoomStore
-        from uclone_x.ui.room_dock import (
-            _legacy_agent_turns,  # pyright: ignore[reportPrivateUsage]
-        )
-
-        store = RoomStore(tmp_path)
-        store.save(
-            self._legacy_room(
-                ("alice", "/loop 30s check the build"),
-                ("system", "🔄 **Repeating task started** (every 30 seconds)"),
-                ("alice", "what does /loop do?"),
-                ("alice", "/loop list"),
-                ("alice", "hello"),
-                ("alice", "/loop"),
-            )
-        )
-
-        loaded = store.load("r1")
-        assert loaded is not None
-        assert [m.kind for m in loaded.transcript] == [
-            RoomMessageKind.NOTE,
-            RoomMessageKind.NOTE,
-            RoomMessageKind.UTTERANCE,
-            RoomMessageKind.UTTERANCE,
-            RoomMessageKind.UTTERANCE,
-            RoomMessageKind.UTTERANCE,
-        ]
-        assert _legacy_agent_turns(loaded) == 0
-
-    def test_a_room_that_seats_a_participant_called_system_is_left_alone(self) -> None:
-        """Only the `/loop` route wrote `system`; a seat of that name speaks for itself.
-
-        Killed by: src/uclone_x/room/models.py :: if any(p.id == _LOOP_NOTICE_SENDER for p in state.participants):
-        Becomes: if False:
-        """
-        from uclone_x.room.models import with_legacy_loop_rows_as_notes
-
-        seat = agent_participant("system")
-        state = self._legacy_room(("alice", "/loop list"), ("system", "a reply"), seat=seat)
-
-        assert with_legacy_loop_rows_as_notes(state) is state
 
     def test_a_row_kind_from_a_newer_build_loads_as_a_note(self) -> None:
         """A build that met an unknown kind refused the whole room (#1661, rollback).
@@ -2766,7 +2722,7 @@ class TestTheHeadCanFollowAlong:
 
             # A cascade the HTTP layer runs and announces the failure of: an address that
             # names nobody, refused by the chain before any turn is given.
-            def ignore_llm(_: object) -> None:
+            def ignore_models(_: object) -> None:
                 return None
 
             stack = RoomStack(
@@ -2776,7 +2732,7 @@ class TestTheHeadCanFollowAlong:
                         storage_dir=tmp_path / "stack",
                         workspace_dir=tmp_path / "workspace",
                         bus=bus,
-                        on_llm_replaced=ignore_llm,
+                        on_models_changed=ignore_models,
                     ),
                 )
             )
@@ -3827,7 +3783,7 @@ class TestARealAgentsFailuresInTheRoom:
 
         Killed by: src/uclone_x/room/models.py :: return RoomTurnRefusal.MODEL_UNAVAILABLE
         Becomes: return None
-        Killed by: src/uclone_x/room/orchestrator.py :: provider_failure = result.provider_failure
+        Killed by: src/uclone_x/room/orchestrator.py :: provider_failure = self._with_own_model(speaker.id, result.provider_failure)
         Becomes: provider_failure = None
         """
         from uclone_x.errors import ModelNotAvailableError
@@ -3941,6 +3897,10 @@ class TestARealAgentsFailuresInTheRoom:
             "message": "OpenAI did not accept the API key.",
             "retryable": False,
             "provider": "OpenAI",
+            # The clone follows the default model, so no own model is named (§3.6).
+            "clone": None,
+            "model_ref": None,
+            "action": None,
         }
 
     @pytest.mark.asyncio
@@ -4028,6 +3988,7 @@ def _execution(
     spawns_subagents: bool = False,
     status: Any = None,
     error: str | None = None,
+    artifacts: tuple[str, ...] = (),
 ) -> Any:
     from uclone_x.agent.models import ToolExecutionRecord
     from uclone_x.tools.models import ToolResultStatus
@@ -4042,6 +4003,7 @@ def _execution(
         tool_call_id=call_id,
         writes_files=writes_files,
         spawns_subagents=spawns_subagents,
+        artifacts=artifacts,
     )
 
 
@@ -4168,8 +4130,8 @@ class TestARoomTurnsToolsAreRecorded:
         A reading tool that names a path is not a write. The flag is the tool's own
         declaration (#1167), never the shape of its output.
 
-        Killed by: src/uclone_x/room/orchestrator.py :: if execution.writes_files and succeeded:
-        Becomes: if succeeded:
+        Killed by: src/uclone_x/agent/models.py :: if not self.writes_files or not isinstance(self.output, dict):
+        Becomes: if not isinstance(self.output, dict):
         """
         from uclone_x.room.store import RoomStore
 
@@ -4233,7 +4195,7 @@ class TestARoomTurnsToolsAreRecorded:
         Each one is a file the conversation wrote, attributed to the seat that asked, and
         a peer that named everything it wrote is not counted as a possible unnamed write.
 
-        Killed by: src/uclone_x/room/orchestrator.py :: candidates.extend(cast(Sequence[object], listed))
+        Killed by: src/uclone_x/agent/models.py :: candidates.extend(listed)
         Becomes: pass
         """
         _, _, agents = built
@@ -4586,7 +4548,7 @@ class TestAFailedSaveIsOnTheRow:
     ) -> None:
         """A failed attempt followed by one that landed, for the same fact, is a save.
 
-        Killed by: src/uclone_x/room/orchestrator.py :: if any(_agrees(key, done) for done in landed):
+        Killed by: src/uclone_x/room/orchestrator.py :: if has_identity and any(_agrees(key, done) for done in landed):
         Becomes: if False:
         """
         _, _, agents = built
@@ -4771,7 +4733,7 @@ class TestAFailedSaveIsOnTheRow:
 
         One word is not enough to leave a name out; only another participant sharing it is.
 
-        Killed by: src/uclone_x/room/orchestrator.py :: others = [p for p in state.participants if p.id != person.id]
+        Killed by: src/uclone_x/room/orchestrator.py :: others = [p for p in state.participants if p.id != participant.id]
         Becomes: others = list(state.participants)
         """
         store, _, agents = built
@@ -4809,8 +4771,8 @@ class TestAFailedSaveIsOnTheRow:
 
         Killed by: src/uclone_x/room/orchestrator.py :: if not (folded in other_names or folded in other_words):
         Becomes: if True:
-        Killed by: src/uclone_x/room/orchestrator.py :: for name in (person.id, person.display_name, *person.aliases):
-        Becomes: for name in (person.display_name, *person.aliases):
+        Killed by: src/uclone_x/room/orchestrator.py :: for name in (participant.id, participant.display_name, *participant.aliases):
+        Becomes: for name in (participant.display_name, *participant.aliases):
         """
         store, _, agents = built
         _cap(built, 1)
@@ -4927,8 +4889,8 @@ class TestAFailedSaveIsOnTheRow:
         So a seat called "José Silva" leaves the person's "José" out, however either is
         encoded.
 
-        Killed by: src/uclone_x/memory/models.py :: return " ".join(unicodedata.normalize("NFC", name).split()).casefold()
-        Becomes: return " ".join(name.split()).casefold()
+        Killed by: src/uclone_x/knowledge/fold.py :: return " ".join(unicodedata.normalize("NFC", text).split()).casefold()
+        Becomes: return " ".join(text.split()).casefold()
         """
         from uclone_x.room.orchestrator import (
             _person_names,  # pyright: ignore[reportPrivateUsage]
@@ -5018,8 +4980,9 @@ class TestAFailedSaveIsOnTheRow:
 
         Room r1 (Alice) is mid-turn when room r2 (Kim) runs a whole turn of the same
         clone. r1's model then saves a fact about "Kim", a colleague, a fact about
-        "Alice", and one about "Scout", r1's other seat. Only "Alice" is r1's person;
-        another room's person and an agent seat are never the person (#1857).
+        "Alice", and one about "Scout", the clone itself. Only "Alice" is r1's person;
+        another room's person and an agent seat are never the person (#1857), and the
+        clone's own name is `self` (#2016).
 
         Killed by: src/uclone_x/agent/turn_executor.py :: person_names=self._turn_person_names,
         Becomes: person_names=(),
@@ -5115,7 +5078,7 @@ class TestAFailedSaveIsOnTheRow:
         await first
 
         saved = {(f.subject, f.predicate) for f in memory.list_facts()}
-        assert saved == {("Kim", "role"), ("user", "colour"), ("Scout", "role")}
+        assert saved == {("Kim", "role"), ("user", "colour"), ("self", "role")}
 
 
 def _save_record(arguments: dict[str, Any], *, ok: bool) -> Any:
@@ -5160,7 +5123,9 @@ class TestMemorySaveOutcome:
         )
 
         records = [
-            _save_record({"subject": "user", "predicate": "colour"}, ok=False),
+            _save_record(
+                {"subject": "user", "predicate": "colour", "object_value": "teal"}, ok=False
+            ),
             _save_record({"predicate": "colour", "object_value": "teal"}, ok=False),
         ]
         assert _memory_save_outcome(records) == (1, 1)
@@ -5180,6 +5145,54 @@ class TestMemorySaveOutcome:
             _save_record({"subject": "user", "predicate": "city"}, ok=False),
         ]
         assert _memory_save_outcome(records) == (2, 1)
+
+    def test_a_failure_with_no_subject_and_no_predicate_is_never_resolved_by_a_success(
+        self,
+    ) -> None:
+        """Killed by: src/uclone_x/room/orchestrator.py :: has_identity = bool(key[0] or key[1])
+        Becomes: has_identity = True
+        """
+        from uclone_x.room.orchestrator import (
+            _memory_save_outcome,  # pyright: ignore[reportPrivateUsage]
+        )
+
+        records = [
+            _save_record({}, ok=False),
+            _save_record(
+                {"subject": "user", "predicate": "colour", "object_value": "teal"}, ok=True
+            ),
+        ]
+        assert _memory_save_outcome(records) == (2, 1)
+
+    def test_a_failure_with_a_different_object_value_from_the_success_stays_unsaved(
+        self,
+    ) -> None:
+        from uclone_x.room.orchestrator import (
+            _memory_save_outcome,  # pyright: ignore[reportPrivateUsage]
+        )
+
+        records = [
+            _save_record(
+                {"subject": "user", "predicate": "colour", "object_value": "teal"}, ok=True
+            ),
+            _save_record(
+                {"subject": "user", "predicate": "colour", "object_value": "blue"}, ok=False
+            ),
+        ]
+        assert _memory_save_outcome(records) == (2, 1)
+
+    def test_a_retry_supplying_a_missing_object_value_resolves_the_failure(self) -> None:
+        from uclone_x.room.orchestrator import (
+            _memory_save_outcome,  # pyright: ignore[reportPrivateUsage]
+        )
+
+        records = [
+            _save_record({"subject": "user", "predicate": "colour"}, ok=False),
+            _save_record(
+                {"subject": "user", "predicate": "colour", "object_value": "teal"}, ok=True
+            ),
+        ]
+        assert _memory_save_outcome(records) == (1, 0)
 
     def test_other_tools_are_not_counted(self) -> None:
         """Killed by: src/uclone_x/room/orchestrator.py :: saves = [e for e in executions if e.tool_name == MEMORY_SAVE_TOOL_NAME]
@@ -5239,3 +5252,187 @@ class TestAutonomousDiscussionMode:
         assert result.last_decision is not None
         assert result.last_decision.verdict is SelectionVerdict.SILENCE
         assert "circuit breaker" in result.last_decision.reasoning
+
+
+# --------------------------------------------------------------------------------------
+# What the image tool added to a picture's prompt is on the row, as tags (#1865)
+# --------------------------------------------------------------------------------------
+
+
+def _drawing_agent(participant: Participant, output: dict[str, Any]) -> Any:
+    """A real agent whose model calls a fake `generate_image` that answers `output`."""
+    from pydantic import BaseModel
+
+    from uclone_x.agent import BaseAgent
+    from uclone_x.agent.models import AgentConfig, AgentContext, AgentLLMConfig
+    from uclone_x.llm import MockLLMConnector
+    from uclone_x.llm.models import ToolCallRequest
+    from uclone_x.tools.base import BaseTool
+    from uclone_x.tools.models import ToolContext
+    from uclone_x.tools.registry import ToolRegistry
+
+    class _Params(BaseModel):
+        prompt: str = ""
+
+    class _Draw(BaseTool[_Params]):
+        name = "generate_image"
+        description = "draws"
+
+        def run(self, params: _Params, context: ToolContext) -> dict[str, Any]:
+            return output
+
+    tools = ToolRegistry()
+    tools.register(_Draw())
+    return BaseAgent(
+        config=AgentConfig(
+            agent_id=participant.id,
+            name=participant.id,
+            llm_config=AgentLLMConfig(model_name="mock-model"),
+        ),
+        llm=MockLLMConnector(
+            responses=["", "Here it is."],
+            tool_calls=[
+                ToolCallRequest(id="c1", name="generate_image", arguments={"prompt": "1girl"})
+            ],
+        ),
+        tools=tools,
+        context=AgentContext(session_id=participant.session_id, agent_id=participant.id),
+    )
+
+
+class TestWhatTheImageToolAddedIsOnTheRow:
+    @pytest.mark.asyncio
+    async def test_the_added_tags_of_every_picture_reach_the_row_once_each(
+        self, built: Any
+    ) -> None:
+        """A batch's pictures are read one by one; each tag is listed once, in order.
+
+        Killed by: src/uclone_x/room/orchestrator.py ::             image_prompt_added=image_prompt_added,
+        Becomes:             image_prompt_added=(),
+        Killed by: src/uclone_x/room/orchestrator.py :: pictures.extend(cast(list[object], images))
+        Becomes: pass
+        """
+        _, _, agents = built
+        _cap(built, 1)
+        agents["scout"] = _drawing_agent(
+            SCOUT,
+            {
+                "status": "success",
+                "prompt_changes": ["Added quality tags the prompt did not have: masterpiece."],
+                "images": [
+                    {"prompt_added": ["masterpiece", "newest"], "negative_added": ["blurry"]},
+                    {"prompt_added": ["masterpiece"], "negative_added": ["blurry", "text"]},
+                ],
+            },
+        )
+
+        state = await _orchestrator(built, [ScriptedSelector("s", [speak("scout")])]).post(
+            "r1", "alice", "draw two"
+        )
+
+        row = state.transcript[-1]
+        assert row.image_prompt_added == ("masterpiece", "newest")
+        assert row.image_negative_added == ("blurry", "text")
+        # The tool's sentences are written for the model; the row carries tags only.
+        assert "Added quality tags" not in row.model_dump_json()
+
+    @pytest.mark.asyncio
+    async def test_a_turn_that_drew_nothing_leaves_the_fields_off_the_saved_row(
+        self, built: Any
+    ) -> None:
+        store, _, _ = built
+        _cap(built, 1)
+        await _orchestrator(built, [ScriptedSelector("s", [speak("scout")])]).post(
+            "r1", "alice", "hello"
+        )
+
+        stored = store.load("r1")
+        assert stored is not None
+        old = stored.transcript[-1].model_dump(mode="json")
+        assert "image_prompt_added" not in old and "image_negative_added" not in old
+
+
+def test_only_a_successful_image_result_is_read() -> None:
+    """A failed draw, another tool's result, or a non-list value adds nothing.
+
+    Killed by: src/uclone_x/room/orchestrator.py ::         if execution.tool_name != IMAGE_TOOL_NAME or execution.status != ToolResultStatus.SUCCESS:
+    Becomes:         if execution.tool_name != IMAGE_TOOL_NAME:
+    """
+    from pydantic import JsonValue
+
+    from uclone_x.agent.models import ToolExecutionRecord
+    from uclone_x.room.orchestrator import image_prompt_additions
+    from uclone_x.tools.models import ToolResultStatus
+
+    added: JsonValue = {"prompt_added": ["masterpiece"], "negative_added": ["blurry"]}
+    executions = [
+        ToolExecutionRecord(
+            tool_name="generate_image", output=added, status=ToolResultStatus.ERROR
+        ),
+        ToolExecutionRecord(tool_name="file_read", output=added),
+        ToolExecutionRecord(tool_name="generate_image", output={"prompt_added": "masterpiece"}),
+        ToolExecutionRecord(tool_name="generate_image", output={"prompt_added": ["newest"]}),
+    ]
+
+    assert image_prompt_additions(executions) == (("newest",), ())
+
+
+def test_an_image_calls_pictures_are_written_files_named_by_their_links() -> None:
+    """The image result names each picture once, by the link a reply embeds (#2013), and the
+    tool declares those pictures as its artifacts; the room records them although the tool
+    declares no `writes_files` (#2079), which once dropped every picture (#2085).
+
+    Killed by: src/uclone_x/room/orchestrator.py :: named: list[str] = list(execution.produced_paths)
+    Becomes: named: list[str] = list(execution.produced_paths) if execution.writes_files else []
+    """
+    from uclone_x.room.models import Participant, ParticipantKind
+    from uclone_x.room.orchestrator import (
+        _record_tools,  # pyright: ignore[reportPrivateUsage]
+    )
+    from uclone_x.tools.base import artifact_content_url, linked_paths
+    from uclone_x.tools.builtin.image import GenerateImageTool
+
+    output = {
+        "status": "success",
+        "count": 2,
+        "prompt": "a cat",
+        "images": [
+            {"relative_url": artifact_content_url("images/cat 1.png"), "seed": 1},
+            {"relative_url": artifact_content_url("images/cat_2.png"), "seed": 2},
+            {"relative_url": "https://elsewhere.example/api/artifacts/content?path=x.png"},
+        ],
+    }
+    # As the real tool declares itself and its result (image.py's `execute`).
+    execution = _execution(
+        "generate_image",
+        "c1",
+        output=output,
+        writes_files=GenerateImageTool.writes_files,
+        artifacts=tuple(linked_paths(output)),
+    )
+    speaker = Participant(id="artist", kind=ParticipantKind.AGENT, display_name="Artist")
+    uses, written = _record_tools(speaker, "t1", [execution])
+    assert GenerateImageTool.writes_files is False
+    assert uses[0].written_paths == ("images/cat 1.png", "images/cat_2.png")
+    assert [f.path for f in written] == ["images/cat 1.png", "images/cat_2.png"]
+    assert uses[0].wrote_unnamed is False
+
+
+def test_tags_a_batch_says_once_at_its_top_are_read_as_every_pictures() -> None:
+    """A batch whose pictures share their added tags says them once, at the top (#2013).
+
+    Killed by: src/uclone_x/room/orchestrator.py :: pictures: list[object] = [output]
+    Becomes: pictures: list[object] = []
+    """
+    from uclone_x.agent.models import ToolExecutionRecord
+    from uclone_x.room.orchestrator import image_prompt_additions
+
+    batch = ToolExecutionRecord(
+        tool_name="generate_image",
+        output={
+            "prompt_added": ["masterpiece"],
+            "negative_added": ["blurry"],
+            "images": [{"relative_url": "/api/artifacts/content?path=a.png", "seed": 1}],
+        },
+    )
+    assert image_prompt_additions([batch]) == (("masterpiece",), ("blurry",))

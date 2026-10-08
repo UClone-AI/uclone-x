@@ -35,6 +35,8 @@ import {
   useWindowWidth,
 } from './lib/rail';
 import { readDeveloperMode, storeDeveloperMode } from './lib/developerMode';
+import type { ModelSet } from './lib/modelGateway';
+import { useBrowserLive } from './lib/browserLive';
 import { SettingsModal, type SettingsTabId } from './components/SettingsModal';
 import { ArtifactLibrary } from './components/artifacts/ArtifactLibrary';
 import { artifactLibraryApi } from './lib/artifactLibrary';
@@ -44,13 +46,14 @@ import {
   AvatarChoiceContext,
   avatarChangeIdsOf,
   avatarUrlsOf,
-  personaOfSeat,
   type AvatarChoice,
   type AvatarChangeIds,
   type AvatarUrls,
 } from './lib/avatarChoice';
 import { savePersona } from './lib/personasApi';
-import { useCopy } from './i18n';
+import { useCopy, useLocale } from './i18n';
+import { cloneIdOf, cloneLabel } from './lib/cloneLabel';
+import { withCloneNames } from './lib/cloneSeats';
 import type { PersonaDraft, PersonaEditMode, PersonaSaveResult } from './lib/personaDraft';
 import {
   DockSurface,
@@ -68,6 +71,7 @@ import {
 
 export function App() {
   const copy = useCopy();
+  const { language } = useLocale();
   const [personas, setPersonas] = useState<PersonaInfo[]>([]);
   /**
    * Clones available for room invites: the installed personas, the same list the rail shows
@@ -75,8 +79,8 @@ export function App() {
    * (2026-09-27, #1775).
    */
   const availableClones = useMemo<CloneChoice[]>(
-    () => personas.map((p) => ({ id: p.name, label: p.name })),
-    [personas],
+    () => personas.map((p) => ({ id: cloneIdOf(p), label: cloneLabel(p, language) })),
+    [personas, language],
   );
   const [cloneDockMode, setCloneDockMode] = useState<'view' | 'edit' | 'create'>('view');
   const [availableTools, setAvailableTools] = useState<string[]>([]);
@@ -107,8 +111,8 @@ export function App() {
    */
   const [agentModelOverrides, setAgentModelOverrides] = useState<Record<string, string>>({});
   /**
-   * Whether the runtime has a model configured — `/api/models`'s `current_model`, which
-   * is `settings["llm_model"]` and is `''` when nothing has been chosen.
+   * Whether the runtime has a model configured — `/api/models`'s `defaults.deep`, the
+   * default conversation model ref, which is `null` when nothing has been chosen.
    *
    * `null` until the first reply lands, so the rail does not accuse a healthy install of
    * having no model during startup. This used to be passed as `agents.length > 0`, which
@@ -196,6 +200,7 @@ export function App() {
   const [seatChoice, setSeatChoice] = useState<{ roomId: string; seatId: string } | null>(null);
   /** The file Docs fronts, set by any "Open in Docs" on the page (#1354). */
   const [selectedArtifactPath, setSelectedArtifactPath] = useState<string | null>(null);
+  const browserDockOpenedRoomsRef = useRef<Set<string>>(new Set());
   const openInDocs = useCallback((path: string) => {
     setSelectedArtifactPath(path);
     setActiveDockSurface('artifacts');
@@ -236,6 +241,40 @@ export function App() {
   const [currentRoomId, setCurrentRoomId] = useState<string | null>(null);
   const [room, setRoom] = useState<RoomState | null>(null);
   const [roomLive, setRoomLive] = useState<RoomLiveState>(EMPTY_LIVE);
+  // The open conversation's browser, live (browser-agent.md §3.4): the dock's Browser tab and
+  // the step lines under a turn read this one socket. The room's event stream cannot serve
+  // them: it publishes a turn's tool calls only once the turn has landed.
+  const browserLive = useBrowserLive(currentRoomId);
+  const showBrowser = useCallback(() => {
+    setActiveDockSurface('browser');
+    setIsDockOpen(true);
+  }, []);
+
+  // Auto-open Dock ▸ Browser tab on first browser action (§8 q3)
+  const hasBrowserActivity = Boolean(
+    browserLive.state?.acting ||
+      browserLive.steps.length > 0 ||
+      (browserLive.state?.tabs && browserLive.state.tabs.length > 0),
+  );
+  useEffect(() => {
+    if (
+      currentRoomId &&
+      hasBrowserActivity &&
+      !browserDockOpenedRoomsRef.current.has(currentRoomId)
+    ) {
+      browserDockOpenedRoomsRef.current.add(currentRoomId);
+      setActiveDockSurface('browser');
+      setIsDockOpen(true);
+    }
+  }, [currentRoomId, hasBrowserActivity]);
+
+  // A turn's live step lines last as long as the turn: once it lands, its recorded calls
+  // (`room.tool_uses`) draw the same lines from the record.
+  const { clearSteps: clearBrowserSteps } = browserLive;
+  const liveTurnId = roomLive.turn?.turnId ?? null;
+  useEffect(() => {
+    clearBrowserSteps();
+  }, [liveTurnId, clearBrowserSteps]);
   // Every room failure the user should see. `lib/rooms.ts` keeps the Core's own `detail` on
   // the error, and `roomFailureReason` shows that or, when the Core gave none, a plain
   // sentence of ours -- never the transport text or status line an error's `message` falls
@@ -334,6 +373,15 @@ export function App() {
    * With a second clone seated there is no single model the header could state, so the
    * picker is not offered and nothing here is keyed.
    */
+  /**
+   * The open conversation as it is drawn: each clone seat named by the listing's label and
+   * handle, since a seat is its clone's id (clone-data-scopes §4 step 3). Only for drawing;
+   * every comparison with the Core's record reads `room`.
+   */
+  const namedRoom = useMemo(
+    () => (room ? withCloneNames(room, personas, language) : room),
+    [room, personas, language],
+  );
   const seatedClones = (room?.participants ?? []).filter((p) => p.kind === 'agent');
   const seatedCloneId = seatedClones.length === 1 ? seatedClones[0].id : null;
 
@@ -478,7 +526,9 @@ export function App() {
     setRoomNotice(null);
     setRoomOpenError(null);
     setRoomContext(null);
-    setParticipantsNotReset([]);
+    if (roomId !== currentRoomIdRef.current) {
+      setParticipantsNotReset([]);
+    }
     const ticket = roomReadsRef.current.issue(roomId, generation);
     try {
       const next = await roomsApi.get(roomId);
@@ -868,9 +918,9 @@ export function App() {
       const [healthRes, personasRes, budgetRes, modelsRes] =
         await Promise.all([
           fetch('/api/health'),
-          fetch('/api/personas'),
+          fetch('/api/clones'),
           fetch('/api/budget'),
-          fetch('/api/models'),
+          fetch('/api/models?capability=chat'),
         ]);
 
       if (healthRes.ok) {
@@ -884,11 +934,11 @@ export function App() {
       let firstNamed: string | null = null;
       if (personasRes.ok) {
         const pData = await personasRes.json();
-        const loaded: PersonaInfo[] = pData.personas || [];
+        const loaded: PersonaInfo[] = pData.clones || [];
         setPersonas(loaded);
         if (pData.available_tools) setAvailableTools(pData.available_tools);
         if (pData.personas_dir !== undefined) setPersonasDir(pData.personas_dir);
-        if (loaded.length > 0) firstNamed = loaded[0].name;
+        if (loaded.length > 0) firstNamed = cloneIdOf(loaded[0]);
       }
       if (firstNamed !== null) {
         const named = firstNamed;
@@ -899,16 +949,14 @@ export function App() {
         setBudgetData(bData);
       }
       if (modelsRes.ok) {
-        const mData = await modelsRes.json();
-        setModelConfigured(Boolean(mData.current_model));
-        if (mData.models && Array.isArray(mData.models)) {
-          setAvailableModels(mData.models);
-        }
-        if (mData.current_model) {
-          setCurrentModel(mData.current_model);
-        } else if (mData.models && mData.models.length > 0) {
-          setCurrentModel(mData.models[0]);
-        }
+        // The model set (model-gateway.md §3.7.1): every connection's chat models as refs,
+        // and the default conversation model. No default is no model: nothing here picks
+        // the first listed one in its place.
+        const mData = (await modelsRes.json()) as Partial<ModelSet>;
+        const deep = mData.defaults?.deep ?? null;
+        setModelConfigured(Boolean(deep));
+        setAvailableModels((mData.groups ?? []).flatMap((g) => (g.models ?? []).map((m) => m.ref)));
+        setCurrentModel(deep ?? '');
       }
     } catch (err) {
       console.error('Failed to fetch UI metadata:', err);
@@ -999,7 +1047,7 @@ export function App() {
   // otherwise add the same request to a box that already holds it.
   useEffect(() => setInsertDraft(null), [currentRoomId]);
   const currentIsGroup = currentRoomId !== null && groupRoomIds.includes(currentRoomId);
-  const openCloneName = room && seatedCloneId && !currentIsGroup ? personaOfSeat(room, seatedCloneId) : null;
+  const openCloneName = room && seatedCloneId && !currentIsGroup ? seatedCloneId : null;
   /**
    * What every place that changes a clone's picture is handed.
    *
@@ -1010,7 +1058,7 @@ export function App() {
    */
   const avatarChoice = useMemo<AvatarChoice>(
     () => ({
-      clones: personas.map((p) => ({ name: p.name, label: p.name })),
+      clones: personas.map((p) => ({ name: cloneIdOf(p), label: cloneLabel(p, language) })),
       onChanged: () => void fetchAllMetadata(),
       latestChanges: avatarChangeIds,
       askFor: (name: string, askText: string) => {
@@ -1024,7 +1072,7 @@ export function App() {
       },
     }),
     // `closeOverlaidRail` is re-made every render and reads only `railIsOverlaid`.
-    [personas, avatarChangeIds, fetchAllMetadata, openCloneName, currentRoomId, handleNewRoom, railIsOverlaid],
+    [personas, language, avatarChangeIds, fetchAllMetadata, openCloneName, currentRoomId, handleNewRoom, railIsOverlaid],
   );
 
   useEffect(() => {
@@ -1043,7 +1091,7 @@ export function App() {
    * its first message renames (F1, the same path the rail's New takes).
    *
    * Both lists are waited for. Firing before `/api/rooms` answers would start a second
-   * conversation beside the one the server already has; firing before `/api/personas`
+   * conversation beside the one the server already has; firing before `/api/clones`
    * does would seat it with nobody, since `handleNewRoom` reads `selectedAgent`.
    *
    * The latch is a ref, not a "done once" flag: deleting the open conversation calls
@@ -1129,6 +1177,14 @@ export function App() {
             // dock shows of its memory may have changed. Both are re-read with the record.
             void refreshRoom(openRoomId);
           }
+          if (openRoomId && topic === `room.${openRoomId}.tool` && raw.payload) {
+            const toolName = (raw.payload as { name?: string; tool_name?: string }).name || (raw.payload as { name?: string; tool_name?: string }).tool_name;
+            if (toolName === 'browser' && !browserDockOpenedRoomsRef.current.has(openRoomId)) {
+              browserDockOpenedRoomsRef.current.add(openRoomId);
+              setActiveDockSurface('browser');
+              setIsDockOpen(true);
+            }
+          }
 
           if (raw.type === 'HEARTBEAT') {
             setLastHeartbeat(new Date().toLocaleTimeString());
@@ -1209,7 +1265,7 @@ export function App() {
       const result = await savePersona(draft, mode, copy.personaEditor);
       if (result.ok) {
         await fetchAllMetadata();
-        setSelectedAgent(result.persona.name);
+        setSelectedAgent(cloneIdOf(result.persona));
         setCloneDockMode('view');
       }
       return result;
@@ -1333,7 +1389,7 @@ export function App() {
 
           {room && currentRoomId ? (
             <RoomConversation
-              room={room}
+              room={namedRoom ?? room}
               onOpenSettings={() => openSettings('usage')}
               availableAgents={availableClones}
               live={roomLive}
@@ -1341,6 +1397,8 @@ export function App() {
               draft={draftsRef.current[currentRoomId] ?? ''}
               onDraftChange={(next) => rememberDraft(currentRoomId, next)}
               insertDraft={insertDraft?.roomId === currentRoomId ? insertDraft : null}
+              browserSteps={browserLive.steps}
+              onShowBrowser={showBrowser}
               avatarUrls={avatarUrls}
               onSend={async (content) => {
                 // Rethrown on purpose: the composer keeps the draft when this rejects.
@@ -1349,7 +1407,7 @@ export function App() {
                 // only moment "nothing has been said yet" is still true.
                 const seed = seededTitle(room, content);
                 const storedDespite = await deliverMessage(currentRoomId, content, lastSeq(room));
-                if (storedDespite !== null) {
+                if (storedDespite !== null && generation === roomGenerationRef.current) {
                   setRoomNotice(
                     `Your message is in this conversation. ${roomFailureReason(storedDespite)}`,
                   );
@@ -1360,9 +1418,11 @@ export function App() {
                   try {
                     await roomsApi.rename(currentRoomId, seed);
                   } catch (err) {
-                    setRoomNotice(
-                      `Your message was sent, but this conversation could not be named after it: ${roomFailureReason(err)}`,
-                    );
+                    if (generation === roomGenerationRef.current) {
+                      setRoomNotice(
+                        `Your message was sent, but this conversation could not be named after it: ${roomFailureReason(err)}`,
+                      );
+                    }
                   }
                 }
                 // Every send, not only the first: the message moved this conversation's
@@ -1440,9 +1500,27 @@ export function App() {
                     setRoomNotice(`Could not update autonomous discussion: ${roomFailureReason(err)}`),
                   );
               }}
+              onSetWorkspace={async (workspace) => {
+                // A refusal is the header's to say, in place; it rejects through to it.
+                const generation = roomGenerationRef.current;
+                const placed = await roomsApi.setWorkspace(currentRoomId, workspace);
+                if (
+                  roomResponseIsStale(generation, roomGenerationRef.current, currentRoomId, currentRoomIdRef.current)
+                ) {
+                  return;
+                }
+                // The current generation, or the guard above would have returned.
+                roomGenerationRef.current += 1;
+                setRoom((prev) =>
+                  prev && prev.room_id === currentRoomId
+                    ? { ...prev, workspace: placed.workspace, default_workspace: placed.default_workspace }
+                    : prev,
+                );
+              }}
               // `why ›` on a turn. The dock is opened, not merely switched: a control
               // that changed a hidden panel's surface and left the screen unchanged is the
               // invisible selection `handleSelectAgent` was written to stop doing.
+              onClonesChanged={() => void fetchAllMetadata()}
               onOpenTurn={(seq) => {
                 setSelectedTurnSeq(seq);
                 setActiveDockSurface('turn');
@@ -1497,7 +1575,7 @@ export function App() {
             ontology={ontology}
             budgetData={budgetData}
             // The conversation on screen, not the retired single-agent history (#1272).
-            room={room}
+            room={namedRoom}
             roomContext={roomContext}
             selectedTurnSeq={selectedTurnSeq}
             isPaused={isPaused}
@@ -1517,13 +1595,14 @@ export function App() {
             cloneMode={cloneDockMode}
             onCloneModeChange={setCloneDockMode}
             availableTools={availableTools}
-            availableModels={availableModels}
             canWritePersonas={personasDir !== null}
             onSavePersona={handleSavePersona}
             cloneStudio={cloneStudio}
             onCloneStudioChange={setCloneStudioRequested}
             onRefresh={fetchAllMetadata}
             isRefreshing={isRefreshing}
+            browserLive={browserLive}
+            onConnectBrowser={() => openSettings('browser')}
           />
         )}
 

@@ -27,6 +27,7 @@ from uclone_x.agent.base import BaseAgent
 from uclone_x.agent.models import AgentConfig, AgentLLMConfig
 from uclone_x.llm.connectors.mock import MockLLMConnector
 from uclone_x.llm.models import LLMRequest, ModelResponse
+from uclone_x.story.character import StoryCharacterSheetTool as CharacterSheetTool
 from uclone_x.story.context import MAX_ENTRIES, CodexIndex, CodexItem, last_and_next
 from uclone_x.story.library import StoryError, StoryLibrary
 from uclone_x.story.schemas import CharacterEntry, Outline
@@ -38,7 +39,6 @@ from uclone_x.story.tools import (
     StoryOutlineTool,
 )
 from uclone_x.tools.base import BaseTool
-from uclone_x.tools.builtin.character import CharacterSheetTool
 from uclone_x.tools.models import NoIsolation, ToolContext, ToolResult
 from uclone_x.tools.registry import create_default_registry
 
@@ -151,7 +151,8 @@ class TestANewConversationContinuesFromTheRecap:
             "characters",
             {"id": "vane", "name": "Lord Vane", "profile": "Holds the ferry."},
         )
-        first = "Mara stepped onto the ferry. " * 80 + "The river went black behind her."
+        first = " ".join(f"Mara counted plank {n} of the ferry." for n in range(80))
+        first += " The river went black behind her."
         await _ok(
             StoryManuscriptTool(),
             ctx,
@@ -441,7 +442,7 @@ class TestAFileThatDoesNotFit:
         Killed by: src/uclone_x/story/work.py :: if name.suffix != ".yaml":
         Becomes: if False:
 
-        Killed by: src/uclone_x/story/work.py :: for relative in self._library.folders_in(self._story_id, folder):
+        Killed by: src/uclone_x/story/work.py :: for relative in folders:
         Becomes: for relative in []:
 
         Killed by: src/uclone_x/story/work.py :: if PurePosixPath(relative).name in CODEX_KINDS:
@@ -487,7 +488,7 @@ class TestAFileThatDoesNotFit:
         """An editor's backup is not told to become `mara.yaml.yaml`, nor to replace the
         entry it is a copy of (#1595).
 
-        Killed by: src/uclone_x/story/work.py :: if base.suffix in (".yaml", ".yml"):
+        Killed by: src/uclone_x/story/work.py :: if match is not None:
         Becomes: if False:
 
         Killed by: src/uclone_x/story/library.py :: and entry.name.lower() not in _SYSTEM_FILES
@@ -505,15 +506,17 @@ class TestAFileThatDoesNotFit:
 
         assert [e["id"] for e in out["entries"]] == ["mara"]
         ending = "codex entries are read only from files ending in '.yaml'."
+        fallback = (
+            "If it is an entry, give it an unused name ending in '.yaml' using only lowercase "
+            "letters, digits, and hyphens (up to 80 characters)."
+        )
         assert {u["file"]: u["reason"] for u in out["unreadable_files"]} == {
             "codex/characters/mara.yaml~": f"'codex/characters/mara.yaml~' was not read: "
-            f"{ending} If it is an entry, give it a name ending in '.yaml' that no other "
-            "file in 'codex/characters/' has, even with different capitals.",
+            f"{ending} {fallback}",
             "codex/places/dock.yaml.bak": f"'codex/places/dock.yaml.bak' was not read: "
             f"{ending} If it is an entry, rename it to 'dock.yaml'.",
             "codex/items/Old Map.txt": f"'codex/items/Old Map.txt' was not read: {ending} "
-            "If it is an entry, give it a name ending in '.yaml' that no other file in "
-            "'codex/items/' has, even with different capitals.",
+            f"{fallback}",
         }
 
     async def test_a_rename_never_targets_a_name_taken_in_other_capitals_or_by_a_twin(
@@ -545,20 +548,92 @@ class TestAFileThatDoesNotFit:
 
         reasons = {u["file"]: u["reason"] for u in out["unreadable_files"]}
         ending = "codex entries are read only from files ending in '.yaml'."
-        no_name = "If it is an entry, give it a name ending in '.yaml' that no other file in "
+        no_name = (
+            "If it is an entry, give it an unused name ending in '.yaml' using only lowercase "
+            "letters, digits, and hyphens (up to 80 characters)."
+        )
         assert reasons["codex/characters/mara.yml"] == (
             f"'codex/characters/mara.yml' was not read: {ending} {no_name}"
-            "'codex/characters/' has, even with different capitals."
         )
         for twin in ("codex/places/bo.yml", "codex/places/bo.yaml~"):
-            assert reasons[twin] == (
-                f"'{twin}' was not read: {ending} {no_name}'codex/places/' has, even with "
-                "different capitals."
-            )
+            assert reasons[twin] == f"'{twin}' was not read: {ending} {no_name}"
         # A file differing only in capitals is not in its own way.
         assert reasons["codex/items/map.YAML"] == (
             f"'codex/items/map.YAML' was not read: {ending} If it is an entry, rename it to "
             "'map.yaml'."
+        )
+
+    async def test_icon_file_is_excluded_from_story_library_files_in(self, tmp_path: Path) -> None:
+        """Killed by: src/uclone_x/story/library.py :: _SYSTEM_FILES = frozenset({"thumbs.db", "ehthumbs.db", "desktop.ini", "icon\r"})
+        Becomes: _SYSTEM_FILES = frozenset({"thumbs.db", "ehthumbs.db", "desktop.ini"})
+        """
+        story_id = await _new_story(tmp_path)
+        library = StoryLibrary(tmp_path)
+        _put(tmp_path, story_id, "codex/characters/Icon\r", "")
+        _put(tmp_path, story_id, "codex/characters/Thumbs.db", "")
+        _put(tmp_path, story_id, "codex/characters/mara.yaml", "id: mara\nname: Mara\n")
+
+        files = library.files_in(story_id, "codex/characters")
+        assert files == ["codex/characters/mara.yaml"]
+
+    async def test_a_backup_with_multiple_extensions_suggests_yaml_not_nested(
+        self, tmp_path: Path
+    ) -> None:
+        story_id = await _new_story(tmp_path)
+        _put(tmp_path, story_id, "codex/characters/mara.yaml.bak.1", "id: mara\nname: Mara\n")
+
+        out = await _ok(StoryCodexTool(), _ctx(tmp_path, story=story_id), action="search")
+
+        [problem] = out["unreadable_files"]
+        assert problem["file"] == "codex/characters/mara.yaml.bak.1"
+        assert problem["reason"] == (
+            "'codex/characters/mara.yaml.bak.1' was not read: "
+            "codex entries are read only from files ending in '.yaml'. "
+            "If it is an entry, rename it to 'mara.yaml'."
+        )
+
+    async def test_a_name_over_eighty_characters_does_not_suggest_a_rename(
+        self, tmp_path: Path
+    ) -> None:
+        """Killed by: src/uclone_x/story/work.py :: if len(base_str) > 80:
+        Becomes: if False:
+        """
+        story_id = await _new_story(tmp_path)
+        long_id = "a" * 81
+        _put(tmp_path, story_id, f"codex/characters/{long_id}.txt", "id: long\n")
+
+        out = await _ok(StoryCodexTool(), _ctx(tmp_path, story=story_id), action="search")
+
+        [problem] = out["unreadable_files"]
+        assert problem["file"] == f"codex/characters/{long_id}.txt"
+        assert problem["reason"] == (
+            f"'codex/characters/{long_id}.txt' was not read: "
+            "codex entries are read only from files ending in '.yaml'. "
+            "If it is an entry, give it an unused name ending in '.yaml' using only lowercase "
+            "letters, digits, and hyphens (up to 80 characters)."
+        )
+
+    async def test_an_existing_folder_named_target_prevents_suggesting_rename(
+        self, tmp_path: Path
+    ) -> None:
+        """Killed by: src/uclone_x/story/work.py :: _rename_advice(relative, files + folders)
+        Becomes: _rename_advice(relative, files)
+        """
+        story_id = await _new_story(tmp_path)
+        folder = tmp_path / "stories" / story_id / "codex/characters/mara.yaml"
+        folder.mkdir(parents=True, exist_ok=True)
+        _put(tmp_path, story_id, "codex/characters/mara.yml", "id: mara\nname: Mara\n")
+
+        out = await _ok(StoryCodexTool(), _ctx(tmp_path, story=story_id), action="search")
+
+        reasons = {u["file"]: u["reason"] for u in out["unreadable_files"]}
+        ending = "codex entries are read only from files ending in '.yaml'."
+        fallback = (
+            "If it is an entry, give it an unused name ending in '.yaml' using only lowercase "
+            "letters, digits, and hyphens (up to 80 characters)."
+        )
+        assert reasons["codex/characters/mara.yml"] == (
+            f"'codex/characters/mara.yml' was not read: {ending} {fallback}"
         )
 
     async def test_a_recap_over_a_broken_sessions_file_says_so_and_goes_on(
@@ -869,7 +944,7 @@ class TestAWriteSaysWhatTheStoryChangedBefore:
         first = await self._write(tmp_path, "ch02.s04", "예린이 웃으며 라온의 어깨를 두드렸다.")
         again = await _ok(
             StoryManuscriptTool(), self._moon_seal(tmp_path), action="write",
-            scene_id="ch02.s04", text="라온은 죽은 예린을 떠올렸다.", digest=first["digest"],
+            scene_id="ch02.s04", text="예린이 라온의 검을 바로잡았다.", digest=first["digest"],
         )  # fmt: skip
 
         assert again["continuity"]
@@ -892,6 +967,446 @@ class TestAWriteSaysWhatTheStoryChangedBefore:
         )  # fmt: skip
 
         assert "고쳐 다시 쓰세요" in again["continuity_note"]
+
+
+class TestAMemoryOfTheDeadIsNotTold:
+    """A sentence that only remembers the dead is the story's own, not a slip (#1808).
+
+    The moon-seal story again: 예린 is dead since ch01.s03, and ch02.s04 comes after.
+    """
+
+    FIXTURE = Path(__file__).resolve().parents[1] / "fixtures" / "writer"
+
+    async def _write(self, workspace: Path, text: str) -> dict[str, Any]:
+        shutil.copytree(self.FIXTURE, workspace, dirs_exist_ok=True)
+        return await _ok(
+            StoryManuscriptTool(),
+            _ctx(workspace, conversation="writer-eval-room", story="moon-seal"),
+            action="write",
+            scene_id="ch02.s04",
+            text=text,
+        )
+
+    async def test_a_sentence_remembering_the_dead_is_not_told(self, tmp_path: Path) -> None:
+        """Killed by: src/uclone_x/story/context.py :: _RECALL.search(sentence)
+        Becomes: False
+        """
+        out = await self._write(tmp_path, "라온은 스승 예린을 떠올렸다. 바람이 차가웠다.")
+
+        assert out["digest"]
+        assert "continuity" not in out and "continuity_note" not in out
+
+    async def test_a_sentence_where_the_dead_act_is_told(self, tmp_path: Path) -> None:
+        """Killed by: src/uclone_x/story/context.py :: if quoted is None:
+        Becomes: if quoted is not None:
+        """
+        out = await self._write(tmp_path, "예린이 라온의 검을 바로잡았다.")
+
+        [line] = out["continuity"]
+        assert '"예린이 라온의 검을 바로잡았다."' in line
+
+    async def test_in_mixed_text_only_the_acting_sentence_is_quoted(self, tmp_path: Path) -> None:
+        """Killed by: src/uclone_x/story/context.py :: if passed_over and not found:
+        Becomes: if passed_over:
+        """
+        out = await self._write(
+            tmp_path, "라온은 예린을 기억했다. 그때 예린이 라온의 어깨를 두드렸다."
+        )
+
+        [line] = out["continuity"]
+        assert '"그때 예린이 라온의 어깨를 두드렸다."' in line
+        assert "기억했다" not in line
+
+
+class TestASentenceThatSaysTheChangeIsNotTold:
+    """A sentence that says the dead are dead, the lost is lost, or that the act did not
+    happen keeps the scene true to the change, so it is not quoted as a slip (#1808).
+
+    The sentences are from a qwen3:8b Writer run on the moon-seal story, where 예린 is dead
+    since ch01.s03 and 월광검 lost at ch02.s01, both before ch02.s04.
+    """
+
+    async def _write(self, workspace: Path, text: str) -> dict[str, Any]:
+        shutil.copytree(TestAMemoryOfTheDeadIsNotTold.FIXTURE, workspace, dirs_exist_ok=True)
+        return await _ok(
+            StoryManuscriptTool(),
+            _ctx(workspace, conversation="writer-eval-room", story="moon-seal"),
+            action="write",
+            scene_id="ch02.s04",
+            text=text,
+        )
+
+    async def test_the_dead_said_to_be_gone_is_not_told_and_an_act_still_is(
+        self, tmp_path: Path
+    ) -> None:
+        """Killed by: src/uclone_x/story/context.py :: 떠났|떠난
+        Becomes: 떠난
+        """
+        out = await self._write(
+            tmp_path,
+            '도윤이 모닥불 앞에서 조용히 말했다. "예린이 떠났을 때, 그의 검을 지키려고 했어."\n'
+            "예린이 칼을 들고 라온에게 다가왔다.",
+        )
+
+        [line] = out["continuity"]
+        assert '"예린이 칼을 들고 라온에게 다가왔다."' in line
+        assert "떠났을" not in line
+
+    async def test_departure_and_loss_stated_together_are_not_told(self, tmp_path: Path) -> None:
+        """Killed by: src/uclone_x/story/context.py :: or _STATED_OR_DENIED.search(sentence)
+        Becomes: or False
+        """
+        out = await self._write(
+            tmp_path,
+            "그는 라온의 자세를 바라보며, 그녀가 스승 예린의 교훈을 잊지 않았다는 걸 느낀다. "
+            "그러나 예린은 이미 영원히 떠났고, 월광검도 카엘에게 빼앗겼다.",
+        )
+
+        assert out["digest"]
+        assert "continuity" not in out and "continuity_note" not in out
+
+    async def test_the_lost_sword_said_to_be_taken_is_not_told(self, tmp_path: Path) -> None:
+        """Killed by: src/uclone_x/story/context.py :: 잃은|빼앗겼|
+        Becomes: 잃은|
+        """
+        for workspace, text in (
+            (tmp_path / "run", "하지만 이제 그는 죽었고, 월광검도 빼앗겼다."),
+            (tmp_path / "taken", "월광검은 카엘에게 빼앗겼다."),
+        ):
+            out = await self._write(workspace, text)
+
+            assert "continuity" not in out and "continuity_note" not in out, text
+
+    async def test_a_use_of_the_lost_sword_negated_is_not_told(self, tmp_path: Path) -> None:
+        """A word between the name and the negated verb is ordinary narration (#1808).
+
+        Killed by: src/uclone_x/story/context.py :: 않았|지
+        Becomes: 않았음|지
+        """
+        for name, text in (
+            ("drawn", "라온은 허리에 손을 얹었지만, 월광검을 뽑아내지 않았다."),
+            ("sheathed", "월광검은 끝내 칼집에서 나오지 않았다."),
+            ("never", "라온은 월광검을 다시는 뽑지 않았다."),
+            ("unseen", "라온은 예린을 다시 보지 않았다."),
+        ):
+            out = await self._write(tmp_path / name, text)
+
+            assert "continuity" not in out and "continuity_note" not in out, text
+
+    async def test_a_use_refused_or_replaced_is_not_told(self, tmp_path: Path) -> None:
+        r"""Two sentences the 417602e6 re-measure quoted that keep the sword lost (#1808).
+
+        Killed by: src/uclone_x/story/context.py :: 꺼내)\S*지\s*않|아닌)
+        Becomes: 꺼내)\S*지\s*않았|아닌)
+        Killed by: src/uclone_x/story/context.py :: 않|아닌)"
+        Becomes: 않)"
+        Killed by: src/uclone_x/story/context.py :: or (lost and _use_denied(
+        Becomes: or (False and _use_denied(
+        """
+        for workspace, text in (
+            (
+                tmp_path / "refused",
+                "라온은 월광검을 뽑지 않고, 몸으로 안개를 뚫으며 자세를 잡는다.",
+            ),
+            (tmp_path / "replaced", "라온은 허리에 월광검이 아닌 칼을 차고 있었다."),
+            (tmp_path / "used_not", "라온은 월광검을 쓰지 않고 맨손으로 싸웠다."),
+            (tmp_path / "drawn_not", "라온은 월광검을 꺼내지 않고 주먹을 쥐었다."),
+            (tmp_path / "held_not", "라온은 월광검을 잡지 않고 등을 돌렸다."),
+            (tmp_path / "applied_not", "라온은 월광검을 사용하지 않고 피했다."),
+        ):
+            out = await self._write(workspace, text)
+
+            assert "continuity" not in out and "continuity_note" not in out, text
+
+    async def test_a_use_after_a_negation_that_is_not_its_own_is_told(self, tmp_path: Path) -> None:
+        r"""A "~지 않고" is also "without ~ing": only a negation right after the name excuses
+        a use, and these three are slips (#1808).
+
+        Killed by: src/uclone_x/story/context.py :: r"|지\s*않았|지\s*않는|지\s*못"
+        Becomes: r"|지\s*않|지\s*못|아닌"
+        """
+        for name, text in (
+            ("hesitate", "라온은 주저하지 않고 월광검을 뽑아 들었다."),
+            ("stop", "라온은 멈추지 않고 월광검을 휘둘렀다."),
+            ("dream", "꿈이 아닌 듯, 라온은 월광검을 쥐었다."),
+        ):
+            out = await self._write(tmp_path / name, text)
+
+            [line] = out["continuity"]
+            assert f'"{text}"' in line, text
+
+    async def test_a_negation_after_the_lost_sword_that_is_not_its_use_is_told(
+        self, tmp_path: Path
+    ) -> None:
+        r"""Only the sword's own use verbs, negated, excuse it: hesitating is not one (#1808).
+
+        Killed by: src/uclone_x/story/context.py :: (?:(?:뽑|쥐|휘두르|들|차|겨누|베|끼|착용하|챙기|쓰|사용하|잡|꺼내)\S*지
+        Becomes: (?:\S*지
+        """
+        text = "라온은 월광검을 주저하지 않고 뽑았다."
+        out = await self._write(tmp_path, text)
+
+        [line] = out["continuity"]
+        assert f'"{text}"' in line
+
+    async def test_a_negation_after_the_dead_is_an_act_and_is_told(self, tmp_path: Path) -> None:
+        r"""A refused use excuses only a lost item: the dead doing anything is the slip (#1808).
+
+        Killed by: src/uclone_x/story/context.py :: or (lost and _use_denied(
+        Becomes: or (_use_denied(
+        Killed by: src/uclone_x/story/context.py :: |꿈에"
+        Becomes: |꿈에|잊지\s*(?:않|못)"
+        """
+        for name, text in (
+            ("hesitate", "예린은 주저하지 않고 칼을 들었다."),
+            ("sheathe", "예린은 휘두르지 않고 검을 거두었다."),
+            ("remember", "예린은 잊지 않고 매일 라온을 찾아왔다."),
+        ):
+            out = await self._write(tmp_path / name, text)
+
+            [line] = out["continuity"]
+            assert f'"{text}"' in line, text
+
+    async def test_english_that_says_the_dead_died_is_not_told(self, tmp_path: Path) -> None:
+        """Killed by: src/uclone_x/story/context.py :: (?:died|
+        Becomes: (?:
+        """
+        out = await self._write(
+            tmp_path, "예린 died at the gate. Raon did not draw 월광검. 예린 smiled at Raon."
+        )
+
+        [line] = out["continuity"]
+        assert '"예린 smiled at Raon."' in line
+        assert "died" not in line
+
+
+class TestAWriteRefusesWhatASmallModelLeavesInProse:
+    """Four faults are refused at write time, in plain words, with nothing written (#1808)."""
+
+    async def _refused(self, workspace: Path, text: str) -> str:
+        story_id = await _new_story(workspace)
+        ctx = await _outlined(workspace, story_id)
+        result = await _call(
+            StoryManuscriptTool(), ctx, action="write", scene_id="ch01.s01", text=text
+        )
+        assert not result.success
+        assert result.error is not None
+        assert not list((workspace / "stories" / story_id).rglob("ch01.s01.md"))
+        for internal in ("Error", "Traceback", "regex", "pattern", "_", "\\", "[가-힣]"):
+            assert internal not in result.error, internal
+        return result.error
+
+    async def _saved(self, workspace: Path, text: str) -> None:
+        story_id = await _new_story(workspace)
+        ctx = await _outlined(workspace, story_id)
+        await _ok(StoryManuscriptTool(), ctx, action="write", scene_id="ch01.s01", text=text)
+
+    async def test_a_chinese_character_stuck_in_a_korean_word_is_refused(
+        self, tmp_path: Path
+    ) -> None:
+        """Killed by: src/uclone_x/story/prose.py :: glued = _glued(text, _GLUED_HAN)
+        Becomes: glued = []
+        Killed by: src/uclone_x/story/tools.py :: raise StoryError(refused)
+        Becomes: pass
+        """
+        error = await self._refused(
+            tmp_path, "불씨가 꺼지고 잔烬만 남았다. 그는 둔钝한 칼을 들었다."
+        )
+
+        assert error == (
+            '"잔烬만", "둔钝한": 한글 낱말 안에 한자가 붙어 있습니다. 한글로 고치거나, 한자를 '
+            "꼭 쓰려면 한자(漢字)처럼 괄호 안에 쓰세요. 장면은 저장되지 않았습니다. 고친 글로 "
+            "다시 저장하세요."
+        )
+
+    async def test_latin_glued_to_a_korean_word_is_refused_in_plain_words(
+        self, tmp_path: Path
+    ) -> None:
+        """Two words of the 417602e6 re-measure (#1808).
+
+        Killed by: src/uclone_x/story/prose.py :: latin = _glued(text, _GLUED_LATIN)
+        Becomes: latin = []
+        """
+        error = await self._refused(
+            tmp_path, "라온은 왼blick 손을 들었다. 그는 왼linkplain 쪽으로 걸었다."
+        )
+
+        assert error == (
+            '"왼blick", "왼linkplain": 한글 낱말 안에 영문이 붙어 있습니다. 한글로 고치거나, '
+            "영문을 꼭 쓰려면 띄어 쓰세요. 장면은 저장되지 않았습니다. 고친 글로 다시 저장하세요."
+        )
+
+    async def test_a_foreign_name_before_a_particle_or_two_letters_is_saved(
+        self, tmp_path: Path
+    ) -> None:
+        """Killed by: src/uclone_x/story/prose.py :: [a-z]{3,}
+        Becomes: [a-zA-Z]{2,}
+        """
+        await self._saved(
+            tmp_path, "그는 AI를 믿지 않았다. 한국vs일본 경기가 열렸다. 도윤은 웃었다."
+        )
+
+    async def test_hanja_in_brackets_or_before_a_particle_is_saved(self, tmp_path: Path) -> None:
+        """Killed by: src/uclone_x/story/prose.py :: for raw in _BRACKETED.sub(" ", text).split():
+        Becomes: for raw in text.split():
+        Killed by: src/uclone_x/story/prose.py :: _GLUED_HAN = re.compile(r"[가-힣]
+        Becomes: _GLUED_HAN = re.compile(r"[㐀-䶿一-鿿][가-힣]|[가-힣]
+        """
+        await self._saved(
+            tmp_path, "그는 검(劍)을 들었다. 사람들은 그 불을 (잔烬이라) 불렀다. 韓國은 멀었다."
+        )
+
+    async def test_the_same_sentence_four_times_is_refused(self, tmp_path: Path) -> None:
+        """Killed by: src/uclone_x/story/prose.py :: _SAME_SENTENCE = 4
+        Becomes: _SAME_SENTENCE = 99
+        """
+        loop = "그는 문을 열고 다시 밖으로 나갔다. "
+        text = (
+            "비가 그치고 새벽이 왔다. " + loop * 2 + "마당에는 아무도 없었다. " + loop * 2
+            + "등불이 하나씩 꺼져 갔다. 멀리서 종소리가 울렸다."
+        )  # fmt: skip
+
+        error = await self._refused(tmp_path, text)
+
+        assert error.startswith(
+            '"그는 문을 열고 다시 밖으로 나갔다." 같은 문장이 되풀이됩니다(이 문장만 4번).'
+        )
+        assert error.endswith("장면은 저장되지 않았습니다. 고친 글로 다시 저장하세요.")
+
+    async def test_a_few_sentences_said_over_and_over_are_refused(self, tmp_path: Path) -> None:
+        """Killed by: src/uclone_x/story/prose.py :: len(times) / len(counted) < _DISTINCT_SHARE
+        Becomes: len(times) / len(counted) < 0
+        """
+        text = " ".join(
+            ["The wind came down the hill.", "She waited by the gate.", "Nobody came for her."] * 3
+        )
+
+        error = await self._refused(tmp_path, text)
+
+        assert '"The wind came down the hill." 3 times' in error
+        assert error.endswith("The scene was not saved. Save it again once it is fixed.")
+
+    async def test_a_refrain_said_three_times_is_saved(self, tmp_path: Path) -> None:
+        """Killed by: src/uclone_x/story/prose.py :: _SAME_SENTENCE = 4
+        Becomes: _SAME_SENTENCE = 3
+        """
+        refrain = "달은 아직 지지 않았다.\n"
+        await self._saved(
+            tmp_path,
+            refrain + "라온은 성벽을 따라 걸었다.\n" + refrain + "도윤이 뒤에서 불렀다.\n"
+            + refrain + "둘은 말없이 동쪽을 보았다.",
+        )  # fmt: skip
+
+    async def test_short_lines_repeated_in_dialogue_are_saved(self, tmp_path: Path) -> None:
+        """Killed by: src/uclone_x/story/prose.py :: _MIN_COUNTED = 8
+        Becomes: _MIN_COUNTED = 1
+        """
+        await self._saved(
+            tmp_path,
+            '"갈 거야?" "응." "정말?" "응." "혼자서?" "응." "그래." "응." 라온은 문을 닫았다.',
+        )
+
+    async def test_a_note_in_brackets_after_the_story_is_refused(self, tmp_path: Path) -> None:
+        """Killed by: src/uclone_x/story/prose.py :: if len(lines) < 2 or not _whole_note(lines[-1]):
+        Becomes: if True:
+        """
+        note = "(이 장면은 라온의 상실감을 강조하기 위해 짧게 썼습니다.)"
+        error = await self._refused(tmp_path, f"라온은 빈 칼집을 쥐었다.\n\n{note}")
+
+        assert error == (
+            f'장면이 이야기 뒤에 괄호로 된 메모로 끝납니다: "{note}". 글에 대한 설명이라면 '
+            "빼고, 하고 싶은 말은 답장에 쓰세요. 장면은 저장되지 않았습니다. 고친 글로 다시 "
+            "저장하세요."
+        )
+
+    async def test_a_scripts_stage_directions_and_a_short_close_are_saved(
+        self, tmp_path: Path
+    ) -> None:
+        """Killed by: src/uclone_x/story/prose.py :: if any(_whole_note(line) for line in lines[:-1]):
+        Becomes: if False:
+        Killed by: src/uclone_x/story/prose.py :: _MIN_NOTE = 20
+        Becomes: _MIN_NOTE = 0
+        """
+        await self._saved(
+            tmp_path,
+            "(무대 왼쪽, 불 꺼진 성벽 위에 라온이 홀로 서 있다.)\n라온: 스승님.\n"
+            "(도윤이 등불을 들고 천천히 오른쪽에서 걸어 들어온다.)",
+        )
+        await self._saved(tmp_path / "second", "라온은 등불을 껐다.\n\n(암전)")
+
+
+class TestTheCodexTakesANameForAnId:
+    """'entry_id' takes the name or an alias the prose uses, as well as the id (#1808)."""
+
+    FIXTURE = Path(__file__).resolve().parents[1] / "fixtures" / "writer"
+
+    def _moon_seal(self, workspace: Path) -> ToolContext:
+        shutil.copytree(self.FIXTURE, workspace, dirs_exist_ok=True)
+        return _ctx(workspace, conversation="writer-eval-room", story="moon-seal")
+
+    async def _propose(self, ctx: ToolContext, entry_id: str) -> ToolResult:
+        return await _call(
+            StoryCodexTool(), ctx, action="propose", entry_id=entry_id, at="ch02.s01",
+            set={"wounded": True}, quote="도윤의 화살이 날아갔을 때",
+        )  # fmt: skip
+
+    async def test_a_proposal_by_name_is_made_for_the_entry_of_that_name(
+        self, tmp_path: Path
+    ) -> None:
+        """Killed by: src/uclone_x/story/tools.py :: named = _named_entries(work.codex(), entry_id, kind, done="nothing was proposed")
+        Becomes: raise StoryError("nothing was proposed")
+        """
+        result = await self._propose(self._moon_seal(tmp_path), "도윤")
+
+        assert result.success, result.error
+        assert isinstance(result.output, dict)
+        path = result.output["path"]
+        assert isinstance(path, str)
+        saved = (tmp_path / path).read_text(encoding="utf-8")
+        assert "doyun" in saved
+
+    async def test_a_name_two_entries_share_is_refused_with_both(self, tmp_path: Path) -> None:
+        """Killed by: src/uclone_x/story/tools.py :: if len({(item.kind, item.entry.id) for item in named}) > 1:
+        Becomes: if False:
+        """
+        ctx = self._moon_seal(tmp_path)
+        _codex(
+            tmp_path, "moon-seal", "characters",
+            {"id": "doyun_elder", "name": "도윤 할아버지", "aliases": ["도윤"]},
+        )  # fmt: skip
+
+        result = await self._propose(ctx, "도윤")
+
+        assert result.error == (
+            "'도윤' names more than one entry: 'doyun' (도윤), 'doyun_elder' (도윤 할아버지). "
+            "Say which, by its id in 'entry_id', so nothing was proposed."
+        )
+        assert not (tmp_path / "stories" / "moon-seal" / "proposals").exists()
+
+    async def test_a_name_no_entry_has_is_refused_with_the_entries_there_are(
+        self, tmp_path: Path
+    ) -> None:
+        """Killed by: src/uclone_x/story/tools.py :: hint = f" Its entries are: {_candidates(listed)}." if listed else " It has no entries yet."
+        Becomes: hint = ""
+        """
+        result = await _call(
+            StoryCodexTool(), self._moon_seal(tmp_path), action="get", entry_id="세린",
+            kind="characters",
+        )  # fmt: skip
+
+        assert result.error == (
+            "The story's characters has no entry called '세린', so nothing was read. Its "
+            "entries are: 'doyun' (도윤), 'kael' (카엘), 'raon' (라온), 'yerin' (예린)."
+        )
+
+    async def test_get_by_name_reads_the_entry(self, tmp_path: Path) -> None:
+        """Killed by: src/uclone_x/story/names.py :: for name in (item.entry.id, item.entry.name, *item.entry.aliases)
+        Becomes: for name in (item.entry.id,)
+        """
+        out = await _ok(StoryCodexTool(), self._moon_seal(tmp_path), action="get", entry_id="카엘")
+
+        [entry] = out["entries"]
+        assert entry["id"] == "kael"
 
 
 class TestForSceneNamesWhatTheRequestAsksThatTheStoryEnded:
@@ -1473,7 +1988,7 @@ class TestCharacterSheetOverAStory:
     async def test_save_proposes_the_change_instead_of_writing_a_sheet(
         self, tmp_path: Path
     ) -> None:
-        """Killed by: src/uclone_x/tools/builtin/character.py :: return _propose_visual(params, context)
+        """Killed by: src/uclone_x/story/character.py :: return _propose_visual(params, context)
         Becomes: raise PlainRefusalError("no")
         """
         story_id = await _new_story(tmp_path)
@@ -1496,7 +2011,7 @@ class TestCharacterSheetOverAStory:
         assert not (tmp_path / "characters").exists()
 
     async def test_get_and_compose_read_the_codex_visual_block(self, tmp_path: Path) -> None:
-        """Killed by: src/uclone_x/tools/builtin/character.py :: "danbooru_tags": ", ".join(visual.tags) if visual else "",
+        """Killed by: src/uclone_x/story/character.py :: "danbooru_tags": ", ".join(visual.tags) if visual else "",
         Becomes: "danbooru_tags": "",
         """
         story_id = await _new_story(tmp_path)

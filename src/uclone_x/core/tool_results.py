@@ -7,18 +7,19 @@ A tool result is normalised once, where it enters the history, and never again:
   round-trips through `json.loads` and is byte-identical on every run. Before this the
   history held `str(output)` -- a Python `repr`, which is not JSON, quotes with `'`, and
   depends on dict insertion order.
-* **The cap.** A result above `TOOL_RESULT_CAP_BYTES` is stored in full in the session's
-  artifact directory, and the history holds an *excerpt*: a header line naming a handle,
-  the start of the result, a marker for the part not shown, and its end. The excerpt is
-  decided here, once, and is the same every time the history is rendered.
-* **Reading it back.** `read_tool_result_page` returns a window of a stored result that
+* **The cap.** A result above `TOOL_RESULT_CAP_BYTES` is kept in full as a body of the
+  session's own log (`ResultBodies`), and the history holds an *excerpt*: a header line
+  naming a handle, the start of the result, a marker for the part not shown, and its end.
+  The excerpt is rendered from that body, here, once, and is the same every time the
+  history is rendered.
+* **Reading it back.** `read_tool_result_page` returns a window of a kept body that
   itself fits under the cap, so a page is never shortened again on its way in.
 
 The handle is content-addressed -- `tr_` and the first 16 hex digits of the SHA-256 of the
-stored text -- so storing the same result twice writes one file, and the handle names what
-it stores rather than when it was stored. It resolves only inside the reader's own
-session directory. The blob is `<artifacts_dir>/<session_id>/<handle>.txt`, the directory
-`cleanup_session_artifacts` removes when a session is deleted or reset.
+redacted text -- so keeping the same result twice keeps one body, and the handle names
+what it keeps rather than when. It is the first 16 hex digits of the body's name in the
+session's context body store too, so it resolves only among the session's own log
+entries: one store for every body a session holds, removed with the session (#1848).
 """
 
 from __future__ import annotations
@@ -29,23 +30,20 @@ import enum
 import hashlib
 import json
 import logging
-import os
 import re
-import tempfile
-from collections.abc import Sequence
-from pathlib import Path, PurePath
-from typing import Final, cast
+from collections.abc import Mapping, Sequence
+from pathlib import PurePath
+from typing import Final, Literal, Protocol, cast, runtime_checkable
 
 from pydantic import BaseModel
 
 from uclone_x.core.immutable import unwrap_immutable
 from uclone_x.core.secrets import redact_credentials
-from uclone_x.errors import PathTraversalError
+from uclone_x.errors import PlainRefusalError
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
-    "ARTIFACT_SUBDIR",
     "EXCERPT_NOTE",
     "STEP_EXCERPT_MIN_BYTES",
     "STEP_NO_ROOM_MESSAGE",
@@ -53,27 +51,29 @@ __all__ = [
     "STEP_NO_ROOM_SETUP_MESSAGE",
     "STEP_NO_ROOM_SETUP_REPLY_MESSAGE",
     "STEP_OVER_WINDOW_MESSAGE",
+    "STEP_REFUSAL_TEXT",
     "STEP_REPLY_RESERVE_TOKENS",
     "STORED_RESULT_PREFIX",
     "STUB_NOTE",
     "TOOL_RESULT_CAP_BYTES",
     "TOOL_RESULT_CAP_TOKENS",
     "TOOL_RESULT_READ_TOOL",
+    "UNAVAILABLE_RESULT_MESSAGE",
     "UNSTORED_EXCERPT_PREFIX",
+    "ResultBodies",
+    "StepRefusalCode",
     "StoredResultNotFoundError",
-    "artifacts_dir_for",
     "canonical_tool_text",
-    "contained_artifacts_dir",
     "excerpt_tool_result",
     "handle_in",
+    "ingest_tool_result",
     "ingest_tool_text",
-    "load_tool_result",
+    "is_result_handle",
+    "load_stored_result",
     "read_tool_result_page",
     "result_handle",
-    "store_tool_result",
     "step_result_caps",
     "stored_result_stub",
-    "stub_tool_result",
 ]
 
 TOOL_RESULT_CAP_TOKENS: Final = 2_000
@@ -98,9 +98,10 @@ TOOL_RESULT_READ_TOOL: Final = "tool_result_read"
 STORED_RESULT_PREFIX: Final = "[Stored tool result "
 """How every excerpt, page and stub this module writes begins.
 
-Recognising the prefix alone is never enough to drop text: `stub_tool_result` is applied
-only when the handle it names resolves to a stored blob, so text a tool happened to
-begin with these words is never mistaken for something that can be read back.
+The prefix is never what makes text droppable: compaction shrinks a result to a stub only
+when the message records the kept result it was cut from (`ChatMessage.rendered_from`, #1848),
+so text a tool happened to begin with these words is never mistaken for something that can be
+read back.
 """
 
 UNSTORED_EXCERPT_PREFIX: Final = "[Tool result shortened: "
@@ -175,8 +176,8 @@ STEP_NO_ROOM_SETUP_MESSAGE: Final = (
 Shortening the conversation cannot help here: without any of it, the request still leaves
 no room for the reply. So it neither promises that the next message can carry on, as
 `STEP_NO_ROOM_MESSAGE` does, nor asks the person to shorten the conversation, as
-`STEP_NO_ROOM_NO_COMPACTION_MESSAGE` does. English only: the refusals in core have no
-translation hook yet (#1862).
+`STEP_NO_ROOM_NO_COMPACTION_MESSAGE` does. A head that writes in the person's language
+says it from its catalog by the refusal's code (`StepRefusalCode`, #1862).
 """
 
 STEP_NO_ROOM_SETUP_REPLY_MESSAGE: Final = (
@@ -190,8 +191,33 @@ STEP_NO_ROOM_SETUP_REPLY_MESSAGE: Final = (
 The agent sets a reply length (`max_tokens`) above the default reserve, and the system
 turn and the tool schemas leave room for a reply of the default size. So lowering the
 reply length is a second fix besides a larger model, and the refusal names both. Plain
-words and English only, like the other refusals in core (#1862).
+words, like the other step refusals, and translated by code like them (#1862).
 """
+
+StepRefusalCode = Literal[
+    "step.over_window",
+    "step.no_room",
+    "step.no_room_no_compaction",
+    "step.no_room_setup",
+    "step.no_room_setup_reply",
+]
+"""Why a turn refused a step, as a key a head translates (#1862).
+
+A turn that refuses a step carries this beside its sentence (`TurnResult.error_code`), so a
+head writing in Korean says the refusal from its own catalog instead of printing Core's
+English. Closed: every code has a sentence in `STEP_REFUSAL_TEXT` and in each language's
+`refusals` catalog, which `tests/unit/test_refusal_i18n.py` holds to.
+"""
+
+STEP_REFUSAL_TEXT: Final[Mapping[StepRefusalCode, str]] = {
+    "step.over_window": STEP_OVER_WINDOW_MESSAGE,
+    "step.no_room": STEP_NO_ROOM_MESSAGE,
+    "step.no_room_no_compaction": STEP_NO_ROOM_NO_COMPACTION_MESSAGE,
+    "step.no_room_setup": STEP_NO_ROOM_SETUP_MESSAGE,
+    "step.no_room_setup_reply": STEP_NO_ROOM_SETUP_REPLY_MESSAGE,
+}
+"""Each step refusal's sentence in English: `TurnResult.error`, and what a head without a
+catalog for the person's language shows."""
 
 STEP_REPLY_RESERVE_TOKENS: Final = 1_024
 """Room kept for the reply when the agent sets no `max_tokens` (#1509).
@@ -204,35 +230,14 @@ choice, and this keeps room for a few paragraphs or a round of tool calls.
 """
 
 _HANDLE_RE: Final = re.compile(r"tr_[0-9a-f]{16}")
-_FORBIDDEN_IN_SESSION_ID: Final = ("..", "/", "\\", "\x00")
 
 
-ARTIFACT_SUBDIR: Final = ".sandbox/tool_artifacts"
-"""Where a workspace keeps tool artifacts: the directory `SessionStore` reaps and cleans."""
+class StoredResultNotFoundError(PlainRefusalError, LookupError):
+    """A handle that does not name a stored result in this session. The message is plain.
 
-
-def artifacts_dir_for(workspace_root: Path) -> Path:
-    """The artifact directory of `workspace_root`."""
-    return workspace_root / ARTIFACT_SUBDIR
-
-
-def contained_artifacts_dir(workspace_root: Path) -> Path:
-    """The artifact directory of `workspace_root`, resolved and held inside it (P3).
-
-    `store_tool_result` and `load_tool_result` keep a blob inside the artifact directory;
-    this keeps that directory inside the workspace, so a `.sandbox` symlinked out of it
-    cannot move the whole store (#1653).
-
-    Raises:
-        PathTraversalError: the artifact directory resolves outside `workspace_root`.
+    A `PlainRefusalError`, so `tool_result_read` fails with exactly this sentence rather
+    than with the class name and a prefix around it (#1848).
     """
-    from uclone_x.sandbox.path_validator import PathValidator
-
-    return PathValidator().resolve_safe_path(artifacts_dir_for(workspace_root), workspace_root)
-
-
-class StoredResultNotFoundError(LookupError):
-    """A handle that does not name a stored result in this session. The message is plain."""
 
 
 def _json_default(value: object) -> object:
@@ -296,94 +301,57 @@ def handle_in(content: str | None) -> str | None:
     return match.group(0) if match else None
 
 
-def _session_dir(artifacts_dir: Path, session_id: str) -> Path:
-    """The session's artifact directory, contained lexically.
+UNAVAILABLE_RESULT_MESSAGE: Final = (
+    "That stored result is no longer available. Run the tool again to see its output."
+)
+"""What reading a handle this conversation no longer holds says (#1848).
 
-    A session id with no separator, no `..` and no NUL is one path component, and a
-    handle matches `tr_[0-9a-f]{16}`, so `<artifacts_dir>/<session_id>/<handle>.txt`
-    cannot name anything outside `artifacts_dir` by its characters. A planted symlink can
-    still point the directory elsewhere; `store_tool_result` resolves before it writes.
+A handle from before tool results were kept in the session, a conversation that was
+cleared, or a mistyped name: none of them can be read, and the remedy is the same. It
+names no file, error code or store, since the model and the person see it as it is.
+"""
+
+
+@runtime_checkable
+class ResultBodies(Protocol):
+    """A session's full tool-result bodies, kept as entries of its own log (#1848).
+
+    `keep` logs `text` as an entry whose body is the whole redacted text and returns its
+    handle; `read` returns the body a handle names in this session, or `None`. The one
+    implementation is the live session's (`agent/session_lifecycle.py`); this module only
+    renders what it keeps.
     """
-    if (
-        not session_id
-        or session_id in (".", "..")
-        or any(bad in session_id for bad in _FORBIDDEN_IN_SESSION_ID)
-    ):
-        raise ValueError(f"session id {session_id!r} cannot name a directory")
-    return artifacts_dir / session_id
+
+    def keep(self, text: str, *, tool_name: str | None) -> str:
+        """Keep `text` in full under the session and return its handle."""
+        ...
+
+    def read(self, handle: str) -> str | None:
+        """The body `handle` names in this session, or `None` when it holds none."""
+        ...
 
 
-def _blob_path(artifacts_dir: Path, session_id: str, handle: str) -> Path:
-    if not _HANDLE_RE.fullmatch(handle):
+def is_result_handle(handle: str) -> bool:
+    """Whether `handle` has the form of a stored result's handle."""
+    return _HANDLE_RE.fullmatch(handle) is not None
+
+
+def load_stored_result(bodies: ResultBodies | None, handle: str) -> str:
+    """The full body `handle` names in this session, or a plain refusal.
+
+    Raises:
+        StoredResultNotFoundError: `handle` is not a handle's form, or the session holds
+            no body under it. The message is plain words only.
+    """
+    if not is_result_handle(handle):
         raise StoredResultNotFoundError(
             f"'{handle}' is not a stored tool result name. Names look like "
             "tr_ followed by 16 letters and digits, as shown in the shortened result."
         )
-    return _session_dir(artifacts_dir, session_id) / f"{handle}.txt"
-
-
-def store_tool_result(artifacts_dir: Path, session_id: str, body: str) -> str:
-    """Store `body` in full under the session and return its handle.
-
-    Credentials are redacted before the body is hashed or written, so neither the file
-    nor the handle derives from a secret (#569). The write is atomic -- a temporary file
-    and `os.replace` -- and skipped when the blob exists, since the name is its content.
-
-    Raises:
-        PathTraversalError: the session directory or the blob resolves outside
-            `artifacts_dir`, as through a planted symlink (P3). Nothing is written.
-    """
-    # The session id and handle are single path components, but a symlink can still move
-    # the directory or the blob out of the store. The one workspace containment guard
-    # resolves the path and refuses it then.
-    from uclone_x.sandbox.path_validator import PathValidator
-
-    redacted = redact_credentials(body)
-    handle = result_handle(redacted)
-    path = PathValidator().resolve_safe_path(
-        _blob_path(artifacts_dir, session_id, handle), artifacts_dir
-    )
-    if path.is_file():
-        return handle
-    path.parent.mkdir(parents=True, exist_ok=True)
-    # `mkstemp` names the temporary file at random and opens it with `O_CREAT|O_EXCL`
-    # (and `O_NOFOLLOW` where the platform has it), so a symlink planted at a name the
-    # writer would use is refused rather than written through (#1653). A PID-derived name
-    # was predictable, and `write_text` followed a link at it.
-    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as tmp:
-            tmp.write(redacted)
-        os.replace(tmp_name, path)
-    except BaseException:
-        Path(tmp_name).unlink(missing_ok=True)
-        raise
-    return handle
-
-
-def load_tool_result(artifacts_dir: Path, session_id: str, handle: str) -> str:
-    """The full stored body `handle` names in this session, or a plain refusal.
-
-    The blob is resolved before it is read, as `store_tool_result` resolves it before it
-    writes: a session directory or blob that is a symlink out of `artifacts_dir` is
-    treated as absent, and the escape is logged (#1653, P3).
-    """
-    from uclone_x.sandbox.path_validator import PathValidator
-
-    not_found = StoredResultNotFoundError(
-        f"No stored tool result named '{handle}' exists in this conversation. It may "
-        "have been cleared with the conversation, or the name was mistyped."
-    )
-    blob = _blob_path(artifacts_dir, session_id, handle)
-    try:
-        path = PathValidator().resolve_safe_path(blob, artifacts_dir)
-    except PathTraversalError as exc:
-        logger.warning("Refused to read a stored tool result outside the store: %s", exc)
-        raise not_found from None
-    try:
-        return path.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        raise not_found from None
+    body = bodies.read(handle) if bodies is not None else None
+    if body is None:
+        raise StoredResultNotFoundError(UNAVAILABLE_RESULT_MESSAGE)
+    return body
 
 
 def _head_within(text: str, max_bytes: int) -> str:
@@ -448,63 +416,64 @@ def excerpt_tool_result(
 def ingest_tool_text(
     text: str,
     *,
-    artifacts_dir: Path | None,
-    session_id: str,
+    bodies: ResultBodies | None,
+    tool_name: str | None = None,
     readable: bool = True,
     cap_bytes: int = TOOL_RESULT_CAP_BYTES,
-    workspace_root: Path | None = None,
 ) -> str:
     """`text` as the history should hold it: unchanged under the cap, else an excerpt.
 
-    With no `artifacts_dir`, or when the write fails, the full text has nowhere to go:
-    the excerpt says so in band and the failure is logged, rather than the turn failing
-    over a result the tool did produce. With `workspace_root`, the artifact directory
-    must also resolve inside it, the check the compactor makes (#1653); one that does
-    not is a failed write like any other.
+    Over the cap, the whole redacted text is kept in the session (`bodies.keep`) and the
+    excerpt is rendered from that same body, so what the model sees and what
+    `tool_result_read` returns are one text. With no `bodies` -- nothing holds this
+    session -- the full text has nowhere to go: the excerpt says so in band and it is
+    logged, rather than the turn failing over a result the tool did produce.
+    """
+    return ingest_tool_result(
+        text, bodies=bodies, tool_name=tool_name, readable=readable, cap_bytes=cap_bytes
+    )[0]
+
+
+def ingest_tool_result(
+    text: str,
+    *,
+    bodies: ResultBodies | None,
+    tool_name: str | None = None,
+    readable: bool = True,
+    cap_bytes: int = TOOL_RESULT_CAP_BYTES,
+) -> tuple[str, str | None]:
+    """`ingest_tool_text`, with the handle the full text was kept under (#1974).
+
+    The handle is `bodies.keep`'s own, so a caller recording the form never reads it back
+    out of the excerpt's text. `None` when the text fits the cap, or when no `bodies`
+    holds it and the excerpt says the rest cannot be read.
     """
     if _fits(text, cap_bytes):
-        return text
-    handle: str | None = None
+        return text, None
     body = redact_credentials(text)
-    if artifacts_dir is not None:
-        try:
-            if workspace_root is not None:
-                from uclone_x.sandbox.path_validator import PathValidator
-
-                artifacts_dir = PathValidator().resolve_safe_path(artifacts_dir, workspace_root)
-            handle = store_tool_result(artifacts_dir, session_id, text)
-        except (OSError, ValueError, PathTraversalError) as exc:
-            logger.warning(
-                "Could not store an over-cap tool result for session %r; the history "
-                "keeps an excerpt only: %s",
-                session_id,
-                exc,
-            )
+    handle: str | None = None
+    if bodies is not None:
+        handle = bodies.keep(body, tool_name=tool_name)
     else:
-        logger.warning(
-            "No artifact directory for session %r; an over-cap tool result is kept as an "
-            "excerpt only",
-            session_id,
-        )
-    return excerpt_tool_result(body, handle, cap_bytes=cap_bytes, readable=readable)
+        logger.warning("No session holds an over-cap tool result; it is kept as an excerpt only")
+    return excerpt_tool_result(body, handle, cap_bytes=cap_bytes, readable=readable), handle
 
 
 def read_tool_result_page(
-    artifacts_dir: Path,
-    session_id: str,
+    bodies: ResultBodies | None,
     handle: str,
     offset: int = 0,
     length: int | None = None,
     *,
     cap_bytes: int = TOOL_RESULT_CAP_BYTES,
 ) -> str:
-    """One window of a stored result, starting at character `offset`, that fits the cap.
+    """One window of a kept result, starting at character `offset`, that fits the cap.
 
     `length` asks for at most that many characters; the window is shorter when the cap
     requires it, and the header says exactly which characters it holds and where the
     next window starts, so paging needs no arithmetic from the reader.
     """
-    body = load_tool_result(artifacts_dir, session_id, handle)
+    body = load_stored_result(bodies, handle)
     total = len(body)
     if offset < 0:
         raise ValueError(f"The offset must be 0 or more; {offset} was given.")
@@ -542,30 +511,6 @@ def stored_result_stub(handle: str, body: str, *, keep_chars: int, readable: boo
         where = "It was kept, but this agent has no tool to read it.]"
     header = f"{STORED_RESULT_PREFIX}{handle}: {len(body):,} characters, {STUB_NOTE}. {where}"
     return f"{header}\n{body[: max(keep_chars, 0)]}"
-
-
-def stub_tool_result(
-    content: str,
-    artifacts_dir: Path,
-    session_id: str,
-    *,
-    keep_chars: int,
-    readable: bool = True,
-) -> str | None:
-    """The smaller form compaction gives an excerpt or a page, or `None` to leave it be.
-
-    `None` unless `content` names a handle whose blob exists in this session: the stub
-    drops text, and text may be dropped only when it can still be read back. The form is
-    `stored_result_stub`'s.
-    """
-    handle = handle_in(content)
-    if handle is None:
-        return None
-    try:
-        body = load_tool_result(artifacts_dir, session_id, handle)
-    except (StoredResultNotFoundError, ValueError):
-        return None
-    return stored_result_stub(handle, body, keep_chars=keep_chars, readable=readable)
 
 
 def step_result_caps(
