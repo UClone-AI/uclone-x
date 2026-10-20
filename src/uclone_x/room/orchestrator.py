@@ -27,6 +27,7 @@ from uclone_x.agent.models import ProviderFailure, ToolExecutionRecord
 from uclone_x.agent.protocols import BaseAgentProtocol
 from uclone_x.agent.session import SessionState
 from uclone_x.core.immutable import unwrap_immutable
+from uclone_x.core.tool_results import StepRefusalCode
 from uclone_x.engine.event_bus import AgentEvent, EventSource, EventType
 from uclone_x.engine.protocols import EventBusProtocol, PublisherHandleProtocol
 from uclone_x.errors import (
@@ -51,6 +52,7 @@ from uclone_x.memory.extractor import (
     SpanLine,
 )
 from uclone_x.memory.models import fold_name
+from uclone_x.ontology.protocols import OntologyEngineProtocol
 from uclone_x.room.models import (
     SPAN_WINDOW_SHARE,
     Participant,
@@ -218,7 +220,9 @@ def _record_tools(
     * a call that reached a tool declaring `writes_files` and did not both succeed and name
       a path -- a shell that wrote and then exited non-zero or timed out, a tool that raised
       partway. Failing does not undo a write. A call that never reached the tool (unknown or
-      refused) carries `writes_files=False` and is not counted;
+      refused) carries `writes_files=False` and is not counted, and neither is one whose
+      output names no file and says `unnamed_writes: false` -- a peer that stopped before
+      any of its tools ran gives that account of itself (#2229);
     * any call to a tool declaring `spawns_subagents`, whatever its status. The helper runs
       with the seat's own tools and its calls never reach this turn's record, and a helper
       that failed may have written first. Its writes are counted, not propagated: the
@@ -249,6 +253,9 @@ def _record_tools(
         child = mapping.get("subagent_id")
         if execution.spawns_subagents and succeeded and isinstance(child, str) and child:
             subagent_id = child
+        # A writing call that names nothing and says it wrote nothing it did not name -- a
+        # peer that stopped before running a tool -- wrote nothing (#2229).
+        says_none = mapping.get("unnamed_writes") is False and not mapping.get("paths")
         arguments, cut_arguments = _preview(unwrap_immutable(execution.arguments))
         result, cut_result = _preview(output)
         uses.append(
@@ -265,7 +272,7 @@ def _record_tools(
                 truncated=cut_arguments or cut_result,
                 written_path=written_path,
                 written_paths=tuple(named),
-                wrote_unnamed=(written_path is None and execution.writes_files)
+                wrote_unnamed=(written_path is None and execution.writes_files and not says_none)
                 or (execution.writes_files and mapping.get("unnamed_writes") is True)
                 or execution.spawns_subagents,
                 subagent_id=subagent_id,
@@ -343,6 +350,11 @@ class RoomOrchestrator:
         #: stale and stops. "One floor, one speaker" was otherwise true only of a room
         #: nobody sent to twice.
         self._floor: dict[str, asyncio.Lock] = {}
+        #: room id -> how many cascades (a `resume`, a `retry`) are running in it, and an
+        #: event set while none is. Learning takes a lesson only while none is, so one
+        #: clone's turns in one cascade are never split between two extractions (#1851).
+        self._cascades: dict[str, int] = {}
+        self._no_cascade: dict[str, asyncio.Event] = {}
         self._activity_events: dict[str, list[asyncio.Event]] = {}
         #: room id -> monotonic timestamp of last reported user presence
         self._presence: dict[str, float] = {}
@@ -498,10 +510,33 @@ class RoomOrchestrator:
         treat the message it is answering as an interjection, which stops it immediately.
         """
         self._refuse_a_head_room(self._require_room(room_id))
+        self._cascade_started(room_id)
         try:
             return await self._run_turns(room_id, baseline_seq, self._generation.get(room_id, 0))
         finally:
+            self._cascade_ended(room_id)
             self._start_learning(room_id)  # after the cascade, never inside it (#1404)
+
+    def _quiet(self, room_id: str) -> asyncio.Event:
+        """The event set while no cascade runs in `room_id`."""
+        event = self._no_cascade.get(room_id)
+        if event is None:
+            event = asyncio.Event()
+            event.set()
+            self._no_cascade[room_id] = event
+        return event
+
+    def _cascade_started(self, room_id: str) -> None:
+        self._cascades[room_id] = self._cascades.get(room_id, 0) + 1
+        self._quiet(room_id).clear()
+
+    def _cascade_ended(self, room_id: str) -> None:
+        left = self._cascades.get(room_id, 1) - 1
+        if left > 0:
+            self._cascades[room_id] = left
+            return
+        self._cascades.pop(room_id, None)
+        self._quiet(room_id).set()
 
     async def wait_for_learning(self, room_id: str) -> None:
         """Return once the room has no lesson queued and none being learned.
@@ -625,10 +660,12 @@ class RoomOrchestrator:
         # Under the floor, like every other turn. `retry` is the second door into
         # `_take_turn`, and a retry running beside a live cascade put two agents on the
         # floor by the one route the loop's own guard cannot see.
+        self._cascade_started(room_id)
         try:
             async with self._floor.setdefault(room_id, asyncio.Lock()):
                 return await self._take_turn(room_id, speaker, failed.decision or retried)
         finally:
+            self._cascade_ended(room_id)
             self._start_learning(room_id)
 
     def append_human(self, state: RoomState, sender_id: str, content: str) -> RoomState:
@@ -939,6 +976,7 @@ class RoomOrchestrator:
         usage = None
         completed = True
         refusal: RoomTurnRefusal | None = None
+        step_refusal: StepRefusalCode | None = None
         provider_failure: ProviderFailure | None = None
         persona_edit_dropped = False
         # What the turn says its tools were. Stays empty *and unrecorded* when the turn
@@ -998,6 +1036,7 @@ class RoomOrchestrator:
                 error = result.error
                 # From the turn's stated stop reason, never from `error`'s wording (#969).
                 refusal = turn_refusal(result.stop_reason)
+                step_refusal = result.error_code
                 provider_failure = self._with_own_model(speaker.id, result.provider_failure)
                 persona_edit_dropped = result.stop_reason == "persona_edit_failed"
         finally:
@@ -1065,6 +1104,7 @@ class RoomOrchestrator:
             provenance=provenance,
             error=error,
             refusal=refusal,
+            step_refusal=step_refusal,
             provider_failure=provider_failure,
             persona_edit_dropped=persona_edit_dropped,
             completed=completed,
@@ -1181,6 +1221,12 @@ class RoomOrchestrator:
         memory = agent.memory
         if memory is None:
             return
+        # The clone's "Learn from conversations" switch (#1840). Off stops only this; the
+        # seat keeps its memory, so `record_memory_fact`, Correct and Forget still work. The
+        # extractor reads it again when it learns the lesson (#2228).
+        persona = agent.latest_persona_definition
+        if persona is not None and not persona.learn_from_conversations:
+            return
         try:
             since = int(state.last_seen_seq.get(speaker.id, "0"))
         except ValueError:
@@ -1198,8 +1244,25 @@ class RoomOrchestrator:
                 generate=agent.invoke_auxiliary_model,
                 person_names=_person_names(state),
                 clone_names=_clone_names(state, speaker),
+                learns=lambda: _still_learns(self._seat_in_place(speaker, agent)),
+                # The seat's rules engine, read when the lesson is learned (#2332).
+                functional=lambda: _functional_relations(agent),
             )
         )
+
+    def _seat_in_place(
+        self, speaker: Participant, queued: LearningSeatProtocol
+    ) -> LearningSeatProtocol:
+        """`speaker`'s seat as the resolver holds it now, else the one a lesson was queued from.
+
+        A lesson waits for the floor, and the seat it was queued from may have been
+        replaced meanwhile; a rebuilt seat takes a saved edit and the one it replaced does
+        not (#2233). A resolver that cannot say (`built_seat` is optional, as
+        `pinned_model` is) leaves the queued seat.
+        """
+        lookup = getattr(self._resolver, "built_seat", None)
+        current = lookup(speaker) if callable(lookup) else None
+        return current if isinstance(current, LearningSeatProtocol) else queued
 
     def _start_learning(self, room_id: str) -> None:
         """Start working through the room's queued lessons, unless that is under way."""
@@ -1211,7 +1274,8 @@ class RoomOrchestrator:
         self._learning[room_id] = asyncio.create_task(self._learn(room_id))
 
     async def _learn(self, room_id: str) -> None:
-        """Learn each queued lesson in turn, each once no turn holds the floor.
+        """Learn each queued lesson in turn, each once no cascade runs and no turn holds the
+        floor.
 
         The floor is waited for and let go, not held: learning takes a model call, and a
         reply the person is waiting for must not queue behind it.
@@ -1220,9 +1284,14 @@ class RoomOrchestrator:
         if extractor is None:
             return
         while True:
+            # Only between cascades (#1851): a lesson taken while one runs holds only the
+            # turns it has had so far, and its clone's later turns would be a second lesson.
+            await self._quiet(room_id).wait()
             waited = self._floor.setdefault(room_id, asyncio.Lock())
             async with waited:  # wait for the floor, then let it go
                 pass
+            if self._cascades.get(room_id):
+                continue  # one started while the floor was waited for
             lesson = extractor.take(room_id)
             if lesson is None:
                 return
@@ -1238,7 +1307,7 @@ class RoomOrchestrator:
                     turn_id=lesson.turn_id,
                     error=EXTRACTION_FAILED,
                 )
-            if outcome.added or outcome.error is not None:
+            if outcome.added or outcome.error is not None or outcome.skipped:
                 self._record_learning(outcome)
             await self._publish_learning(outcome)
 
@@ -1258,6 +1327,7 @@ class RoomOrchestrator:
                         update={
                             "knowledge_learned": (*row.knowledge_learned, *outcome.added),
                             "knowledge_extract_error": outcome.error,
+                            "knowledge_skipped": outcome.skipped,
                         }
                     )
                     break
@@ -1294,6 +1364,7 @@ class RoomOrchestrator:
                         "reinforced": len(outcome.reinforced),
                         "superseded": len(outcome.superseded),
                         "failed": outcome.error is not None,
+                        "skipped": outcome.skipped,
                     },
                 )
             )
@@ -1419,6 +1490,8 @@ class RoomOrchestrator:
             payload["error"] = message.error
         if message.refusal is not None:
             payload["refusal"] = message.refusal.value
+        if message.step_refusal is not None:
+            payload["step_refusal"] = message.step_refusal
         if message.provider_failure is not None:
             payload["provider_failure"] = message.provider_failure.model_dump(mode="json")
         try:
@@ -2027,6 +2100,20 @@ def _add_unshared_names(
         if not (folded in other_names or folded in other_words):
             given.add(folded)
             names.append(name)
+
+
+def _functional_relations(agent: object) -> frozenset[str]:
+    """The relations the seat's rules declare one value at a time; none without rules (#2332)."""
+    engine = getattr(agent, "ontology", None)
+    return (
+        engine.functional_relations() if isinstance(engine, OntologyEngineProtocol) else frozenset()
+    )
+
+
+def _still_learns(agent: LearningSeatProtocol) -> bool:
+    """Whether `agent`'s clone learns from conversations now, a saved edit included (#2228)."""
+    persona = agent.latest_persona_definition
+    return persona is None or persona.learn_from_conversations
 
 
 def _lesson_lines(

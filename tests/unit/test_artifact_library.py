@@ -40,7 +40,7 @@ from uclone_x.errors import StaleRoomWriteError
 from uclone_x.room.models import RoomWrittenFile
 from uclone_x.room.service import RoomService
 from uclone_x.room.store import RoomStore
-from uclone_x.story.library import StoryLibrary
+from uclone_x_story.library import StoryLibrary
 
 
 @pytest.fixture
@@ -140,7 +140,7 @@ def test_the_list_states_what_it_covers(library: ArtifactLibrary) -> None:
         ("stories/night-train/story.yaml", True),
         (".archive/artifacts/a.md", True),
         (".archive/stories/night-train/story.yaml", True),
-        ("src/uclone_x/story/bundled/stories/x.md", False),
+        ("examples/story/src/uclone_x_story/bundled/stories/x.md", False),
         ("frontend/src/components/stories/x.tsx", False),
         ("tests/fixtures/stories/x.yaml", False),
     ],

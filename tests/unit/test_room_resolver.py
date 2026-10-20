@@ -168,6 +168,29 @@ class TestWhoGetsAnAgent:
         assert first is second
         assert first.context.session_id == "sess_room__r1__scout"
 
+    async def test_the_built_seat_is_found_by_its_session_and_none_is_built_for_asking(
+        self, host: HostDependencies
+    ) -> None:
+        """`built_seat` is what a queued lesson reads to see the seat as it is now (#2233).
+        With the real resolver, not a fake keyed by participant id (#2251): before a seat is
+        built there is none, and asking does not build one; once built, any participant
+        record with that session finds that same seat; one with no session finds none.
+
+        Killed by: src/uclone_x/room/resolver.py :: return self._agents.get(participant.session_id) if participant.session_id else None
+        Becomes: return None
+        """
+        resolver = RoomAgentResolver(host)
+        scout = agent_participant("scout", "sess_room__r1__scout")
+
+        assert resolver.built_seat(scout) is None
+        assert resolver.seated_agent_ids() == frozenset()  # asking built nothing
+
+        seat = await resolver.resolve(scout)
+        same_session = agent_participant("scout", "sess_room__r1__scout", persona="Scout")
+        assert resolver.built_seat(same_session) is seat
+        assert resolver.built_seat(agent_participant("scout", "sess_room__r2__scout")) is None
+        assert resolver.built_seat(agent_participant("scout", "")) is None
+
 
 # --------------------------------------------------------------------------------------
 # G3: no two participants on one session

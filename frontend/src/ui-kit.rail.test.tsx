@@ -115,7 +115,7 @@ describe('the kit rail holds no words of its own (#1158)', () => {
     expect(text).toContain('«conversations.deleteDialog.body(1,ag_1, ag_2)»');
   });
 
-  // Killed by: frontend/src/ui-kit/rail/Rail.tsx :: {copy.conversations.emptyCause(modelConfigured, clones.length)}
+  // Killed by: frontend/src/ui-kit/rail/Rail.tsx :: {copy.conversations.emptyCause(modelConfigured, listed.length)}
   // Becomes: {'No agents configured.'}
   it('states an empty Clones section with the cause function it is passed', () => {
     render(<Rail {...baseProps} personas={[]} rooms={[]} />);
@@ -232,6 +232,101 @@ describe('the rail`s delete dialog names who was in the conversation (#1814)', (
     fireEvent.click(screen.getByTestId('delete-conversation-room_solo'));
     expect(readable(document.body)).toContain('«conversations.deleteDialog.body(2,Scout)»');
     expect(readable(document.body)).not.toContain('agt_');
+  });
+});
+
+describe('Rail and a clone that cannot be loaded (#2241)', () => {
+  const persona = baseProps.personas![0];
+  const scout = { ...persona, id: 'agt_scout', name: 'scout', label: 'Scout' };
+  const bad = { ...persona, id: 'agt_bad', name: 'bad', label: 'Bad', unreadable: true };
+  const solo = (agent: string) => ({
+    room_id: `room_${agent}`,
+    title: '',
+    agent_ids: [agent],
+    message_count: 3,
+    updated_at: '2026-01-01T00:00:00Z',
+  });
+
+  // Killed by: frontend/src/ui-kit/rail/Rail.tsx :: const listed = clones.filter((c) => !c.unreadable || sessionsByClone.has(c.id));
+  // Becomes: const listed = clones.filter((c) => !c.unreadable);
+  it('keeps one with 1:1 conversations, marked, so its history does not vanish', () => {
+    render(<Rail {...baseProps} personas={[scout, bad]} selectedAgent="agt_scout" rooms={[solo('agt_scout'), solo('agt_bad')]} />);
+
+    const row = screen.getByTestId('persona-item-agt_bad');
+    expect(readable(row)).toContain('«unreadableBadge»');
+    expect(readable(document.body)).toContain('«unreadableTitle»');
+    // Its conversations stay under its row (expanded by default), as any clone's do.
+    expect(screen.getByTestId('clone-session-item-room_agt_bad')).toBeInTheDocument();
+  });
+
+  // Seen in the live app (#2253): on the name's line the mark squeezed "sleepy" to "s.".
+  // An unreadable clone has no role, so the mark takes the role's line instead.
+  // Killed by: frontend/src/ui-kit/rail/Rail.tsx :: {clone.unreadable ? (
+  // Becomes: {false ? (
+  it('puts the mark on its own line, so the name keeps the full width', () => {
+    render(<Rail {...baseProps} personas={[scout, bad]} selectedAgent="agt_scout" rooms={[solo('agt_scout'), solo('agt_bad')]} />);
+
+    const name = screen.getByText('Bad');
+    expect(name.parentElement).not.toHaveTextContent('«unreadableBadge»');
+    expect(screen.getByTestId('clone-unreadable-agt_bad')).toHaveTextContent('«unreadableBadge»');
+  });
+
+  // Killed by: frontend/src/ui-kit/rail/Rail.tsx :: if (onEditAgent && !clone.unreadable) {
+  // Becomes: if (onEditAgent) {
+  it('offers no Edit for it, since there is nothing loaded to edit (#2253)', () => {
+    render(
+      <Rail
+        {...baseProps}
+        personas={[scout, bad]}
+        selectedAgent="agt_scout"
+        rooms={[solo('agt_scout'), solo('agt_bad')]}
+        onEditAgent={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByTestId('clone-menu-agt_bad'));
+    expect(screen.queryByTestId('persona-edit-agt_bad')).toBeNull();
+    // Its profile is still there: that is where its conversations and picture are.
+    expect(screen.getByTestId('clone-profile-item-agt_bad')).toBeInTheDocument();
+  });
+
+  // Killed by: frontend/src/ui-kit/rail/Rail.tsx :: {clone.unreadable ? null : (
+  // Becomes: {false ? null : (
+  it('offers no new conversation with it', () => {
+    render(<Rail {...baseProps} personas={[scout, bad]} selectedAgent="agt_scout" rooms={[solo('agt_scout'), solo('agt_bad')]} />);
+
+    expect(screen.getByTestId('clone-new-thread-agt_scout')).toBeInTheDocument();
+    expect(screen.queryByTestId('clone-new-thread-agt_bad')).toBeNull();
+  });
+
+  // Killed by: frontend/src/ui-kit/rail/Rail.tsx :: const listed = clones.filter((c) => !c.unreadable || sessionsByClone.has(c.id));
+  // Becomes: const listed = clones;
+  it('leaves it out of the clone list, and still names it in a conversation it was in', () => {
+    const persona = baseProps.personas![0];
+    render(
+      <Rail
+        {...baseProps}
+        personas={[
+          { ...persona, id: 'agt_scout', name: 'scout', label: 'Scout' },
+          { ...persona, id: 'agt_bad', name: 'bad', label: 'Bad', unreadable: true },
+        ]}
+        selectedAgent="agt_scout"
+        rooms={[
+          {
+            room_id: 'room_pair',
+            title: '',
+            agent_ids: ['agt_scout', 'agt_bad'],
+            message_count: 1,
+            updated_at: '2026-01-01T00:00:00Z',
+          },
+        ]}
+      />,
+    );
+
+    expect(screen.getByTestId('persona-item-agt_scout')).toBeInTheDocument();
+    expect(screen.queryByTestId('persona-item-agt_bad')).toBeNull();
+    fireEvent.click(screen.getByTestId('delete-conversation-room_pair'));
+    expect(readable(document.body)).toContain('«conversations.deleteDialog.body(1,Scout, Bad)»');
   });
 });
 

@@ -8,6 +8,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, mock_open, patch
 
 import pytest
+from rich.console import Console
 
 from uclone_x.cli.commands import bootstrap
 from uclone_x.core.environment_install import install_into_running_environment
@@ -751,6 +752,19 @@ def test_install_diffusers_is_false_when_there_is_no_installer() -> None:
         assert bootstrap.install_diffusers() is False
 
 
+@pytest.fixture
+def unwrapped_console(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Give `bootstrap` a console that does not wrap, for tests that assert a whole phrase.
+
+    rich wraps to the terminal's width, and a long word such as the interpreter path is
+    folded mid-word, so rejoining the output on whitespace leaves a space inside the path.
+    The remedy then fails to match at a narrow `COLUMNS` and passes at a wide one (#2252).
+    What is pinned is the remedy's words, not how a terminal lays them out.
+    """
+    monkeypatch.setattr(bootstrap, "console", Console(width=10_000))
+
+
+@pytest.mark.usefixtures("unwrapped_console")
 def test_install_diffusers_points_at_uv_when_there_is_no_installer(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -777,6 +791,7 @@ def test_install_diffusers_points_at_uv_when_there_is_no_installer(
     assert "https://docs.astral.sh/uv/" in out
 
 
+@pytest.mark.usefixtures("unwrapped_console")
 def test_install_diffusers_points_at_ensurepip_when_there_is_no_installer(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -799,6 +814,7 @@ def test_install_diffusers_points_at_ensurepip_when_there_is_no_installer(
     assert f"{bootstrap.sys.executable} -m ensurepip --upgrade" in out
 
 
+@pytest.mark.usefixtures("unwrapped_console")
 def test_install_diffusers_remedy_survives_a_venv_path_containing_square_brackets(
     capsys: pytest.CaptureFixture[str],
 ) -> None:

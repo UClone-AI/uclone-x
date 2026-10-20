@@ -101,6 +101,19 @@ class EmbedderProtocol(Protocol):
 
 
 @runtime_checkable
+class UsageRemainingProtocol(Protocol):
+    """A connector whose calls pass the person's paid-model usage limit (#1851).
+
+    Learning asks it what is left before it spends the clone's budget, so the person's
+    next reply is never refused for it. A connector that is not limited does not have it.
+    """
+
+    def usage_remaining(self) -> int | None:
+        """The fewest tokens any limited window has left now; `None` when none is limited."""
+        ...
+
+
+@runtime_checkable
 class TokenBudgetManagerProtocol(Protocol):
     """Protocol for tracking token consumption and token ceiling enforcement."""
 
@@ -133,6 +146,14 @@ class TokenBudgetManagerProtocol(Protocol):
 
     def get_budget(self, session_id: str) -> TokenBudget | None:
         """Retrieve the active budget snapshot."""
+        ...
+
+    def get_turn_history(self, session_id: str) -> tuple[TokenUsage, ...]:
+        """Every call booked on the session, oldest first.
+
+        Declared here because learning reads it to size a reply's worth before it spends
+        the clone's budget (#1851).
+        """
         ...
 
     def record_compaction(

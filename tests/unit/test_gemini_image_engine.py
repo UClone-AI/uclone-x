@@ -18,11 +18,12 @@ import httpx
 import pytest
 
 from uclone_x.core.remote_worker import PortMapping, SSHTunnelManager, TunnelSessionStatus
-from uclone_x.errors import ImageNotReturnedError
+from uclone_x.errors import ImageNotReturnedError, PlainRefusalError
 from uclone_x.llm.connectors.factory import image_engine_choice
 from uclone_x.llm.connectors.gemini import GeminiConnector
 from uclone_x.tools.base import artifact_path_from_url, linked_paths
 from uclone_x.tools.builtin.image import (
+    GEMINI_FALLBACK_IMAGE_MODEL,
     ComfyUIImageEngine,
     GenerateImageParams,
     GenerateImageTool,
@@ -206,7 +207,7 @@ def _pinned_gemini(gemini: Any, model: str = "gemini-2.5-flash-image") -> ImageE
     )
 
 
-def _auto(gemini: Any = None, model: str | None = "gemini-2.5-flash-image") -> ImageEngineChoice:
+def _auto(gemini: Any = None, model: str | None = "gemini-3.1-flash-image") -> ImageEngineChoice:
     """`auto`, with ``gemini`` as the cloud model on a connection that has a key."""
     return ImageEngineChoice(
         gemini=gemini,
@@ -308,9 +309,9 @@ async def test_auto_draws_with_the_cloud_model_on_a_connection_with_a_key() -> N
     drawn = await _draw(_dispatcher(_auto(gemini), local_ready=False))
     assert drawn.engine_name == "gemini"
     assert drawn.width == 1024
-    assert gemini.calls[0][1:] == ("16:9", "gemini-2.5-flash-image")
+    assert gemini.calls[0][1:] == ("16:9", "gemini-3.1-flash-image")
     assert drawn.drawn_with == (
-        "Drawn with Gemini 2.5 Flash Image in the cloud (Google) (picked automatically)."
+        "Drawn with Gemini 3.1 Flash Image in the cloud (Google) (picked automatically)."
     )
 
     with pytest.raises(ImageGenerationError):
@@ -412,7 +413,7 @@ async def test_a_stale_look_does_not_hold_up_the_description(tmp_path: Path) -> 
 async def test_a_chosen_cloud_model_draws_there_and_records_it(tmp_path: Path) -> None:
     """A Google picture model chosen by name draws there even with a local engine ready.
 
-    Killed by: src/uclone_x/tools/builtin/image.py :: return self._cloud_profile(choice.gemini_model or DEFAULT_IMAGE_MODEL)
+    Killed by: src/uclone_x/tools/builtin/image.py :: return self._cloud_profile(choice.gemini_model or GEMINI_FALLBACK_IMAGE_MODEL)
     Becomes: return self._local_profile()
     Killed by: src/uclone_x/tools/builtin/image.py :: engine_name=GEMINI_ENGINE_NAME,
     Becomes: engine_name="diffusers-sdxl",
@@ -520,7 +521,7 @@ def test_the_saved_gemini_key_builds_the_client_for_auto(
     choice = image_engine_choice(settings)
 
     assert (choice.chosen, choice.pin) == ("auto", None)
-    assert choice.gemini_model == "gemini-2.5-flash-image"
+    assert choice.gemini_model == "gemini-3.1-flash-image"
     assert isinstance(choice.gemini, GeminiConnector)
     assert choice.gemini.api_key == "saved-key"
     assert image_engine_choice(tmp_path / "absent.json").gemini is None
@@ -610,19 +611,19 @@ def test_the_probe_reads_the_picture_model_and_the_key(
     settings = tmp_path / "settings.json"
     settings.write_text(
         json.dumps(
-            {**_GEMINI_KEY_SAVED, "default_models": {"image": "gemini/gemini-2.5-flash-image"}}
+            {**_GEMINI_KEY_SAVED, "default_models": {"image": "gemini/gemini-3.1-flash-image"}}
         )
     )
     with patch.object(LocalDiffusersImageEngine, "resolve_checkpoint", return_value=None):
         report = probe_image_engines(settings)
 
-    assert (report.setting, report.pin) == ("gemini/gemini-2.5-flash-image", "gemini")
-    assert report.gemini_model == "gemini-2.5-flash-image"
+    assert (report.setting, report.pin) == ("gemini/gemini-3.1-flash-image", "gemini")
+    assert report.gemini_model == "gemini-3.1-flash-image"
     assert report.engine == "gemini"
     assert resolve_image_choice(report)["create"] == {
         "engine": "gemini",
-        "model_id": "gemini-2.5-flash-image",
-        "label": "Gemini 2.5 Flash Image",
+        "model_id": "gemini-3.1-flash-image",
+        "label": "Gemini 3.1 Flash Image",
         "where": "cloud",
     }
 
@@ -756,7 +757,7 @@ async def test_a_gemini_jpeg_is_saved_as_a_jpg_that_its_sidecar_and_address_name
     picture = _picture_rel(result["relative_url"])
     assert re.fullmatch(r"artifacts/s/images/img_[0-9a-f]{6}\.jpg", picture)
     assert (tmp_path / picture).read_bytes() == _JPEG_5X3
-    assert list((tmp_path / "artifacts/images").glob("*.png")) == []
+    assert list((tmp_path / "artifacts/s/images").glob("*.png")) == []
     assert result["relative_url"] == f"/api/artifacts/content?path={picture}"
     sidecar = _sidecar(tmp_path, result["relative_url"])
     assert sidecar["image_path"] == picture
@@ -784,7 +785,7 @@ async def test_a_batch_of_gemini_jpegs_is_saved_and_shown_as_jpgs(tmp_path: Path
         sidecar = _sidecar(tmp_path, img["relative_url"])
         assert sidecar["image_path"] == picture
         assert sidecar["mime_type"] == "image/jpeg"
-    assert list((tmp_path / "artifacts/images").glob("*.png")) == []
+    assert list((tmp_path / "artifacts/s/images").glob("*.png")) == []
 
 
 @pytest.mark.asyncio
@@ -1318,3 +1319,47 @@ def test_profiles_say_what_they_can_do_and_gemini_is_its_own_engine() -> None:
     )
     assert both.capabilities == ("create", "edit")
     assert gemini_profile("gemini-2.5-flash-image").engine_type == "gemini"
+
+
+def test_the_cloud_fallback_model_is_one_the_registry_declares(tmp_path: Path) -> None:
+    """The fallback draws only where the registry names it, so the two must agree (#2295).
+
+    A fallback the registry does not declare is offered by no Google listing and draws
+    without its name ("Drawn with gemini-…" in place of the model's label).
+
+    Killed by: src/uclone_x/tools/builtin/image.py :: GEMINI_FALLBACK_IMAGE_MODEL = "gemini-3.1-flash-image"
+    Becomes: GEMINI_FALLBACK_IMAGE_MODEL = "gemini-2.5-flash-image"
+    """
+    from uclone_x.tools.builtin.media_registry import ModelRegistry
+
+    declared = {
+        p.model_id: p.display_name
+        for p in ModelRegistry(user_config_path=tmp_path / "absent.yaml").profiles()
+        if p.engine_type == "gemini"
+    }
+
+    assert GEMINI_FALLBACK_IMAGE_MODEL in declared, declared
+    assert declared[GEMINI_FALLBACK_IMAGE_MODEL] == "Gemini 3.1 Flash Image"
+
+
+@pytest.mark.asyncio
+async def test_a_session_id_that_climbs_out_writes_no_picture(tmp_path: Path) -> None:
+    """The session's folder is named from its id, so an id with `..` is refused (#1390).
+
+    A hand-built context with `session_id="../x"` wrote the picture beside the workspace's
+    `artifacts/`, outside any session folder.
+
+    Killed by: src/uclone_x/tools/base.py :: validate_session_id(session_id)
+    Becomes: pass
+    """
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    tool = _gemini_tool(_JPEG_5X3, "image/jpeg")
+    context = ToolContext(agent_id="artist", session_id="../x", workspace_root=workspace)
+
+    with pytest.raises(PlainRefusalError) as refused:
+        await tool.run(GenerateImageParams(prompt="a friendly face"), context)
+
+    assert "no picture was made" in str(refused.value)
+    assert "../x" not in str(refused.value)
+    assert [p for p in tmp_path.rglob("*") if p.is_file()] == []

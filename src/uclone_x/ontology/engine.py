@@ -9,7 +9,7 @@ import re
 import time
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Any, Final, Literal, cast
 
 import yaml
 
@@ -22,6 +22,8 @@ from uclone_x.errors import (
     PromotionCriteriaNotMetError,
     UnparseableDirectiveError,
 )
+from uclone_x.knowledge.fold import relation_key
+from uclone_x.ontology.justification import FUNCTIONAL_PROPERTY
 from uclone_x.ontology.models import (
     EvidenceRecord,
     OntologyAxiom,
@@ -33,6 +35,7 @@ from uclone_x.ontology.models import (
     tier_to_precedence,
     utc_now_iso,
 )
+from uclone_x.ontology.rules import normalize_axiom_kind
 
 
 def _slugify_axiom_name(raw: str, max_len: int = 60) -> str:
@@ -239,6 +242,20 @@ def _validate_promotion_evidence(
         )
 
 
+#: The name a functional declaration is saved under, so the box finds the one it wrote.
+FUNCTIONAL_AXIOM_PREFIX: Final = "functional:"
+
+
+def _declares_functional(axiom: OntologyAxiom) -> bool:
+    """Whether `axiom` is an asserted `functionalProperty` declaration on a relation."""
+    return (
+        axiom.tier is OntologyTier.ASSERTED
+        and not axiom.rule_expression.strip()
+        and bool(axiom.subject_entity.strip())
+        and normalize_axiom_kind(axiom.predicate) == FUNCTIONAL_PROPERTY
+    )
+
+
 class OntologyEngine:
     """Manages tiered living knowledge graph with deterministic validation and induction."""
 
@@ -434,6 +451,52 @@ class OntologyEngine:
         if tier is None:
             return list(self._axioms.values())
         return [a for a in self._axioms.values() if a.tier == tier]
+
+    def functional_relations(self) -> frozenset[str]:
+        """The relations this engine declares to hold one value at a time (#2332).
+
+        A clone's facts carry no word for whether a relation takes one value (`lives_in`)
+        or many (`prefers`); the clone's rules say so, as an asserted `functionalProperty`
+        axiom on the relation, the axiom the reasoner already checks. Any such axiom counts,
+        whoever wrote it (Remembers' question, its box, or `ucx ontology teach`). Nothing in
+        code lists relations (#2204). Each is keyed as the clone files a relation
+        (`relation_key`).
+        """
+        return frozenset(
+            relation_key(axiom.subject_entity)
+            for axiom in self._axioms.values()
+            if _declares_functional(axiom)
+        )
+
+    def set_functional(self, relation: str, functional: bool) -> bool:
+        """Declare `relation` functional, or take every declaration of it back (#2332).
+
+        Returns whether anything changed. The caller saves the engine.
+
+        Raises:
+            ValueError: `relation` is blank.
+        """
+        key = relation_key(relation)
+        if not key:
+            raise ValueError("relation cannot be empty")
+        held = [
+            axiom.name
+            for axiom in self._axioms.values()
+            if _declares_functional(axiom) and relation_key(axiom.subject_entity) == key
+        ]
+        if functional:
+            if held:
+                return False
+            self.teach_axiom(
+                name=f"{FUNCTIONAL_AXIOM_PREFIX}{key}",
+                subject_entity=key,
+                predicate=FUNCTIONAL_PROPERTY,
+                description="Holds one value at a time; a person said so in Remembers.",
+            )
+            return True
+        for name in held:
+            self.forget(name)
+        return bool(held)
 
     def get_active_invariants(
         self,

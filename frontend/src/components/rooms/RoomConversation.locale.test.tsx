@@ -174,6 +174,75 @@ describe('the conversation in the chosen language', () => {
     expect(screen.getByTestId('row-error-1')).not.toHaveTextContent('Session token limit');
   });
 
+  // A step whose tool results did not fit the window is said as that, in plain words, with
+  // Retry still offered: the #2257 run read this row as an empty reply (#2264).
+  // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: (stepRefusalSentence(label, message.step_refusal, t.outcome) ??
+  // Becomes: (null ??
+  it('says a refused step in Korean, as its cause, with no internals and with Retry', () => {
+    const core =
+      'The results of the tools called in this step do not fit in what the model can still read at once, even shortened, so they were not sent to it.';
+    render(
+      <Host
+        hints={['ko-KR']}
+        over={{
+          room: room({
+            transcript: [
+              message({
+                seq: 1,
+                sender_id: 'scout',
+                content: '',
+                error: core,
+                step_refusal: 'step.over_window',
+              }),
+            ],
+          }),
+        }}
+      />,
+    );
+
+    const row = screen.getByTestId('row-error-1');
+    expect(row).toHaveTextContent(
+      fmt(ko.conversation.outcome.stepFailed, {
+        label: 'Scout',
+        cause: ko.conversation.outcome.stepCause['step.over_window'],
+      }),
+    );
+    expect(row).not.toHaveTextContent(ko.conversation.outcome.wentWrong.split('{label}')[1]!);
+    for (const internal of ['step.over_window', 'step_results', 'The results of the tools', '[Turn Context]']) {
+      expect(row).not.toHaveTextContent(internal);
+    }
+    expect(screen.getByTestId('retry-turn')).toBeInTheDocument();
+  });
+
+  // A code this head has no sentence for keeps the generic one rather than showing nothing.
+  // Killed by: frontend/src/lib/turnOutcome.ts :: return cause ? fmt(copy.stepFailed, { label, cause }) : null;
+  // Becomes: return fmt(copy.stepFailed, { label, cause: cause ?? '' });
+  it('says the generic failure for a step code it does not know', () => {
+    render(
+      <Host
+        hints={['en-US']}
+        over={{
+          room: room({
+            transcript: [
+              message({
+                seq: 1,
+                sender_id: 'scout',
+                content: '',
+                error: 'x',
+                step_refusal: 'step.from_a_newer_core',
+              }),
+            ],
+          }),
+        }}
+      />,
+    );
+
+    expect(screen.getByTestId('row-error-1')).toHaveTextContent(
+      fmt(en.conversation.outcome.wentWrong, { label: 'Scout' }),
+    );
+    expect(screen.getByTestId('row-error-1')).not.toHaveTextContent('step.from_a_newer_core');
+  });
+
   // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: {sendFailureNotice(sendError.cause, c.sendFailure)}
   // Becomes: {sendFailureNotice(sendError.cause)}
   it('says a failed send in the language on screen, and again after a switch', async () => {

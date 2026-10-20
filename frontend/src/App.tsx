@@ -38,6 +38,7 @@ import { readDeveloperMode, storeDeveloperMode } from './lib/developerMode';
 import type { ModelSet } from './lib/modelGateway';
 import { useBrowserLive } from './lib/browserLive';
 import { SettingsModal, type SettingsTabId } from './components/SettingsModal';
+import type { SignInPrefill } from './components/settings/BrowserSignIns';
 import { ArtifactLibrary } from './components/artifacts/ArtifactLibrary';
 import { artifactLibraryApi } from './lib/artifactLibrary';
 import { CoreFailure } from './lib/coreFailure';
@@ -52,7 +53,7 @@ import {
 } from './lib/avatarChoice';
 import { savePersona } from './lib/personasApi';
 import { useCopy, useLocale } from './i18n';
-import { cloneIdOf, cloneLabel } from './lib/cloneLabel';
+import { cloneIdOf, cloneLabel, isUsableClone } from './lib/cloneLabel';
 import { withCloneNames } from './lib/cloneSeats';
 import type { PersonaDraft, PersonaEditMode, PersonaSaveResult } from './lib/personaDraft';
 import {
@@ -79,7 +80,8 @@ export function App() {
    * (2026-09-27, #1775).
    */
   const availableClones = useMemo<CloneChoice[]>(
-    () => personas.map((p) => ({ id: cloneIdOf(p), label: cloneLabel(p, language) })),
+    // A clone whose settings could not be loaded is not offered: a turn naming it is refused (#2241).
+    () => personas.filter(isUsableClone).map((p) => ({ id: cloneIdOf(p), label: cloneLabel(p, language) })),
     [personas, language],
   );
   const [cloneDockMode, setCloneDockMode] = useState<'view' | 'edit' | 'create'>('view');
@@ -163,6 +165,13 @@ export function App() {
   const openSettings = (tab?: SettingsTabId): void => {
     setSettingsTab(tab);
     setIsSettingsOpen(true);
+  };
+  // The dock's Save offer (#2106): Settings ▸ Browser with the Saved sign-ins form open on the
+  // site. `key` is new per offer, so a second offer for the same site opens the form again.
+  const [browserSignInPrefill, setBrowserSignInPrefill] = useState<SignInPrefill | null>(null);
+  const openSignInSettings = (site: string): void => {
+    setBrowserSignInPrefill((now) => ({ site, key: (now?.key ?? 0) + 1 }));
+    openSettings('browser');
   };
   // The Files screen (#1554): a user feature, so not behind developer mode.
   const [isFilesOpen, setIsFilesOpen] = useState<boolean>(false);
@@ -267,6 +276,14 @@ export function App() {
       setIsDockOpen(true);
     }
   }, [currentRoomId, hasBrowserActivity]);
+
+  // A clone that asks the person to sign in needs them to see the page (§3.5 path B), so
+  // each new ask fronts the Browser tab even after the person closed the dock.
+  const askedUser = browserLive.state?.asked_user ?? null;
+  const askedKey = askedUser ? `${askedUser.clone}@${askedUser.site}` : null;
+  useEffect(() => {
+    if (askedKey) showBrowser();
+  }, [askedKey, showBrowser]);
 
   // A turn's live step lines last as long as the turn: once it lands, its recorded calls
   // (`room.tool_uses`) draw the same lines from the record.
@@ -938,7 +955,8 @@ export function App() {
         setPersonas(loaded);
         if (pData.available_tools) setAvailableTools(pData.available_tools);
         if (pData.personas_dir !== undefined) setPersonasDir(pData.personas_dir);
-        if (loaded.length > 0) firstNamed = cloneIdOf(loaded[0]);
+        const usable = loaded.filter(isUsableClone);
+        if (usable.length > 0) firstNamed = cloneIdOf(usable[0]);
       }
       if (firstNamed !== null) {
         const named = firstNamed;
@@ -1084,9 +1102,9 @@ export function App() {
    *
    * Retiring `PlaygroundTab` (#1208) makes the conversation the centre column
    * unconditionally, so `currentRoomId === null` stops being a state the head can
-   * render and becomes one it has to leave: the most recent conversation is reopened
-   * -- `rooms[0]`, since `RoomService.list_rooms` orders by `updated_at` for every
-   * head at once (#1053) --
+   * render and becomes one it has to leave: the most recent conversation some clone in it
+   * can answer is reopened -- the first such in `rooms`, since `RoomService.list_rooms`
+   * orders by `updated_at` for every head at once (#1053) --
    * and an install that has none is given one under `NEW_CONVERSATION_TITLE`, which
    * its first message renames (F1, the same path the rail's New takes).
    *
@@ -1107,9 +1125,15 @@ export function App() {
     if (currentRoomId !== null || autoOpenRef.current || createInFlightRef.current) return;
     if (!roomsListed || !metadataListed) return;
     autoOpenRef.current = true;
-    const mostRecent = rooms[0];
-    void (mostRecent ? openRoom(mostRecent.room_id) : handleNewRoom());
-  }, [currentRoomId, roomsListed, metadataListed, rooms, openRoom, handleNewRoom]);
+    // Skipped, as the first clone is (#2275): a conversation whose every clone could not be
+    // loaded would open on a composer naming one that answers, and refuse every message.
+    // The rail still lists it under that clone, so a person can open it on purpose.
+    const unreadable = new Set(personas.filter((p) => !isUsableClone(p)).map(cloneIdOf));
+    const onlyUnreadableSeats = (room: { agent_ids: string[] }) =>
+      room.agent_ids.length > 0 && room.agent_ids.every((id) => unreadable.has(id));
+    const openable = rooms.find((room) => !onlyUnreadableSeats(room));
+    void (openable ? openRoom(openable.room_id) : handleNewRoom());
+  }, [currentRoomId, roomsListed, metadataListed, rooms, personas, openRoom, handleNewRoom]);
 
   // Server-Sent Events (SSE) live connection
   useEffect(() => {
@@ -1398,6 +1422,7 @@ export function App() {
               onDraftChange={(next) => rememberDraft(currentRoomId, next)}
               insertDraft={insertDraft?.roomId === currentRoomId ? insertDraft : null}
               browserSteps={browserLive.steps}
+              browserAsked={askedUser}
               onShowBrowser={showBrowser}
               avatarUrls={avatarUrls}
               onSend={async (content) => {
@@ -1603,6 +1628,7 @@ export function App() {
             isRefreshing={isRefreshing}
             browserLive={browserLive}
             onConnectBrowser={() => openSettings('browser')}
+            onSaveBrowserSignIn={openSignInSettings}
           />
         )}
 
@@ -1621,6 +1647,7 @@ export function App() {
         developerMode={developerMode}
         onDeveloperModeChange={changeDeveloperMode}
         initialTab={settingsTab}
+        browserSignInPrefill={browserSignInPrefill}
       />
     </div>
     </AvatarChoiceContext.Provider>

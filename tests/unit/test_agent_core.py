@@ -827,6 +827,33 @@ async def test_event_loop_survives_a_failing_event_and_keeps_consuming() -> None
 
 
 @pytest.mark.asyncio
+async def test_an_error_ended_turn_names_the_connection_it_asked_not_the_agent() -> None:
+    """`requested` names the service the turn asked, as every other provenance does (#2229).
+
+    It named the agent id, which the turn panel then showed as "asked for
+    agt_…:gemini-3.8-flash". A connector that cannot say its name (a bare mock) keeps the
+    agent id rather than inventing one.
+
+    Killed by: src/uclone_x/agent/turn_executor.py :: req_provider = named if isinstance(named, str) and named else self.agent_id
+    Becomes: req_provider = self.agent_id
+    """
+    gemini = MagicMock(spec=LLMProviderProtocol)
+    gemini.provider_name = "gemini"
+    gemini.generate = AsyncMock(side_effect=RuntimeError("stream interrupted"))
+    finish_after_tools(gemini)
+    tracer = TelemetryTracer()
+
+    result = await BaseAgent(
+        config=_sample_config("agt_774ca8e6"), llm=gemini, tracer=tracer
+    ).execute_turn("Hi")
+
+    assert result.provenance is not None
+    assert result.provenance.requested.provider == "gemini"
+    assert [a.provider for a in result.provenance.attempts] == ["gemini"]
+    (span,) = [s for s in tracer.get_completed_spans() if s.name == "failover.event"]
+    assert span.attributes["requested_provider"] == "gemini"
+
+
 async def test_base_agent_failover_emits_telemetry_span_and_correlates_span_id() -> None:
     """BaseAgent.execute_turn natively emits failover.event span and correlates span_id in Provenance (P6, P8, #175)."""
     tracer = TelemetryTracer()

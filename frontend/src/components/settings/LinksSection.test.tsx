@@ -46,7 +46,13 @@ const mockFetch = (lists: unknown[], routes: Record<string, Handler> = {}) => {
       return jsonResponse(answer);
     }
     if (method === 'GET' && url === '/api/clones') {
-      return jsonResponse({ clones: [{ name: 'clone' }, { name: 'haru', display_name: { en: '잠 꾸러기' } }] });
+      return jsonResponse({
+        clones: [
+          { name: 'clone' },
+          { name: 'haru', display_name: { en: '잠 꾸러기' } },
+          { name: 'broken', status: 'unreadable' },
+        ],
+      });
     }
     return jsonResponse({ detail: `unrouted ${method} ${url}` }, false, 599);
   });
@@ -84,6 +90,18 @@ describe('LinksSection', () => {
     const haru = await within(picker).findByRole('option', { name: '잠 꾸러기' });
     expect((haru as HTMLOptionElement).value).toBe('haru');
     expect(within(picker).getByRole('option', { name: 'clone' })).toBeTruthy();
+  });
+
+  // Seen in the live app (#2253): the picker offered a clone whose settings could not be loaded.
+  // Killed by: frontend/src/components/settings/LinksSection.tsx :: const names = (clones.data?.clones ?? []).filter(isUsableClone).map((p) => ({ id: p.name, label: cloneLabel(p, language) }));
+  // Becomes: const names = (clones.data?.clones ?? []).map((p) => ({ id: p.name, label: cloneLabel(p, language) }));
+  it('does not offer a clone whose settings could not be loaded', async () => {
+    mockFetch([listOf()]);
+    render(<LinksSection />);
+
+    const picker = await screen.findByTestId('settings-links-clone');
+    await within(picker).findByRole('option', { name: 'clone' });
+    expect(within(picker).queryByRole('option', { name: 'broken' })).toBeNull();
   });
 
   it('shows the clone pair and a link to the minihompy', async () => {

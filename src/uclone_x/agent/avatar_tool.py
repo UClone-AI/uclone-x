@@ -13,7 +13,12 @@ from typing import ClassVar
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from uclone_x.agent.persona_avatar import AvatarRefused, PersonaAvatarStore, avatar_url
+from uclone_x.agent.persona_avatar import (
+    AvatarRefused,
+    PersonaAvatarStore,
+    avatar_url,
+    missing_picture_advice,
+)
 from uclone_x.agent.persona_registry import get_default_persona_registry
 from uclone_x.errors import PathTraversalError, PlainRefusalError
 from uclone_x.tools.base import BaseTool
@@ -98,7 +103,9 @@ class SetAvatarTool(BaseTool[SetAvatarParams]):
                         f"'{params.image_path}' is outside the workspace, so it was not used. "
                         "Use a picture in the workspace."
                     ) from exc
-            change = store.set_from_path(persona, source, undo_of=params.undo_of)
+            change = store.set_from_path(
+                persona, source, undo_of=params.undo_of, advice=missing_picture_advice(agent)
+            )
         return {
             "avatar_url": avatar_url(registry.id_of(persona) or persona, store.find(persona)),
             "previous_path": _relative(change.previous, workspace),

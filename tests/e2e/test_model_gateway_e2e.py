@@ -140,7 +140,7 @@ async def test_a_clone_saved_with_its_own_model_keeps_that_ref(server: str) -> N
             )
             await picker.select_option("mock/mock-llm")
             await page.get_by_test_id("persona-editor").get_by_role("button", name="Save").click()
-            await section.get_by_test_id("persona-row-cartographer").wait_for(timeout=10_000)
+            await section.locator('[data-clone-handle="cartographer"]').wait_for(timeout=10_000)
 
             read = await page.request.get(f"{server}/api/clones/cartographer")
             persona = (await read.json())["persona"]

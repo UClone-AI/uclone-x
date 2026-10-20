@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import json
+import logging
 import time
 from collections.abc import AsyncIterator, Callable, Sequence
 from pathlib import Path
@@ -2787,6 +2788,11 @@ async def test_mock_connector_labels_its_token_figures_as_the_shared_estimate() 
 
 async def _gemini_sent_body(*messages: ChatMessage) -> dict[str, Any]:
     """The whole request body Gemini actually receives for `messages`."""
+    return await _gemini_sent_body_for(LLMRequest(model="gemini-1.5-pro", messages=tuple(messages)))
+
+
+async def _gemini_sent_body_for(request: LLMRequest) -> dict[str, Any]:
+    """The whole request body Gemini actually receives for `request`."""
     captured: dict[str, Any] = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -2812,7 +2818,7 @@ async def _gemini_sent_body(*messages: ChatMessage) -> dict[str, Any]:
     connector = GeminiConnector(
         model="gemini-1.5-pro", api_key="k", http_client=_make_mock_client(handler)
     )
-    await connector.generate(LLMRequest(model="gemini-1.5-pro", messages=tuple(messages)))
+    await connector.generate(request)
     return cast("dict[str, Any]", captured["body"])
 
 
@@ -6196,3 +6202,382 @@ def test_ollama_sends_think_parameter_when_thinking_is_specified() -> None:
 
     think_true_body = _ollama_body(connector, model="qwen3:8b", thinking=True)
     assert think_true_body["think"] is True
+
+
+# ======================================================================================
+# Gemini 3 thought signatures (#2227)
+# ======================================================================================
+
+_SIGNATURE = "Eq0BCqoBAWkUfRN-opaque-signature"
+_GEMINI_MISSING_SIGNATURE = {
+    "error": {
+        "code": 400,
+        "message": (
+            "Function call is missing a thought_signature in functionCall parts. This is "
+            "required for tools to work correctly, and missing thought_signature may lead to "
+            "degraded model performance. Additional data, function call "
+            "`default_api:get_weather` , position 2. Please refer to "
+            "https://ai.google.dev/gemini-api/docs/thought-signatures for more details."
+        ),
+        "status": "INVALID_ARGUMENT",
+    }
+}
+
+
+class _SigningGemini:
+    """A fake Gemini 3 (#2227): its function calls carry a `thoughtSignature`, and a request
+    that replays a call without the signature it was issued with is refused with the 400
+    `gemini-3.8-flash` gave on 2026-10-10."""
+
+    def __init__(self) -> None:
+        self.bodies: list[dict[str, Any]] = []
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        self.bodies.append(body)
+        replayed = [
+            part
+            for content in body["contents"]
+            if content["role"] == "model"
+            for part in content["parts"]
+            if "functionCall" in part
+        ]
+        if any(part.get("thoughtSignature") != _SIGNATURE for part in replayed):
+            return httpx.Response(400, json=_GEMINI_MISSING_SIGNATURE)
+        part: dict[str, Any] = (
+            {"text": "It is 18C and clear in Seoul."}
+            if replayed
+            else {
+                "functionCall": {"name": "get_weather", "args": {"city": "Seoul"}, "id": "c1"},
+                "thoughtSignature": _SIGNATURE,
+            }
+        )
+        reply = {
+            "candidates": [{"content": {"role": "model", "parts": [part]}, "finishReason": "STOP"}],
+            "usageMetadata": {"promptTokenCount": 5, "candidatesTokenCount": 5},
+        }
+        if "streamGenerateContent" in str(request.url):
+            return httpx.Response(200, text=f"data: {json.dumps(reply)}\n\n")
+        return httpx.Response(200, json=reply)
+
+
+async def _two_step_tool_turn(*, stream: bool) -> tuple[_SigningGemini, str | None]:
+    """A tool call and the request that replays it with its result, as an agent sends them."""
+    gemini = _SigningGemini()
+    connector = GeminiConnector(
+        model="gemini-3.8-flash", api_key="key", http_client=_make_mock_client(gemini)
+    )
+    asked = ChatMessage(role=MessageRole.USER, content="Weather in Seoul?")
+    tool = ToolDefinition(name="get_weather", description="Weather.", parameters={})
+    if stream:
+        calls: list[ToolCallRequest] = []
+        async for chunk in connector.stream(LLMRequest(messages=(asked,), tools=(tool,))):
+            calls.extend(chunk.tool_calls)
+    else:
+        first = await connector.generate(LLMRequest(messages=(asked,), tools=(tool,)))
+        calls = list(first.tool_calls)
+    [call] = calls
+    replay = (
+        asked,
+        ChatMessage(role=MessageRole.ASSISTANT, content=None, tool_calls=(call,)),
+        ChatMessage(
+            role=MessageRole.TOOL, name=call.name, tool_call_id=call.id, content="18C, clear"
+        ),
+    )
+    second = await connector.generate(LLMRequest(messages=replay, tools=(tool,)))
+    return gemini, second.content
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True], ids=["generate", "stream"])
+async def test_gemini_replays_a_function_calls_thought_signature(stream: bool) -> None:
+    """Gemini 3 refuses a replayed function call without the `thoughtSignature` it was issued
+    with (400 above, measured live on `gemini-3.8-flash`, #2227): every tool turn's second
+    request failed. The signature is kept on the call and sent back on its part.
+
+    Killed by: src/uclone_x/llm/connectors/gemini.py :: part["thoughtSignature"] = tc.signature
+    Becomes: pass
+    """
+    gemini, answer = await _two_step_tool_turn(stream=stream)
+    assert answer == "It is 18C and clear in Seoul."
+    assert gemini.bodies[1]["contents"][1]["parts"] == [
+        {
+            "functionCall": {"name": "get_weather", "args": {"city": "Seoul"}},
+            "thoughtSignature": _SIGNATURE,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_gemini_keeps_the_signature_from_the_part_it_came_on() -> None:
+    """Read from the response, on both paths.
+
+    Killed by: src/uclone_x/llm/connectors/gemini.py :: signature=_signature(part),
+    Becomes: signature=None,
+    Killed by: src/uclone_x/llm/connectors/gemini.py :: signature=_signature(p),
+    Becomes: signature=None,
+    """
+    for stream in (False, True):
+        gemini = _SigningGemini()
+        connector = GeminiConnector(
+            model="gemini-3.8-flash", api_key="key", http_client=_make_mock_client(gemini)
+        )
+        request = LLMRequest(messages=(ChatMessage(role=MessageRole.USER, content="?"),))
+        if stream:
+            calls = [c async for chunk in connector.stream(request) for c in chunk.tool_calls]
+        else:
+            calls = list((await connector.generate(request)).tool_calls)
+        assert [c.signature for c in calls] == [_SIGNATURE]
+
+
+@pytest.mark.asyncio
+async def test_a_call_without_a_signature_is_sent_without_one() -> None:
+    """A call no provider signed (another provider's, or Gemini 2) carries no
+    `thoughtSignature` key, not an empty one."""
+    contents = await _gemini_sent_contents(
+        ChatMessage(
+            role=MessageRole.ASSISTANT,
+            content=None,
+            tool_calls=(ToolCallRequest(id="call_1", name="read_file"),),
+        )
+    )
+    assert contents[0]["parts"] == [{"functionCall": {"name": "read_file", "args": {}}}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("thinking", "sent"), [(False, {"thinkingBudget": 0}), (None, None), (True, None)]
+)
+async def test_gemini_turns_thinking_off_when_a_request_asks(
+    thinking: bool | None, sent: dict[str, int] | None
+) -> None:
+    """`thinking=False` was not sent, so Gemini 3 thought through a short call's whole token
+    budget and returned no text (2026-10-11 live run, #2217).
+
+    Killed by: src/uclone_x/llm/connectors/gemini.py :: if request.thinking is False:
+    Becomes: if False:
+    """
+    body = await _gemini_sent_body_for(
+        LLMRequest(
+            messages=(ChatMessage(role=MessageRole.USER, content="hi"),),
+            max_tokens=500,
+            thinking=thinking,
+        )
+    )
+    assert body["generationConfig"].get("thinkingConfig") == sent
+
+
+# ======================================================================================
+# Turning thinking off, per model family (#2240)
+# ======================================================================================
+
+_THINKS_ALWAYS = {
+    "error": {
+        "code": 400,
+        "message": "Budget 0 is invalid. This model only works in thinking mode.",
+        "status": "INVALID_ARGUMENT",
+    }
+}
+
+
+_SOMETHING_ELSE = {
+    "error": {
+        "code": 400,
+        "message": "Request contains an invalid argument.",
+        "status": "INVALID_ARGUMENT",
+    }
+}
+
+
+class _FamilyGemini:
+    """A fake Gemini whose models answer `thinkingConfig` as the live ones did on 2026-10-11
+    (#2240): `pro` refuses `thinkingBudget: 0` with Google's 400 and takes `thinkingLevel`;
+    `flash` takes either. `refuse_all` refuses every thinking setting."""
+
+    def __init__(self, *, refuse_all: bool = False) -> None:
+        self.refuse_all = refuse_all
+        self.sent: list[tuple[str, Any]] = []
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        model = request.url.path.split("/models/")[1].split(":")[0]
+        thinking = json.loads(request.content)["generationConfig"].get("thinkingConfig")
+        self.sent.append((model, thinking))
+        refused = self.refuse_all or (model == "pro" and thinking == {"thinkingBudget": 0})
+        if refused and thinking is not None:
+            return httpx.Response(400, json=_THINKS_ALWAYS)
+        if model == "odd" and thinking is not None:
+            return httpx.Response(400, json=_SOMETHING_ELSE)
+        reply = {
+            "candidates": [
+                {"content": {"role": "model", "parts": [{"text": "Blue"}]}, "finishReason": "STOP"}
+            ],
+            "usageMetadata": {"promptTokenCount": 1, "candidatesTokenCount": 1},
+        }
+        if "streamGenerateContent" in str(request.url):
+            return httpx.Response(200, text=f"data: {json.dumps(reply)}\n\n")
+        return httpx.Response(200, json=reply)
+
+
+async def _auxiliary(connector: GeminiConnector, model: str, *, stream: bool) -> str:
+    """One auxiliary call: thinking off, as the extractor and the selector ask."""
+    request = LLMRequest(
+        model=model,
+        messages=(ChatMessage(role=MessageRole.USER, content="Sky colour?"),),
+        max_tokens=300,
+        thinking=False,
+    )
+    if stream:
+        return "".join([c.delta_content or "" async for c in connector.stream(request)])
+    return (await connector.generate(request)).content or ""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True], ids=["generate", "stream"])
+async def test_thinking_off_succeeds_on_a_model_that_only_thinks_and_on_one_that_can_stop(
+    stream: bool, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A Pro model refuses `thinkingBudget: 0` ("This model only works in thinking mode",
+    `gemini-3.1-pro-preview` live), so every auxiliary call of a clone on it failed. It is
+    asked once more at the lowest level, and from then on at that level; a flash model still
+    turns thinking off. The switch is logged, not silent.
+
+    Killed by: src/uclone_x/llm/connectors/gemini.py :: if not refusal or refusal not in body.lower():
+    Becomes: if True:
+    Killed by: src/uclone_x/llm/connectors/gemini.py :: _THINKING_STEP[key] = max(_THINKING_STEP.get(key, 0), step + 1)
+    Becomes: pass
+    Killed by: src/uclone_x/llm/connectors/gemini.py :: config, _ = _THINKING_OFF_STEPS[_THINKING_STEP.get(self._thinking_key(model), 0)]
+    Becomes: config, _ = _THINKING_OFF_STEPS[0]
+    """
+    gemini = _FamilyGemini()
+    connector = GeminiConnector(api_key="key", http_client=_make_mock_client(gemini))
+    with caplog.at_level(logging.INFO, logger="uclone_x.llm.connectors.gemini"):
+        assert await _auxiliary(connector, "pro", stream=stream) == "Blue"
+        assert await _auxiliary(connector, "pro", stream=stream) == "Blue"
+        assert await _auxiliary(connector, "flash", stream=stream) == "Blue"
+    assert gemini.sent == [
+        ("pro", {"thinkingBudget": 0}),
+        ("pro", {"thinkingLevel": "low"}),
+        ("pro", {"thinkingLevel": "low"}),
+        ("flash", {"thinkingBudget": 0}),
+    ]
+    assert any("pro refused thinkingConfig" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True], ids=["generate", "stream"])
+async def test_a_model_that_refuses_every_thinking_setting_fails_plainly_with_googles_answer(
+    stream: bool,
+) -> None:
+    """Asked once more and refused again: the failure is the plain one, with Google's status
+    and body kept for the log (#2227), and nothing is asked a third time."""
+    gemini = _FamilyGemini(refuse_all=True)
+    connector = GeminiConnector(api_key="key", http_client=_make_mock_client(gemini))
+    with pytest.raises(ProviderResponseError) as failed:
+        await _auxiliary(connector, "pro", stream=stream)
+    assert str(failed.value) == (
+        "Google returned an error UClone-X didn't recognise. If it happens again, check the "
+        "model name and any custom endpoint."
+    )
+    assert failed.value.status_code == 400
+    assert "only works in thinking mode" in (failed.value.body_excerpt or "")
+    assert [thinking for _, thinking in gemini.sent] == [
+        {"thinkingBudget": 0},
+        {"thinkingLevel": "low"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_what_a_model_refused_is_known_to_the_next_connector() -> None:
+    """A connector is made per seat and per call site; each one learning again cost one
+    refused request per Pro model (#2242 review). What a model at an address refused is the
+    model's, so it is kept for the process.
+
+    Killed by: src/uclone_x/llm/connectors/gemini.py :: _THINKING_STEP[key] = max(_THINKING_STEP.get(key, 0), step + 1)
+    Becomes: pass
+    """
+    gemini = _FamilyGemini()
+    first = GeminiConnector(api_key="key", http_client=_make_mock_client(gemini))
+    second = GeminiConnector(api_key="key", http_client=_make_mock_client(gemini))
+    other = GeminiConnector(
+        api_key="key",
+        base_url="https://proxy.example/v1beta",
+        http_client=_make_mock_client(gemini),
+    )
+    await _auxiliary(first, "pro", stream=False)
+    await _auxiliary(second, "pro", stream=False)
+    await _auxiliary(other, "pro", stream=False)
+    assert [thinking for _, thinking in gemini.sent] == [
+        {"thinkingBudget": 0},
+        {"thinkingLevel": "low"},
+        {"thinkingLevel": "low"},
+        {"thinkingBudget": 0},  # another address: not known there
+        {"thinkingLevel": "low"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_thinking_refusal_in_other_words_fails_plainly_and_is_logged(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A 400 to a thinking-off request whose words are none the steps know is not guessed
+    at: the call fails as before, and the log says a thinking setting was refused in words
+    not read (#2242 review), so a new wording is found from the log.
+
+    Killed by: src/uclone_x/llm/connectors/gemini.py :: "%s refused thinkingConfig %s for model %s in words not read as a step",
+    Becomes: "%s refused thinkingConfig %s for model %s",
+    """
+    gemini = _FamilyGemini()
+    connector = GeminiConnector(api_key="key", http_client=_make_mock_client(gemini))
+    with (
+        caplog.at_level(logging.INFO, logger="uclone_x.llm.connectors.gemini"),
+        pytest.raises(ProviderResponseError),
+    ):
+        await _auxiliary(connector, "odd", stream=False)
+    assert [thinking for _, thinking in gemini.sent] == [{"thinkingBudget": 0}]
+    assert any("in words not read as a step" in r.getMessage() for r in caplog.records)
+
+
+class _BarrierGemini(_FamilyGemini):
+    """`_FamilyGemini` whose answers to `thinkingBudget: 0` wait until two have arrived: two
+    first calls to one model in flight together, as two seats learning at once make."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.waiting = 0
+        self.both = asyncio.Event()
+
+    async def handle(self, request: httpx.Request) -> httpx.Response:
+        thinking = json.loads(request.content)["generationConfig"].get("thinkingConfig")
+        if thinking == {"thinkingBudget": 0}:
+            self.waiting += 1
+            if self.waiting == 2:
+                self.both.set()
+            await asyncio.wait_for(self.both.wait(), 5)
+        return self(request)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True], ids=["generate", "stream"])
+async def test_two_first_calls_at_once_to_a_model_that_only_thinks_both_succeed(
+    stream: bool,
+) -> None:
+    """Both refused `thinkingBudget: 0`; the first refusal moved the shared step on, and the
+    second, read against that step instead of what it had sent, failed plainly (#2265
+    review). Each refusal is read against the step its own request sent.
+
+    Killed by: src/uclone_x/llm/connectors/gemini.py :: (i for i, (config, _) in enumerate(_THINKING_OFF_STEPS) if config == sent), None
+    Becomes: (_THINKING_STEP.get(self._thinking_key(model), 0) for _ in (0,)), None
+    """
+    gemini = _BarrierGemini()
+    transport = httpx.MockTransport(gemini.handle)
+    first = GeminiConnector(api_key="key", http_client=httpx.AsyncClient(transport=transport))
+    second = GeminiConnector(api_key="key", http_client=httpx.AsyncClient(transport=transport))
+    answers = await asyncio.gather(
+        _auxiliary(first, "pro", stream=stream),
+        _auxiliary(second, "pro", stream=stream),
+        return_exceptions=True,
+    )
+    assert answers == ["Blue", "Blue"]
+    assert sorted(str(thinking) for _, thinking in gemini.sent) == sorted(
+        [str({"thinkingBudget": 0})] * 2 + [str({"thinkingLevel": "low"})] * 2
+    )

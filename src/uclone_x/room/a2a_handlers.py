@@ -339,7 +339,14 @@ class PersonaTaskHandler:
             return TaskResult(
                 task_id=message.task_id,
                 status=TaskStatus.FAILED,
-                output_data={"steps": agent.run_steps, "paths": [], "unnamed_writes": True},
+                output_data={
+                    "steps": agent.run_steps,
+                    "paths": [],
+                    "unnamed_writes": True,
+                    # The same plain record a failed turn leaves; the cause is logged above
+                    # (#2234). No turn ended, so there is no stop reason.
+                    "failure": {"stop_reason": None, "message": "It ran into a problem."},
+                },
                 error=f"{persona.name} ran into a problem and could not finish.",
                 provenance=_handler_provenance(persona.name),
             )
@@ -365,7 +372,16 @@ class PersonaTaskHandler:
             out_of_steps = turn.stop_reason == _STEP_CEILING or (
                 not turn.error and not turn.is_completed
             )
-            reason = "it ran out of steps" if out_of_steps else "it could not finish"
+            reason = "it ran out of steps" if out_of_steps else _plain_reason(turn)
+            output["failure"] = _failure(turn, reason)
+            logger.warning(
+                "a2a: %s stopped before finishing a task for %s (stop %s): %s",
+                persona.name,
+                message.sender_agent_id,
+                turn.stop_reason,
+                turn.error,
+                extra={"session_id": message.session_id},
+            )
             return TaskResult(
                 task_id=message.task_id,
                 status=TaskStatus.FAILED,
@@ -379,6 +395,39 @@ class PersonaTaskHandler:
             output_data=output,
             provenance=turn.provenance,
         )
+
+
+def _plain_reason(turn: TurnResult) -> str:
+    """Why the called agent stopped, as the caller can be told it (#2227).
+
+    A provider's failure has a sentence written to be shown (`ProviderFailure.message`);
+    any other failure's `error` may name internals, so it is said generically and kept in
+    the record (`_failure`) and the server log instead. The bare "it could not finish" was
+    all the caller got on 2026-10-10, for a Gemini error every tool turn hit.
+    """
+    if turn.provider_failure is not None:
+        return turn.provider_failure.message.rstrip(".")
+    return "it could not finish"
+
+
+def _failure(turn: TurnResult, reason: str) -> dict[str, Any]:
+    """What the caller's tool result record keeps of a called agent's failure (#2227): its
+    stop reason and plain sentence, and what the provider answered, when it did. The called
+    agent's own session is a temporary folder, gone when the task ends.
+
+    Without a provider failure the sentence is `reason`, the one the caller was told: the
+    raw `error` may name an exception class, a path or an internal id, so it goes to the
+    server log only (#2234)."""
+    failure = turn.provider_failure
+    if failure is None:
+        return {"stop_reason": turn.stop_reason, "message": f"{reason[:1].upper()}{reason[1:]}."}
+    return {
+        "stop_reason": turn.stop_reason,
+        "provider_kind": failure.kind.value,
+        "message": failure.message,
+        "provider_status": failure.status_code,
+        "provider_body": failure.body_excerpt,
+    }
 
 
 def register_persona_handlers(

@@ -3,6 +3,8 @@ import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { TurnDetail } from './TurnDetail';
 import type { EventEnvelope, RoomState, RoomTranscriptMessage } from '../../types';
 import { OpenInDocsContext, type TurnSummary } from '../../lib/roomDock';
+import { LocaleProvider } from '../../i18n';
+import { englishFragments, visibleWords } from '../../test/leftoverEnglish';
 
 const message = (over: Partial<RoomTranscriptMessage> = {}): RoomTranscriptMessage => ({
   seq: 1,
@@ -92,7 +94,7 @@ describe('TurnDetail', () => {
     expect(screen.getByTestId('turn-detail-served')).toHaveTextContent('ollama:qwen3:8b');
   });
 
-  // Killed by: frontend/src/components/layout/TurnDetail.tsx :: This turn reported no model, so none is named here.
+  // Killed by: frontend/src/components/layout/TurnDetail.tsx :: {copy.model.none}
   // Becomes: {''}
   it('says a turn reported no model, and why none is named, rather than showing a blank', () => {
     render(
@@ -146,7 +148,7 @@ describe('TurnDetail', () => {
     expect(screen.getByTestId('turn-detail-path')).toHaveTextContent('failover');
   });
 
-  // Killed by: frontend/src/components/layout/TurnDetail.tsx :: {attempts.length > 0 ? (
+  // Killed by: frontend/src/components/layout/TurnDetail.tsx :: {showRecord && attempts.length > 0 ? (
   // Becomes: {false ? (
   it('shows the attempts that did not answer, which nothing rendered before', () => {
     render(
@@ -226,7 +228,7 @@ describe('TurnDetail', () => {
     expect(screen.getByText('Chosen by')).toBeDefined();
   });
 
-  // Killed by: frontend/src/components/layout/TurnDetail.tsx :: Nobody chose this speaker: the turn records no selection.
+  // Killed by: frontend/src/components/layout/TurnDetail.tsx :: {copy.record.noDecision}
   // Becomes: {''}
   it('says nobody chose the speaker rather than leaving the field blank', () => {
     render(<TurnDetail seq={1} room={room([message({ decision: null })])} />);
@@ -326,7 +328,7 @@ describe('TurnDetail', () => {
     // Row 1: File Mutation
     expect(stepRows[0]).toHaveTextContent('File Mutation: main.py');
     expect(stepRows[0]).toHaveTextContent('1.3s');
-    expect(stepRows[0]).toHaveTextContent('success');
+    expect(stepRows[0]).toHaveTextContent('done');
 
     // Row 2: Subagent helper
     expect(stepRows[1]).toHaveTextContent(
@@ -364,7 +366,7 @@ describe('TurnDetail', () => {
     expect(onOpen).toHaveBeenCalledWith('docs/guide.md');
 
     expect(screen.getByTestId('turn-detail-unnamed-writes')).toHaveTextContent(
-      'Also wrote 3 file(s) without a name.',
+      'May also have written 3 files it did not name.',
     );
   });
 
@@ -504,8 +506,8 @@ describe('TurnDetail', () => {
     expect(containerText).not.toMatch(/bash_run/);
   });
 
-  // Killed by: frontend/src/components/layout/TurnDetail.tsx :: ) : summary.provider_failure && providerFailureRemedy(summary.provider_failure.kind) ? (
-  // Becomes: ) : false ? (
+  // Killed by: frontend/src/components/layout/TurnDetail.tsx :: providerFailureRemedy(summary.provider_failure.kind, outcomeCopy) ? (
+  // Becomes: false ? (
   it('says where to act on a provider failure a retry can cure, as the room row does (#1630)', () => {
     const plain = "Couldn't reach Google. Check your internet connection.";
     render(
@@ -803,6 +805,158 @@ describe('TurnDetail', () => {
 
       expect(screen.queryByTestId('turn-copy-id')).toBeNull();
       expect(screen.queryByTestId('turn-chip-copy-id')).toBeNull();
+    });
+  });
+
+  /**
+   * The turn a provider error ended, as the Core records it (#2229, room_541b39e7bf16): the
+   * core's error handler writes `path: failover`, `served_by: agent.core:error_handler`,
+   * `degraded: true`, an attempt with the exception class, and -- in records written before
+   * the fix -- the clone's id where the connection belongs. Its failed `a2a_call` was
+   * counted as a possible unnamed write.
+   */
+  describe('a turn that ended in a provider error (#2229)', () => {
+    const errored = (over: Partial<TurnSummary> = {}): TurnSummary =>
+      defaultSummary({
+        error: "Google returned an error UClone-X didn't recognise.",
+        provider_failure: {
+          kind: 'provider_error',
+          message: "Google returned an error UClone-X didn't recognise.",
+          retryable: true,
+          provider: 'Google',
+          clone: null,
+          model_ref: null,
+          action: null,
+        },
+        provenance: {
+          path: 'failover',
+          requested: { provider: 'agt_774ca8e64b70440198f9aa199eeb941c', model: 'gemini-3.8-flash' },
+          served_by: { provider: 'agent.core', model: 'error_handler' },
+          attempts: [
+            {
+              provider: 'agt_774ca8e64b70440198f9aa199eeb941c',
+              model: 'gemini-3.8-flash',
+              error_class: 'LLMStreamInterruptedError',
+              status_code: null,
+            },
+          ],
+          degraded: true,
+        },
+        notable: ['ended_in_error'],
+        steps: [
+          {
+            turn_id: 'turn_101',
+            participant_id: 'scout',
+            tool_name: 'a2a_call',
+            tool_call_id: 'call_0',
+            status: 'error',
+            error: 'scout stopped before finishing: it could not finish.',
+            duration_ms: 3659,
+            arguments_preview: '{"agent": "scout2", "task": "Search the news."}',
+            output_preview: '',
+            truncated: false,
+            written_path: null,
+            wrote_unnamed: false,
+            subagent_id: null,
+            recorded_at: '2026-10-11T03:44:20Z',
+            seq: 1,
+          },
+        ],
+        unnamed_writes: 0,
+        ...over,
+      });
+
+    // Killed by: frontend/src/components/layout/TurnDetail.tsx :: const showRecord = devMode || !endedInError;
+    // Becomes: const showRecord = true;
+    it('says in plain words that the clone could not finish, with no internals', () => {
+      render(
+        <TurnDetail seq={1} room={room([message()])} summary={errored()} developerMode={false} />,
+      );
+      const words = visibleWords(screen.getByTestId('turn-detail'));
+
+      expect(screen.getByTestId('turn-detail-error')).toHaveTextContent(/Google/);
+      expect(screen.getByTestId('turn-detail-no-answer')).toHaveTextContent(
+        'gemini-3.8-flash did not answer: the turn ended in an error.',
+      );
+      for (const internal of [
+        /substitut/i,
+        /failover/i,
+        /agt_/,
+        /agent\.core/,
+        /error_handler/,
+        /LLMStreamInterruptedError/,
+        /Answered by/,
+      ]) {
+        expect(words).not.toMatch(internal);
+      }
+      expect(screen.queryByTestId('turn-detail-unnamed-writes')).toBeNull();
+      // The model line says it once; the notable box would say it again.
+      expect(screen.queryByTestId('turn-detail-notable')).toBeNull();
+    });
+
+    // Killed by: frontend/src/components/layout/TurnDetail.tsx :: const endedInError = summary.notable.includes('ended_in_error');
+    // Becomes: const endedInError = false;
+    it('shows the record in developer mode, labelled as an error rather than a substitution', () => {
+      render(
+        <TurnDetail seq={1} room={room([message()])} summary={errored()} developerMode={true} />,
+      );
+      const words = visibleWords(screen.getByTestId('turn-detail'));
+
+      expect(screen.getByTestId('turn-detail-notable')).toHaveTextContent(
+        'Ended in an error: no model answered, and nothing was used in its place.',
+      );
+      expect(words).not.toMatch(/substitut/i);
+      expect(words).not.toMatch(/Answered by/);
+      expect(screen.getByTestId('turn-detail-attempts')).toHaveTextContent('LLMStreamInterruptedError');
+      expect(screen.getByTestId('turn-detail-path')).toHaveTextContent('failover');
+    });
+
+    // Killed by: frontend/src/components/layout/TurnDetail.tsx :: Boolean(error) && path === 'failover';
+    // Becomes: false;
+    it('builds the same reading before the summary arrives, from the transcript row alone', () => {
+      const { provenance, error, provider_failure } = errored();
+      render(
+        <TurnDetail
+          seq={1}
+          room={room([message({ content: '', error, provider_failure, provenance })])}
+          developerMode={false}
+        />,
+      );
+
+      expect(screen.getByTestId('turn-detail-no-answer')).toBeDefined();
+      expect(visibleWords(screen.getByTestId('turn-detail'))).not.toMatch(/substitut/i);
+    });
+
+    // Killed by: frontend/src/components/layout/TurnDetail.tsx :: {plural(copy.changed.unnamed, summary.unnamed_writes)}
+    // Becomes: {`Also wrote ${summary.unnamed_writes} file(s) without a name.`}
+    it('says a possible unnamed write is possible, never that it happened', () => {
+      render(
+        <TurnDetail
+          seq={1}
+          room={room([message()])}
+          summary={defaultSummary({ unnamed_writes: 1 })}
+          developerMode={false}
+        />,
+      );
+
+      expect(screen.getByTestId('turn-detail-unnamed-writes')).toHaveTextContent(
+        'May also have written 1 file it did not name.',
+      );
+    });
+
+    it('reads in Korean on a Korean screen, with no English template words left', async () => {
+      render(
+        <LocaleProvider hints={['ko-KR']}>
+          <TurnDetail seq={1} room={room([message()])} summary={errored()} developerMode={false} />
+        </LocaleProvider>,
+      );
+      const panel = await screen.findByTestId('turn-detail');
+
+      expect(screen.getByTestId('turn-detail-no-answer')).toHaveTextContent(
+        'gemini-3.8-flash 모델이 답하지 못했습니다. 턴이 오류로 끝났습니다.',
+      );
+      const words = visibleWords(panel);
+      expect(englishFragments(['turnDetail']).filter((f) => words.includes(f))).toEqual([]);
     });
   });
 });

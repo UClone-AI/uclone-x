@@ -6,8 +6,11 @@ Two views of one point, and no third:
   these and nothing else.
 - **approved and proposed** (`proposed=True`): what it believes and what is waiting for a
   decision, for a check that must see a change before a person approves it (a death a
-  scene wrote, still a proposal). A proposed edge stays `proposed` in the result, so the
-  caller can tell the two apart.
+  scene wrote, still a proposal). It is the vessel as it would be with every pending
+  proposal made: a proposed change, or a proposed removal, ends the value it replaces
+  here (`Edge.proposed_valid`), so one point holds one value per change and never the old
+  value beside the new. A proposed edge stays `proposed` in the result, so the caller can
+  tell the two apart.
 
 A `retracted` edge, and an edge whose belief has ended (`expired_at`), is in neither.
 """
@@ -45,7 +48,11 @@ def holds_at(edge: Edge, axis: Axis, point: Position, *, proposed: bool = False)
     """Whether `edge` is in the view of `point` on `axis`: believed (or, with `proposed`,
     waiting for a decision), unexpired, and valid there."""
     wanted = APPROVED_OR_PROPOSED if proposed else APPROVED
-    return edge.status in wanted and edge.expired_at is None and edge.valid.contains(axis, point)
+    return (
+        edge.status in wanted
+        and edge.expired_at is None
+        and edge.valid_in(proposed=proposed).contains(axis, point)
+    )
 
 
 def edges_at(

@@ -65,6 +65,13 @@ class EntityResolver:
                 if key:
                     self._index.setdefault(key, []).append(entity.id)
 
+    def names_of(self, entity_id: str) -> tuple[str, ...]:
+        """The names `entity_id` goes by in this scope: its name and its aliases (#2238)."""
+        for entity in self._entities:
+            if entity.id == entity_id:
+                return (entity.name, *entity.aliases)
+        return ()
+
     def resolve(self, name: str) -> EntityRef:
         key = name_key(name)  # stage 1
         if not key:

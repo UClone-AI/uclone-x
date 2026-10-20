@@ -1,7 +1,7 @@
 """The codex grows from each written scene, as proposals a person decides (§1.1 row 7).
 
 `story_manuscript write` reads every saved scene once more for what it adds to the codex
-(`uclone_x.story.enrich`). A fake model stands in for the reading; everything after the
+(`uclone_x_story.enrich`). A fake model stands in for the reading; everything after the
 reply is code, and that is what these pin, in order of what it would cost to get wrong:
 
 * **Nothing is applied**: every addition is a pending proposal, and the codex files are
@@ -21,12 +21,12 @@ from typing import Any
 
 import yaml
 
-from uclone_x.story.enrich import ENRICH_MARKER
-from uclone_x.story.library import StoryLibrary
-from uclone_x.story.tool import StoryLibraryTool
-from uclone_x.story.tools import StoryManuscriptTool, StoryOutlineTool
-from uclone_x.story.work import StoryWork
 from uclone_x.tools.models import REPLY_NOTE_KEY, NoIsolation, ToolContext
+from uclone_x_story.enrich import ENRICH_MARKER
+from uclone_x_story.library import StoryLibrary
+from uclone_x_story.tool import StoryLibraryTool
+from uclone_x_story.tools import StoryManuscriptTool, StoryOutlineTool
+from uclone_x_story.work import StoryWork
 
 ROOM = "room_a"
 
@@ -164,12 +164,12 @@ class TestAScenesAdditionsBecomeProposals:
     async def test_a_new_character_is_a_new_entry_proposal_and_the_codex_is_untouched(
         self, tmp_path: Path
     ) -> None:
-        """Killed by: src/uclone_x/story/enrich.py :: result.proposed.append(work.add_proposal(draft, room_id=room_id))
+        """Killed by: examples/story/src/uclone_x_story/enrich.py :: result.proposed.append(work.add_proposal(draft, room_id=room_id))
         Becomes: pass
         """
         story_id, ctx = await _story(tmp_path)
         before = _codex_files(tmp_path, story_id)
-        out = await _write(ctx, FakeModel({"new": [ILSA], "changes": []}))
+        out = await _write(ctx, FakeModel({"new": [ILSA], "facts": []}))
         assert out["codex_growth"]["proposed"] == ["p001"]
         [proposal] = _pending(tmp_path, story_id)
         assert proposal["kind"] == "characters"
@@ -181,11 +181,11 @@ class TestAScenesAdditionsBecomeProposals:
     async def test_a_death_with_its_quote_is_a_progression_at_the_scene(
         self, tmp_path: Path
     ) -> None:
-        """Killed by: src/uclone_x/story/enrich.py :: return "status", "dead"
+        """Killed by: examples/story/src/uclone_x_story/enrich.py :: return "status", "dead"
         Becomes: return None
         """
         story_id, ctx = await _story(tmp_path)
-        await _write(ctx, FakeModel({"new": [], "changes": [DEATH]}))
+        await _write(ctx, FakeModel({"new": [], "facts": [DEATH]}))
         [proposal] = _pending(tmp_path, story_id)
         assert proposal["entry_id"] == "mara"
         assert proposal["change"]["progression"]["at"] == "ch01.s02"
@@ -195,7 +195,7 @@ class TestAScenesAdditionsBecomeProposals:
 
     async def test_the_person_is_told_in_plain_words_where_to_decide(self, tmp_path: Path) -> None:
         _, ctx = await _story(tmp_path)
-        out = await _write(ctx, FakeModel({"new": [ILSA], "changes": [DEATH]}))
+        out = await _write(ctx, FakeModel({"new": [ILSA], "facts": [DEATH]}))
         note = out[REPLY_NOTE_KEY]
         assert "2건" in note["ko"] and "이야기 보기에서 승인" in note["ko"]
         assert note["ko"].endswith("니다.")
@@ -205,45 +205,47 @@ class TestAScenesAdditionsBecomeProposals:
 
 class TestWhatIsNotProposed:
     async def test_a_quote_the_scene_does_not_have_proposes_nothing(self, tmp_path: Path) -> None:
-        """Killed by: src/uclone_x/story/enrich.py :: if not quote_found(quote, self.text):
+        """Killed by: src/uclone_x/knowledge/extraction.py :: if not quote_found(fact.quote, text):
+        Becomes: if False:
+        Killed by: examples/story/src/uclone_x_story/enrich.py :: if not quote_found(quote, self.text) or folded(name) not in folded(self.text):
         Becomes: if False:
         """
         story_id, ctx = await _story(tmp_path)
         made_up = {**DEATH, "quote": "Mara was buried beneath the old oak"}
         ghost = {**ILSA, "name": "Borin", "quote": "Borin the smith sharpened his axe"}
-        out = await _write(ctx, FakeModel({"new": [ghost], "changes": [made_up]}))
+        out = await _write(ctx, FakeModel({"new": [ghost], "facts": [made_up]}))
         assert _pending(tmp_path, story_id) == []
-        assert out["codex_growth"]["dropped"] == {"quote_not_in_scene": 2}
+        assert out["codex_growth"]["dropped"] == {"quote_not_in_text": 2}
         assert REPLY_NOTE_KEY not in out
 
     async def test_a_real_line_about_someone_else_proposes_no_change(self, tmp_path: Path) -> None:
         """qwen3:8b proposed a death from "a scream was heard", a line that names no one.
 
-        Killed by: src/uclone_x/story/enrich.py :: if not self.names_subject(subject, quote):
+        Killed by: examples/story/src/uclone_x_story/enrich.py :: if not self.names_subject(subject, fact.quote):
         Becomes: if False:
         """
         story_id, ctx = await _story(tmp_path)
         elsewhere = {**DEATH, "quote": "with a bow on her back"}
-        out = await _write(ctx, FakeModel({"new": [], "changes": [elsewhere]}))
+        out = await _write(ctx, FakeModel({"new": [], "facts": [elsewhere]}))
         assert _pending(tmp_path, story_id) == []
         assert out["codex_growth"]["dropped"] == {"subject_not_named": 1}
 
     async def test_what_the_codex_has_or_a_proposal_waits_on_is_not_proposed_again(
         self, tmp_path: Path
     ) -> None:
-        """Killed by: src/uclone_x/story/enrich.py :: if clash is not None:
+        """Killed by: examples/story/src/uclone_x_story/enrich.py :: if clash is not None:
         Becomes: if False:
-        Killed by: src/uclone_x/story/enrich.py :: if (subject, pending_key, repr(new_value)) in self.pending_sets:
+        Killed by: examples/story/src/uclone_x_story/enrich.py :: if status in after:
         Becomes: if False:
         """
         story_id, ctx = await _story(tmp_path)
         known = {**ILSA, "name": "Mara", "quote": "Mara lifted the brass lantern"}
-        await _write(ctx, FakeModel({"new": [known, ILSA], "changes": [DEATH]}))
+        await _write(ctx, FakeModel({"new": [known, ILSA], "facts": [DEATH]}))
         assert [p["id"] for p in _pending(tmp_path, story_id)] == ["p001", "p002"]
         # The same scene written again: Ilsa and the death already wait for a person.
         written = StoryWork(StoryLibrary(tmp_path), story_id).manuscript("ch01.s02")
         assert written is not None
-        again = FakeModel({"new": [ILSA], "changes": [DEATH]})
+        again = FakeModel({"new": [ILSA], "facts": [DEATH]})
         out = await _write(ctx, again, digest=written.digest)
         assert out["codex_growth"]["proposed"] == []
         assert out["codex_growth"]["dropped"] == {"already_known": 1, "already_pending": 1}
@@ -252,7 +254,7 @@ class TestWhatIsNotProposed:
     async def test_what_contradicts_the_codex_is_left_to_the_continuity_check(
         self, tmp_path: Path
     ) -> None:
-        """Killed by: src/uclone_x/story/enrich.py :: if other in have:
+        """Killed by: examples/story/src/uclone_x_story/enrich.py :: if have is not None:
         Becomes: if False:
         """
         story_id, ctx = await _story(tmp_path)
@@ -264,14 +266,14 @@ class TestWhatIsNotProposed:
             "value": "husband",
             "quote": "Doyun wept over his wife Mara",
         }
-        out = await _write(ctx, FakeModel({"new": [], "changes": [husband]}), text)
+        out = await _write(ctx, FakeModel({"new": [], "facts": [husband]}), text)
         assert _pending(tmp_path, story_id) == []
         assert out["codex_growth"]["dropped"] == {"contradicts_codex": 1}
 
     async def test_a_remembered_death_is_not_a_change_now(self, tmp_path: Path) -> None:
         story_id, ctx = await _story(tmp_path)
         remembered = {**DEATH, "time": "past"}
-        out = await _write(ctx, FakeModel({"new": [], "changes": [remembered]}))
+        out = await _write(ctx, FakeModel({"new": [], "facts": [remembered]}))
         assert _pending(tmp_path, story_id) == []
         assert out["codex_growth"]["dropped"] == {"not_in_the_present": 1}
 
@@ -280,11 +282,11 @@ class TestItRunsOnTheWrite:
     async def test_the_write_reads_the_saved_scene_without_the_model_asking(
         self, tmp_path: Path
     ) -> None:
-        """Killed by: src/uclone_x/story/tools.py :: await self._grow(result, params, context)
+        """Killed by: examples/story/src/uclone_x_story/tools.py :: await self._grow(result, params, context)
         Becomes: pass
         """
         _, ctx = await _story(tmp_path)
-        model = FakeModel({"new": [], "changes": []})
+        model = FakeModel({"new": [], "facts": []})
         out = await _write(ctx, model)
         [prompt] = model.prompts
         assert prompt.startswith(ENRICH_MARKER)
@@ -322,8 +324,8 @@ class TestAFamilyRelationIsProposedAsARelation:
     ) -> None:
         """The relation goes to the entry's `relations:`, never to a state key.
 
-        Killed by: src/uclone_x/story/enrich.py :: pending_key, change = _relation_key(other), {"relations": {other: role}}
-        Becomes: pending_key, change = _relation_key(other), {"set": {other: role}}
+        Killed by: examples/story/src/uclone_x_story/enrich.py :: staged_key, change, new_value = f"relations.{other}", {"relations": {other: role}}, role
+        Becomes: staged_key, change, new_value = f"relations.{other}", {"set": {other: role}}, role
         """
         story_id, ctx = await _story(tmp_path)
         mother = {
@@ -333,7 +335,7 @@ class TestAFamilyRelationIsProposedAsARelation:
             "value": "mother",
             "quote": self.QUOTE,
         }
-        await _write(ctx, FakeModel({"new": [], "changes": [mother]}), self.TEXT)
+        await _write(ctx, FakeModel({"new": [], "facts": [mother]}), self.TEXT)
         [proposal] = _pending(tmp_path, story_id)
         assert proposal["entry_id"] == "mara"
         assert proposal["change"]["progression"] == {
@@ -352,15 +354,15 @@ class TestANewCharactersFamilyIsProposedOnBothSides:
     async def test_the_new_entry_and_its_relative_both_hold_the_kinship(
         self, tmp_path: Path
     ) -> None:
-        """Killed by: src/uclone_x/story/enrich.py :: entry["relations"] = {other: role for other, role, _ in family}
+        """Killed by: examples/story/src/uclone_x_story/enrich.py :: entry["relations"] = {other: role for other, role, _ in family}
         Becomes: pass
-        Killed by: src/uclone_x/story/enrich.py :: inverse = INVERSE_ROLE[role]
+        Killed by: examples/story/src/uclone_x_story/enrich.py :: inverse = INVERSE_ROLE[role]
         Becomes: inverse = role
         """
         story_id, ctx = await _story(tmp_path)
         before = _codex_files(tmp_path, story_id)
         daughter = {**ILSA, "family": {"doyun": "daughter"}, "quote": self.QUOTE}
-        out = await _write(ctx, FakeModel({"new": [daughter], "changes": []}), self.TEXT)
+        out = await _write(ctx, FakeModel({"new": [daughter], "facts": []}), self.TEXT)
         new, back = _pending(tmp_path, story_id)
         assert new["change"]["new_entry"]["state"] == {"status": "alive"}
         assert new["change"]["new_entry"]["relations"] == {"doyun": "child"}
@@ -378,14 +380,14 @@ class TestANewCharactersFamilyIsProposedOnBothSides:
     ) -> None:
         """The new character is still proposed, without the relation, and the drop counted.
 
-        Killed by: src/uclone_x/story/enrich.py :: if word is None or not names_family(quote):
+        Killed by: examples/story/src/uclone_x_story/enrich.py :: if word is None or not names_family(quote):
         Becomes: if word is None:
-        Killed by: src/uclone_x/story/enrich.py :: if other is None or other == entry_id or self.kinds.get(other) != "characters":
+        Killed by: examples/story/src/uclone_x_story/enrich.py :: if other is None or other == entry_id or self.store.kind_of(other) != "characters":
         Becomes: if other is None or other == entry_id:
         """
         story_id, ctx = await _story(tmp_path)
         unnamed = {**ILSA, "family": {"mara": "sister", "lantern": "sister"}}
-        out = await _write(ctx, FakeModel({"new": [unnamed], "changes": []}))
+        out = await _write(ctx, FakeModel({"new": [unnamed], "facts": []}))
         [new] = _pending(tmp_path, story_id)
         assert new["change"]["new_entry"]["state"] == {"status": "alive"}
         assert "relations" not in new["change"]["new_entry"]

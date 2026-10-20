@@ -83,6 +83,12 @@ class ToolCallRequest(BaseModel):
     id: str
     name: str
     arguments: ImmutableJsonMapping = Field(default_factory=dict)
+    #: The provider's opaque token for this call, sent back with it when the call is
+    #: replayed, or `None` when the provider gave none. Gemini 3 signs a function call
+    #: (`thoughtSignature`) and refuses a request that replays the call without it, so a
+    #: tool turn's second request failed until it was kept (#2227). It is kept through the
+    #: session log, a reload and compaction, as the call is; nothing reads its contents.
+    signature: str | None = None
 
 
 class RenderedFrom(BaseModel):

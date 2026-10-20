@@ -108,6 +108,7 @@ const overview = (over: Partial<StoryOverview> = {}): StoryOverview => ({
           aliases: ['the courier'],
           profile: 'A courier.',
           state: { has_map: true },
+          relations: {},
           progressions: [],
           looks: ['red coat'],
         },
@@ -465,6 +466,7 @@ const boardStory = (): StoryOverview => {
           scenes: [
             {
               ...chapter.scenes[0],
+              illustration: '/api/artifacts/content?path=artifacts/sess_1/images/ch01_s01.png',
               entries: [
                 { kind: 'characters', id: 'mara', name: 'Mara', how: 'listed', in_codex: true },
                 { kind: 'characters', id: 'ivo', name: 'Ivo', how: 'listed', in_codex: false },
@@ -500,7 +502,7 @@ const boardStory = (): StoryOverview => {
         kind: 'threads',
         label: 'Threads',
         entries: [
-          { id: 'the-map', name: 'The map', aliases: [], profile: '', state: {}, progressions: [], looks: null },
+          { id: 'the-map', name: 'The map', aliases: [], profile: '', state: {}, relations: {}, progressions: [], looks: null },
         ],
       },
     ],
@@ -517,6 +519,8 @@ describe('StoryView, the story board (§1.1 row 5)', () => {
   it("marks each chapter's function and twist, and each scene written or planned", async () => {
     // Killed by: frontend/src/components/artifacts/StoryView.tsx :: ...chapter.functions.map((f) => functions[f]).filter((f): f is string => Boolean(f)),
     // Becomes: ...chapter.functions,
+    // Killed by: frontend/src/components/artifacts/StoryView.tsx :: src={scene.illustration}
+    // Becomes: src=""
     answers[SHOW] = ok(boardStory());
     renderView();
 
@@ -528,6 +532,11 @@ describe('StoryView, the story board (§1.1 row 5)', () => {
     // A function the screen has no word for is the arc's code, and is not shown.
     expect(marks).not.toHaveTextContent('no-such-function');
     expect(within(scene('ch01.s01')).getByTestId('story-scene-state')).toHaveTextContent(STORY.board.written);
+    expect(within(scene('ch01.s01')).getByTestId('story-scene-illustration')).toHaveAttribute(
+      'src',
+      '/api/artifacts/content?path=artifacts/sess_1/images/ch01_s01.png',
+    );
+    expect(within(scene('ch01.s02')).queryByTestId('story-scene-illustration')).toBeNull();
     expect(within(scene('ch01.s03')).getByTestId('story-scene-state')).toHaveTextContent(STORY.board.planned);
   });
 
@@ -661,5 +670,54 @@ describe('StoryView, the story board (§1.1 row 5)', () => {
     const notice = await screen.findByTestId('story-view-notice');
     expect(notice).toHaveTextContent(ko.dock.story.refusals.writer_busy);
     expect(notice).not.toHaveTextContent(english);
+  });
+});
+
+describe('StoryView: what an entry is to others, and what each scene changed (#2332, #2346)', () => {
+  it('shows relations and changes by name, with the quote an applied change rests on, read-only', async () => {
+    // Killed by: frontend/src/components/artifacts/StoryView.tsx :: <EntryGraph entry={e} names={names} scenes={scenes} quotes={quotes} t={t} />
+    // Becomes: {null}
+    // Killed by: frontend/src/components/artifacts/StoryView.tsx :: const nameOf = (id: string): string => names.get(id) ?? id;
+    // Becomes: const nameOf = (id: string): string => id;
+    // Killed by: frontend/src/components/artifacts/StoryView.tsx :: const propQuotes = typeof p.proposal === 'string' ? quotes.get(p.proposal) : undefined;
+    // Becomes: const propQuotes = undefined;
+    const story = overview();
+    story.codex = [
+      {
+        kind: 'characters',
+        label: 'Characters',
+        entries: [
+          { ...story.codex[0].entries[0] },
+          {
+            id: 'vane',
+            name: 'Lord Vane',
+            aliases: [],
+            profile: '',
+            state: {},
+            relations: { mara: 'brother' },
+            progressions: [
+              { at: 'ch01.s02', set: { wounded: true }, relations: { mara: null }, proposal: 'p-000' },
+              { at: 'ch01.s01', set: { armed: true } },
+            ],
+            looks: null,
+          },
+        ],
+      },
+    ];
+    answers[SHOW] = ok(story);
+    renderView();
+
+    const vane = (await screen.findAllByTestId('story-entry')).find(
+      (li) => li.getAttribute('data-entry') === 'vane',
+    );
+    expect(vane).toBeDefined();
+    expect(within(vane!).getByTestId('story-entry-relations')).toHaveTextContent('Is: brother of Mara');
+    const changes = within(vane!).getAllByTestId('story-entry-change');
+    expect(changes[0]).toHaveTextContent(
+      'From “The platform”: wounded: true, no longer anything to Mara (“The map slid under the seat.”, “She had no map now.”)',
+    );
+    expect(changes[1]).toHaveTextContent('From “The ticket”: armed: true');
+    expect(vane!.textContent).not.toMatch(/ch01\.s02|mara\b|p-000/);
+    expect(within(vane!).queryByRole('button')).toBeNull();
   });
 });

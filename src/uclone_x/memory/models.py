@@ -186,12 +186,25 @@ class MemoryFact(BaseModel):
         default=None,
         description="ID of a prior fact this fact contradicts or supersedes.",
     )
+    superseded_by: str | None = Field(
+        default=None,
+        description="The fact that replaced this one, once one did (#2332). `None` on a fact "
+        "still current, on one a person forgot, and on one replaced before this was kept.",
+    )
     valid_until: str | None = Field(
         default=None,
         description="UTC ISO 8601 time the fact stopped holding, when the person said so "
         '("until last year"). `None` for a fact with no stated end. A fact with an end is '
         "history: it is listed and shown with its end, is not worked out from, and neither "
         "supersedes nor is superseded by another fact on the same subject and predicate.",
+    )
+    single_valued: bool = Field(
+        default=True,
+        description="Whether the subject holds one value of this predicate at a time (where "
+        "someone lives, their job), so a new value replaces the old, or several at once "
+        "(things they like, languages they speak), so each stays (#2224). Whoever states the "
+        "fact says which: the extracting model, or the model saving it. Only the newer fact's "
+        "answer is read (`conflicts_with`).",
     )
     tags: tuple[str, ...] = Field(
         default_factory=tuple,
@@ -212,10 +225,13 @@ class MemoryFact(BaseModel):
         return v
 
     def conflicts_with(self, other: MemoryFact) -> bool:
-        """Determine if this fact conflicts with another active fact.
+        """Whether `other`, a newer fact, replaces this active one.
 
-        A conflict occurs when two active facts share the same subject and predicate but
-        assert different object values. Subject and predicate are compared folded
+        It does when the two share the subject and predicate, assert different values, and
+        `other` holds one value at a time (`single_valued`). A newer fact that holds
+        alongside others ("prefers jazz", then "prefers Korean") replaces nothing (#2224).
+        The newer fact's answer is the one read: it is the latest word on the predicate.
+        Subject and predicate are compared folded
         (`fold_name`, NFC included), so a subject stored decomposed before #1895 still
         meets the composed form a model writes now (#1893).
         """
@@ -224,6 +240,8 @@ class MemoryFact(BaseModel):
         if self.valid_until is not None or other.valid_until is not None:
             return False  # a stated end makes it history, which a current value does not replace
         if self.fact_id == other.fact_id:
+            return False
+        if not other.single_valued:
             return False
 
         same_subject = fold_name(self.subject) == fold_name(other.subject)

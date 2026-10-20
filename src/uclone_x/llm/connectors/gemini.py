@@ -111,6 +111,40 @@ def _cache_read(usage_meta: dict[str, Any] | None) -> int | None:
     return reported_count(usage_meta, "cachedContentTokenCount")
 
 
+#: The lowest `thinkingLevel` every Gemini 3 model took live on 2026-10-11: `minimal` was
+#: refused by `gemini-3.1-pro-preview` and `gemini-3.8-flash` (#2240).
+_LOWEST_THINKING_LEVEL = "low"
+#: The `thinkingConfig`s that ask a model to think least, in the order asked (#2240), each
+#: with the words, lowercased, of the 400 that means the model cannot take it and the next
+#: is to be asked. The model listing says nothing of which a model takes (every Gemini 3 text
+#: model there reads `thinking: true`), so the model's own answer decides:
+#: - `thinkingBudget: 0` turns thinking off, on the flash models. A model that only thinks
+#:   answers "Budget 0 is invalid. This model only works in thinking mode."
+#:   (`gemini-3.1-pro-preview`);
+#: - `thinkingLevel: low`, which Gemini 3 Pro takes. The last: nothing follows it. (A model
+#:   with no `thinkingLevel` is not one the catalog offers; owner 2026-10-12.)
+_THINKING_OFF_STEPS: tuple[tuple[dict[str, Any], str], ...] = (
+    ({"thinkingBudget": 0}, "only works in thinking mode"),
+    ({"thinkingLevel": _LOWEST_THINKING_LEVEL}, ""),
+)
+
+#: Which step each model takes, by (base URL, model), learned from its refusals and kept for
+#: the process: it is the model's, not one connector's, and a connector is made per seat and
+#: call site, so each learning it again cost one refused request (#2242 review). Another
+#: address -- a proxy, a custom endpoint -- learns its own.
+_THINKING_STEP: dict[tuple[str, str], int] = {}
+
+
+def _signature(part: dict[str, Any]) -> str | None:
+    """The `thoughtSignature` Gemini put on a response part, or `None` (#2227).
+
+    Gemini 3 signs the first function call of a turn and must get the signature back on
+    that call's part when the turn is replayed. It is opaque: kept as it came.
+    """
+    signature = part.get("thoughtSignature")
+    return signature if isinstance(signature, str) and signature else None
+
+
 def _first_inline_image(data: object, *, model: str) -> tuple[bytes, str]:
     """The first candidate's first ``inlineData`` part, decoded, or `ImageNotReturnedError`.
 
@@ -192,9 +226,11 @@ class GeminiConnector(BaseLLMConnector):
             or os.getenv("GEMINI_BASE_URL")
             or "https://generativelanguage.googleapis.com/v1beta"
         )
+        #: The address requests go to, as a key of what models there take (`_THINKING_STEP`).
+        self._address: str = resolved_base.rstrip("/")
         super().__init__(
             api_key=resolved_key,
-            base_url=resolved_base.rstrip("/"),
+            base_url=self._address,
             timeout=timeout,
             http_client=http_client,
         )
@@ -430,14 +466,17 @@ class GeminiConnector(BaseLLMConnector):
                 if msg.content is not None:
                     parts.append({"text": msg.content})
                 for tc in msg.tool_calls:
-                    parts.append(
-                        {
-                            "functionCall": {
-                                "name": tc.name,
-                                "args": cast(dict[str, Any], unwrap_immutable(tc.arguments)),
-                            }
+                    part: dict[str, Any] = {
+                        "functionCall": {
+                            "name": tc.name,
+                            "args": cast(dict[str, Any], unwrap_immutable(tc.arguments)),
                         }
-                    )
+                    }
+                    if tc.signature is not None:
+                        # Gemini 3 refuses the replay without it (400 "Function call is
+                        # missing a thought_signature", #2227).
+                        part["thoughtSignature"] = tc.signature
+                    parts.append(part)
                 if not parts:
                     raise UnmappableChatMessageError(
                         "ChatMessage(role='assistant') has content=None and no tool_calls, so "
@@ -462,6 +501,11 @@ class GeminiConnector(BaseLLMConnector):
         gen_config: dict[str, Any] = {"temperature": request.temperature}
         if request.max_tokens is not None:
             gen_config["maxOutputTokens"] = request.max_tokens
+        if request.thinking is False:
+            # Gemini 3 thinks by default, and its thinking spends `maxOutputTokens`: a
+            # 500-token story call came back with 495 tokens of thought and no text
+            # (`finishReason: length`, 2026-10-11). `None` keeps the model's default.
+            gen_config["thinkingConfig"] = self._thinking_off(self._requested_model(request))
 
         payload: dict[str, Any] = {
             "contents": contents,
@@ -497,6 +541,56 @@ class GeminiConnector(BaseLLMConnector):
 
         return payload
 
+    def _thinking_key(self, model: str) -> tuple[str, str]:
+        """Where `_THINKING_STEP` keeps what `model` at this connector's address takes."""
+        return (self._address, model)
+
+    def _thinking_off(self, model: str) -> dict[str, Any]:
+        """The `thinkingConfig` that asks `model` to think least: the step it is known to
+        take (`_THINKING_OFF_STEPS`, `_THINKING_STEP`), the first when nothing is known."""
+        config, _ = _THINKING_OFF_STEPS[_THINKING_STEP.get(self._thinking_key(model), 0)]
+        return dict(config)
+
+    def _learned_a_thinking_step(
+        self, model: str, payload: dict[str, Any], status_code: int, body: str
+    ) -> bool:
+        """Whether this refusal says `model` cannot take the thinking setting it was sent;
+        if so the next step is remembered and logged, and the caller asks once more.
+
+        Read against the step this request sent, not the one now kept for the model: two
+        first calls in flight together both send step 0, and the first refusal to land
+        moves the kept step on, so the second, read against that, failed plainly (#2265
+        review). The kept step only moves forward.
+
+        A 400 to a thinking-off request in words none of the steps knows is not guessed
+        at: the call fails as any other, and the log says so, so the wording is found.
+        """
+        sent = payload.get("generationConfig", {}).get("thinkingConfig")
+        step = next(
+            (i for i, (config, _) in enumerate(_THINKING_OFF_STEPS) if config == sent), None
+        )
+        if status_code != 400 or step is None:
+            return False
+        _, refusal = _THINKING_OFF_STEPS[step]
+        if not refusal or refusal not in body.lower():
+            _logger.info(
+                "%s refused thinkingConfig %s for model %s in words not read as a step",
+                _PROVIDER,
+                sent,
+                model,
+            )
+            return False
+        key = self._thinking_key(model)
+        _THINKING_STEP[key] = max(_THINKING_STEP.get(key, 0), step + 1)
+        _logger.info(
+            "%s model %s refused thinkingConfig %s, so it is asked with %s",
+            _PROVIDER,
+            model,
+            sent,
+            _THINKING_OFF_STEPS[step + 1][0],
+        )
+        return True
+
     async def generate(self, request: LLMRequest) -> ModelResponse:
         """Generate response from Gemini REST endpoint."""
         model = self._requested_model(request)
@@ -511,6 +605,13 @@ class GeminiConnector(BaseLLMConnector):
 
         try:
             resp = await client.post(url, json=payload, headers=headers, timeout=self.timeout)
+            for _ in _THINKING_OFF_STEPS[1:]:  # at most one request per step
+                if resp.status_code == 200 or not self._learned_a_thinking_step(
+                    model, payload, resp.status_code, resp.text
+                ):
+                    break
+                payload = self._build_payload(request)
+                resp = await client.post(url, json=payload, headers=headers, timeout=self.timeout)
             if resp.status_code != 200:
                 raise failed_status(
                     provider=_PROVIDER, model=model, status_code=resp.status_code, body=resp.text
@@ -545,6 +646,7 @@ class GeminiConnector(BaseLLMConnector):
                         id=f"call_{i}",
                         name=fc.get("name", ""),
                         arguments=parse_dict_payload(fc.get("args", {})),
+                        signature=_signature(part),
                     )
                 )
 
@@ -603,80 +705,83 @@ class GeminiConnector(BaseLLMConnector):
         should_close = self._http_client is None
 
         try:
-            async with client.stream(
-                "POST", url, json=payload, headers=headers, timeout=self.timeout
-            ) as resp:
-                if resp.status_code != 200:
-                    err_body = await resp.aread()
-                    raise failed_status(
-                        provider=_PROVIDER,
-                        model=model,
-                        status_code=resp.status_code,
-                        body=err_body.decode("utf-8", errors="replace"),
-                    )
+            for _ in _THINKING_OFF_STEPS:
+                async with client.stream(
+                    "POST", url, json=payload, headers=headers, timeout=self.timeout
+                ) as resp:
+                    if resp.status_code != 200:
+                        body = (await resp.aread()).decode("utf-8", errors="replace")
+                        if self._learned_a_thinking_step(model, payload, resp.status_code, body):
+                            payload = self._build_payload(request)
+                            continue
+                        raise failed_status(
+                            provider=_PROVIDER, model=model, status_code=resp.status_code, body=body
+                        )
 
-                async for raw_line in resp.aiter_lines():
-                    line = raw_line.strip()
-                    if not line or not line.startswith("data:"):
-                        continue
-                    data_str = line[5:].strip()
-                    try:
-                        chunk_json = json.loads(data_str)
-                    except json.JSONDecodeError:
-                        continue
+                    async for raw_line in resp.aiter_lines():
+                        line = raw_line.strip()
+                        if not line or not line.startswith("data:"):
+                            continue
+                        data_str = line[5:].strip()
+                        try:
+                            chunk_json = json.loads(data_str)
+                        except json.JSONDecodeError:
+                            continue
 
-                    candidates = chunk_json.get("candidates", [])
-                    delta_content: str | None = None
-                    tool_calls: list[ToolCallRequest] = []
-                    finish_reason: FinishReason | None = None
+                        candidates = chunk_json.get("candidates", [])
+                        delta_content: str | None = None
+                        tool_calls: list[ToolCallRequest] = []
+                        finish_reason: FinishReason | None = None
 
-                    if candidates:
-                        cand = candidates[0]
-                        parts = cand.get("content", {}).get("parts", [])
-                        text_list: list[str] = []
-                        for i, p in enumerate(parts):
-                            if "text" in p:
-                                text_list.append(p["text"])
-                            elif "functionCall" in p:
-                                fc = p["functionCall"]
-                                tool_calls.append(
-                                    ToolCallRequest(
-                                        id=f"call_{i}",
-                                        name=fc.get("name", ""),
-                                        arguments=parse_dict_payload(fc.get("args", {})),
+                        if candidates:
+                            cand = candidates[0]
+                            parts = cand.get("content", {}).get("parts", [])
+                            text_list: list[str] = []
+                            for i, p in enumerate(parts):
+                                if "text" in p:
+                                    text_list.append(p["text"])
+                                elif "functionCall" in p:
+                                    fc = p["functionCall"]
+                                    tool_calls.append(
+                                        ToolCallRequest(
+                                            id=f"call_{i}",
+                                            name=fc.get("name", ""),
+                                            arguments=parse_dict_payload(fc.get("args", {})),
+                                            signature=_signature(p),
+                                        )
                                     )
-                                )
-                        if text_list:
-                            delta_content = "".join(text_list)
-                        # `is not None`, not truthiness: an absent or null
-                        # `finishReason` on a mid-stream candidate carries no claim, but
-                        # `""` is a value Gemini reported and `generate` maps it to
-                        # `UNKNOWN`. See the same change in `openai.py` (P6, #397).
-                        raw_fr: object = cand.get("finishReason")
-                        if raw_fr is not None:
-                            finish_reason = self._map_finish_reason(str(raw_fr))
+                            if text_list:
+                                delta_content = "".join(text_list)
+                            # `is not None`, not truthiness: an absent or null
+                            # `finishReason` on a mid-stream candidate carries no claim, but
+                            # `""` is a value Gemini reported and `generate` maps it to
+                            # `UNKNOWN`. See the same change in `openai.py` (P6, #397).
+                            raw_fr: object = cand.get("finishReason")
+                            if raw_fr is not None:
+                                finish_reason = self._map_finish_reason(str(raw_fr))
 
-                    usage_meta = chunk_json.get("usageMetadata")
-                    usage: TokenUsage | None = None
-                    if usage_meta:
-                        in_tok, out_tok, total_tok = _usage_counts(usage_meta)
-                        model_name = chunk_json.get("modelVersion", model)
-                        usage = TokenUsage(
-                            provider="gemini",
-                            model=model_name,
-                            input_tokens=in_tok,
-                            output_tokens=out_tok,
-                            total_tokens=total_tok,
-                            cache_read_input_tokens=_cache_read(usage_meta),
-                        )
+                        usage_meta = chunk_json.get("usageMetadata")
+                        usage: TokenUsage | None = None
+                        if usage_meta:
+                            in_tok, out_tok, total_tok = _usage_counts(usage_meta)
+                            model_name = chunk_json.get("modelVersion", model)
+                            usage = TokenUsage(
+                                provider="gemini",
+                                model=model_name,
+                                input_tokens=in_tok,
+                                output_tokens=out_tok,
+                                total_tokens=total_tok,
+                                cache_read_input_tokens=_cache_read(usage_meta),
+                            )
 
-                    if delta_content or tool_calls or usage or finish_reason:
-                        yield StreamChunk(
-                            delta_content=delta_content,
-                            tool_calls=tuple(tool_calls),
-                            usage=usage,
-                            finish_reason=finish_reason,
-                        )
+                        if delta_content or tool_calls or usage or finish_reason:
+                            yield StreamChunk(
+                                delta_content=delta_content,
+                                tool_calls=tuple(tool_calls),
+                                usage=usage,
+                                finish_reason=finish_reason,
+                            )
+                break
         except httpx.RequestError as exc:
             raise failed_request(provider=_PROVIDER, model=model, exc=exc) from exc
         finally:

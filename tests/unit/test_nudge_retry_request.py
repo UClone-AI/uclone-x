@@ -352,12 +352,21 @@ async def test_a_grounding_retry_that_writes_nothing_leaves_the_rejected_answer_
 
     Killed by: src/uclone_x/agent/turn_executor.py :: superseded = (
     Becomes: superseded = self._history.pop() if resp_content else None or (
+
+    The standing answer is the turn's reply too, never a blank one (#2322): read as blank,
+    the turn added a line of its own beside it, two answers to one message.
+
+    Killed by: src/uclone_x/agent/turn_executor.py :: content = content if content.strip() else self._standing_answer(assistant_msg_idx)
+    Becomes: content = content
     """
     llm = RecordingLLM([_call("tc_1"), _answer(_REJECTED), _empty()])
     agent = _agent(llm)
     await agent.start()
 
-    await agent.execute_turn("what is the configured maximum?")
+    result = await agent.execute_turn("what is the configured maximum?")
+
+    assert result.content == _REJECTED
+    assert result.error is None
 
     answers = [
         m.content for m in agent.history if m.role is MessageRole.ASSISTANT and not m.tool_calls

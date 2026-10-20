@@ -13,6 +13,7 @@ import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
+from typing import cast
 
 import pytest
 import yaml
@@ -49,7 +50,12 @@ from uclone_x.core.agent_home import (
 from uclone_x.errors import PlainRefusalError
 from uclone_x.memory.store import default_cross_session_memory, read_saved_facts
 from uclone_x.tools.builtin.filesystem import FileWriteTool
+from uclone_x_story.ucx_extension import PERSONAS_DIR as STORY_PERSONAS_DIR
 
+#: The peers the core's `clone` ships with, in order (`src/uclone_x/personas/clone.yaml`).
+SHIPPED_CLONE_PEERS = ("writer", "artist", "scout", "pioneer", "guardian")
+
+#: The core's five builtins, and Writer, which the story example ships (#2208).
 BUILTINS = ("artist", "clone", "guardian", "pioneer", "scout", "writer")
 
 
@@ -90,7 +96,9 @@ def test_a_fresh_install_has_the_six_builtins_as_clones(tmp_path: Path) -> None:
     Becomes: if handle not in installed:
     """
     root = default_agents_root()
-    ensure_clone_store(tmp_path, builtin_dir=BUILTIN_PERSONAS_DIR)
+    ensure_clone_store(
+        tmp_path, builtin_dir=BUILTIN_PERSONAS_DIR, extension_dirs=(STORY_PERSONAS_DIR,)
+    )
 
     claims = clone_handles(root)
     assert sorted(claims) == list(BUILTINS)
@@ -156,7 +164,9 @@ def test_legacy_homes_workspace_personas_and_a_conflict_migrate_with_a_report(
     create_clone("notes", "handle: notes\nrole: Kept\nsystem_prompt: kept\n", root=root)
     _workspace_persona(workspace, "notes", role="Different")
 
-    ensure_clone_store(workspace, builtin_dir=BUILTIN_PERSONAS_DIR)
+    ensure_clone_store(
+        workspace, builtin_dir=BUILTIN_PERSONAS_DIR, extension_dirs=(STORY_PERSONAS_DIR,)
+    )
 
     # Step 1: renamed, memory kept, persona written in, nothing deleted.
     assert not (root / "scout").exists() and not (root / "mine").exists()
@@ -397,7 +407,8 @@ def test_peers_are_stored_by_id_and_read_back_to_handles(tmp_path: Path) -> None
     (scout_id,) = clone_handles(root)["scout"]
 
     assert _clone_file(root, "lead")["a2a_peers"] == [writer_id]
-    assert "peer 'ghost' names no clone and was dropped" in _log_text(root)
+    assert "peer 'ghost' names no clone yet" in _log_text(root)
+    assert _clone_file(root, "lead")["pending_peers"] == {"ghost": 1}
     lead = registry.get_persona("lead")
     assert lead is not None and lead.a2a_peers == (writer_id,)
     assert peer_handles(lead.a2a_peers, registry.writable_dir()) == ("writer",)
@@ -412,6 +423,131 @@ def test_peers_are_stored_by_id_and_read_back_to_handles(tmp_path: Path) -> None
             PersonaDraft(name="lead", role="Lead", system_prompt="L.", a2a_peers=["ghost"]),
             create=False,
         )
+
+
+def test_a_peer_whose_clone_is_not_installed_yet_waits_and_is_not_offered(
+    tmp_path: Path,
+) -> None:
+    """Core alone: `clone` names `writer`, which only the story example ships (#2245).
+
+    The peer is kept pending, beside the live peers rather than among them, so nothing
+    offers a Writer that is not there, and a second start neither rewrites nor re-reports it.
+
+    Killed by: src/uclone_x/agent/clone_store.py :: still_pending.setdefault(peer, len(translated) + len(still_pending))
+    Becomes: still_pending.setdefault(peer, len(live))
+    """
+    root = default_agents_root()
+    ensure_clone_store(tmp_path, builtin_dir=BUILTIN_PERSONAS_DIR)
+
+    assert "writer" not in clone_handles(root)
+    stored = _clone_file(root, "clone")
+    # Where it stood in the shipped list, so it goes back there (#2256).
+    assert stored["pending_peers"] == {"writer": 0}
+    peers = cast(list[object], stored["a2a_peers"])
+    assert len(peers) == 4
+    assert all(is_agent_id(str(peer)) for peer in peers)
+    clone = CloneDirectoryPersonaStore(root).get_persona("clone")
+    assert clone is not None
+    assert "writer" not in peer_handles(clone.a2a_peers, root)
+    assert len(clone.a2a_peers) == 4
+    assert "peer 'writer' names no clone yet" in _log_text(root)
+
+    log_before = _log_text(root)
+    file_before = (root / clone_handles(root)["clone"][0] / "clone.yaml").read_bytes()
+    assert ensure_clone_store(tmp_path, builtin_dir=BUILTIN_PERSONAS_DIR).lines == []
+    assert _log_text(root) == log_before
+    assert (root / clone_handles(root)["clone"][0] / "clone.yaml").read_bytes() == file_before
+
+
+def test_a_pending_peer_becomes_live_once_its_clone_is_installed(tmp_path: Path) -> None:
+    """The example installed after the core gives `clone` its Writer peer back (#2245).
+
+    An edit made in between keeps the pending peer: a person never saw it to remove it. It
+    goes back where the shipped list had it, first, not last (#2256).
+
+    Killed by: src/uclone_x/agent/clone_store.py :: merged.insert(min(place, len(merged)), peer)
+    Becomes: merged.append(peer)
+    """
+    root = default_agents_root()
+    ensure_clone_store(tmp_path, builtin_dir=BUILTIN_PERSONAS_DIR)
+    registry = PersonaRegistry(workspace_root=tmp_path, include_defaults=False)
+    held = registry.get_persona("clone")
+    assert held is not None
+    registry.save_persona(
+        PersonaDraft(
+            name="clone",
+            role=held.role,
+            system_prompt="Edited before the story came.",
+            a2a_peers=list(peer_handles(held.a2a_peers, root)),
+        ),
+        create=False,
+    )
+    assert _clone_file(root, "clone")["pending_peers"] == {"writer": 0}
+
+    ensure_clone_store(
+        tmp_path, builtin_dir=BUILTIN_PERSONAS_DIR, extension_dirs=(STORY_PERSONAS_DIR,)
+    )
+
+    (writer_id,) = clone_handles(root)["writer"]
+    stored = _clone_file(root, "clone")
+    assert "pending_peers" not in stored
+    peers = cast(list[object], stored["a2a_peers"])
+    assert peers[0] == writer_id
+    assert peer_handles([str(peer) for peer in peers], root) == SHIPPED_CLONE_PEERS
+    clone = CloneDirectoryPersonaStore(root).get_persona("clone")
+    assert clone is not None and "writer" in peer_handles(clone.a2a_peers, root)
+    assert clone.system_prompt == "Edited before the story came."
+
+
+def test_a_clone_a_person_made_does_not_take_a_pending_peer(tmp_path: Path) -> None:
+    """A pending peer waits for the builtin of that handle, not any clone called so (#2256).
+
+    A `writer` someone made before the story came is not the Writer `clone` shipped
+    naming; linking it would give `clone` a peer nobody chose. Installing the story then
+    records its Writer only, as for any handle a clone already has, so the peer still waits.
+
+    Killed by: src/uclone_x/agent/clone_store.py :: return owners[0] if fields is not None and fields.get("template") == handle else None
+    Becomes: return owners[0]
+    """
+    root = default_agents_root()
+    ensure_clone_store(tmp_path, builtin_dir=BUILTIN_PERSONAS_DIR)
+    registry = PersonaRegistry(workspace_root=tmp_path, include_defaults=False)
+    registry.save_persona(
+        PersonaDraft(name="writer", role="Mine", system_prompt="My own writer."), create=True
+    )
+    (mine,) = clone_handles(root)["writer"]
+
+    for extension_dirs in ((), (STORY_PERSONAS_DIR,)):
+        ensure_clone_store(
+            tmp_path, builtin_dir=BUILTIN_PERSONAS_DIR, extension_dirs=extension_dirs
+        )
+        stored = _clone_file(root, "clone")
+        assert stored["pending_peers"] == {"writer": 0}
+        assert mine not in cast(list[object], stored["a2a_peers"])
+    assert clone_handles(root)["writer"] == (mine,)
+
+
+def test_waiting_peers_saved_as_a_list_are_dropped_and_reported(tmp_path: Path) -> None:
+    """#2245's build saved them as a list, with no place; one start says so and drops it.
+
+    Not read as if a place had been recorded: the person is told, once (#2256).
+
+    Killed by: src/uclone_x/agent/clone_store.py :: unreadable = PENDING_PEERS_KEY in fields and not isinstance(
+    Becomes: unreadable = False and not isinstance(
+    """
+    root = default_agents_root()
+    ensure_clone_store(tmp_path, builtin_dir=BUILTIN_PERSONAS_DIR)
+    (clone_id,) = clone_handles(root)["clone"]
+    path = root / clone_id / "clone.yaml"
+    fields = yaml.safe_load(path.read_text(encoding="utf-8"))
+    fields["pending_peers"] = ["writer"]
+    path.write_text(yaml.safe_dump(fields, allow_unicode=True), encoding="utf-8")
+
+    report = ensure_clone_store(tmp_path, builtin_dir=BUILTIN_PERSONAS_DIR)
+
+    assert "pending_peers" not in _clone_file(root, "clone")
+    assert any("form this one does not read" in line for line in report.lines)
+    assert ensure_clone_store(tmp_path, builtin_dir=BUILTIN_PERSONAS_DIR).lines == []
 
 
 def test_a_builtin_is_builtin_until_it_is_edited(tmp_path: Path) -> None:

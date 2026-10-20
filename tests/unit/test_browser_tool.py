@@ -287,3 +287,39 @@ async def test_read_without_a_max_length_reads_up_to_the_stated_default() -> Non
     await tool.run(BrowserParams(action="read"), context)
 
     assert service.calls == [("read", ("s-1", "scout"), 20000)]
+
+
+def test_select_takes_one_option_in_text_as_type_does() -> None:
+    """#2393: `select(ref, text="Maple")` was refused as "select needs options", which a
+    small model read as the page's option list and gave up. One option in `text` is taken.
+
+    Killed by: src/uclone_x/browser/tool.py :: return {**raw, "options": [text]}
+    Becomes: return data
+    """
+    try:
+        params = BrowserParams(action="select", ref="e3", text="Maple")
+    except ValidationError as refused:
+        params = None
+        why = str(refused)
+    else:
+        why = ""
+
+    # Asserted, not left to raise: with the mapping gone this is a refusal, and the test
+    # should fail on what it checks rather than error in its setup (#2396 review).
+    assert params is not None, f"select with text= was refused: {why}"
+    assert params.options == ["Maple"]
+
+
+def test_select_with_no_option_names_the_argument_to_send() -> None:
+    with pytest.raises(ValidationError) as refused:
+        BrowserParams(action="select", ref="e3")
+
+    message = str(refused.value)
+    assert 'options=["' in message
+    assert 'text="' in message
+
+
+def test_select_with_both_keeps_options() -> None:
+    params = BrowserParams(action="select", ref="e3", options=["Oak"], text="ignored")
+
+    assert params.options == ["Oak"]

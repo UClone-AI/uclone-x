@@ -13,6 +13,28 @@ names does.
 Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Each date is
 the date that version was published.
 
+## [0.4.1] - 2026-10-19
+
+### Added
+
+- **Interactive RPG story mode and chronological knowledge-graph tracking**: The Writer can guide a story scene by scene in an interactive RPG mode, presenting approach choices and updating character locations, possessions, milestones, goals, and plot thread stages chronologically after each scene.
+- **Scene-by-scene story illustrations**: When an image engine is available, the Writer automatically extracts a key visual moment after writing each scene, composes a character-consistent prompt using the cast's visual tags and chronological progressions, generates a scene illustration, displays it inline in chat, and shows it on the Story View outline board.
+- **Temporal knowledge-graph story planning and validation**: `story_start` plans chapter and scene state transitions over the story's knowledge graph, checks plot thread lifecycles and continuity before and after writing, and shows relations and temporal state changes on codex cards.
+- **Browser sign-in detection and saved sign-ins**: Clones using the browser detect sign-in pages, support saved credentials and 2FA codes under Settings › Browser, and hand over to the user cleanly when interactive sign-in is required.
+- **Per-clone learning switch and fact history**: Each clone has a "Learn from conversations" toggle in Settings (on by default), and the Remembers panel shows a fact's replacement history with a **Bring back** action and links progression proposals.
+
+### Changed
+
+- **Structured `story_start` stop handling**: Stop turns at genre, premise, cast, outline, chapter, and scene stages use structured tool parameters, preserve deferred constraints across stops, redraw rejected premises, and rewrite scenes directly when requested.
+- **Cross-script entity resolution in uGraph**: Knowledge extraction and recall resolve cross-script aliases to a single entity, rank recalled facts by the current message, and fold single-valued relations cleanly.
+- **Gemini thinking and cloud image fallback**: Gemini 3 thought signatures are replayed across turns, thinking-only models fall back down the thinking ladder instead of failing, and the cloud image fallback uses `gemini-3.1-flash-image`.
+
+### Fixed
+
+- **Browser tool reliability**: Calls on the same tab run one at a time, `select` accepts option text, file inputs and pop-up `back` navigation return actionable guidance, and sign-in guards check focus and loopback port before typing.
+- **Story continuity and language consistency**: Characters who are only remembered, spoken of, or appearing as ghosts are no longer flagged as alive-and-acting contradictions; replies follow the user's language without leaking internal IDs or check codes.
+- **Settings and clone resilience**: Reopening Settings no longer overwrites folders added while loading, unreadable clones are isolated with plain-language notices instead of blocking startup, and server logs redact URL credentials and uvicorn tracebacks.
+
 ## [0.4.0] - 2026-10-08
 
 ### Upgrading from 0.3.1

@@ -74,6 +74,7 @@ const channel = () => {
     navigate: (url) => value.controls.push(`navigate:${url}`),
     handTo: (target) => value.controls.push(`hand_to:${target}`),
     input: (message) => value.inputs.push(message),
+    dismissSaveOffer: () => value.controls.push('dismiss_save_offer'),
     onFrame: (listener) => {
       frames.add(listener);
       return () => frames.delete(listener);
@@ -298,12 +299,26 @@ describe('BrowserPanel banner', () => {
       />,
     );
     expect(screen.getByTestId('browser-banner')).toHaveTextContent(
-      'Scout needs you to sign in to example.com',
+      'Scout asked you to take over on example.com',
     );
     const takeOverBtn = screen.getByTestId('browser-btn-take-over');
     expect(takeOverBtn).toBeInTheDocument();
     fireEvent.click(takeOverBtn);
     expect(value.controls).toContain('take_over');
+  });
+
+  it('words a hand-over without naming a reason it may not have, in either language', () => {
+    // ask_user also covers a CAPTCHA or a choice, so the banner must not claim a sign-in.
+    const asked = state({
+      asked_user: { clone: 'scout', kind: 'captcha', site: 'shop.example.com', message: '' },
+    });
+    const { unmount } = render(<BrowserPanel roomId="r1" room={room} live={live(asked)} />);
+    expect(screen.getByTestId('browser-banner').textContent).toContain('shop.example.com');
+    expect(screen.getByTestId('browser-banner').textContent).not.toMatch(/sign[ -]?in|log[ -]?in/i);
+    unmount();
+    render(<BrowserPanel roomId="r1" room={room} live={live(asked)} />, { wrapper: Korean });
+    expect(screen.getByTestId('browser-banner').textContent).toContain('shop.example.com');
+    expect(screen.getByTestId('browser-banner').textContent).not.toContain('로그인');
   });
 
   it('allows clicking + button to open new tab', () => {
@@ -355,6 +370,61 @@ describe('BrowserPanel banner', () => {
     const analystBtn = screen.getByTestId('browser-hand-to-analyst');
     fireEvent.click(analystBtn);
     expect(value.controls).toContain('hand_to:analyst');
+  });
+});
+
+describe('BrowserPanel save offer', () => {
+  const OFFER = { save_offer: { clone: 'scout', site: 'shop.example.com' } };
+
+  it('shows no offer line while there is no offer', () => {
+    render(<BrowserPanel roomId="r1" room={room} live={live(state())} onSaveSignIn={() => undefined} />);
+    expect(screen.queryByTestId('browser-save-offer')).toBeNull();
+  });
+
+  it('asks once, by the clone’s name; Not now dismisses it on the socket', () => {
+    const { value } = channel();
+    const save = vi.fn();
+    render(
+      <BrowserPanel
+        roomId="r1"
+        room={room}
+        live={live(state(OFFER), 'open', { channel: value })}
+        onSaveSignIn={save}
+      />,
+    );
+    const line = screen.getByTestId('browser-save-offer');
+    expect(line).toHaveTextContent('Save this sign-in so Scout can sign in next time?');
+    fireEvent.click(within(line).getByRole('button', { name: 'Not now' }));
+    expect(value.controls).toEqual(['dismiss_save_offer']);
+    expect(save).not.toHaveBeenCalled();
+  });
+
+  it('Save hands the site on to open Settings, and asks nothing of the page', () => {
+    const { value } = channel();
+    const save = vi.fn();
+    render(
+      <BrowserPanel
+        roomId="r1"
+        room={room}
+        live={live(state(OFFER), 'open', { channel: value })}
+        onSaveSignIn={save}
+      />,
+    );
+    fireEvent.click(within(screen.getByTestId('browser-save-offer')).getByRole('button', { name: 'Save' }));
+    expect(save).toHaveBeenCalledWith('shop.example.com');
+    // Taken up, so the line goes; the form in Settings is where the person types.
+    expect(value.controls).toEqual(['dismiss_save_offer']);
+    expect(value.inputs).toEqual([]);
+  });
+
+  it('says it in Korean too', () => {
+    render(
+      <BrowserPanel roomId="r1" room={room} live={live(state(OFFER))} onSaveSignIn={() => undefined} />,
+      { wrapper: Korean },
+    );
+    const line = screen.getByTestId('browser-save-offer');
+    expect(line.textContent).toContain('Scout');
+    expect(line.textContent).not.toMatch(INTERNALS);
   });
 });
 

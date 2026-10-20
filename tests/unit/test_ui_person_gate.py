@@ -29,7 +29,6 @@ from uclone_x.core.failure_journal import consent_path
 from uclone_x.core.secrets import is_secret_env_name
 from uclone_x.llm import MockLLMConnector
 from uclone_x.sandbox.models import NoIsolation
-from uclone_x.story.library import StoryLibrary
 from uclone_x.tools import BashRunTool, ToolContext
 from uclone_x.tools.client import MCPClient
 from uclone_x.tools.models import MCPConnectionConfig
@@ -42,6 +41,7 @@ from uclone_x.ui.person import (
     WINDOW_TOO_SOON,
     PersonGate,
 )
+from uclone_x_story.library import StoryLibrary
 
 
 @pytest.fixture(autouse=True)

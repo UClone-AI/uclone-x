@@ -5,6 +5,7 @@ import { useApiRead } from '../../lib/useApiRead';
 import { Button } from '../ui/Button';
 import { StatusDot } from '../ui/StatusDot';
 import { ReadFailure, ReadLoading } from './ReadState';
+import { SavedSignIns, SignedInSites, type SignInPrefill } from './BrowserSignIns';
 
 /** How often the state is read again while no extension is connected, to show it pairing. */
 const UNPAIRED_POLL_MS = 3000;
@@ -33,7 +34,11 @@ const isStatus = (value: unknown): value is ExtensionStatus => {
  * Every sentence comes from the `browser` catalog. The Core's answers carry state, never a
  * sentence this section shows: a failure is worded here, by what failed.
  */
-export const BrowserSection: React.FC<{ pollMs?: number }> = ({ pollMs = UNPAIRED_POLL_MS }) => {
+export const BrowserSection: React.FC<{
+  pollMs?: number;
+  /** The dock's Save offer: open the Saved sign-ins form on this site. */
+  signInPrefill?: SignInPrefill | null;
+}> = ({ pollMs = UNPAIRED_POLL_MS, signInPrefill = null }) => {
   const allCopy = useCopy();
   const copy = allCopy.browser;
   const read = useApiRead<unknown>('/api/browser/extension');
@@ -145,6 +150,13 @@ export const BrowserSection: React.FC<{ pollMs?: number }> = ({ pollMs = UNPAIRE
           </div>
         </>
       )}
+
+      <div className="pt-3 border-t border-slate-800/80">
+        <SavedSignIns prefill={signInPrefill} />
+      </div>
+      <div className="pt-3 border-t border-slate-800/80">
+        <SignedInSites />
+      </div>
     </div>
   );
 };

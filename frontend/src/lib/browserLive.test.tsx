@@ -117,6 +117,22 @@ describe('useBrowserLive', () => {
     expect(result.current.state?.problem).toBeNull();
   });
 
+  it('reads a save offer as data, none when absent, and sends its dismissal', () => {
+    const { sockets, factory } = harness();
+    const { result } = renderHook(() => useBrowserLive('r1', factory));
+    act(() => {
+      sockets[0].open();
+      sockets[0].deliver(STATE);
+    });
+    expect(result.current.state?.save_offer).toBeNull();
+    act(() => sockets[0].deliver({ ...STATE, save_offer: { clone: 'scout', site: 'shop.example.com' } }));
+    expect(result.current.state?.save_offer).toEqual({ clone: 'scout', site: 'shop.example.com' });
+    act(() => sockets[0].deliver({ ...STATE, save_offer: 'shop.example.com' }));
+    expect(result.current.state?.save_offer).toBeNull();
+    act(() => result.current.channel.dismissSaveOffer());
+    expect(sockets[0].sent).toContainEqual({ type: 'dismiss_save_offer' });
+  });
+
   it('asks for frames only once told to, and again after it reconnects', () => {
     vi.useFakeTimers();
     try {
@@ -214,6 +230,18 @@ describe('step sentences', () => {
     );
     expect(stepSentence(ko.dock.browser.steps, { action: 'open', element: '', ok: false })).toBe(
       '페이지를 열었습니다 — 실패했습니다',
+    );
+  });
+
+  it('say a saved sign-in was used, and nothing of what it held', () => {
+    expect(stepSentence(en.dock.browser.steps, { action: 'sign_in', element: '', ok: true })).toBe(
+      'Used a saved sign-in',
+    );
+    expect(stepSentence(ko.dock.browser.steps, { action: 'sign_in', element: '', ok: true })).toBe(
+      '저장된 로그인을 사용했습니다',
+    );
+    expect(stepSentence(en.dock.browser.steps, { action: 'sign_in', element: '', ok: false })).toBe(
+      'Used a saved sign-in — did not work',
     );
   });
 

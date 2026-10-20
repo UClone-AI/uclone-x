@@ -42,6 +42,7 @@
   "failure": {
     "unreachable": "UClone-X could not be reached, so {name}'s picture was not changed. Try again once it is running.",
     "noClone": "{name} is not installed here any more, so its picture was not changed.",
+    "unreadable": "{name}'s settings file cannot be read, so its picture was not changed. Settings › Personas & Clones says why.",
     "refused": "{name}'s picture could not be changed with that file. Use a PNG, JPEG or WebP picture of 10 MB or less.",
     "tooLarge": "That picture is larger than 10 MB, so {name}'s picture was not changed. Choose a smaller one.",
     "notSaved": "{name} has not been saved in this workspace yet, so it cannot keep a picture. Save it from its settings first.",

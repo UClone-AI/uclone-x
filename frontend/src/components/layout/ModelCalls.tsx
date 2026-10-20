@@ -633,6 +633,13 @@ export const ModelCalls: React.FC<{ roomId: string; seq: number }> = ({ roomId, 
           {read?.status === 'failed' ? (
             <Failed testId="model-calls-failed" worded={wordProblem(t, read.problem, { seq })} />
           ) : null}
+          {/* Where to look past this panel: the session this turn ran in, and the server log
+              that keeps a provider's raw answer (#2227). Developer mode only, as the panel is. */}
+          {body ? (
+            <p data-testid="model-calls-where" className="break-all text-[11px] text-slate-400">
+              {fmt(t.where, { session: body.session_id, log: body.log_file ?? '—' })}
+            </p>
+          ) : null}
           {body && !trace ? (
             <Failed
               testId="model-calls-reason"

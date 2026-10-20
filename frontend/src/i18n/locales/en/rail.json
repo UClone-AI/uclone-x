@@ -16,6 +16,8 @@
   "moreLabel": "More actions for {name}",
   "moreTitle": "More actions",
   "pinnedHeading": "Pinned",
+  "unreadableBadge": "Can't be loaded",
+  "unreadableTitle": "Its settings file cannot be read, so it cannot answer. Settings › Personas & Clones says why.",
   "cloneConversations": {
     "heading": "Conversations",
     "none": "In no conversation yet.",

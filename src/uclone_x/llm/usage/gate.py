@@ -116,6 +116,22 @@ class UsageGate:
             available_again_at=again,
         )
 
+    def remaining(self) -> int | None:
+        """The fewest tokens any limited window has left now; `None` when none is limited.
+
+        For work that must leave room for the person's next reply (#1851): the gate refuses
+        a call only once a window is reached, so what is left is what a call may still
+        spend before the next one is refused.
+        """
+        limits = self._limits()
+        if limits == UsageLimits():
+            return None
+        status = check(limits, self.store, self._clock())
+        left = [w.limit - w.used for w in status.windows if w.limit is not None]
+        if not left:
+            return None
+        return max(0, min(left))
+
     def record(self, usage: TokenUsage) -> None:
         """Book one call's tokens. The provider's count, or the estimate it is labelled as."""
         self.store.add(
@@ -154,6 +170,10 @@ def _gated_class(base: type[BaseLLMConnector]) -> type[BaseLLMConnector]:
                 # A failed write must not throw away a reply the provider already served.
                 logger.exception("Could not record paid-model usage for a call")
             return response
+
+        def usage_remaining(self) -> int | None:
+            """What the person's usage limit leaves now (`UsageRemainingProtocol`, #1851)."""
+            return _gate_of(self).remaining()
 
         def stream(self, request: LLMRequest) -> AsyncIterator[StreamChunk]:
             return _gated_stream(

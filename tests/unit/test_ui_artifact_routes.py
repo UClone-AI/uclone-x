@@ -19,9 +19,9 @@ from uclone_x.artifacts.library import READERS_NOT_CLEARED_NOTE, ArtifactLibrary
 from uclone_x.errors import StaleRoomWriteError
 from uclone_x.llm import MockLLMConnector
 from uclone_x.room.service import RoomService
-from uclone_x.story.library import StoryLibrary
 from uclone_x.ui.app import create_ui_app
 from uclone_x.ui.artifacts import FILES_FAILURE_DETAIL, FILES_READ_FAILURE_DETAIL
+from uclone_x_story.library import StoryLibrary
 
 
 @pytest.fixture
@@ -502,7 +502,7 @@ def test_a_decision_on_a_changed_proposal_is_a_400_with_the_plain_sentence(
 def test_a_decision_while_the_writer_answers_is_a_409(
     client: TestClient, workspace: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Killed by: src/uclone_x/story/routes.py :: http = http_error(exc, failed=failed, busy=(WriterBusyError,), missing=(StoryNotFoundError,))
+    """Killed by: examples/story/src/uclone_x_story/routes.py :: http = http_error(exc, failed=failed, busy=(WriterBusyError,), missing=(StoryNotFoundError,))
     Becomes: http = http_error(exc, failed=failed, missing=(StoryNotFoundError,))
     """
     story_id, room_id = _story_with_proposal(client, workspace)
@@ -531,7 +531,7 @@ def test_a_story_view_refusal_carries_the_code_the_head_words_it_from(
 ) -> None:
     """The English `detail` stays for a head that does not know the code.
 
-    Killed by: src/uclone_x/story/routes.py :: body["code"] = exc.code
+    Killed by: examples/story/src/uclone_x_story/routes.py :: body["code"] = exc.code
     Becomes: pass
     """
     gone = client.get("/api/artifacts/library/stories/night-train")
@@ -591,7 +591,7 @@ def test_a_story_view_failure_that_is_not_a_refusal_is_a_plain_500(
     def _fails(*_: object, **__: object) -> None:
         raise PermissionError(13, "Permission denied", "/Users/someone/workspace/stories")
 
-    monkeypatch.setattr("uclone_x.story.view.apply_proposal", _fails)
+    monkeypatch.setattr("uclone_x_story.view.apply_proposal", _fails)
 
     failed = client.post(
         f"/api/artifacts/library/stories/{story_id}/proposals/p001/approve",

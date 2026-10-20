@@ -27,20 +27,20 @@ from uclone_x.agent.base import BaseAgent
 from uclone_x.agent.models import AgentConfig, AgentLLMConfig
 from uclone_x.llm.connectors.mock import MockLLMConnector
 from uclone_x.llm.models import LLMRequest, ModelResponse
-from uclone_x.story.character import StoryCharacterSheetTool as CharacterSheetTool
-from uclone_x.story.context import MAX_ENTRIES, CodexIndex, CodexItem, last_and_next
-from uclone_x.story.library import StoryError, StoryLibrary
-from uclone_x.story.schemas import CharacterEntry, Outline
-from uclone_x.story.tool import StoryLibraryTool
-from uclone_x.story.tools import (
+from uclone_x.tools.base import BaseTool
+from uclone_x.tools.models import NoIsolation, ToolContext, ToolResult
+from uclone_x.tools.registry import create_default_registry
+from uclone_x_story.character import StoryCharacterSheetTool as CharacterSheetTool
+from uclone_x_story.context import MAX_ENTRIES, CodexIndex, CodexItem, last_and_next
+from uclone_x_story.library import StoryError, StoryLibrary
+from uclone_x_story.schemas import CharacterEntry, Outline
+from uclone_x_story.tool import StoryLibraryTool
+from uclone_x_story.tools import (
     StoryCodexTool,
     StoryContextTool,
     StoryManuscriptTool,
     StoryOutlineTool,
 )
-from uclone_x.tools.base import BaseTool
-from uclone_x.tools.models import NoIsolation, ToolContext, ToolResult
-from uclone_x.tools.registry import create_default_registry
 
 ROOM_A = "room_a"
 ROOM_B = "room_b"
@@ -129,10 +129,10 @@ class TestANewConversationContinuesFromTheRecap:
     async def test_the_recap_carries_the_story_the_summary_and_the_next_scene(
         self, tmp_path: Path
     ) -> None:
-        """Killed by: src/uclone_x/story/work.py :: "summary": summary if summary is not None else entry.summary,
+        """Killed by: examples/story/src/uclone_x_story/work.py :: "summary": summary if summary is not None else entry.summary,
         Becomes: "summary": entry.summary,
 
-        Killed by: src/uclone_x/story/context.py :: recent = list(sessions.sessions[-RECENT_SESSIONS:])
+        Killed by: examples/story/src/uclone_x_story/context.py :: recent = list(sessions.sessions[-RECENT_SESSIONS:])
         Becomes: recent = list(reversed(sessions.sessions[-RECENT_SESSIONS:]))
         """
         story_id = await _new_story(
@@ -239,7 +239,7 @@ class TestANewConversationContinuesFromTheRecap:
         assert "next_scene" not in recap
 
     def test_the_next_scene_is_after_the_last_written_one_not_the_first_gap(self) -> None:
-        """Killed by: src/uclone_x/story/context.py :: start = 0 if last_index is None else last_index + 1
+        """Killed by: examples/story/src/uclone_x_story/context.py :: start = 0 if last_index is None else last_index + 1
         Becomes: start = 0
         """
         outline = Outline.model_validate(
@@ -269,7 +269,7 @@ class TestANewConversationContinuesFromTheRecap:
 
 class TestTheStoryRecordIsNotWrittenByAPath:
     async def test_a_link_inside_the_story_to_its_record_is_refused(self, tmp_path: Path) -> None:
-        """Killed by: src/uclone_x/story/library.py :: if target == record or (target.exists() and target.samefile(record)):
+        """Killed by: examples/story/src/uclone_x_story/library.py :: if target == record or (target.exists() and target.samefile(record)):
         Becomes: if pure.name == STORY_FILE:
         """
         story_id = await _new_story(tmp_path)
@@ -288,7 +288,7 @@ class TestTheStoryRecordIsNotWrittenByAPath:
         assert (folder / "story.yaml").read_text(encoding="utf-8") == before
 
     async def test_the_record_spelled_in_another_case_is_refused(self, tmp_path: Path) -> None:
-        """Killed by: src/uclone_x/story/library.py :: (target.exists() and target.samefile(record))
+        """Killed by: examples/story/src/uclone_x_story/library.py :: (target.exists() and target.samefile(record))
         Becomes: False
         """
         story_id = await _new_story(tmp_path)
@@ -316,7 +316,7 @@ class TestAFailedMoveKeepsTheStoryItHad:
     async def test_opening_an_unreadable_story_keeps_the_lease_on_the_open_one(
         self, tmp_path: Path
     ) -> None:
-        """Killed by: src/uclone_x/story/tool.py :: opening = library.open(story_id, conversation)
+        """Killed by: examples/story/src/uclone_x_story/tool.py :: opening = library.open(story_id, conversation)
         Becomes: self._leave(library, context.story_id, conversation, keep=story_id); opening = library.open(story_id, conversation)
         """
         kept = await _new_story(tmp_path, "Kept")
@@ -334,7 +334,7 @@ class TestAFailedMoveKeepsTheStoryItHad:
     async def test_taking_over_an_unreadable_story_keeps_the_lease_on_the_open_one(
         self, tmp_path: Path
     ) -> None:
-        """Killed by: src/uclone_x/story/tool.py :: record, previous = library.take_over(story_id, conversation)
+        """Killed by: examples/story/src/uclone_x_story/tool.py :: record, previous = library.take_over(story_id, conversation)
         Becomes: self._leave(library, context.story_id, conversation, keep=story_id); record, previous = library.take_over(story_id, conversation)
         """
         kept = await _new_story(tmp_path, "Kept")
@@ -359,7 +359,7 @@ class TestTextThatIsNotUtf8:
     async def test_a_scene_saved_in_another_encoding_is_refused_in_words(
         self, tmp_path: Path
     ) -> None:
-        """Killed by: src/uclone_x/story/library.py :: text = data.decode("utf-8")
+        """Killed by: examples/story/src/uclone_x_story/library.py :: text = data.decode("utf-8")
         Becomes: text = data.decode("utf-8", "replace")
         """
         story_id = await _new_story(tmp_path)
@@ -384,7 +384,7 @@ class TestTextThatIsNotUtf8:
 
 class TestAFileThatDoesNotFit:
     async def test_a_codex_entry_names_its_file_and_field(self, tmp_path: Path) -> None:
-        """Killed by: src/uclone_x/story/schemas.py :: field = _where(loc)
+        """Killed by: examples/story/src/uclone_x_story/schemas.py :: field = _where(loc)
         Becomes: field = ""
         """
         story_id = await _new_story(tmp_path)
@@ -423,7 +423,7 @@ class TestAFileThatDoesNotFit:
         assert "pattern" not in result.error and "Error" not in result.error
 
     async def test_a_file_named_other_than_its_id_is_reported(self, tmp_path: Path) -> None:
-        """Killed by: src/uclone_x/story/work.py :: unreadable.append(UnreadableFile(relative, str(exc)))
+        """Killed by: examples/story/src/uclone_x_story/work.py :: unreadable.append(UnreadableFile(relative, str(exc)))
         Becomes: raise
         """
         story_id = await _new_story(tmp_path)
@@ -439,16 +439,16 @@ class TestAFileThatDoesNotFit:
     ) -> None:
         """A person who saved `mara.yml` is told why Mara is missing (#1576).
 
-        Killed by: src/uclone_x/story/work.py :: if name.suffix != ".yaml":
+        Killed by: examples/story/src/uclone_x_story/work.py :: if name.suffix != ".yaml":
         Becomes: if False:
 
-        Killed by: src/uclone_x/story/work.py :: for relative in folders:
+        Killed by: examples/story/src/uclone_x_story/work.py :: for relative in folders:
         Becomes: for relative in []:
 
-        Killed by: src/uclone_x/story/work.py :: if PurePosixPath(relative).name in CODEX_KINDS:
+        Killed by: examples/story/src/uclone_x_story/work.py :: if PurePosixPath(relative).name in CODEX_KINDS:
         Becomes: if True:
 
-        Killed by: src/uclone_x/story/work.py :: for relative in self._library.files_in(self._story_id, CODEX_DIR):
+        Killed by: examples/story/src/uclone_x_story/work.py :: for relative in self._library.files_in(self._story_id, CODEX_DIR):
         Becomes: for relative in []:
         """
         story_id = await _new_story(tmp_path)
@@ -488,10 +488,10 @@ class TestAFileThatDoesNotFit:
         """An editor's backup is not told to become `mara.yaml.yaml`, nor to replace the
         entry it is a copy of (#1595).
 
-        Killed by: src/uclone_x/story/work.py :: if match is not None:
+        Killed by: examples/story/src/uclone_x_story/work.py :: if match is not None:
         Becomes: if False:
 
-        Killed by: src/uclone_x/story/library.py :: and entry.name.lower() not in _SYSTEM_FILES
+        Killed by: examples/story/src/uclone_x_story/library.py :: and entry.name.lower() not in _SYSTEM_FILES
         Becomes: and True
         """
         story_id = await _new_story(tmp_path)
@@ -525,16 +525,16 @@ class TestAFileThatDoesNotFit:
         """On a Mac, `mv mara.yml mara.yaml` beside `Mara.yaml` replaces it, and two files
         both told to become `bo.yaml` would have the second replace the first (#1595).
 
-        Killed by: src/uclone_x/story/work.py :: taken = any(name.casefold() == wanted for name in others)
+        Killed by: examples/story/src/uclone_x_story/work.py :: taken = any(name.casefold() == wanted for name in others)
         Becomes: taken = any(name == target for name in others)
 
-        Killed by: src/uclone_x/story/work.py :: if not taken and not shared:
+        Killed by: examples/story/src/uclone_x_story/work.py :: if not taken and not shared:
         Becomes: if not taken:
 
-        Killed by: src/uclone_x/story/work.py :: if not taken and not shared:
+        Killed by: examples/story/src/uclone_x_story/work.py :: if not taken and not shared:
         Becomes: if not shared:
 
-        Killed by: src/uclone_x/story/work.py :: others = [PurePosixPath(b).name for b in beside if b != relative]
+        Killed by: examples/story/src/uclone_x_story/work.py :: others = [PurePosixPath(b).name for b in beside if b != relative]
         Becomes: others = [PurePosixPath(b).name for b in beside]
         """
         story_id = await _new_story(tmp_path)
@@ -564,7 +564,7 @@ class TestAFileThatDoesNotFit:
         )
 
     async def test_icon_file_is_excluded_from_story_library_files_in(self, tmp_path: Path) -> None:
-        """Killed by: src/uclone_x/story/library.py :: _SYSTEM_FILES = frozenset({"thumbs.db", "ehthumbs.db", "desktop.ini", "icon\r"})
+        """Killed by: examples/story/src/uclone_x_story/library.py :: _SYSTEM_FILES = frozenset({"thumbs.db", "ehthumbs.db", "desktop.ini", "icon\r"})
         Becomes: _SYSTEM_FILES = frozenset({"thumbs.db", "ehthumbs.db", "desktop.ini"})
         """
         story_id = await _new_story(tmp_path)
@@ -595,7 +595,7 @@ class TestAFileThatDoesNotFit:
     async def test_a_name_over_eighty_characters_does_not_suggest_a_rename(
         self, tmp_path: Path
     ) -> None:
-        """Killed by: src/uclone_x/story/work.py :: if len(base_str) > 80:
+        """Killed by: examples/story/src/uclone_x_story/work.py :: if len(base_str) > 80:
         Becomes: if False:
         """
         story_id = await _new_story(tmp_path)
@@ -616,7 +616,7 @@ class TestAFileThatDoesNotFit:
     async def test_an_existing_folder_named_target_prevents_suggesting_rename(
         self, tmp_path: Path
     ) -> None:
-        """Killed by: src/uclone_x/story/work.py :: _rename_advice(relative, files + folders)
+        """Killed by: examples/story/src/uclone_x_story/work.py :: _rename_advice(relative, files + folders)
         Becomes: _rename_advice(relative, files)
         """
         story_id = await _new_story(tmp_path)
@@ -639,7 +639,7 @@ class TestAFileThatDoesNotFit:
     async def test_a_recap_over_a_broken_sessions_file_says_so_and_goes_on(
         self, tmp_path: Path
     ) -> None:
-        """Killed by: src/uclone_x/story/tools.py :: problems.append(UnreadableFile(SESSIONS_FILE, str(exc)))
+        """Killed by: examples/story/src/uclone_x_story/tools.py :: problems.append(UnreadableFile(SESSIONS_FILE, str(exc)))
         Becomes: raise
         """
         story_id = await _new_story(tmp_path)
@@ -665,7 +665,7 @@ class TestAFileThatDoesNotFit:
 
 class TestTwoStoriesDoNotCollide:
     async def test_the_same_character_id_is_its_own_in_each_story(self, tmp_path: Path) -> None:
-        """Killed by: src/uclone_x/story/work.py :: return f"{STORIES_DIRNAME}/{self._story_id}/{relative}"
+        """Killed by: examples/story/src/uclone_x_story/work.py :: return f"{STORIES_DIRNAME}/{self._story_id}/{relative}"
         Becomes: return f"{STORIES_DIRNAME}/{relative}"
         """
         first = await _new_story(tmp_path, "First")
@@ -715,7 +715,7 @@ class TestTwoStoriesDoNotCollide:
 
 class TestTheManuscriptKeepsWhatItReplaces:
     async def test_a_rewrite_keeps_the_old_text_and_logs_both_writes(self, tmp_path: Path) -> None:
-        """Killed by: src/uclone_x/story/work.py :: if current is not None and current.digest == expected_digest:
+        """Killed by: examples/story/src/uclone_x_story/work.py :: if current is not None and current.digest == expected_digest:
         Becomes: if False:
         """
         story_id = await _new_story(tmp_path)
@@ -750,7 +750,7 @@ class TestTheManuscriptKeepsWhatItReplaces:
         and repeated the same digest-less write until the step cap. The refusal names the
         argument to pass, and no file.
 
-        Killed by: src/uclone_x/story/tools.py :: if digest is None:
+        Killed by: examples/story/src/uclone_x_story/tools.py :: if digest is None:
         Becomes: if False:
         """
         story_id = await _new_story(tmp_path)
@@ -772,7 +772,7 @@ class TestTheManuscriptKeepsWhatItReplaces:
         """A digest that no longer matches is a different case from a missing one: the
         scene changed since it was read (here, by hand), so reading again is the fix.
 
-        Killed by: src/uclone_x/story/tools.py :: if digest is None:
+        Killed by: examples/story/src/uclone_x_story/tools.py :: if digest is None:
         Becomes: if True:
         """
         story_id = await _new_story(tmp_path)
@@ -855,7 +855,7 @@ class TestAWriteSaysWhatTheStoryChangedBefore:
     async def test_a_scene_after_the_death_that_names_the_dead_is_told(
         self, tmp_path: Path
     ) -> None:
-        """Killed by: src/uclone_x/story/context.py :: and "status" in snapshot.set_at
+        """Killed by: examples/story/src/uclone_x_story/context.py :: and "status" in snapshot.set_at
         Becomes: and "status" not in snapshot.set_at
         """
         out = await self._write(tmp_path, "ch02.s04", "예린이 웃으며 라온의 어깨를 두드렸다.")
@@ -867,7 +867,7 @@ class TestAWriteSaysWhatTheStoryChangedBefore:
         assert "고쳐 다시 쓰세요" in out["continuity_note"]
 
     async def test_a_lost_thing_names_who_lost_it_last_and_who_has_it(self, tmp_path: Path) -> None:
-        """Killed by: src/uclone_x/story/context.py :: max(lost, key=lambda found: found[0])
+        """Killed by: examples/story/src/uclone_x_story/context.py :: max(lost, key=lambda found: found[0])
         Becomes: min(lost, key=lambda found: found[0])
         """
         out = await self._write(tmp_path, "ch02.s04", "라온은 월광검을 높이 들었다.")
@@ -877,7 +877,7 @@ class TestAWriteSaysWhatTheStoryChangedBefore:
         assert "ch02.s01" in line and "카엘 has it now" in line
 
     async def test_a_flashback_before_the_death_is_not_told(self, tmp_path: Path) -> None:
-        """Killed by: src/uclone_x/story/context.py :: item.entry, placements, scene_id, through_scene=False
+        """Killed by: examples/story/src/uclone_x_story/context.py :: item.entry, placements, scene_id, through_scene=False
         Becomes: item.entry, placements, list(placements)[-1], through_scene=False
         """
         out = await self._write(
@@ -888,7 +888,7 @@ class TestAWriteSaysWhatTheStoryChangedBefore:
         assert "notes" not in out
 
     async def test_the_notice_is_in_plain_words(self, tmp_path: Path) -> None:
-        """Killed by: src/uclone_x/story/context.py :: name = item.entry.name
+        """Killed by: examples/story/src/uclone_x_story/context.py :: name = item.entry.name
         Becomes: name = item.entry.id
         """
         out = await self._write(tmp_path, "ch02.s04", "예린이 월광검을 라온에게 돌려주었다.")
@@ -913,7 +913,7 @@ class TestAWriteSaysWhatTheStoryChangedBefore:
             assert internal not in words, internal
 
     async def test_the_notice_quotes_the_sentence_that_names_them(self, tmp_path: Path) -> None:
-        """Killed by: src/uclone_x/story/context.py :: found.append(f'"{sentence}"')
+        """Killed by: examples/story/src/uclone_x_story/context.py :: found.append(f'"{sentence}"')
         Becomes: pass
         """
         out = await self._write(
@@ -927,7 +927,7 @@ class TestAWriteSaysWhatTheStoryChangedBefore:
     async def test_the_first_notice_says_to_rewrite_now_in_the_scenes_language(
         self, tmp_path: Path
     ) -> None:
-        """Killed by: src/uclone_x/story/context.py :: korean = bool(_HANGUL.search(text))
+        """Killed by: examples/story/src/uclone_x_story/context.py :: korean = bool(_HANGUL.search(text))
         Becomes: korean = False
         """
         out = await self._write(tmp_path, "ch02.s04", "예린이 웃으며 라온의 어깨를 두드렸다.")
@@ -938,7 +938,7 @@ class TestAWriteSaysWhatTheStoryChangedBefore:
         assert "회상" in note  # a flashback may stay as it is: a notice, not a refusal
 
     async def test_a_rewrite_of_its_own_text_is_not_sent_round_again(self, tmp_path: Path) -> None:
-        """Killed by: src/uclone_x/story/tools.py :: rewrite_of_own = work.last_writer(scene_id) == room_id
+        """Killed by: examples/story/src/uclone_x_story/tools.py :: rewrite_of_own = work.last_writer(scene_id) == room_id
         Becomes: rewrite_of_own = False
         """
         first = await self._write(tmp_path, "ch02.s04", "예린이 웃으며 라온의 어깨를 두드렸다.")
@@ -953,7 +953,7 @@ class TestAWriteSaysWhatTheStoryChangedBefore:
         assert again["digest"] not in note
 
     async def test_another_conversations_text_is_a_first_notice(self, tmp_path: Path) -> None:
-        """Killed by: src/uclone_x/story/tools.py :: rewrite_of_own = work.last_writer(scene_id) == room_id
+        """Killed by: examples/story/src/uclone_x_story/tools.py :: rewrite_of_own = work.last_writer(scene_id) == room_id
         Becomes: rewrite_of_own = work.last_writer(scene_id) is not None
         """
         first = await self._write(tmp_path, "ch02.s04", "예린이 웃으며 라온의 어깨를 두드렸다.")
@@ -988,7 +988,7 @@ class TestAMemoryOfTheDeadIsNotTold:
         )
 
     async def test_a_sentence_remembering_the_dead_is_not_told(self, tmp_path: Path) -> None:
-        """Killed by: src/uclone_x/story/context.py :: _RECALL.search(sentence)
+        """Killed by: examples/story/src/uclone_x_story/context.py :: _RECALL.search(sentence)
         Becomes: False
         """
         out = await self._write(tmp_path, "라온은 스승 예린을 떠올렸다. 바람이 차가웠다.")
@@ -997,7 +997,7 @@ class TestAMemoryOfTheDeadIsNotTold:
         assert "continuity" not in out and "continuity_note" not in out
 
     async def test_a_sentence_where_the_dead_act_is_told(self, tmp_path: Path) -> None:
-        """Killed by: src/uclone_x/story/context.py :: if quoted is None:
+        """Killed by: examples/story/src/uclone_x_story/context.py :: if quoted is None:
         Becomes: if quoted is not None:
         """
         out = await self._write(tmp_path, "예린이 라온의 검을 바로잡았다.")
@@ -1006,7 +1006,7 @@ class TestAMemoryOfTheDeadIsNotTold:
         assert '"예린이 라온의 검을 바로잡았다."' in line
 
     async def test_in_mixed_text_only_the_acting_sentence_is_quoted(self, tmp_path: Path) -> None:
-        """Killed by: src/uclone_x/story/context.py :: if passed_over and not found:
+        """Killed by: examples/story/src/uclone_x_story/context.py :: if passed_over and not found:
         Becomes: if passed_over:
         """
         out = await self._write(
@@ -1039,7 +1039,7 @@ class TestASentenceThatSaysTheChangeIsNotTold:
     async def test_the_dead_said_to_be_gone_is_not_told_and_an_act_still_is(
         self, tmp_path: Path
     ) -> None:
-        """Killed by: src/uclone_x/story/context.py :: 떠났|떠난
+        """Killed by: examples/story/src/uclone_x_story/context.py :: 떠났|떠난
         Becomes: 떠난
         """
         out = await self._write(
@@ -1053,7 +1053,7 @@ class TestASentenceThatSaysTheChangeIsNotTold:
         assert "떠났을" not in line
 
     async def test_departure_and_loss_stated_together_are_not_told(self, tmp_path: Path) -> None:
-        """Killed by: src/uclone_x/story/context.py :: or _STATED_OR_DENIED.search(sentence)
+        """Killed by: examples/story/src/uclone_x_story/context.py :: or _STATED_OR_DENIED.search(sentence)
         Becomes: or False
         """
         out = await self._write(
@@ -1066,7 +1066,7 @@ class TestASentenceThatSaysTheChangeIsNotTold:
         assert "continuity" not in out and "continuity_note" not in out
 
     async def test_the_lost_sword_said_to_be_taken_is_not_told(self, tmp_path: Path) -> None:
-        """Killed by: src/uclone_x/story/context.py :: 잃은|빼앗겼|
+        """Killed by: examples/story/src/uclone_x_story/context.py :: 잃은|빼앗겼|
         Becomes: 잃은|
         """
         for workspace, text in (
@@ -1080,7 +1080,7 @@ class TestASentenceThatSaysTheChangeIsNotTold:
     async def test_a_use_of_the_lost_sword_negated_is_not_told(self, tmp_path: Path) -> None:
         """A word between the name and the negated verb is ordinary narration (#1808).
 
-        Killed by: src/uclone_x/story/context.py :: 않았|지
+        Killed by: examples/story/src/uclone_x_story/context.py :: 않았|지
         Becomes: 않았음|지
         """
         for name, text in (
@@ -1096,11 +1096,11 @@ class TestASentenceThatSaysTheChangeIsNotTold:
     async def test_a_use_refused_or_replaced_is_not_told(self, tmp_path: Path) -> None:
         r"""Two sentences the 417602e6 re-measure quoted that keep the sword lost (#1808).
 
-        Killed by: src/uclone_x/story/context.py :: 꺼내)\S*지\s*않|아닌)
+        Killed by: examples/story/src/uclone_x_story/context.py :: 꺼내)\S*지\s*않|아닌)
         Becomes: 꺼내)\S*지\s*않았|아닌)
-        Killed by: src/uclone_x/story/context.py :: 않|아닌)"
+        Killed by: examples/story/src/uclone_x_story/context.py :: 않|아닌)"
         Becomes: 않)"
-        Killed by: src/uclone_x/story/context.py :: or (lost and _use_denied(
+        Killed by: examples/story/src/uclone_x_story/context.py :: or (lost and _use_denied(
         Becomes: or (False and _use_denied(
         """
         for workspace, text in (
@@ -1122,7 +1122,7 @@ class TestASentenceThatSaysTheChangeIsNotTold:
         r"""A "~지 않고" is also "without ~ing": only a negation right after the name excuses
         a use, and these three are slips (#1808).
 
-        Killed by: src/uclone_x/story/context.py :: r"|지\s*않았|지\s*않는|지\s*못"
+        Killed by: examples/story/src/uclone_x_story/context.py :: r"|지\s*않았|지\s*않는|지\s*못"
         Becomes: r"|지\s*않|지\s*못|아닌"
         """
         for name, text in (
@@ -1140,7 +1140,7 @@ class TestASentenceThatSaysTheChangeIsNotTold:
     ) -> None:
         r"""Only the sword's own use verbs, negated, excuse it: hesitating is not one (#1808).
 
-        Killed by: src/uclone_x/story/context.py :: (?:(?:뽑|쥐|휘두르|들|차|겨누|베|끼|착용하|챙기|쓰|사용하|잡|꺼내)\S*지
+        Killed by: examples/story/src/uclone_x_story/context.py :: (?:(?:뽑|쥐|휘두르|들|차|겨누|베|끼|착용하|챙기|쓰|사용하|잡|꺼내)\S*지
         Becomes: (?:\S*지
         """
         text = "라온은 월광검을 주저하지 않고 뽑았다."
@@ -1152,9 +1152,9 @@ class TestASentenceThatSaysTheChangeIsNotTold:
     async def test_a_negation_after_the_dead_is_an_act_and_is_told(self, tmp_path: Path) -> None:
         r"""A refused use excuses only a lost item: the dead doing anything is the slip (#1808).
 
-        Killed by: src/uclone_x/story/context.py :: or (lost and _use_denied(
+        Killed by: examples/story/src/uclone_x_story/context.py :: or (lost and _use_denied(
         Becomes: or (_use_denied(
-        Killed by: src/uclone_x/story/context.py :: |꿈에"
+        Killed by: examples/story/src/uclone_x_story/context.py :: |꿈에"
         Becomes: |꿈에|잊지\s*(?:않|못)"
         """
         for name, text in (
@@ -1168,7 +1168,7 @@ class TestASentenceThatSaysTheChangeIsNotTold:
             assert f'"{text}"' in line, text
 
     async def test_english_that_says_the_dead_died_is_not_told(self, tmp_path: Path) -> None:
-        """Killed by: src/uclone_x/story/context.py :: (?:died|
+        """Killed by: examples/story/src/uclone_x_story/context.py :: (?:died|
         Becomes: (?:
         """
         out = await self._write(
@@ -1204,9 +1204,9 @@ class TestAWriteRefusesWhatASmallModelLeavesInProse:
     async def test_a_chinese_character_stuck_in_a_korean_word_is_refused(
         self, tmp_path: Path
     ) -> None:
-        """Killed by: src/uclone_x/story/prose.py :: glued = _glued(text, _GLUED_HAN)
+        """Killed by: examples/story/src/uclone_x_story/prose.py :: glued = _glued(text, _GLUED_HAN)
         Becomes: glued = []
-        Killed by: src/uclone_x/story/tools.py :: raise StoryError(refused)
+        Killed by: examples/story/src/uclone_x_story/tools.py :: raise StoryError(refused)
         Becomes: pass
         """
         error = await self._refused(
@@ -1224,7 +1224,7 @@ class TestAWriteRefusesWhatASmallModelLeavesInProse:
     ) -> None:
         """Two words of the 417602e6 re-measure (#1808).
 
-        Killed by: src/uclone_x/story/prose.py :: latin = _glued(text, _GLUED_LATIN)
+        Killed by: examples/story/src/uclone_x_story/prose.py :: latin = _glued(text, _GLUED_LATIN)
         Becomes: latin = []
         """
         error = await self._refused(
@@ -1239,7 +1239,7 @@ class TestAWriteRefusesWhatASmallModelLeavesInProse:
     async def test_a_foreign_name_before_a_particle_or_two_letters_is_saved(
         self, tmp_path: Path
     ) -> None:
-        """Killed by: src/uclone_x/story/prose.py :: [a-z]{3,}
+        """Killed by: examples/story/src/uclone_x_story/prose.py :: [a-z]{3,}
         Becomes: [a-zA-Z]{2,}
         """
         await self._saved(
@@ -1247,9 +1247,9 @@ class TestAWriteRefusesWhatASmallModelLeavesInProse:
         )
 
     async def test_hanja_in_brackets_or_before_a_particle_is_saved(self, tmp_path: Path) -> None:
-        """Killed by: src/uclone_x/story/prose.py :: for raw in _BRACKETED.sub(" ", text).split():
+        """Killed by: examples/story/src/uclone_x_story/prose.py :: for raw in _BRACKETED.sub(" ", text).split():
         Becomes: for raw in text.split():
-        Killed by: src/uclone_x/story/prose.py :: _GLUED_HAN = re.compile(r"[가-힣]
+        Killed by: examples/story/src/uclone_x_story/prose.py :: _GLUED_HAN = re.compile(r"[가-힣]
         Becomes: _GLUED_HAN = re.compile(r"[㐀-䶿一-鿿][가-힣]|[가-힣]
         """
         await self._saved(
@@ -1257,7 +1257,7 @@ class TestAWriteRefusesWhatASmallModelLeavesInProse:
         )
 
     async def test_the_same_sentence_four_times_is_refused(self, tmp_path: Path) -> None:
-        """Killed by: src/uclone_x/story/prose.py :: _SAME_SENTENCE = 4
+        """Killed by: examples/story/src/uclone_x_story/prose.py :: _SAME_SENTENCE = 4
         Becomes: _SAME_SENTENCE = 99
         """
         loop = "그는 문을 열고 다시 밖으로 나갔다. "
@@ -1274,7 +1274,7 @@ class TestAWriteRefusesWhatASmallModelLeavesInProse:
         assert error.endswith("장면은 저장되지 않았습니다. 고친 글로 다시 저장하세요.")
 
     async def test_a_few_sentences_said_over_and_over_are_refused(self, tmp_path: Path) -> None:
-        """Killed by: src/uclone_x/story/prose.py :: len(times) / len(counted) < _DISTINCT_SHARE
+        """Killed by: examples/story/src/uclone_x_story/prose.py :: len(times) / len(counted) < _DISTINCT_SHARE
         Becomes: len(times) / len(counted) < 0
         """
         text = " ".join(
@@ -1287,7 +1287,7 @@ class TestAWriteRefusesWhatASmallModelLeavesInProse:
         assert error.endswith("The scene was not saved. Save it again once it is fixed.")
 
     async def test_a_refrain_said_three_times_is_saved(self, tmp_path: Path) -> None:
-        """Killed by: src/uclone_x/story/prose.py :: _SAME_SENTENCE = 4
+        """Killed by: examples/story/src/uclone_x_story/prose.py :: _SAME_SENTENCE = 4
         Becomes: _SAME_SENTENCE = 3
         """
         refrain = "달은 아직 지지 않았다.\n"
@@ -1298,7 +1298,7 @@ class TestAWriteRefusesWhatASmallModelLeavesInProse:
         )  # fmt: skip
 
     async def test_short_lines_repeated_in_dialogue_are_saved(self, tmp_path: Path) -> None:
-        """Killed by: src/uclone_x/story/prose.py :: _MIN_COUNTED = 8
+        """Killed by: examples/story/src/uclone_x_story/prose.py :: _MIN_COUNTED = 8
         Becomes: _MIN_COUNTED = 1
         """
         await self._saved(
@@ -1307,7 +1307,7 @@ class TestAWriteRefusesWhatASmallModelLeavesInProse:
         )
 
     async def test_a_note_in_brackets_after_the_story_is_refused(self, tmp_path: Path) -> None:
-        """Killed by: src/uclone_x/story/prose.py :: if len(lines) < 2 or not _whole_note(lines[-1]):
+        """Killed by: examples/story/src/uclone_x_story/prose.py :: if len(lines) < 2 or not _whole_note(lines[-1]):
         Becomes: if True:
         """
         note = "(이 장면은 라온의 상실감을 강조하기 위해 짧게 썼습니다.)"
@@ -1322,9 +1322,9 @@ class TestAWriteRefusesWhatASmallModelLeavesInProse:
     async def test_a_scripts_stage_directions_and_a_short_close_are_saved(
         self, tmp_path: Path
     ) -> None:
-        """Killed by: src/uclone_x/story/prose.py :: if any(_whole_note(line) for line in lines[:-1]):
+        """Killed by: examples/story/src/uclone_x_story/prose.py :: if any(_whole_note(line) for line in lines[:-1]):
         Becomes: if False:
-        Killed by: src/uclone_x/story/prose.py :: _MIN_NOTE = 20
+        Killed by: examples/story/src/uclone_x_story/prose.py :: _MIN_NOTE = 20
         Becomes: _MIN_NOTE = 0
         """
         await self._saved(
@@ -1353,8 +1353,8 @@ class TestTheCodexTakesANameForAnId:
     async def test_a_proposal_by_name_is_made_for_the_entry_of_that_name(
         self, tmp_path: Path
     ) -> None:
-        """Killed by: src/uclone_x/story/tools.py :: named = _named_entries(work.codex(), entry_id, kind, done="nothing was proposed")
-        Becomes: raise StoryError("nothing was proposed")
+        """Killed by: examples/story/src/uclone_x_story/tools.py :: named = _named_entries(
+        Becomes: named = (lambda *a, **k: (_ for _ in ()).throw(StoryError("nothing was proposed")))(
         """
         result = await self._propose(self._moon_seal(tmp_path), "도윤")
 
@@ -1366,7 +1366,7 @@ class TestTheCodexTakesANameForAnId:
         assert "doyun" in saved
 
     async def test_a_name_two_entries_share_is_refused_with_both(self, tmp_path: Path) -> None:
-        """Killed by: src/uclone_x/story/tools.py :: if len({(item.kind, item.entry.id) for item in named}) > 1:
+        """Killed by: examples/story/src/uclone_x_story/tools.py :: if len({(item.kind, item.entry.id) for item in named}) > 1:
         Becomes: if False:
         """
         ctx = self._moon_seal(tmp_path)
@@ -1386,8 +1386,8 @@ class TestTheCodexTakesANameForAnId:
     async def test_a_name_no_entry_has_is_refused_with_the_entries_there_are(
         self, tmp_path: Path
     ) -> None:
-        """Killed by: src/uclone_x/story/tools.py :: hint = f" Its entries are: {_candidates(listed)}." if listed else " It has no entries yet."
-        Becomes: hint = ""
+        """Killed by: examples/story/src/uclone_x_story/tools.py :: f" Its entries are: {_candidates(listed)}."
+        Becomes: ""
         """
         result = await _call(
             StoryCodexTool(), self._moon_seal(tmp_path), action="get", entry_id="세린",
@@ -1400,7 +1400,7 @@ class TestTheCodexTakesANameForAnId:
         )
 
     async def test_get_by_name_reads_the_entry(self, tmp_path: Path) -> None:
-        """Killed by: src/uclone_x/story/names.py :: for name in (item.entry.id, item.entry.name, *item.entry.aliases)
+        """Killed by: examples/story/src/uclone_x_story/names.py :: for name in (item.entry.id, item.entry.name, *item.entry.aliases)
         Becomes: for name in (item.entry.id,)
         """
         out = await _ok(StoryCodexTool(), self._moon_seal(tmp_path), action="get", entry_id="카엘")
@@ -1432,7 +1432,7 @@ class TestForSceneNamesWhatTheRequestAsksThatTheStoryEnded:
     async def test_the_dead_teacher_and_the_lost_sword_come_first_one_line_each(
         self, tmp_path: Path
     ) -> None:
-        """Killed by: src/uclone_x/story/context.py :: request_conflicts(outline, scene_id, codex, request) if request else ([], None)
+        """Killed by: examples/story/src/uclone_x_story/context.py :: request_conflicts(outline, scene_id, codex, request) if request else ([], None)
         Becomes: request_conflicts(outline, scene_id, codex, "") if request else ([], None)
         """
         out = await self._for_scene(tmp_path, "ch02.s04", request=self.TEMPT)
@@ -1444,7 +1444,7 @@ class TestForSceneNamesWhatTheRequestAsksThatTheStoryEnded:
         assert "승인" in out["request_conflicts_note"]  # how the person changes it
 
     async def test_the_lost_sword_line_says_who_has_it_now(self, tmp_path: Path) -> None:
-        """Killed by: src/uclone_x/story/context.py :: now_ko = f" 지금은 {', '.join(change.holders)}에게 있습니다." if change.holders else ""
+        """Killed by: examples/story/src/uclone_x_story/context.py :: now_ko = f" 지금은 {', '.join(change.holders)}에게 있습니다." if change.holders else ""
         Becomes: now_ko = ""
         """
         out = await self._for_scene(tmp_path, "ch02.s04", request="라온이 월광검을 뽑는다")
@@ -1453,7 +1453,7 @@ class TestForSceneNamesWhatTheRequestAsksThatTheStoryEnded:
         assert "지금은 카엘에게 있습니다" in lost
 
     async def test_a_request_for_a_living_character_raises_nothing(self, tmp_path: Path) -> None:
-        """Killed by: src/uclone_x/story/context.py :: and _mentions(item.entry, haystack)
+        """Killed by: examples/story/src/uclone_x_story/context.py :: and _mentions(item.entry, haystack)
         Becomes: and True
         """
         out = await self._for_scene(tmp_path, "ch02.s04", request="도윤이 멀리서 지켜본다")
@@ -1461,7 +1461,7 @@ class TestForSceneNamesWhatTheRequestAsksThatTheStoryEnded:
         assert "request_conflicts" not in out and "request_conflicts_note" not in out
 
     async def test_a_flashback_before_the_death_raises_nothing(self, tmp_path: Path) -> None:
-        """Killed by: src/uclone_x/story/context.py :: for change in named_changes(outline, scene_id, codex, request):
+        """Killed by: examples/story/src/uclone_x_story/context.py :: for change in named_changes(outline, scene_id, codex, request):
         Becomes: for change in named_changes(outline, "ch02.s04", codex, request):
         """
         out = await self._for_scene(tmp_path, "ch02.s03", request=self.TEMPT)
@@ -1469,7 +1469,7 @@ class TestForSceneNamesWhatTheRequestAsksThatTheStoryEnded:
         assert "request_conflicts" not in out and "request_conflicts_note" not in out
 
     async def test_without_a_request_the_bundle_is_as_it_was(self, tmp_path: Path) -> None:
-        """Killed by: src/uclone_x/story/context.py :: if conflicts:
+        """Killed by: examples/story/src/uclone_x_story/context.py :: if conflicts:
         Becomes: if conflicts is not None:
         """
         plain = await self._for_scene(tmp_path, "ch02.s04")
@@ -1479,7 +1479,7 @@ class TestForSceneNamesWhatTheRequestAsksThatTheStoryEnded:
         assert "request_conflicts" not in plain and plain == empty
 
     async def test_the_lines_are_in_plain_words(self, tmp_path: Path) -> None:
-        """Killed by: src/uclone_x/story/context.py :: title = found[1].title if found and found[1].title else at
+        """Killed by: examples/story/src/uclone_x_story/context.py :: title = found[1].title if found and found[1].title else at
         Becomes: title = at
         """
         out = await self._for_scene(tmp_path, "ch02.s04", request=self.TEMPT)
@@ -1496,7 +1496,7 @@ class TestTheOutline:
     async def test_new_scenes_get_the_next_free_id_and_move_keeps_order(
         self, tmp_path: Path
     ) -> None:
-        """Killed by: src/uclone_x/story/tools.py :: while f"{chapter_id}.s{number:02d}" in taken:
+        """Killed by: examples/story/src/uclone_x_story/tools.py :: while f"{chapter_id}.s{number:02d}" in taken:
         Becomes: while False:
         """
         story_id = await _new_story(tmp_path)
@@ -1553,7 +1553,7 @@ class TestASceneContextSaysWhatItLeftOut:
     async def test_named_always_and_mentioned_entries_go_in_with_their_reasons(
         self, tmp_path: Path
     ) -> None:
-        """Killed by: src/uclone_x/story/context.py :: for name in (entry.name, *entry.aliases)
+        """Killed by: examples/story/src/uclone_x_story/context.py :: for name in (entry.name, *entry.aliases)
         Becomes: for name in (entry.name,)
         """
         story_id = await _new_story(tmp_path)
@@ -1593,10 +1593,10 @@ class TestASceneContextSaysWhatItLeftOut:
         assert "changes_in_this_scene" not in manifest
 
     def test_entries_over_the_budget_are_listed_as_left_out(self) -> None:
-        """Killed by: src/uclone_x/story/context.py :: if len(entries) >= MAX_ENTRIES:
+        """Killed by: examples/story/src/uclone_x_story/context.py :: if len(entries) >= MAX_ENTRIES:
         Becomes: if False:
         """
-        from uclone_x.story.context import scene_context
+        from uclone_x_story.context import scene_context
 
         outline = Outline.model_validate(
             {"chapters": [{"id": "c", "title": "C", "scenes": [{"id": "s", "title": "S"}]}]}
@@ -1615,9 +1615,9 @@ class TestASceneContextSaysWhatItLeftOut:
     async def test_an_earlier_scene_s_change_is_applied_and_this_scene_s_is_listed(
         self, tmp_path: Path
     ) -> None:
-        """Killed by: src/uclone_x/story/context.py :: entries.append(render_entry(item, snapshot))
+        """Killed by: examples/story/src/uclone_x_story/context.py :: entries.append(render_entry(item, snapshot))
         Becomes: entries.append(render_entry(item))
-        Killed by: src/uclone_x/story/context.py :: manifest["changes_in_this_scene"] = in_this_scene
+        Killed by: examples/story/src/uclone_x_story/context.py :: manifest["changes_in_this_scene"] = in_this_scene
         Becomes: pass
         """
         story_id = await _new_story(tmp_path)
@@ -1660,11 +1660,11 @@ class TestASceneContextSaysWhatItLeftOut:
     async def test_a_character_s_appearance_reaches_the_writer_at_the_scene_s_moment(
         self, tmp_path: Path
     ) -> None:
-        """Killed by: src/uclone_x/story/context.py :: if visual.prose:
+        """Killed by: examples/story/src/uclone_x_story/context.py :: if visual.prose:
         Becomes: if False:
-        Killed by: src/uclone_x/story/context.py :: if visual.gender is not None:
+        Killed by: examples/story/src/uclone_x_story/context.py :: if visual.gender is not None:
         Becomes: if False:
-        Killed by: src/uclone_x/story/context.py :: if snapshot is not None and any(p["kind"] == "visual" for p in snapshot.applied):
+        Killed by: examples/story/src/uclone_x_story/context.py :: if snapshot is not None and any(p["kind"] == "visual" for p in snapshot.applied):
         Becomes: if snapshot is not None:
         """
         story_id = await _new_story(tmp_path)
@@ -1710,7 +1710,7 @@ class TestASceneContextSaysWhatItLeftOut:
     async def test_a_visual_block_without_prose_gives_no_appearance(self, tmp_path: Path) -> None:
         """#1613 item 7: a character drawn by tags alone has no `appearance`, not a null one.
 
-        Killed by: src/uclone_x/story/context.py :: if visual.prose:
+        Killed by: examples/story/src/uclone_x_story/context.py :: if visual.prose:
         Becomes: if True:
         """
         story_id = await _new_story(tmp_path)
@@ -1732,17 +1732,17 @@ class TestASceneContextSaysWhatItLeftOut:
         """#1613: the live writer eval's Writer, handed 예린's full entry only when the scene's
         beats happened to name her, wrote the dead teacher correcting a stance.
 
-        Killed by: src/uclone_x/story/context.py :: if (item.kind, item.entry.id) in listed_in_full:
+        Killed by: examples/story/src/uclone_x_story/context.py :: if (item.kind, item.entry.id) in listed_in_full:
         Becomes: if False:
-        Killed by: src/uclone_x/story/context.py :: outside = entry_snapshot(item.entry, placements, scene.id, through_scene=False)
+        Killed by: examples/story/src/uclone_x_story/context.py :: outside = entry_snapshot(item.entry, placements, scene.id, through_scene=False)
         Becomes: outside = entry_snapshot(item.entry, placements, scene.id, through_scene=True)
-        Killed by: src/uclone_x/story/context.py :: dated.sort(key=lambda pair: pair[0], reverse=True)
+        Killed by: examples/story/src/uclone_x_story/context.py :: dated.sort(key=lambda pair: pair[0], reverse=True)
         Becomes: dated.sort(key=lambda pair: pair[0])
-        Killed by: src/uclone_x/story/context.py :: bundle["earlier_changes"] = earlier_changes
+        Killed by: examples/story/src/uclone_x_story/context.py :: bundle["earlier_changes"] = earlier_changes
         Becomes: pass
-        Killed by: src/uclone_x/story/context.py :: where = f"since {change['at']}" + (f", {change['note']}" if change.get("note") else "")
+        Killed by: examples/story/src/uclone_x_story/context.py :: where = f"since {change['at']}" + (f", {change['note']}" if change.get("note") else "")
         Becomes: where = f"since {change['at']}"
-        Killed by: src/uclone_x/story/context.py :: return f"{item.entry.name} ('{item.entry.id}', {item.kind}): " + "; ".join(reversed(parts))
+        Killed by: examples/story/src/uclone_x_story/context.py :: return f"{item.entry.name} ('{item.entry.id}', {item.kind}): " + "; ".join(reversed(parts))
         Becomes: return f"{item.entry.name} ('{item.entry.id}', {item.kind}): " + "; ".join(parts)
         """
         story_id = await _new_story(tmp_path)
@@ -1826,10 +1826,10 @@ class TestASceneContextSaysWhatItLeftOut:
         """A scene that lists more entries than `MAX_ENTRIES` drops the rest from the bundle;
         a death in a dropped one still reaches the Writer as one line (#1613 item 8).
 
-        Killed by: src/uclone_x/story/context.py :: listed_in_full = {key for key in listed if key in snapshots}
+        Killed by: examples/story/src/uclone_x_story/context.py :: listed_in_full = {key for key in listed if key in snapshots}
         Becomes: listed_in_full = listed
         """
-        from uclone_x.story.context import scene_context
+        from uclone_x_story.context import scene_context
 
         outline = Outline.model_validate(
             {
@@ -1872,10 +1872,10 @@ class TestASceneContextSaysWhatItLeftOut:
         ]
 
     def test_earlier_changes_over_the_budget_are_counted(self) -> None:
-        """Killed by: src/uclone_x/story/context.py :: earlier_changes = [line for _, line in dated[:MAX_EARLIER_CHANGES]]
+        """Killed by: examples/story/src/uclone_x_story/context.py :: earlier_changes = [line for _, line in dated[:MAX_EARLIER_CHANGES]]
         Becomes: earlier_changes = [line for _, line in dated]
         """
-        from uclone_x.story.context import MAX_EARLIER_CHANGES, scene_context
+        from uclone_x_story.context import MAX_EARLIER_CHANGES, scene_context
 
         outline = Outline.model_validate(
             {
@@ -1913,7 +1913,7 @@ class TestASceneContextSaysWhatItLeftOut:
 
 class TestSessionsAreRecorded:
     async def test_opening_and_closing_are_written_to_sessions(self, tmp_path: Path) -> None:
-        """Killed by: src/uclone_x/story/tool.py :: result.update(StoryLibraryTool._session_closed(library, story_id, conversation))
+        """Killed by: examples/story/src/uclone_x_story/tool.py :: result.update(StoryLibraryTool._session_closed(library, story_id, conversation))
         Becomes: result.update({})
         """
         story_id = await _new_story(tmp_path)
@@ -1931,7 +1931,7 @@ class TestSessionsAreRecorded:
     ) -> None:
         """Room A can no longer write the story, so it cannot close its own entry (#1576).
 
-        Killed by: src/uclone_x/story/tool.py :: result.update(self._session_opened(library, story_id, conversation, taken_from=previous))
+        Killed by: examples/story/src/uclone_x_story/tool.py :: result.update(self._session_opened(library, story_id, conversation, taken_from=previous))
         Becomes: result.update(self._session_opened(library, story_id, conversation))
         """
         story_id = await _new_story(tmp_path)
@@ -1958,7 +1958,7 @@ class TestTheLibraryOutsideAConversation:
     ) -> None:
         """A direct call of 'list' works outside a room; the tool is not offered there (#1576).
 
-        Killed by: src/uclone_x/story/tool.py :: if params.action == "list":
+        Killed by: examples/story/src/uclone_x_story/tool.py :: if params.action == "list":
         Becomes: if False:
         """
         story_id = await _new_story(tmp_path)
@@ -1988,7 +1988,7 @@ class TestCharacterSheetOverAStory:
     async def test_save_proposes_the_change_instead_of_writing_a_sheet(
         self, tmp_path: Path
     ) -> None:
-        """Killed by: src/uclone_x/story/character.py :: return _propose_visual(params, context)
+        """Killed by: examples/story/src/uclone_x_story/character.py :: return _propose_visual(params, context)
         Becomes: raise PlainRefusalError("no")
         """
         story_id = await _new_story(tmp_path)
@@ -2011,7 +2011,7 @@ class TestCharacterSheetOverAStory:
         assert not (tmp_path / "characters").exists()
 
     async def test_get_and_compose_read_the_codex_visual_block(self, tmp_path: Path) -> None:
-        """Killed by: src/uclone_x/story/character.py :: "danbooru_tags": ", ".join(visual.tags) if visual else "",
+        """Killed by: examples/story/src/uclone_x_story/character.py :: "danbooru_tags": ", ".join(visual.tags) if visual else "",
         Becomes: "danbooru_tags": "",
         """
         story_id = await _new_story(tmp_path)

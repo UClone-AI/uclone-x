@@ -144,7 +144,7 @@ describe('changing a picture', () => {
   // Killed by: frontend/src/lib/avatarChoice.ts :: return FAILURE_OF_CODE[code];
   // Becomes: return 'refused';
   it('tells each refusal apart by the reason the runtime gives (#1780)', async () => {
-    const codes = ['no_clone', 'not_an_image', 'too_large', 'not_saved', 'no_workspace', 'outside_workspace', 'no_file', 'stale_change', 'new_reason'];
+    const codes = ['no_clone', 'clone_unreadable', 'not_an_image', 'too_large', 'not_saved', 'no_workspace', 'outside_workspace', 'no_file', 'stale_change', 'new_reason'];
     let i = 0;
     vi.stubGlobal(
       'fetch',
@@ -154,6 +154,8 @@ describe('changing a picture', () => {
     for (let n = 0; n < codes.length; n += 1) failures.push((await resetAvatar('scout')) as { failure: string });
     expect(failures.map((f) => f.failure)).toEqual([
       'noClone',
+      // The clone is there; its settings file cannot be read (#2241).
+      'unreadable',
       'refused',
       'tooLarge',
       'notSaved',

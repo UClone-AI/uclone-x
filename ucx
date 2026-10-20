@@ -28,7 +28,16 @@ else
     PYTHON_BIN="python3"
 fi
 
-export PYTHONPATH="$REPO_ROOT/src:$REPO_ROOT:$PYTHONPATH"
+# This checkout's examples too (`examples/<name>/src`), ahead of the shared venv's
+# editable install, which points at whichever checkout ran `uv sync`: without this a
+# worktree's dev app and evals ran the primary checkout's story code (#2256).
+EXAMPLES_PATH=""
+for example_src in "$REPO_ROOT"/examples/*/src; do
+    if [ -d "$example_src" ]; then
+        EXAMPLES_PATH="$EXAMPLES_PATH$example_src:"
+    fi
+done
+export PYTHONPATH="$REPO_ROOT/src:$EXAMPLES_PATH$REPO_ROOT:$PYTHONPATH"
 
 # Never write __pycache__ from a `ucx` invocation. CPython invalidates a cached .pyc on
 # the tuple (source mtime in whole seconds, source size); a size-preserving mutation

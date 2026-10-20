@@ -46,6 +46,7 @@ from uclone_x.llm.models import (
 from uclone_x.memory.extractor import INSTRUCTIONS_OPENING
 from uclone_x.room.models import ParticipantKind
 from uclone_x.room.resolver import room_participant_system_prompt
+from uclone_x_story.ucx_extension import PERSONAS_DIR as STORY_PERSONAS_DIR
 
 _MODEL = "parity-model"
 _PROV = Provenance(
@@ -135,7 +136,10 @@ def _clone_request(tmp: Path, *, other_seat: bool) -> tuple[LLMRequest, str]:
         # Both are clones, as a name no clone carries is refused (clone-data-scopes §3.4):
         # the clone is the installed builtin, so its persona's instructions are compared too;
         # the other seat, whose request is not compared, is a bare one.
-        ensure_clone_store(None, builtin_dir=BUILTIN_PERSONAS_DIR)
+        # Writer ships with the story example (#2208).
+        ensure_clone_store(
+            None, builtin_dir=BUILTIN_PERSONAS_DIR, extension_dirs=(STORY_PERSONAS_DIR,)
+        )
         make_clones(_OTHER)
         mgr = AgentSessionManager(
             storage_dir=tmp / "sessions", llm=llm, workspace_dir=tmp / "workspace"

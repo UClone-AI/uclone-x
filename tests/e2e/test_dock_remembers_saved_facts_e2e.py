@@ -154,17 +154,19 @@ async def test_tell_a_fact_see_will_remember_forget_from_row_and_see_gone_from_r
     tmp_path: Path,
 ) -> None:
     extraction_json = json.dumps(
-        [
-            {
-                "subject": "Kenny",
-                "relation": "favourite_colour",
-                "value": "teal",
-                "source": "person",
-                "durable": True,
-                "confidence": 0.8,
-                "why": "stated by user",
-            }
-        ]
+        {
+            "facts": [
+                {
+                    "subject": "Kenny",
+                    "key": "favourite_colour",
+                    "value": "teal",
+                    "quote": "My favourite colour is teal",
+                    "durable": True,
+                    "confidence": 0.8,
+                    "why": "stated by user",
+                }
+            ]
+        }
     )
     llm = _E2EMockLLMConnector(
         default_model="mock-gpt-4o",

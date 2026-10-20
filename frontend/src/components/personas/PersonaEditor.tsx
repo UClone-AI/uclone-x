@@ -726,6 +726,20 @@ export const PersonaEditor: React.FC<PersonaEditorProps> = ({
         <p className="text-[11px] text-slate-500 mt-1">{copy.fields.capabilitiesHint}</p>
       </fieldset>
 
+      {/* One switch per clone, on by default (#1840, owner ruling 2026-10-10). */}
+      <fieldset>
+        <legend className={labelClass}>{copy.fields.memory}</legend>
+        <label className="flex items-center gap-2 text-[11px] text-slate-400">
+          <input
+            type="checkbox"
+            checked={draft.learn_from_conversations}
+            onChange={(e) => set('learn_from_conversations', e.target.checked)}
+          />
+          {copy.fields.learnFromConversations}
+        </label>
+        <p className="text-[11px] text-slate-500 mt-1">{copy.fields.learnFromConversationsHint}</p>
+      </fieldset>
+
       <p className="text-[11px] text-slate-500">{copy.fields.modelSettingsHint}</p>
 
       {error || (problem && touched) ? (

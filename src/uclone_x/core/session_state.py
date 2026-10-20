@@ -144,12 +144,11 @@ def redact_message(message: ChatMessage) -> ChatMessage:
             sanitized_args = cast(dict[str, Any], redact_log_payload(unwrapped))
             if sanitized_args != unwrapped:
                 tool_calls_modified = True
+                # Every field but the arguments as it was, not a rebuild by field: that
+                # dropped the provider's signature, and Gemini 3 refuses the replay
+                # without it (#2227).
                 new_tool_calls.append(
-                    ToolCallRequest(
-                        id=tc.id,
-                        name=tc.name,
-                        arguments=sanitized_args,
-                    )
+                    ToolCallRequest.model_validate({**tc.model_dump(), "arguments": sanitized_args})
                 )
                 continue
         new_tool_calls.append(tc)

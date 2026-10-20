@@ -82,5 +82,6 @@ def supersede_edge(
             "retraction_reason": reason or f"Superseded by fact {by}",
             "retracted_at": at,
             "updated_at": at,
+            "superseded_by": by,
         },
     )

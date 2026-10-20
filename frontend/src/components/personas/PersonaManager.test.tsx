@@ -3,6 +3,9 @@ import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import React from 'react';
 import { PersonaManager, type PersonaManagerProps } from './PersonaManager';
 import { en } from '../../i18n/en';
+import { ko } from '../../i18n/ko';
+
+const ko_personaEditor = ko.personaEditor;
 import { fmt, plural } from '../../i18n/format';
 import type { PersonaSaveResult } from '../../lib/personaDraft';
 import { makePersonaInfo } from '../../test/fixtures';
@@ -59,6 +62,81 @@ describe('PersonaManager', () => {
     expect(screen.getByTestId('persona-row-guide')).toHaveTextContent(PERSONA_EDITOR_COPY.builtinBadge);
     expect(screen.getByTestId('persona-row-reader')).toHaveTextContent(PERSONA_EDITOR_COPY.overrideBadge);
     expect(screen.getByText(fmt(PERSONA_EDITOR_COPY.savedTo, { dir: '/work/.uclone/personas' }))).toBeInTheDocument();
+  });
+
+  it('marks a clone that could not be loaded, says why, and offers no edit (#2220)', () => {
+    const reason = "This clone's model does not say which connection it is on.";
+    renderManager({
+      personas: [
+        makePersonaInfo({ name: 'guide', role: 'Guide', system_prompt: 'You guide.' }),
+        makePersonaInfo({ name: 'bad', role: '', status: 'unreadable', reason }),
+      ],
+    });
+
+    const row = screen.getByTestId('persona-row-bad');
+    expect(row).toHaveTextContent(PERSONA_EDITOR_COPY.unreadableBadge);
+    // Killed by: frontend/src/components/personas/PersonaManager.tsx :: <p className="text-[11px] text-amber-200/90">{unreadableReason(persona, copy)}</p>
+    // Becomes: <p className="text-[11px] text-amber-200/90">{persona.role}</p>
+    // With no code (an older Core), the Core's own sentence is shown.
+    expect(row).toHaveTextContent(reason);
+    // Killed by: frontend/src/components/personas/PersonaManager.tsx :: disabled={!canWrite || unreadable}
+    // Becomes: disabled={!canWrite}
+    expect(screen.getByRole('button', { name: `${PERSONA_EDITOR_COPY.edit} bad` })).toBeDisabled();
+    expect(screen.getByRole('button', { name: `${PERSONA_EDITOR_COPY.edit} guide` })).toBeEnabled();
+  });
+
+  // Killed by: frontend/src/lib/personaDraft.ts :: if (code && Object.prototype.hasOwnProperty.call(copy.unreadableReasons, code)) {
+  // Becomes: if (false) {
+  it('words the reason in the screen language when the Core sends its code (#2241)', () => {
+    const english = "This clone's model does not say which connection it is on.";
+    const ko = ko_personaEditor;
+    renderManager({
+      copy: ko,
+      personas: [
+        makePersonaInfo({ name: 'bad', role: '', status: 'unreadable', reason: english, reason_code: 'bare_model' }),
+        makePersonaInfo({ name: 'odd', role: '', status: 'unreadable', reason: 'Old words.', reason_code: 'newer_code' }),
+      ],
+    });
+
+    const bad = screen.getByTestId('persona-row-bad');
+    expect(bad).toHaveTextContent(ko.unreadableReasons.bare_model);
+    expect(bad).not.toHaveTextContent(english);
+    // A code this head does not know yet falls back to the Core's sentence.
+    expect(screen.getByTestId('persona-row-odd')).toHaveTextContent('Old words.');
+  });
+
+  // #2282: two clones can claim one handle (both listed unreadable); keyed by handle, React
+  // saw one key twice and could drop or swap their rows on the next render.
+  // Killed by: frontend/src/components/personas/PersonaManager.tsx :: key={cloneIdOf(persona)}
+  // Becomes: key={persona.name}
+  it('keys each row by its clone id, so two clones sharing a handle stay two rows', () => {
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
+    renderManager({
+      personas: [
+        makePersonaInfo({ id: 'agt_a', name: 'twin', role: '', status: 'unreadable', reason: 'One.' }),
+        makePersonaInfo({ id: 'agt_b', name: 'twin', role: '', status: 'unreadable', reason: 'Two.' }),
+      ],
+    });
+
+    expect(errors.mock.calls.flat().join(' ')).not.toMatch(/same key/);
+    errors.mockRestore();
+  });
+
+  // #2286: the test id was the handle, so the two rows shared one. It is the clone's id now,
+  // and the handle is on `data-clone-handle`, which the end-to-end tests look rows up by.
+  // Killed by: frontend/src/components/personas/PersonaManager.tsx :: data-testid={`persona-row-${cloneIdOf(persona)}`}
+  // Becomes: data-testid={`persona-row-${persona.name}`}
+  it('gives each row its own test id, and names its handle beside it', () => {
+    renderManager({
+      personas: [
+        makePersonaInfo({ id: 'agt_a', name: 'twin', role: '', status: 'unreadable', reason: 'One.' }),
+        makePersonaInfo({ id: 'agt_b', name: 'twin', role: '', status: 'unreadable', reason: 'Two.' }),
+      ],
+    });
+
+    expect(screen.getByTestId('persona-row-agt_a')).toHaveTextContent('One.');
+    expect(screen.getByTestId('persona-row-agt_b')).toHaveTextContent('Two.');
+    expect(screen.getByTestId('persona-row-agt_a').getAttribute('data-clone-handle')).toBe('twin');
   });
 
   it('states why the list is empty', () => {
@@ -146,8 +224,9 @@ describe('PersonaManager', () => {
       fireEvent.click(screen.getByRole('button', { name: `${PERSONA_EDITOR_COPY.edit} builder` }));
 
       // #1167: the runtime enforces both flags now, so the editor offers them again --
-      // alongside the default-prompt one -- each showing what the persona actually stores.
-      expect(screen.getAllByRole('checkbox')).toHaveLength(3);
+      // alongside the default-prompt one and "Learn from conversations" (#1840) -- each
+      // showing what the persona actually stores.
+      expect(screen.getAllByRole('checkbox')).toHaveLength(4);
       const writeBox = screen.getByRole('checkbox', {
         name: PERSONA_EDITOR_COPY.fields.enableWriteTools,
       });
@@ -214,6 +293,64 @@ describe('PersonaManager', () => {
         'edit',
       ),
     );
+  });
+
+  it.each([
+    [undefined, true],
+    [true, true],
+    [false, false],
+  ])(
+    'shows "Learn from conversations" as the clone stores it (stored %s, shown %s) and saves what the person leaves',
+    async (stored, shown) => {
+      // #1840: one switch per clone, on by default. A clone listed without the field -- every
+      // clone saved before the switch existed -- reads as on, as the Core loads it.
+      const props = renderManager({
+        personas: [
+          makePersonaInfo({
+            name: 'builder',
+            role: 'Builder',
+            system_prompt: 'You build.',
+            ...(stored === undefined ? {} : { learn_from_conversations: stored }),
+          }),
+        ],
+      });
+
+      fireEvent.click(screen.getByRole('button', { name: `${PERSONA_EDITOR_COPY.edit} builder` }));
+      const learnBox = screen.getByRole('checkbox', {
+        name: PERSONA_EDITOR_COPY.fields.learnFromConversations,
+      }) as HTMLInputElement;
+      // Killed by: frontend/src/lib/personaDraft.ts :: learn_from_conversations: persona.learn_from_conversations ?? true,
+      // Becomes: learn_from_conversations: persona.learn_from_conversations ?? false,
+      expect(learnBox.checked).toBe(shown);
+      expect(screen.getByText(PERSONA_EDITOR_COPY.fields.learnFromConversationsHint)).toBeInTheDocument();
+      // The field's name is the Core's, never the reader's.
+      expect(screen.queryByText(/learn_from_conversations/)).not.toBeInTheDocument();
+
+      fireEvent.click(learnBox);
+      fireEvent.click(screen.getByRole('button', { name: PERSONA_EDITOR_COPY.save }));
+
+      // Killed by: frontend/src/components/personas/PersonaEditor.tsx :: onChange={(e) => set('learn_from_conversations', e.target.checked)}
+      // Becomes: onChange={(e) => set('enable_subagent_tools', e.target.checked)}
+      await waitFor(() =>
+        expect(props.onSave).toHaveBeenCalledWith(
+          expect.objectContaining({ name: 'builder', learn_from_conversations: !shown }),
+          'edit',
+        ),
+      );
+    },
+  );
+
+  it('creates a clone that learns from conversations unless the person turns it off', () => {
+    renderManager();
+
+    fireEvent.click(screen.getByRole('button', { name: PERSONA_EDITOR_COPY.newPersona }));
+
+    // Killed by: frontend/src/lib/personaDraft.ts :: learn_from_conversations: true,
+    // Becomes: learn_from_conversations: false,
+    const learnBox = screen.getByRole('checkbox', {
+      name: PERSONA_EDITOR_COPY.fields.learnFromConversations,
+    }) as HTMLInputElement;
+    expect(learnBox.checked).toBe(true);
   });
 
   it('keeps who a persona may call when the editor saves it', async () => {

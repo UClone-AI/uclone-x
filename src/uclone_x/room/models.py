@@ -33,6 +33,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from uclone_x.agent.models import AgentLLMConfig, ProviderFailure
 from uclone_x.core.immutable import ImmutableStrMapping
 from uclone_x.core.provenance import Provenance
+from uclone_x.core.tool_results import StepRefusalCode
 from uclone_x.llm.models import TokenUsage
 from uclone_x.room.notices import NoticeCode, NoticeParams
 
@@ -337,6 +338,19 @@ class RoomMessage(BaseModel):
         description="Set, beside `error`, when the failure is one a retry would meet "
         "again (#969). `None` on every other row, and on rows stored before it existed.",
     )
+    step_refusal: StepRefusalCode | None = Field(
+        default=None,
+        exclude_if=lambda refused: refused is None,
+        description="Set, beside `error`, when the turn refused a step its tools' results "
+        "could not fit in the model's window (#1509, #1862), ended with its reply still "
+        "empty after the re-ask (`step.empty_reply`), or thought past its budget twice "
+        "(`step.thinking_budget`, #2202): the code a head says in the "
+        "reader's language, as the CLI and the ACP server already do. Without it the app "
+        "could only say that something went wrong, and the person resent the same message "
+        "into the same refusal (#2264). Not a `refusal`: the turn is rolled back, so a "
+        "retry starts from before it. `None` on every other row, and on rows stored before "
+        "it existed.",
+    )
     provider_failure: ProviderFailure | None = Field(
         default=None,
         exclude_if=lambda failure: failure is None,
@@ -464,6 +478,13 @@ class RoomMessage(BaseModel):
         description="A plain sentence for the person when the speaker could not learn from "
         "this turn (#1404). Never the cause: the model's error, its raw reply and fact ids "
         "stay in the log. The reply stands either way, and the extraction is not retried.",
+    )
+    knowledge_skipped: bool = Field(
+        default=False,
+        exclude_if=lambda skipped: not skipped,
+        description="True when the speaker did not learn from this turn because what was "
+        "left of its budget was kept for the person's next reply (#1851, #2328). Not a "
+        "failure: nothing was sent to the model. Left out of the saved row while false.",
     )
     tools_recorded: bool = Field(
         default=False,

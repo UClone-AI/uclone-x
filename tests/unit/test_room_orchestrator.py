@@ -3901,6 +3901,9 @@ class TestARealAgentsFailuresInTheRoom:
             "clone": None,
             "model_ref": None,
             "action": None,
+            # A 401 is placed (auth), so no raw answer is kept for it (#2227).
+            "status_code": None,
+            "body_excerpt": None,
         }
 
     @pytest.mark.asyncio
@@ -3941,6 +3944,82 @@ class TestARealAgentsFailuresInTheRoom:
         ]
         assert len(landed) == 1
         assert landed[0]["refusal"] == "budget_exceeded"
+
+    @pytest.mark.asyncio
+    async def test_a_refused_step_lands_with_its_code_so_the_row_can_say_why(
+        self, built: Any
+    ) -> None:
+        """A step whose results did not fit lands with the code a head words (#2264).
+
+        In the #2257 run the Writer's reply came back empty: the turn had refused a step
+        (`step_results_over_window`), and the row held only `error`, which no head shows.
+        The app could say only that something went wrong, and the person sent the same
+        message again. The row and the landed event now carry the code, as the CLI and the
+        ACP server read it from the turn; it stays a failure Retry can try, not a refusal.
+
+        Killed by: src/uclone_x/room/orchestrator.py :: step_refusal = result.error_code
+        Becomes: step_refusal = None
+        Killed by: src/uclone_x/room/orchestrator.py :: payload["step_refusal"] = message.step_refusal
+        Becomes: pass
+        """
+        from uclone_x.core.tool_results import STEP_REFUSAL_TEXT
+        from uclone_x.engine.event_bus import AgentEvent, EventBus, EventType
+        from uclone_x.room.models import RoomMessage
+        from uclone_x.room.orchestrator import RoomOrchestrator
+
+        class Refusing(FakeAgent):
+            async def execute_turn(
+                self, prompt: str, *, stream_callback: Any = None, **kwargs: Any
+            ) -> Any:
+                from uclone_x.agent.models import TurnResult
+
+                self.prompts.append(prompt)
+                return TurnResult(
+                    turn_index=1,
+                    content="",
+                    is_completed=False,
+                    error=STEP_REFUSAL_TEXT["step.over_window"],
+                    error_code="step.over_window",
+                    stop_reason="step_results_over_window",
+                    provenance=None,
+                )
+
+        store, resolver, agents = built
+        _cap(built, 1)
+        agents["scout"] = Refusing("scout", SCOUT.session_id)
+        async with EventBus() as bus:
+            sub = bus.subscribe({"room.r1"})
+            orch = RoomOrchestrator(
+                store=store,
+                selectors=[ScriptedSelector("s", [speak("scout")])],
+                resolver=resolver,
+                bus=bus,
+            )
+            row = (await orch.post("r1", "alice", "more, please")).transcript[-1]
+            events: list[AgentEvent] = []
+            while True:
+                try:
+                    events.append(await asyncio.wait_for(sub.get(), 0.3))
+                except TimeoutError:
+                    break
+
+        assert row.content == ""
+        assert row.step_refusal == "step.over_window"
+        assert row.refusal is None  # Retry is still offered
+        landed = [
+            e.payload
+            for e in events
+            if e.type is EventType.AGENT_REPLY and e.payload.get("status") == "final"
+        ]
+        assert [p.get("step_refusal") for p in landed] == ["step.over_window"]
+        stored = store.load("r1")
+        assert stored is not None and stored.transcript[-1].step_refusal == "step.over_window"
+        # A row stored before the field existed still loads, without one.
+        old = stored.transcript[-1].model_dump(mode="json")
+        del old["step_refusal"]
+        assert RoomMessage.model_validate_json(json.dumps(old)).step_refusal is None
+        # Every other row leaves it out of what it stores.
+        assert "step_refusal" not in stored.transcript[0].model_dump(mode="json")
 
     @pytest.mark.asyncio
     async def test_a_retry_puts_the_prompt_in_front_of_the_model_once(self, built: Any) -> None:
@@ -4195,7 +4274,7 @@ class TestARoomTurnsToolsAreRecorded:
         Each one is a file the conversation wrote, attributed to the seat that asked, and
         a peer that named everything it wrote is not counted as a possible unnamed write.
 
-        Killed by: src/uclone_x/agent/models.py :: candidates.extend(listed)
+        Killed by: src/uclone_x/agent/models.py :: candidates.extend(cast(list[object], listed))
         Becomes: pass
         """
         _, _, agents = built
@@ -4253,8 +4332,8 @@ class TestARoomTurnsToolsAreRecorded:
     async def test_a_failed_peer_call_leaves_a_trace(self, built: Any) -> None:
         """A peer that failed may have written before it stopped; the room counts it (#1558).
 
-        Killed by: src/uclone_x/room/orchestrator.py :: wrote_unnamed=(written_path is None and execution.writes_files)
-        Becomes: wrote_unnamed=(False)
+        Killed by: src/uclone_x/room/orchestrator.py :: wrote_unnamed=(written_path is None and execution.writes_files
+        Becomes: wrote_unnamed=(False
         """
         from uclone_x.tools.models import ToolResultStatus
 
@@ -4277,13 +4356,75 @@ class TestARoomTurnsToolsAreRecorded:
         assert saved.file_record.unattributed_writes == 1
 
     @pytest.mark.asyncio
+    async def test_a_failed_peer_call_that_says_it_wrote_nothing_is_not_counted(
+        self, built: Any
+    ) -> None:
+        """A peer that failed before writing anything says so, and the room believes it (#2229).
+
+        The peer's own turn records its tool calls, so a peer that stopped on a provider
+        error before any tool ran reports `unnamed_writes: false` and no paths. Counting it
+        anyway put "wrote a file" under a call that wrote nothing.
+
+        Killed by: src/uclone_x/room/orchestrator.py :: says_none = mapping.get("unnamed_writes") is False and not mapping.get("paths")
+        Becomes: says_none = False
+        """
+        from uclone_x.tools.models import ToolResultStatus
+
+        _, _, agents = built
+        agents["scout"].tool_executions = (
+            _execution(
+                "a2a_call",
+                "call_1",
+                output={"agent": "scout2", "paths": [], "unnamed_writes": False},
+                writes_files=True,
+                status=ToolResultStatus.ERROR,
+                error="scout2 stopped before finishing: it could not finish.",
+            ),
+        )
+        orch = _orchestrator(built, [ScriptedSelector("s", [speak("scout")])])
+        saved = await orch.post("r1", "alice", "ask scout2")
+
+        assert saved.written_files == ()
+        assert saved.tool_uses[0].wrote_unnamed is False
+        assert saved.file_record.unattributed_writes == 0
+
+    @pytest.mark.asyncio
+    async def test_a_failed_peer_call_that_wrote_before_stopping_is_counted(
+        self, built: Any
+    ) -> None:
+        """A failed call's files are not listed as written, but they are not forgotten either:
+        a peer that names files and then fails is counted as a possible unnamed write.
+
+        Killed by: src/uclone_x/room/orchestrator.py :: says_none = mapping.get("unnamed_writes") is False and not mapping.get("paths")
+        Becomes: says_none = mapping.get("unnamed_writes") is False
+        """
+        from uclone_x.tools.models import ToolResultStatus
+
+        _, _, agents = built
+        agents["scout"].tool_executions = (
+            _execution(
+                "a2a_call",
+                "call_1",
+                output={"agent": "artist", "paths": ["images/a.png"], "unnamed_writes": False},
+                writes_files=True,
+                status=ToolResultStatus.ERROR,
+                error="artist stopped before finishing: it ran out of steps.",
+            ),
+        )
+        orch = _orchestrator(built, [ScriptedSelector("s", [speak("scout")])])
+        saved = await orch.post("r1", "alice", "draw it")
+
+        assert saved.written_files == ()
+        assert saved.tool_uses[0].wrote_unnamed is True
+
+    @pytest.mark.asyncio
     async def test_a_write_that_names_no_path_is_counted_rather_than_dropped(
         self, built: Any
     ) -> None:
         """A shell can put bytes on the host without saying where (P6: say so).
 
-        Killed by: src/uclone_x/room/orchestrator.py :: wrote_unnamed=(written_path is None and execution.writes_files)
-        Becomes: wrote_unnamed=(False)
+        Killed by: src/uclone_x/room/orchestrator.py :: wrote_unnamed=(written_path is None and execution.writes_files
+        Becomes: wrote_unnamed=(False
         """
         _, _, agents = built
         agents["scout"].tool_executions = (

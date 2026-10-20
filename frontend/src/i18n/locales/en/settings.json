@@ -75,6 +75,8 @@
     "notUsable": "not usable",
     "remove": "Remove {root}",
     "empty": "No other folders added here.",
+    "notLoaded": "The saved folders could not be read, so none can be added or removed until they are.",
+    "retry": "Try again",
     "envIntro": "Also readable, set when the app started:",
     "envListLabel": "Read-only folders from the environment",
     "ignored": "Ignored: {reason}",

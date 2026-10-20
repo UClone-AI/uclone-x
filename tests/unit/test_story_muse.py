@@ -9,8 +9,9 @@ from typing import Any
 
 import pytest
 
-from uclone_x.story.muse import MuseSparkTool, draw_cards
-from uclone_x.story.skill_data import (
+from uclone_x.tools.models import ToolContext
+from uclone_x_story.muse import MuseSparkTool, draw_cards
+from uclone_x_story.skill_data import (
     BUNDLED_DATA_ROOT,
     MuseSlot,
     MuseTable,
@@ -18,7 +19,6 @@ from uclone_x.story.skill_data import (
     load_muse_tables,
     load_structure_templates,
 )
-from uclone_x.tools.models import ToolContext
 
 _FIXTURE_TABLE = MuseTable(
     genre="fixture",
@@ -53,7 +53,7 @@ def _write(path: Path, text: str) -> Path:
 def test_the_same_seed_draws_the_same_cards(tmp_path: Path) -> None:
     """Two draws with one seed return identical cards; another seed draws others.
 
-    Killed by: src/uclone_x/story/muse.py :: seed = params.seed if params.seed is not None else
+    Killed by: examples/story/src/uclone_x_story/muse.py :: seed = params.seed if params.seed is not None else
     Becomes: seed = params.seed if params.seed is None else
     """
     tool = MuseSparkTool()
@@ -70,7 +70,7 @@ def test_the_same_seed_draws_the_same_cards(tmp_path: Path) -> None:
 def test_a_draw_without_a_seed_returns_the_seed_that_repeats_it(tmp_path: Path) -> None:
     """The model need not choose a seed; the one the tool chose comes back and reproduces.
 
-    Killed by: src/uclone_x/story/muse.py :: "seed": seed,
+    Killed by: examples/story/src/uclone_x_story/muse.py :: "seed": seed,
     Becomes: "seed": 1234,
     """
     tool = MuseSparkTool()
@@ -83,7 +83,7 @@ def test_a_draw_without_a_seed_returns_the_seed_that_repeats_it(tmp_path: Path) 
 def test_a_card_is_a_fixed_function_of_the_seed_not_of_the_interpreter() -> None:
     """Pinned literally: a card must not depend on `random`, hash seeding or the Python version.
 
-    Killed by: src/uclone_x/story/muse.py :: f"{seed}:{card}:{slot}"
+    Killed by: examples/story/src/uclone_x_story/muse.py :: f"{seed}:{card}:{slot}"
     Becomes: f"{seed}:{slot}:{card}"
     """
     assert draw_cards(_FIXTURE_TABLE, 81123, 2) == [
@@ -122,7 +122,7 @@ def test_the_result_carries_a_digest_that_changes_when_the_table_does(tmp_path: 
 def test_an_unknown_genre_draws_nothing_and_names_the_genres_there_are(tmp_path: Path) -> None:
     """P6: no default table stands in for a genre that has none.
 
-    Killed by: src/uclone_x/story/muse.py :: if found is None:
+    Killed by: examples/story/src/uclone_x_story/muse.py :: if found is None:
     Becomes: if found is True:
     """
     result = asyncio.run(
@@ -140,7 +140,7 @@ def test_an_unknown_genre_draws_nothing_and_names_the_genres_there_are(tmp_path:
 def test_an_unknown_genre_is_refused_in_plain_words_only(tmp_path: Path) -> None:
     """The whole refusal, as the conversation shows it: no class name, no prefix.
 
-    Killed by: src/uclone_x/story/muse.py :: class UnknownGenreError(PlainRefusalError):
+    Killed by: examples/story/src/uclone_x_story/muse.py :: class UnknownGenreError(PlainRefusalError):
     Becomes: class UnknownGenreError(Exception):
     """
     result = asyncio.run(
@@ -160,7 +160,7 @@ def test_a_broken_table_is_refused_naming_the_file_in_its_root_and_the_field(
     """A skill's damaged table is reported by file and field, relative to the skill's
     folder: no class name, no absolute path, no validator text.
 
-    Killed by: src/uclone_x/story/muse.py :: class MuseDataError(PlainRefusalError):
+    Killed by: examples/story/src/uclone_x_story/muse.py :: class MuseDataError(PlainRefusalError):
     Becomes: class MuseDataError(Exception):
     """
     root = tmp_path / "skill"
@@ -185,7 +185,7 @@ def test_a_broken_table_is_refused_naming_the_file_in_its_root_and_the_field(
 def test_a_genre_matches_however_it_is_spaced_or_cased(tmp_path: Path, spelling: str) -> None:
     """The model writes a genre as a person would; the table's id uses hyphens.
 
-    Killed by: src/uclone_x/story/muse.py :: found = tables.get(normalize_genre(genre))
+    Killed by: examples/story/src/uclone_x_story/muse.py :: found = tables.get(normalize_genre(genre))
     Becomes: found = tables.get(genre)
     """
     tool = MuseSparkTool()
@@ -257,7 +257,7 @@ acts:
 def test_a_schema_error_names_the_file_and_the_field(tmp_path: Path) -> None:
     """A missing beat title is reported where it is, not replaced by a default.
 
-    Killed by: src/uclone_x/story/skill_data.py :: _field_path(first["loc"]) or None
+    Killed by: examples/story/src/uclone_x_story/skill_data.py :: _field_path(first["loc"]) or None
     Becomes: None
     """
     bad = _write(
@@ -275,7 +275,7 @@ def test_a_schema_error_names_the_file_and_the_field(tmp_path: Path) -> None:
 def test_an_id_that_disagrees_with_its_file_name_is_refused(tmp_path: Path) -> None:
     """The id is what `story.yaml` will store, and the file name is how it is found again.
 
-    Killed by: src/uclone_x/story/skill_data.py :: if getattr(loaded, id_field) != path.stem:
+    Killed by: examples/story/src/uclone_x_story/skill_data.py :: if getattr(loaded, id_field) != path.stem:
     Becomes: if False:
     """
     bad = _write(tmp_path / "structures" / "small.yaml", _TEMPLATE)
@@ -288,7 +288,7 @@ def test_an_id_that_disagrees_with_its_file_name_is_refused(tmp_path: Path) -> N
 def test_a_repeated_beat_id_is_refused(tmp_path: Path) -> None:
     """An outline addresses beats by id, so two with one id would be one beat.
 
-    Killed by: src/uclone_x/story/skill_data.py :: raise ValueError(f"{what} repeat '{item}'")
+    Killed by: examples/story/src/uclone_x_story/skill_data.py :: raise ValueError(f"{what} repeat '{item}'")
     Becomes: pass
     """
     _write(tmp_path / "structures" / "tiny.yaml", _TEMPLATE.replace("id: end", "id: start"))
@@ -308,7 +308,7 @@ def test_a_file_that_is_not_yaml_is_named(tmp_path: Path) -> None:
 def test_a_later_root_replaces_a_table_and_adds_a_genre(tmp_path: Path) -> None:
     """How a skill supplies data: same id replaces, a new id adds.
 
-    Killed by: src/uclone_x/story/skill_data.py :: loaded[path.stem] = Sourced(item, _source(root))
+    Killed by: examples/story/src/uclone_x_story/skill_data.py :: loaded[path.stem] = Sourced(item, _source(root))
     Becomes: loaded.setdefault(path.stem, Sourced(item, _source(root)))
     """
     _write(
@@ -329,7 +329,7 @@ def test_a_later_root_replaces_a_table_and_adds_a_genre(tmp_path: Path) -> None:
 def test_a_root_that_does_not_exist_is_an_error_not_an_empty_set(tmp_path: Path) -> None:
     """A mistyped skill path would otherwise load nothing, silently.
 
-    Killed by: src/uclone_x/story/skill_data.py :: if not _is_folder(root, root):
+    Killed by: examples/story/src/uclone_x_story/skill_data.py :: if not _is_folder(root, root):
     Becomes: if False:
     """
     missing = tmp_path / "nowhere"

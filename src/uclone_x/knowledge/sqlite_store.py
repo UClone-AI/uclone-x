@@ -31,7 +31,7 @@ import logging
 import sqlite3
 import unicodedata
 import uuid
-from collections.abc import Generator
+from collections.abc import Generator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -343,6 +343,52 @@ class KnowledgeTransaction(_Reader):
                 status if status is not None else held.edge.status,
                 expired_at if expired_at is not None else held.edge.expired_at,
                 json.dumps(merged, ensure_ascii=False),
+                edge_id,
+            ),
+        )
+
+    def set_entity_aliases(self, entity_id: str, aliases: Sequence[str]) -> None:
+        """Replace `entity_id`'s aliases in this scope (uGraph §6 Q2)."""
+        if self.entity(entity_id) is None:
+            raise KeyError(f"entity {entity_id!r} is not in scope {self.scope}")
+        cleaned = list(dict.fromkeys(_collapse(a) for a in aliases if _collapse(a)))
+        self._conn.execute(
+            "UPDATE entities SET aliases = ? WHERE id = ?",
+            (json.dumps(cleaned, ensure_ascii=False), entity_id),
+        )
+
+    def delete_entity(self, entity_id: str) -> None:
+        """Remove `entity_id` once its edges have been moved to another entity (uGraph §6 Q2)."""
+        self._conn.execute("DELETE FROM entities WHERE id = ?", (entity_id,))
+
+    def reassign_edge(
+        self,
+        edge_id: str,
+        *,
+        subject_id: str | None = None,
+        expired_at: str | None = None,
+        clear_expired: bool = False,
+        record: dict[str, Any] | None = None,
+    ) -> None:
+        """Move `edge_id` to `subject_id` or update its belief end and record (uGraph §6 Q2)."""
+        held = self.row(edge_id)
+        if held is None:
+            raise KeyError(f"edge {edge_id!r} is not in scope {self.scope}")
+        target_subject = subject_id if subject_id is not None else held.edge.subject_id
+        if self.entity(target_subject) is None:
+            raise KeyError(f"entity {target_subject!r} is not in scope {self.scope}")
+        next_expired = (
+            None
+            if clear_expired
+            else (expired_at if expired_at is not None else held.edge.expired_at)
+        )
+        next_record = record if record is not None else held.record
+        self._conn.execute(
+            "UPDATE edges SET subject_id = ?, expired_at = ?, record = ? WHERE id = ?",
+            (
+                target_subject,
+                next_expired,
+                json.dumps(next_record, ensure_ascii=False),
                 edge_id,
             ),
         )

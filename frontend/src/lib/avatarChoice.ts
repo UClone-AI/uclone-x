@@ -132,6 +132,7 @@ export const personaPicture = (
 export type AvatarFailure =
   | 'unreachable'
   | 'noClone'
+  | 'unreadable'
   | 'refused'
   | 'tooLarge'
   | 'notSaved'
@@ -152,6 +153,7 @@ export type AvatarResult =
 
 const FAILURE_OF_CODE: Readonly<Record<string, AvatarFailure>> = {
   no_clone: 'noClone',
+  clone_unreadable: 'unreadable',
   not_an_image: 'refused',
   too_large: 'tooLarge',
   not_saved: 'notSaved',

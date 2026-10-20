@@ -22,21 +22,21 @@ import yaml
 
 from uclone_x.room.service import RoomService
 from uclone_x.room.store import RoomStore
-from uclone_x.story.library import StoryLibrary
-from uclone_x.story.names import id_for_name
-from uclone_x.story.proposals import preview_proposal
-from uclone_x.story.tool import StoryLibraryTool
-from uclone_x.story.tools import (
+from uclone_x.tools.base import BaseTool
+from uclone_x.tools.models import NoIsolation, ToolContext, ToolResult
+from uclone_x_story.library import StoryLibrary
+from uclone_x_story.names import id_for_name
+from uclone_x_story.proposals import preview_proposal
+from uclone_x_story.tool import StoryLibraryTool
+from uclone_x_story.tools import (
     StoryAuditTool,
     StoryCodexTool,
     StoryContextTool,
     StoryManuscriptTool,
     StoryOutlineTool,
 )
-from uclone_x.story.view import StoryView
-from uclone_x.story.work import StoryWork
-from uclone_x.tools.base import BaseTool
-from uclone_x.tools.models import NoIsolation, ToolContext, ToolResult
+from uclone_x_story.view import StoryView
+from uclone_x_story.work import StoryWork
 
 ROOM = "room_a"
 
@@ -115,7 +115,7 @@ def _entry_files(workspace: Path, story_id: str) -> list[str]:
 
 class TestCreateProposesAndAPersonAdds:
     async def test_create_proposes_and_writes_no_entry(self, tmp_path: Path) -> None:
-        """Killed by: src/uclone_x/story/tools.py :: saved = [work.add_proposal(draft, room_id=room_id) for draft in drafts]
+        """Killed by: examples/story/src/uclone_x_story/tools.py :: saved = [work.add_proposal(draft, room_id=room_id) for draft in drafts]
         Becomes: saved = [draft for draft in drafts]
         """
         story_id, ctx = await _new_story(tmp_path)
@@ -129,9 +129,9 @@ class TestCreateProposesAndAPersonAdds:
     async def test_apply_writes_the_entry_and_get_context_and_audit_read_it(
         self, tmp_path: Path
     ) -> None:
-        """Killed by: src/uclone_x/story/proposals.py :: work.write(relative, dump_file(entry, compact=True), room_id=room_id, expected_digest=None)
+        """Killed by: examples/story/src/uclone_x_story/proposals.py :: work.write(relative, dump_file(entry, compact=True), room_id=room_id, expected_digest=None)
         Becomes: pass
-        Killed by: src/uclone_x/story/proposals.py :: return _apply_new(work, proposal, proposal_digest, room_id=room_id, decided_in=decided_in)
+        Killed by: examples/story/src/uclone_x_story/proposals.py :: return _apply_new(work, proposal, proposal_digest, room_id=room_id, decided_in=decided_in)
         Becomes: raise StoryError("x")
         """
         story_id, ctx = await _new_story(tmp_path)
@@ -192,7 +192,7 @@ class TestNoSecondEntryForOneName:
     async def test_a_name_an_entry_has_is_refused_and_nothing_is_proposed(
         self, tmp_path: Path
     ) -> None:
-        """Killed by: src/uclone_x/story/proposals.py :: for item in names.matches(key):
+        """Killed by: examples/story/src/uclone_x_story/proposals.py :: for item in names.matches(key):
         Becomes: for item in []:
         """
         story_id, ctx = await _new_story(tmp_path)
@@ -213,7 +213,7 @@ class TestNoSecondEntryForOneName:
         assert listed["pending"] == []
 
     async def test_an_entry_waiting_for_a_decision_holds_its_name(self, tmp_path: Path) -> None:
-        """Killed by: src/uclone_x/story/proposals.py :: if wanted & {folded(k) for k in (other.id, other.name, *other.aliases)}:
+        """Killed by: examples/story/src/uclone_x_story/proposals.py :: if wanted & {folded(k) for k in (other.id, other.name, *other.aliases)}:
         Becomes: if False:
         """
         _, ctx = await _new_story(tmp_path)
@@ -226,7 +226,7 @@ class TestNoSecondEntryForOneName:
         assert "already proposes the new place 'Salt Crossing'" in error
 
     async def test_an_entry_added_since_blocks_applying_the_proposal(self, tmp_path: Path) -> None:
-        """Killed by: src/uclone_x/story/proposals.py :: if clash is not None:
+        """Killed by: examples/story/src/uclone_x_story/proposals.py :: if clash is not None:
         Becomes: if False:
         """
         story_id, ctx = await _new_story(tmp_path)
@@ -253,9 +253,9 @@ class TestAPersonSeesWhatTheyApprove:
     async def test_the_preview_shows_every_value_and_the_file_as_added(
         self, tmp_path: Path
     ) -> None:
-        """Killed by: src/uclone_x/story/proposals.py :: return _preview_new(work, proposal)
+        """Killed by: examples/story/src/uclone_x_story/proposals.py :: return _preview_new(work, proposal)
         Becomes: return ProposalPreview(None, "", [], [], None)
-        Killed by: src/uclone_x/story/proposals.py :: lines.extend(ChangeLine(name, None, None, v) for name, v in state.items())
+        Killed by: examples/story/src/uclone_x_story/proposals.py :: lines.extend(ChangeLine(name, None, None, v) for name, v in state.items())
         Becomes: pass
         """
         story_id, ctx = await _new_story(tmp_path)
@@ -280,7 +280,7 @@ class TestAPersonSeesWhatTheyApprove:
         assert not [line for line in preview.diff[2:] if line.startswith("-")]
 
     async def test_a_rejected_new_entry_is_listed_by_its_name(self, tmp_path: Path) -> None:
-        """Killed by: src/uclone_x/story/view.py :: entry_name = current[0].name if current is not None else _new_name(proposal)
+        """Killed by: examples/story/src/uclone_x_story/view.py :: entry_name = current[0].name if current is not None else _new_name(proposal)
         Becomes: entry_name = current[0].name if current is not None else None
         """
         story_id, ctx = await _new_story(tmp_path)
@@ -294,7 +294,7 @@ class TestAPersonSeesWhatTheyApprove:
 
 class TestIdsAndRefusals:
     def test_an_id_is_made_from_the_name_as_the_codex_writes_ids(self) -> None:
-        """Killed by: src/uclone_x/story/names.py :: out.append(_FINALS[index % 28])
+        """Killed by: examples/story/src/uclone_x_story/names.py :: out.append(_FINALS[index % 28])
         Becomes: out.append("")
         """
         assert id_for_name("라온") == "raon"

@@ -1,13 +1,24 @@
 """uGraph: one fact model and one entity resolver for clone memory and story codex.
 
-See the uGraph design document. The model, the shared fold, the resolver and the two views
-of a point (`edges_at`: approved, or approved and proposed) are pure. `SqliteKnowledgeStore`
+See the uGraph design document. The model, the shared fold, the resolver, the two views
+of a point (`edges_at`: approved, or approved and proposed), and what every extraction does
+with a model's reply (`extraction`: read it, check each quote against its text with
+`quotes`, resolve each name, keep each fact once) are pure. `SqliteKnowledgeStore`
 and `ClonePolicy` are the clone vessel (step 3). The story vessel reads its YAML codex into
 this model in the story package (step 2), since the codex files are the story's own.
 """
 
 from __future__ import annotations
 
+from uclone_x.knowledge.extraction import (
+    ExtractedFact,
+    ReadFact,
+    Verified,
+    parse_extraction,
+    reply_object,
+    salvage_extraction,
+    verify_facts,
+)
 from uclone_x.knowledge.fold import bigram_overlap, bigrams, fold
 from uclone_x.knowledge.models import (
     Edge,
@@ -45,16 +56,23 @@ __all__ = [
     "EntityRef",
     "EntityResolver",
     "Episode",
+    "ExtractedFact",
     "Interval",
     "KnowledgeStore",
     "KnowledgeTransaction",
     "KnowledgeUnreadableError",
+    "ReadFact",
     "ScopeMismatchError",
     "SqliteKnowledgeStore",
+    "Verified",
     "bigram_overlap",
     "bigrams",
     "edges_at",
     "facts_at",
     "fold",
     "holds_at",
+    "parse_extraction",
+    "reply_object",
+    "salvage_extraction",
+    "verify_facts",
 ]

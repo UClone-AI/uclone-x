@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import logging
 from collections.abc import AsyncIterator, Mapping
 from pathlib import Path
 from typing import Any
@@ -448,6 +449,41 @@ async def test_input_reaches_the_page_only_while_u0_has_taken_over(
     socket.inbox.put_nowait({"type": "stop"})
     await socket.until(lambda: socket.of("state")[-1]["tabs"][0]["controller"] == "user")
     assert "Input.dispatchKeyEvent" not in link.methods("t1")
+
+
+async def test_what_the_person_types_through_the_dock_reaches_only_the_page(
+    running: tuple[FakeLink, BrowserService, FakeSocket], caplog: pytest.LogCaptureFixture
+) -> None:
+    """A password typed in the dock while the person signs in (§3.5 path B) goes to the page
+    and nowhere else: not back to the head, not into the log, not into a notice."""
+    caplog.set_level(logging.DEBUG)
+    link, service, socket = running
+    heard = service.watch("room-1")
+    sentinel = "sentinel-pw-0Lm7-typed-in-the-dock"
+    socket.inbox.put_nowait({"type": "take_over"})
+    await socket.until(lambda: socket.of("state")[-1]["tabs"][0]["controller"] == "user")
+    socket.inbox.put_nowait({"type": "input", "event": "text", "text": sentinel})
+    await socket.until(lambda: "Input.insertText" in link.methods("t1"))
+
+    notices = [heard.get_nowait() for _ in range(heard.qsize())]
+    for surface in (socket.json, notices, service.live_state("room-1"), caplog.text):
+        assert sentinel not in json.dumps(surface, ensure_ascii=False, default=str)
+
+
+async def test_the_save_offer_is_shown_until_the_person_dismisses_it(
+    running: tuple[FakeLink, BrowserService, FakeSocket],
+) -> None:
+    """Killed by: src/uclone_x/browser/live.py :: elif kind in ("take_over", "give_back", "stop", "hand_to", "dismiss_save_offer"):
+    Becomes: elif kind in ("take_over", "give_back", "stop", "hand_to"):
+    """
+    _, service, socket = running
+    service._save_offers["room-1"] = {"clone": "scout", "site": "shop.example.com"}  # pyright: ignore[reportPrivateUsage]
+    service._notify("room-1", {"type": "state"})  # pyright: ignore[reportPrivateUsage]
+    await socket.until(lambda: socket.of("state")[-1].get("save_offer"))
+    assert socket.of("state")[-1]["save_offer"] == {"clone": "scout", "site": "shop.example.com"}
+
+    socket.inbox.put_nowait({"type": "dismiss_save_offer"})
+    await socket.until(lambda: "save_offer" not in socket.of("state")[-1])
 
 
 async def test_messages_the_view_does_not_know_are_ignored(

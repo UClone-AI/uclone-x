@@ -69,7 +69,11 @@ def _clone_rules(agent_name: str) -> tuple[OntologyEngine, Path]:
 
     repo = _repo_root()
     package_dir = registry_module.BUILTIN_PERSONAS_DIR
-    ensure_clone_store(repo, builtin_dir=package_dir if package_dir.is_dir() else None)
+    ensure_clone_store(
+        repo,
+        builtin_dir=package_dir if package_dir.is_dir() else None,
+        extension_dirs=registry_module.extension_persona_dirs(),
+    )
     import_repository_ontologies(repo)
     try:
         agent_id = clone_id_of(agent_name)

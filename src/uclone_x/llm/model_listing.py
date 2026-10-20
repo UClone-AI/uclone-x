@@ -95,9 +95,13 @@ _OLLAMA_CHAT_CAPABILITY: Final = "completion"
 
 
 def _ollama_capabilities(item: Mapping[str, Any]) -> list[str] | None:
-    """The `capabilities` list an Ollama answer carries for one model, or None when silent."""
+    """The `capabilities` list an Ollama answer carries for one model, or None when silent.
+
+    An empty list says nothing either, so it is silent too: the caller asks `/api/show`
+    or the family, rather than hiding a model that never said it cannot chat (#2179).
+    """
     raw = item.get("capabilities")
-    if not isinstance(raw, list):
+    if not isinstance(raw, list) or not raw:
         return None
     return [str(c) for c in cast(list[object], raw)]
 

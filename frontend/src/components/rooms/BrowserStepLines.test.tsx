@@ -61,7 +61,12 @@ const room = (over: Partial<RoomState> = {}): RoomState => ({
 
 const drawn = (
   r: RoomState,
-  extra: { live?: RoomLiveState; browserSteps?: BrowserStep[]; onShowBrowser?: () => void } = {},
+  extra: {
+    live?: RoomLiveState;
+    browserSteps?: BrowserStep[];
+    browserAsked?: { clone: string; site: string } | null;
+    onShowBrowser?: () => void;
+  } = {},
 ) => (
   <RoomConversation
     room={r}
@@ -76,6 +81,7 @@ const drawn = (
     onTyping={() => {}}
     onOpenTurn={() => {}}
     browserSteps={extra.browserSteps}
+    browserAsked={extra.browserAsked}
     onShowBrowser={extra.onShowBrowser}
   />
 );
@@ -138,5 +144,42 @@ describe('browser step lines', () => {
     );
     const lines = within(screen.getByTestId('live-turn-browser-steps')).getAllByTestId('browser-step');
     expect(lines.map((line) => line.textContent)).toEqual(['Clicked "Search"']);
+  });
+
+  it('say under the turn in flight that its clone is waiting for the person to sign in (§3.5 path B)', () => {
+    const onShowBrowser = vi.fn();
+    render(
+      drawn(room({ transcript: [message({})] }), {
+        live: { turn: { agentId: 'scout', turnId: 't9', text: '' }, error: null },
+        browserAsked: { clone: 'scout', site: 'shop.example.com' },
+        onShowBrowser,
+      }),
+    );
+    const asked = screen.getByTestId('browser-asked');
+    expect(asked.textContent).toContain('Scout asked you to take over on shop.example.com');
+    fireEvent.click(within(asked).getByRole('button', { name: 'Show in the Browser tab' }));
+    expect(onShowBrowser).toHaveBeenCalledTimes(1);
+  });
+
+  it('do not put another clone’s ask under this turn', () => {
+    render(
+      drawn(room({ transcript: [message({})] }), {
+        live: { turn: { agentId: 'scout', turnId: 't9', text: '' }, error: null },
+        browserAsked: { clone: 'writer', site: 'shop.example.com' },
+      }),
+    );
+    expect(screen.queryByTestId('browser-asked')).toBeNull();
+  });
+
+  it('name a recorded hand-over in words', () => {
+    render(
+      drawn(
+        room({
+          tool_uses: [use({ arguments_preview: '{"action": "ask_user", "text": "sign in"}', output_preview: '{"url": "x"}' })],
+        }),
+      ),
+    );
+    const lines = within(screen.getByTestId('row-browser-steps-2')).getAllByTestId('browser-step');
+    expect(lines.map((line) => line.textContent)).toEqual(['Handed you the tab']);
   });
 });

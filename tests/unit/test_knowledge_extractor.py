@@ -30,6 +30,7 @@ from uclone_x.agent.models import (
     ToolExecutionRecord,
 )
 from uclone_x.agent.session import SessionStore
+from uclone_x.core.models import PersonaDefinition
 from uclone_x.core.provenance import ExecutionPath, Provenance, ServiceRef
 from uclone_x.engine.event_bus import AgentEvent, EventBus, EventType
 from uclone_x.errors import LLMProviderError
@@ -93,13 +94,14 @@ _EXTRACTION_MARK = "You pick out durable facts"
 
 
 def _fact(
-    subject: str, relation: str, value: str, source: str = "person", **extra: Any
+    subject: str, relation: str, value: str, quote: str | None = None, **extra: Any
 ) -> dict[str, Any]:
+    """One fact as the extraction prompt asks for it; its quote is its value unless given."""
     item: dict[str, Any] = {
         "subject": subject,
-        "relation": relation,
+        "key": relation,
         "value": value,
-        "source": source,
+        "quote": value if quote is None else quote,
         "confidence": 0.95,
         "durable": True,
         "why": "said so",
@@ -137,7 +139,7 @@ class _Model(BaseLLMConnector):
             answer: Any = self.extractions.pop(0) if self.extractions else []
             if isinstance(answer, Exception):
                 raise answer
-            content = answer if isinstance(answer, str) else json.dumps(answer)
+            content = answer if isinstance(answer, str) else json.dumps({"facts": answer})
         else:
             self.replies.append(request)
             content = self.reply
@@ -154,7 +156,27 @@ class _Model(BaseLLMConnector):
         yield StreamChunk(delta_content=response.content or "")
 
 
-def _seat(participant: Participant, llm: _Model, memory: CrossSessionMemory | None) -> BaseAgent:
+def _seat(
+    participant: Participant,
+    llm: _Model,
+    memory: CrossSessionMemory | None,
+    *,
+    learns: bool | None = None,
+) -> BaseAgent:
+    """A seat for `participant`. `learns` gives it a persona with that switch (#1840);
+    `None` gives it none, as most seats here have."""
+    personas = (
+        ()
+        if learns is None
+        else (
+            PersonaDefinition(
+                name=participant.id,
+                role="Helper",
+                system_prompt="Help.",
+                learn_from_conversations=learns,
+            ),
+        )
+    )
     return BaseAgent(
         config=AgentConfig(
             agent_id=participant.id,
@@ -166,6 +188,8 @@ def _seat(participant: Participant, llm: _Model, memory: CrossSessionMemory | No
         context=AgentContext(session_id=participant.session_id, agent_id=participant.id),
         memory=memory,
         store=SessionStore(_SESSIONS[0] / participant.id),
+        personas=personas,
+        persona=participant.id if personas else None,
     )
 
 
@@ -350,8 +374,8 @@ async def test_two_clones_in_one_room_keep_their_own_facts(tmp_path: Path) -> No
 async def test_another_clones_message_is_never_a_source(tmp_path: Path) -> None:
     """Sage's line is shown to Scout's extraction as context; a fact sourced to it is dropped.
 
-    Killed by: src/uclone_x/memory/extractor.py :: if source not in _SOURCE_ORIGIN:
-    Becomes: if False:
+    Killed by: src/uclone_x/memory/extractor.py :: grounds = [line for line in lesson.lines if line.kind in _SOURCE_ORIGIN]
+    Becomes: grounds = list(lesson.lines)
     Killed by: src/uclone_x/room/orchestrator.py :: kind = "person" if kinds.get(row.sender_id) is ParticipantKind.HUMAN else "other"
     Becomes: kind = "person"
     """
@@ -417,9 +441,10 @@ async def test_a_clone_echoing_another_clone_does_not_make_it_a_fact(tmp_path: P
 
 
 async def test_a_source_the_span_does_not_hold_is_dropped(tmp_path: Path) -> None:
-    """A fact claimed from a tool result, in a turn that ran no tool, has nothing under it.
+    """A fact claimed from a tool result, in a turn that ran no tool, has nothing under it:
+    its words are in no line of the span (#2235).
 
-    Killed by: src/uclone_x/memory/extractor.py :: if candidate.source not in kinds:
+    Killed by: src/uclone_x/knowledge/extraction.py :: if not quote_found(fact.quote, text):
     Becomes: if False:
     """
     memory = _memory(tmp_path)
@@ -472,10 +497,10 @@ async def test_nothing_that_could_ground_a_fact_means_no_model_call(tmp_path: Pa
 
 async def test_not_durable_and_unsure_facts_are_dropped(tmp_path: Path) -> None:
     """
-    Killed by: src/uclone_x/memory/extractor.py :: if fields.get("durable") is not True:
+    Killed by: src/uclone_x/memory/extractor.py :: if item.get("durable") is not True:
     Becomes: if False:
-    Killed by: src/uclone_x/memory/extractor.py :: if candidate.confidence < MIN_CONFIDENCE:
-    Becomes: if False:
+    Killed by: src/uclone_x/memory/extractor.py :: return confidence >= MIN_CONFIDENCE
+    Becomes: return True
     """
     memory = _memory(tmp_path)
     llm = _Model(
@@ -522,12 +547,12 @@ async def test_a_fact_seen_again_is_reinforced_not_repeated(tmp_path: Path) -> N
 
 async def test_a_changed_fact_supersedes_the_old_one(tmp_path: Path) -> None:
     """
-    Killed by: src/uclone_x/memory/extractor.py :: auto_retract_conflicts=True,
-    Becomes: auto_retract_conflicts=False,
+    Killed by: src/uclone_x/memory/extractor.py :: replaces=tuple(f.fact_id for f in replaced),
+    Becomes: replaces=(),
     """
     memory = _memory(tmp_path)
     old = memory.record_fact("user", "lives_in", "Busan", _PROV, "s0", origin="told")
-    llm = _Model(extractions=[[_fact("user", "lives_in", "Seoul")]])
+    llm = _Model(extractions=[[_fact("user", "lives_in", "Seoul", replaces="Busan")]])
     orch = _room(tmp_path, _Seats((SCOUT, _seat(SCOUT, llm, memory))))
 
     await _say(orch, "I moved to Seoul last month.")
@@ -547,7 +572,7 @@ async def test_a_persons_correction_survives_a_conflicting_extraction(
     route would, after the seat's memory was loaded: the extractor re-reads before it
     decides.
 
-    Killed by: src/uclone_x/memory/extractor.py :: corrected = [f for f in active if f.origin == "corrected"]
+    Killed by: src/uclone_x/memory/extractor.py :: corrected = [f for f in (*active, *replaced) if f.origin == "corrected"]
     Becomes: corrected = []
     """
     seat_memory = _memory(tmp_path)
@@ -564,6 +589,237 @@ async def test_a_persons_correction_survives_a_conflicting_extraction(
     assert "corrected by a person" in caplog.text
 
 
+async def _learn(
+    memory: CrossSessionMemory,
+    said: str,
+    facts: list[dict[str, Any]],
+    functional: frozenset[str] = frozenset(),
+) -> Any:
+    """What `extract` does with the person saying `said` and the model answering `facts`."""
+
+    async def generate(request: LLMRequest) -> ModelResponse:
+        return ModelResponse(
+            finish_reason=FinishReason.STOP,
+            content=json.dumps({"facts": facts}),
+            tool_calls=(),
+            usage=_USAGE,
+            provenance=_PROV,
+        )
+
+    lesson = Lesson(
+        clone_id="scout",
+        clone_name="Scout",
+        room_id="r1",
+        session_id="s1",
+        turn_id="t1",
+        lines=(SpanLine("person", "Alice", said),),
+        memory=memory,
+        generate=generate,
+        person_names=("Alice",),
+        functional=lambda: functional,
+    )
+    return await KnowledgeExtractor().extract(lesson)
+
+
+@pytest.mark.parametrize("replaces", [None, "", "Rock"], ids=["null", "empty", "not-held"])
+async def test_a_value_that_replaces_nothing_held_supersedes_nothing(
+    tmp_path: Path, replaces: str | None
+) -> None:
+    """ "Prefers jazz" held, "prefers Korean" learned: both stay, and nothing is reported
+    replaced (#2224). Only a held value the model names is replaced.
+
+    Killed by: src/uclone_x/memory/extractor.py :: single_valued=False,
+    Becomes: single_valued=True,
+    """
+    memory = _memory(tmp_path)
+    jazz = memory.record_fact(
+        "user", "prefers", "jazz", _PROV, "s0", origin="told", single_valued=False
+    )
+    extra: dict[str, Any] = {} if replaces is None else {"replaces": replaces}
+
+    outcome = await _learn(
+        memory, "I like Korean food.", [_fact("user", "prefers", "Korean", **extra)]
+    )
+
+    [korean] = outcome.added
+    assert outcome.superseded == ()
+    assert {f.fact_id for f in memory.list_facts()} == {jazz.fact_id, korean}
+    assert memory.get_fact(korean).single_valued is False  # type: ignore[union-attr]
+
+
+async def test_the_held_value_the_model_names_is_replaced_under_any_relation(
+    tmp_path: Path,
+) -> None:
+    """ "I stopped Rust; I'm on Zig now", filed under a key that holds nothing yet, the value
+    given bare: Rust is replaced, and the other things held about the person stay.
+
+    Killed by: src/uclone_x/memory/extractor.py :: replaces=_value_key(replaces) if isinstance(replaces, str) else "",
+    Becomes: replaces="",
+    Killed by: src/uclone_x/memory/extractor.py :: return named
+    Becomes: return []
+    Killed by: src/uclone_x/memory/extractor.py :: superseded.extend(f.fact_id for f in replaced)
+    Becomes: pass
+    """
+    memory = _memory(tmp_path)
+    rust = memory.record_fact("user", "learning", "Rust", _PROV, "s0", origin="told")
+    jazz = memory.record_fact(
+        "user", "prefers", "jazz", _PROV, "s0", origin="told", single_valued=False
+    )
+
+    outcome = await _learn(
+        memory,
+        "I've stopped learning Rust; I'm on Zig now.",
+        [_fact("user", "current_language", "Zig", replaces=" rust ")],
+    )
+
+    [zig] = outcome.added
+    assert outcome.superseded == (rust.fact_id,)
+    assert {f.fact_id for f in memory.list_facts()} == {jazz.fact_id, zig}
+    assert memory.get_fact(zig).contradicts_fact_id == rust.fact_id  # type: ignore[union-attr]
+
+
+async def test_of_two_held_values_named_the_one_under_the_same_relation_is_replaced(
+    tmp_path: Path,
+) -> None:
+    """ "Korean" is held as a preference and as the reply language; a new reply language
+    replacing "Korean" replaces only the reply language.
+
+    Killed by: src/uclone_x/memory/extractor.py :: return [f for f in named if relation_key(f.predicate) == candidate.relation]
+    Becomes: return named
+    """
+    memory = _memory(tmp_path)
+    food = memory.record_fact("user", "prefers", "Korean", _PROV, "s0", origin="told")
+    reply = memory.record_fact("user", "reply_language", "Korean", _PROV, "s0", origin="told")
+
+    outcome = await _learn(
+        memory,
+        "Please answer in English from now on.",
+        [_fact("user", "reply_language", "English", replaces="Korean")],
+    )
+
+    assert outcome.superseded == (reply.fact_id,)
+    assert food.fact_id in {f.fact_id for f in memory.list_facts()}
+
+
+async def test_a_bare_value_reaches_another_relation_only_while_its_own_holds_nothing(
+    tmp_path: Path,
+) -> None:
+    """ "Moved to Busan from Seoul" with "Seoul" bare: "likes Seoul" is not replaced while
+    "lives_in" holds a value of its own (#2328).
+
+    Killed by: src/uclone_x/memory/extractor.py :: if any(relation_key(f.predicate) == candidate.relation for f in live):
+    Becomes: if False:
+    """
+    memory = _memory(tmp_path)
+    likes = memory.record_fact("user", "likes", "Seoul", _PROV, "s0", origin="told")
+    ulsan = memory.record_fact("user", "lives_in", "Ulsan", _PROV, "s0", origin="told")
+
+    outcome = await _learn(
+        memory,
+        "I moved to Busan from Seoul.",
+        [_fact("user", "lives_in", "Busan", quote="moved to Busan", replaces="Seoul")],
+    )
+
+    [busan] = outcome.added
+    assert outcome.superseded == ()
+    assert {f.fact_id for f in memory.list_facts()} == {likes.fact_id, ulsan.fact_id, busan}
+
+
+async def test_under_a_functional_relation_a_new_value_replaces_every_current_one(
+    tmp_path: Path,
+) -> None:
+    """A person declared `lives_in` one value at a time: Seoul replaces Busan and Ulsan
+    though the model named neither, and `prefers` keeps both its values (#2332).
+
+    Killed by: src/uclone_x/memory/extractor.py :: if candidate.relation in functional:
+    Becomes: if False:
+    Killed by: src/uclone_x/memory/extractor.py :: f for f in active if f.valid_until is None and f.fact_id not in named
+    Becomes: f for f in active if f.fact_id not in named
+    """
+    memory = _memory(tmp_path)
+    busan = memory.record_fact("user", "lives_in", "Busan", _PROV, "s0", origin="told")
+    ulsan = memory.record_fact(
+        "user", "lives_in", "Ulsan", _PROV, "s0", origin="told", single_valued=False
+    )
+    then = memory.record_fact(
+        "user",
+        "lives_in",
+        "Daegu",
+        _PROV,
+        "s0",
+        origin="told",
+        single_valued=False,
+        valid_until="2020-01-01T00:00:00Z",
+    )
+    jazz = memory.record_fact(
+        "user", "prefers", "jazz", _PROV, "s0", origin="told", single_valued=False
+    )
+
+    outcome = await _learn(
+        memory,
+        "I live in Seoul and I like Korean food.",
+        [_fact("user", "lives_in", "Seoul"), _fact("user", "prefers", "Korean")],
+        functional=frozenset({"lives_in"}),
+    )
+
+    seoul, korean = outcome.added
+    assert set(outcome.superseded) == {busan.fact_id, ulsan.fact_id}
+    assert {f.fact_id for f in memory.list_facts()} == {then.fact_id, jazz.fact_id, seoul, korean}
+
+
+async def test_a_learned_fact_keeps_the_words_it_was_learned_from(tmp_path: Path) -> None:
+    """Remembers' history shows them (#2332).
+
+    Killed by: src/uclone_x/memory/extractor.py :: "quote": candidate.quote,
+    Becomes: "quote": "",
+    """
+    memory = _memory(tmp_path)
+
+    outcome = await _learn(
+        memory,
+        "I moved to Busan last spring.",
+        [_fact("user", "lives_in", "Busan", quote="moved to Busan")],
+    )
+
+    [busan] = outcome.added
+    assert memory.get_fact(busan).metadata["quote"] == "moved to Busan"  # type: ignore[union-attr]
+
+
+async def test_a_value_replacing_a_corrected_one_under_another_relation_is_dropped(
+    tmp_path: Path,
+) -> None:
+    """A person corrected "lives_in"; the model filing a move under "location" and naming
+    the corrected value does not replace it.
+
+    Killed by: src/uclone_x/memory/extractor.py :: corrected = [f for f in (*active, *replaced) if f.origin == "corrected"]
+    Becomes: corrected = [f for f in active if f.origin == "corrected"]
+    """
+    memory = _memory(tmp_path)
+    busan = memory.record_fact("user", "lives_in", "Busan", _PROV, "s0", origin="told")
+    daegu = memory.correct_fact(busan.fact_id, "Daegu", _PROV)
+
+    outcome = await _learn(
+        memory, "I live in Ulsan now.", [_fact("user", "location", "Ulsan", replaces="Daegu")]
+    )
+
+    assert outcome.added == ()
+    assert [f.fact_id for f in memory.list_facts()] == [daegu.fact_id]
+
+
+def test_the_model_is_asked_which_held_value_a_fact_replaces() -> None:
+    """The extraction prompt asks for "replaces", and when to leave it null (#2224).
+
+    Killed by: src/uclone_x/memory/extractor.py :: '"durable" (true or false), "replaces" (only when the line says a fact already held '
+    Becomes: '"durable" (true or false), (only when the line says a fact already held '
+    """
+    from uclone_x.memory.extractor import _instructions  # pyright: ignore[reportPrivateUsage]
+
+    told = _instructions(_lesson(_SAID))
+
+    assert '"replaces" (only when the line says a fact already held' in told
+    assert "otherwise null" in told
+
+
 #: "José" as a build before #1895 could store it (`e` and a combining accent); the extractor
 #: saves the composed form (`person_subject`), so the two meet only when compared folded.
 _JOSE_DECOMPOSED = "Jose\u0301"
@@ -575,18 +831,21 @@ async def test_a_fact_stored_decomposed_is_superseded_by_the_composed_extraction
 ) -> None:
     """The old subject spelling is still the same subject, so the new value replaces it (#1893).
 
-    Killed by: src/uclone_x/memory/models.py :: same_subject = fold_name(self.subject) == fold_name(other.subject)
-    Becomes: same_subject = self.subject.strip().lower() == other.subject.strip().lower()
+    The composed name resolves to the subject the clone holds (#2235), so the fact is filed
+    under the spelling already held.
+
+    Killed by: src/uclone_x/memory/extractor.py :: *(Entity(s, scope, "subject", s) for s in sorted(held) if name_key(s) not in taken),
+    Becomes: *(),
     """
     memory = _memory(tmp_path)
     old = memory.record_fact(_JOSE_DECOMPOSED, "lives_in", "Busan", _PROV, "s0", origin="told")
-    llm = _Model(extractions=[[_fact(_JOSE_COMPOSED, "lives_in", "Seoul")]])
+    llm = _Model(extractions=[[_fact(_JOSE_COMPOSED, "lives_in", "Seoul", replaces="Busan")]])
     orch = _room(tmp_path, _Seats((SCOUT, _seat(SCOUT, llm, memory))))
 
     await _say(orch, f"{_JOSE_COMPOSED} moved to Seoul last month.")
 
     [new] = memory.list_facts()
-    assert new.subject == _JOSE_COMPOSED
+    assert new.subject == _JOSE_DECOMPOSED
     assert new.object_value == "Seoul"
     assert new.contradicts_fact_id == old.fact_id
 
@@ -708,7 +967,7 @@ async def test_a_failed_extraction_says_so_plainly_and_leaves_the_reply(
 
     Killed by: src/uclone_x/memory/extractor.py :: return replace(outcome, error=EXTRACTION_FAILED)
     Becomes: return replace(outcome, error=f"{type(exc).__name__}: {exc}")
-    Killed by: src/uclone_x/memory/extractor.py :: raise ExtractionFailed("the reply holds no JSON array")
+    Killed by: src/uclone_x/memory/extractor.py :: raise ExtractionFailed(str(exc)) from exc
     Becomes: return []
     """
     memory = _memory(tmp_path)
@@ -944,6 +1203,265 @@ async def test_a_seat_with_no_memory_learns_nothing_and_is_not_asked(tmp_path: P
     assert _row(state, SCOUT.id).knowledge_learned == ()
 
 
+# --------------------------------------------------------------------------------------
+# "Learn from conversations", one switch per clone (#1840, design §3.3 "Opting out").
+# --------------------------------------------------------------------------------------
+
+
+async def test_a_clone_switched_off_is_not_asked_what_to_remember(tmp_path: Path) -> None:
+    """Off stops the extraction for that clone: no model call, nothing saved, no row line.
+
+    Killed by: src/uclone_x/room/orchestrator.py :: if persona is not None and not persona.learn_from_conversations:
+    Becomes: if False:
+    """
+    llm = _Model(extractions=[[_fact("user", "likes", "jazz")]])
+    memory = _memory(tmp_path)
+    orch = _room(tmp_path, _Seats((SCOUT, _seat(SCOUT, llm, memory, learns=False))))
+
+    state = await _say(orch, "I like jazz.")
+
+    assert llm.extraction_requests == []
+    assert memory.list_facts() == []
+    assert _row(state, SCOUT.id).knowledge_learned == ()
+
+
+async def test_a_clone_switched_on_still_learns(tmp_path: Path) -> None:
+    """The switch on is the default behaviour, not a second way of turning learning off."""
+    llm = _Model(extractions=[[_fact("user", "likes", "jazz")]])
+    memory = _memory(tmp_path)
+    orch = _room(tmp_path, _Seats((SCOUT, _seat(SCOUT, llm, memory, learns=True))))
+
+    await _say(orch, "I like jazz.")
+
+    assert [(f.subject, f.object_value) for f in memory.list_facts()] == [("user", "jazz")]
+
+
+async def test_switching_one_clone_off_leaves_the_other_in_the_room_learning(
+    tmp_path: Path,
+) -> None:
+    """The switch is the clone's, not the room's: the other seat is asked and saves."""
+    scout_llm = _Model(extractions=[[_fact("user", "likes", "jazz")]])
+    sage_llm = _Model(extractions=[[_fact("user", "likes", "jazz")]])
+    scout_memory, sage_memory = _memory(tmp_path, "scout"), _memory(tmp_path, "sage")
+    orch = _room(
+        tmp_path,
+        _Seats(
+            (SCOUT, _seat(SCOUT, scout_llm, scout_memory, learns=False)),
+            (SAGE, _seat(SAGE, sage_llm, sage_memory)),
+        ),
+        SCOUT.id,
+        SAGE.id,
+    )
+
+    await _say(orch, "I like jazz.")
+
+    assert scout_llm.extraction_requests == []
+    assert scout_memory.list_facts() == []
+    assert len(sage_llm.extraction_requests) == 1
+    assert [f.object_value for f in sage_memory.list_facts()] == ["jazz"]
+
+
+def _switched_off(participant: Participant) -> PersonaDefinition:
+    """What saving the clone with the switch off hands its live seat (`stage_persona_edit`)."""
+    return PersonaDefinition(
+        name=participant.id,
+        role="Helper",
+        system_prompt="Help.",
+        learn_from_conversations=False,
+    )
+
+
+async def test_a_lesson_queued_before_the_switch_is_turned_off_is_not_learned(
+    tmp_path: Path,
+) -> None:
+    """Queued, then switched off, then drained: nothing is asked and nothing is saved (#2228).
+
+    The seat takes the saved edit only at its next turn, so the switch is read from the edit
+    it holds, not only from the persona in force.
+
+    Killed by: src/uclone_x/memory/extractor.py :: if not lesson.learns():  # switched off since the lesson was queued
+    Becomes: if False:  # switched off since the lesson was queued
+    """
+    memory = _memory(tmp_path)
+    llm = _Model(extractions=[[_fact("user", "likes", "jazz")]])
+    seat = _seat(SCOUT, llm, memory, learns=True)
+    orch = _room(tmp_path, _Seats((SCOUT, seat)))
+    floor = orch._floor.setdefault("r1", asyncio.Lock())  # pyright: ignore[reportPrivateUsage]
+
+    await orch.post("r1", ALICE.id, "I like jazz.")
+    await floor.acquire()  # the lesson is queued and waits for the floor
+    learning = asyncio.create_task(orch.wait_for_learning("r1"))
+    seat.stage_persona_edit(_switched_off(SCOUT))
+    floor.release()
+    await learning
+
+    assert llm.extraction_requests == []
+    assert memory.list_facts() == []
+
+
+async def test_turning_the_switch_off_while_the_model_is_asked_saves_nothing(
+    tmp_path: Path,
+) -> None:
+    """The answer of an extraction call already out when learning is turned off is dropped.
+
+    Killed by: src/uclone_x/memory/extractor.py :: if not lesson.learns():  # turned off while the model was asked
+    Becomes: if False:  # turned off while the model was asked
+    """
+    memory = _memory(tmp_path)
+    llm = _Model(extractions=[[_fact("user", "likes", "jazz")]])
+    seat = _seat(SCOUT, llm, memory, learns=True)
+    orch = _room(tmp_path, _Seats((SCOUT, seat)))
+    llm.hold = asyncio.Event()
+
+    await orch.post("r1", ALICE.id, "I like jazz.")
+    learning = asyncio.create_task(orch.wait_for_learning("r1"))
+    for _ in range(50):
+        if llm.extraction_requests:
+            break
+        await asyncio.sleep(0)
+    assert len(llm.extraction_requests) == 1  # the call is out, and paused
+    seat.stage_persona_edit(_switched_off(SCOUT))
+    llm.hold.set()
+    await learning
+
+    assert memory.list_facts() == []
+    assert _row(orch._require_room("r1"), SCOUT.id).knowledge_learned == ()  # pyright: ignore[reportPrivateUsage]
+
+
+def _persona(name: str, *, learns: bool) -> PersonaDefinition:
+    return PersonaDefinition(
+        name=name, role="Helper", system_prompt="Help.", learn_from_conversations=learns
+    )
+
+
+def test_the_latest_persona_is_the_one_in_force_when_no_edit_is_held(tmp_path: Path) -> None:
+    seat = _seat(SCOUT, _Model(), _memory(tmp_path), learns=True)
+
+    latest = seat.latest_persona_definition
+
+    assert latest is not None and latest.learn_from_conversations is True
+    assert latest == seat.persona_definition
+
+
+def test_the_latest_persona_is_a_held_edit_of_the_persona_the_seat_speaks_as(
+    tmp_path: Path,
+) -> None:
+    """Killed by: src/uclone_x/agent/base.py :: if staged is not None and staged.name == self._persona:
+    Becomes: if False:
+    """
+    seat = _seat(SCOUT, _Model(), _memory(tmp_path), learns=True)
+    seat.stage_persona_edit(_persona(SCOUT.id, learns=False))
+
+    latest = seat.latest_persona_definition
+
+    assert latest is not None and latest.learn_from_conversations is False
+    applied = seat.persona_definition
+    assert applied is not None and applied.learn_from_conversations is True  # not yet taken
+
+
+def test_a_held_edit_of_a_persona_the_seat_no_longer_speaks_as_is_not_the_latest(
+    tmp_path: Path,
+) -> None:
+    """An edit held for the seat's old persona says nothing about the one it speaks as now
+    (#2233): `stage_persona_edit` is keyed by the persona the seat had when it was saved.
+
+    Killed by: src/uclone_x/agent/base.py :: if staged is not None and staged.name == self._persona:
+    Becomes: if staged is not None:
+    """
+    seat = _seat(SCOUT, _Model(), _memory(tmp_path), learns=True)
+    seat.define_persona(_persona("other", learns=True))
+    seat.stage_persona_edit(_persona(SCOUT.id, learns=False))
+    seat.persona = "other"
+
+    latest = seat.latest_persona_definition
+
+    assert latest is not None and latest.name == "other"
+    assert latest.learn_from_conversations is True
+
+
+class _ReplacingSeats(_Seats):
+    """A resolver that can put a new seat in a participant's place, as a rebuilt one would."""
+
+    def built_seat(self, participant: Participant) -> BaseAgent | None:
+        return self.agents.get(participant.id)
+
+
+async def test_a_queued_lesson_reads_the_switch_from_the_seat_in_place_when_it_is_learned(
+    tmp_path: Path,
+) -> None:
+    """The switch is read from the participant's current seat, not the one the lesson was
+    queued from, which a rebuilt seat no longer is (#2233).
+
+    Killed by: src/uclone_x/room/orchestrator.py :: current = lookup(speaker) if callable(lookup) else None
+    Becomes: current = None
+    """
+    memory = _memory(tmp_path)
+    llm = _Model(extractions=[[_fact("user", "likes", "jazz")]])
+    seats = _ReplacingSeats((SCOUT, _seat(SCOUT, llm, memory, learns=True)))
+    orch = _room(tmp_path, seats)
+    floor = orch._floor.setdefault("r1", asyncio.Lock())  # pyright: ignore[reportPrivateUsage]
+
+    await orch.post("r1", ALICE.id, "I like jazz.")
+    await floor.acquire()  # the lesson is queued and waits for the floor
+    learning = asyncio.create_task(orch.wait_for_learning("r1"))
+    seats.agents[SCOUT.id] = _seat(SCOUT, _Model(), memory, learns=False)
+    floor.release()
+    await learning
+
+    assert llm.extraction_requests == []
+    assert memory.list_facts() == []
+
+
+class _SavesWhenAsked(_Model):
+    """Answers the first reply request with a `record_memory_fact` call, then replies."""
+
+    def __init__(self) -> None:
+        super().__init__(reply="Saved.")
+        self._asked = False
+
+    async def generate(self, request: LLMRequest) -> ModelResponse:
+        system = str(request.messages[0].content) if request.messages else ""
+        if self._asked or system.startswith(_EXTRACTION_MARK):
+            return await super().generate(request)
+        self._asked = True
+        self.replies.append(request)
+        save = ToolCallRequest(
+            id="call_save",
+            name="record_memory_fact",
+            arguments={"subject": "user", "predicate": "editor", "object_value": "helix"},
+        )
+        return ModelResponse(
+            finish_reason=FinishReason.TOOL_CALLS,
+            content="",
+            tool_calls=(save,),
+            usage=_USAGE,
+            provenance=_PROV,
+        )
+
+
+async def test_a_clone_switched_off_still_saves_corrects_and_forgets(tmp_path: Path) -> None:
+    """Off stops only the automatic extraction. Being asked to remember still saves, and a
+    person's Correct and Forget still change what the clone knows.
+
+    An "off" built by withholding the seat's memory would pass the tests above and fail here.
+    """
+    llm = _SavesWhenAsked()
+    memory = _memory(tmp_path)
+    orch = _room(tmp_path, _Seats((SCOUT, _seat(SCOUT, llm, memory, learns=False))))
+
+    await _say(orch, "Remember that I use helix.")
+
+    assert llm.extraction_requests == []
+    (saved,) = memory.list_facts()
+    assert (saved.subject, saved.predicate, saved.object_value) == ("user", "editor", "helix")
+
+    person = Provenance.primary("person")
+    corrected = memory.correct_fact(saved.fact_id, "vim", person)
+    assert [f.object_value for f in memory.list_facts()] == ["vim"]
+    memory.retract_fact(corrected.fact_id, "forgotten by the user", person)
+    assert memory.list_facts() == []
+
+
 async def test_a_failed_turn_is_not_learned_from(tmp_path: Path) -> None:
     """Only a committed turn is queued.
 
@@ -969,14 +1487,174 @@ async def test_a_failed_turn_is_not_learned_from(tmp_path: Path) -> None:
     assert memory.list_facts() == []
 
 
-def test_fenced_and_wrapped_answers_are_read() -> None:
-    """A model that fences its JSON, or wraps the list in an object, is still read."""
-    from uclone_x.memory.extractor import _parse  # pyright: ignore[reportPrivateUsage]
+def _lesson(
+    *lines: SpanLine,
+    memory: CrossSessionMemory | None = None,
+    person_names: tuple[str, ...] = ("Alice",),
+    clone_names: tuple[str, ...] = ("Scout",),
+) -> Lesson:
+    return Lesson(
+        clone_id="scout",
+        clone_name="Scout",
+        room_id="r1",
+        session_id="s1",
+        turn_id="t1",
+        lines=lines,
+        memory=memory if memory is not None else CrossSessionMemory(),
+        generate=_never,
+        person_names=person_names,
+        clone_names=clone_names,
+    )
 
-    fenced = "```json\n" + json.dumps([_fact("user", "likes", "jazz")]) + "\n```"
-    wrapped = json.dumps({"facts": [_fact("user", "likes", "tea"), "junk", {"subject": ""}]})
-    assert [c.value for c in _parse(fenced)] == ["jazz"]
-    assert [c.value for c in _parse(wrapped)] == ["tea"]
+
+def _read_reply(content: str, lesson: Lesson) -> list[tuple[str, str, str, str]]:
+    from uclone_x.memory.extractor import _read  # pyright: ignore[reportPrivateUsage]
+
+    return [(c.subject, c.relation, c.value, c.source) for c in _read(content, lesson)]
+
+
+_SAID = SpanLine("person", "Alice", "I like jazz and my sister Mina likes tea.")
+
+
+def test_fenced_and_wrapped_answers_are_read() -> None:
+    """A model that fences its JSON, answers a bare array, or puts junk in the list, is still
+    read: the reply is read as every vessel's is (`knowledge.extraction.listed_facts`)."""
+    lesson = _lesson(_SAID)
+    fenced = "```json\n" + json.dumps({"facts": [_fact("user", "likes", "jazz")]}) + "\n```"
+    bare = json.dumps([_fact("user", "likes", "jazz")])
+    wrapped = json.dumps({"facts": [_fact("user", "likes", "jazz"), "junk", {"subject": ""}]})
+    for content in (fenced, bare, wrapped):
+        assert _read_reply(content, lesson) == [("user", "likes", "jazz", "person")]
+
+
+# --------------------------------------------------------------------------------------
+# Read and verified as every vessel's facts are (uGraph step 4, #2235).
+# --------------------------------------------------------------------------------------
+
+
+def test_a_reply_cut_off_by_its_token_cap_keeps_the_facts_it_finished() -> None:
+    """A model that ran to its cap wrote one whole fact before the cut; it is kept, typed
+    fields and all, and the half-written one is not.
+
+    Killed by: src/uclone_x/knowledge/extraction.py :: if salvaged:
+    Becomes: if False:
+    """
+    whole = json.dumps(_fact("user", "likes", "jazz"))
+    cut = '{"facts": [' + whole + ', {"subject": "Mina", "key": "likes", "val'
+    assert _read_reply(cut, _lesson(_SAID)) == [("user", "likes", "jazz", "person")]
+
+
+def test_a_quote_that_is_not_in_a_person_or_tool_line_is_dropped() -> None:
+    """The clone said it, or the model paraphrased: neither grounds a fact (#2235).
+
+    Killed by: src/uclone_x/memory/extractor.py :: grounds = [line for line in lesson.lines if line.kind in _SOURCE_ORIGIN]
+    Becomes: grounds = list(lesson.lines)
+    """
+    lesson = _lesson(_SAID, SpanLine("self", "Scout", "You also love opera, I think."))
+    reply = json.dumps(
+        {
+            "facts": [
+                _fact("user", "loves", "opera", quote="You also love opera"),
+                _fact("user", "enjoys", "jazz music", quote="she enjoys jazz music"),
+                _fact("user", "likes", "jazz", quote="I like jazz"),
+            ]
+        }
+    )
+    assert _read_reply(reply, lesson) == [("user", "likes", "jazz", "person")]
+
+
+def test_a_name_two_subjects_share_is_dropped_not_guessed() -> None:
+    """The clone holds two subjects that fold to one name ("Mina" and "MINA", filed before
+    names were folded): a fact about "mina" is filed under neither.
+
+    Killed by: src/uclone_x/knowledge/extraction.py :: return None, "ambiguous_name"  # nothing is guessed: not the first, not any
+    Becomes: return ids[0], None
+    """
+    memory = CrossSessionMemory()
+    memory.record_fact("Mina", "is", "a friend", _PROV, "s0")
+    memory.record_fact("MINA", "works_at", "Acme", _PROV, "s0")
+    lesson = _lesson(SpanLine("person", "Alice", "mina likes jazz."), memory=memory)
+    reply = json.dumps({"facts": [_fact("mina", "likes", "jazz", quote="mina likes jazz")]})
+    assert _read_reply(reply, lesson) == []
+
+
+def test_a_held_subject_is_named_as_held_and_a_new_name_is_a_new_subject() -> None:
+    """The clone's names policy (§3.4): a name it holds, written another way, is that
+    subject; a name it does not hold is filed as written; a near name is not merged.
+
+    Killed by: src/uclone_x/memory/extractor.py :: *(Entity(s, scope, "subject", s) for s in sorted(held) if name_key(s) not in taken),
+    Becomes: *(),
+    Killed by: src/uclone_x/knowledge/extraction.py :: if new_names:
+    Becomes: if False:
+    """
+    memory = CrossSessionMemory()
+    memory.record_fact("Mina Park", "is", "Alice's sister", _PROV, "s0")
+    lesson = _lesson(
+        SpanLine("person", "Alice", "mina park likes tea, and Mina's friend Jo likes jazz."),
+        memory=memory,
+    )
+    reply = json.dumps(
+        {
+            "facts": [
+                _fact("mina  park", "likes", "tea", quote="mina park likes tea"),
+                _fact("Jo", "likes", "jazz", quote="Jo likes jazz"),
+                _fact("Mina", "has_friend", "Jo", quote="Mina's friend Jo"),
+            ]
+        }
+    )
+    assert _read_reply(reply, lesson) == [
+        ("Mina Park", "likes", "tea", "person"),
+        ("Jo", "likes", "jazz", "person"),
+        ("Mina", "has_friend", "Jo", "person"),
+    ]
+
+
+def test_a_fact_given_twice_is_kept_once() -> None:
+    """The same fact twice in one reply, the second with its relation spelled with a space,
+    is one fact, not two to file.
+
+    Killed by: src/uclone_x/memory/extractor.py :: facts = [replace(f, key=relation_key(f.key)) for f in facts]
+    Becomes: facts = facts
+    """
+    reply = json.dumps(
+        {
+            "facts": [
+                _fact("user", "likes", "jazz", quote="I like jazz"),
+                _fact("user", "Likes", "Jazz", quote="I like jazz"),
+                _fact("Mina", "likes tea", "yes", quote="Mina likes tea"),
+                _fact("Mina", "likes_tea", "yes", quote="Mina likes tea"),
+            ]
+        }
+    )
+    assert _read_reply(reply, _lesson(_SAID)) == [
+        ("user", "likes", "jazz", "person"),
+        ("Mina", "likes_tea", "yes", "person"),
+    ]
+
+
+def test_a_tool_result_grounds_a_found_fact_and_the_person_comes_first() -> None:
+    """A quote in a tool result is `tool`; one in both the person's line and a tool's is the
+    person's.
+
+    Killed by: src/uclone_x/memory/extractor.py :: for line in sorted(grounds, key=lambda line: line.kind != "person"):
+    Becomes: for line in grounds:
+    """
+    lesson = _lesson(
+        SpanLine("tool", "web_search", "Busan is the second largest city. Alice lives in Busan."),
+        SpanLine("person", "Alice", "Yes, Alice lives in Busan."),
+    )
+    reply = json.dumps(
+        {
+            "facts": [
+                _fact("Busan", "is", "the second largest city", quote="second largest city"),
+                _fact("user", "lives_in", "Busan", quote="Alice lives in Busan"),
+            ]
+        }
+    )
+    assert _read_reply(reply, lesson) == [
+        ("Busan", "is", "the second largest city", "tool"),
+        ("user", "lives_in", "Busan", "person"),
+    ]
 
 
 def test_generate_image_results_are_excluded_from_lesson_lines() -> None:
@@ -1009,7 +1687,7 @@ async def _never(_request: LLMRequest) -> ModelResponse:
 
 
 def test_self_fact_from_tool_source_is_dropped_by_curate() -> None:
-    # Killed by: src/uclone_x/memory/extractor.py :: if subject == SELF_SUBJECT and candidate.source != "person":
+    # Killed by: src/uclone_x/memory/extractor.py :: if candidate.subject == SELF_SUBJECT and candidate.source != "person":
     # Becomes: if False:
     from uclone_x.memory.extractor import _Candidate, _curate  # pyright: ignore[reportPrivateUsage]
 
@@ -1031,7 +1709,7 @@ def test_self_fact_from_tool_source_is_dropped_by_curate() -> None:
         generate=_never,
         clone_names=("Fiona",),
     )
-    kept = _curate([candidate], {"tool"}, lesson)
+    kept = _curate([candidate], lesson)
     assert kept == []
 
 
@@ -1144,3 +1822,69 @@ async def test_a_clone_turn_whose_generate_image_arguments_describe_its_looks_yi
 
     row = _row(state, fiona.id)
     assert row.knowledge_learned == ()
+
+
+def test_a_durable_copy_of_a_fact_is_kept_though_a_later_copy_is_not_durable() -> None:
+    """The same fact twice, the later copy marked not durable: the durable one is kept. The
+    gates ran after the duplicate was folded away, which kept the later copy and then lost
+    the fact to it (#2240 item 3).
+
+    Killed by: src/uclone_x/memory/extractor.py :: items = [item for item in items if _passes_gates(item)]
+    Becomes: items = items
+    """
+    reply = json.dumps(
+        {
+            "facts": [
+                _fact("user", "likes", "jazz", quote="I like jazz"),
+                _fact("user", "likes", "jazz", quote="I like jazz", durable=False, confidence=0.6),
+                _fact("Mina", "likes", "tea", quote="Mina likes tea", confidence=0.2),
+                _fact("Mina", "likes", "tea", quote="Mina likes tea"),
+            ]
+        }
+    )
+    from uclone_x.memory.extractor import _read  # pyright: ignore[reportPrivateUsage]
+
+    kept = _read(reply, _lesson(_SAID))
+    assert [(c.subject, c.relation, c.value, c.confidence) for c in kept] == [
+        ("user", "likes", "jazz", 0.95),  # the durable copy, not the later one
+        ("Mina", "likes", "tea", 0.95),  # the sure copy, not the earlier one
+    ]
+
+
+def test_a_name_the_person_and_the_clone_share_is_the_persons() -> None:
+    """Decided (#2240 item 4): as `fact_subject` files it for `record_memory_fact`, the person
+    is read first, so a fact about the person never becomes the clone's. Dropping it as
+    ambiguous, as #2235 did, lost a fact the person told about themselves.
+
+    Killed by: src/uclone_x/memory/extractor.py :: clone = tuple(n for n in (*SELF_WORDS, *lesson.clone_names) if name_key(n) not in person)
+    Becomes: clone = (*SELF_WORDS, *lesson.clone_names)
+    """
+    lesson = _lesson(
+        SpanLine("person", "Sam", "Sam likes jazz."), person_names=("Sam",), clone_names=("Sam",)
+    )
+    reply = json.dumps({"facts": [_fact("Sam", "likes", "jazz", quote="Sam likes jazz")]})
+    assert _read_reply(reply, lesson) == [("user", "likes", "jazz", "person")]
+
+
+def test_a_fact_that_does_not_say_it_is_durable_is_not_kept_and_one_at_the_threshold_is() -> None:
+    """The gates' edges (#2272): a fact with no `durable` field is not durable, and a
+    confidence of exactly `MIN_CONFIDENCE` is sure enough.
+
+    Killed by: src/uclone_x/memory/extractor.py :: if item.get("durable") is not True:
+    Becomes: if item.get("durable") is False:
+    Killed by: src/uclone_x/memory/extractor.py :: return confidence >= MIN_CONFIDENCE
+    Becomes: return confidence > MIN_CONFIDENCE
+    """
+    from uclone_x.memory.extractor import MIN_CONFIDENCE
+
+    undecided = _fact("user", "likes", "jazz", quote="I like jazz")
+    del undecided["durable"]
+    reply = json.dumps(
+        {
+            "facts": [
+                undecided,
+                _fact("Mina", "likes", "tea", quote="Mina likes tea", confidence=MIN_CONFIDENCE),
+            ]
+        }
+    )
+    assert _read_reply(reply, _lesson(_SAID)) == [("Mina", "likes", "tea", "person")]

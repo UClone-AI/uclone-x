@@ -38,7 +38,8 @@ from uclone_x.agent.turn_trace import (
     trace_step,
     trace_turn,
 )
-from uclone_x.core.agent_home import AgentHomeError, seat_id_for
+from uclone_x.core.agent_home import AgentHome, AgentHomeError, seat_id_for
+from uclone_x.core.logging_setup import shown_log_file
 from uclone_x.core.provenance import Provenance
 from uclone_x.errors import (
     LogHeaderError,
@@ -46,6 +47,7 @@ from uclone_x.errors import (
     PathTraversalError,
     UnknownLogEventError,
 )
+from uclone_x.knowledge.fold import relation_key
 from uclone_x.log import read_session_log
 from uclone_x.memory.models import MemoryFact
 from uclone_x.memory.store import CrossSessionMemory, read_saved_facts, read_saved_memory
@@ -321,7 +323,7 @@ def _no_turns_reason(state: RoomState, name: str, unsaved: int, in_progress: boo
 
 
 def _known_facts(
-    room_id: str, seat: Participant
+    room_id: str, seat: Participant, functional: frozenset[str] = frozenset()
 ) -> tuple[dict[str, Any], dict[str, tuple[str, str, str]] | None]:
     """The clone's facts, one clone-wide list, or why they cannot be listed (#1638 step 3).
 
@@ -354,7 +356,14 @@ def _known_facts(
             "facts": None,
             "facts_reason": f"What {name} knows could not be read, so it cannot be shown.",
         }, None
-    listed = known_facts(saved.facts if saved else [], room_id, seat.session_id)
+    listed = known_facts(
+        saved.facts if saved else [],
+        room_id,
+        seat.session_id,
+        functional=functional,
+        superseded=saved.superseded if saved else (),
+        several=saved.several if saved else frozenset(),
+    )
     reason = None
     return {"facts": listed, "facts_reason": reason}, dict(saved.statements) if saved else {}
 
@@ -369,6 +378,15 @@ MEMORY_EDIT_REFUSALS: dict[str, str] = {
     "memory_unreadable": "The clone's memory could not be read, so nothing was changed.",
     "value_missing": "Write what it should say instead.",
     "save_failed": "The change could not be saved, so it may not last after a restart.",
+    "clone_not_found": "This clone could not be found, so nothing was changed.",
+    "relation_missing": "Say which kind of fact this is about.",
+    "functional_missing": "Say whether it holds one value at a time.",
+    "not_replaced": "Only a value another one replaced can be brought back.",
+    "not_restorable": (
+        "This value can no longer be brought back: what replaced it has changed since. "
+        "Read the list again."
+    ),
+    "subject_missing": "Say which name should be kept separate.",
 }
 
 
@@ -660,6 +678,10 @@ def register_room_dock_routes(
             "turn_id": message.turn_id,
             "participant_id": participant_id,
             "session_id": session_id,
+            # Where a provider's raw answer and the turn's failure are written (#2227).
+            # From `~` when under the home directory: the page is no place for the
+            # person's account name (#2234).
+            "log_file": shown_log_file(),
         }
         reason = _unlinked_reason(state, message)
         if reason is not None:
@@ -1045,8 +1067,8 @@ def register_room_dock_routes(
                 detail=f"Name the seat to read with agent_id (seated: {seats}).",
             )
         seat = _seat(state, agent_id)
-        known, statements = _known_facts(state.room_id, seat)
         engine = stack.session_manager().ontology_for(seat.id)
+        known, statements = _known_facts(state.room_id, seat, engine.functional_relations())
         axioms = engine.list_axioms() if isinstance(engine, OntologyEngine) else []
         return {
             "room_id": state.room_id,
@@ -1111,6 +1133,110 @@ def register_room_dock_routes(
         fact = _edited(agent_id, lambda: store.correct_fact(fact_id, value, _user_provenance()))
         return {"fact": fact.model_dump(mode="json")}
 
+    @app.put("/api/agents/{agent_id}/relations/{relation}/functional")
+    async def set_relation_functional(  # pyright: ignore[reportUnusedFunction]
+        agent_id: str, relation: str, req: dict[str, Any], request: Request
+    ) -> dict[str, Any]:
+        """Whether a relation holds one value at a time, as the person says (#2332).
+
+        Body `{functional}`. Saved as an asserted `functionalProperty` axiom in the clone's
+        rules (`ontology.yaml`), the engine its seats and chats read, so the next lesson and
+        the next recall follow it. `false` takes the declaration back. Returns the relation
+        as the clone files it and whether it is now functional.
+        """
+        refuse_cross_origin(request)
+        functional = req.get("functional")
+        if not isinstance(functional, bool):
+            raise _memory_edit_refusal(400, "functional_missing")
+        if not relation.strip():
+            raise _memory_edit_refusal(400, "relation_missing")
+        try:
+            home = AgentHome.for_ref(agent_id)
+        except AgentHomeError:
+            raise _memory_edit_refusal(404, "clone_not_found") from None
+        engine = stack.session_manager().ontology_for(agent_id)
+        if not isinstance(engine, OntologyEngine):
+            raise _memory_edit_refusal(404, "clone_not_found")
+        if engine.set_functional(relation, functional):
+            try:
+                engine.save_to_yaml(home.ontology_path)
+            except OSError as exc:
+                engine.set_functional(relation, not functional)  # as it was on disk
+                logger.error("Rules of %r could not be saved: %s", agent_id, exc)
+                unsaved = _memory_edit_refusal(500, "save_failed")
+                raise unsaved from None
+        key = relation_key(relation)
+        return {"relation": key, "functional": key in engine.functional_relations()}
+
+    @app.post("/api/agents/{agent_id}/relations/{relation}/several")
+    async def mark_relation_several(  # pyright: ignore[reportUnusedFunction]
+        agent_id: str, relation: str, request: Request
+    ) -> dict[str, Any]:
+        """A person said a relation holds several values at once: never ask again (#2332).
+
+        Kept in the clone's own knowledge file. It declares nothing in the clone's rules: the
+        relation behaves as any undeclared one, and only the question stops.
+        """
+        refuse_cross_origin(request)
+        if not relation.strip():
+            raise _memory_edit_refusal(400, "relation_missing")
+        try:
+            AgentHome.for_ref(agent_id)
+        except AgentHomeError:
+            raise _memory_edit_refusal(404, "clone_not_found") from None
+        store = stack.session_manager().memory_for(agent_id)
+        try:
+            store.mark_several_values(relation)
+        except (OSError, sqlite3.Error) as exc:
+            logger.error("Answer for %r could not be saved: %s", agent_id, exc)
+            not_kept = _memory_edit_refusal(500, "save_failed")
+            raise not_kept from None
+        return {"relation": relation_key(relation), "several": True}
+
+    @app.post("/api/agents/{agent_id}/memory/{fact_id}/restore")
+    async def restore_memory_fact(  # pyright: ignore[reportUnusedFunction]
+        agent_id: str, fact_id: str, request: Request
+    ) -> dict[str, Any]:
+        """Restore: a value a later fact replaced comes back as a `corrected` fact (#2332).
+
+        It takes the place of the fact that replaced it, which is superseded, and extraction
+        does not overwrite it. Refused (409) unless that fact is still current: after a
+        chain of changes, a second click or an older list, bringing the value back would
+        leave it beside whatever is current now (review of #2337). Returns the restored fact.
+
+        Refusals (`MEMORY_EDIT_REFUSALS`): an unknown clone or a fact gone meanwhile is 404
+        `fact_not_found`; an unreadable store is 409 `memory_unreadable`; an id that was
+        never replaced (a current fact, or one a person forgot) is 409 `not_replaced`; a
+        replacer that is no longer current, checked here or found by the store after another
+        writer moved it, is 409 `not_restorable` (#2338); a save that failed is 500
+        `save_failed`.
+        """
+        refuse_cross_origin(request)
+        try:
+            saved = read_saved_memory(agent_id)
+        except AgentHomeError:
+            raise _memory_edit_refusal(404, "fact_not_found") from None
+        except MemoryStoreUnreadableError:
+            unreadable = _memory_edit_refusal(409, "memory_unreadable")
+            raise unreadable from None
+        if saved is None or all(old.fact_id != fact_id for old in saved.superseded):
+            raise _memory_edit_refusal(409, "not_replaced")
+        replaced = next(old for old in saved.superseded if old.fact_id == fact_id)
+        if replaced.superseded_by not in {fact.fact_id for fact in saved.facts}:
+            raise _memory_edit_refusal(409, "not_restorable")
+        store = stack.session_manager().memory_for(agent_id)
+        try:
+            fact = store.restore_fact(fact_id, _user_provenance())
+        except KeyError:
+            raise _memory_edit_refusal(404, "fact_not_found") from None
+        except ValueError:  # what replaced it changed after the check above
+            raise _memory_edit_refusal(409, "not_restorable") from None
+        except (OSError, sqlite3.Error) as exc:
+            logger.error("Restore for %r could not be saved: %s", agent_id, exc)
+            restore_unsaved = _memory_edit_refusal(500, "save_failed")
+            raise restore_unsaved from None
+        return {"fact": fact.model_dump(mode="json")}
+
     @app.delete("/api/agents/{agent_id}/memory/{fact_id}")
     async def forget_memory_fact(  # pyright: ignore[reportUnusedFunction]
         agent_id: str, fact_id: str, request: Request
@@ -1127,3 +1253,34 @@ def register_room_dock_routes(
             lambda: store.retract_fact(fact_id, "forgotten by the user", _user_provenance()),
         )
         return {"fact": fact.model_dump(mode="json")}
+
+    @app.post("/api/agents/{agent_id}/subjects/unmerge")
+    async def unmerge_subject_route(  # pyright: ignore[reportUnusedFunction]
+        agent_id: str, req: dict[str, Any], request: Request
+    ) -> dict[str, Any]:
+        """Keep separate: split a merged near-matching subject back out (uGraph §6 Q2).
+
+        Body `{subject}`. Removes `subject` from its canonical entity's aliases, restores
+        its own facts, and records the pair so future turns do not merge them again.
+        """
+        refuse_cross_origin(request)
+        subject = req.get("subject")
+        if not isinstance(subject, str) or not subject.strip():
+            raise _memory_edit_refusal(400, "subject_missing")
+        try:
+            AgentHome.for_ref(agent_id)
+        except AgentHomeError:
+            raise _memory_edit_refusal(404, "clone_not_found") from None
+        store = stack.session_manager().memory_for(agent_id)
+        try:
+            restored = store.unmerge_subject(subject, _user_provenance())
+        except (KeyError, ValueError):
+            raise _memory_edit_refusal(404, "fact_not_found") from None
+        except (OSError, sqlite3.Error) as exc:
+            logger.error("Unmerge for %r could not be saved: %s", agent_id, exc)
+            unmerge_unsaved = _memory_edit_refusal(500, "save_failed")
+            raise unmerge_unsaved from None
+        return {
+            "subject": subject.strip(),
+            "facts": [f.model_dump(mode="json") for f in restored],
+        }

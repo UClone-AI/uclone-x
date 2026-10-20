@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import sqlite3
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -1411,8 +1412,8 @@ class TestTheDockNeverSaysNothingWasWritten:
     ) -> None:
         """A shell that exits non-zero may already have written; its status says nothing.
 
-        Killed by: src/uclone_x/room/orchestrator.py :: wrote_unnamed=(written_path is None and execution.writes_files)
-        Becomes: wrote_unnamed=(written_path is None and execution.writes_files and succeeded)
+        Killed by: src/uclone_x/room/orchestrator.py :: wrote_unnamed=(written_path is None and execution.writes_files
+        Becomes: wrote_unnamed=(written_path is None and execution.writes_files and succeeded
         """
         from uclone_x.tools.builtin.shell import BashRunTool
 
@@ -2208,6 +2209,47 @@ class TestRoomDockTurnTraceRoutes:
         assert body["trace"] is None
         assert body["reason"]["code"] == "session_not_found"
 
+    def test_a_turns_trace_names_the_server_log(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A failed turn leads a developer to the server log, where the provider's raw answer
+        is, even when its trace cannot be read (#2227).
+
+        Killed by: src/uclone_x/ui/room_dock.py :: "log_file": shown_log_file(),
+        Becomes: "log_file": None,
+        """
+        monkeypatch.setenv("UCX_LOG_DIR", str(tmp_path / "logs"))
+        room_id = _create(client, ["scout"])
+        _seed(
+            client,
+            room_id,
+            transcript=(_utterance(1, seat_id_for("scout"), turn_id="t1", tools_recorded=True),),
+        )
+        body = client.get(f"/api/rooms/{room_id}/turns/1/trace").json()
+        assert body["log_file"] == str((tmp_path / "logs" / "ucx.log").resolve())
+        assert body["session_id"]
+
+    def test_a_turns_trace_names_a_log_in_the_home_folder_from_tilde(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """The log's path is shown in developer mode; one under the home folder is written
+        from `~`, so the page does not carry the person's account name (#2234).
+
+        Killed by: src/uclone_x/core/logging_setup.py :: return f"~/{log_file.relative_to(Path.home().resolve()).as_posix()}"
+        Becomes: return str(log_file)
+        """
+        home = (tmp_path / "home").resolve()
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("UCX_LOG_DIR", str(home / ".uclone" / "logs"))
+        room_id = _create(client, ["scout"])
+        _seed(
+            client,
+            room_id,
+            transcript=(_utterance(1, seat_id_for("scout"), turn_id="t1", tools_recorded=True),),
+        )
+        body = client.get(f"/api/rooms/{room_id}/turns/1/trace").json()
+        assert body["log_file"] == "~/.uclone/logs/ucx.log"
+
     def test_trace_log_missing(self, client: TestClient) -> None:
         """Killed by: src/uclone_x/ui/room_dock.py :: if log_path is None or not log_path.exists():
         Becomes: if log_path is None:
@@ -2980,3 +3022,508 @@ def test_origin_matching_host_on_non_loopback_server_succeeds_and_mismatch_is_re
             headers={"Host": "192.168.1.50:5180", "Origin": "http://192.168.1.99:5180"},
         )
         assert other_host.status_code == 403
+
+
+# --------------------------------------------------------------------------------------
+# One value at a time: PUT /api/agents/{agent_id}/relations/{relation}/functional (#2332)
+# --------------------------------------------------------------------------------------
+
+
+def _told_move(seat: str) -> tuple[str, str]:
+    """Kenny told the clone he lives in Busan, then that he moved to Seoul, which replaced it."""
+    from uclone_x.core.provenance import Provenance
+    from uclone_x.memory.store import default_cross_session_memory
+
+    memory = default_cross_session_memory(seat)
+    prov = Provenance.primary(provider=f"agent.{seat}", model="memory")
+    busan = memory.record_fact(
+        "Kenny", "lives_in", "Busan", prov, "a-chat", origin="told", single_valued=False
+    )
+    seoul = memory.record_fact(
+        "Kenny",
+        "lives_in",
+        "Seoul",
+        prov,
+        "a-chat",
+        origin="told",
+        single_valued=False,
+        replaces=(busan.fact_id,),
+    )
+    return busan.fact_id, seoul.fact_id
+
+
+class TestARelationHoldsOneValueAtATime:
+    def test_a_value_a_persons_words_replaced_asks_and_no_other_does(
+        self, client: TestClient
+    ) -> None:
+        """The chip shows on the relation a told fact replaced a value of, and not on one
+        whose values were never replaced.
+
+        Killed by: src/uclone_x/ui/knowledge.py :: if replaced.get(fact.contradicts_fact_id) == (fold(fact.subject), key):
+        Becomes: if True:
+        Killed by: src/uclone_x/ui/knowledge.py :: if fact.origin != "told" or key in functional or fact.contradicts_fact_id is None:
+        Becomes: if key in functional or fact.contradicts_fact_id is None:
+        """
+        from uclone_x.core.provenance import Provenance
+        from uclone_x.memory.store import default_cross_session_memory
+
+        room_id = _create(client, ["scout"])
+        _, seoul = _told_move("scout")
+        memory = default_cross_session_memory("scout")
+        prov = Provenance.primary(provider="agent.scout", model="memory")
+        jazz = memory.record_fact("Kenny", "prefers", "jazz", prov, "a-chat", origin="told")
+        # A person's Correct replaces a value too, but says it was wrong, not that it changed.
+        tea = memory.record_fact("Kenny", "drinks", "tea", prov, "a-chat", origin="told")
+        coffee = memory.correct_fact(tea.fact_id, "coffee", prov)
+        # A value replaced under another relation says nothing about this one's values.
+        rust = memory.record_fact(
+            "Kenny", "learning", "Rust", prov, "a-chat", origin="told", single_valued=False
+        )
+        zig = memory.record_fact(
+            "Kenny",
+            "current_language",
+            "Zig",
+            prov,
+            "a-chat",
+            origin="told",
+            single_valued=False,
+            replaces=(rust.fact_id,),
+        )
+
+        facts = {f["fact_id"]: f for f in _knowledge(client, room_id, "scout")["facts"]}
+
+        assert facts[seoul]["relation"] == "lives_in"
+        assert facts[seoul]["ask_functional"] is True
+        assert facts[seoul]["functional"] is False
+        assert facts[jazz.fact_id]["ask_functional"] is False
+        assert facts[coffee.fact_id]["ask_functional"] is False
+        assert facts[zig.fact_id]["ask_functional"] is False
+
+    def test_yes_declares_it_in_the_clones_rules_and_off_takes_it_back(
+        self, client: TestClient
+    ) -> None:
+        """Saved as an asserted functionalProperty axiom in the clone's own ontology.yaml;
+        the question is not asked once it is answered, and is again once it is taken back.
+
+        Killed by: src/uclone_x/ui/room_dock.py :: engine.save_to_yaml(home.ontology_path)
+        Becomes: pass
+        Killed by: src/uclone_x/ui/room_dock.py :: if engine.set_functional(relation, functional):
+        Becomes: if False:
+        """
+        from uclone_x.core.agent_home import AgentHome
+
+        room_id = _create(client, ["scout"])
+        _, seoul = _told_move("scout")
+
+        answered = client.put(
+            "/api/agents/scout/relations/Lives in/functional", json={"functional": True}
+        )
+
+        assert answered.status_code == 200, answered.text
+        assert answered.json() == {"relation": "lives_in", "functional": True}
+        saved = AgentHome.for_handle("scout").ontology_path.read_text(encoding="utf-8")
+        assert "functionalProperty" in saved and "lives_in" in saved
+        fact = next(
+            f for f in _knowledge(client, room_id, "scout")["facts"] if f["fact_id"] == seoul
+        )
+        assert (fact["functional"], fact["ask_functional"]) == (True, False)
+
+        off = client.put(
+            "/api/agents/scout/relations/lives_in/functional", json={"functional": False}
+        )
+
+        assert off.json() == {"relation": "lives_in", "functional": False}
+        fact = next(
+            f for f in _knowledge(client, room_id, "scout")["facts"] if f["fact_id"] == seoul
+        )
+        assert (fact["functional"], fact["ask_functional"]) == (False, True)
+        saved = AgentHome.for_handle("scout").ontology_path.read_text(encoding="utf-8")
+        assert "functionalProperty" not in saved
+
+    def test_a_missing_answer_or_clone_is_a_plain_refusal(self, client: TestClient) -> None:
+        _create(client, ["scout"])
+
+        no_answer = client.put("/api/agents/scout/relations/lives_in/functional", json={})
+        no_clone = client.put(
+            "/api/agents/nobody/relations/lives_in/functional", json={"functional": True}
+        )
+
+        assert no_answer.status_code == 400
+        assert no_answer.json()["detail"] == "Say whether it holds one value at a time."
+        assert no_clone.status_code == 404
+        _assert_plain_refusal(no_clone.json()["detail"], "nobody")
+
+
+class TestAFactsHistoryAndRestore:
+    """Remembers shows what a fact replaced and brings a value back (#2332)."""
+
+    def test_a_fact_lists_the_values_it_replaced_and_its_words(self, client: TestClient) -> None:
+        """
+        Killed by: src/uclone_x/ui/knowledge.py :: replaced_by.setdefault(old.superseded_by, []).append(old)
+        Becomes: pass
+        Killed by: src/uclone_x/ui/knowledge.py :: return quote.strip() if isinstance(quote, str) and quote.strip() else None
+        Becomes: return None
+        """
+        from uclone_x.core.provenance import Provenance
+        from uclone_x.memory.store import default_cross_session_memory
+
+        room_id = _create(client, ["scout"])
+        busan, seoul = _told_move("scout")
+        memory = default_cross_session_memory("scout")
+        prov = Provenance.primary(provider="agent.scout", model="memory")
+        tea = memory.record_fact(
+            "Kenny", "drinks", "tea", prov, "a-chat", metadata={"quote": " tea every morning "}
+        )
+
+        facts = {f["fact_id"]: f for f in _knowledge(client, room_id, "scout")["facts"]}
+
+        assert [r["fact_id"] for r in facts[seoul]["replaced"]] == [busan]
+        assert facts[seoul]["replaced"][0]["value"] == "Busan"
+        assert facts[tea.fact_id]["quote"] == "tea every morning"
+        assert (facts[tea.fact_id]["replaced"], facts[seoul]["quote"]) == ([], None)
+
+    def test_restore_brings_the_value_back_as_the_current_one(self, client: TestClient) -> None:
+        """
+        Killed by: src/uclone_x/ui/room_dock.py :: fact = store.restore_fact(fact_id, _user_provenance())
+        Becomes: fact = store.get_fact(fact_id)
+        """
+        room_id = _create(client, ["scout"])
+        busan, seoul = _told_move("scout")
+
+        answered = client.post(f"/api/agents/scout/memory/{busan}/restore")
+
+        assert answered.status_code == 200, answered.text
+        assert answered.json()["fact"]["object_value"] == "Busan"
+        assert answered.json()["fact"]["origin"] == "corrected"
+        facts = _knowledge(client, room_id, "scout")["facts"]
+        assert [f["object_value"] for f in facts] == ["Busan"]
+        assert facts[0]["replaced"][0]["fact_id"] == seoul
+
+    def test_a_restore_leaves_one_current_value_whatever_comes_first(
+        self, client: TestClient
+    ) -> None:
+        """Busan -> Seoul -> Daegu: Busan cannot come back beside Daegu; Seoul can, once; and
+        a fact replaced before replacers were kept cannot (review of #2337).
+
+        Killed by: src/uclone_x/ui/room_dock.py :: if replaced.superseded_by not in {fact.fact_id for fact in saved.facts}:
+        Becomes: if False:
+        """
+        from uclone_x.core.provenance import Provenance
+        from uclone_x.memory.store import default_cross_session_memory
+
+        room_id = _create(client, ["scout"])
+        busan, seoul = _told_move("scout")
+        memory = default_cross_session_memory("scout")
+        prov = Provenance.primary(provider="agent.scout", model="memory")
+        memory.record_fact(
+            "Kenny", "lives_in", "Daegu", prov, "a-chat", single_valued=False, replaces=(seoul,)
+        )
+
+        chain = client.post(f"/api/agents/scout/memory/{busan}/restore")
+
+        assert chain.status_code == 409
+        assert chain.json()["detail"] == (
+            "This value can no longer be brought back: what replaced it has changed since. "
+            "Read the list again."
+        )
+        _assert_plain_refusal(chain.json()["detail"], busan)
+        current = _knowledge(client, room_id, "scout")["facts"]
+        assert [f["object_value"] for f in current] == ["Daegu"]
+
+        first = client.post(f"/api/agents/scout/memory/{seoul}/restore")
+        again = client.post(f"/api/agents/scout/memory/{seoul}/restore")
+
+        assert (first.status_code, again.status_code) == (200, 409)
+        current = _knowledge(client, room_id, "scout")["facts"]
+        assert [f["object_value"] for f in current] == ["Seoul"]
+
+        tea = memory.record_fact("Kenny", "drinks", "tea", prov, "a-chat", single_valued=False)
+        memory.record_fact(
+            "Kenny",
+            "drinks",
+            "coffee",
+            prov,
+            "a-chat",
+            single_valued=False,
+            replaces=(tea.fact_id,),
+        )
+        with memory.knowledge.transaction() as tx:  # as a row written before #2332 reads
+            tx.update_edge(tea.fact_id, record={"superseded_by": None})
+
+        old = client.post(f"/api/agents/scout/memory/{tea.fact_id}/restore")
+
+        assert old.status_code == 409
+        drinks = [
+            f["object_value"]
+            for f in _knowledge(client, room_id, "scout")["facts"]
+            if f["predicate"] == "drinks"
+        ]
+        assert drinks == ["coffee"]
+
+    def test_a_change_between_the_check_and_the_restore_is_a_409_not_a_404(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Another writer replaces the replacer after the route checked it and before the
+        store restores: the store refuses, and the route says why, as 409 (#2338).
+
+        Killed by: src/uclone_x/ui/room_dock.py :: except ValueError:  # what replaced it changed after the check above
+        Becomes: except ZeroDivisionError:
+        """
+        from uclone_x.core.provenance import Provenance
+        from uclone_x.memory.store import CrossSessionMemory, default_cross_session_memory
+
+        room_id = _create(client, ["scout"])
+        busan, seoul = _told_move("scout")
+        real = CrossSessionMemory.restore_fact
+
+        def raced(self: CrossSessionMemory, fact_id: str, provenance: Provenance) -> Any:
+            default_cross_session_memory("scout").record_fact(
+                "Kenny",
+                "lives_in",
+                "Daegu",
+                Provenance.primary(provider="agent.scout", model="memory"),
+                "a-chat",
+                single_valued=False,
+                replaces=(seoul,),
+            )
+            return real(self, fact_id, provenance)
+
+        monkeypatch.setattr(CrossSessionMemory, "restore_fact", raced)
+
+        refused = client.post(f"/api/agents/scout/memory/{busan}/restore")
+
+        assert refused.status_code == 409
+        assert refused.json()["detail"] == (
+            "This value can no longer be brought back: what replaced it has changed since. "
+            "Read the list again."
+        )
+        current = _knowledge(client, room_id, "scout")["facts"]
+        assert [f["object_value"] for f in current] == ["Daegu"]
+
+    @pytest.mark.parametrize(
+        ("raised", "status", "detail"),
+        [
+            (KeyError("mem_gone"), 404, "fact_not_found"),
+            (sqlite3.OperationalError("disk I/O error"), 500, "save_failed"),
+        ],
+        ids=["gone-meanwhile", "save-failed"],
+    )
+    def test_the_stores_other_refusals_are_plain_words(
+        self,
+        client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+        raised: Exception,
+        status: int,
+        detail: str,
+    ) -> None:
+        """Gone after the check is 404; a save that failed is 500; neither says why (#2344).
+
+        Killed by: src/uclone_x/ui/room_dock.py :: except KeyError:
+        Becomes: except ZeroDivisionError:
+        Killed by: src/uclone_x/ui/room_dock.py :: restore_unsaved = _memory_edit_refusal(500, "save_failed")
+        Becomes: restore_unsaved = _memory_edit_refusal(409, "not_restorable")
+        """
+        from uclone_x.memory.store import CrossSessionMemory
+        from uclone_x.ui.room_dock import MEMORY_EDIT_REFUSALS
+
+        _create(client, ["scout"])
+        busan, _ = _told_move("scout")
+
+        def fails(*_: object) -> None:
+            raise raised
+
+        monkeypatch.setattr(CrossSessionMemory, "restore_fact", fails)
+
+        refused = client.post(f"/api/agents/scout/memory/{busan}/restore")
+
+        assert refused.status_code == status
+        assert refused.json()["detail"] == MEMORY_EDIT_REFUSALS[detail]
+        _assert_plain_refusal(refused.json()["detail"], "mem_gone", "disk", busan)
+
+    def test_a_current_value_is_not_restored_and_says_so_plainly(self, client: TestClient) -> None:
+        """
+        Killed by: src/uclone_x/ui/room_dock.py :: if saved is None or all(old.fact_id != fact_id for old in saved.superseded):
+        Becomes: if saved is None:
+        """
+        _create(client, ["scout"])
+        _, seoul = _told_move("scout")
+
+        refused = client.post(f"/api/agents/scout/memory/{seoul}/restore")
+
+        assert refused.status_code == 409
+        assert refused.json()["detail"] == "Only a value another one replaced can be brought back."
+        _assert_plain_refusal(refused.json()["detail"], seoul)
+
+
+class TestARelationAnsweredSeveralValues:
+    def test_no_is_kept_and_the_question_never_comes_back(self, client: TestClient) -> None:
+        """ "No, several values" is kept in the clone's knowledge file; the next read, and one
+        after another value is replaced, do not ask again (#2332, review of #2336).
+
+        Killed by: src/uclone_x/ui/knowledge.py :: if key in several:
+        Becomes: if False:
+        Killed by: src/uclone_x/ui/room_dock.py :: store.mark_several_values(relation)
+        Becomes: pass
+        """
+        from uclone_x.core.provenance import Provenance
+        from uclone_x.memory.store import default_cross_session_memory, read_saved_memory
+
+        room_id = _create(client, ["scout"])
+        _, seoul = _told_move("scout")
+        assert _knowledge(client, room_id, "scout")["facts"][0]["ask_functional"] is True
+
+        answered = client.post("/api/agents/scout/relations/Lives in/several")
+
+        assert answered.status_code == 200, answered.text
+        assert answered.json() == {"relation": "lives_in", "several": True}
+        saved = read_saved_memory("scout")
+        assert saved is not None and saved.several == frozenset({"lives_in"})
+        facts = _knowledge(client, room_id, "scout")["facts"]
+        assert [(f["ask_functional"], f["functional"]) for f in facts] == [(False, False)]
+        # Another value of it replaced later still does not bring the question back.
+        prov = Provenance.primary(provider="agent.scout", model="memory")
+        default_cross_session_memory("scout").record_fact(
+            "Kenny",
+            "lives_in",
+            "Daegu",
+            prov,
+            "a-chat",
+            origin="told",
+            single_valued=False,
+            replaces=(seoul,),
+        )
+        assert all(not f["ask_functional"] for f in _knowledge(client, room_id, "scout")["facts"])
+        assert client.post("/api/agents/scout/relations/lives_in/several").status_code == 200
+
+    def test_an_unknown_clone_is_a_plain_refusal(self, client: TestClient) -> None:
+        _create(client, ["scout"])
+
+        refused = client.post("/api/agents/nobody/relations/lives_in/several")
+
+        assert refused.status_code == 404
+        _assert_plain_refusal(refused.json()["detail"], "nobody")
+
+
+class TestNearSubjectMergeAndKeepSeparate:
+    """Near-matching subjects show their merge in Remembers and can be split back (uGraph §6 Q2)."""
+
+    def test_merged_subject_is_listed_without_false_history_and_unmerge_splits_it_back(
+        self, client: TestClient
+    ) -> None:
+        """
+        Killed by: src/uclone_x/ui/knowledge.py :: "merged_from": _merged_from(fact),
+        Becomes: "merged_from": None,
+        Killed by: src/uclone_x/ui/knowledge.py :: if not cleaned or fold(cleaned) == fold(fact.subject):
+        Becomes: if not cleaned:
+        Killed by: src/uclone_x/memory/store.py :: and "merged_duplicate_of" not in (row.record.get("metadata") or {})
+        Becomes: and True
+        Killed by: src/uclone_x/ui/room_dock.py :: restored = store.unmerge_subject(subject, _user_provenance())
+        Becomes: restored = []
+        """
+        from uclone_x.core.provenance import Provenance
+        from uclone_x.memory.store import default_cross_session_memory
+
+        room_id = _create(client, ["scout"])
+        memory = default_cross_session_memory("scout")
+        prov = Provenance.primary(provider="agent.scout", model="memory")
+        memory.record_fact(
+            "김지현",
+            "works_at",
+            "Hanbit",
+            prov,
+            "a-chat",
+            single_valued=False,
+        )
+        memory.record_fact(
+            "김지현",
+            "lives_in",
+            "Seoul",
+            prov,
+            "a-chat",
+            single_valued=False,
+            metadata={"merged_from": "김지현"},
+        )
+        memory.record_fact(
+            "지현",
+            "role",
+            "designer",
+            prov,
+            "a-chat",
+            single_valued=False,
+        )
+        dup = memory.record_fact(
+            "지현",
+            "works_at",
+            "Hanbit",
+            prov,
+            "a-chat",
+            single_valued=False,
+        )
+        # Even if a duplicate row carries `superseded_by`, `merged_duplicate_of` keeps it out
+        # of `replaced` in Remembers.
+        with memory.knowledge.transaction() as tx:
+            for row in tx.rows():
+                meta = cast("dict[str, Any]", row.record.get("metadata") or {})
+                if meta.get("merged_duplicate_of"):
+                    tx.update_edge(row.edge.id, record={"superseded_by": dup.fact_id})
+
+        facts = {
+            (f["subject"], f["predicate"]): f for f in _knowledge(client, room_id, "scout")["facts"]
+        }
+        assert facts[("김지현", "works_at")]["merged_from"] == "지현"
+        assert facts[("김지현", "works_at")]["replaced"] == []
+        assert facts[("김지현", "role")]["merged_from"] == "지현"
+        assert facts[("김지현", "lives_in")]["merged_from"] is None
+
+        unmerged = client.post("/api/agents/scout/subjects/unmerge", json={"subject": "지현"})
+        assert unmerged.status_code == 200, unmerged.text
+        body = unmerged.json()
+        assert body["subject"] == "지현"
+        assert {(f["subject"], f["predicate"]) for f in body["facts"]} == {
+            ("지현", "role"),
+            ("지현", "works_at"),
+        }
+
+        after = _knowledge(client, room_id, "scout")["facts"]
+        assert {(f["subject"], f["predicate"]) for f in after} == {
+            ("김지현", "works_at"),
+            ("김지현", "lives_in"),
+            ("지현", "role"),
+            ("지현", "works_at"),
+        }
+        assert all(f["merged_from"] is None for f in after)
+
+    def test_unmerge_refusals_use_plain_words(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """
+        Killed by: src/uclone_x/ui/room_dock.py :: if not isinstance(subject, str) or not subject.strip():
+        Becomes: if False:
+        Killed by: src/uclone_x/ui/room_dock.py :: unmerge_unsaved = _memory_edit_refusal(500, "save_failed")
+        Becomes: unmerge_unsaved = _memory_edit_refusal(404, "fact_not_found")
+        """
+        from uclone_x.memory.store import CrossSessionMemory
+        from uclone_x.ui.room_dock import MEMORY_EDIT_REFUSALS
+
+        _create(client, ["scout"])
+
+        blank = client.post("/api/agents/scout/subjects/unmerge", json={"subject": "  "})
+        assert blank.status_code == 400
+        assert blank.json()["detail"] == MEMORY_EDIT_REFUSALS["subject_missing"]
+
+        no_clone = client.post("/api/agents/nobody/subjects/unmerge", json={"subject": "지현"})
+        assert no_clone.status_code == 404
+        _assert_plain_refusal(no_clone.json()["detail"], "nobody")
+
+        missing = client.post("/api/agents/scout/subjects/unmerge", json={"subject": "지현"})
+        assert missing.status_code == 404
+        assert missing.json()["detail"] == MEMORY_EDIT_REFUSALS["fact_not_found"]
+
+        def broken(*_: object) -> list[Any]:
+            raise sqlite3.OperationalError("disk I/O error")
+
+        monkeypatch.setattr(CrossSessionMemory, "unmerge_subject", broken)
+        failed = client.post("/api/agents/scout/subjects/unmerge", json={"subject": "지현"})
+        assert failed.status_code == 500
+        assert failed.json()["detail"] == MEMORY_EDIT_REFUSALS["save_failed"]
+        _assert_plain_refusal(failed.json()["detail"], "disk")

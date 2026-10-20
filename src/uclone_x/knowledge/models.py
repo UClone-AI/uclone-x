@@ -70,7 +70,13 @@ class Interval:
 
 @dataclass(frozen=True)
 class Edge:
-    """One fact: `subject predicate object` (an entity) or `value` (a literal)."""
+    """One fact: `subject predicate object` (an entity) or `value` (a literal).
+
+    `valid` is when the fact holds as the vessel believes it. `proposed_valid`, when set,
+    is when it holds once every pending proposal is taken as made: an approved value that
+    a proposed change (or a proposed removal) replaces ends there in the approved-and-
+    proposed view, and only there (`store.holds_at`). `None` is the same as `valid`.
+    """
 
     id: str
     scope: str
@@ -85,10 +91,19 @@ class Edge:
     confidence: float = 1.0
     origin: str = ""
     evidence: tuple[tuple[str, str], ...] = ()  # (episode id, quote)
+    proposed_valid: Interval | None = None
 
     def __post_init__(self) -> None:
         if (self.object_id is None) == (self.value is None):
             raise ValueError("an edge has exactly one of object_id and value")
+        if self.proposed_valid is not None and self.proposed_valid.axis != self.valid.axis:
+            raise ValueError("an edge's two intervals are on one axis")
+
+    def valid_in(self, *, proposed: bool) -> Interval:
+        """When the edge holds in the approved view, or in the approved-and-proposed one."""
+        if proposed and self.proposed_valid is not None:
+            return self.proposed_valid
+        return self.valid
 
 
 _MINT: Final = object()

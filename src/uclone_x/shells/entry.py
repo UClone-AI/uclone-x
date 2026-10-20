@@ -18,9 +18,12 @@ The same holds while a command *runs*, not only while the CLI is imported
 from inside `app()`. Typer does not intercept it: `Typer.__call__` re-raises
 every exception and leaves the Rich traceback to `sys.excepthook`, so catching
 it around `app()` is what stops that traceback, for every command at once.
-Only `MissingDependencyError` is caught; any other exception keeps its
-traceback, because reporting a defect as a one-line message discards the
-evidence.
+Only `MissingDependencyError` and `ExtensionError` are caught; any other
+exception keeps its traceback, because reporting a defect as a one-line message
+discards the evidence. An `ExtensionError` is an installed extension that could
+not load, not a defect in `ucx`: its message is written for a person (#2283),
+and the cause it chains -- the extension's own exception and file -- goes to
+`ucx.log` -- logged by the registry where it failed, once (#2290, #2292).
 
 Placement is load-bearing twice over, and both constraints were found by a
 test rather than by reasoning:
@@ -38,9 +41,14 @@ test rather than by reasoning:
 
 from __future__ import annotations
 
+import logging
 import sys
 
+from uclone_x.core.logging_setup import log_to_file_not_terminal, reason_is_in_the_log
 from uclone_x.errors import MissingDependencyError
+from uclone_x.extensions.contract import ExtensionError
+
+logger = logging.getLogger(__name__)
 
 
 def main() -> None:
@@ -51,4 +59,20 @@ def main() -> None:
         app()
     except MissingDependencyError as exc:
         print(f"ucx: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
+    except ExtensionError as exc:
+        # Its words are written for a person (#2283); the cause it chains -- the
+        # extension's own exception, its file -- is not. Where the registry logged that
+        # cause as the extension failed (with where its entry point points; that record
+        # serves the web head too) it is not logged again (#2292). Any other -- a
+        # conflict, or an error from a part the registry does not wrap -- has its
+        # traceback here, the one record of it, since the printed line says the reason
+        # is in the log (#2290, #2294 review).
+        with log_to_file_not_terminal():
+            logger.error(
+                "ucx: an extension stopped the command: %s",
+                exc,
+                exc_info=None if exc.cause_logged else exc,
+            )
+        print(f"ucx: {exc} {reason_is_in_the_log()}", file=sys.stderr)
         raise SystemExit(1) from exc

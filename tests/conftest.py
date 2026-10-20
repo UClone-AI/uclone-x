@@ -41,6 +41,14 @@ from uclone_x.tools.builtin import mcp_loader
 # Collection-time isolation: ensure UCLONE_SESSION_DIR is established immediately
 # when conftest is imported, preventing import-time singletons (such as the module-level
 # FastAPI app in uclone_x.ui.app) from defaulting to DEFAULT_SESSION_STORAGE_DIR.
+# The story example (#2208) is importable wherever this conftest is, as `pyproject.toml`'s
+# `pythonpath` makes it for the suite. A child pytest that loads this file as a plugin
+# (`-p tests.conftest`) reads no ini file, and without this its session fixture below
+# could not import the story at all.
+_STORY_EXAMPLE_SRC = str(Path(__file__).resolve().parent.parent / "examples" / "story" / "src")
+if _STORY_EXAMPLE_SRC not in sys.path:
+    sys.path.insert(0, _STORY_EXAMPLE_SRC)
+
 _COLLECTION_SESSION_DIR = Path(tempfile.gettempdir()) / "uclone-test-session-collection"
 _COLLECTION_SESSION_DIR.mkdir(parents=True, exist_ok=True)
 if SESSION_STORAGE_DIR_ENV_VAR not in os.environ:
@@ -240,6 +248,26 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
 @pytest.fixture
 def sample_fixture() -> str:
     return "uclone_x"
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _the_story_example_is_installed() -> Iterator[None]:  # pyright: ignore[reportUnusedFunction]
+    """Run the suite with the story example as its one extension, wherever it is installed.
+
+    The story is its own distribution (`examples/story/`, #2208), found through an entry
+    point, and entry points exist only in an installed package's metadata. Whether the
+    shared virtual environment has it installed is a fact about the machine, and a
+    worktree must not reinstall it. Without this the same suite would test the story on
+    one machine and silently drop it on another, and a branch that changed the example's
+    entry point would test the primary checkout's. A test about the core alone says so
+    with `use_extensions([])`; discovery itself is tested against patched entry points
+    (`tests/unit/test_extensions.py`).
+    """
+    from uclone_x.extensions import use_extensions
+    from uclone_x_story.ucx_extension import EXTENSION
+
+    with use_extensions([EXTENSION]):
+        yield
 
 
 @pytest.fixture(autouse=True)
@@ -574,6 +602,8 @@ def builtin_personas_absent(
 
     empty = tmp_path_factory.mktemp("no-builtin-personas")
     monkeypatch.setattr(persona_registry, "BUILTIN_PERSONAS_DIR", empty)
+    # Nor an extension's builtins: the story ships Writer (#2208).
+    monkeypatch.setattr(persona_registry, "extension_persona_dirs", tuple)
 
 
 def finish_after_tools(llm: object) -> None:
@@ -719,3 +749,15 @@ def pytest_configure(config: pytest.Config) -> None:
             f"{joined}\n\n"
             f"Set {_INVOCATION_GUARD_OPT_OUT}=1 to bypass this check deliberately."
         )
+
+
+@pytest.fixture(autouse=True)
+def _no_thinking_step_learned() -> Iterator[None]:  # pyright: ignore[reportUnusedFunction]
+    """The Gemini connector keeps, for the process, which thinking setting each model took
+    (`_THINKING_STEP`, #2240). Every test starts and ends with nothing learned, so no test
+    depends on which ran before it (#2272)."""
+    from uclone_x.llm.connectors import gemini
+
+    gemini._THINKING_STEP.clear()  # pyright: ignore[reportPrivateUsage]
+    yield
+    gemini._THINKING_STEP.clear()  # pyright: ignore[reportPrivateUsage]

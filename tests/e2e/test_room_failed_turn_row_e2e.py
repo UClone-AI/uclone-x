@@ -41,7 +41,7 @@ from typing import Any
 import pytest
 from playwright.async_api import Page, ViewportSize, async_playwright
 
-from tests.e2e.conftest import mock_llm, running_ui
+from tests.e2e.conftest import TWO_FRAMES, dock_locator, mock_llm, running_ui
 from uclone_x.errors import ModelNotAvailableError, ProviderFailureError, ProviderQuotaError
 from uclone_x.llm.budget import TokenBudgetManager
 from uclone_x.llm.connectors.mock import MockLLMConnector
@@ -427,6 +427,61 @@ async def test_a_retired_model_says_so_on_its_row_and_sends_the_user_to_settings
                 )
                 for internal in ("404", "{", "Error", "http"):
                     assert internal not in stated, internal
+        finally:
+            await browser.close()
+
+
+@pytest.mark.asyncio
+async def test_why_on_a_turn_a_provider_error_ended_names_no_substitute_and_no_internals(
+    retired_model_ui_server: str,
+) -> None:
+    """The turn's record, opened from `why ›`, says the model did not answer (#2229).
+
+    The core's error handler records a provider-ended turn as `failover`, `degraded`, served
+    by `agent.core:error_handler`, with the exception class in its attempts. The panel read
+    that as a substitution and printed the internals. With developer mode off (the default)
+    it now says which model did not answer and why, and nothing from that record.
+
+    Killed by: src/uclone_x/room/turn_summary.py :: if message.error is not None and path_str == "failover":
+    Becomes: if False:
+    """
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(headless=True)
+        try:
+            page = await browser.new_page(viewport=VIEWPORT)
+            await _open_a_conversation(page, retired_model_ui_server)
+            await _say(page, PROMPT)
+            await page.locator("[data-testid='row-error-4']").wait_for(timeout=20000)
+
+            # Read after the summary route has answered: the panel first draws a provisional
+            # reading from the transcript row, and the route's is the one under test.
+            async with page.expect_response(
+                lambda r: "/turns/4" in r.url and r.request.method == "GET", timeout=15000
+            ) as routed:
+                await page.click("[data-testid='why-4']")
+            assert (await routed.value).ok
+            dock = await dock_locator(page)
+            detail = dock.locator("[data-testid='turn-detail']")
+            await detail.wait_for(timeout=10000)
+            await page.evaluate(TWO_FRAMES)  # the routed summary's render
+            no_answer = detail.locator("[data-testid='turn-detail-no-answer']")
+            await no_answer.wait_for(timeout=10000)
+            # This seat's config names no model, so the sentence names none either.
+            assert (await no_answer.inner_text()).strip() == (
+                "No model answered: the turn ended in an error."
+            )
+
+            shown = await detail.inner_text()
+            for internal in (
+                "ubstitut",
+                "failover",
+                "agent.core",
+                "error_handler",
+                "ModelNotAvailableError",
+                "Answered by",
+            ):
+                assert internal not in shown, f"{internal!r} shown: {shown!r}"
+            assert "Google" in shown, shown
         finally:
             await browser.close()
 

@@ -233,6 +233,27 @@ def test_ui_app_raises_named_error_when_fastapi_missing() -> None:
     assert "OK" in result.stdout
 
 
+def test_the_web_app_imports_with_the_http_extra_alone() -> None:
+    """`uclone-x[http]` is enough for the web head's app: no `rich`, no `typer` (#2245).
+
+    `rich` is the terminal's (the `cli` extra); the app writes to no terminal.
+
+    Killed by: src/uclone_x/ui/app.py :: from pydantic import ValidationError
+    Becomes: from pydantic import ValidationError; import rich.console
+    """
+    script = (
+        "import sys\n"
+        "sys.modules['rich'] = None\n"
+        "sys.modules['typer'] = None\n"
+        "import uclone_x.ui.app\n"
+        "assert callable(uclone_x.ui.app.create_ui_app)\n"
+        "print('OK')\n"
+    )
+    result = _run_in_isolated_python(script)
+    assert result.returncode == 0, f"Subprocess failed:\n{result.stderr}"
+    assert "OK" in result.stdout
+
+
 def test_ui_server_raises_named_error_when_uvicorn_missing() -> None:
     """Importing uclone_x.ui.server when uvicorn is missing raises MissingDependencyError.
 

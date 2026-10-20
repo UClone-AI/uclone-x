@@ -6,6 +6,11 @@
   paste into it, and the folder to load unpacked.
 - `POST /api/browser/extension/pairing-code`: a new code; the paired extension is dropped
   and must be given the new one.
+- `GET`/`POST`/`DELETE /api/browser/sign-ins`: Settings ▸ Browser ▸ Saved sign-ins (§3.5
+  path A). Kept in the settings file by its one writer; listed without the password or the
+  2FA setup key, and refused by a code the head words.
+- `GET /api/browser/sessions`, `POST /api/browser/sessions/sign-out`: the sites the clones'
+  browsing left signed in, and signing out of one or all of them.
 - `WS /api/browser/{conversation_id}`: the dock's Browser tab, live (§3.4, §6 step 3):
   state, screencast frames, overlay and step notices from `browser.live.LiveView`, and the
   take-over controls. Only a page of this dashboard is let in.
@@ -22,13 +27,23 @@ from typing import Any, cast
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, ConfigDict
 from starlette.websockets import WebSocketDisconnect, WebSocketState
 from websockets.exceptions import ConnectionClosed
 
 from uclone_x.browser.extension import EXTENSION_FOLDER, ExtensionHub, pairing_code
 from uclone_x.browser.live import LiveView
 from uclone_x.browser.service import BrowserService
-from uclone_x.browser.tool import default_browser_service
+from uclone_x.browser.sign_ins import (
+    InvalidSignInError,
+    SavedSignIn,
+    public_rows,
+    read_sign_ins,
+    site_key,
+    with_sign_in,
+    without_sign_in,
+)
+from uclone_x.browser.tool import default_browser_service, use_default_sign_ins
 from uclone_x.llm.connectors.saved_choice import settings_data, update_settings_file
 
 EXTENSION_ORIGIN_PREFIX = "chrome-extension://"
@@ -38,6 +53,33 @@ _SETTINGS_UNREADABLE = (
     "UClone-X could not make a pairing code because its settings could not be read or "
     "saved. Check that the UClone-X folder is writable and try again."
 )
+
+
+class SignInBody(BaseModel):
+    """A saved sign-in from Settings. An empty password on an edit keeps the saved one."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    site: str
+    username: str
+    password: str = ""
+    totp_key: str = ""
+    clear_totp_key: bool = False
+
+
+class SignInKey(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    site: str
+    username: str
+
+
+class SignOutBody(BaseModel):
+    """One listed site, or every one when `site` is omitted."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    site: str | None = None
 
 
 def saved_pairing_token(settings_file: Path) -> str | None:
@@ -150,6 +192,75 @@ def register_browser_routes(
             {"reason_code": "settings_unreadable", "message": _SETTINGS_UNREADABLE},
             status_code=503,
         )
+
+    # `sign_in` reads the saved sign-ins from the same file Settings writes (§3.5 path A).
+    # The default service is not created here: Chrome's service starts on first use.
+    def _saved_sign_ins() -> list[SavedSignIn]:
+        return read_sign_ins(settings_data(settings_file))
+
+    if service is None:
+        use_default_sign_ins(_saved_sign_ins)
+    else:
+        service.use_sign_ins(_saved_sign_ins)
+
+    def _sign_ins() -> dict[str, Any]:
+        return {"sign_ins": public_rows(read_sign_ins(settings_data(settings_file)))}
+
+    @app.get("/api/browser/sign-ins")
+    async def list_sign_ins(request: Request) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
+        """The saved sign-ins: site, username and whether 2FA is saved. Never a secret."""
+        refuse_cross_origin(request)
+        return _sign_ins()
+
+    @app.post("/api/browser/sign-ins", response_model=None)
+    async def save_sign_in(request: Request, body: SignInBody) -> dict[str, Any] | JSONResponse:  # pyright: ignore[reportUnusedFunction]
+        """Save one sign-in, replacing the one saved for the same site and username."""
+        refuse_cross_origin(request)
+        try:
+            update_settings_file(
+                lambda current: with_sign_in(
+                    current,
+                    body.site,
+                    body.username,
+                    body.password,
+                    totp_key=body.totp_key,
+                    clear_totp_key=body.clear_totp_key,
+                ),
+                path=settings_file,
+            )
+        except InvalidSignInError as refused:
+            return JSONResponse({"reason_code": refused.code}, status_code=400)
+        except (ValueError, OSError):
+            return _unreadable()
+        _service().sign_in_saved(site_key(body.site))
+        return _sign_ins()
+
+    @app.delete("/api/browser/sign-ins", response_model=None)
+    async def delete_sign_in(request: Request, body: SignInKey) -> dict[str, Any] | JSONResponse:  # pyright: ignore[reportUnusedFunction]
+        """Delete one saved sign-in."""
+        refuse_cross_origin(request)
+        try:
+            update_settings_file(
+                lambda current: without_sign_in(current, body.site, body.username),
+                path=settings_file,
+            )
+        except (ValueError, OSError):
+            return _unreadable()
+        return _sign_ins()
+
+    @app.get("/api/browser/sessions")
+    async def signed_in_sites(request: Request) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
+        """The sites the clones' browsing left signed in. Starts no browser to answer."""
+        refuse_cross_origin(request)
+        open_, sites = await _service().signed_in_sites()
+        return {"open": open_, "sites": sites}
+
+    @app.post("/api/browser/sessions/sign-out")
+    async def sign_out(request: Request, body: SignOutBody) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
+        """Sign out of one listed site, or of every listed site."""
+        refuse_cross_origin(request)
+        open_, sites = await _service().sign_out(body.site)
+        return {"open": open_, "sites": sites}
 
     @app.websocket("/api/browser/extension")
     async def extension_link(websocket: WebSocket) -> None:  # pyright: ignore[reportUnusedFunction]

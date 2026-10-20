@@ -834,6 +834,308 @@ describe('SettingsModal read-only folders', () => {
     expect(await screen.findByTestId('settings-read-roots-status')).toHaveAttribute('data-state', 'saved');
   });
 
+  /** A settings read that fails first, then answers with the saved folders. */
+  const failingFirstLoad = () => {
+    let loads = 0;
+    return mockFetch({
+      '/api/settings/remote-gpu/connect': () =>
+        jsonResponse({ status: 'ok', connected: true, tunnel: { host: 'gpu-box', connected: true, mappings: [] } }),
+      '/api/settings/remote-gpu/status': () => jsonResponse({ host: '', connected: false }),
+      '/api/settings/remote-gpu/hosts': () => jsonResponse({ hosts: [] }),
+      '/api/settings': (_url, init) => {
+        if (init?.method === 'POST') {
+          const sent = JSON.parse(init.body as string) as { read_roots: string[] };
+          return jsonResponse({ ...withRoots, read_roots: sent.read_roots, read_roots_missing: [] });
+        }
+        loads += 1;
+        return loads === 1 ? jsonResponse({ detail: 'Traceback: boom' }, false, 500) : jsonResponse(withRoots);
+      },
+    });
+  };
+
+  // #2282: after a failed load nothing knows the saved folders, so a save would replace them.
+  // Killed by: frontend/src/components/SettingsModal.tsx :: if (!root || !rootsLoaded) return;
+  // Becomes: if (!root) return;
+  it('saves nothing after a failed load, and offers to read the folders again', async () => {
+    const calls = failingFirstLoad();
+    render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
+
+    const retry = await screen.findByTestId('settings-read-roots-retry');
+    const note = screen.getByTestId('settings-read-roots-not-loaded');
+    expect(note).toHaveTextContent(en.settings.folders.notLoaded);
+    expect(note.textContent).not.toMatch(/Traceback|500|Error/);
+    const field = screen.getByLabelText(/folder to add/i) as HTMLInputElement;
+    fireEvent.change(field, { target: { value: '~/notes' } });
+    expect(screen.getByRole('button', { name: /add folder/i })).toBeDisabled();
+    fireEvent.keyDown(field, { key: 'Enter' });
+    expect(saveCalls(calls)).toHaveLength(0);
+
+    fireEvent.click(retry);
+    await screen.findByRole('list', { name: 'Read-only folders' });
+    expect(screen.queryByTestId('settings-read-roots-retry')).toBeNull();
+    fireEvent.keyDown(field, { key: 'Enter' });
+    await waitFor(() => expect(saveCalls(calls)).toHaveLength(1));
+    expect(saveCalls(calls)[0].body).toEqual({ read_roots: ['/data/papers', '~/gone', '~/notes'] });
+  });
+
+  // #2282: a remote-GPU connect re-reads the settings for the model list, not the folders;
+  // that read set what Add was waiting for, and the next add replaced the saved folders.
+  // Killed by: frontend/src/components/SettingsModal.tsx :: disabled={!newReadRoot.trim() || !rootsLoaded}
+  // Becomes: disabled={!newReadRoot.trim() || currentSettings === null}
+  it('keeps Add locked when a GPU connect re-reads the settings after a failed load', async () => {
+    const calls = failingFirstLoad();
+    render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
+    await screen.findByTestId('settings-read-roots-retry');
+
+    fireEvent.change(screen.getByTestId('remote-gpu-host-input'), { target: { value: 'gpu-box' } });
+    fireEvent.click(screen.getByTestId('remote-gpu-connect-button'));
+    await waitFor(() =>
+      expect(calls.filter((c) => c.method === 'GET' && c.url.endsWith('/api/settings'))).toHaveLength(2),
+    );
+
+    fireEvent.change(screen.getByLabelText(/folder to add/i), { target: { value: '~/notes' } });
+    expect(screen.getByRole('button', { name: /add folder/i })).toBeDisabled();
+    expect(saveCalls(calls)).toHaveLength(0);
+  });
+
+  // #2286: reopened with a read that failed, the window drew the last opening's folders, with
+  // Remove buttons that did nothing and no word of why.
+  // Killed by: frontend/src/components/SettingsModal.tsx :: {rootsLoaded && readRoots.length > 0 ? (
+  // Becomes: {readRoots.length > 0 ? (
+  it('draws no folders from an earlier opening when this one cannot read them', async () => {
+    let fail = false;
+    const calls = mockFetch({
+      '/api/settings/remote-gpu/status': () => jsonResponse({ host: '', connected: false }),
+      '/api/settings/remote-gpu/hosts': () => jsonResponse({ hosts: [] }),
+      '/api/settings': (_url, init) => {
+        if (init?.method === 'POST') return jsonResponse(withRoots);
+        return fail ? jsonResponse({ detail: 'boom' }, false, 500) : jsonResponse(withRoots);
+      },
+    });
+    const { rerender } = render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
+    await screen.findByRole('list', { name: 'Read-only folders' });
+
+    fail = true;
+    rerender(<SettingsModal {...devModeOff} isOpen={false} onClose={() => {}} />);
+    rerender(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
+
+    expect(await screen.findByTestId('settings-read-roots-not-loaded')).toBeTruthy();
+    expect(screen.queryByRole('list', { name: 'Read-only folders' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Remove /data/papers' })).toBeNull();
+    expect(saveCalls(calls)).toHaveLength(0);
+  });
+
+  // #2287 review: a save still on its way when the window closed redrew the list after a
+  // reopen whose read failed, and its Remove sent the whole list before this opening had read
+  // the saved folders (the #2260 kind of loss). Only this opening's read may draw the list.
+  /** A save on its way when the window closes, which settles after a reopen whose read fails. */
+  const lateSaveAfterAFailedReopen = async (saveOk: boolean) => {
+    let fail = false;
+    let settle = () => {};
+    const posted = new Promise<void>((resolve) => {
+      settle = resolve;
+    });
+    const calls = mockFetch({
+      '/api/settings/remote-gpu/status': () => jsonResponse({ host: '', connected: false }),
+      '/api/settings/remote-gpu/hosts': () => jsonResponse({ hosts: [] }),
+      '/api/settings': async (_url, init) => {
+        if (init?.method === 'POST') {
+          await posted;
+          const sent = JSON.parse(init.body as string) as { read_roots: string[] };
+          return saveOk
+            ? jsonResponse({ ...withRoots, read_roots: sent.read_roots, read_roots_missing: [] })
+            : jsonResponse({ detail: 'nope' }, false, 500);
+        }
+        return fail ? jsonResponse({ detail: 'boom' }, false, 500) : jsonResponse(withRoots);
+      },
+    });
+    const { rerender } = render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
+    await screen.findByRole('list', { name: 'Read-only folders' });
+    const field = screen.getByLabelText(/folder to add/i);
+    fireEvent.change(field, { target: { value: '/new' } });
+    fireEvent.keyDown(field, { key: 'Enter' });
+    await waitFor(() => expect(saveCalls(calls)).toHaveLength(1));
+
+    fail = true;
+    rerender(<SettingsModal {...devModeOff} isOpen={false} onClose={() => {}} />);
+    rerender(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
+    await screen.findByTestId('settings-read-roots-not-loaded');
+    settle();
+    await waitFor(() => expect(saveCalls(calls)).toHaveLength(1));
+    // Let the save's answer (or its restore) run before looking.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(screen.getByTestId('settings-read-roots-not-loaded')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'Remove /data/papers' })).toBeNull();
+    expect(saveCalls(calls)).toHaveLength(1);
+  };
+
+  it('draws no list from a save that lands after a failed reopen', async () => {
+    // Killed by: frontend/src/components/SettingsModal.tsx :: {rootsLoaded && readRoots.length > 0 ? (
+    // Becomes: {readRoots.length > 0 ? (
+    await lateSaveAfterAFailedReopen(true);
+  });
+
+  it('draws no list from a refused save restored after a failed reopen', async () => {
+    // Killed by: frontend/src/components/SettingsModal.tsx :: {rootsLoaded && readRoots.length > 0 ? (
+    // Becomes: {readRoots.length > 0 ? (
+    await lateSaveAfterAFailedReopen(false);
+  });
+
+  // #2282: the window kept the last load's folders when closed, so on reopening Add was live
+  // against them until the new read landed.
+  // Killed by: frontend/src/components/SettingsModal.tsx :: setRootsLoaded(false); // the last opening's folders are not drawn
+  // Becomes: // the last opening's folders are not drawn
+  it('locks Add again when the window reopens, until the new read lands', async () => {
+    let held: Promise<void> = Promise.resolve();
+    let release = () => {};
+    mockFetch({
+      '/api/settings': async (_url, init) => {
+        if (init?.method === 'POST') return jsonResponse(withRoots);
+        await held;
+        return jsonResponse(withRoots);
+      },
+    });
+    const { rerender } = render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
+    await screen.findByRole('list', { name: 'Read-only folders' });
+
+    held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    rerender(<SettingsModal {...devModeOff} isOpen={false} onClose={() => {}} />);
+    rerender(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
+    fireEvent.change(await screen.findByLabelText(/folder to add/i), { target: { value: '~/notes' } });
+    expect(screen.getByRole('button', { name: /add folder/i })).toBeDisabled();
+
+    release();
+    await waitFor(() => expect(screen.getByRole('button', { name: /add folder/i })).toBeEnabled());
+  });
+
+  // #2292 (from #2287's re-review): reopening reset `rootsLoaded` only in an effect, which
+  // runs after the reopened window is committed, so its first frame drew the last opening's
+  // folders and their Remove buttons. A test cannot see a frame -- `rerender` flushes the
+  // effect before it returns -- but it can see the DOM that frame was painted from: a node a
+  // commit inserts and the effect then removes reaches a MutationObserver as removed, still
+  // holding its text (a detached node keeps its children). Added nodes are read for the same.
+  // Killed by: frontend/src/components/SettingsModal.tsx :: setRootsLoaded(false); // the last opening's folders are not drawn
+  // Becomes: // the last opening's folders are not drawn
+  it('never commits the folders of an earlier opening when the window reopens', async () => {
+    let held: Promise<void> = Promise.resolve();
+    mockFetch({
+      '/api/settings': async (_url, init) => {
+        if (init?.method === 'POST') return jsonResponse(withRoots);
+        await held;
+        return jsonResponse(withRoots);
+      },
+    });
+    const { container, rerender } = render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
+    await screen.findByRole('button', { name: 'Remove /data/papers' });
+
+    held = new Promise<void>(() => {}); // this opening's read never lands
+    rerender(<SettingsModal {...devModeOff} isOpen={false} onClose={() => {}} />);
+    const committed: string[] = [];
+    const observer = new MutationObserver((records) => {
+      for (const record of records) {
+        record.addedNodes.forEach((node) => committed.push(node.textContent ?? ''));
+        record.removedNodes.forEach((node) => committed.push(node.textContent ?? ''));
+      }
+    });
+    observer.observe(container.ownerDocument.body, { childList: true, subtree: true });
+    rerender(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
+    for (const record of observer.takeRecords()) {
+      record.addedNodes.forEach((node) => committed.push(node.textContent ?? ''));
+      record.removedNodes.forEach((node) => committed.push(node.textContent ?? ''));
+    }
+    observer.disconnect();
+
+    expect(committed.length).toBeGreaterThan(0); // the reopened window was observed at all
+    expect(committed.filter((text) => text.includes('/data/papers'))).toEqual([]);
+    expect(screen.queryByRole('button', { name: 'Remove /data/papers' })).toBeNull();
+  });
+
+  // #2260: a folder added before the saved ones had loaded was saved as the whole list,
+  // overwriting them ({"read_roots": ["~/notes"]} with /data/papers and ~/gone on disk).
+  // Killed by: frontend/src/components/SettingsModal.tsx :: if (!root || !rootsLoaded) return;
+  // Becomes: if (!root) return;
+  it('does not save a folder added before the saved folders have loaded', async () => {
+    let release = () => {};
+    const loading = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const calls = mockFetch({
+      '/api/settings': async (_url, init) => {
+        if (init?.method === 'POST') {
+          const sent = JSON.parse(init.body as string) as { read_roots: string[] };
+          return jsonResponse({ ...withRoots, read_roots: sent.read_roots, read_roots_missing: [] });
+        }
+        await loading;
+        return jsonResponse(withRoots);
+      },
+    });
+    render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
+
+    const field = (await screen.findByLabelText(/folder to add/i)) as HTMLInputElement;
+    fireEvent.change(field, { target: { value: '~/notes' } });
+    expect(screen.getByRole('button', { name: /add folder/i })).toBeDisabled();
+    fireEvent.keyDown(field, { key: 'Enter' });
+    expect(saveCalls(calls)).toHaveLength(0);
+    // The typed folder waits for the load, then joins the saved ones.
+    expect(field.value).toBe('~/notes');
+
+    release();
+    await screen.findByRole('list', { name: 'Read-only folders' });
+    fireEvent.keyDown(field, { key: 'Enter' });
+    await waitFor(() => expect(saveCalls(calls)).toHaveLength(1));
+    expect(saveCalls(calls)[0].body).toEqual({ read_roots: ['/data/papers', '~/gone', '~/notes'] });
+  });
+
+  // #2252: the settings that load as the window opens used to clear the folder field when
+  // they arrived, so a folder typed before then was lost and Enter saved nothing. Under load
+  // that is what `test_settings_autosave_e2e` hit, a 30 s wait for a save that never came.
+  // Killed by: frontend/src/components/SettingsModal.tsx :: setReadRoots(data.read_roots ?? []);
+  // Becomes: setReadRoots(data.read_roots ?? []); setNewReadRoot('');
+  it('keeps a folder typed while the settings are still loading, and saves it', async () => {
+    let release = () => {};
+    const loading = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const calls = mockFetch({
+      '/api/settings': async (_url, init) => {
+        if (init?.method === 'POST') {
+          const sent = JSON.parse(init.body as string) as { read_roots: string[] };
+          return jsonResponse({ ...withRoots, read_roots: sent.read_roots, read_roots_missing: [] });
+        }
+        await loading;
+        return jsonResponse(withRoots);
+      },
+    });
+    render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
+
+    const field = (await screen.findByLabelText(/folder to add/i)) as HTMLInputElement;
+    fireEvent.change(field, { target: { value: '~/notes' } });
+    release();
+    await screen.findByRole('list', { name: 'Read-only folders' });
+
+    expect(field.value).toBe('~/notes');
+    fireEvent.keyDown(field, { key: 'Enter' });
+    await waitFor(() => expect(saveCalls(calls)).toHaveLength(1));
+    expect(saveCalls(calls)[0].body).toEqual({ read_roots: ['/data/papers', '~/gone', '~/notes'] });
+  });
+
+  // Killed by: frontend/src/components/SettingsModal.tsx :: setNewReadRoot(''); // the field starts empty each time the window opens
+  // Becomes: // the field starts empty each time the window opens
+  it('opens again with the folder field empty', async () => {
+    mockFetch({ '/api/settings': () => jsonResponse(withRoots) });
+    const { rerender } = render(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
+    fireEvent.change(await screen.findByLabelText(/folder to add/i), { target: { value: '~/half' } });
+
+    rerender(<SettingsModal {...devModeOff} isOpen={false} onClose={() => {}} />);
+    rerender(<SettingsModal {...devModeOff} isOpen onClose={() => {}} />);
+
+    const field = (await screen.findByLabelText(/folder to add/i)) as HTMLInputElement;
+    expect(field.value).toBe('');
+  });
+
   it('saves nothing when the folders were not touched and the window is closed', async () => {
     const calls = mockFetch({ '/api/settings': () => jsonResponse(withRoots) });
     const onClose = vi.fn();
@@ -1451,5 +1753,28 @@ describe('SettingsModal models', () => {
     expect(screen.queryByTestId('api-key-input')).toBeNull();
     expect(screen.queryByTestId('settings-model-select')).toBeNull();
     expect(screen.queryByRole('button', { name: /^Gemini/ })).toBeNull();
+  });
+});
+
+describe('SettingsModal Browser section, from the dock’s Save offer (#2106)', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('opens on Browser with the Saved sign-ins form on the offered site, the secrets left blank', async () => {
+    mockFetch({ '/api/browser/sign-ins': () => jsonResponse({ sign_ins: [] }) });
+    render(
+      <SettingsModal
+        {...devModeOff}
+        isOpen
+        onClose={() => {}}
+        initialTab="browser"
+        browserSignInPrefill={{ site: 'shop.example.com', key: 1 }}
+      />,
+    );
+
+    const site = (await screen.findByTestId('sign-in-site')) as HTMLInputElement;
+    expect(site.value).toBe('shop.example.com');
+    expect((screen.getByTestId('sign-in-username') as HTMLInputElement).value).toBe('');
+    expect((screen.getByTestId('sign-in-password') as HTMLInputElement).value).toBe('');
+    expect(screen.queryByTestId('settings-skills')).toBeNull();
   });
 });

@@ -7,6 +7,7 @@ import logging
 import uuid
 from collections import deque
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from itertools import pairwise
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, Literal, cast
 
@@ -97,7 +98,9 @@ from uclone_x.engine.protocols import (
 )
 from uclone_x.errors import (
     InvalidStateTransitionError,
+    NoRoomToLearnError,
 )
+from uclone_x.llm.compactor import estimate_request_tokens
 from uclone_x.llm.context_window import (
     SERVED_WINDOW_PROVIDERS,
     ListedContextWindows,
@@ -121,6 +124,7 @@ from uclone_x.llm.protocols import (
     EmbedderProtocol,
     LLMProviderProtocol,
     TokenBudgetManagerProtocol,
+    UsageRemainingProtocol,
 )
 from uclone_x.llm.router import SemanticModelRouter
 from uclone_x.memory import (
@@ -250,6 +254,9 @@ class _ParentSessionBudget:
     def get_budget(self, session_id: str) -> TokenBudget | None:
         return self._parent.get_budget(self._session_id)
 
+    def get_turn_history(self, session_id: str) -> tuple[TokenUsage, ...]:
+        return self._parent.get_turn_history(self._session_id)
+
     def record_compaction(
         self,
         reason: str,
@@ -266,6 +273,24 @@ class _ParentSessionBudget:
 
     def get_summary(self, session_id: str | None = None) -> dict[str, Any]:
         return self._parent.get_summary(self._session_id if session_id is not None else None)
+
+
+def next_reply_worth(booked: Sequence[TokenUsage], *, default: int) -> int:
+    """What the person's next reply may cost, from the calls a session has booked (#2328).
+
+    The largest call so far, plus one turn's growth: the next reply's request carries the
+    whole history and the new message, so it can outgrow every call before it. A turn's
+    growth is taken as the largest rise in request size between two calls in a row. With
+    nothing booked, `default`.
+    """
+    if not booked:
+        return default
+    largest = max(u.input_tokens + u.output_tokens for u in booked)
+    growth = max(
+        (max(0, later.input_tokens - earlier.input_tokens) for earlier, later in pairwise(booked)),
+        default=0,
+    )
+    return largest + growth
 
 
 class BaseAgent(BaseAgentProtocol):
@@ -840,6 +865,23 @@ class BaseAgent(BaseAgentProtocol):
         return self._resolved_persona()
 
     @property
+    def latest_persona_definition(self) -> PersonaDefinition | None:
+        """The persona this agent speaks as from its next turn on: a saved edit it holds and
+        has not taken yet (`stage_persona_edit`), else the one in force.
+
+        Read where a saved change must count at once rather than at the next turn, such as
+        the "Learn from conversations" switch on a lesson already queued (#2228).
+
+        A held edit counts only while it is of the persona the agent speaks as: it is held
+        for the persona the seat had when the edit was saved, and the agent may have been
+        given another persona since (#2233).
+        """
+        staged = self._staged_persona
+        if staged is not None and staged.name == self._persona:
+            return staged
+        return self._resolved_persona()
+
+    @property
     def approvals_answered(self) -> bool:
         """Whether a person answers this agent's approval requests during a turn.
 
@@ -1115,11 +1157,13 @@ class BaseAgent(BaseAgentProtocol):
 
         For work done on the clone's behalf after a turn, such as learning from it: the
         call is budget-checked before and charged after, exactly as a turn's own calls are
-        (P5). A request that names no model is sent with the clone's configured model, and
+        (P5). It is not sent when it would leave less than a reply's worth of the budget
+        (`_room_to_learn`, #1851): the person's next reply comes first. A request that names no model is sent with the clone's configured model, and
         with its configured context window when it names none.
 
         Raises:
             RuntimeError: The agent has no model connector.
+            NoRoomToLearnError: Sending it would leave less than a reply's worth.
         """
         llm = self._llm
         if llm is None:
@@ -1130,9 +1174,40 @@ class BaseAgent(BaseAgentProtocol):
         limit = self._config.llm_config.context_limit
         if request.context_window is None and (limit or 0) > 0:
             update["context_window"] = limit
-        return await self._invoke_model(
-            llm, request.model_copy(update=update) if update else request
-        )
+        req = request.model_copy(update=update) if update else request
+        if not self._room_to_learn(req):
+            raise NoRoomToLearnError(
+                f"Agent {self._config.agent_id}: auxiliary call not sent; it would leave less "
+                "than a reply's worth of the budget"
+            )
+        return await self._invoke_model(llm, req)
+
+    def _room_to_learn(self, request: LLMRequest) -> bool:
+        """Whether `request` leaves a reply's worth of every ceiling it is charged to (#1851).
+
+        Option (b) of #1851: work after a turn is skipped, not counted against the reply.
+        Its worth is the request as estimated plus its reply cap; a reply's is
+        `next_reply_worth` of what this session has booked, or the request's own worth
+        before there is any. Both
+        must fit in what is left of the session's ceiling, when it has one, and of the
+        person's paid-model limit, when this connector passes it. With neither, there is
+        nothing to protect, and the work runs.
+        """
+        worth = estimate_request_tokens(request) + (request.max_tokens or 0)
+        remaining: list[int] = []
+        reply = worth
+        if self._budget is not None:
+            session = self._context.session_id
+            booked = self._budget.get_turn_history(session)
+            reply = next_reply_worth(booked, default=worth)
+            left = self._budget.check_budget(session).remaining_tokens
+            if left is not None:
+                remaining.append(left)
+        if isinstance(self._llm, UsageRemainingProtocol):
+            left = self._llm.usage_remaining()
+            if left is not None:
+                remaining.append(left)
+        return all(left >= worth + reply for left in remaining)
 
     def set_read_roots(self, read_roots: tuple[Path, ...]) -> None:
         """Replace the folders outside the workspace this agent's read-only tools may read.

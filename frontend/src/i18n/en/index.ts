@@ -38,6 +38,7 @@ import rail from '../locales/en/rail.json';
 import time from '../locales/en/time.json';
 import toolSteps from '../locales/en/toolSteps.json';
 import usage from '../locales/en/usage.json';
+import turnDetail from '../locales/en/turnDetail.json';
 import avatar from '../locales/en/avatar.json';
 import imageCard from '../locales/en/imageCard.json';
 import links from '../locales/en/links.json';
@@ -62,6 +63,7 @@ export const en = {
   cloneProfile,
   notices,
   usage,
+  turnDetail,
   avatar,
   imageCard,
   links,

@@ -16,8 +16,8 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from playwright.sync_api import sync_playwright
 
+from tests.support.chromium import chromium_executable
 from uclone_x.browser import BrowserService, R2Link
 from uclone_x.browser.actions import SECRET_FIELD_REFUSAL, STALE_REF
 from uclone_x.browser.service import LOAD_TIMEOUT_S
@@ -84,8 +84,7 @@ def site(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
 
 @pytest.fixture(scope="module")
 def chromium() -> Path:
-    with sync_playwright() as p:
-        return Path(p.chromium.executable_path)
+    return chromium_executable()
 
 
 @pytest.fixture
@@ -171,8 +170,23 @@ async def test_type_refuses_password_and_one_time_code_fields(
         await service.type_text(KEY, field, "hunter2")
 
     assert str(refused.value) == SECRET_FIELD_REFUSAL
-    assert "Use sign_in, or ask the person to take over" in str(refused.value)
+    assert "Call ask_user so the person can sign in" in str(refused.value)
     _plain(str(refused.value))
+
+
+async def test_press_refuses_typing_into_a_focused_password_field(
+    service: BrowserService, site: str
+) -> None:
+    """A key that types a character into a password field is refused like `type` is (§3.5);
+    a key that types nothing (Tab) still moves on from it."""
+    await _open(service, site)
+    await service.click(KEY, await _ref(service, "textbox", "비밀번호"))
+
+    with pytest.raises(PlainRefusalError) as refused:
+        await service.press(KEY, "a")
+
+    assert str(refused.value) == SECRET_FIELD_REFUSAL
+    await service.press(KEY, "Tab")
 
 
 async def test_a_ref_from_a_page_left_behind_is_refused_as_stale(
@@ -339,6 +353,45 @@ async def test_a_pop_up_becomes_the_current_tab_and_tabs_switch_and_close(
     with pytest.raises(PlainRefusalError) as missing:
         await service.tab(KEY, index=5)
     assert "There is no tab 5" in str(missing.value)
+
+
+async def test_back_in_a_tab_a_page_opened_names_the_tab_to_go_back_to(
+    service: BrowserService, site: str
+) -> None:
+    """#2397: in a tab a link opened, `back` has no earlier page. The refusal names the call
+    that works, `tab(index=…)` of the tab that opened it, from the tabs' own state.
+
+    Killed by: src/uclone_x/browser/service.py :: tab.opener = opener.target
+    Becomes: pass
+    """
+    await _open(service, site)
+    await service.click(KEY, await _ref(service, "link", "새 창"))
+
+    with pytest.raises(PlainRefusalError) as refused:
+        await service.back(KEY)
+
+    assert "There is no earlier page in this tab." in str(refused.value)
+    assert "tab(index=1)" in str(refused.value)
+    _plain(str(refused.value))
+
+
+async def test_type_into_a_file_field_names_upload(service: BrowserService, site: str) -> None:
+    """#2397: `type` on a file input was refused with "Use click, select or check", none of
+    which chooses a file. Decided by the field's own type, not its label.
+
+    Killed by: src/uclone_x/browser/service.py :: if info.get("file") is True:
+    Becomes: if False:
+    """
+    await _open(service, site)
+    field = await _ref(service, "button", "첨부")
+
+    with pytest.raises(PlainRefusalError) as refused:
+        await service.type_text(KEY, field, "report.txt")
+
+    message = str(refused.value)
+    assert f'upload(ref="{field}", paths=' in message
+    assert "Use click, select or check" not in message
+    _plain(message)
 
 
 async def test_a_download_lands_in_the_downloads_folder(

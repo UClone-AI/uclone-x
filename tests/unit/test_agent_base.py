@@ -39,6 +39,7 @@ from uclone_x.agent.session import AnchorAuthor, AnchorProvenance, SessionState,
 from uclone_x.core.provenance import ExecutionPath, Provenance, ServiceRef
 from uclone_x.engine.event_bus import EventBus, EventType
 from uclone_x.errors import BudgetExceededError, LLMStreamInterruptedError
+from uclone_x.i18n.tool_refusals import TOOL_REFUSAL_TEXT
 from uclone_x.llm.budget import TokenBudgetManager
 from uclone_x.llm.compactor import estimate_reply_tokens
 from uclone_x.llm.connectors.base import resolve_token_counts
@@ -1391,7 +1392,7 @@ async def test_a_tool_call_outside_the_allowlist_does_not_run_mid_turn() -> None
     assert record.status is ToolResultStatus.ERROR
     # "not allowed" and "not there" are different answers; a scoped registry would have
     # reported this one as the other.
-    assert "allowed_tools" in (record.error or "")
+    assert record.error == TOOL_REFUSAL_TEXT["tool.out_of_range"]
     assert "not found" not in (record.error or "")
 
 
@@ -2927,6 +2928,96 @@ async def test_the_step_after_a_tool_result_still_carries_the_turn_context_secti
     step_two = wire.requests[1].messages
     assert [m.role for m in step_two[-2:]] == [MessageRole.TOOL, MessageRole.USER]
     assert (step_two[-1].content or "").startswith(TURN_CONTEXT_HEADER)
+
+
+class _EchoingToolConnector(CannedToolResponseConnector):
+    """A model that passes the person's message on "word for word": the request's last user
+    message, which on a turn's first step carries the `[Turn Context]` block (#2264)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.requests: list[LLMRequest] = []
+
+    async def generate(self, request: LLMRequest) -> ModelResponse:
+        self.requests.append(request)
+        said = request.messages[-1].content or ""
+        self._canned_tool_calls = (
+            ToolCallRequest(id="call_1", name="dummy_echo", arguments={"text": said}),
+        )
+        return await super().generate(request)
+
+
+@pytest.mark.asyncio
+async def test_a_tool_gets_the_persons_words_without_the_turn_context_a_model_copied() -> None:
+    """A call that copies the person's message carries their words only, everywhere (#2264).
+
+    On the first step the block joins the person's message, so a model told to forward it
+    "word for word" sent the runtime's plan with it, and `story_start` read a bare "네"
+    followed by the block as outline feedback. The block is taken out of the call before
+    it is run, kept in history or logged as a call; the request still carried it.
+
+    Killed by: src/uclone_x/agent/request_record.py :: return kept.replace(block, "")
+    Becomes: return value
+    Killed by: src/uclone_x/agent/turn_executor.py :: tool_calls = self._calls_of(resp, step, durable_events)
+    Becomes: tool_calls = resp.tool_calls
+    Killed by: src/uclone_x/agent/prompt_assembler.py :: self.sent_turn_context = layers.turn_context
+    Becomes: self.sent_turn_context = ""
+    """
+    registry = ToolRegistry()
+    registry.register(DummyEchoTool())
+    wire = _EchoingToolConnector()
+    agent = BaseAgent(
+        config=AgentConfig(
+            agent_id="echo-context",
+            name="P",
+            llm_config=AgentLLMConfig(model_name="mock-model"),
+        ),
+        llm=wire,
+        tools=registry,
+    )
+    agent.create_plan("Survey", ["map the ridge"])
+
+    result = await agent.execute_turn("네")
+
+    assert result.is_completed is True
+    assert (wire.requests[0].messages[-1].content or "").startswith(f"네\n\n{TURN_CONTEXT_HEADER}")
+    assert [e.arguments for e in result.tool_executions] == [{"text": "네"}]
+    assert [str(e.output) for e in result.tool_executions] == ["Echoed: 네"]
+    calls = [tc for m in agent.history for tc in m.tool_calls]
+    assert [dict(tc.arguments) for tc in calls] == [{"text": "네"}]
+    # The step after the call extends the history the call entered, block-free.
+    assert all(
+        TURN_CONTEXT_HEADER not in json.dumps(dict(tc.arguments), ensure_ascii=False)
+        for m in wire.requests[1].messages
+        for tc in m.tool_calls
+    )
+
+
+def test_only_the_runtimes_own_block_leaves_a_call_and_the_persons_words_stay_whole() -> None:
+    """Only the block the request carried is taken out; nothing of the person's is (#2264).
+
+    A call that holds no copy is passed on as the model sent it and is not named as
+    cleaned. A person who writes the header themselves, or ends with spaces, keeps it.
+
+    Killed by: src/uclone_x/agent/request_record.py :: if not _holds_block(call.arguments, block):
+    Becomes: if False:
+    """
+    # Imported here, so the turn-level test above runs, and fails, on a build without it.
+    from uclone_x.agent.request_record import calls_without_turn_context
+
+    block = f"{TURN_CONTEXT_HEADER}\n\n## Plan\n- [ ] map the ridge"
+    said = "what does [Turn Context] mean?  "
+    plain = ToolCallRequest(id="a", name="dummy_echo", arguments={"text": said})
+    copied = ToolCallRequest(
+        id="b", name="dummy_echo", arguments={"text": f"{said}\n\n{block}", "n": [block, 3]}
+    )
+
+    calls, cleaned = calls_without_turn_context((plain, copied), block)
+
+    assert calls[0] is plain
+    assert cleaned == ("b",)
+    assert dict(calls[1].arguments) == {"text": said, "n": ("", 3)}
+    assert calls_without_turn_context((copied,), "") == ((copied,), ())
 
 
 # --------------------------------------------------------------------------------------

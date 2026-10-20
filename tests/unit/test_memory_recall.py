@@ -88,6 +88,7 @@ def _put(
             source_session_id="sess_a",
             confidence=confidence,
             created_at=created_at,
+            updated_at=created_at,
         ),
     )
 
@@ -102,8 +103,8 @@ async def test_user_facts_lead_newest_first_and_are_capped_at_five() -> None:
 
     Killed by: src/uclone_x/memory/recall.py :: USER_FACTS_LIMIT = 5
     Becomes: USER_FACTS_LIMIT = 9
-    Killed by: src/uclone_x/memory/recall.py :: key=lambda fact: (fact.created_at, fact.fact_id),
-    Becomes: key=lambda fact: (fact.fact_id, fact.created_at),
+    Killed by: src/uclone_x/memory/recall.py :: return (fact.updated_at, fact.created_at, fact.fact_id)
+    Becomes: return (fact.fact_id, fact.created_at, fact.updated_at)
     """
     memory = CrossSessionMemory(max_facts_in_prompt=10)
     for day in range(1, 8):
@@ -130,11 +131,134 @@ async def test_user_facts_lead_newest_first_and_are_capped_at_five() -> None:
 
 
 @pytest.mark.asyncio
+async def test_the_persons_fact_the_message_is_about_is_recalled_however_old() -> None:
+    """Six facts about the person: the one the message names leads, though it is the oldest.
+
+    Before #2224 the five newest were taken whatever the message said, and "where Kenny
+    lives", filed first, was never recalled once five more were filed after it.
+
+    Killed by: src/uclone_x/memory/recall.py :: users = _relevant_first(users, ranking)
+    Becomes: pass
+    Killed by: src/uclone_x/memory/recall.py :: ranked = [entry.fact for entry in ranking.ranked if entry.fact.fact_id in ids]
+    Becomes: ranked = []
+    """
+    memory = CrossSessionMemory(max_facts_in_prompt=10)
+    _put(memory, "mem_home", "user", "location", "Busan", created_at="2026-09-01T00:00:00+00:00")
+    for day in range(2, 7):
+        _put(
+            memory,
+            f"mem_u{day}",
+            "user",
+            f"likes_{day}",
+            f"thing {day}",
+            created_at=f"2026-09-0{day}T00:00:00+00:00",
+        )
+
+    section = await recall_prompt_section(memory, "Is it raining in Busan today?")
+
+    lines = _fact_lines(section)
+    assert lines[0] == "- user: location -> Busan"
+    assert len(lines) == 5
+    assert "- user: likes_2 -> thing 2" not in lines
+    assert "(1 more facts not selected for this message" in section
+
+
+@pytest.mark.asyncio
+async def test_a_fact_seen_again_counts_from_when_it_was_last_seen() -> None:
+    """A message about none of them: the five last observed, and a reinforced old fact is one.
+
+    Killed by: src/uclone_x/memory/recall.py :: return (fact.updated_at, fact.created_at, fact.fact_id)
+    Becomes: return (fact.created_at, fact.updated_at, fact.fact_id)
+    """
+    memory = CrossSessionMemory(max_facts_in_prompt=10)
+    _put(memory, "mem_home", "user", "location", "Busan", created_at="2026-09-01T00:00:00+00:00")
+    for day in range(2, 7):
+        _put(
+            memory,
+            f"mem_u{day}",
+            "user",
+            f"likes_{day}",
+            f"thing {day}",
+            created_at=f"2026-09-0{day}T00:00:00+00:00",
+        )
+    memory.reinforce_fact("mem_home", "turn_later")
+
+    section = await recall_prompt_section(memory, "hello")
+
+    lines = _fact_lines(section)
+    assert lines[0] == "- user: location -> Busan"
+    assert "- user: likes_2 -> thing 2" not in lines
+    assert len(lines) == 5
+
+
+@pytest.mark.asyncio
+async def test_current_values_of_one_relation_share_a_line_said_last_first() -> None:
+    """A move the extractor was not told replaced the old home: both are current, and recall
+    shows them on one line, the one said last first and marked so (#2328).
+
+    Killed by: src/uclone_x/memory/recall.py :: latest, *earlier = sorted(group, key=_last_seen, reverse=True)
+    Becomes: latest, *earlier = group
+    Killed by: src/uclone_x/memory/recall.py :: (fold_name(fact.subject), fold_name(fact.predicate))
+    Becomes: (fact.fact_id, fact.fact_id)
+    """
+    memory = CrossSessionMemory(max_facts_in_prompt=10)
+    _put(memory, "mem_a", "user", "lives_in", "Seoul", created_at="2026-09-01T00:00:00+00:00")
+    _put(memory, "mem_b", "user", "lives_in", "Busan", created_at="2026-09-02T00:00:00+00:00")
+    for day in range(3, 7):
+        _put(
+            memory,
+            f"mem_u{day}",
+            "user",
+            f"likes_{day}",
+            f"thing {day}",
+            created_at=f"2026-09-0{day}T00:00:00+00:00",
+        )
+    memory.reinforce_fact("mem_a", "turn_later")
+
+    # The message ranks Busan first; Seoul was still said last.
+    section = await recall_prompt_section(memory, "Is it raining in Busan?")
+
+    lines = _fact_lines(section)
+    assert lines[0] == "- user: lives_in -> Seoul (said last); Busan"
+    assert sum("lives_in" in line for line in lines) == 1
+
+
+@pytest.mark.asyncio
+async def test_the_model_says_whether_a_saved_fact_replaces_the_last() -> None:
+    """`record_memory_fact` with `single_valued` false keeps the earlier value (#2224).
+
+    Killed by: src/uclone_x/memory/tools.py :: single_valued=params.single_valued,
+    Becomes: single_valued=True,
+    """
+    memory = CrossSessionMemory()
+    tool = RecordMemoryFactTool(memory)
+    context = ToolContext(agent_id="clone", session_id="sess")
+    for value in ("jazz", "Korean"):
+        await tool.run(
+            RecordMemoryFactParams(
+                subject="user", predicate="prefers", object_value=value, single_valued=False
+            ),
+            context,
+        )
+    for value in ("Busan", "Seoul"):
+        await tool.run(
+            RecordMemoryFactParams(subject="user", predicate="lives_in", object_value=value),
+            context,
+        )
+
+    assert sorted((f.predicate, f.object_value) for f in memory.list_facts()) == [
+        ("lives_in", "Seoul"),
+        ("prefers", "Korean"),
+        ("prefers", "jazz"),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_relevant_fact_outranks_higher_confidence_ones_and_the_rest_are_counted() -> None:
     """The message, not confidence, picks the facts; what is left out is counted (C2).
 
-    Killed by: src/uclone_x/agent/prompt_assembler.py :: return None if memory is None else await recall_prompt_section(memory, message)
-    Becomes: return None if memory is None else memory.format_prompt_section()
+    Killed by: src/uclone_x/agent/prompt_assembler.py :: return await recall_prompt_section(memory, message, functional=functional)
+    Becomes: return memory.format_prompt_section()
     """
     memory = CrossSessionMemory(max_facts_in_prompt=2)
     _put(memory, "mem_a", "theme", "colour", "dark", confidence=0.95)
@@ -536,7 +660,7 @@ def test_the_model_is_told_to_use_the_project_subject() -> None:
     ids=["stored-decomposed", "wanted-decomposed", "inner-whitespace"],
 )
 def test_a_standing_subject_is_matched_folded(stored: str, wanted: str) -> None:
-    """`_newest_about` compares subjects as every other subject lookup does (#1904).
+    """`_latest_about` compares subjects as every other subject lookup does (#1904).
 
     Today it is asked only for the ASCII constants `user` and `project`, and through
     `recall_prompt_section` a revert to `strip().casefold()` is not seen: neither constant
@@ -549,13 +673,13 @@ def test_a_standing_subject_is_matched_folded(stored: str, wanted: str) -> None:
     Becomes: (fact for fact in active if fact.subject.strip().casefold() == wanted),
     """
     from uclone_x.memory.recall import (
-        _newest_about,  # pyright: ignore[reportPrivateUsage]
+        _latest_about,  # pyright: ignore[reportPrivateUsage]
     )
 
     memory = CrossSessionMemory()
     _put(memory, "mem_a", stored, "lives_in", "Seoul")
     _put(memory, "mem_b", "someone else", "lives_in", "Busan")
 
-    found = _newest_about(memory.list_facts(), wanted, 5)
+    found = _latest_about(memory.list_facts(), wanted, 5)
 
     assert [fact.fact_id for fact in found] == ["mem_a"]

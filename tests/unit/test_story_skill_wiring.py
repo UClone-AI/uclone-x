@@ -38,13 +38,13 @@ from uclone_x.skills.models import (
     SkillOrigin,
     SkillStatus,
 )
-from uclone_x.story.muse import MuseSparkTool
-from uclone_x.story.skill_data import MAX_DATA_FILE_BYTES, data_roots
-from uclone_x.story.tool import StoryLibraryTool
-from uclone_x.story.tools import StoryOutlineTool
 from uclone_x.tools.base import BaseTool
 from uclone_x.tools.models import NoIsolation, ToolContext, ToolResult
 from uclone_x.tools.registry import ToolRegistry
+from uclone_x_story.muse import MuseSparkTool
+from uclone_x_story.skill_data import MAX_DATA_FILE_BYTES, data_roots
+from uclone_x_story.tool import StoryLibraryTool
+from uclone_x_story.tools import StoryOutlineTool
 
 ROOM = "room_a"
 
@@ -133,7 +133,7 @@ def _story(workspace: Path, **extra: Any) -> str:
 def test_a_skill_adds_a_genre_that_is_listed_and_drawn_with_its_source(tmp_path: Path) -> None:
     """A table under the skill's `resources/story/muse/` is a genre like a bundled one.
 
-    Killed by: src/uclone_x/story/muse.py :: data_roots(context.skill_dirs, self._data_roots)
+    Killed by: examples/story/src/uclone_x_story/muse.py :: data_roots(context.skill_dirs, self._data_roots)
     Becomes: data_roots((), self._data_roots)
     """
     skill = _skill(tmp_path / "skills", "weird-west", {"muse/western.yaml": _WESTERN})
@@ -150,7 +150,7 @@ def test_a_skill_adds_a_genre_that_is_listed_and_drawn_with_its_source(tmp_path:
 def test_a_skill_replaces_a_bundled_table_by_its_genre(tmp_path: Path) -> None:
     """Same id replaces: the skill's `fantasy` is drawn, and the result says whose it is.
 
-    Killed by: src/uclone_x/story/skill_data.py :: return (*base, *found)
+    Killed by: examples/story/src/uclone_x_story/skill_data.py :: return (*base, *found)
     Becomes: return (*found, *base)
     """
     fantasy = _WESTERN.replace("genre: western", "genre: fantasy").replace("Western", "Mine")
@@ -164,7 +164,7 @@ def test_a_skill_replaces_a_bundled_table_by_its_genre(tmp_path: Path) -> None:
 def test_two_skills_with_one_genre_resolve_by_skill_name_not_by_order(tmp_path: Path) -> None:
     """Which skill wins does not depend on the order the registry listed them in.
 
-    Killed by: src/uclone_x/story/skill_data.py :: key=lambda root: root.parents[len(SKILL_DATA_PARTS) - 1].name,
+    Killed by: examples/story/src/uclone_x_story/skill_data.py :: key=lambda root: root.parents[len(SKILL_DATA_PARTS) - 1].name,
     Becomes: key=lambda root: 0,
     """
     first = _skill(tmp_path / "skills", "aaa-west", {"muse/western.yaml": _WESTERN})
@@ -179,7 +179,7 @@ def test_two_skills_with_one_genre_resolve_by_skill_name_not_by_order(tmp_path: 
 def test_a_skill_without_story_data_adds_nothing_and_is_not_an_error(tmp_path: Path) -> None:
     """Most skills are not about stories; their folders are passed all the same.
 
-    Killed by: src/uclone_x/story/skill_data.py :: if _is_folder(d.joinpath(*SKILL_DATA_PARTS), d.joinpath(*SKILL_DATA_PARTS))
+    Killed by: examples/story/src/uclone_x_story/skill_data.py :: if _is_folder(d.joinpath(*SKILL_DATA_PARTS), d.joinpath(*SKILL_DATA_PARTS))
     Becomes: if True
     """
     unrelated = tmp_path / "skills" / "sql-helper"
@@ -193,7 +193,7 @@ def test_a_skill_without_story_data_adds_nothing_and_is_not_an_error(tmp_path: P
 def test_a_damaged_skill_table_is_refused_naming_the_skill_in_plain_words(tmp_path: Path) -> None:
     """The person fixing it needs the skill and the file in it, not a path or a class name.
 
-    Killed by: src/uclone_x/story/skill_data.py :: where = f"{where} of the skill '{skill}'"
+    Killed by: examples/story/src/uclone_x_story/skill_data.py :: where = f"{where} of the skill '{skill}'"
     Becomes: where = f"{where}"
     """
     skill = _skill(
@@ -218,7 +218,7 @@ def test_a_macos_appledouble_file_is_skipped_but_another_dot_file_is_still_refus
 
     Only the `._` prefix is skipped: `.hidden.yaml` is still refused by the id rule.
 
-    Killed by: src/uclone_x/story/skill_data.py :: and not entry.name.startswith(_APPLEDOUBLE_PREFIX)
+    Killed by: examples/story/src/uclone_x_story/skill_data.py :: and not entry.name.startswith(_APPLEDOUBLE_PREFIX)
     Becomes: and True
     """
     files = {"muse/western.yaml": _WESTERN, "muse/._western.yaml": "\x00\x05\x16\x07junk"}
@@ -252,7 +252,7 @@ def test_a_story_folder_linked_out_is_refused_even_when_its_files_link_back(
 
     The file resolves inside the skill, so only the check on the folder refuses it.
 
-    Killed by: src/uclone_x/story/skill_data.py :: _require_inside(home, root, root)
+    Killed by: examples/story/src/uclone_x_story/skill_data.py :: _require_inside(home, root, root)
     Becomes: None
     """
     skill = _skill(tmp_path / "skills", "weird-west", {})
@@ -274,7 +274,7 @@ def test_a_muse_folder_linked_out_is_refused_even_when_its_files_link_back(
 ) -> None:
     """The same out-and-back, one folder down: `muse` itself leads out.
 
-    Killed by: src/uclone_x/story/skill_data.py :: _require_inside(home, root, directory)
+    Killed by: examples/story/src/uclone_x_story/skill_data.py :: _require_inside(home, root, directory)
     Becomes: None
     """
     skill = _skill(tmp_path / "skills", "weird-west", {"structures/.keep": ""})
@@ -293,7 +293,7 @@ def test_a_muse_folder_linked_out_is_refused_even_when_its_files_link_back(
 def test_a_skills_data_file_linked_from_outside_it_is_refused(tmp_path: Path) -> None:
     """A link to one file is caught too: the check is on where the file resolves, not its name.
 
-    Killed by: src/uclone_x/story/skill_data.py :: PathValidator().resolve_safe_path(path.absolute(), home)
+    Killed by: examples/story/src/uclone_x_story/skill_data.py :: PathValidator().resolve_safe_path(path.absolute(), home)
     Becomes: PathValidator().resolve_safe_path(path.parent.absolute(), home)
     """
     outside = _write(tmp_path / "outside" / "western.yaml", _WESTERN)
@@ -323,7 +323,7 @@ def test_a_link_that_stays_inside_the_skill_is_read(tmp_path: Path) -> None:
 def test_an_oversized_skill_table_is_refused_before_it_is_read(tmp_path: Path) -> None:
     """One file a skill carries cannot fill the prompt.
 
-    Killed by: src/uclone_x/story/skill_data.py :: if len(data) > MAX_DATA_FILE_BYTES:
+    Killed by: examples/story/src/uclone_x_story/skill_data.py :: if len(data) > MAX_DATA_FILE_BYTES:
     Becomes: if False:
     """
     padding = "# " + "x" * MAX_DATA_FILE_BYTES + "\n"
@@ -339,7 +339,7 @@ def test_a_skill_table_that_is_a_fifo_is_refused_without_hanging(tmp_path: Path)
 
     The call runs in a thread with a deadline, so a regression fails instead of hanging.
 
-    Killed by: src/uclone_x/story/skill_data.py :: if not stat.S_ISREG(os.fstat(fd).st_mode):
+    Killed by: examples/story/src/uclone_x_story/skill_data.py :: if not stat.S_ISREG(os.fstat(fd).st_mode):
     Becomes: if False:
     """
     skill = _skill(tmp_path / "skills", "weird-west", {})
@@ -367,16 +367,16 @@ def test_a_folder_named_like_a_table_is_refused_and_leaves_no_descriptor_open(
 ) -> None:
     """A folder opens like a file; its descriptor is closed after the refusal, every call.
 
-    Killed by: src/uclone_x/story/skill_data.py :: os.close(fd)
+    Killed by: examples/story/src/uclone_x_story/skill_data.py :: os.close(fd)
     Becomes: pass
 
     The file is opened by walking down from the skill's folder (#1604); the folder
     descriptors that walk holds are closed too.
 
-    Killed by: src/uclone_x/story/skill_data.py :: os.close(folder_fd)
+    Killed by: examples/story/src/uclone_x_story/skill_data.py :: os.close(folder_fd)
     Becomes: pass
 
-    Killed by: src/uclone_x/story/skill_data.py :: os.close(above)
+    Killed by: examples/story/src/uclone_x_story/skill_data.py :: os.close(above)
     Becomes: pass
     """
     if not Path("/dev/fd").is_dir():
@@ -410,11 +410,12 @@ def test_a_data_file_that_links_to_itself_is_refused_in_plain_words(
 ) -> None:
     """Python 3.11 and 3.12 raise `RuntimeError` resolving a loop; it must not reach the result.
 
-    On 3.13 `resolve()` does not raise and the open refuses it with the same words, so the
-    declaration below is killed only where `resolve()` raises.
+    On 3.13 and later `resolve()` does not raise and the open (`O_NOFOLLOW`) refuses it with
+    the same words, so the declaration below is the one this repository's Python kills; the
+    `resolve()` handler is killed only where it raises.
 
-    Killed by: src/uclone_x/story/skill_data.py :: except (RuntimeError, OSError) as exc:  # a link that loops
-    Becomes: except ZeroDivisionError as exc:  # a link that loops
+    Killed by: examples/story/src/uclone_x_story/skill_data.py :: except (OSError, UnicodeDecodeError) as exc:
+    Becomes: except UnicodeDecodeError as exc:
     """
     skill = _skill(tmp_path / "skills", "weird-west", {})
     loop = skill / "resources" / "story" / relative
@@ -442,10 +443,10 @@ def test_a_story_folder_that_cannot_be_searched_is_refused_in_plain_words(
     the folder itself now (#1604). `as-on-3.14` gives `Path.is_dir` its 3.14 behaviour, so
     the 3.14 case runs on every version.
 
-    Killed by: src/uclone_x/story/skill_data.py :: raise _unreadable(root, path, exc) from exc  # stat refused
+    Killed by: examples/story/src/uclone_x_story/skill_data.py :: raise _unreadable(root, path, exc) from exc  # stat refused
     Becomes: return False  # stat refused
 
-    Killed by: src/uclone_x/story/skill_data.py :: mode = os.stat(path).st_mode
+    Killed by: examples/story/src/uclone_x_story/skill_data.py :: mode = os.stat(path).st_mode
     Becomes: mode = stat.S_IFDIR if path.is_dir() else 0
     """
     if not hasattr(os, "geteuid") or os.geteuid() == 0:
@@ -486,7 +487,7 @@ def test_a_data_folder_that_cannot_be_listed_is_refused_not_skipped(
 ) -> None:
     """`glob` answered nothing for a mode-000 folder, so the skill silently supplied nothing.
 
-    Killed by: src/uclone_x/story/skill_data.py :: except OSError as exc:  # listing refused
+    Killed by: examples/story/src/uclone_x_story/skill_data.py :: except OSError as exc:  # listing refused
     Becomes: except ZeroDivisionError as exc:  # listing refused
     """
     if not hasattr(os, "geteuid") or os.geteuid() == 0:
@@ -511,7 +512,7 @@ def test_a_data_folder_that_cannot_be_listed_is_refused_not_skipped(
 def test_a_data_folder_that_is_a_link_that_loops_supplies_nothing(tmp_path: Path) -> None:
     """A `muse` folder that is a looping link is not a folder, so the skill adds no tables.
 
-    Killed by: src/uclone_x/story/skill_data.py :: if not _is_folder(directory, root):
+    Killed by: examples/story/src/uclone_x_story/skill_data.py :: if not _is_folder(directory, root):
     Becomes: if False:
     """
     skill = _skill(tmp_path / "skills", "weird-west", {"structures/heist.yaml": _HEIST})
@@ -538,13 +539,13 @@ def test_a_data_folder_swapped_for_a_link_after_the_check_is_not_followed_out(
     folder could swap `muse` for a link out between the containment check and the open,
     and the old open by path followed it (#1604). The swap is made inside that window here.
 
-    Killed by: src/uclone_x/story/skill_data.py :: walk_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    Killed by: examples/story/src/uclone_x_story/skill_data.py :: walk_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
     Becomes: walk_flags = os.O_RDONLY | os.O_DIRECTORY
 
-    Killed by: src/uclone_x/story/skill_data.py :: fd = os.open(read_from, flags) if beneath is None else _open_beneath(beneath, read_from, flags)
+    Killed by: examples/story/src/uclone_x_story/skill_data.py :: fd = os.open(read_from, flags) if beneath is None else _open_beneath(beneath, read_from, flags)
     Becomes: fd = os.open(read_from, flags)
     """
-    from uclone_x.story import skill_data
+    from uclone_x_story import skill_data
 
     outside = _write(
         tmp_path / "outside" / "western.yaml", _WESTERN.replace("a drifter", "from outside")
@@ -573,7 +574,7 @@ def test_a_data_folder_swapped_for_a_link_after_the_check_is_not_followed_out(
 def test_a_skill_table_that_repeats_itself_by_alias_is_refused(tmp_path: Path) -> None:
     """An alias is how a few lines of YAML expand to millions of entries; none is needed here.
 
-    Killed by: src/uclone_x/story/skill_data.py :: if _uses_alias(text):
+    Killed by: examples/story/src/uclone_x_story/skill_data.py :: if _uses_alias(text):
     Becomes: if False:
     """
     aliased = (
@@ -732,7 +733,7 @@ def test_init_from_a_bundled_structure_lays_out_acts_as_chapters_and_beats_as_sc
 ) -> None:
     """Each scene is a beat to be rewritten: its title, and what it is for as the summary.
 
-    Killed by: src/uclone_x/story/tools.py :: "summary": beat.purpose,
+    Killed by: examples/story/src/uclone_x_story/tools.py :: "summary": beat.purpose,
     Becomes: "summary": "",
     """
     story = _story(tmp_path)
@@ -763,7 +764,7 @@ def test_init_from_a_bundled_structure_lays_out_acts_as_chapters_and_beats_as_sc
 def test_init_from_a_skills_structure_and_the_list_names_it(tmp_path: Path) -> None:
     """A structure a skill adds is listed with its source and builds an outline.
 
-    Killed by: src/uclone_x/story/tools.py :: return load_structure_templates_sourced(data_roots(context.skill_dirs))
+    Killed by: examples/story/src/uclone_x_story/tools.py :: return load_structure_templates_sourced(data_roots(context.skill_dirs))
     Becomes: return load_structure_templates_sourced(data_roots(()))
     """
     skill = _skill(tmp_path / "skills", "heists", {"structures/heist.yaml": _HEIST})
@@ -794,7 +795,7 @@ def test_init_from_a_skills_structure_and_the_list_names_it(tmp_path: Path) -> N
 def test_an_unknown_structure_is_refused_naming_the_structures_there_are(tmp_path: Path) -> None:
     """P6: no default structure stands in, and nothing is written.
 
-    Killed by: src/uclone_x/story/tools.py :: found = templates.get(_structure_id(requested))
+    Killed by: examples/story/src/uclone_x_story/tools.py :: found = templates.get(_structure_id(requested))
     Becomes: found = templates.get(_structure_id(requested)) or next(iter(templates.values()))
     """
     story = _story(tmp_path)
@@ -811,7 +812,7 @@ def test_an_unknown_structure_is_refused_naming_the_structures_there_are(tmp_pat
 def test_init_with_both_titles_and_a_structure_is_refused(tmp_path: Path) -> None:
     """Two answers to one question: neither is picked silently.
 
-    Killed by: src/uclone_x/story/tools.py :: if params.chapter_titles:
+    Killed by: examples/story/src/uclone_x_story/tools.py :: if params.chapter_titles:
     Becomes: if False:
     """
     ctx = _ctx(tmp_path, story=_story(tmp_path))
@@ -829,7 +830,7 @@ def test_init_with_both_titles_and_a_structure_is_refused(tmp_path: Path) -> Non
 def test_a_draw_without_a_genre_uses_the_open_storys_and_says_so(tmp_path: Path) -> None:
     """P6: the default is stated in the result, not applied silently.
 
-    Killed by: src/uclone_x/story/muse.py :: result["note"] = note
+    Killed by: examples/story/src/uclone_x_story/muse.py :: result["note"] = note
     Becomes: pass
     """
     story = _story(tmp_path, genre="Science Fiction")
@@ -844,7 +845,7 @@ def test_a_draw_without_a_genre_uses_the_open_storys_and_says_so(tmp_path: Path)
 def test_a_named_genre_carries_no_note(tmp_path: Path) -> None:
     """The note is for a genre the model did not choose, not a line on every draw.
 
-    Killed by: src/uclone_x/story/muse.py :: if note is not None:
+    Killed by: examples/story/src/uclone_x_story/muse.py :: if note is not None:
     Becomes: if True:
     """
     story = _story(tmp_path, genre="horror")
@@ -875,7 +876,7 @@ def test_a_draw_with_no_genre_anywhere_is_refused_in_plain_words(
 ) -> None:
     """Nothing is drawn from a table nobody chose.
 
-    Killed by: src/uclone_x/story/muse.py :: if record.genre is None or not record.genre.strip():
+    Killed by: examples/story/src/uclone_x_story/muse.py :: if record.genre is None or not record.genre.strip():
     Becomes: if False:
     """
     story = _story(tmp_path) if with_story else None
@@ -889,7 +890,7 @@ def test_a_storys_genre_with_no_table_is_refused_saying_it_came_from_the_story(
 ) -> None:
     """The model did not name the genre, so the refusal says whose it was.
 
-    Killed by: src/uclone_x/story/muse.py :: whose = f"the open story's genre '{genre}'"
+    Killed by: examples/story/src/uclone_x_story/muse.py :: whose = f"the open story's genre '{genre}'"
     Becomes: whose = f"the genre '{genre}'"
     """
     story = _story(tmp_path, genre="western")

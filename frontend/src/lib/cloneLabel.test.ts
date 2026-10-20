@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { cloneIdOf, cloneLabel } from './cloneLabel';
+import { cloneIdOf, cloneLabel, isUsableClone } from './cloneLabel';
 
 const SLEEPY = '잠 꾸러기';
 
@@ -33,5 +33,15 @@ describe('cloneIdOf', () => {
     expect(cloneIdOf({ id: 'agt_1', name: 'scout' })).toBe('agt_1');
     expect(cloneIdOf({ name: 'memo' })).toBe('memo');
     expect(cloneIdOf({ id: '', name: 'memo' })).toBe('memo');
+  });
+});
+
+describe('isUsableClone', () => {
+  // Killed by: frontend/src/lib/cloneLabel.ts :: clone.status !== 'unreadable';
+  // Becomes: true;
+  it('is false only for a clone whose settings file could not be loaded (#2241)', () => {
+    expect(isUsableClone({ status: 'unreadable' })).toBe(false);
+    expect(isUsableClone({ status: 'dormant' })).toBe(true);
+    expect(isUsableClone({})).toBe(true);
   });
 });

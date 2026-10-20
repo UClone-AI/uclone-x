@@ -65,6 +65,20 @@ class TurnAidProtocol(Protocol):
 
 
 @runtime_checkable
+class ReplyTextAidProtocol(Protocol):
+    """A turn aid that also rewrites the turn's final reply before it is kept (#2300).
+
+    For handles the person must not read: a domain's ids that its tools show the model and
+    the model repeats. The agent applies it to the finished reply, before the reply lines,
+    and keeps what it returns as the answer.
+    """
+
+    def reply_text(self, reply: str) -> str:
+        """`reply` as the person is to read it."""
+        ...
+
+
+@runtime_checkable
 class TurnAidHookProtocol(Protocol):
     """A lifecycle hook that also works out, once at a turn's start, what to add to it.
 

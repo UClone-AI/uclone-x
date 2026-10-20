@@ -29,7 +29,14 @@ from uclone_x.agent.models import (
     ToolExecutionRecord,
 )
 from uclone_x.agent.protocols import TurnAidHookProtocol, TurnAidProtocol
-from uclone_x.agent.reply_lines import is_korean, lines_to_add, reply_notes, with_lines
+from uclone_x.agent.reply_lines import (
+    NOTE_ASKS_KEY,
+    NOTE_LISTS_KEY,
+    is_korean,
+    lines_to_add,
+    reply_notes,
+    with_lines,
+)
 from uclone_x.agent.session import SessionStore
 from uclone_x.core.provenance import ExecutionPath, Provenance, ServiceRef
 from uclone_x.engine.event_bus import EventBus
@@ -45,14 +52,14 @@ from uclone_x.llm.models import (
     TokenUsage,
     ToolCallRequest,
 )
-from uclone_x.story.library import StoryLibrary
-from uclone_x.story.muse import MuseSparkTool
-from uclone_x.story.scene_turn import SceneTurnHook, scene_section
-from uclone_x.story.work import StoryWork
 from uclone_x.telemetry.tracer import TelemetryTracer
 from uclone_x.tools.base import BaseTool
 from uclone_x.tools.models import REPLY_NOTE_KEY, ToolContext, ToolResultStatus
 from uclone_x.tools.registry import ToolRegistry
+from uclone_x_story.library import StoryLibrary
+from uclone_x_story.muse import MuseSparkTool
+from uclone_x_story.scene_turn import SceneTurnHook, scene_section
+from uclone_x_story.work import StoryWork
 
 FIXTURE = Path(__file__).resolve().parents[1] / "fixtures" / "writer"
 STORY = "moon-seal"
@@ -107,7 +114,7 @@ def _write_record(scene_id: str, status: ToolResultStatus = ToolResultStatus.SUC
 def test_an_open_story_gives_the_next_scene_with_the_request_conflicts_first(
     tmp_path: Path,
 ) -> None:
-    """Killed by: src/uclone_x/story/scene_turn.py :: request=message or None,
+    """Killed by: examples/story/src/uclone_x_story/scene_turn.py :: request=message or None,
     Becomes: request=None,
     """
     aid = _aid(tmp_path)
@@ -134,7 +141,7 @@ def test_an_open_story_gives_the_next_scene_with_the_request_conflicts_first(
 def test_a_message_that_names_a_scene_gets_that_scene(
     tmp_path: Path, message: str, scene_id: str
 ) -> None:
-    """Killed by: src/uclone_x/story/scene_turn.py :: named = _named_scene(outline, message)
+    """Killed by: examples/story/src/uclone_x_story/scene_turn.py :: named = _named_scene(outline, message)
     Becomes: named = None
     """
     aid = _aid(tmp_path, message)
@@ -145,7 +152,7 @@ def test_a_message_that_names_a_scene_gets_that_scene(
 
 
 def test_an_id_inside_a_longer_id_is_not_a_name(tmp_path: Path) -> None:
-    """Killed by: src/uclone_x/story/scene_turn.py :: {re.escape(scene.id)}(?![A-Za-z0-9_])
+    """Killed by: examples/story/src/uclone_x_story/scene_turn.py :: {re.escape(scene.id)}(?![A-Za-z0-9_])
     Becomes: {re.escape(scene.id)}
     """
     aid = _aid(tmp_path, "xch02.s04 와 ch02.s040 은 없는 씬이야")
@@ -166,7 +173,7 @@ def test_an_id_inside_a_longer_id_is_not_a_name(tmp_path: Path) -> None:
 def test_no_open_story_or_no_story_context_adds_nothing(
     tmp_path: Path, overrides: dict[str, Any]
 ) -> None:
-    """Killed by: src/uclone_x/story/scene_turn.py :: or _STORY_CONTEXT not in tool_names:
+    """Killed by: examples/story/src/uclone_x_story/scene_turn.py :: or not offered:
     Becomes: or False:
     """
     assert _aid(tmp_path, **overrides) is None
@@ -175,7 +182,7 @@ def test_no_open_story_or_no_story_context_adds_nothing(
 def test_a_story_that_cannot_be_read_adds_nothing_and_does_not_raise(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Killed by: src/uclone_x/story/scene_turn.py :: except Exception:
+    """Killed by: examples/story/src/uclone_x_story/scene_turn.py :: except Exception:
     Becomes: except KeyError:
     """
     assert _aid(tmp_path, story_id="no-such-story") is None
@@ -187,10 +194,10 @@ def test_a_story_with_every_scene_written_adds_nothing(
 ) -> None:
     """Said in the log as what it is, not as a story that could not be read.
 
-    Killed by: src/uclone_x/story/scene_turn.py :: if following is None:
+    Killed by: examples/story/src/uclone_x_story/scene_turn.py :: if following is None:
     Becomes: if False:
     """
-    caplog.set_level(logging.INFO, logger="uclone_x.story.scene_turn")
+    caplog.set_level(logging.INFO, logger="uclone_x_story.scene_turn")
     workspace = _workspace(tmp_path)
     manuscripts = workspace / "stories" / STORY / "manuscript"
     work = StoryWork(StoryLibrary(workspace), STORY)
@@ -206,13 +213,14 @@ def test_a_story_with_every_scene_written_adds_nothing(
         workspace_root=workspace,
         tool_names=WITH_STORY_CONTEXT,
     )
-    assert aid is None
+    # No scene is added; the story's ids are still kept out of the reply (#2300).
+    assert aid is not None and aid.section == ""
     assert "no unwritten scene left" in caplog.text
     assert "could not be read" not in caplog.text
 
 
 def test_a_section_over_the_cap_drops_the_neighbours_text_first_and_says_so() -> None:
-    """Killed by: src/uclone_x/story/scene_turn.py :: _DROP_FIRST = ("end_of_previous_scene", "previous_scene", "next_scene", "manifest")
+    """Killed by: examples/story/src/uclone_x_story/scene_turn.py :: _DROP_FIRST = ("end_of_previous_scene", "previous_scene", "next_scene", "manifest")
     Becomes: _DROP_FIRST = ("manifest", "end_of_previous_scene", "previous_scene", "next_scene")
     """
     bundle = {
@@ -234,7 +242,7 @@ def test_a_section_over_the_cap_drops_the_neighbours_text_first_and_says_so() ->
 
 
 def test_a_section_that_cannot_fit_even_cut_down_is_none() -> None:
-    """Killed by: src/uclone_x/story/scene_turn.py :: return section if estimate_text_tokens(section) <= cap else None
+    """Killed by: examples/story/src/uclone_x_story/scene_turn.py :: return section if estimate_text_tokens(section) <= cap else None
     Becomes: return section
     """
     bundle = {"request_conflicts": ["r" * 4000], "scene": {"id": "s"}, "codex": [{"id": "a"}]}
@@ -247,7 +255,7 @@ def test_a_section_that_cannot_fit_even_cut_down_is_none() -> None:
 def test_a_saved_conflicting_scene_gets_the_kept_line_in_the_persons_language(
     tmp_path: Path,
 ) -> None:
-    """Killed by: src/uclone_x/story/scene_turn.py :: if not self.conflicts or not any(self._saved(record) for record in records):
+    """Killed by: examples/story/src/uclone_x_story/scene_turn.py :: if not self.conflicts or not any(self._saved(record) for record in records):
     Becomes: if not self.conflicts:
     """
     aid = _aid(tmp_path)
@@ -269,7 +277,7 @@ def test_a_saved_conflicting_scene_gets_the_kept_line_in_the_persons_language(
 
 
 def test_a_request_the_story_does_not_contradict_gets_no_kept_line(tmp_path: Path) -> None:
-    """Killed by: src/uclone_x/story/scene_turn.py :: if not self.conflicts or not any(
+    """Killed by: examples/story/src/uclone_x_story/scene_turn.py :: if not self.conflicts or not any(
     Becomes: if not any(
     """
     aid = _aid(tmp_path, message="다음 장면을 써줘")
@@ -282,8 +290,8 @@ def test_a_request_the_story_does_not_contradict_gets_no_kept_line(tmp_path: Pat
 
 
 def test_reply_notes_follow_the_persons_language_and_skip_failed_calls() -> None:
-    """Killed by: src/uclone_x/agent/reply_lines.py :: note = cast(Mapping[str, object], note).get("ko" if korean else "en")
-    Becomes: note = cast(Mapping[str, object], note).get("en")
+    """Killed by: src/uclone_x/agent/reply_lines.py :: note = found.get("ko" if korean else "en")
+    Becomes: note = found.get("en")
     """
     note: dict[str, JsonValue] = {REPLY_NOTE_KEY: {"en": "Seed 7.", "ko": "시드 7."}}
     records = [
@@ -302,10 +310,144 @@ def test_reply_notes_follow_the_persons_language_and_skip_failed_calls() -> None
 
 
 def test_a_line_is_added_once_and_not_when_the_reply_already_says_it() -> None:
-    """Killed by: src/uclone_x/agent/reply_lines.py :: if text and text not in added and text not in reply:
+    """Killed by: src/uclone_x/agent/reply_lines.py :: if text and text not in added and _plain(text) not in plain_reply:
     Becomes: if text:
     """
     assert lines_to_add("Done. Seed 7.", ["Seed 7.", "Kept.", " Kept. ", ""]) == ["Kept."]
+
+
+def test_a_note_whose_list_the_reply_already_names_gives_only_what_follows_it() -> None:
+    """#2301, picky T2: the Writer listed the three premises in its own words (renumbered,
+    bolded, another dash), and the note listed them again under it.
+
+    Killed by: src/uclone_x/agent/reply_lines.py :: if not all(name and name in plain_reply for name in names):
+    Becomes: if True:
+    """
+    note: dict[str, JsonValue] = {
+        "ko": "판타지 이야기의 핵심 발상 세 가지입니다.\n1. 용기의 약속 — 산맥의 수도원.\n"
+        "2. 가시 외벽 — 강의 페리맨.\n마음에 드는 발상의 번호를 골라 주세요.",
+        "en": "Two premises:\n1. Oath — a monastery.\n2. Wall — a ferryman.\nChoose one.",
+        NOTE_LISTS_KEY: ["용기의 약속", "가시 외벽"],
+    }
+    record = ToolExecutionRecord(tool_name="story_start", output={REPLY_NOTE_KEY: note})
+    own = "추천드려요.\n\n1) **용기의 약속**: 수도원 이야기  \n2) _가시 외벽_: 페리맨 이야기"
+
+    assert reply_notes([record], korean=True, reply=own) == [
+        "마음에 드는 발상의 번호를 골라 주세요."
+    ]
+    # A reply that leaves one of them out gets the whole note, as before.
+    (whole,) = reply_notes([record], korean=True, reply="1) **용기의 약속**: 수도원 이야기")
+    assert whole == note["ko"]
+
+
+def test_a_marked_question_the_reply_already_asks_in_its_words_is_not_added_again() -> None:
+    """#2305: the model asked the stop's question with straight quotes and bold, and the
+    note's own copy, with curly quotes, was added under it.
+
+    Killed by: src/uclone_x/agent/reply_lines.py :: if not (line.strip() in marked and _words(line) and _asked(line, held))
+    Becomes: if True
+    """
+    question = "마음에 드는 발상의 번호를 골라 주세요. ‘네’라고만 하셔도 1번으로 진행합니다."
+    note: dict[str, JsonValue] = {
+        "ko": f"발상을 새로 만들었습니다.\n{question}",
+        "en": "New premises.\nChoose one.",
+        NOTE_ASKS_KEY: [question, "Choose one."],
+    }
+    record = ToolExecutionRecord(tool_name="story_start", output={REPLY_NOTE_KEY: note})
+    reply = "**마음에 드는 발상의 번호를 골라 주세요.** '네'라고만 하셔도 1번으로 진행합니다!"
+
+    assert reply_notes([record], korean=True, reply=reply) == ["발상을 새로 만들었습니다."]
+    # A line the note does not mark is compared as before, and is added.
+    unmarked = {**note, NOTE_ASKS_KEY: []}
+    plain = ToolExecutionRecord(tool_name="story_start", output={REPLY_NOTE_KEY: unmarked})
+    assert reply_notes([plain], korean=True, reply=reply) == [note["ko"]]
+
+
+def test_a_marked_question_is_not_found_across_two_of_the_replys_sentences() -> None:
+    """#2317 item 5: the reply's letters were compared joined, so a short marked line could
+    match across a sentence boundary. Each sentence of the marked line must be in one of the
+    reply's sentences.
+
+    Killed by: src/uclone_x/agent/reply_lines.py :: return all(any(own in said for said in held) for own in wanted)
+    Becomes: return "".join(wanted) in "".join(held)
+    """
+    question = "Shall I go on?"
+    note: dict[str, JsonValue] = {
+        "ko": "새 장을 썼습니다.",
+        "en": f"Chapter written.\n{question}",
+        NOTE_ASKS_KEY: ["새 장을 썼습니다.", question],
+    }
+    record = ToolExecutionRecord(tool_name="story_start", output={REPLY_NOTE_KEY: note})
+
+    split = "That is what I shall. I go on to the next chapter now."
+    assert reply_notes([record], korean=False, reply=split) == [note["en"]]
+    asked = "Here it is. **Shall I go on?**"
+    assert reply_notes([record], korean=False, reply=asked) == ["Chapter written."]
+
+
+def test_a_line_the_reply_copied_with_markdown_and_hard_breaks_is_not_added_again() -> None:
+    r"""#2263: the Writer copied a stop's proposal into its reply with bold marks and
+    markdown hard breaks, and the exact-substring check added the same lines again.
+
+    Killed by: src/uclone_x/agent/reply_lines.py :: lines = (" ".join(line.split()) for line in _WRAPPED.sub(r"\2", text).splitlines())
+    Becomes: lines = (line for line in text.splitlines())
+    """
+    note = "No genre was named, so here are some:\n1. Horror (recommended)\n2. Fantasy"
+    copied = "No genre was named, so here are some:  \n1. **Horror** (recommended)  \n2. _Fantasy_"
+
+    assert lines_to_add(copied, [note]) == []
+    # Different words are still added, marks or not.
+    assert lines_to_add(copied, ["1. **Mystery**"]) == ["1. **Mystery**"]
+
+
+def test_a_mark_inside_a_token_is_not_markdown() -> None:
+    r"""#2272: `_` and `~` inside a path were stripped, so `my_story.md` read as `mystory.md`.
+
+    Killed by: src/uclone_x/agent/reply_lines.py :: r"(?<![A-Za-z0-9*_`~])([*_`~]+)(?=[^\s*_`~])(.+?)(?<=[^\s*_`~])\1(?![A-Za-z0-9*_`~])"
+    Becomes: r"()[*_`~]+()"
+    """
+    assert lines_to_add("Saved to mystory.md.", ["Saved to my_story.md."]) == [
+        "Saved to my_story.md."
+    ]
+    assert lines_to_add("Open /notes.", ["Open ~/notes."]) == ["Open ~/notes."]
+    assert lines_to_add("Saved to `my_story.md`.", ["Saved to my_story.md."]) == []
+
+
+def test_bold_before_a_korean_particle_is_still_markdown() -> None:
+    r"""#2279 review: `\w` in the token edge matched Hangul, so `**미스터리**로` kept its
+    marks and a copied note was added again (#2263 regressed for Korean replies).
+
+    Killed by: src/uclone_x/agent/reply_lines.py :: (?<=[^\s*_`~])\1(?![A-Za-z0-9*_`~])
+    Becomes: (?<=[^\s*_`~])\1(?![\w*_`~])
+    """
+    assert (
+        lines_to_add(
+            "‘네’라고 하시면 **미스터리**로 발상을 만들겠습니다.",
+            ["‘네’라고 하시면 미스터리로 발상을 만들겠습니다."],
+        )
+        == []
+    )
+    assert lines_to_add("추천은 **1번**입니다.", ["추천은 1번입니다."]) == []
+    assert lines_to_add("**하린**은 등대지기입니다.", ["하린은 등대지기입니다."]) == []
+    # Nor a mark right after Hangul (the opening edge).
+    assert lines_to_add("이번엔**SF**로 갑니다.", ["이번엔SF로 갑니다."]) == []
+    # The path cases still hold with ASCII edges.
+    assert lines_to_add("Saved to mystory.md.", ["Saved to my_story.md."]) == [
+        "Saved to my_story.md."
+    ]
+    assert lines_to_add("Open /notes.", ["Open ~/notes."]) == ["Open ~/notes."]
+
+
+def test_two_lines_never_read_as_one() -> None:
+    r"""#2272: whitespace collapse joined lines across a newline.
+
+    Killed by: src/uclone_x/agent/reply_lines.py :: return "\n".join(line for line in lines if line)
+    Becomes: return " ".join(line for line in lines if line)
+    """
+    assert lines_to_add("Pick one\nnow.", ["Pick one now."]) == ["Pick one now."]
+    assert lines_to_add("Pick one now.", ["Pick one\nnow."]) == ["Pick one\nnow."]
+    # Blank lines and a hard break between the same lines are spacing, not words.
+    assert lines_to_add("A.  \n\n\nB.", ["A.\nB."]) == []
 
 
 def test_the_reply_stays_the_prefix_of_the_reply_with_lines() -> None:
@@ -321,7 +463,7 @@ def test_the_reply_stays_the_prefix_of_the_reply_with_lines() -> None:
 
 
 def test_a_muse_draw_asks_the_reply_to_name_its_seed(tmp_path: Path) -> None:
-    """Killed by: src/uclone_x/story/muse.py :: REPLY_NOTE_KEY: {
+    """Killed by: examples/story/src/uclone_x_story/muse.py :: REPLY_NOTE_KEY: {
     Becomes: "unused_note": {
     """
     context = ToolContext(agent_id="writer", session_id="s1", workspace_root=tmp_path)
@@ -512,7 +654,9 @@ async def test_a_second_empty_reply_stops_the_turn(tmp_path: Path) -> None:
     result = await agent.execute_turn("Write the next scene.")
 
     assert len(llm.requests) == 2
-    assert result.stop_reason == "model_stopped_after_nudge"
+    # Ended with the plain sentence, not an empty reply (#2264).
+    assert result.stop_reason == "empty_reply"
+    assert result.error_code == "step.empty_reply"
 
 
 def test_compose_empty_reply_nudge_names_tools_or_instructs_text() -> None:
@@ -553,3 +697,87 @@ def test_composing_the_app_hooks_adds_the_scene_hook_once(tmp_path: Path) -> Non
     twice = with_app_lifecycle_hooks(with_app_lifecycle_hooks(host))
 
     assert sum(isinstance(h, SceneTurnHook) for h in twice.lifecycle_hooks) == 1
+
+
+def test_the_storys_ids_are_put_as_their_names_in_the_reply(tmp_path: Path) -> None:
+    r"""#2300: a live reply said "현재 진행 중인 장면은 **ch01.s02**입니다".
+
+    Killed by: examples/story/src/uclone_x_story/scene_turn.py :: rf"(?<![A-Za-z0-9_.-]){re.escape(found)}(?![A-Za-z0-9_]|\.[A-Za-z0-9])",
+    Becomes: rf"(?<![\w.-]){re.escape(found)}(?![\w]|\.[A-Za-z0-9])",
+    """
+    aid = _aid(tmp_path)
+    assert aid is not None
+
+    said = aid.reply_text(
+        "현재 진행 중인 장면은 **ch01.s02**입니다. ch01.s02입니다, ch01장과 moon-seal을 봅니다."
+    )
+
+    assert (
+        said
+        == "현재 진행 중인 장면은 **습격**입니다. 습격입니다, 은월성의 밤장과 달의 봉인을 봅니다."
+    )
+    # A token that only contains an id is not it.
+    assert aid.reply_text("xch01.s02 ch01.s022") == "xch01.s02 ch01.s022"
+
+
+class _RaisingAid(_Aid):
+    def reply_text(self, reply: str) -> str:
+        raise RuntimeError(f"a domain bug on {reply!r}")
+
+    def reply_lines(self, records: Sequence[ToolExecutionRecord], *, korean: bool) -> list[str]:
+        raise RuntimeError("a domain bug")
+
+
+class _RaisingHook(_AidHook):
+    def turn_aid(self, **kwargs: Any) -> _RaisingAid:
+        del kwargs
+        self.calls += 1
+        return _RaisingAid()
+
+
+@pytest.mark.asyncio
+async def test_an_aid_that_raises_costs_its_own_part_and_not_the_reply(tmp_path: Path) -> None:
+    """#2303 item 1: a domain's bug in `reply_text` or `reply_lines` failed the turn's finish.
+
+    Killed by: src/uclone_x/agent/turn_executor.py :: rewritten = self._of_aid(lambda a=aid, c=content: a.reply_text(c), "rewrite the reply")
+    Becomes: rewritten = aid.reply_text(content)
+    Killed by: src/uclone_x/agent/turn_executor.py :: lambda a=aid: a.reply_lines(records, korean=korean), "give its reply lines"
+    Becomes: aid.reply_lines(records, korean=korean), "give its reply lines"
+    """
+    llm = _Scripted(
+        [_reply(None, ToolCallRequest(id="c1", name="noting", arguments={})), _reply("Scene.")]
+    )
+    agent = _agent(tmp_path, llm, _RaisingHook(), _AidHook())
+
+    result = await agent.execute_turn("Write the next scene.")
+
+    assert result.content == "Scene.\n\nNoted.\nKept."
+    final = [m for m in agent.history if m.role is MessageRole.ASSISTANT][-1]
+    assert final.content == result.content
+
+
+class _RenamingAid(_Aid):
+    def reply_text(self, reply: str) -> str:
+        return reply.replace("ch01.s02", "습격")
+
+
+class _RenamingHook(_AidHook):
+    def turn_aid(self, **kwargs: Any) -> _RenamingAid:
+        del kwargs
+        self.calls += 1
+        return _RenamingAid()
+
+
+@pytest.mark.asyncio
+async def test_an_aid_that_rewrites_the_reply_is_what_the_turn_keeps(tmp_path: Path) -> None:
+    """Killed by: src/uclone_x/agent/turn_executor.py :: sanitized = self._aid_reply_text(apply_artifact_sanitization(shown, self.workspace_root))
+    Becomes: sanitized = apply_artifact_sanitization(shown, self.workspace_root)
+    """
+    llm = _Scripted([_reply("Next is ch01.s02.")])
+    agent = _agent(tmp_path, llm, _RenamingHook())
+
+    result = await agent.execute_turn("Where are we?")
+
+    assert result.content == "Next is 습격."
+    final = [m for m in agent.history if m.role is MessageRole.ASSISTANT][-1]
+    assert final.content == result.content

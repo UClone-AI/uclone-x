@@ -45,6 +45,11 @@ export interface BrowserLiveState {
     site: string;
     message: string;
   } | null;
+  /**
+   * After U0 signed in by hand: an offer to save that sign-in for `clone` on `site` (§3.5,
+   * path A). The Core never reads what was typed; the offer carries only the site.
+   */
+  save_offer?: { clone: string; site: string } | null;
 }
 
 export interface BrowserStep {
@@ -84,6 +89,8 @@ export interface BrowserChannel {
   handTo: (target: string) => void;
   /** U0's mouse, key or text, for the shown tab while it is theirs. */
   input: (message: Record<string, unknown>) => void;
+  /** Turn down the offer to save a sign-in ("Not now"). */
+  dismissSaveOffer: () => void;
   onFrame: (listener: (jpeg: Blob, size: BrowserFrameSize | null) => void) => () => void;
   onOverlay: (listener: (overlay: BrowserOverlay) => void) => () => void;
 }
@@ -159,7 +166,19 @@ export const parseState = (message: Record<string, unknown>): BrowserLiveState =
         message: str(message.asked_user.message),
       }
     : null;
-  return { tabs, acting, problem, shown, extension: message.extension === true, asked_user };
+  const save_offer =
+    isRecord(message.save_offer) && str(message.save_offer.site)
+      ? { clone: str(message.save_offer.clone), site: str(message.save_offer.site) }
+      : null;
+  return {
+    tabs,
+    acting,
+    problem,
+    shown,
+    extension: message.extension === true,
+    asked_user,
+    save_offer,
+  };
 };
 
 /**
@@ -319,6 +338,7 @@ export const useBrowserLive = (
       navigate: (url) => sendNow({ type: 'navigate', url }),
       handTo: (target) => sendNow({ type: 'hand_to', target }),
       input: (message) => sendNow({ ...message, type: 'input' }),
+      dismissSaveOffer: () => sendNow({ type: 'dismiss_save_offer' }),
       onFrame: (listener) => {
         frameListeners.current.add(listener);
         return () => frameListeners.current.delete(listener);
@@ -359,6 +379,10 @@ export const stepSentence = (copy: StepCopy, step: Pick<BrowserStep, 'action' | 
   let sentence: string;
   if (named && step.element) {
     sentence = fmt(copy[named], { element: step.element });
+  } else if (step.action === 'ask_user') {
+    sentence = copy.askUser;
+  } else if (step.action === 'sign_in') {
+    sentence = copy.signIn;
   } else if (PLAIN.has(step.action)) {
     sentence = copy[step.action as keyof StepCopy];
   } else {

@@ -394,6 +394,14 @@ class RoomAgentResolver:
         if agent.persona_definition != edited:
             agent.define_persona(edited)
 
+    def built_seat(self, participant: Participant) -> BaseAgentProtocol | None:
+        """The seat built for `participant`, without building one; `None` if there is none.
+
+        Read where something queued earlier needs the participant's seat as it is now
+        rather than as it was, such as a lesson's "Learn from conversations" switch (#2233).
+        """
+        return self._agents.get(participant.session_id) if participant.session_id else None
+
     def live_agents(self) -> tuple[BaseAgent, ...]:
         """Every seat agent this resolver has built and still holds, for the health reads."""
         return tuple(agent for agent in self._agents.values() if isinstance(agent, BaseAgent))

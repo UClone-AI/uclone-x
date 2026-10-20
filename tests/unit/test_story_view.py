@@ -29,10 +29,10 @@ import yaml
 
 from uclone_x.room.service import RoomService
 from uclone_x.room.store import RoomStore
-from uclone_x.story.library import StoryError, StoryLibrary, StoryReadOnlyError
-from uclone_x.story.proposals import apply_proposal
-from uclone_x.story.schemas import Chapter, Outline, Proposal, Scene, dump_file
-from uclone_x.story.view import (
+from uclone_x_story.library import StoryError, StoryLibrary, StoryReadOnlyError
+from uclone_x_story.proposals import apply_proposal
+from uclone_x_story.schemas import Chapter, Outline, Proposal, Scene, dump_file
+from uclone_x_story.view import (
     StoryNoteCode,
     StoryNotFoundError,
     StoryNotWritableError,
@@ -40,9 +40,11 @@ from uclone_x.story.view import (
     StoryView,
     WriterBusyError,
 )
-from uclone_x.story.work import StoryWork
+from uclone_x_story.work import StoryWork
 
-SRC = Path(__file__).resolve().parents[2] / "src" / "uclone_x"
+ROOT = Path(__file__).resolve().parents[2]
+#: The core and the story example (#2208): a tool module in either may not import the view.
+SOURCES = (ROOT / "src" / "uclone_x", ROOT / "examples" / "story" / "src" / "uclone_x_story")
 
 
 @pytest.fixture
@@ -153,7 +155,7 @@ def _vane(workspace: Path, story_id: str) -> str:
 def test_the_outline_is_shown_in_reading_order_and_in_story_time(
     workspace: Path, rooms: RoomService, view: StoryView
 ) -> None:
-    """Killed by: src/uclone_x/story/view.py :: order = [p.scene_id for p in sorted(placements.values(), key=lambda p: p.position)]
+    """Killed by: examples/story/src/uclone_x_story/view.py :: order = [p.scene_id for p in sorted(placements.values(), key=lambda p: p.position)]
     Becomes: order = list(placements)
     """
     story_id, _ = _story(workspace, rooms)
@@ -212,7 +214,7 @@ def test_a_pending_proposal_shows_what_approving_would_do(
     assert proposal.diff == [
         "--- codex/characters/vane.yaml (now)",
         "+++ codex/characters/vane.yaml (if approved)",
-        "@@ -3,2 +3,7 @@",
+        "@@ -3,2 +3,8 @@",
         " state:",
         "   status: alive",
         "+progressions:",
@@ -220,6 +222,7 @@ def test_a_pending_proposal_shows_what_approving_would_do(
         "+  set:",
         "+    wounded: true",
         "+  note: The arrow grazed him.",
+        "+  proposal: p001",
     ]
     evidence = proposal.evidence[0]
     assert (evidence.scene_title, evidence.quote, evidence.still_in_scene) == (
@@ -236,7 +239,7 @@ def test_a_pending_proposal_shows_what_approving_would_do(
 def test_a_change_to_how_a_character_looks_shows_the_looks_before_and_after(
     workspace: Path, rooms: RoomService, view: StoryView
 ) -> None:
-    """Killed by: src/uclone_x/story/proposals.py :: after_tags = kept + [t for t in vp.add_tags if t not in kept]
+    """Killed by: examples/story/src/uclone_x_story/proposals.py :: after_tags = kept + [t for t in vp.add_tags if t not in kept]
     Becomes: after_tags = list(vp.add_tags)
     """
     story_id, room_id = _story(workspace, rooms)
@@ -279,7 +282,7 @@ def test_a_change_to_how_a_character_looks_shows_the_looks_before_and_after(
 def test_a_quote_the_scene_no_longer_has_is_shown_as_gone(
     workspace: Path, rooms: RoomService, view: StoryView
 ) -> None:
-    """Killed by: src/uclone_x/story/view.py :: still_in_scene=passage_in(item.quote, text.text) if text else None,
+    """Killed by: examples/story/src/uclone_x_story/view.py :: still_in_scene=passage_in(item.quote, text.text) if text else None,
     Becomes: still_in_scene=True if text else None,
     """
     story_id, _ = _story(workspace, rooms)
@@ -295,7 +298,7 @@ def test_a_passage_quoted_before_quotes_were_whole_words_is_still_in_the_scene(
 
     Those words are still in the scene, so the view does not say they are gone.
 
-    Killed by: src/uclone_x/story/quotes.py :: return bool(needle) and needle in folded(text)
+    Killed by: src/uclone_x/knowledge/quotes.py :: return bool(needle) and needle in fold(text)
     Becomes: return quote_found(passage, text)
     """
     story_id, _ = _story(workspace, rooms)
@@ -315,7 +318,7 @@ def test_a_passage_quoted_before_quotes_were_whole_words_is_still_in_the_scene(
 def test_an_entry_edited_since_the_proposal_is_shown_blocked_and_not_applied(
     workspace: Path, rooms: RoomService, view: StoryView
 ) -> None:
-    """Killed by: src/uclone_x/story/proposals.py :: if digest == proposal.entry_digest
+    """Killed by: examples/story/src/uclone_x_story/proposals.py :: if digest == proposal.entry_digest
     Becomes: if True
     """
     story_id, _ = _story(workspace, rooms)
@@ -377,8 +380,10 @@ def test_a_story_that_is_gone_is_named(view: StoryView) -> None:
 def test_approving_applies_the_change_as_the_writer_and_records_where(
     workspace: Path, rooms: RoomService, view: StoryView
 ) -> None:
-    """Killed by: src/uclone_x/story/proposals.py :: update={"status": "applied", "decided_at": _now(), "decided_in": decided_in}
+    """Killed by: examples/story/src/uclone_x_story/proposals.py :: update={"status": "applied", "decided_at": _now(), "decided_in": decided_in}
     Becomes: update={"status": "applied", "decided_at": _now()}
+    Killed by: examples/story/src/uclone_x_story/proposals.py :: data = changed_entry(entry, proposal.change, proposal_id=proposal.id)
+    Becomes: data = changed_entry(entry, proposal.change)
     """
     story_id, _ = _story(workspace, rooms)
     seen = view.show(story_id).pending[0].digest
@@ -388,7 +393,12 @@ def test_approving_applies_the_change_as_the_writer_and_records_where(
     assert (decided.decision, decided.notes) == ("applied", [])
     vane = yaml.safe_load(_vane(workspace, story_id))
     assert vane["progressions"] == [
-        {"at": "ch01.s01", "set": {"wounded": True}, "note": "The arrow grazed him."}
+        {
+            "at": "ch01.s01",
+            "set": {"wounded": True},
+            "note": "The arrow grazed him.",
+            "proposal": "p001",
+        }
     ]
     shown = view.show(story_id)
     assert shown.pending == []
@@ -405,7 +415,7 @@ def test_a_proposal_changed_after_it_was_shown_is_not_applied(
 ) -> None:
     """The person decides what they saw, not what the file says a moment later.
 
-    Killed by: src/uclone_x/story/proposals.py :: if expected_digest is not None and digest != expected_digest:
+    Killed by: examples/story/src/uclone_x_story/proposals.py :: if expected_digest is not None and digest != expected_digest:
     Becomes: if False:
     """
     story_id, _ = _story(workspace, rooms)
@@ -431,7 +441,7 @@ def test_a_proposal_changed_after_it_was_shown_is_not_applied(
 def test_rejecting_keeps_the_reason_and_changes_no_entry(
     workspace: Path, rooms: RoomService, view: StoryView
 ) -> None:
-    """Killed by: src/uclone_x/story/view.py :: reason=reason.strip() if reason and reason.strip() else None,
+    """Killed by: examples/story/src/uclone_x_story/view.py :: reason=reason.strip() if reason and reason.strip() else None,
     Becomes: reason=reason,
     """
     story_id, _ = _story(workspace, rooms)
@@ -473,7 +483,7 @@ def test_with_no_writer_nothing_is_saved_and_the_view_says_why(
 def test_a_writer_that_was_deleted_holds_nothing_to_write_with(
     workspace: Path, rooms: RoomService, view: StoryView
 ) -> None:
-    """Killed by: src/uclone_x/story/view.py :: if note is not None or writer is None:
+    """Killed by: examples/story/src/uclone_x_story/view.py :: if note is not None or writer is None:
     Becomes: if writer is None:
     """
     story_id, room_id = _story(workspace, rooms)
@@ -494,7 +504,7 @@ def test_a_writer_that_was_deleted_holds_nothing_to_write_with(
 def test_a_writer_answering_right_now_is_waited_for(
     workspace: Path, rooms: RoomService, answering: set[str], view: StoryView
 ) -> None:
-    """Killed by: src/uclone_x/story/view.py :: if self._turn_busy(writer.room_id):
+    """Killed by: examples/story/src/uclone_x_story/view.py :: if self._turn_busy(writer.room_id):
     Becomes: if False:
     """
     story_id, room_id = _story(workspace, rooms)
@@ -532,13 +542,14 @@ def test_no_tool_reaches_the_approval_path() -> None:
     This pins imports, not reachability: a persona with an unconfined shell can still
     call the local API (#1589 item 6)."""
     importers = sorted(
-        path.relative_to(SRC).as_posix()
-        for path in SRC.rglob("*.py")
-        if "from uclone_x.story.view import" in path.read_text(encoding="utf-8")
-        or "import uclone_x.story.view" in path.read_text(encoding="utf-8")
+        path.relative_to(ROOT).as_posix()
+        for source in SOURCES
+        for path in source.rglob("*.py")
+        if "from uclone_x_story.view import" in path.read_text(encoding="utf-8")
+        or "import uclone_x_story.view" in path.read_text(encoding="utf-8")
     )
     # The routes are the story extension's own since #2205, mounted by the web head.
-    assert importers == ["story/routes.py"]
+    assert importers == ["examples/story/src/uclone_x_story/routes.py"]
 
 
 # -- the board: scenes linked to the codex (§1.1 row 5) ---------------------------------
@@ -727,13 +738,13 @@ def test_each_note_carries_the_code_the_head_words_it_from(
 ) -> None:
     """A Korean screen words a note from its code, not from the English sentence beside it.
 
-    Killed by: src/uclone_x/story/view.py :: board_code="start_unreadable" if board_note else None,
+    Killed by: examples/story/src/uclone_x_story/view.py :: board_code="start_unreadable" if board_note else None,
     Becomes: board_code=None,
-    Killed by: src/uclone_x/story/view.py :: decide_code=decide[0] if decide else None,
+    Killed by: examples/story/src/uclone_x_story/view.py :: decide_code=decide[0] if decide else None,
     Becomes: decide_code=None,
-    Killed by: src/uclone_x/story/view.py :: return None, ("no_outline", "This story has no outline yet."), None, {}
+    Killed by: examples/story/src/uclone_x_story/view.py :: return None, ("no_outline", "This story has no outline yet."), None, {}
     Becomes: return None, ("outline_unreadable", "This story has no outline yet."), None, {}
-    Killed by: src/uclone_x/story/view.py :: return "writer_gone", (
+    Killed by: examples/story/src/uclone_x_story/view.py :: return "writer_gone", (
     Becomes: return "no_writer", (
     """
     story_id, room_id = _story(workspace, rooms)
@@ -773,9 +784,70 @@ _LOCALES = Path(__file__).resolve().parents[2] / "frontend" / "src" / "i18n" / "
 def test_every_note_and_refusal_code_has_a_sentence_in_the_head(language: str) -> None:
     """Equal, not contained: a code the catalog lacks reads as English on a Korean screen.
 
-    Killed by: src/uclone_x/story/view.py :: StoryRefusalCode = Literal["story_gone", "no_writer", "writer_gone", "writer_busy"]
+    Killed by: examples/story/src/uclone_x_story/view.py :: StoryRefusalCode = Literal["story_gone", "no_writer", "writer_gone", "writer_busy"]
     Becomes: StoryRefusalCode = Literal["story_gone", "no_writer", "writer_gone", "writer_away"]
     """
     catalog = json.loads((_LOCALES / language / "dock.json").read_text(encoding="utf-8"))
     assert set(get_args(StoryNoteCode)) == set(catalog["story"]["notes"])
     assert set(get_args(StoryRefusalCode)) == set(catalog["story"]["refusals"])
+
+
+def test_an_entry_shows_what_it_is_to_other_entries(
+    workspace: Path, rooms: RoomService, view: StoryView
+) -> None:
+    """The codex card reads an entry's `relations:` from the view, by the other entry's id
+    (uGraph step 6, #2332). Read-only: a change still goes through a proposal.
+
+    Killed by: examples/story/src/uclone_x_story/view.py :: relations={other: str(word) for other, word in entry.relations.items()},
+    Becomes: relations={},
+    """
+    story_id, _ = _story(workspace, rooms)
+    _put(
+        workspace,
+        story_id,
+        "codex/characters/mira.yaml",
+        yaml.safe_dump({"id": "mira", "name": "Mira", "relations": {"vane": "sister"}}),
+    )
+
+    shown = view.show(story_id)
+
+    entries = {e.id: e for group in shown.codex for e in group.entries}
+    assert entries["mira"].relations == {"vane": "sister"}
+    assert entries["vane"].relations == {}
+
+
+def test_a_scene_on_the_board_shows_its_illustration_url(
+    workspace: Path, rooms: RoomService, view: StoryView
+) -> None:
+    """A scene's illustration URL from `outline.yaml` or `start.yaml` is exposed on `SceneView`.
+
+    Killed by: examples/story/src/uclone_x_story/view.py :: illustration=illustration,
+    Becomes: illustration=None,
+    """
+    story_id, _ = _story(workspace, rooms)
+    outline = Outline(
+        chapters=[
+            Chapter(
+                id="ch01",
+                title="The Crossing",
+                scenes=[
+                    Scene(
+                        id="ch01.s01",
+                        title="The gate",
+                        illustration="/api/artifacts/content?path=artifacts/sess_1/images/s01.png",
+                    ),
+                    Scene(id="ch01.s02", title="The bridge"),
+                ],
+            )
+        ]
+    )
+    _put(workspace, story_id, "outline.yaml", dump_file(outline))
+
+    shown = view.show(story_id)
+    assert shown.outline is not None
+    scenes = {s.id: s for s in shown.outline.chapters[0].scenes}
+    assert (
+        scenes["ch01.s01"].illustration
+        == "/api/artifacts/content?path=artifacts/sess_1/images/s01.png"
+    )
+    assert scenes["ch01.s02"].illustration is None

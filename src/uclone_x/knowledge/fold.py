@@ -1,8 +1,8 @@
 """One way to compare names and texts, and the character-pair measure built on it (uGraph step 1).
 
 `fold` is NFC, runs of white space as one space, trimmed, casefolded. It is what
-`memory.models.fold_name` and `story.quotes.folded` were, as two copies of one rule; both
-now call this. `story/audit.py` reads a predicate or a class name with a stricter rule
+`memory.models.fold_name` and `quotes.folded` (then in the story package) were, as two
+copies of one rule; both now call this. `story/audit.py` reads a predicate or a class name with a stricter rule
 (`_` and `-` are separators, and the capitalised spelling is shown to the author), so it
 is a layer built on `fold`, not a replacement for it.
 
@@ -14,7 +14,7 @@ from __future__ import annotations
 import re
 import unicodedata
 
-__all__ = ["bigram_overlap", "bigrams", "fold"]
+__all__ = ["bigram_overlap", "bigrams", "fold", "relation_key"]
 
 _NO_SPACE = re.compile(r"\s+")
 
@@ -26,6 +26,11 @@ def fold(text: str) -> str:
     the composed form a model writes, and the reverse.
     """
     return " ".join(unicodedata.normalize("NFC", text).split()).casefold()
+
+
+def relation_key(relation: str) -> str:
+    """A relation as a clone files it: `fold`ed, its spaces as `_` ("Works at" is `works_at`)."""
+    return "_".join(fold(relation).split())
 
 
 def bigrams(text: str) -> set[str]:

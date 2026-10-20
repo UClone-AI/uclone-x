@@ -30,10 +30,10 @@ from uclone_x.room.models import (
 from uclone_x.room.orchestrator import RoomOrchestrator
 from uclone_x.room.service import RoomService
 from uclone_x.room.store import RoomStore
-from uclone_x.story import OPEN_STORY_KEY, story_after
-from uclone_x.story.library import StoryLibrary
 from uclone_x.tools.models import ToolResultStatus
 from uclone_x.ui.app import create_ui_app
+from uclone_x_story import OPEN_STORY_KEY, story_after
+from uclone_x_story.library import StoryLibrary
 
 ALICE = Participant(id="alice", kind=ParticipantKind.HUMAN, display_name="Alice")
 

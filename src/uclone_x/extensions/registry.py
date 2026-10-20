@@ -1,28 +1,27 @@
 """Find the installed extensions, and hand the core what they add (#2205).
 
-Two places are searched, and neither is named in code by what it holds:
+An extension is an installed package declaring an entry point in the group
+`uclone_x.extensions`. The entry point names an `Extension`, or a function of no arguments
+that returns one. The core names none of them.
 
-* **In the tree:** every top-level package of `uclone_x` that has an
-  `ucx_extension.py` module. The module's `EXTENSION` is the extension. The file is found
-  by name before anything is imported, so a package without one is never loaded.
-* **Installed:** every entry point in the group `uclone_x.extensions`. The entry point
-  names an `Extension`, or a function of no arguments that returns one.
-
-Why both, and why in this order, is in the design for #2205.
+The core's own packages were searched too while the story lived among them (#2205); since
+the story became its own example package (#2208) nothing in the core is an extension, and
+that search is gone.
 
 Finding is done once per process, on first use, and never at import: importing the
-agent or the tool registry loads no extension. Every failure raises `ExtensionError`
-naming the extension and where it came from -- one that does not import, has no
-`EXTENSION`, is not an `Extension`, or adds something that conflicts. Nothing is skipped
-with a log line, since a registry missing an extension's tools would look like a working
-one (P6).
+agent or the tool registry loads no extension. Every failure raises `ExtensionError` --
+one that does not import, has no `EXTENSION`, is not an `Extension`, or adds something
+that conflicts. Nothing is skipped with a log line, since a registry missing an
+extension's tools would look like a working one (P6). The error's words name the
+extension as it was installed and say what to do; where its entry point points and what
+the exception said go to the log, never to the person (#2283).
 """
 
 from __future__ import annotations
 
 import dataclasses
-import importlib
 import importlib.metadata
+import logging
 import threading
 from collections.abc import Callable, Generator, Sequence
 from contextlib import contextmanager
@@ -40,9 +39,9 @@ if TYPE_CHECKING:
 
 __all__ = [
     "ENTRY_POINT_GROUP",
-    "IN_TREE_MODULE",
     "a2a_character_lookup",
     "discover",
+    "extension_persona_dirs",
     "extension_lifecycle_hooks",
     "leased_folder_kinds",
     "loaded_extensions",
@@ -52,55 +51,103 @@ __all__ = [
     "with_extension_tools",
 ]
 
+logger = logging.getLogger(__name__)
+
 #: The entry-point group an installed package declares its extension under.
 ENTRY_POINT_GROUP: Final = "uclone_x.extensions"
-
-#: The module a top-level package of `uclone_x` declares its extension in.
-IN_TREE_MODULE: Final = "ucx_extension"
-
-#: The package searched for in-tree extensions. Read, not named: this is the core itself.
-_ROOT_PACKAGE: Final = __name__.split(".", 1)[0]
 
 _lock = threading.Lock()
 _loaded: tuple[Extension, ...] | None = None
 _override: tuple[Extension, ...] | None = None
 
 
-def _resolve(value: object, source: str) -> Extension:
-    """`value` as an `Extension`: itself, or what calling it returns."""
+def _built_for_a_newer_core(exc: Exception) -> bool:
+    """Whether `exc` is an extension building `Extension` with a field this core lacks.
+
+    That is an extension written against a newer core: most often a source checkout
+    older than the extension the shared environment installed (#2245).
+    """
+    signature = f"{Extension.__qualname__}.__init__()"
+    return isinstance(exc, TypeError) and str(exc).startswith(signature)
+
+
+def _newer_than_the_core(name: str) -> str:
+    """Plain words for `_built_for_a_newer_core`: what happened and what to do."""
+    return (
+        f"The extension {name!r} was written for a newer version of uclone-x than the one "
+        "running here, so it could not start. If you run uclone-x from a source checkout, "
+        "that checkout is older than the installed extension: merge origin/main into it. "
+        "Otherwise, upgrade uclone-x."
+    )
+
+
+def _logged(error: ExtensionError) -> ExtensionError:
+    """`error`, marked as one whose cause this module has logged (`cause_logged`)."""
+    error.cause_logged = True
+    return error
+
+
+def _could_not_load(name: str) -> str:
+    return (
+        f"The extension {name!r} is installed but could not be loaded. Reinstall it, or "
+        "uninstall it to run without it."
+    )
+
+
+def _could_not_start(name: str) -> str:
+    return (
+        f"The extension {name!r} could not start. Reinstall it, or uninstall it to run without it."
+    )
+
+
+def _not_an_extension(name: str) -> str:
+    return (
+        f"The package installed as the extension {name!r} does not provide a uclone-x "
+        "extension. Uninstall it, or install a version made for uclone-x."
+    )
+
+
+def _named_twice(name: str) -> str:
+    return (
+        f"Two installed extensions are both named {name!r}, so neither can be used. "
+        "Uninstall one of them."
+    )
+
+
+def _tools_failed(name: str) -> str:
+    return (
+        f"The extension {name!r} could not set up its tools. Reinstall it, or uninstall "
+        "it to run without it."
+    )
+
+
+def _resolve(value: object, source: str, name: str) -> Extension:
+    """`value` as an `Extension`: itself, or what calling it returns.
+
+    `source` says where it was found, for a developer; `name` is the entry point's name,
+    what a person installed it as, for the plain-words message (#2256).
+    """
     if not isinstance(value, Extension) and callable(value):
         try:
             value = value()
-        except ExtensionError:
+        except ExtensionError as exc:
+            # The extension's own words, or the contract's, kept as they are; the cause it
+            # chains -- and the file it was raised in -- go to the log here, as for any
+            # other failure, since nothing else logs them on the web head (#2294 review).
+            logger.error("extension %r at %s failed to start", name, source, exc_info=exc)
+            _logged(exc)
             raise
         except Exception as exc:
-            raise ExtensionError(f"The extension at {source} failed to start: {exc}") from exc
+            logger.error("extension %r at %s failed to start", name, source, exc_info=exc)
+            if _built_for_a_newer_core(exc):
+                raise _logged(ExtensionError(_newer_than_the_core(name))) from exc
+            raise _logged(ExtensionError(_could_not_start(name))) from exc
     if not isinstance(value, Extension):
-        raise ExtensionError(
-            f"{source} is not an extension: it gives a {type(value).__name__}, not an Extension."
+        logger.error(
+            "extension %r at %s gives a %s, not an Extension", name, source, type(value).__name__
         )
+        raise _logged(ExtensionError(_not_an_extension(name)))
     return value if value.source else dataclasses.replace(value, source=source)
-
-
-def _in_tree() -> list[Extension]:
-    """The extensions declared by `ucx_extension.py` modules in the core's own packages."""
-    root_module = importlib.import_module(_ROOT_PACKAGE)
-    found: list[Extension] = []
-    for directory in root_module.__path__:
-        for package in sorted(Path(directory).iterdir()):
-            if not (package / f"{IN_TREE_MODULE}.py").is_file():
-                continue
-            module_name = f"{_ROOT_PACKAGE}.{package.name}.{IN_TREE_MODULE}"
-            try:
-                module = importlib.import_module(module_name)
-            except Exception as exc:
-                raise ExtensionError(
-                    f"The extension module {module_name} could not be imported: {exc}"
-                ) from exc
-            if not hasattr(module, "EXTENSION"):
-                raise ExtensionError(f"The extension module {module_name} has no EXTENSION.")
-            found.append(_resolve(module.EXTENSION, module_name))
-    return found
 
 
 def _installed() -> list[Extension]:
@@ -113,8 +160,11 @@ def _installed() -> list[Extension]:
         try:
             value = entry.load()
         except Exception as exc:
-            raise ExtensionError(f"The extension at {source} could not be loaded: {exc}") from exc
-        found.append(_resolve(value, source))
+            logger.error("extension %r at %s could not be loaded", entry.name, source, exc_info=exc)
+            if _built_for_a_newer_core(exc):
+                raise _logged(ExtensionError(_newer_than_the_core(entry.name))) from exc
+            raise _logged(ExtensionError(_could_not_load(entry.name))) from exc
+        found.append(_resolve(value, source, entry.name))
     return found
 
 
@@ -124,10 +174,13 @@ def _checked(extensions: Sequence[Extension]) -> tuple[Extension, ...]:
     roots: dict[str, str] = {}
     for extension in extensions:
         if extension.name in by_name:
-            raise ExtensionError(
-                f"Two extensions are named {extension.name!r} "
-                f"({by_name[extension.name].source or 'given'} and {extension.source or 'given'})."
+            logger.error(
+                "two extensions are named %r: %s and %s",
+                extension.name,
+                by_name[extension.name].source or "given",
+                extension.source or "given",
             )
+            raise _logged(ExtensionError(_named_twice(extension.name)))
         by_name[extension.name] = extension
         for root in extension.protected_roots:
             holder = roots.setdefault(root.dirname, extension.name)
@@ -141,7 +194,7 @@ def _checked(extensions: Sequence[Extension]) -> tuple[Extension, ...]:
 
 def discover() -> tuple[Extension, ...]:
     """Every extension, in name order, found now. `loaded_extensions` keeps the answer."""
-    return _checked([*_in_tree(), *_installed()])
+    return _checked(_installed())
 
 
 def loaded_extensions() -> tuple[Extension, ...]:
@@ -190,12 +243,13 @@ def with_extension_tools(core: Sequence[ToolProtocol]) -> list[ToolProtocol]:
                 )
         try:
             added = list(extension.tools())
-        except ExtensionError:
+        except ExtensionError as error:
+            logger.error("extension %r could not build its tools", extension.name, exc_info=error)
+            _logged(error)
             raise
         except Exception as exc:
-            raise ExtensionError(
-                f"The extension {extension.name!r} could not build its tools: {exc}"
-            ) from exc
+            logger.error("extension %r could not build its tools", extension.name, exc_info=exc)
+            raise _logged(ExtensionError(_tools_failed(extension.name))) from exc
         replaced: set[str] = set()
         for tool in added:
             name = tool.name
@@ -230,6 +284,11 @@ def extension_lifecycle_hooks() -> list[TurnLifecycleHookProtocol]:
     for extension in loaded_extensions():
         hooks.extend(extension.lifecycle_hooks())
     return hooks
+
+
+def extension_persona_dirs() -> tuple[Path, ...]:
+    """Every folder of builtin personas an extension ships, in extension order."""
+    return tuple(folder for extension in loaded_extensions() for folder in extension.personas)
 
 
 def protected_roots() -> tuple[ProtectedRoot, ...]:

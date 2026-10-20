@@ -93,12 +93,12 @@ class TestLookup:
         Killed by: src/uclone_x/agent/persona_avatar.py :: template = record.template or (name if self._registry.has_builtin(name) else None)
         Becomes: template = record.template
         """
-        _install(tmp_path, "writer")
+        _install(tmp_path, "artist")
 
-        found = _store(tmp_path).find("writer")
+        found = _store(tmp_path).find("artist")
 
         assert found is not None
-        assert found.path == BUILTIN_PERSONAS_DIR / "writer.png"
+        assert found.path == BUILTIN_PERSONAS_DIR / "artist.png"
         assert found.mime == "image/png"
 
     def test_a_picture_chosen_in_the_workspace_wins_over_the_shipped_one(
@@ -514,3 +514,26 @@ class TestTheWriteGuard:
                 {"path": path, "content": "kept\n"}, _ctx(tmp_path)
             )
             assert result.success, (path, result.error)
+
+
+class TestMissingPictureRefusal:
+    def test_a_missing_picture_is_refused_without_naming_a_tool(self, tmp_path: Path) -> None:
+        """A model may repeat a refusal to the person, so it names no tool (#2165).
+
+        Set from the head, with no clone calling, it tells no one to draw (#2290); a clone's
+        own advice is pinned in `test_set_avatar_tool.py::TestTheMissingPictureAdvice`.
+
+        Killed by: src/uclone_x/agent/persona_avatar.py :: _FROM_A_PATH = "Use the path of a picture that is in the workspace."
+        Becomes: _FROM_A_PATH = "Use the path generate_image returned."
+        """
+        _install(tmp_path, "surveyor")
+        store = _store(tmp_path)
+
+        with pytest.raises(AvatarRefused) as caught:
+            store.set_from_path("surveyor", tmp_path / "nowhere.png")
+
+        assert caught.value.reason_code == "no_file"
+        message = str(caught.value)
+        assert message.endswith("Use the path of a picture that is in the workspace.")
+        for internal in ("generate_image", "set_avatar", "a2a_call", "show_self", "Error", "/"):
+            assert internal not in message, (internal, message)

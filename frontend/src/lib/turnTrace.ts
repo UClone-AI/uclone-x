@@ -133,6 +133,11 @@ export interface TurnTraceResponse {
   turn_id: string | null;
   participant_id: string;
   session_id: string;
+  /**
+   * The server's log file, where a provider's raw answer and the turn's failure are written
+   * (#2227). Absent from a Core older than the field.
+   */
+  log_file?: string | null;
   trace: TurnTrace | null;
   reason?: TraceReason | null;
 }

@@ -25,6 +25,7 @@ except ImportError as exc:
 
 from uclone_x import __version__
 from uclone_x.agent.session import SESSION_STORAGE_DIR_ENV_VAR
+from uclone_x.core.logging_setup import server_log_config
 from uclone_x.errors import DashboardNotIdentifiedError, FrontendBuildFailedError
 from uclone_x.shells import ui_process
 from uclone_x.shells.ui_process import UI_BIND_HOST_ENV_VAR
@@ -249,6 +250,8 @@ def _serve(
     address carries the pairing code after `#`, which the browser never sends back, and it
     is handed to the browser only -- not printed, not logged.
     """
+    # Both ways of serving, and the reload worker `dev` spawns, write `ucx.log` (#2227).
+    log_config = server_log_config()
     if dev:
         frontend_dir = Path(__file__).resolve().parents[3] / "frontend"
         vite_proc = None
@@ -330,6 +333,7 @@ def _serve(
                 reload=True,
                 reload_dirs=[src_dir],
                 log_level="info",
+                log_config=log_config,
                 timeout_graceful_shutdown=timeout_graceful_shutdown,
             )
         finally:
@@ -363,5 +367,6 @@ def _serve(
             host=host,
             port=port,
             log_level="info",
+            log_config=log_config,
             timeout_graceful_shutdown=timeout_graceful_shutdown,
         )

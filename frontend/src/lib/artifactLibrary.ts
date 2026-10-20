@@ -112,6 +112,7 @@ export interface SceneView {
   characters: string[];
   places: string[];
   written: boolean;
+  illustration?: string | null;
   entries: SceneEntry[];
   changes: SceneChange[];
   continuity: 'checked' | 'unread' | null;
@@ -150,6 +151,8 @@ export interface EntryView {
   aliases: string[];
   profile: string;
   state: Record<string, JsonValue>;
+  /** What the entry is to other entries at the start, by their id (uGraph step 6). */
+  relations: Record<string, string>;
   progressions: Record<string, JsonValue>[];
   looks: string[] | null;
 }

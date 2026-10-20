@@ -31,3 +31,11 @@ export const cloneLabel = (clone: Labelled, language: string): string => {
   }
   return clone.name;
 };
+
+/**
+ * Whether a clone can be offered as one to talk to: false for one whose settings file could
+ * not be loaded (#2241). The Core refuses a turn that names it, so a picker that offers it
+ * offers only that refusal; Settings › Personas & Clones still lists it, with why.
+ */
+export const isUsableClone = (clone: { status?: string }): boolean =>
+  clone.status !== 'unreadable';

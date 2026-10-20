@@ -66,6 +66,10 @@ class OntologyEngineProtocol(Protocol):
         """Retrieve active invariant rules filtered by domain and ontology tier (P7, P8)."""
         ...
 
+    def functional_relations(self) -> frozenset[str]:
+        """The relations declared to hold one value at a time, as a clone files them (#2332)."""
+        ...
+
     def export_linkml_yaml(self) -> str:
         """Serialize current ontology to LinkML YAML format."""
         ...

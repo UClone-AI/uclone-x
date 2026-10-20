@@ -9,7 +9,12 @@ from typing import Any, ClassVar
 from pydantic import BaseModel, ConfigDict, Field
 
 from uclone_x.errors import ComfyUIError
-from uclone_x.tools.base import BaseTool, artifact_content_url, replace_file
+from uclone_x.tools.base import (
+    BaseTool,
+    artifact_content_url,
+    replace_file,
+    session_artifacts_dir,
+)
 from uclone_x.tools.builtin.comfy_client import (
     COMFY_CHECKPOINT_ENV,
     COMFY_DEFAULT_CHECKPOINT,
@@ -223,8 +228,8 @@ class ComfyImageGenTool(BaseTool[ComfyImageGenParams]):
         if params.output_path is not None:
             dest_path = self.resolve_write_path(params.output_path, context.require_workspace())
         else:
-            # The session's own directory, the one the Docs & Artifacts listing reads (#1390).
-            session_dir = f"artifacts/{context.session_id or 'sess_default'}"
+            # The session's own directory (#1390); its id is checked before it names a folder.
+            session_dir = session_artifacts_dir(context)
             default_rel = f"{session_dir}/images/{actual_seed}_{uuid.uuid4().hex[:8]}.png"
             dest_path = self.resolve_safe_path(default_rel, context.require_workspace())
 

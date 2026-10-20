@@ -1,0 +1,82 @@
+{
+  "empty": {
+    "title": "No turn selected.",
+    "hint": "Press {why} under any turn to see which model served it and how the speaker was chosen."
+  },
+  "gone": {
+    "title": "This turn is no longer in the conversation.",
+    "hint": "It was removed by a rewind or by clearing the history. Pick another turn."
+  },
+  "loading": "Loading turn record...",
+  "outcome": {
+    "stopped": "Stopped",
+    "couldNotFinish": "Couldn't finish",
+    "replied": "Replied"
+  },
+  "tokens": {
+    "one": "{count} token",
+    "other": "{count} tokens"
+  },
+  "notable": {
+    "degraded": "Substituted: the requested model was not available.",
+    "failover": "Served on a failover path after earlier attempts failed.",
+    "retried": "Retried: required multiple attempts to complete.",
+    "contested": "Contested: multiple candidates were evaluated.",
+    "ended_in_error": "Ended in an error: no model answered, and nothing was used in its place."
+  },
+  "record": {
+    "askedFor": "Asked for",
+    "substituted": "substituted",
+    "path": "Path",
+    "route": "Route",
+    "attempts": "Attempts ({count})",
+    "chosenBy": "Chosen by",
+    "onlySeated": "Only seated agent",
+    "selected": "Selected agent",
+    "confidenceDev": "Selector reported confidence {value}.",
+    "confidence": "Confidence {value}.",
+    "noDecision": "Nobody chose this speaker: the turn records no selection.",
+    "sawThrough": "Saw through",
+    "contextThrough": "Context through",
+    "throughTurn": "turn {n}",
+    "notRecorded": "Not recorded for this turn.",
+    "copy": "Copy",
+    "copied": "Copied",
+    "copyTurnId": "Copy turn ID",
+    "copyTurnIdChip": "Turn ID {id} (click to copy)"
+  },
+  "steps": {
+    "title": "What it did",
+    "notRecorded": "This turn's steps weren't recorded.",
+    "notAnAgentTurn": "This turn was not run by an agent.",
+    "none": "No tools used.",
+    "helper": "Handed part of this to a helper. The helper's own steps aren't kept.",
+    "failed": "This step failed.",
+    "status": {
+      "success": "done",
+      "error": "failed",
+      "running": "running",
+      "timeout": "timed out"
+    }
+  },
+  "changed": {
+    "title": "Changed",
+    "none": "No documents changed.",
+    "writes": "({count} writes)",
+    "open": "Open",
+    "unnamed": {
+      "one": "May also have written {count} file it did not name.",
+      "other": "May also have written {count} files it did not name."
+    }
+  },
+  "model": {
+    "answeredBy": "Answered by",
+    "none": "This turn reported no model, so none is named here.",
+    "noAnswer": "{model} did not answer: the turn ended in an error.",
+    "noAnswerUnnamed": "No model answered: the turn ended in an error.",
+    "disclosure": "How this reply was chosen"
+  },
+  "error": {
+    "title": "This turn did not finish"
+  }
+}

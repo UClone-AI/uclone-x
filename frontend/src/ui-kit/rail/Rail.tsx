@@ -223,7 +223,12 @@ export const Rail: React.FC<RailProps> = ({
    * 3. Clones without conversations fall to the bottom of their tier, sorted alphabetically.
    */
   const clones = React.useMemo(() => {
-    const base = (personas ?? []).map((p) => ({ id: p.id ?? p.name, label: p.label ?? p.name, role: p.role }));
+    const base = (personas ?? []).map((p) => ({
+      id: p.id ?? p.name,
+      label: p.label ?? p.name,
+      role: p.role,
+      unreadable: p.unreadable ?? false,
+    }));
 
     const latestActive = new Map<string, number>();
     for (const room of rooms) {
@@ -254,6 +259,13 @@ export const Rail: React.FC<RailProps> = ({
       return cmp !== 0 ? cmp : a.id.localeCompare(b.id);
     });
   }, [personas, rooms, pinnedCloneIds]);
+
+  /**
+   * The clones the list shows. One whose settings could not be loaded is left out unless it
+   * has 1:1 conversations: those are drawn only under its row, and hiding the row would hide
+   * them with no word of why (#2241).
+   */
+  const listed = clones.filter((c) => !c.unreadable || sessionsByClone.has(c.id));
 
   /** What a seat is called: its clone's label, since the seat itself is the clone's id. */
   const agentLabel = (agentId: string) => clones.find((c) => c.id === agentId)?.label ?? agentId;
@@ -311,7 +323,7 @@ export const Rail: React.FC<RailProps> = ({
             onDeleteRoom={onDeleteRoom}
             // `clones`: the empty list's cause says whether any clone is set up, and `clones`
             // is what the section below actually lists (#1088).
-            agentCount={clones.length}
+            agentCount={listed.length}
             modelConfigured={modelConfigured}
             listTestId="sessions-list"
             onCollapse={onClose}
@@ -352,8 +364,8 @@ export const Rail: React.FC<RailProps> = ({
               cap was load-bearing while this section was the second of two scrollers;
               with one scroller for the whole body, the section sizes to its rows. */}
           <div className="space-y-0.5">
-            {clones.length > 0 ? (
-              clones.map((clone, index) => {
+            {listed.length > 0 ? (
+              listed.map((clone, index) => {
                 const cloneSessions = sessionsByClone.get(clone.id) || [];
                 const hasSessions = cloneSessions.length > 0;
                 const isExpanded = expandedClones[clone.id] ?? true;
@@ -364,7 +376,7 @@ export const Rail: React.FC<RailProps> = ({
                 // a rule over the first unpinned one.
                 const startsPinned = isPinned && index === 0;
                 const startsUnpinned =
-                  !isPinned && index > 0 && (pinnedCloneIds ?? []).includes(clones[index - 1].id);
+                  !isPinned && index > 0 && (pinnedCloneIds ?? []).includes(listed[index - 1].id);
                 const isMenuOpen = menuCloneId === clone.id;
                 const menuItems: CloneRowMenuItem[] = [];
                 if (onTogglePinClone) {
@@ -377,7 +389,8 @@ export const Rail: React.FC<RailProps> = ({
                     onSelect: () => onTogglePinClone(clone.id),
                   });
                 }
-                if (onEditAgent) {
+                // An unreadable clone has nothing loaded to edit: a save would be refused.
+                if (onEditAgent && !clone.unreadable) {
                   menuItems.push({
                     testId: `persona-edit-${clone.id}`,
                     label: copy.editTitle || `Edit ${clone.label} settings`,
@@ -401,6 +414,7 @@ export const Rail: React.FC<RailProps> = ({
                       onSelectRoom(cloneSessions[0].room_id);
                     }
                   } else {
+                    // Not reached for an unreadable clone: it is listed only with sessions.
                     onNewRoom(clone.id);
                   }
                 };
@@ -472,7 +486,17 @@ export const Rail: React.FC<RailProps> = ({
                           <div className="flex items-center gap-1.5 truncate">
                             <span className="truncate text-sm font-medium text-slate-200">{clone.label}</span>
                           </div>
-                          {clone.role && (
+                          {/* On the role's line, which an unreadable clone does not have: on the
+                              name's line the mark squeezed a short name to one letter (#2253). */}
+                          {clone.unreadable ? (
+                            <span
+                              data-testid={`clone-unreadable-${clone.id}`}
+                              className="self-start text-[10px] text-amber-300 border border-amber-800 rounded px-1"
+                              title={copy.unreadableTitle}
+                            >
+                              {copy.unreadableBadge}
+                            </span>
+                          ) : clone.role && (
                             <span
                               className="text-[12px] font-mono text-slate-500 truncate flex items-center gap-0.5"
                               title={clone.role}
@@ -490,6 +514,7 @@ export const Rail: React.FC<RailProps> = ({
                               : 'opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto group-focus-within:opacity-100 group-focus-within:pointer-events-auto'
                           }`}
                         >
+                          {clone.unreadable ? null : (
                           <button
                             type="button"
                             data-testid={`clone-new-thread-${clone.id}`}
@@ -510,6 +535,7 @@ export const Rail: React.FC<RailProps> = ({
                           >
                             <NewThreadIcon className="w-3.5 h-3.5" />
                           </button>
+                          )}
                           {menuItems.length > 0 && (
                             <button
                               type="button"
@@ -680,7 +706,7 @@ export const Rail: React.FC<RailProps> = ({
                 data-testid="agents-empty-cause"
                 className="text-[11px] text-slate-500 leading-relaxed py-1 px-1"
               >
-                {copy.conversations.emptyCause(modelConfigured, clones.length)}
+                {copy.conversations.emptyCause(modelConfigured, listed.length)}
               </p>
             )}
           </div>

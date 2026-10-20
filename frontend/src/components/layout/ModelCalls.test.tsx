@@ -142,6 +142,21 @@ const expandSection = async (): Promise<void> => {
 };
 
 describe('ModelCalls (#1492)', () => {
+  // Killed by: frontend/src/components/layout/ModelCalls.tsx :: {fmt(t.where, { session: body.session_id, log: body.log_file ?? '—' })}
+  // Becomes: {null}
+  it('names the session and the server log, with a trace or without one (#2227)', async () => {
+    answers[TRACE_URL] = ok({
+      ...trace([]),
+      trace: null,
+      reason: { code: 'session_not_found', message: 'gone' },
+      log_file: '/home/u/.uclone/logs/ucx.log',
+    });
+    render(<ModelCalls roomId="room_1" seq={4} />);
+    await expandSection();
+    const where = await screen.findByTestId('model-calls-where');
+    expect(where.textContent).toBe('Session sess_scout · server log /home/u/.uclone/logs/ucx.log');
+  });
+
   // Killed by: frontend/src/components/layout/ModelCalls.tsx :: if (next && read === null) {
   // Becomes: if (next) {
   it('reads nothing until expanded, then reads the trace once however often it is toggled', async () => {

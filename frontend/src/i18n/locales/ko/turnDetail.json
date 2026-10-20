@@ -1,0 +1,82 @@
+{
+  "empty": {
+    "title": "선택한 턴이 없습니다.",
+    "hint": "턴 아래의 {why} 버튼을 누르면 어느 모델이 답했고 누가 말하도록 정해졌는지 볼 수 있습니다."
+  },
+  "gone": {
+    "title": "이 턴은 더 이상 대화에 없습니다.",
+    "hint": "되돌리기나 기록 지우기로 사라졌습니다. 다른 턴을 고르세요."
+  },
+  "loading": "턴 기록을 불러오는 중입니다...",
+  "outcome": {
+    "stopped": "멈춤",
+    "couldNotFinish": "끝내지 못함",
+    "replied": "답함"
+  },
+  "tokens": {
+    "one": "토큰 {count}개",
+    "other": "토큰 {count}개"
+  },
+  "notable": {
+    "degraded": "대체됨: 요청한 모델을 쓸 수 없었습니다.",
+    "failover": "앞선 시도가 실패해 다른 경로로 답했습니다.",
+    "retried": "다시 시도함: 여러 번 시도한 끝에 끝났습니다.",
+    "contested": "경합: 여러 후보를 비교했습니다.",
+    "ended_in_error": "오류로 끝남: 답한 모델이 없고, 대신 쓰인 것도 없습니다."
+  },
+  "record": {
+    "askedFor": "요청한 모델",
+    "substituted": "대체됨",
+    "path": "경로",
+    "route": "경로",
+    "attempts": "시도 ({count})",
+    "chosenBy": "고른 방식",
+    "onlySeated": "자리에 있는 유일한 클론",
+    "selected": "선택된 클론",
+    "confidenceDev": "선택기가 보고한 확신도 {value}.",
+    "confidence": "확신도 {value}.",
+    "noDecision": "이 화자를 고른 기록이 없습니다.",
+    "sawThrough": "본 범위",
+    "contextThrough": "맥락 범위",
+    "throughTurn": "{n}번째 턴까지",
+    "notRecorded": "이 턴에는 기록되지 않았습니다.",
+    "copy": "복사",
+    "copied": "복사됨",
+    "copyTurnId": "턴 ID 복사",
+    "copyTurnIdChip": "턴 ID {id} (누르면 복사)"
+  },
+  "steps": {
+    "title": "한 일",
+    "notRecorded": "이 턴의 단계는 기록되지 않았습니다.",
+    "notAnAgentTurn": "이 턴은 클론이 실행하지 않았습니다.",
+    "none": "도구를 쓰지 않았습니다.",
+    "helper": "일부를 보조 클론에게 맡겼습니다. 보조 클론의 단계는 남지 않습니다.",
+    "failed": "이 단계는 실패했습니다.",
+    "status": {
+      "success": "완료",
+      "error": "실패",
+      "running": "진행 중",
+      "timeout": "시간 초과"
+    }
+  },
+  "changed": {
+    "title": "바뀐 것",
+    "none": "바뀐 문서가 없습니다.",
+    "writes": "({count}번 씀)",
+    "open": "열기",
+    "unnamed": {
+      "one": "이름을 밝히지 않은 파일 {count}개를 더 썼을 수 있습니다.",
+      "other": "이름을 밝히지 않은 파일 {count}개를 더 썼을 수 있습니다."
+    }
+  },
+  "model": {
+    "answeredBy": "답한 모델:",
+    "none": "이 턴은 모델을 보고하지 않아 여기에 이름이 없습니다.",
+    "noAnswer": "{model} 모델이 답하지 못했습니다. 턴이 오류로 끝났습니다.",
+    "noAnswerUnnamed": "답한 모델이 없습니다. 턴이 오류로 끝났습니다.",
+    "disclosure": "이 답이 정해진 방식"
+  },
+  "error": {
+    "title": "이 턴은 끝나지 않았습니다"
+  }
+}

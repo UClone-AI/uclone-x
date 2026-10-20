@@ -46,7 +46,26 @@
     "valueMissing": "대신 기억할 내용을 입력해 주십시오.",
     "factGone": "이 사실은 더 이상 {name}의 기억에 없습니다. 이미 잊었거나 고쳤을 수 있습니다.",
     "memoryUnreadable": "{name}의 기억을 읽지 못해 아무것도 바꾸지 않았습니다.",
-    "editFailed": "변경하지 못했습니다. 다시 시도해 주십시오."
+    "editFailed": "변경하지 못했습니다. 다시 시도해 주십시오.",
+    "oneValue": "값은 하나만",
+    "oneValueOn": "값이 하나뿐입니다. 새 값이 이전 값을 대신합니다.",
+    "askOneValue": "{relation}의 값은 한 번에 하나뿐입니까? 그렇다면 새 값이 이전 값을 대신합니다.",
+    "askYes": "예, 하나뿐입니다",
+    "askNo": "아니요, 여러 값입니다",
+    "saidLast": "마지막으로 말함",
+    "oneValueFailed": "저장하지 못했습니다. 다시 시도해 주십시오.",
+    "history": "이력",
+    "historyHide": "이력 닫기",
+    "historyQuote": "배운 말: “{quote}”",
+    "historyLearned": "배운 날: {when}",
+    "historyLastSeen": "마지막으로 들은 날: {when}",
+    "historyReplaced": "{value}을(를) 대신함 ({when}에 들은 값)",
+    "historyNothingReplaced": "대신한 이전 값이 없습니다.",
+    "restore": "되살리기",
+    "restoreStale": "{value}을(를) 되살리지 못했습니다. 그사이 바뀌었습니다.",
+    "restoreFailed": "{name}이(가) 그 값을 되살리지 못했습니다. 이미 바뀌었을 수 있습니다.",
+    "mergedFrom": "{name}와(과) 같은 대상으로 합침",
+    "keepSeparate": "따로 두기"
   },
   "activity": {
     "readFailed": "{name}의 활동을 읽지 못했습니다.",
@@ -144,6 +163,7 @@
     "helpers": "도우미 에이전트가 실행되었습니다 ({names}). 도우미 자신의 모델 호출은 보관하지 않습니다.",
     "helpersUnreadable": "도우미 에이전트를 가리키는 도구 결과를 읽지 못했습니다. 이 목록에서 도우미가 빠졌을 수 있습니다.",
     "noSteps": "세션 로그에 이 턴의 모델 호출이 없습니다.",
+    "where": "세션 {session} · 서버 로그 {log}",
     "headline": {
       "step": "{step}단계",
       "tokens": "{input} → {output}토큰"
@@ -317,6 +337,11 @@
     "codex": "설정집",
     "noEntries": "설정집에 아직 {label} 항목이 없습니다.",
     "looks": "외모: {looks}",
+    "relationOf": "{name}의 {word}",
+    "relationsLine": "관계: {relations}",
+    "changeFrom": "“{scene}”부터: {what}",
+    "relationNow": "{name}의 {word}",
+    "relationEnds": "{name}와(과)의 관계 없음",
     "unreadable": "다음 파일을 읽지 못해 표시하지 않습니다:",
     "codexUnreadable": "다음 파일이나 폴더를 읽지 못해 표시하지 않습니다:",
     "decided": "결정한 변경",
@@ -420,11 +445,16 @@
     "restart": "다시 시작",
     "lastStep": "마지막 단계: {step}",
     "lastStepNone": "아직 수행한 작업이 없습니다",
+    "saveOffer": {
+      "ask": "다음에 {name}이(가) 로그인할 수 있도록 이 로그인 정보를 저장하시겠습니까?",
+      "save": "저장",
+      "notNow": "나중에"
+    },
     "banner": {
       "acting": "{name}이(가) 브라우저를 사용하고 있습니다",
       "idle": "대기 중입니다 — {name}이(가) 작업을 마쳤습니다",
       "userControl": "지금 직접 제어하고 있습니다",
-      "askedUser": "{name}이(가) {site}에 로그인을 요청했습니다",
+      "askedUser": "{name}이(가) {site}에서 직접 조작해 달라고 요청했습니다",
       "chromeMissing": "Google Chrome이 설치되어 있지 않습니다. 클론이 브라우저를 사용하려면 Chrome이 필요합니다.",
       "extensionMissing": "내 Chrome 연결: UClone-X 확장 프로그램을 추가하십시오",
       "crashed": "브라우저가 예기치 않게 중지되었습니다.",
@@ -470,6 +500,8 @@
       "tab": "탭을 전환했습니다",
       "other": "브라우저를 사용했습니다",
       "failed": "{step} — 실패했습니다",
+      "askUser": "탭을 넘겨드렸습니다",
+      "signIn": "저장된 로그인을 사용했습니다",
       "show": "브라우저 탭에서 보기"
     }
   }

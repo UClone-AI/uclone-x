@@ -131,7 +131,7 @@ class LiveView:
                 inbox.put_nowait(
                     {"type": "_tab", "clone": message.get("clone"), "index": message.get("index")}
                 )
-            elif kind in ("take_over", "give_back", "stop", "hand_to"):
+            elif kind in ("take_over", "give_back", "stop", "hand_to", "dismiss_save_offer"):
                 inbox.put_nowait({"type": "_control", "to": kind, "target": message.get("target")})
             elif kind == "new_tab":
                 inbox.put_nowait({"type": "_new_tab", "url": message.get("url") or "about:blank"})
@@ -191,6 +191,8 @@ class LiveView:
                 clone = shown[0] if shown and shown[0] != "user" else None
                 index = shown[1] if shown else None
                 self._service.give_back(self._conversation, clone, index)
+            elif action == "dismiss_save_offer":
+                self._service.dismiss_save_offer(self._conversation)
             elif action == "hand_to" and isinstance(target, str):
                 index = shown[1] if shown else None
                 self._service.hand_to(self._conversation, target, index)

@@ -33,16 +33,20 @@ from uclone_x.agent.hooks.protocols import BaseHook
 from uclone_x.agent.models import AgentConfig
 from uclone_x.agent.persona_registry import PersonaRegistry
 from uclone_x.engine.event_bus import AgentEvent, EventBus, EventType
+from uclone_x.knowledge.quotes import quote_found
 from uclone_x.llm.models import ToolCallRequest
 from uclone_x.room.a2a_handlers import (
     _DeferredApprovalRunner,  # pyright: ignore[reportPrivateUsage]
 )
-from uclone_x.story.character import StoryCharacterSheetTool as CharacterSheetTool
-from uclone_x.story.quotes import quote_found
-from uclone_x.story.schemas import Outline, StoryFileError, parse_file
-from uclone_x.story.timeline import assumptions, place_scenes, time_key
-from uclone_x.story.tool import StoryLibraryTool
-from uclone_x.story.tools import (
+from uclone_x.tools.base import BaseTool, tool_writes_files
+from uclone_x.tools.models import NoIsolation, ToolContext, ToolResult
+from uclone_x.tools.registry import ToolRegistry
+from uclone_x.tools.schema import advertised_tool_parameters
+from uclone_x_story.character import StoryCharacterSheetTool as CharacterSheetTool
+from uclone_x_story.schemas import Outline, StoryFileError, parse_file
+from uclone_x_story.timeline import assumptions, place_scenes, time_key
+from uclone_x_story.tool import StoryLibraryTool
+from uclone_x_story.tools import (
     AUDIT_FACT_EXAMPLE,
     StoryAuditTool,
     StoryCodexTool,
@@ -50,10 +54,6 @@ from uclone_x.story.tools import (
     StoryManuscriptTool,
     StoryOutlineTool,
 )
-from uclone_x.tools.base import BaseTool, tool_writes_files
-from uclone_x.tools.models import NoIsolation, ToolContext, ToolResult
-from uclone_x.tools.registry import ToolRegistry
-from uclone_x.tools.schema import advertised_tool_parameters
 
 ROOM = "room_a"
 
@@ -166,13 +166,13 @@ class TestStoryTime:
         Dotted values of any depth compare part by part, so the order stays total when
         depths mix (#1597 review B3), and a date written with dots is in date order.
 
-        Killed by: src/uclone_x/story/timeline.py :: return [_number(part, signed and not index) for index, part in enumerate(parts)]
+        Killed by: examples/story/src/uclone_x_story/timeline.py :: return [_number(part, signed and not index) for index, part in enumerate(parts)]
         Becomes: return [_number(parts[0], signed)]
-        Killed by: src/uclone_x/story/timeline.py :: return [_number(part, signed and not index) for index, part in enumerate(parts)]
+        Killed by: examples/story/src/uclone_x_story/timeline.py :: return [_number(part, signed and not index) for index, part in enumerate(parts)]
         Becomes: return [_number(part, False) for index, part in enumerate(parts)]
-        Killed by: src/uclone_x/story/timeline.py :: return [_number(part, signed and not index) for index, part in enumerate(parts)]
+        Killed by: examples/story/src/uclone_x_story/timeline.py :: return [_number(part, signed and not index) for index, part in enumerate(parts)]
         Becomes: return [_number(part, signed) for index, part in enumerate(parts)]
-        Killed by: src/uclone_x/story/timeline.py :: if signed and match.start() > 0 and not text[match.start() - 1].isspace():
+        Killed by: examples/story/src/uclone_x_story/timeline.py :: if signed and match.start() > 0 and not text[match.start() - 1].isspace():
         Becomes: if False:
         """
         times = ["1.1", "1.2", "1.2.1", "1.5", "1.10", "2"]
@@ -190,7 +190,7 @@ class TestStoryTime:
     def test_a_superscript_is_text_not_a_number(self) -> None:
         """#1597 review B3: `²` is a digit to `str.isdigit` but not to `int` or `\\d`.
 
-        Killed by: src/uclone_x/story/timeline.py :: if not (token[0].isdecimal() or (token[0] == "-" and len(token) > 1)):
+        Killed by: examples/story/src/uclone_x_story/timeline.py :: if not (token[0].isdecimal() or (token[0] == "-" and len(token) > 1)):
         Becomes: if not (token[0].isdigit() or (token[0] == "-" and len(token) > 1)):
         """
         assert time_key("²x") == ((1, "²x"),)
@@ -200,11 +200,11 @@ class TestStoryTime:
     def test_a_number_of_any_length_is_ordered_by_its_value(self) -> None:
         """#1601: `int` refuses more than 4300 digits, and a `story_time` is free text.
 
-        Killed by: src/uclone_x/story/timeline.py :: plain = "".join(str(unicodedata.decimal(ch)) for ch in digits).lstrip("0")
+        Killed by: examples/story/src/uclone_x_story/timeline.py :: plain = "".join(str(unicodedata.decimal(ch)) for ch in digits).lstrip("0")
         Becomes: plain = str(int(digits)).lstrip("0")
-        Killed by: src/uclone_x/story/timeline.py :: return (0, -len(plain), plain.translate(_COMPLEMENT))
+        Killed by: examples/story/src/uclone_x_story/timeline.py :: return (0, -len(plain), plain.translate(_COMPLEMENT))
         Becomes: return (0, -len(plain), plain)
-        Killed by: src/uclone_x/story/timeline.py :: return (0, -len(plain), plain.translate(_COMPLEMENT))
+        Killed by: examples/story/src/uclone_x_story/timeline.py :: return (0, -len(plain), plain.translate(_COMPLEMENT))
         Becomes: return (0, len(plain), plain.translate(_COMPLEMENT))
         """
         long_times = ["-" + "9" * 5000, "-" + "1" * 5000, "0", "9" * 4999, "1" * 5000, "2" * 5000]
@@ -220,9 +220,9 @@ class TestStoryTime:
     def test_an_int_of_any_length_is_ordered_as_its_digits_are(self) -> None:
         """#1613: `str` refuses an `int` of more than 4300 digits; a string time has no limit.
 
-        Killed by: src/uclone_x/story/timeline.py :: return ((0, _number(_decimal(abs(value)), value < 0)),)
+        Killed by: examples/story/src/uclone_x_story/timeline.py :: return ((0, _number(_decimal(abs(value)), value < 0)),)
         Becomes: return ((0, _number(str(abs(value)), value < 0)),)
-        Killed by: src/uclone_x/story/timeline.py :: chunks.append(f"{low:0{_CHUNK_DIGITS}d}")
+        Killed by: examples/story/src/uclone_x_story/timeline.py :: chunks.append(f"{low:0{_CHUNK_DIGITS}d}")
         Becomes: chunks.append(str(low))
         """
         huge = 10**5000 + 7
@@ -235,7 +235,7 @@ class TestStoryTime:
 
         Python refuses both with its own `ValueError`; the author is told what to do.
 
-        Killed by: src/uclone_x/story/schemas.py :: except ValueError as exc:
+        Killed by: examples/story/src/uclone_x_story/schemas.py :: except ValueError as exc:
         Becomes: except KeyError as exc:
         """
         for value in ("1" * 5000, "2024-13-01"):
@@ -250,9 +250,9 @@ class TestStoryTime:
     def test_times_compare_as_numbers_and_an_untimed_scene_continues_the_one_before(
         self,
     ) -> None:
-        """Killed by: src/uclone_x/story/timeline.py :: key.append((0, number))
+        """Killed by: examples/story/src/uclone_x_story/timeline.py :: key.append((0, number))
         Becomes: key.append((1, str(number)))
-        Killed by: src/uclone_x/story/timeline.py :: placements[scene.id] = Placement(scene.id, index, current, inherited_from=source)
+        Killed by: examples/story/src/uclone_x_story/timeline.py :: placements[scene.id] = Placement(scene.id, index, current, inherited_from=source)
         Becomes: placements[scene.id] = Placement(scene.id, index, (), untimed=True)
         """
         assert time_key("day 3") < time_key("day 10")
@@ -292,7 +292,7 @@ class TestStoryTime:
     async def test_a_flashback_s_context_shows_the_entry_as_it_was_then(
         self, tmp_path: Path
     ) -> None:
-        """Killed by: src/uclone_x/story/timeline.py :: elif placement.position > here.position:
+        """Killed by: examples/story/src/uclone_x_story/timeline.py :: elif placement.position > here.position:
         Becomes: elif False:
         """
         _, ctx = await _timed_story(tmp_path)
@@ -325,9 +325,9 @@ class TestTheAuditChecksAgainstStoryTime:
     ) -> None:
         """The acceptance of #1557: the same fact, two scenes, two answers.
 
-        Killed by: src/uclone_x/story/audit.py :: for row in store.rows_at(store.point(scene_id, ended=True)):
-        Becomes: for row in store.rows_at(store.point("ch01.s03", ended=True)):
-        Killed by: src/uclone_x/story/audit.py :: pred, obj = "type", self.class_name(value)
+        Killed by: examples/story/src/uclone_x_story/audit.py :: for row in store.rows_at(store.point(scene_id, ended=True), proposed=proposed):
+        Becomes: for row in store.rows_at(store.point("ch01.s03", ended=True), proposed=proposed):
+        Killed by: examples/story/src/uclone_x_story/audit.py :: pred, obj = "type", self.class_name(value)
         Becomes: obj = self.class_name(value)
         """
         _, ctx = await _timed_story(tmp_path)
@@ -370,8 +370,8 @@ class TestTheAuditChecksAgainstStoryTime:
     async def test_the_scene_s_own_change_is_in_force_when_it_is_checked(
         self, tmp_path: Path
     ) -> None:
-        """Killed by: src/uclone_x/story/timeline.py :: if not through_scene:
-        Becomes: if True:
+        """Killed by: examples/story/src/uclone_x_story/audit.py :: for row in store.rows_at(store.point(scene_id, ended=True), proposed=proposed):
+        Becomes: for row in store.rows_at(store.point(scene_id, ended=False), proposed=proposed):
         """
         _, ctx = await _timed_story(tmp_path)
         out = await _ok(
@@ -388,11 +388,11 @@ class TestTheAuditChecksAgainstStoryTime:
     async def test_a_fact_without_a_quote_or_with_one_the_scene_lacks_is_rejected(
         self, tmp_path: Path
     ) -> None:
-        """Killed by: src/uclone_x/story/audit.py :: if fact.quote is None or not fact.quote.strip():
+        """Killed by: examples/story/src/uclone_x_story/audit.py :: if fact.quote is None or not fact.quote.strip():
         Becomes: if False:
-        Killed by: src/uclone_x/story/audit.py :: elif not quote_found(fact.quote, scene_text):
+        Killed by: examples/story/src/uclone_x_story/audit.py :: elif not quote_found(fact.quote, scene_text):
         Becomes: elif False:
-        Killed by: src/uclone_x/story/audit.py :: elif quote_too_short(fact.quote):
+        Killed by: examples/story/src/uclone_x_story/audit.py :: elif quote_too_short(fact.quote):
         Becomes: elif False:
         """
         _, ctx = await _timed_story(tmp_path)
@@ -433,7 +433,7 @@ class TestTheAuditChecksAgainstStoryTime:
         )
 
     async def test_one_owner_at_a_time_is_a_default_rule(self, tmp_path: Path) -> None:
-        """Killed by: src/uclone_x/story/schemas.py :: kind="inverseFunctional",
+        """Killed by: examples/story/src/uclone_x_story/schemas.py :: kind="inverseFunctional",
         Becomes: kind="inverseFunctionaX",
         """
         story_id, ctx = await _timed_story(tmp_path)
@@ -464,7 +464,7 @@ class TestTheAuditChecksAgainstStoryTime:
     async def test_story_yaml_s_rules_replace_the_defaults(self, tmp_path: Path) -> None:
         """An empty list is the story's choice: nothing is checked against a rule.
 
-        Killed by: src/uclone_x/story/work.py :: return story_axioms(extra.get("axioms"), present="axioms" in extra, where=STORY_FILE)
+        Killed by: examples/story/src/uclone_x_story/work.py :: return story_axioms(extra.get("axioms"), present="axioms" in extra, where=STORY_FILE)
         Becomes: return story_axioms(None, present=False, where=STORY_FILE)
         """
         story_id, ctx = await _timed_story(tmp_path)
@@ -481,15 +481,15 @@ class TestTheAuditChecksAgainstStoryTime:
     ) -> None:
         """#1584 item 2: a lowercase rule applies, and one that cannot is named as written.
 
-        Killed by: src/uclone_x/story/audit.py :: return class_name(subject), class_name(obj)
+        Killed by: examples/story/src/uclone_x_story/audit.py :: return class_name(subject), class_name(obj)
         Becomes: return subject, obj
-        Killed by: src/uclone_x/story/audit.py :: return self._spelling.setdefault(spelled.casefold(), spelled)
+        Killed by: examples/story/src/uclone_x_story/audit.py :: return self._spelling.setdefault(spelled.casefold(), spelled)
         Becomes: return spelled
-        Killed by: src/uclone_x/story/audit.py :: {"rule": written.get(u.source, u.source), "reason": _plain_reason(u.reason)}
+        Killed by: examples/story/src/uclone_x_story/audit.py :: {"rule": written.get(u.source, u.source), "reason": _plain_reason(u.reason)}
         Becomes: {"rule": u.source, "reason": _plain_reason(u.reason)}
-        Killed by: src/uclone_x/story/audit.py :: {"rule": written.get(u.source, u.source), "reason": _plain_reason(u.reason)}
+        Killed by: examples/story/src/uclone_x_story/audit.py :: {"rule": written.get(u.source, u.source), "reason": _plain_reason(u.reason)}
         Becomes: {"rule": written.get(u.source, u.source), "reason": u.reason}
-        Killed by: src/uclone_x/story/audit.py :: return _KINDS.get(_WORD_JOIN.sub("", _KIND_PREFIX.sub("", raw.strip())).casefold())
+        Killed by: examples/story/src/uclone_x_story/audit.py :: return _KINDS.get(_WORD_JOIN.sub("", _KIND_PREFIX.sub("", raw.strip())).casefold())
         Becomes: return _KINDS.get(raw.strip())
         """
         story_id, ctx = await _timed_story(tmp_path)
@@ -526,8 +526,8 @@ class TestTheAuditChecksAgainstStoryTime:
     ) -> None:
         """#1597 review B1: `HalfDead` in a rule meets `half dead` in the codex.
 
-        Killed by: src/uclone_x/story/audit.py :: return self._spelling.setdefault(spelled.casefold(), spelled)
-        Becomes: return spelled
+        Killed by: examples/story/src/uclone_x_story/audit.py :: words = [part for part in _WORD_JOIN.split(_nfc(raw)) if part]
+        Becomes: words = [_nfc(raw)]
         """
         story_id, ctx = await _timed_story(tmp_path)
         _codex(
@@ -558,9 +558,9 @@ class TestTheAuditChecksAgainstStoryTime:
     ) -> None:
         """#1613: the codex's `HALF-dead`, named by no rule, is shown `HalfDead`, not `HALFDead`.
 
-        Killed by: src/uclone_x/story/audit.py :: words = [word.capitalize() if word.isupper() else word for word in words]
+        Killed by: examples/story/src/uclone_x_story/audit.py :: words = [word.capitalize() if word.isupper() else word for word in words]
         Becomes: words = words
-        Killed by: src/uclone_x/story/audit.py :: if len(words) > 1:
+        Killed by: examples/story/src/uclone_x_story/audit.py :: if len(words) > 1:
         Becomes: if False:
         """
         story_id, ctx = await _timed_story(tmp_path)
@@ -590,7 +590,7 @@ class TestTheAuditChecksAgainstStoryTime:
     ) -> None:
         """#1601: the codex's `npc alive` is shown as the rule's `NPCAlive`, not `NpcAlive`.
 
-        Killed by: src/uclone_x/story/audit.py :: for axiom in axioms:
+        Killed by: examples/story/src/uclone_x_story/audit.py :: for axiom in axioms:
         Becomes: for axiom in ():
         """
         story_id, ctx = await _timed_story(tmp_path)
@@ -621,7 +621,7 @@ class TestTheAuditChecksAgainstStoryTime:
     async def test_a_composed_and_a_decomposed_letter_are_one_class(self, tmp_path: Path) -> None:
         """#1601: `é` typed as one code point or as `e` and an accent is the same letter.
 
-        Killed by: src/uclone_x/story/audit.py :: return unicodedata.normalize("NFC", raw.strip())
+        Killed by: examples/story/src/uclone_x_story/audit.py :: return unicodedata.normalize("NFC", raw.strip())
         Becomes: return raw.strip()
         """
         story_id, ctx = await _timed_story(tmp_path)
@@ -650,7 +650,7 @@ class TestTheAuditChecksAgainstStoryTime:
         assert contradiction["kind"] == "disjoint"
 
     async def test_a_property_rule_is_read_whatever_its_case(self, tmp_path: Path) -> None:
-        """Killed by: src/uclone_x/story/audit.py :: return _predicate(subject), obj
+        """Killed by: examples/story/src/uclone_x_story/audit.py :: return _predicate(subject), obj
         Becomes: return subject, obj
         """
         story_id, ctx = await _timed_story(tmp_path)
@@ -679,7 +679,7 @@ class TestTheAuditChecksAgainstStoryTime:
     async def test_a_rule_that_does_not_fit_names_story_yaml_and_the_field(
         self, tmp_path: Path
     ) -> None:
-        """Killed by: src/uclone_x/story/schemas.py :: parsed = StoryAxioms.model_validate({"axioms": raw})
+        """Killed by: examples/story/src/uclone_x_story/schemas.py :: parsed = StoryAxioms.model_validate({"axioms": raw})
         Becomes: parsed = StoryAxioms.model_validate({"axioms": []})
         """
         story_id, ctx = await _timed_story(tmp_path)
@@ -703,7 +703,7 @@ class TestTheAuditChecksAgainstStoryTime:
     ) -> None:
         """#1613: qwen3:8b left 'facts' out of 8 of 9 first calls.
 
-        Killed by: src/uclone_x/story/tools.py :: if _without_facts(data):
+        Killed by: examples/story/src/uclone_x_story/tools.py :: if _without_facts(data):
         Becomes: if False:
         """
         _, ctx = await _timed_story(tmp_path)
@@ -743,9 +743,9 @@ class TestTheAuditChecksAgainstStoryTime:
         )
 
     def test_the_schema_the_model_sees_requires_facts_and_shows_one(self) -> None:
-        """Killed by: src/uclone_x/story/tools.py :: min_length=1,
+        """Killed by: examples/story/src/uclone_x_story/tools.py :: min_length=1,
         Becomes: default_factory=list[AuditFact],
-        Killed by: src/uclone_x/story/tools.py :: f"[{json.dumps(AUDIT_FACT_EXAMPLE)}].",
+        Killed by: examples/story/src/uclone_x_story/tools.py :: f"[{json.dumps(AUDIT_FACT_EXAMPLE)}].",
         Becomes: ".",
         """
         schema = advertised_tool_parameters(StoryAuditTool())
@@ -777,7 +777,7 @@ async def _proposed(ctx: ToolContext) -> str:
 
 class TestProposals:
     async def test_a_proposal_needs_a_quote_the_scene_has(self, tmp_path: Path) -> None:
-        """Killed by: src/uclone_x/story/tools.py :: if not quote_found(quote, text.text):
+        """Killed by: examples/story/src/uclone_x_story/tools.py :: if not quote_found(quote, text.text):
         Becomes: if False:
         """
         story_id, ctx = await _timed_story(tmp_path)
@@ -803,21 +803,21 @@ class TestProposals:
     ) -> None:
         """#1584 item 3: a letter, or part of a word, is in almost every scene.
 
-        Killed by: src/uclone_x/story/quotes.py :: return sum(1 for ch in folded(quote) if ch.isalnum()) < MIN_QUOTE_CHARACTERS
-        Becomes: return not folded(quote)
-        Killed by: src/uclone_x/story/quotes.py :: if not _cuts_a_word(before, needle[0]) and not _cuts_a_word(after, needle[-1]):
+        Killed by: src/uclone_x/knowledge/quotes.py :: return sum(1 for ch in fold(quote) if ch.isalnum()) < MIN_QUOTE_CHARACTERS
+        Becomes: return not fold(quote)
+        Killed by: src/uclone_x/knowledge/quotes.py :: if not _cuts_a_word(before, needle[0]) and not _cuts_a_word(after, needle[-1]):
         Becomes: if not _cuts_a_word(after, needle[-1]):
-        Killed by: src/uclone_x/story/quotes.py :: if not _cuts_a_word(before, needle[0]) and not _cuts_a_word(after, needle[-1]):
+        Killed by: src/uclone_x/knowledge/quotes.py :: if not _cuts_a_word(before, needle[0]) and not _cuts_a_word(after, needle[-1]):
         Becomes: if not _cuts_a_word(before, needle[0]):
-        Killed by: src/uclone_x/story/quotes.py :: start = haystack.find(needle, start + 1)
+        Killed by: src/uclone_x/knowledge/quotes.py :: start = haystack.find(needle, start + 1)
         Becomes: break
-        Killed by: src/uclone_x/story/tools.py :: if quote_too_short(quote):
+        Killed by: examples/story/src/uclone_x_story/tools.py :: if quote_too_short(quote):
         Becomes: if False:
-        Killed by: src/uclone_x/story/quotes.py :: "IDEOGRAPHIC",
+        Killed by: src/uclone_x/knowledge/quotes.py :: "IDEOGRAPHIC",
         Becomes: "IDEOGRAPHIX",
-        Killed by: src/uclone_x/story/quotes.py :: "VERTICAL IDEOGRAPHIC",
+        Killed by: src/uclone_x/knowledge/quotes.py :: "VERTICAL IDEOGRAPHIC",
         Becomes: "VERTICAL IDEOGRAPHIX",
-        Killed by: src/uclone_x/story/quotes.py :: "HALFWIDTH KATAKANA",
+        Killed by: src/uclone_x/knowledge/quotes.py :: "HALFWIDTH KATAKANA",
         Becomes: "HALFWIDTH KATAKANX",
         """
         story_id, ctx = await _timed_story(tmp_path)
@@ -857,9 +857,9 @@ class TestProposals:
         """#1584 item 7: one broken file under proposals/ neither hides the others nor
         vanishes; it is named with what is wrong with it.
 
-        Killed by: src/uclone_x/story/work.py :: unreadable.append(problem)
+        Killed by: examples/story/src/uclone_x_story/work.py :: unreadable.append(problem)
         Becomes: raise
-        Killed by: src/uclone_x/story/work.py :: unreadable.append(problem)
+        Killed by: examples/story/src/uclone_x_story/work.py :: unreadable.append(problem)
         Becomes: pass
         """
         story_id, ctx = await _timed_story(tmp_path)
@@ -876,7 +876,7 @@ class TestProposals:
         assert "Traceback" not in problem["reason"]
 
     async def test_apply_without_a_person_s_approval_changes_nothing(self, tmp_path: Path) -> None:
-        """Killed by: src/uclone_x/story/tools.py :: if not context.approved_by_person:
+        """Killed by: examples/story/src/uclone_x_story/tools.py :: if not context.approved_by_person:
         Becomes: if False:
         """
         story_id, ctx = await _timed_story(tmp_path)
@@ -909,7 +909,11 @@ class TestProposals:
         entry = yaml.safe_load(
             (_story_dir(tmp_path, story_id) / "codex/characters/vane.yaml").read_text()
         )
-        assert {"at": "ch01.s01", "set": {"wounded": True}} in entry["progressions"]
+        assert {
+            "at": "ch01.s01",
+            "set": {"wounded": True},
+            "proposal": proposal_id,
+        } in entry["progressions"]
         listed = await _ok(StoryCodexTool(), ctx, action="proposals")
         assert listed["pending"] == []
         assert listed["decided"] == [{"id": proposal_id, "status": "applied", "entry_id": "vane"}]
@@ -919,7 +923,7 @@ class TestProposals:
     async def test_an_entry_edited_since_the_proposal_is_not_overwritten(
         self, tmp_path: Path
     ) -> None:
-        """Killed by: src/uclone_x/story/proposals.py :: if digest != proposal.entry_digest:
+        """Killed by: examples/story/src/uclone_x_story/proposals.py :: if digest != proposal.entry_digest and not _names_only(proposal.change):
         Becomes: if False:
         """
         story_id, ctx = await _timed_story(tmp_path)
@@ -1022,9 +1026,11 @@ class TestOnlyAPersonApproves:
         assert (
             asked["reason"] == "story_codex runs this action only when a person approves the call."
         )
-        assert {"at": "ch01.s01", "set": {"wounded": True}} in _vane_progressions(
-            tmp_path, story_id
-        )
+        assert {
+            "at": "ch01.s01",
+            "set": {"wounded": True},
+            "proposal": "p001",
+        } in _vane_progressions(tmp_path, story_id)
 
     async def test_a_hook_s_rewrite_is_what_the_person_approves_and_what_runs(
         self, tmp_path: Path
@@ -1098,8 +1104,12 @@ class TestOnlyAPersonApproves:
         assert record.status == "success", record.error
         assert asked["arguments"] == {"action": "apply", "proposal_id": "p002"}
         progressions = _vane_progressions(tmp_path, story_id)
-        assert {"at": "ch01.s01", "set": {"hooded": True}} in progressions
-        assert {"at": "ch01.s01", "set": {"wounded": True}} not in progressions
+        assert {"at": "ch01.s01", "set": {"hooded": True}, "proposal": "p002"} in progressions
+        assert {
+            "at": "ch01.s01",
+            "set": {"wounded": True},
+            "proposal": "p001",
+        } not in progressions
 
     async def test_an_empty_rewrite_is_what_the_person_sees_and_what_runs(
         self, tmp_path: Path
@@ -1180,7 +1190,7 @@ class TestOnlyAPersonApproves:
 
         Killed by: src/uclone_x/agent/tool_execution.py :: timeout_note or "Approval request timed out (denied fail-closed)",
         Becomes: "Approval request timed out (denied fail-closed)",
-        Killed by: src/uclone_x/story/tools.py :: approval_timeout_note: ClassVar[str | None] = APPLY_NOT_APPROVED_NOTE
+        Killed by: examples/story/src/uclone_x_story/tools.py :: approval_timeout_note: ClassVar[str | None] = APPLY_NOT_APPROVED_NOTE
         Becomes: approval_timeout_note: ClassVar[str | None] = None
         """
         story_id, ctx = await _timed_story(tmp_path)
@@ -1212,7 +1222,7 @@ class TestOnlyAPersonApproves:
 
         Killed by: src/uclone_x/agent/tool_execution.py :: if pre_decision.action == HookAction.ASK and not self._approvals_answered:
         Becomes: if pre_decision.action == HookAction.ASK and False:
-        Killed by: src/uclone_x/story/tools.py :: approval_unavailable_note: ClassVar[str | None] = APPLY_NOT_ASKED_NOTE
+        Killed by: examples/story/src/uclone_x_story/tools.py :: approval_unavailable_note: ClassVar[str | None] = APPLY_NOT_ASKED_NOTE
         Becomes: approval_unavailable_note: ClassVar[str | None] = None
         """
         story_id, ctx = await _timed_story(tmp_path)
@@ -1280,7 +1290,7 @@ class TestOnlyAPersonApproves:
         It must not say a proposal is kept when there is none, nor that this shell is the
         desktop app.
 
-        Killed by: src/uclone_x/story/tools.py :: "in the story's view, under Files."
+        Killed by: examples/story/src/uclone_x_story/tools.py :: "in the story's view, under Files."
         Becomes: "in the story's view, under Files. The proposal is kept."
         """
         story_id, ctx = await _timed_story(tmp_path)
@@ -1341,11 +1351,11 @@ class TestAReadIsNotRecordedAsAWrite:
         Becomes: declared_writes = tool_writes_files(tool_inst)
         Killed by: src/uclone_x/tools/base.py :: return not (isinstance(action, str) and action in cast(frozenset[object], declared))
         Becomes: return True
-        Killed by: src/uclone_x/story/tools.py :: read_actions: ClassVar[frozenset[str]] = frozenset({"get", "search", "proposals"})
+        Killed by: examples/story/src/uclone_x_story/tools.py :: read_actions: ClassVar[frozenset[str]] = frozenset({"get", "search", "proposals"})
         Becomes: read_actions: ClassVar[frozenset[str]] = frozenset({"search", "proposals"})
-        Killed by: src/uclone_x/story/tools.py :: read_actions: ClassVar[frozenset[str]] = frozenset({"get"})
+        Killed by: examples/story/src/uclone_x_story/tools.py :: read_actions: ClassVar[frozenset[str]] = frozenset({"get"})
         Becomes: read_actions: ClassVar[frozenset[str]] = frozenset()
-        Killed by: src/uclone_x/story/tools.py :: read_actions: ClassVar[frozenset[str]] = frozenset({"read", "list"})
+        Killed by: examples/story/src/uclone_x_story/tools.py :: read_actions: ClassVar[frozenset[str]] = frozenset({"read", "list"})
         Becomes: read_actions: ClassVar[frozenset[str]] = frozenset({"list"})
         """
         _, ctx = await _timed_story(tmp_path)
@@ -1385,7 +1395,7 @@ class TestTheRuleKindsAreTheReasoners:
         from uclone_x.ontology.rules import (
             _KIND_ALIASES,  # pyright: ignore[reportPrivateUsage]
         )
-        from uclone_x.story.audit import _KINDS  # pyright: ignore[reportPrivateUsage]
+        from uclone_x_story.audit import _KINDS  # pyright: ignore[reportPrivateUsage]
 
         assert dict(_KINDS) == dict(_KIND_ALIASES)
 
@@ -1414,7 +1424,7 @@ class TestCharacterSheetSaysWhatItLacks:
     async def test_a_broken_workspace_sheet_is_reported_not_taken_for_missing(
         self, tmp_path: Path
     ) -> None:
-        """Killed by: src/uclone_x/story/character.py :: result["workspace_sheet_unreadable"] = legacy_problem
+        """Killed by: examples/story/src/uclone_x_story/character.py :: result["workspace_sheet_unreadable"] = legacy_problem
         Becomes: pass
         """
         story_id, _ = await _timed_story(tmp_path)
@@ -1429,9 +1439,9 @@ class TestCharacterSheetSaysWhatItLacks:
         }
 
     async def test_looks_the_codex_does_not_give_are_not_invented(self, tmp_path: Path) -> None:
-        """Killed by: src/uclone_x/story/character.py :: "gender": visual.gender if visual else None,
+        """Killed by: examples/story/src/uclone_x_story/character.py :: "gender": visual.gender if visual else None,
         Becomes: "gender": (visual.gender if visual else None) or "other",
-        Killed by: src/uclone_x/story/character.py :: "default_style": visual.default_style if visual else None,
+        Killed by: examples/story/src/uclone_x_story/character.py :: "default_style": visual.default_style if visual else None,
         Becomes: "default_style": (visual.default_style if visual else None) or "anime",
         """
         story_id, _ = await _timed_story(tmp_path)
@@ -1443,7 +1453,7 @@ class TestCharacterSheetSaysWhatItLacks:
         assert out["character"]["default_style"] is None
 
     async def test_compose_says_which_characters_brought_no_looks(self, tmp_path: Path) -> None:
-        """Killed by: src/uclone_x/story/character.py :: composed["notes"] = notes
+        """Killed by: examples/story/src/uclone_x_story/character.py :: composed["notes"] = notes
         Becomes: pass
         """
         story_id, _ = await _timed_story(tmp_path)

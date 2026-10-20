@@ -13,8 +13,23 @@ one lesson and one model call (`submit` coalesces by room and clone).
 **What may ground a fact.** The human owner's words (`told`) and a tool result the clone
 received (`found`). The clone's own statements and another clone's messages are shown to the
 model as context only (design §3.3): a clone repeating what another clone said, or what it
-made up, must not turn it into a fact. A fact the model attributes to either, or to a kind of
-line the span does not hold, is dropped before saving.
+made up, must not turn it into a fact. Each fact carries the words it rests on, and they
+must be in a person or tool line; which of the two holds them is its source. A quote only in
+a clone's line, or in no line, is dropped before saving.
+
+**Read and verified as every vessel reads (uGraph §3.5, #2235).** Only the prompt is the
+clone's. The reply is read by `knowledge.extraction` -- its JSON, a reply cut off by its
+token cap salvaged, a malformed one field by field (`listed_facts`, `parse_facts`) -- and
+held to the span and to the clone's subjects by `verify_facts`: the quote must be in the
+span, a name resolves through an `EntityResolver` over the person (`user`), the clone
+(`self`), the workspace (`project`) and every subject the clone already holds, a name two of
+them share is dropped and not guessed, and a fact given twice is kept once.
+
+**Names (the clone's §3.4 policy).** A name resolves exactly (folded, an honorific dropped)
+to a subject the clone holds, or it is a new subject, filed as written. A near match --
+`지현` beside a held `김지현` -- is not merged: the clone has no alias record yet to show a
+person or undo a merge with, and learning runs with no one to ask. Merging near names is
+left to the clone store's step, with the open design question it carries (uGraph §6 Q2).
 
 **A failure is a plain sentence, never the cause.** `ExtractionOutcome.error` is written for
 the person reading the turn's row; the exception, the model's raw text and the fact ids stay
@@ -23,22 +38,28 @@ in the log.
 
 from __future__ import annotations
 
-import json
 import logging
-import re
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field, replace
-from typing import Any, Final, Literal, Protocol, runtime_checkable
+from typing import Any, Final, Literal, Protocol, cast, runtime_checkable
 
+from uclone_x.core.models import PersonaDefinition
 from uclone_x.core.provenance import Provenance, require_provenance
+from uclone_x.errors import NoRoomToLearnError
+from uclone_x.knowledge.extraction import ReadFact, listed_facts, parse_facts, verify_facts
+from uclone_x.knowledge.fold import fold, relation_key
+from uclone_x.knowledge.models import Entity
+from uclone_x.knowledge.quotes import quote_found
+from uclone_x.knowledge.resolver import EntityResolver, name_key
 from uclone_x.llm.models import ChatMessage, LLMRequest, MessageRole, ModelResponse
 from uclone_x.memory.models import (
     PERSON_SUBJECT,
+    PERSON_WORDS,
     PROJECT_SUBJECT,
     SELF_SUBJECT,
+    SELF_WORDS,
     FactOrigin,
     MemoryFact,
-    fact_subject,
     fold_name,
 )
 
@@ -118,19 +139,28 @@ class FactStoreProtocol(Protocol):
         *,
         confidence: float,
         metadata: dict[str, Any],
-        auto_retract_conflicts: bool,
         origin: FactOrigin,
         source_room_id: str | None,
         source_turn_id: str | None,
+        single_valued: bool,
+        replaces: Sequence[str],
     ) -> MemoryFact: ...
 
 
 @runtime_checkable
 class LearningSeatProtocol(Protocol):
-    """A seat that can learn: it has a memory, and a model call charged to it (#1404)."""
+    """A seat that can learn: it has a memory, and a model call charged to it (#1404).
+
+    `latest_persona_definition` carries the clone's "Learn from conversations" switch
+    (#1840), including a saved edit the seat has not taken yet (#2228); `None` is a seat
+    with no persona, which learns.
+    """
 
     @property
     def memory(self) -> FactStoreProtocol | None: ...
+
+    @property
+    def latest_persona_definition(self) -> PersonaDefinition | None: ...
 
     async def invoke_auxiliary_model(self, request: LLMRequest) -> ModelResponse: ...
 
@@ -169,6 +199,13 @@ class Lesson:
     clone_names: tuple[str, ...] = ()
     #: Every turn this lesson covers, oldest first; `turn_id` is the last of them.
     turn_ids: tuple[str, ...] = ()
+    #: Whether the clone still learns from conversations, read when the lesson is learned
+    #: rather than when it was queued, so switching learning off stops a queued lesson too
+    #: (#2228).
+    learns: Callable[[], bool] = field(default=lambda: True)
+    #: The relations the clone's rules declare functional, read when the lesson is learned
+    #: (#2332). A new value under one of them replaces the current ones.
+    functional: Callable[[], frozenset[str]] = field(default=lambda: frozenset[str]())
 
 
 @dataclass(frozen=True)
@@ -182,6 +219,9 @@ class ExtractionOutcome:
     reinforced: tuple[str, ...] = ()
     superseded: tuple[str, ...] = ()
     error: str | None = None
+    #: Not learned, to keep what is left of the budget for the person's next reply
+    #: (#1851). Not a failure; the turn's row says it in plain words (#2328).
+    skipped: bool = False
 
 
 @dataclass
@@ -193,6 +233,13 @@ class _Candidate:
     confidence: float
     why: str = ""
     keys: tuple[str, str, str] = field(default=("", "", ""))
+    #: The held value the model says this fact replaces, as `_value_key` keys it; empty when
+    #: it replaces nothing (#2224).
+    replaces: str = ""
+    #: The words of the person or tool line the fact rests on, as the model quoted them.
+    quote: str = ""
+    #: The alias the reply used for `subject`, when `subject` merged an earlier name (uGraph §6 Q2).
+    merged_from: str = ""
 
 
 class ExtractionFailed(Exception):
@@ -257,11 +304,23 @@ class KnowledgeExtractor:
         if not any(line.kind in _SOURCE_ORIGIN for line in lesson.lines):
             # Nothing in the span can ground a fact, so the model is not asked.
             return outcome
+        if not lesson.learns():  # switched off since the lesson was queued
+            return outcome
         try:
             lesson.memory.refresh()  # see a Forget or Correct made elsewhere since the load
             response = await lesson.generate(self._request(lesson))
-            candidates = _parse(response.content or "")
+            candidates = _read(response.content or "", lesson)
             provenance = require_provenance(response.provenance, "The knowledge extraction reply")
+        except NoRoomToLearnError:
+            # Skipped, not failed (#1851): what is left of the clone's budget is the person's
+            # next reply's. Nothing was sent; the row says learning waited, not that it failed.
+            logger.info(
+                "Clone %s: learning from turn %s skipped; it would leave less than a reply's "
+                "worth of the budget",
+                lesson.clone_id,
+                lesson.turn_id,
+            )
+            return replace(outcome, skipped=True)
         except Exception as exc:  # any failure to get facts back is the row's one sentence
             logger.warning(
                 "Knowledge extraction for clone %s in room %s (turn %s) failed: %s: %s",
@@ -272,6 +331,8 @@ class KnowledgeExtractor:
                 exc,
             )
             return replace(outcome, error=EXTRACTION_FAILED)
+        if not lesson.learns():  # turned off while the model was asked
+            return outcome
         # From here to the last save there is no `await`, so on one event loop two
         # extractions for the same clone never interleave their reads and writes.
         return self._save(lesson, candidates, provenance, outcome)
@@ -296,12 +357,12 @@ class KnowledgeExtractor:
         outcome: ExtractionOutcome,
     ) -> ExtractionOutcome:
         memory = lesson.memory
-        kinds = {line.kind for line in lesson.lines}
-        kept = _curate(candidates, kinds, lesson)
+        kept = _curate(candidates, lesson)
         added: list[str] = []
         reinforced: list[str] = []
         superseded: list[str] = []
         try:
+            functional = lesson.functional()
             memory.refresh()  # the model call awaited; a person may have acted meanwhile
             for candidate in kept:
                 active = memory.list_facts(subject=candidate.subject, predicate=candidate.relation)
@@ -310,7 +371,15 @@ class KnowledgeExtractor:
                     fact = memory.reinforce_fact(same[0].fact_id, lesson.turn_id)
                     reinforced.append(fact.fact_id)
                     continue
-                corrected = [f for f in active if f.origin == "corrected"]
+                replaced = _replaced(memory.list_facts(subject=candidate.subject), candidate)
+                if candidate.relation in functional:
+                    # One value at a time, as a person declared (#2332): every current value
+                    # under the relation is replaced, named or not.
+                    named = {f.fact_id for f in replaced}
+                    replaced += [
+                        f for f in active if f.valid_until is None and f.fact_id not in named
+                    ]
+                corrected = [f for f in (*active, *replaced) if f.origin == "corrected"]
                 if corrected:
                     # A person's correction outranks the model (design §3.3 step 5).
                     logger.info(
@@ -321,6 +390,16 @@ class KnowledgeExtractor:
                         corrected[0].fact_id,
                     )
                     continue
+                fact_meta: dict[str, Any] = {
+                    "observations": [lesson.turn_id],
+                    "grounded_in": candidate.source,
+                    "why": candidate.why,
+                    # Shown in Remembers' history: the words it was learned from (#2332).
+                    "quote": candidate.quote,
+                }
+                if candidate.merged_from:
+                    fact_meta["merged_from"] = candidate.merged_from
+                    fact_meta["merged_moved"] = True
                 fact = memory.record_fact(
                     subject=candidate.subject,
                     predicate=candidate.relation,
@@ -328,18 +407,17 @@ class KnowledgeExtractor:
                     provenance=provenance,
                     source_session_id=lesson.session_id,
                     confidence=min(candidate.confidence, EXTRACTED_CONFIDENCE_CAP),
-                    metadata={
-                        "observations": [lesson.turn_id],
-                        "grounded_in": candidate.source,
-                        "why": candidate.why,
-                    },
-                    auto_retract_conflicts=True,
+                    metadata=fact_meta,
                     origin=_SOURCE_ORIGIN[candidate.source],
                     source_room_id=lesson.room_id,
                     source_turn_id=lesson.turn_id,
+                    # Only what the model named as replaced is superseded: asked instead whether
+                    # a relation holds one value, the model said yes for every one (#2224).
+                    single_valued=False,
+                    replaces=tuple(f.fact_id for f in replaced),
                 )
                 added.append(fact.fact_id)
-                superseded.extend(f.fact_id for f in active)
+                superseded.extend(f.fact_id for f in replaced)
         except Exception as exc:  # a save that failed part-way still reports what landed
             logger.warning(
                 "Knowledge extraction for clone %s in room %s (turn %s) could not save: %s: %s",
@@ -379,18 +457,19 @@ def _instructions(lesson: Lesson) -> str:
         f"{INSTRUCTIONS_OPENING} that {name}, an AI clone, should remember from one "
         "exchange. You do not reply to anyone.\n\n"
         "Each line of the exchange starts with a label:\n"
-        '- [person: NAME] is what the human wrote. Use source "person".\n'
-        f'- [tool: NAME] is a tool result {name} received. Use source "tool".\n'
+        "- [person: NAME] is what the human wrote.\n"
+        f"- [tool: NAME] is a tool result {name} received.\n"
         f"- [{name} (you)] is what {name} itself said. It is context only, never a source: "
         f"{name} agreeing with or repeating something does not make it true.\n"
         "- [other clone: NAME] is another clone's message. It is context only, never a "
         "source.\n"
-        "Return only facts that a person line or a tool line states.\n\n"
+        "Return only facts that a person line or a tool line states, each with the words of "
+        "that line that state it.\n\n"
         "Keep only durable, reusable facts: about the person, their projects and their "
         'preferences, and stable facts that were found. Use the subject "user" for the '
         f'person. Use the subject "{PROJECT_SUBJECT}" for durable working preferences of '
         "this workspace, such as the reply language or a code style. "
-        f'Use the subject "{SELF_SUBJECT}", with source "person", when a person line tells '
+        f'Use the subject "{SELF_SUBJECT}" when a person line tells '
         f"{name} about {name} itself: its looks, age, gender, personality, speech style, "
         f'name or likes ("you have red hair", "너는 귀엽고 착해"). Use relations such as '
         '"hair", "eyes", "age", "appearance", "personality" or "speech_style". '
@@ -400,11 +479,15 @@ def _instructions(lesson: Lesson) -> str:
         "characters, places, plot and style rules), and anything you are unsure the source "
         "asserted.\n\n"
         f"Facts {name} already holds (subject | relation | value):\n{known_block}\n\n"
-        "Answer with a JSON array and nothing else. Each item is an object with the keys "
-        '"subject", "relation", "value", "source" ("person" or "tool"), '
-        '"confidence" (0 to 1), "durable" (true or false) and "why" (a few words). '
-        'Use a short snake_case relation such as "prefers" or "works_at". '
-        "If nothing is worth keeping, answer []."
+        'Answer with a JSON object and nothing else: {"facts": [...]}. Each fact is an '
+        'object with the keys "subject", "key" (a short snake_case relation such as '
+        '"prefers" or "works_at"), "value", "quote" (the words of the person or tool line '
+        'that state it, copied exactly, a few words at least), "confidence" (0 to 1), '
+        '"durable" (true or false), "replaces" (only when the line says a fact already held '
+        "has stopped being true, as when someone moved, changed jobs or stopped doing "
+        "something: the held value it replaces, copied from the list above; otherwise null) "
+        'and "why" (a few words). '
+        'If nothing is worth keeping, answer {"facts": []}.'
     )
 
 
@@ -446,97 +529,197 @@ def _known_facts(lesson: Lesson) -> list[MemoryFact]:
         for fact in lesson.memory.list_facts()
         if (subject := fold_name(fact.subject)) in (PERSON_SUBJECT, SELF_SUBJECT) or subject in text
     ]
+    for fact in lesson.memory.list_facts():
+        if (
+            fact not in known
+            and isinstance(merged := fact.metadata.get("merged_from"), str)
+            and bool(merged_folded := fold_name(merged))
+            and merged_folded in text
+        ):
+            known.append(fact)
     known.sort(key=lambda fact: (fact.created_at, fact.fact_id), reverse=True)
     return known[:MAX_KNOWN_FACTS]
 
 
 # -- reading the reply -----------------------------------------------------------------
 
-_FENCE = re.compile(r"^```[a-zA-Z]*\s*|\s*```$")
 
+def _read(content: str, lesson: Lesson) -> list[_Candidate]:
+    """The reply's facts, read and verified as every vessel's are (`knowledge.extraction`),
+    with the clone's own fields. Raises `ExtractionFailed` when no fact list can be read.
 
-def _parse(content: str) -> list[_Candidate]:
-    """The candidates in the model's reply. Raises `ExtractionFailed` when it is not a list.
-
-    An item that is not a well-formed candidate is skipped, not fatal: one bad object in an
-    otherwise usable answer should not lose the rest.
+    An item that is not an object is skipped, not fatal: one bad item in an otherwise usable
+    answer should not lose the rest. What `verify_facts` drops is logged by reason.
     """
-    text = _FENCE.sub("", content.strip())
-    start, end = text.find("["), text.rfind("]")
-    if start == -1 or end < start:
-        raise ExtractionFailed("the reply holds no JSON array")
     try:
-        data = json.loads(text[start : end + 1])
-    except json.JSONDecodeError as exc:
-        raise ExtractionFailed(f"the reply's array is not JSON ({exc.msg})") from exc
-    if not isinstance(data, list):
-        raise ExtractionFailed("the reply's JSON is not an array")
+        listed = listed_facts(content)
+    except ValueError as exc:
+        raise ExtractionFailed(str(exc)) from exc
+    items = [cast("dict[str, Any]", item) for item in listed if isinstance(item, dict)]
+    # The clone's gates before duplicates fold: of two copies, the one kept passes them
+    # (#2240 item 3).
+    items = [item for item in items if _passes_gates(item)]
+    facts = parse_facts(items)
+    # The relation as it is filed, before verifying: "works at" and "works_at" are one fact.
+    facts = [replace(f, key=relation_key(f.key)) for f in facts]
+    grounds = [line for line in lesson.lines if line.kind in _SOURCE_ORIGIN]
+    verified = verify_facts(
+        facts, "\n".join(line.text for line in grounds), _resolver(lesson), new_names=True
+    )
+    if verified.dropped:
+        logger.info(
+            "Clone %s: extracted facts dropped in verifying them: %s",
+            lesson.clone_id,
+            verified.dropped,
+        )
+    fields = {id(fact): item for fact, item in zip(facts, items, strict=True)}
     candidates: list[_Candidate] = []
-    for item in data:  # pyright: ignore[reportUnknownVariableType]
-        candidate = _candidate(item)
+    for read in verified.kept:
+        candidate = _candidate(read, fields[id(read.fact)], grounds)
         if candidate is not None:
             candidates.append(candidate)
     return candidates
 
 
-def _candidate(item: Any) -> _Candidate | None:
-    if not isinstance(item, dict):
-        return None
-    fields: dict[str, Any] = item  # pyright: ignore[reportUnknownVariableType]
-    subject, relation, value = fields.get("subject"), fields.get("relation"), fields.get("value")
-    source, confidence = fields.get("source"), fields.get("confidence")
-    if not all(isinstance(part, str) and part.strip() for part in (subject, relation, value)):
-        return None
-    if source not in _SOURCE_ORIGIN:
-        return None
-    if fields.get("durable") is not True:
-        return None
+def _passes_gates(item: dict[str, Any]) -> bool:
+    """Whether a fact the reply gave is durable and sure enough to keep (§3.3 step 5).
+
+    Read on the reply's own object, before `verify_facts` folds a fact given twice into one:
+    folded first, the later copy was kept, and a later copy marked not durable lost a fact
+    the earlier one said was durable (#2240 item 3).
+    """
+    confidence = item.get("confidence")
+    if item.get("durable") is not True:
+        return False
     if isinstance(confidence, bool) or not isinstance(confidence, int | float):
+        return False
+    return confidence >= MIN_CONFIDENCE
+
+
+def _resolver(lesson: Lesson) -> EntityResolver:
+    """The clone's subjects (§3.4): the person, the clone, the workspace, and each subject
+    it holds a fact about. A held subject that is one of the first three's names is theirs,
+    as it would be filed, not a fourth that shares the name."""
+    scope = f"clone:{lesson.clone_id}"
+    # The person first, as `fact_subject` files a fact for `record_memory_fact`: a name the
+    # person and the clone share is the person's, so what the person tells about
+    # themselves is never filed as the clone's, nor lost as ambiguous (#2240 item 4).
+    person = {name_key(n) for n in (*PERSON_WORDS, *lesson.person_names)}
+    clone = tuple(n for n in (*SELF_WORDS, *lesson.clone_names) if name_key(n) not in person)
+    named = (
+        Entity(
+            PERSON_SUBJECT, scope, "person", PERSON_SUBJECT, (*PERSON_WORDS, *lesson.person_names)
+        ),
+        Entity(SELF_SUBJECT, scope, "self", SELF_SUBJECT, clone),
+        Entity(PROJECT_SUBJECT, scope, "project", PROJECT_SUBJECT),
+    )
+    taken = {name_key(n) for e in named for n in (e.id, e.name, *e.aliases)}
+    held_facts = lesson.memory.list_facts()
+    held = {fact.subject for fact in held_facts}
+    aliases_by_subject: dict[str, list[str]] = {}
+    for fact in held_facts:
+        merged = fact.metadata.get("merged_from")
+        if isinstance(merged, str) and merged.strip() and name_key(merged) not in taken:
+            aliases = aliases_by_subject.setdefault(fact.subject, [])
+            if merged.strip() not in aliases:
+                aliases.append(merged.strip())
+    subjects = [
+        *(Entity(s, scope, "subject", s) for s in sorted(held) if name_key(s) not in taken),
+    ]
+    subjects = [
+        replace(e, aliases=tuple(aliases_by_subject[e.id])) if e.id in aliases_by_subject else e
+        for e in subjects
+    ]
+    return EntityResolver(scope, (*named, *subjects))
+
+
+def _source(quote: str, grounds: Sequence[SpanLine]) -> str:
+    """The kind of line the quote is in, the person's words before a tool's result.
+
+    `verify_facts` has found the quote in the lines joined, so it is in one of them, or it
+    runs across two: then it is the line the quote starts in.
+    """
+    for line in sorted(grounds, key=lambda line: line.kind != "person"):
+        if quote_found(quote, line.text):
+            return line.kind
+    at = fold(" ".join(line.text for line in grounds)).find(fold(quote))
+    for line in grounds:
+        size = len(fold(line.text)) + 1
+        if at < size:
+            return line.kind
+        at -= size
+    return grounds[-1].kind
+
+
+def _candidate(
+    read: ReadFact, item: dict[str, Any], grounds: Sequence[SpanLine]
+) -> _Candidate | None:
+    fact = read.fact
+    if not fact.checked or not fact.value.strip() or not fact.key:
         return None
-    why = fields.get("why")
+    source = _source(fact.quote, grounds)
+    confidence = cast("float", item["confidence"])  # `_passes_gates` read it as a number
+    why = item.get("why")
+    value = " ".join(fact.value.split())
+    replaces = item.get("replaces")
+    raw_subj = " ".join(fact.subject.split())
+    merged_from = (
+        raw_subj
+        if read.subject not in (PERSON_SUBJECT, SELF_SUBJECT, PROJECT_SUBJECT)
+        and name_key(raw_subj) != name_key(read.subject)
+        else ""
+    )
     return _Candidate(
-        subject=str(subject),
-        relation=str(relation),
-        value=str(value),
-        source=str(source),
+        subject=read.subject,
+        relation=fact.key,
+        value=value,
+        source=source,
         confidence=max(0.0, min(1.0, float(confidence))),
         why=why.strip()[:200] if isinstance(why, str) else "",
+        keys=(read.subject.casefold(), fact.key, _value_key(value)),
+        replaces=_value_key(replaces) if isinstance(replaces, str) else "",
+        quote=fact.quote,
+        merged_from=merged_from,
     )
+
+
+def _replaced(held: Sequence[MemoryFact], candidate: _Candidate) -> list[MemoryFact]:
+    """The held facts about the candidate's subject that it says it replaces (#2224, #2328).
+
+    The named value under the candidate's own relation, or, only while that relation holds
+    nothing, under any other: the model may file the new value under another key
+    ("learning Rust", then "current_language Zig"), but "moved from Seoul" must not replace
+    "likes Seoul". A fact with a stated end is history and is never replaced.
+
+    The model is not asked to name the relation too: asked for `{"key", "value"}`, the
+    local model replaced the person's home with their sister's new one (#2328).
+    """
+    if not candidate.replaces or candidate.replaces == candidate.keys[2]:
+        return []
+    live = [f for f in held if f.valid_until is None]
+    named = [f for f in live if _value_key(f.object_value) == candidate.replaces]
+    if any(relation_key(f.predicate) == candidate.relation for f in live):
+        return [f for f in named if relation_key(f.predicate) == candidate.relation]
+    return named
 
 
 # -- curation --------------------------------------------------------------------------
 
 
-def _curate(candidates: Sequence[_Candidate], kinds: set[str], lesson: Lesson) -> list[_Candidate]:
-    """Durable gate, grounding check, normalisation and in-reply de-duplication (§3.3 step 5)."""
+def _curate(candidates: Sequence[_Candidate], lesson: Lesson) -> list[_Candidate]:
+    """The clone's own gates on verified facts (§3.3 step 5): a fact about the clone itself
+    only from the person, and no more than one lesson's share. Durable and sure enough are
+    read before verifying (`_passes_gates`)."""
     kept: list[_Candidate] = []
-    seen: set[tuple[str, str, str]] = set()
     for candidate in candidates:
-        if candidate.confidence < MIN_CONFIDENCE:
-            continue
-        if candidate.source not in kinds:
-            # The model named a source the span does not hold: a claim with nothing under it.
-            logger.info(
-                "Clone %s: extracted fact dropped; its source %r is not in the span",
-                lesson.clone_id,
-                candidate.source,
-            )
-            continue
-        subject = fact_subject(candidate.subject, lesson.person_names, lesson.clone_names)
-        if subject == SELF_SUBJECT and candidate.source != "person":
+        if candidate.subject == SELF_SUBJECT and candidate.source != "person":
             logger.info(
                 "Clone %s: self fact dropped; self facts can only be grounded in person speech, not %r",
                 lesson.clone_id,
                 candidate.source,
             )
             continue
-        relation = "_".join(candidate.relation.casefold().split())
-        value = " ".join(candidate.value.split())
-        keys = (subject.casefold(), relation, _value_key(value))
-        if keys in seen:
-            continue
-        seen.add(keys)
-        kept.append(replace(candidate, subject=subject, relation=relation, value=value, keys=keys))
+        kept.append(candidate)
     if len(kept) > MAX_FACTS_PER_LESSON:
         logger.info(
             "Clone %s: %d extracted facts over the limit of %d were dropped",

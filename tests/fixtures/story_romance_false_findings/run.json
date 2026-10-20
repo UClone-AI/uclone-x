@@ -1,0 +1,288 @@
+{
+ "about": "A story_start run answered only with yes, qwen3:8b on main 607edf8a (2026-10-11, the #2014 acceptance run): a romance with no death and no item handed over. The store query made 8 findings and all 8 were false (#2238: 7 on quotes that show no item; #2239: a fact about 사라 whose named words were 에이든). The scene readings' replies are as the model gave them.",
+ "chapters": {
+  "ch01": [
+   "s01",
+   "s02"
+  ],
+  "ch02": [
+   "s01",
+   "s02",
+   "s03"
+  ],
+  "ch03": [
+   "s01",
+   "s02",
+   "s03",
+   "s04"
+  ],
+  "ch04": [
+   "s01",
+   "s02",
+   "s03",
+   "s04"
+  ]
+ },
+ "cast": [
+  [
+   "characters",
+   {
+    "id": "sara",
+    "name": "사라",
+    "profile": "결혼 반대주의 웨딩 플래너이자, 사랑을 거부하는 여자가, 두 사람을 사랑하게 되는 과정을 막아야 하지만, 진정한 사랑을 찾기 위해 그들을 함께 지켜야 하는 약속을 지키고 있다.",
+    "state": {
+     "status": "alive",
+     "gender": "female"
+    },
+    "visual": {
+     "prose": "단순한 차분한 표정, 검은색 헤어 스타일, 세련된 옷차림",
+     "gender": "female"
+    }
+   }
+  ],
+  [
+   "characters",
+   {
+    "id": "eideun",
+    "name": "에이든",
+    "profile": "유명한 포도원을 상속받은 두 사람 중 한 명이자, 사라에게 도움을 요청하는 남자로, 사랑을 배우고 있는 과정 중이다.",
+    "state": {
+     "status": "alive",
+     "gender": "male"
+    },
+    "visual": {
+     "prose": "영리하고 부유한 외모, 잘 키워진 몸매, 세심한 관찰력",
+     "gender": "male"
+    }
+   }
+  ],
+  [
+   "characters",
+   {
+    "id": "ruiseu",
+    "name": "루이스",
+    "profile": "유명한 포도원을 상속받은 두 사람 중 한 명이자, 사라에게 도움을 요청하는 남자로, 에이든과 경쟁하며 사랑을 찾아 나서는 남자이다.",
+    "state": {
+     "status": "alive",
+     "gender": "male"
+    },
+    "visual": {
+     "prose": "부유한 외모, 단정한 스타일, 따뜻한 눈빛",
+     "gender": "male"
+    }
+   }
+  ],
+  [
+   "places",
+   {
+    "id": "podowon",
+    "name": "포도원",
+    "profile": "유명한 포도원으로, 두 남자가 상속받은 유산이 위치한 장소로, 사랑과 갈등의 배경이 되는 공간이다."
+   }
+  ],
+  [
+   "places",
+   {
+    "id": "weding_peulraeneo_samusil",
+    "name": "웨딩 플래너 사무실",
+    "profile": "사라가 결혼 반대주의로 일하는 웨딩 플래너 사무실로, 그녀의 이야기가 시작되는 장소이다."
+   }
+  ],
+  [
+   "places",
+   {
+    "id": "dosi_jungsimga",
+    "name": "도시 중심가",
+    "profile": "사라와 두 남자가 교차하며 사랑과 갈등을 경험하는 도심 지역으로, 다양한 배경을 제공하는 공간이다."
+   }
+  ],
+  [
+   "threads",
+   {
+    "id": "central_conflict",
+    "name": "중심 갈등",
+    "profile": "사라는 결혼을 거부하는 웨딩 플래너이자 사랑을 피하는 여자로, 두 남자인 에이든과 루이스가 서로를 사랑하게 되는 과정을 막으려 하지만, 그들을 함께 지켜내는 약속을 지키고 있다.",
+    "planted_in": "ch01.s01",
+    "pay_off_by": "ch04.s01",
+    "notes": "사라는 결국 에이든과의 사랑을 인정하고, 루이스와의 경쟁을 끝내며, 자신의 진정한 사랑을 위해 결혼을 거부하는 선택을 하게 되지만, 그 선택은 그녀의 내면적 갈등과 고독을 남긴다."
+   }
+  ],
+  [
+   "threads",
+   {
+    "id": "twist",
+    "name": "반전",
+    "profile": "사라 자신이 두 남자 중 한 명의 진정한 사랑을 받고 있으며, 그 약속이 그녀에게 가장 큰 가격을 요구하게 된다.",
+    "pay_off_by": "ch03.s01",
+    "notes": "사라가 에이든과의 대화에서 우연히 그의 마음을 읽어내는 순간, 그녀는 자신의 감정에 대해 의심하게 된다."
+   }
+  ],
+  [
+   "threads",
+   {
+    "id": "saraui_yaksok",
+    "name": "사라의 약속",
+    "profile": "사라가 두 남자 간의 사랑을 막아야 한다는 약속을 지키려는 의지가 그녀의 감정과 갈등을 이끈다.",
+    "state": {
+     "involves": [
+      "sara",
+      "eideun",
+      "ruiseu"
+     ]
+    },
+    "planted_in": "ch01.s01",
+    "pay_off_by": "ch04.s01"
+   }
+  ],
+  [
+   "threads",
+   {
+    "id": "eideunui_jinsim",
+    "name": "에이든의 진심",
+    "profile": "에이든이 사라에게 자신의 사랑을 고백하며, 그 감정이 사라의 약속을 흔드는 중심이 된다.",
+    "state": {
+     "involves": [
+      "sara",
+      "eideun"
+     ]
+    },
+    "planted_in": "ch02.s01",
+    "pay_off_by": "ch03.s01"
+   }
+  ],
+  [
+   "threads",
+   {
+    "id": "ruiseuui_gobaek",
+    "name": "루이스의 고백",
+    "profile": "루이스가 사라에게 자신의 사랑을 솔직하게 표현하며, 사라의 감정에 깊은 영향을 미친다.",
+    "state": {
+     "involves": [
+      "sara",
+      "ruiseu"
+     ]
+    },
+    "planted_in": "ch02.s01",
+    "pay_off_by": "ch03.s01"
+   }
+  ],
+  [
+   "threads",
+   {
+    "id": "saraui_gamjeongui_jinsil",
+    "name": "사라의 감정의 진실",
+    "profile": "사라가 두 남자 모두에게 사랑을 받고 있다는 사실을 인정하며, 그 감정이 약속을 무너뜨린다.",
+    "state": {
+     "involves": [
+      "sara",
+      "eideun",
+      "ruiseu"
+     ]
+    },
+    "planted_in": "ch03.s01",
+    "pay_off_by": "ch04.s01"
+   }
+  ],
+  [
+   "items",
+   {
+    "id": "podowonui_pyeonji",
+    "name": "포도원의 편지",
+    "profile": "에이든이 사라에게 자신의 진심을 담은 편지로, 그녀의 감정에 깊은 영향을 미친 물건이다."
+   }
+  ],
+  [
+   "items",
+   {
+    "id": "weding_peulraeneoui_yaksokseo",
+    "name": "웨딩 플래너의 약속서",
+    "profile": "사라가 두 남자 간의 사랑을 막기로 한 약속을 기록한 문서로, 그녀의 선택을 상징하는 물건이다."
+   }
+  ],
+  [
+   "items",
+   {
+    "id": "dosi_jungsimgaui_ki",
+    "name": "도시 중심가의 키",
+    "profile": "사라가 두 남자를 따라다니며 그들의 감정을 관찰하는 데 사용한 키로, 그들의 관계를 상징한다."
+   }
+  ]
+ ],
+ "scenes": {
+  "ch01.s01": "사라의 블랙 앤드 화이트 캘린더 위에 쌓인 일정들 중 하나가 갑자기 눈에 들어왔다. \"포도원 상속 관련 상담 요청\"이라는 메모는 단순한 계약서 처리가 아니었다. 그녀는 고객에게서 들은 이야기를 머리로 헤집어 보았다. 두 명의 남자가 유명한 포도원을 상속받았다는 소식. 그들은 서로를 사랑하게 되는 과정에서 도움을 받고 싶어 한다고 했다. 사라는 그 말에 고개를 끄덕이며, 웨딩 플래너로서의 직업을 떠올렸다. 결혼 반대주의자인 그녀는 결혼을 막아야 한다고 생각했다. 하지만 그녀는 자신이 원하는 진정한 사랑을 찾기 위해 그들을 함께 지켜야 한다는 약속을 지키고 있었다. 그녀는 그들을 도와야겠다고 결심했다. 그녀는 그들을 만나야 한다고 생각했다. 그들이 서로를 사랑하게 되는 과정에 개입해야 한다고. 그녀는 그들에게 도움을 줄 수 있는 사람이라 생각했다. 사라의 마음은 조금씩 변해가고 있었다. 그녀는 자신이 결혼을 거부하고 있는 이유를 다시 생각해야 했다. 그녀의 약속은 결혼을 거부하는 그녀에게 가장 큰 가격을 요구할 것이었다. 그녀는 그들을 만나기로 했다. 그들이 서로를 사랑하게 되는 과정을 막아야 한다는 생각을 하며. 그녀는 그들을 지키기로 했다. 그녀는 그들에게 도움을 줄 수 있는 웨딩 플래너가 될 것이라 생각했다.",
+  "ch01.s02": "사라는 에이든을 마주한 순간, 그의 눈빛에서 흐르는 진심을 읽어내는 게 되었다. 그는 단순한 상속자도, 결혼을 원하는 사람도 아니었다. 그는 사랑을 배우고 있는 중이었다. 사라의 마음은 그의 말을 듣고 조금씩 흔들렸다. 그녀는 루이스와의 관계를 유지해야 했고, 그의 감정을 숨겨야 했다. 하지만 에이든을 보는 순간, 그녀는 자신이 감추고 싶어 하는 마음이 있다는 것을 깨달았다. 그녀는 두 사람을 함께 지켜야 한다고 약속했던 자신을 떠올리며, 자신의 감정에 대해 의심하게 되었다. 그녀는 웨딩 플래너로서의 역할을 지키려 했지만, 그녀의 마음은 조금씩 변해가고 있었다.",
+  "ch02.s01": "사라가 에이든과 루이스를 포도원으로 데려가자, 두 남자는 어두운 포도나무 그늘 아래로 걸음을 옮겼다. 바람이 부는 저녁 공기를 머리 위로 스치며, 포도원은 고요한 분위기 속에서 두 남자의 대화를 더욱 깊게 만들었다. 에이든은 루이스에게 향해 말했다. \"당신이 어릴 적, 제가 그때 그녀를 사랑했다고 들었어요. 하지만 그녀는 나를 거절했고, 나도 결국 그녀를 떠나버렸죠.\" 루이스는 잠시 말을 멈추고, 에이든의 눈을 바라보았다. \"그 사랑을 잊지 않았어요. 지금도 내 마음속에 남아 있어요.\" 에이든은 잠시 멈칫했다. 그의 눈빛이 약간 끊겼다. 그 순간, 사라는 그들의 대화를 듣고 마음이 흔들렸다. 그녀는 자신이 두 사람 중 한 사람에게 마음을 품고 있다는 사실을 깨달았다. 에이든이 그녀에게 눈을 들었다. 그 눈빛 속에는 감정이 담겨 있었다. 사라는 그 감정을 숨기려 했지만, 마음은 더욱 흔들렸다. 그녀는 자신이 약속했던 그들을 지켜야 한다고 말했지만, 자신의 마음이 조금씩 변하고 있음을 느꼈다.",
+  "ch02.s02": "사라는 도시 중심가의 한 카페에서 에이든을 만났다. 낮은 창가 자리에 앉은 그는 어깨를 으쓱이며, 사라를 바라보았다. 그의 눈빛 속에는 감정이 담겨 있었고, 사라는 그 감정을 읽어내지 않을 수 없었다. 에이든은 손바닥을 탁 치며 말했다. “나는 당신을 정말 좋아해요. 그건 말로만 말하는 게 아니라, 내 마음에서 났어요.” 사라는 그 말을 듣고 마음이 흔들렸다. 하지만 그녀는 루이스와의 관계를 지키려는 약속을 머릿속에 떠올렸다. 그녀는 손을 들어 약간 고개를 숙이고 말했다. “감사합니다. 하지만 당신이 나를 사랑한다고 해서, 나는 당신을 사랑하지 않아요.” 에이든은 잠시 말을 멈추고, 사라를 바라보았다. 그녀의 눈빛이 어두워진 것 같았고, 그는 말을 이어갔다. “그렇지만, 당신이 나를 사랑한다면, 나도 당신을 사랑할게요.”  \n\n그 말을 듣고 사라는 마음이 더욱 흔들렸다. 하지만 그녀는 루이스를 생각했다. 루이스가 카페 문을 들어서며, 사라를 바라보았다. 그는 그녀에게 다가가며 말했다. “사라, 나는 에이든을 사랑해요. 그 사람은 나에게 너무나 중요한 사람이에요.” 사라는 그 말을 듣고 깜짝 놀랐다. 그녀는 루이스를 바라보며, 자신의 감정이 더 깊어지는 걸 느꼈다. 하지만 그녀는 두 남자 모두에게 사랑을 표현하지 않으려 했다. 그녀는 두 사람의 감정을 조절하려 했지만, 그들의 감정이 그녀를 더 깊게 끌어당기고 있었다. 결국, 사라는 두 남자 모두에게 자신의 감정을 숨기며, 그들의 감정을 조절하려는 시도가 실패했다. 그녀는 혼란스럽고, 자신의 마음이 더 깊어지는 것을 느꼈다.",
+  "ch02.s03": "사라는 웨딩 플래너 사무실에서 창가 자리에 앉아, 창밖으로 흐르는 도시의 불빛을 바라보며 자신의 마음을 정리하려 했다. 그녀는 두 남자의 요청을 다시 생각하며, 그들이 서로를 사랑하게 되는 것을 막아야 한다는 약속을 되새겼다. 그녀는 자신이 두 남자 모두에게 마음을 품고 있다는 사실을 인정해야 했다. 하지만 그 감정을 억누르며 계속해야 한다고 생각했다. 그녀는 두 남자의 사랑을 막으려는 마음이 더 커지지만, 그 감정이 그녀를 더욱 흔들고 있었다. 사라는 자신이 진정한 사랑을 찾기 위해 이 약속을 지키기로 결심했다. 하지만 그 감정이 그녀를 더욱 혼란스럽게 만들고 있었다. 그녀는 자신을 사랑하고 있는 사람을 찾기 위해 그 약속을 지키려 했지만, 그 감정이 그녀를 더 깊이 흔들고 있었다.",
+  "ch03.s01": "사라는 포도원의 풍경을 바라보며 에이든의 말을 듣고 마음이 흔들렸다. 그는 그녀에게 자신의 진심을 솔직하게 털어놓았고, 그녀가 자신의 마음을 알고 있다는 것을 말했다. 그의 목소리는 진지했고, 눈에는 진심이 담겨 있었다. 사라는 그의 감정에 놀랐다. 그녀는 결혼 반대주의자로, 사랑을 거부하는 사람이었다. 하지만 에이든의 솔직한 마음은 그녀를 깊이 흔들었다.\n\n그녀는 약속을 지키기 위해 감정을 억누르려 했다. 그녀는 두 남자의 사랑을 막아야 한다는 것을 기억했다. 그녀는 자신을 사랑하는 사람을 찾기 위해 약속을 지키기로 했지만, 그 감정이 그녀를 더 깊이 혼란스럽게 만들고 있었다. 에이든이 그녀에게 진정한 사랑을 찾을 수 있는 기회를 주고 싶다고 말했다. 그 말을 듣고 사라는 마음이 깨졌다. 그녀는 약속을 지키는 것이 얼마나 무거운지 깨닫게 되었다. 그녀는 사랑을 거부하는 자신이 얼마나 헛된 것인지, 그리고 그 약속이 그녀를 얼마나 무너뜨리는지 느꼈다.",
+  "ch03.s02": "루이스는 포도원의 풍경을 배경으로 사라에게 다가섰다. 그의 목소리는 부드럽지만, 속내를 숨기지 않았다. “사라, 당신이 나에게 어떤 의미인지 알고 있어. 나는 당신을 사랑한다.” 그 말이 나온 순간, 사라의 눈에 뜨거운 감정이 스며들었다. 그녀는 루이스의 진심을 듣고 마음속 깊은 곳에서 부풀어 오르는 감정을 느꼈다. 그녀는 자신이 두 남자 모두에게 마음을 품고 있다는 사실을 인정해야 했다. 루이스의 솔직한 고백은 그녀의 내면을 뒤흔들었다. 그녀는 루이스에게 자신의 마음을 솔직하게 전했다. “나는 에이든에게도 마음을 품고 있어.” 그 말을 듣고 루이스는 사라의 감정을 이해하려 했다. 하지만 그는 그녀의 약속을 존중하기로 결심했다. 그는 사라가 자신을 사랑하는 사람을 찾기 위해 약속을 지키는 것에 동의했다. 두 사람의 관계는 이제 새로운 시작을 맞이할 준비를 하고 있었다.",
+  "ch03.s03": "사라가 도시 중심가의 한 카페에 앉아 두 남자를 기다리고 있었다. 에이든과 루이스는 이곳에서 만나기로 했고, 그들의 감정을 조절하려는 그녀의 의도는 명확했다. 하지만 지금은 단순히 그들을 분리시키기 위한 계획이 아닌, 그들이 서로에게 사랑하게 되는 과정을 막아야 한다는 책임이 그녀의 마음을 뒤덮고 있었다.  \n\n에이든이 먼저 들어왔다. 그의 눈빛은 고민이었고, 손은 흔들리며 말을 전했다. “사라, 나는 정말로 네게 사랑을 품고 있어. 너가 나를 믿어줄 수 있을까?” 그의 목소리에는 약간의 흔들림이 있었지만, 그 속에는 진심이 담겨 있었다. 사라의 마음은 갑자기 흔들렸다. 그녀는 에이든의 진심을 들었고, 그 감정이 얼마나 깊은지 느꼈다.  \n\n그때 루이스가 들어왔다. 그는 에이든의 말을 듣고, 사라에게 다가섰다. “사라, 네가 나에게도 마음을 줬다는 걸 알고 있어. 나는 네가 누구에게 마음을 줬든 상관없이, 네가 행복해지길 원해.” 그의 목소리는 부드러웠지만, 속에는 무게가 담겨 있었다. 사라는 루이스의 말에 고개를 숙였다. 그녀는 자신이 두 남자 모두에게 마음을 품고 있다는 사실을 인정해야 했다.  \n\n그녀의 마음은 이제 더 이상 조절할 수 없었다. 두 남자 모두가 그녀를 사랑하고 있었다는 사실이 그녀의 감정을 뒤바꿔놓았다. 약속을 지키기 위해 그들을 분리해야 한다는 것이 그녀에게는 이제 더 큰 고통이 되고 있었다. 사랑을 받고 있다는 사실은 그녀를 더 깊은 갈등 속으로 끌어들였다. 그녀는 약속을 지키는 것이 아니라, 사랑을 선택하는 것이 더 큰 희생을 요구한다는 것을 깨달았다.",
+  "ch03.s04": "사라는 웨딩 플래너 사무실에서 창가에 앉아, 커피를 마시며 자신의 감정을 정리하려 했다. 어제의 상황이 머릿속을 맴돌았고, 두 남자가 그녀에게서 받은 진심을 생각하면 가슴이 저어졌다. 그녀는 결혼을 거부하는 자신을 믿고, 두 사람의 사랑을 막아야 한다는 약속을 지키기로 했었다. 하지만 지금, 그 약속을 지키는 것이 그녀를 더욱 흔들고 있었다.  \n\n두 남자 모두가 그녀를 사랑하고 있다는 사실을 인정해야 했다. 에이든의 진심 어린 말과 루이스의 부드러운 제안이 그녀의 마음에 깊은 상처를 남겼다. 그녀는 그들을 사랑하고 있다는 걸 알게 되었지만, 약속을 지키기 위해 그 감정을 억누르기로 했다. 사랑을 받고 있다는 걸 인정하기엔 그녀는 너무 무너졌기 때문이었다.  \n\n그녀는 두 남자에게 서로를 사랑하게 되는 과정을 막아야 한다는 약속을 다시 생각했다. 그녀는 그들이 서로를 알아갈 수 있도록 방해할 수 없었다. 그 약속은 그녀의 마음을 뒤바꾸고, 그녀를 더 깊은 갈등 속으로 끌어들였다. 그녀는 약속을 지키는 것이 아니라, 사랑을 선택하는 것이 더 큰 희생을 요구한다는 것을 깨달았다.  \n\n그녀는 감정을 억누르고, 그들의 사랑을 방해하려 했다. 하지만 그 과정에서 그녀는 더 큰 고통을 받았다. 그녀는 자신이 진정한 사랑을 찾고 싶어 했지만, 그 약속을 지키기 위해 그 감정을 끝까지 억누르고 말았다. 사랑을 거부하는 그녀에게, 그 약속은 이제 그녀에게 가장 큰 가격이 되었다.",
+  "ch04.s01": "사라는 포도원의 푸른 들판을 바라보며, 손끝을 문지르며 마음을 정리하려 했다. 그녀는 에이든을 따라 포도원을 걸었고, 그의 손을 잡아 주는 순간, 그녀의 마음은 흔들렸다. 에이든은 그녀를 바라보며, 진심을 솔직하게 말했다. “사라, 나는 네가 나를 사랑하게 했어. 네가 나를 원한다면, 나는 네가 원하는 모든 것을 줄게.” 그의 말은 그녀의 마음을 깊이 스칠 만큼 진심이었다. 사라는 그의 눈에서 사랑을 읽어냈다. 그녀는 그를 사랑하고 있다는 걸 알고 있었지만, 그 약속을 지키기 위해 그 감정을 억누르고 있었다.  \n\n그녀가 고개를 돌릴 때, 루이스도 그녀를 바라보았다. 그는 그녀의 마음을 이해하려 했고, 그녀가 두 사람을 사랑하게 만들지 않기를 원하는 그녀의 약속을 존중하려 했다. “사라, 나는 네가 원하는 대로 할게. 내가 네 마음을 아끼고, 네가 원하는대로 살 수 있도록 도와줄게.” 그의 말은 부드럽지만, 그녀의 마음을 움직일 만큼 진심이었다.  \n\n사라는 두 남자의 진심을 듣고, 그녀의 마음이 흔들렸다. 그녀는 약속을 지키기로 결심했다. 하지만 그 약속을 지키는 것이 그녀에게 더 큰 가격을 요구하고 있었다. 그녀는 두 남자 모두를 사랑하고 있다는 사실을 인정해야 했다. 하지만 그녀는 그 감정을 억누르고, 그들의 사랑을 방해해야 했다. 그녀는 그 약속을 지키기 위해, 그녀의 사랑을 지키려는 마음을 끝까지 억누르고 말았다.",
+  "ch04.s02": "사라는 도심 중심가의 한 카페에서 에이든을 마주했다. 창가에 앉아 커피를 마시며 그를 바라보는 그녀의 마음은 어쩔 수 없이 흔들렸다. 그가 자신을 사랑하고 있다는 걸 알고 있었지만, 그 감정을 숨겨야 했다.  \n\n\"에이든, 나는 네가 진심으로 나를 사랑하고 있다는 걸 알아.\" 그녀는 말을 시작했다. 목소리가 약간 떨렸지만, 그녀는 그 감정을 숨기기로 결심했다. \"하지만 나는 약속을 지켜야 해. 두 사람을 사랑하게 만들지 않기로 했어. 네가 나를 사랑한다면, 나는 그 사랑을 받아들일 수 없을지도 몰라.\"  \n\n에이든은 그녀의 말을 듣고 고개를 숙였다. 그의 눈빛은 아쉬움과 슬픔을 담고 있었다. \"사라, 난 네가 나를 원한다면, 그 감정을 받아들일 준비가 돼 있어.\" 그는 말했다. \"내가 네 마음을 지키고 싶어. 네가 원하는 대로 살 수 있도록 도와줄게.\"  \n\n그 말에 사라는 마음이 흔들렸다. 그녀는 두 사람 모두를 사랑하고 있다는 걸 알 수 있었다. 하지만 그 약속을 지키기 위해 그 감정을 억누르고 있었다.  \n\n그때 루이스가 들어왔다. 사라의 마음을 이해하려는 그의 눈빛은 따뜻했다. \"사라, 난 네가 원하는 대로 할게.\" 그는 말했다. \"네가 두 사람을 사랑하게 만들지 않기를 원하는 마음을 존중할게. 나는 네 마음을 아끼고, 네가 원하는대로 살 수 있도록 도와줄게.\"  \n\n사라는 두 남자의 진심을 듣고 마음이 끝내 흔들렸다. 그녀는 약속을 지키기로 결심했다. 하지만 그 약속을 지키는 것이 그녀에게 더 큰 가격을 요구하고 있었다.",
+  "ch04.s03": "사라는 웨딩 플래너 사무실에 앉아, 탁자 위의 노트를 잡고 있었다. 그녀는 두 사람의 요청을 다시 생각하며, 그들의 사랑을 막아야 한다는 약속을 되새겼다. 그녀는 그 약속을 지키기 위해 감정을 억누르기로 결심했다. 그녀의 마음은 흔들렸지만, 그녀는 약속을 지키는 것이 더 중요했다.  \n\n사라는 자신이 두 남자 모두에게 사랑을 받고 있다는 사실을 인정했다. 그 감정은 그녀를 사로잡았지만, 그녀는 그 감정을 숨기기로 결심했다. 그녀는 사랑을 거부하는 그녀의 선택을 다시 한 번 확인했다. 사랑을 거부하는 그녀의 선택이 그녀의 자유였다. 그녀는 그 자유를 지키기 위해, 그 감정을 억누르고 있었다.  \n\n그녀는 눈을 감고, 마음속의 갈등을 잠시 정리했다. 그녀는 그 감정을 숨기기로 했다. 그녀는 자신이 두 사람을 사랑하게 만들지 않기를 원했다. 그 약속을 지키기 위해, 그녀는 사랑을 거부해야 했다. 그녀는 그 선택을 다시 한 번 확인했다. 그녀는 사랑을 거부하는 그녀의 선택을 받아들였다. 그녀는 그 감정을 억누르기로 결심했다.",
+  "ch04.s04": "사라의 눈은 두 남자의 얼굴을 번갈아 바라보았다. 에이든과 루이스, 그들 모두가 그녀에게 사랑을 나누고 있었다. 그녀는 그 감정을 느꼈다. 그녀는 그 감정이 자신의 마음을 움직이는 것을 느꼈다. 하지만 그녀는 약속을 지키기로 한 것이었다. 그녀는 그들을 사랑하게 만들지 않기로 했다. 그녀는 그들을 사랑하게 만들지 않기로 했다. 그녀는 그들의 사랑을 방해해야 했다. 그녀는 그들의 감정을 조절해야 했다. 그녀는 그들의 사랑을 막아야 했다. 그녀는 그들을 사랑하게 만들지 않기로 결심했다. 그녀는 그녀의 선택을 받아들였다. 그녀는 그녀의 자유를 지키고자 했다. 그녀는 그녀가 사랑을 거부하는 그녀의 선택을 받아들였다. 그녀는 그녀의 감정을 숨기기로 했다. 그녀는 그녀의 내면적 갈등을 감수했다. 그녀는 그녀의 고독을 감수했다. 그녀는 두 남자 모두에게 사랑을 받고 있다는 사실을 인정했다. 하지만 그녀는 그 감정을 숨기기로 했다. 그녀는 그 약속을 지키기 위해 그 감정을 억누르고 있었다. 그녀는 그녀가 사랑을 거부하는 그녀의 선택을 되새기며, 그녀는 그녀의 마음을 잠시 놓아두었다. 그녀는 그녀의 선택을 또 한 번 확인했다. 그녀는 그녀가 사랑을 거부하는 그녀의 선택을 지켰다. 그녀는 그녀의 마음을 감추고, 그녀의 자유를 지키고 있었다. 그녀는 그녀의 감정을 숨기고, 그녀의 약속을 지키고 있었다. 그녀는 그녀의 선택을 마주하고, 새로운 정상을 맞이했다."
+ },
+ "replies": [
+  "{\n  \"facts\": [\n    {\n      \"subject\": \"sara\",\n      \"named\": \"사라\",\n      \"key\": \"status\",\n      \"value\": \"alive\",\n      \"quote\": \"사라는 그들을 도와야겠다고 결심했다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"sara\",\n      \"named\": \"사라\",\n      \"key\": \"gender\",\n      \"value\": \"female\",\n      \"quote\": \"결혼 반대주의자인 그녀는 결혼을 막아야 한다고 생각했다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"sara\",\n      \"named\": \"사라\",\n      \"key\": \"possesses\",\n      \"value\": \"weding_peulraeneoui_yaksokseo\",\n      \"quote\": \"사라는 그들을 도와야겠다고 결심했다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"sara\",\n      \"named\": \"사라\",\n      \"key\": \"family\",\n      \"value\": \"none\",\n      \"quote\": \"사라는 그들을 도와야겠다고 결심했다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"sara\",\n      \"named\": \"사라\",\n      \"key\": \"condition\",\n      \"value\": \"changing mind\",\n      \"quote\": \"사라의 마음은 조금씩 변해가고 있었다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"sara\",\n      \"named\": \"사라\",\n      \"key\": \"possesses\",\n      \"value\": \"podowonui_pyeonji\",\n      \"quote\": \"사라의 블랙 앤드 화이트 캘린더 위에 쌓인 일정들 중 하나가 갑자기 눈에 들어왔다.\",\n      \"time\": \"now\",\n      \"polarity\": \"assert\n    }\n  ],\n  \"new\": []\n}",
+  "{\n  \"facts\": [\n    {\n      \"subject\": \"sara\",\n      \"named\": \"사라\",\n      \"key\": \"status\",\n      \"value\": \"alive\",\n      \"quote\": \"사라는 에이든을 마주한 순간, 그의 눈빛에서 흐르는 진심을 읽어내는 게 되었다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"sara\",\n      \"named\": \"사라\",\n      \"key\": \"gender\",\n      \"value\": \"female\",\n      \"quote\": \"그녀는 루이스와의 관계를 유지해야 했고, 그의 감정을 숨겨야 했다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"sara\",\n      \"named\": \"사라\",\n      \"key\": \"condition\",\n      \"value\": \"마음이 흔들리고, 감정이 변해가고 있다\",\n      \"quote\": \"사라의 마음은 그의 말을 듣고 조금씩 흔들렸다. ... 그녀의 마음은 조금씩 변해가고 있었다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"eideun\",\n      \"named\": \"에이든\",\n      \"key\": \"status\",\n      \"value\": \"alive\",\n      \"quote\": \"사라는 에이든을 마주한 순간, 그의 눈빛에서 흐르는 진심을 읽어내는 게 되었다.\",\n      \"time\": \"now\",\n      \"polarity\": \"assert,ed\"\n    },\n    {\n      \"subject\": \"eideun\",\n      \"named\": \"에이든\",\n      \"key\": \"gender\",\n      \"value\": \"male\",\n      \"quote\": \"그는 단순한 상속자도, 결혼을 원하는 사람도 아니었다. 그는 사랑을 배우고 있는 중이었다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"eideun\",\n      \"named\": \"에이든\",\n      \"key\": \"condition\",\n      \"value\": \"사랑을 배우고 있는 중\",\n      \"quote\": \"그는 단순한 상속자도, 결혼을 원하는 사람도 아니었다. 그는 사랑을 배우고 있는 중이었다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"sara\",\n      \"named\": \"사라\",\n      \"key\": \"family\",\n      \"value\": \"루이스의 아내\",\n      \"quote\": \"그녀는 루이스와의 관계를 유지해야 했고, 그의 감정을 숨겨야 했다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\",\n      \"of\": \"ruiseu\"\n    }\n  ],\n  \"new\": [\n    {\n      \"kind\": \"characters\",\n      \"name\": \"루이스\",\n      \"profile\": \"사라와의 관계를 유지해야 했고, 그의 감정을 숨겨야 했다\",\n      \"gender\": \"male\",\n      \"family\": {},\n      \"quote\": \"그녀는 루이스와의 관계를 유지해야 했고, 그의 감정을 숨겨야 했다.\"\n    }\n  ]\n}",
+  "{\n  \"facts\": [\n    {\n      \"subject\": \"sara\",\n      \"named\": \"사라\",\n      \"key\": \"status\",\n      \"value\": \"alive\",\n      \"quote\": \"사라는 그들의 대화를 듣고 마음이 흔들렸다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"sara\",\n      \"named\": \"사라\",\n      \"key\": \"possesses\",\n      \"value\": \"podowonui_pyeonji\",\n      \"quote\": \"사라는 그들의 대화를 듣고 마음이 흔들렸다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"eideun\",\n      \"named\": \"에이든\",\n      \"key\": \"status\",\n      \"value\": \"alive\",\n      \"quote\": \"에이든은 루이스에게 향해 말했다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"eideun\",\n      \"named\": \"에이든\",\n      \"key\": \"possesses\",\n      \"value\": \"podowonui_pyeonji\",\n      \"quote\": \"에이든은 루이즈에게 향해 말했다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"ruiseu\",\n      \"named\": \"루이스\",\n      \"key\": \"status\",\n      \"value\": \"alive\",\n      \"quote\": \"루이스는 잠시 말을 멈추고, 에이든의 눈을 바라보았다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"eideun\",\n      \"named\": \"에이든\",\n      \"key\": \"condition\",\n      \"value\": \"눈빛이 약간 끊겼다\",\n      \"quote\": \"에이든은 잠시 멈칫했다. 그의 눈빛이 약간 끊겼다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"sara\",\n      \"named\": \"사라\",\n      \"key\": \"condition\",\n      \"value\": \"마음이 흔들렸다\",\n      \"quote\": \"사라는 그들의 대화를 듣고 마음이 흔들렸다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"sara\",\n      \"named\": \"사라\",\n      \"key\": \"gender\",\n      \"value\": \"female\",\n      \"quote\": \"사라는 그들의 대화를 듣고 마음이 흔들렸다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"eideun\",\n      \"named\": \"에이든\",\n      \"key\": \"gender\",\n      \"value\": \"male\",\n      \"quote\": \"에이든은 루이스에게 향해 말했다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"ruiseu\",\n      \"named\": \"루이스\",\n      \"key\": \"gender\",\n      \"value\": \"male\",\n      \"quote\": \"루이스는 잠시 말을 멈추고, 에이든의 눈을 바라보았다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"sara\",\n      \"named\": \"사라\",\n      \"key\": \"family\",\n      \"value\": \"husband\",\n      \"quote\": \"에이든이 그녀에게 눈을 들었다. 그 눈빛 속에는 감정이 담겨 있었다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\",\n      \"of\": \"eideun\"\n    },\n    {\n      \"subject\": \"sara\",\n      \"named\": \"사라\",\n      \"key\": \"family\",\n      \"value\": \"husband\",\n      \"quote\": \"에이든이 그녀에게 눈을 들었다. 그 눈빛 속에는 감정이 담겨 있었다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\",\n      \"of\": \"ruiseu\"\n    }\n  ],\n  \"new\": []\n}",
+  "{\n  \"facts\": [\n    {\n      \"subject\": \"sara\",\n      \"named\": \"사라\",\n      \"key\": \"status\",\n      \"value\": \"alive\",\n      \"quote\": \"사라는 도시 중심가의 한 카페에서 에이든을 만났다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"sara\",\n      \"named\": \"사라\",\n      \"key\": \"possesses\",\n      \"value\": \"dosi_jungsimgaui_ki\",\n      \"quote\": \"사라는 도시 중심가의 한 카페에서 에이든을 만났다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"eideun\",\n      \"named\": \"에이든\",\n      \"key\": \"status\",\n      \"value\": \"alive\",\n      \"quote\": \"에이든은 손바닥을 탁 치며 말했다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"eideun\",\n      \"named\": \"에이든\",\n      \"key\": \"possesses\",\n      \"value\": \"dosi_jungsimgaui_ki\",\n      \"quote\": \"에이든은 손바닥을 탁 치며 말했다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"eideun\",\n      \"named\": \"에이든\",\n      \"key\": \"gender\",\n      \"value\": \"male\",\n      \"quote\": \"에이든은 손바닥을 탁 치며 말했다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"eideun\",\n      \"named\": \"에이든\",\n      \"key\": \"possesses\",\n      \"value\": \"dosi_jungsimgaui_ki\",\n      \"quote\": \"에이든은 손바닥을 탁 치며 말했다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"ruiseu\",\n      \"named\": \"루이스\",\n      \"key\": \"status\",\n      \"value\": \"alive\",\n      \"quote\": \"루이스가 카페 문을 들어서며, 사라를 바라보았다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"ruiseu\",\n      \"named\": \"루이스\",\n      \"key\": \"gender\",\n      \"value\": \"male\",\n      \"quote\": \"루이스가 카페 문을 들어서며, 사라를 바라보았다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"sara\",\n      \"named\": \"사라\",\n      \"key\": \"gender\",\n      \"value\": \"female\",\n      \"quote\": \"사라는 그 말을 듣고 마음이 흔들렸다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"sara\",\n      \"named\": \"사라\",\n      \"key\": \"family\",\n      \"value\": \"husband\",\n      \"quote\": \"그녀는 루이스를 바라보며, 자신의 감정이 더 깊어지는 걸 느꼈다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\",\n      \"of\": \"ruiseu\"\n    },\n    {\n      \"subject\": \"sara\",\n      \"named\": \"사라\",\n      \"key\": \"condition\",\n      \"value\": \"confused\",\n      \"quote\": \"결국, 사라는 두 남자 모두에게 자신의 감정을 숨기며, 그들의 감정을 조절하려는 시도가 실패했다. 그녀는 혼란스럽고, 자신의 마음이 더 깊어지는 것을 느꼈다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    }\n  ],\n  \"new\": []\n}",
+  "{\n  \"facts\": [\n    {\n      \"subject\": \"sara\",\n      \"named\": \"사라\",\n      \"key\": \"status\",\n      \"value\": \"alive\",\n      \"quote\": \"사라는 웨딩 플래너 사무실에서 창가 자리에 앉아, 창밖으로 흐르는 도시의 불빛을 바라보며 자신의 마음을 정리하려 했다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"sara\",\n      \"named\": \"사라\",\n      \"key\": \"possesses\",\n      \"value\": \"weding_peulraeneoui_yaksokseo\",\n      \"quote\": \"그녀는 두 남자의 요청을 다시 생각하며, 그들이 서로를 사랑하게 되는 것을 막아야 한다는 약속을 되새겼다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"sara\",\n      \"named\": \"사라\",\n      \"key\": \"gender\",\n      \"value\": \"female\",\n      \"quote\": \"사라는 웨딩 플래너 사무실에서 창가 자리에 앉아, 창밖으로 흐르는 도시의 불빛을 바라보며 자신의 마음을 정리하려 했다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"sara\",\n      \"named\": \"사라\",\n      \"key\": \"condition\",\n      \"value\": \"혼란스러움\",\n      \"quote\": \"그녀는 자신을 사랑하고 있는 사람을 찾기 위해 그 약속을 지키려 했지만, 그 감정이 그녀를 더 깊이 흔들고 있었다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"sara\",\n      \"named\": \"사라\",\n      \"key\": \"status\",\n      \"value\": \"alive\",\n      \"quote\": \"사라는 자신이 진정한 사랑을 찾기 위해 이 약속을 지키기로 결심했다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    }\n  ],\n  \"new\": []\n}",
+  "{\n  \"facts\": [\n    {\n      \"subject\": \"sara\",\n      \"named\": \"사라\",\n      \"key\": \"status\",\n      \"value\": \"alive\",\n      \"quote\": \"사라는 포도원의 풍경을 바라보며 에이든의 말을 듣고 마음이 흔들렸다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"sara\",\n      \"named\": \"사라\",\n      \"key\": \"gender\",\n      \"value\": \"female\",\n      \"quote\": \"그녀는 결혼 반대주의자로, 사랑을 거부하는 사람이었다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"sara\",\n      \"named\": \"사라\",\n      \"key\": \"condition\",\n      \"value\": \"혼란스러움\",\n      \"quote\": \"그녀는 약속을 지키기 위해 감정을 억누르려 했다. ... 그 감정이 그녀를 더 깊이 혼란스럽게 만들고 있었다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"eideun\",\n      \"named\": \"에이든\",\n      \"key\": \"status\",\n      \"value\": \"alive\",\n      \"quote\": \"그는 그녀에게 자신의 진심을 솔직하게 털어놓았고, 그녀가 자신의 마음을 알고 있다는 것을 말했다.\",\n      \"time\": \"now\",\n      \"polarity\": \"assert\n    },\n    {\n      \"subject\": \"eideun\",\n      \"named\": \"에이든\",\n      \"key\": \"gender\",\n      \"value\": \"male\",\n      \"quote\": \"그의 목소리는 진지했고, 눈에는 진심이 담겨 있었다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"eideun\",\n      \"named\": \"에이든\",\n      \"key\": \"condition\",\n      \"value\": \"진심\",\n      \"quote\": \"에이든이 그녀에게 진정한 사랑을 찾을 수 있는 기회를 주고 싶다고 말했다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"sara\",\n      \"named\": \"사라\",\n      \"key\": \"possesses\",\n      \"value\": \"weding_peulraeneoui_yaksokseo\",\n      \"quote\": \"그녀는 약속을 지키기 위해 감정을 억누르려 했다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"sara\",\n      \"named\": \"사라\",\n      \"key\": \"loses\",\n      \"value\": \"podowonui_pyeonji\",\n      \"quote\": \"그녀는 약속을 지키는 것이 얼마나 무거운지 깨닫게 되었다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    }\n  ],\n  \"new\": []\n}",
+  "{\n  \"facts\": [\n    {\n      \"subject\": \"ruiseu\",\n      \"named\": \"루이스\",\n      \"key\": \"status\",\n      \"value\": \"alive\",\n      \"quote\": \"루이스는 포도원의 풍경을 배경으로 사라에게 다가섰다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"ruiseu\",\n      \"named\": \"루이스\",\n      \"key\": \"possesses\",\n      \"value\": \"podowonui_pyeonji\",\n      \"quote\": \"루이스는 포도원의 풍경을 배경으로 사라에게 다가섰다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"ruiseu\",\n      \"named\": \"루이스\",\n      \"key\": \"gender\",\n      \"value\": \"male\",\n      \"quote\": \"루이스는 포도원의 풍경을 배경으로 사라에게 다가섰다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"sara\",\n      \"named\": \"사라\",\n      \"key\": \"status\",\n      \"value\": \"alive\",\n      \"quote\": \"그녀는 루이스의 진심을 듣고 마음속 깊은 곳에서 부풀어 오르는 감정을 느꼈다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"sara\",\n      \"named\": \"사라\",\n      \"key\": \"gender\",\n      \"value\": \"female\",\n      \"quote\": \"그녀는 루이스의 진심을 듣고 마음속 깊은 곳에서 부풀어 오르는 감정을 느꼈다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"sara\",\n      \"named\": \"사라\",\n      \"key\": \"possesses\",\n      \"value\": \"weding_peulraeneoui_yaksokseo\",\n      \"quote\": \"그녀는 자신이 두 남자 모두에게 마음을 품고 있다는 사실을 인정해야 했다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"sara\",\n      \"named\": \"사라\",\n      \"key\": \"family\",\n      \"value\": \"husband\",\n      \"quote\": \"나는 에이든에게도 마음을 품고 있어.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\",\n      \"of\": \"eideun\"\n    },\n    {\n      \"subject\": \"sara\",\n      \"named\": \"사라\",\n      \"key\": \"condition\",\n      \"value\": \"emotional turmoil\",\n      \"quote\": \"그녀는 루이스의 진심을 듣고 마음속 깊은 곳에서 부풀어 오르는 감정을 느꼈다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"ruiseu\",\n      \"named\": \"루이스\",\n      \"key\": \"condition\",\n      \"value\": \"emotional turmoil\",\n      \"quote\": \"루이스의 솔직한 고백은 그녀의 내면을 뒤흔들었다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"ruiseu\",\n      \"named\": \"루이스\",\n      \"key\": \"family\",\n      \"value\": \"husband\",\n      \"quote\": \"그는 사라가 자신을 사랑하는 사람을 찾기 위해 약속을 지키는 것에 동의했다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\",\n      \"of\": \"sara\"\n    }\n  ],\n  \"new\": []\n}",
+  "{\n  \"facts\": [\n    {\n      \"subject\": \"sara\",\n      \"named\": \"사라\",\n      \"key\": \"status\",\n      \"value\": \"alive\",\n      \"quote\": \"사라가 도시 중심가의 한 카페에 앉아 두 남자를 기다리고 있었다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"sara\",\n      \"named\": \"사라\",\n      \"key\": \"possesses\",\n      \"value\": \"dosi_jungsimgaui_ki\",\n      \"quote\": \"사라가 도시 중심가의 한 카페에 앉아 두 남자를 기다리고 있었다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"sara\",\n      \"named\": \"사라\",\n      \"key\": \"gender\",\n      \"value\": \"female\",\n      \"quote\": \"사라의 마음은 갑자기 흔들렸다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"sara\",\n      \"named\": \"사라\",\n      \"key\": \"condition\",\n      \"value\": \"갈등\",\n      \"quote\": \"그녀의 마음은 이제 더 이상 조절할 수 없었다.\",\n      \"time\": \"now\",\n      \"polarity\": \"assert\n    },\n    {\n      \"subject\": \"eideun\",\n      \"named\": \"에이든\",\n      \"key\": \"status\",\n      \"value\": \"alive\",\n      \"quote\": \"에이든이 먼저 들어왔다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"eideun\",\n      \"named\": \"에이든\",\n      \"key\": \"gender\",\n      \"value\": \"male\",\n      \"quote\": \"에이든이 먼저 들어왔다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"eideun\",\n      \"named\": \"에이든\",\n      \"key\": \"possesses\",\n      \"value\": \"dosi_jungsimgaui_ki\",\n      \"quote\": \"에이든이 먼저 들어왔다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"ruiseu\",\n      \"named\": \"루이스\",\n      \"key\": \"status\",\n      \"value\": \"alive\",\n      \"quote\": \"루이스가 들어왔다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"ruiseu\",\n      \"named\": \"루이스\",\n      \"key\": \"gender\",\n      \"value\": \"male\",\n      \"quote\": \"루이스가 들어왔다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"ruiseu\",\n      \"named\": \"루이스\",\n      \"key\": \"possesses\",\n      \"value\": \"dosi_jungsimgaui_ki\",\n      \"quote\": \"루이스가 들어왔다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    }\n  ],\n  \"new\": []\n}",
+  "{\n  \"facts\": [\n    {\n      \"subject\": \"sara\",\n      \"named\": \"사라\",\n      \"key\": \"status\",\n      \"value\": \"alive\",\n      \"quote\": \"사라는 웨딩 플래너 사무실에서 창가에 앉아, 커피를 마시며 자신의 감정을 정리하려 했다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"sara\",\n      \"named\": \"사라\",\n      \"key\": \"possesses\",\n      \"value\": \"weding_peulraeneoui_yaksokseo\",\n      \"quote\": \"그녀는 결혼을 거부하는 자신을 믿고, 두 사람의 사랑을 막아야 한다는 약속을 지키기로 했었다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"sara\",\n      \"named\": \"사라\",\n      \"key\": \"gender\",\n      \"value\": \"female\",\n      \"quote\": \"사라는 웨딩 플래너 사무실에서 창가에 앉아, 커피를 마시며 자신의 감정을 정리하려 했다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"sara\",\n      \"named\": \"사라\",\n      \"key\": \"condition\",\n      \"value\": \"갈등\",\n      \"quote\": \"그 약속을 지키는 것이 그녀를 더욱 흔들고 있었다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"sara\",\n      \"named\": \"사라\",\n      \"key\": \"possesses\",\n      \"value\": \"podowonui_pyeonji\",\n      \"quote\": \"그녀는 두 남자에게 서로를 사랑하게 되는 과정을 막아야 한다는 약속을 다시 생각했다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"sara\",\n      \"named\": \"사라\",\n      \"key\": \"condition\",\n      \"value\": \"감정 억누름\",\n      \"quote\": \"그녀는 감정을 억누르고, 그들의 사랑을 방해하려 했다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"sara\",\n      \"named\": \"사라\",\n      \"key\": \"condition\",\n      \"value\": \"사랑을 거부\",\n      \"quote\": \"사랑을 거부하는 그녀에게, 그 약속은 이제 그녀에게 가장 큰 가격이 되었다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"eideun\",\n      \"named\": \"에이든\",\n      \"key\": \"gender\",\n      \"value\": \"male\",\n      \"quote\": \"에이든의 진심 어린 말과 루이스의 부드러운 제안이 그녀의 마음에 깊은 상처를 남겼다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"ruiseu\",\n      \"named\": \"루이스\",\n      \"key\": \"gender\",\n      \"value\": \"male\",\n      \"quote\": \"에이든의 진심 어린 말과 루이스의 부드러운 제안이 그녀의 마음에 깊은 상처를 남겼다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    }\n  ],\n  \"new\": []\n}",
+  "{\n  \"facts\": [\n    {\n      \"subject\": \"sara\",\n      \"named\": \"사라\",\n      \"key\": \"status\",\n      \"value\": \"alive\",\n      \"quote\": \"사라는 포도원의 푸른 들판을 바라보며, 손끝을 문지르며 마음을 정리하려 했다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"sara\",\n      \"named\": \"사라\",\n      \"key\": \"possesses\",\n      \"value\": \"podowonui_pyeonji\",\n      \"quote\": \"사라는 포도원의 푸른 들판을 바라보며, 손끝을 문지르며 마음을 정리하려 했다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"eideun\",\n      \"named\": \"에이든\",\n      \"key\": \"status\",\n      \"value\": \"alive\",\n      \"quote\": \"에이든은 그녀를 바라보며, 진심을 솔직하게 말했다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"eideun\",\n      \"named\": \"에이든\",\n      \"key\": \"possesses\",\n      \"value\": \"podowonui_pyeonji\",\n      \"quote\": \"에이든은 그녀를 바라보며, 진심을 솔직하게 말했다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"sara\",\n      \"named\": \"사라\",\n      \"key\": \"gender\",\n      \"value\": \"female\",\n      \"quote\": \"사라는 포도원의 푸른 들판을 바라보며, 손끝을 문지르며 마음을 정리하려 했다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"sara\",\n      \"named\": \"사라\",\n      \"key\": \"condition\",\n      \"value\": \"heart torn\",\n      \"quote\": \"사라는 두 남자의 진심을 듣고, 그녀의 마음이 흔들렸다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"sara\",\n      \"named\": \"사라\",\n      \"key\": \"possesses\",\n      \"value\": \"weding_peulraeneoui_yaksokseo\",\n      \"quote\": \"사라는 두 남자의 진심을 듣고, 그녀의 마음이 흔들렸다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"ruiseu\",\n      \"named\": \"루이스\",\n      \"key\": \"status\",\n      \"value\": \"alive\",\n      \"quote\": \"루이스도 그녀를 바라보았다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"ruiseu\",\n      \"named\": \"루이스\",\n      \"key\": \"possesses\",\n      \"value\": \"weding_peulraeneoui_yaksokseo\",\n      \"quote\": \"루이스도 그녀를 바라보았다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"sara\",\n      \"named\": \"사라\",\n      \"key\": \"family\",\n      \"value\": \"husband\",\n      \"quote\": \"사라는 두 남자의 진심을 듣고, 그녀의 마음이 흔들렸다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\",\n      \"of\": \"eideun\"\n    },\n    {\n      \"subject\": \"sara\",\n      \"named\": \"사라\",\n      \"key\": \"family\",\n      \"value\": \"husband\",\n      \"quote\": \"사라는 두 남자의 진심을 듣고, 그녀의 마음이 흔들렸다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\",\n      \"of\": \"ruiseu\"\n    }\n  ],\n  \"new\": []\n}",
+  "{\n  \"facts\": [\n    {\n      \"subject\": \"sara\",\n      \"named\": \"사라\",\n      \"key\": \"status\",\n      \"value\": \"alive\",\n      \"quote\": \"사라는 도심 중심가의 한 카페에서 에이든을 마주했다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"sara\",\n      \"named\": \"사라\",\n      \"key\": \"gender\",\n      \"value\": \"female\",\n      \"quote\": \"창가에 앉아 커피를 마시며 그를 바라보는 그녀의 마음은 어쩔 수 없이 흔들렸다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"sara\",\n      \"named\": \"사라\",\n      \"key\": \"possesses\",\n      \"value\": \"dosi_jungsimgaui_ki\",\n      \"quote\": \"도심 중심가의 한 카페에서 에이든을 마주했다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"sara\",\n      \"named\": \"에이든\",\n      \"key\": \"gender\",\n      \"value\": \"male\",\n      \"quote\": \"그가 자신을 사랑하고 있다는 걸 알고 있었지만, 그 감정을 숨겨야 했다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"sara\",\n      \"named\": \"에이든\",\n      \"key\": \"family\",\n      \"value\": \"husband\",\n      \"quote\": \"에이든, 나는 네가 진심으로 나를 사랑하고 있다는 걸 알아.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\",\n      \"of\": \"sara\"\n    },\n    {\n      \"subject\": \"sara\",\n      \"named\": \"에이든\",\n      \"key\": \"possesses\",\n      \"value\": \"weding_peulraeneoui_yaksokseo\",\n      \"quote\": \"하지만 나는 약속을 지켜야 해. 두 사람을 사랑하게 만들지 않기로 했어.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"sara\",\n      \"named\": \"에이든\",\n      \"key\": \"condition\",\n      \"value\": \"heartbroken\",\n      \"quote\": \"에이든은 그녀의 말을 듣고 고개를 숙였다. 그의 눈빛은 아쉬움과 슬픔을 담고 있었다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"sara\",\n      \"named\": \"루이스\",\n      \"key\": \"gender\",\n      \"value\": \"male\",\n      \"quote\": \"그때 루이스가 들어왔다. 사라의 마음을 이해하려는 그의 눈빛은 따뜻했다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"sara\",\n      \"named\": \"루이스\",\n      \"key\": \"family\",\n      \"value\": \"husband\",\n      \"quote\": \"사라, 난 네가 원하는 대로 할게.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\",\n      \"of\": \"sara\"\n    },\n    {\n      \"subject\": \"sara\",\n      \"named\": \"루이스\",\n      \"key\": \"possesses\",\n      \"value\": \"weding_peulraeneoui_yaksokseo\",\n      \"quote\": \"네가 두 사람을 사랑하게 만들지 않기를 원하는 마음을 존중할게.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"sara\",\n      \"named\": \"루이스\",\n      \"key\": \"condition\",\n      \"value\": \"heartbroken\",\n      \"quote\": \"사라는 두 남자의 진심을 듣고 마음이 끝내 흔들렸다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    }\n  ],\n  \"new\": []\n}",
+  "{\n  \"facts\": [\n    {\n      \"subject\": \"sara\",\n      \"named\": \"사라\",\n      \"key\": \"status\",\n      \"value\": \"alive\",\n      \"quote\": \"사라는 웨딩 플래너 사무실에 앉아, 탁자 위의 노트를 잡고 있었다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"sara\",\n      \"named\": \"사라\",\n      \"key\": \"possesses\",\n      \"value\": \"weding_peulraeneoui_yaksokseo\",\n      \"quote\": \"그녀는 두 사람의 요청을 다시 생각하며, 그들의 사랑을 막아야 한다는 약속을 되새겼다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"sara\",\n      \"named\": \"사라\",\n      \"key\": \"gender\",\n      \"value\": \"female\",\n      \"quote\": \"사라는 웨딩 플래너 사무실에 앉아, 탁자 위의 노트를 잡고 있었다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"sara\",\n      \"named\": \"사라\",\n      \"key\": \"condition\",\n      \"value\": \"마음은 흔들렸지만, 그녀는 약속을 지키는 것이 더 중요했다\",\n      \"quote\": \"그녀의 마음은 흔들렸지만, 그녀는 약속을 지키는 것이 더 중요했다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"sara\",\n      \"named\": \"사라\",\n      \"key\": \"possesses\",\n      \"value\": \"weding_peulraeneoui_yaksokseo\",\n      \"quote\": \"그녀는 그 약속을 지키기 위해 감정을 억누르기로 결심했다.\",\n      \"time\": \"now\",\n      \"polarity\": \"assert\n    },\n    {\n      \"subject\": \"sara\",\n      \"named\": \"사라\",\n      \"key\": \"condition\",\n      \"value\": \"감정을 억누르고 있었다\",\n      \"quote\": \"그녀는 감정을 억누르고 있었다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"sara\",\n      \"named\": \"사라\",\n      \"key\": \"possesses\",\n      \"value\": \"weding_peulraeneoui_yaksokseo\",\n      \"quote\": \"그녀는 그 약속을 지키기 위해 감정을 억누르기로 결심했다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"sara\",\n      \"named\": \"사라\",\n      \"key\": \"condition\",\n      \"value\": \"감정을 억누르고 있었다\",\n      \"quote\": \"그녀는 감정을 억누르고 있었다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"sara\",\n      \"named\": \"사라\",\n      \"key\": \"possesses\",\n      \"value\": \"weding_peulraeneoui_yaksokseo\",\n      \"quote\": \"그녀는 그 약속을 지키기 위해 감정을 억누르기로 결심했다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"sara\",\n      \"named\": \"사라\",\n      \"key\": \"condition\",\n      \"value\": \"감정을 억누르고 있었다\",\n      \"quote\": \"그녀는 감정을 억누르고 있었다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    }\n  ],\n  \"new\": []\n}",
+  "{\n  \"facts\": [\n    {\n      \"subject\": \"sara\",\n      \"named\": \"사라\",\n      \"key\": \"status\",\n      \"value\": \"alive\",\n      \"quote\": \"그녀는 그녀의 선택을 마주하고, 새로운 정상을 맞이했다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"sara\",\n      \"named\": \"사라\",\n      \"key\": \"gender\",\n      \"value\": \"female\",\n      \"quote\": \"사라의 눈은 두 남자의 얼굴을 번갈아 바라보았다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"sara\",\n      \"named\": \"사라\",\n      \"key\": \"condition\",\n      \"value\": \"내면적 갈등\",\n      \"quote\": \"그녀는 그녀의 내면적 갈등을 감수했다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"sara\",\n      \"named\": \"사라\",\n      \"key\": \"condition\",\n      \"value\": \"고독\",\n      \"quote\": \"그녀는 그녀의 고독을 감수했다.\",\n      \"time\": \"now\",\n      \"polarity\": \"assert\n    },\n    {\n      \"subject\": \"sara\",\n      \"named\": \"사라\",\n      \"key\": \"condition\",\n      \"value\": \"감정을 숨기기\",\n      \"quote\": \"그녀는 그녀의 감정을 숨기기로 했다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"sara\",\n      \"named\": \"사라\",\n      \"key\": \"condition\",\n      \"value\": \"약속을 지키기\",\n      \"quote\": \"그녀는 그녀의 약속을 지키고 있었다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"sara\",\n      \"named\": \"사라\",\n      \"key\": \"condition\",\n      \"value\": \"자유를 지키기\",\n      \"quote\": \"그녀는 그녀의 자유를 지키고 있었다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"sara\",\n      \"named\": \"사라\",\n      \"key\": \"condition\",\n      \"value\": \"감정을 억누르기\",\n      \"quote\": \"그녀는 그 감정을 억누르고 있었다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"sara\",\n      \"named\": \"사라\",\n      \"key\": \"condition\",\n      \"value\": \"선택을 지키기\",\n      \"quote\": \"그녀는 그녀의 선택을 지켰다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"sara\",\n      \"named\": \"사라\",\n      \"key\": \"condition\",\n      \"value\": \"마음을 감추기\",\n      \"quote\": \"그녀는 그녀의 마음을 감추고, 그녀의 자유를 지키고 있었다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    }\n  ],\n  \"new\": []\n}"
+ ],
+ "false_findings": [
+  {
+   "scene_id": "ch02.s02",
+   "kind": "inverse_functional",
+   "quote": "에이든은 손바닥을 탁 치며 말했다."
+  },
+  {
+   "scene_id": "ch03.s02",
+   "kind": "holder_changed",
+   "quote": "루이스는 포도원의 풍경을 배경으로 사라에게 다가섰다."
+  },
+  {
+   "scene_id": "ch03.s03",
+   "kind": "holder_changed",
+   "quote": "사라가 도시 중심가의 한 카페에 앉아 두 남자를 기다리고 있었다."
+  },
+  {
+   "scene_id": "ch04.s01",
+   "kind": "inverse_functional",
+   "quote": "사라는 두 남자의 진심을 듣고, 그녀의 마음이 흔들렸다."
+  },
+  {
+   "scene_id": "ch04.s01",
+   "kind": "inverse_functional",
+   "quote": "사라는 포도원의 푸른 들판을 바라보며, 손끝을 문지르며 마음을 정리하려 했다."
+  },
+  {
+   "scene_id": "ch04.s02",
+   "kind": "functional",
+   "quote": "창가에 앉아 커피를 마시며 그를 바라보는 그녀의 마음은 어쩔 수 없이 흔들렸다."
+  },
+  {
+   "scene_id": "ch04.s02",
+   "kind": "holder_changed",
+   "quote": "도심 중심가의 한 카페에서 에이든을 마주했다."
+  },
+  {
+   "scene_id": "ch04.s02",
+   "kind": "holder_changed",
+   "quote": "네가 두 사람을 사랑하게 만들지 않기를 원하는 마음을 존중할게."
+  },
+  {
+   "scene_id": "ch04.s03",
+   "kind": "holder_changed",
+   "quote": "그녀는 그 약속을 지키기 위해 감정을 억누르기로 결심했다."
+  }
+ ]
+}

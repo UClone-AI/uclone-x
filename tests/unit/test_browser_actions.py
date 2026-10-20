@@ -52,7 +52,7 @@ def test_ordinary_fields_are_not_secret(input_type: str, autocomplete: str) -> N
 
 
 def test_the_secret_field_refusal_is_plain_copy() -> None:
-    assert "Use sign_in, or ask the person to take over" in SECRET_FIELD_REFUSAL
+    assert "Call ask_user so the person can sign in" in SECRET_FIELD_REFUSAL
     for internal in ("autocomplete", "type=", "CDP", "backend", "Error"):
         assert internal not in SECRET_FIELD_REFUSAL
 

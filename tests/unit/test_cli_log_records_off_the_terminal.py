@@ -171,8 +171,8 @@ def test_the_log_a_notice_names_is_the_one_records_go_to(
 
     Under the home directory it is written from `~`.
 
-    Killed by: src/uclone_x/core/logging_setup.py :: shown = f"~/{log_file.relative_to(Path.home().resolve()).as_posix()}"
-    Becomes: shown = "the log"
+    Killed by: src/uclone_x/core/logging_setup.py :: return f"~/{log_file.relative_to(Path.home().resolve()).as_posix()}"
+    Becomes: return "the log"
     """
     from uclone_x.core.logging_setup import reason_is_in_the_log
 

@@ -21,6 +21,13 @@ const fact = (statement: string, over: Partial<KnownFact> = {}): KnownFact => ({
   source_turn_id: 'turn-1',
   confidence: 1,
   created_at: '2026-09-26T00:00:00Z',
+  last_seen_at: '2026-09-26T00:00:00Z',
+  // Each fact its own relation unless a test puts two under one (#2332).
+  relation: `rel_${statement.length}${statement.charCodeAt(0)}`,
+  functional: false,
+  ask_functional: false,
+  quote: null,
+  replaced: [],
   ...over,
 });
 
@@ -103,11 +110,11 @@ describe('RemembersPanel: one clone-wide list in two groups (#1638 step 3)', () 
     expect(here).toHaveTextContent('Learned in this conversation');
     expect(elsewhere).toHaveTextContent('From other conversations');
     expect(within(here).getAllByTestId('known-fact').map((i) => i.textContent)).toEqual([
-      'Kenny favourite colour tealsaved',
-      'Project X uses Postgres 16corrected',
+      'Kenny favourite colour tealsavedHistory',
+      'Project X uses Postgres 16correctedHistory',
     ]);
     expect(within(elsewhere).getAllByTestId('known-fact').map((i) => i.textContent)).toEqual([
-      'Kenny works at Hanbittold',
+      'Kenny works at HanbittoldHistory',
     ]);
     expect(screen.getByText('What Scout knows')).toBeInTheDocument();
     expect(requested).toEqual([URL_A]);
@@ -424,3 +431,320 @@ describe('RemembersPanel: a failed read shows no transport text (#1401)', () => 
     expect(container.textContent ?? '').not.toMatch(TECHNICAL);
   });
 });
+
+describe('RemembersPanel: one value at a time (#2332)', () => {
+  const ONE_VALUE_URL = '/api/agents/scout/relations/lives_in/functional';
+  const busan = fact('Kenny lives in Busan', {
+    fact_id: 'mem_busan',
+    relation: 'lives_in',
+    last_seen_at: '2026-09-01T00:00:00Z',
+  });
+  const seoul = fact('Kenny lives in Seoul', {
+    fact_id: 'mem_seoul',
+    relation: 'lives_in',
+    origin: 'told',
+    last_seen_at: '2026-09-02T00:00:00Z',
+    ask_functional: true,
+  });
+
+  it('puts the values of one relation together and marks the one said last', async () => {
+    // Killed by: frontend/src/components/artifacts/RemembersPanel.tsx :: (b.last_seen_at ?? '') > (a.last_seen_at ?? '') ? b : a,
+    // Becomes: (b.last_seen_at ?? '') < (a.last_seen_at ?? '') ? b : a,
+    // Killed by: frontend/src/components/artifacts/RemembersPanel.tsx :: const key = `${f.subject.toLowerCase()}\u0000${f.relation}`;
+    // Becomes: const key = f.fact_id;
+    answers[URL_A] = knowledge([busan, fact('Kenny likes jazz'), seoul]);
+    render(<RemembersPanel roomId="room-a" seatId="scout" seatName="Scout" />);
+
+    const group = await screen.findByTestId('relation-group');
+    const rows = within(group).getAllByTestId('known-fact');
+    expect(rows.map((r) => r.textContent)).toEqual([
+      expect.stringContaining('Busan'),
+      expect.stringContaining('Seoul'),
+    ]);
+    expect(within(rows[1]).getByTestId('fact-said-last')).toHaveTextContent('said last');
+    expect(within(rows[0]).queryByTestId('fact-said-last')).toBeNull();
+    expect(group).toHaveTextContent('Kenny · lives in');
+    expect(screen.getAllByTestId('known-fact')).toHaveLength(3);
+  });
+
+  it('asks after a person changed a value, and Yes declares it; ignoring saves nothing', async () => {
+    // Killed by: frontend/src/components/artifacts/RemembersPanel.tsx :: const outcome = await setRelationFunctional(seatId, first.relation, true);
+    // Becomes: const outcome = await setRelationFunctional(seatId, first.relation, false);
+    // Killed by: frontend/src/components/artifacts/RemembersPanel.tsx :: const asks = facts.some((f) => f.ask_functional);
+    // Becomes: const asks = false;
+    answers[URL_A] = knowledge([busan, seoul]);
+    render(<RemembersPanel roomId="room-a" seatId="scout" seatName="Scout" />);
+
+    const ask = await screen.findByTestId('relation-ask');
+    expect(ask).toHaveTextContent(
+      'Can lives in hold only one value at a time? Then a new one will replace the old.',
+    );
+    expect(ask.textContent).not.toMatch(FORBIDDEN);
+    expect(calls.filter((c) => c.method !== 'GET')).toEqual([]);
+
+    answers[URL_A] = knowledge([
+      { ...busan, functional: true, ask_functional: false },
+      { ...seoul, functional: true, ask_functional: false },
+    ]);
+    fireEvent.click(screen.getByTestId('relation-ask-yes'));
+
+    await vi.waitFor(() => expect(screen.queryByTestId('relation-ask')).toBeNull());
+    expect(calls.filter((c) => c.method !== 'GET')).toEqual([
+      { url: ONE_VALUE_URL, method: 'PUT', body: { functional: true } },
+    ]);
+    expect(screen.getByTestId('relation-one-value')).toBeChecked();
+  });
+
+  it('No, several at once is sent and the question does not come back', async () => {
+    // Killed by: frontend/src/components/artifacts/RemembersPanel.tsx :: const outcome = await markRelationSeveral(seatId, first.relation);
+    // Becomes: const outcome = await setRelationFunctional(seatId, first.relation, true);
+    answers[URL_A] = knowledge([busan, seoul]);
+    render(<RemembersPanel roomId="room-a" seatId="scout" seatName="Scout" />);
+    expect(await screen.findByTestId('relation-ask-no')).toHaveTextContent('No, several at once');
+
+    // The Core keeps the answer, so every read after it no longer asks.
+    answers[URL_A] = knowledge([busan, { ...seoul, ask_functional: false }]);
+    fireEvent.click(screen.getByTestId('relation-ask-no'));
+
+    await vi.waitFor(() => expect(screen.queryByTestId('relation-ask')).toBeNull());
+    expect(calls.filter((c) => c.method !== 'GET')).toEqual([
+      { url: '/api/agents/scout/relations/lives_in/several', method: 'POST', body: undefined },
+    ]);
+    expect(screen.getByTestId('relation-one-value')).not.toBeChecked();
+  });
+
+  it('the box in the group header turns it off again', async () => {
+    // Killed by: frontend/src/components/artifacts/RemembersPanel.tsx :: const outcome = await setRelationFunctional(seatId, fact.relation, e.target.checked);
+    // Becomes: const outcome = await setRelationFunctional(seatId, fact.relation, true);
+    const home = { ...seoul, functional: true, ask_functional: false };
+    answers[URL_A] = knowledge([home]);
+    render(<RemembersPanel roomId="room-a" seatId="scout" seatName="Scout" />);
+
+    const box = await screen.findByTestId('relation-one-value');
+    expect(box).toBeChecked();
+    fireEvent.click(box);
+
+    await vi.waitFor(() =>
+      expect(calls.filter((c) => c.method !== 'GET')).toEqual([
+        { url: ONE_VALUE_URL, method: 'PUT', body: { functional: false } },
+      ]),
+    );
+  });
+
+  it('a refused save says so in plain words', async () => {
+    edits[`PUT ${ONE_VALUE_URL}`] = { status: 500, body: { detail: 'OSError: disk full' } };
+    answers[URL_A] = knowledge([busan, seoul]);
+    render(<RemembersPanel roomId="room-a" seatId="scout" seatName="Scout" />);
+
+    fireEvent.click(await screen.findByTestId('relation-ask-yes'));
+
+    const refusal = await screen.findByTestId('relation-ask-refusal');
+    expect(refusal).toHaveTextContent('That could not be saved. Try again.');
+    expect(refusal.textContent).not.toMatch(/OSError|disk/);
+  });
+
+  it('asks in Korean in 합니다체', () => {
+    const copy = ko.dock.remembers;
+    for (const line of [copy.askOneValue, copy.oneValueOn, copy.oneValueFailed]) {
+      expect(line).toMatch(/니까\?|니다\./);
+    }
+    expect(copy.askOneValue).toContain('{relation}');
+  });
+});
+
+describe('RemembersPanel: a fact’s history and bringing a value back (#2332)', () => {
+  const seoul = fact('Kenny lives in Seoul', {
+    fact_id: 'mem_seoul',
+    relation: 'lives_in',
+    origin: 'told',
+    quote: 'I moved to Seoul',
+    replaced: [{ fact_id: 'mem_busan', value: 'Busan', said_at: '2026-09-01T00:00:00Z' }],
+  });
+
+  it('shows the words, and brings back what it replaced', async () => {
+    // Killed by: frontend/src/components/artifacts/RemembersPanel.tsx :: const outcome = await restoreMemoryFact(seatId, old.fact_id);
+    // Becomes: const outcome = await restoreMemoryFact(seatId, fact.fact_id);
+    answers[URL_A] = knowledge([seoul]);
+    render(<RemembersPanel roomId="room-a" seatId="scout" seatName="Scout" />);
+
+    expect(screen.queryByTestId('fact-history')).toBeNull();
+    fireEvent.click(await screen.findByTestId('fact-history-toggle'));
+
+    const history = screen.getByTestId('fact-history');
+    expect(within(history).getByTestId('fact-history-quote')).toHaveTextContent(
+      'Learned from: “I moved to Seoul”',
+    );
+    expect(within(history).getByTestId('fact-history-replaced')).toHaveTextContent('Replaced Busan');
+    expect(history.textContent).not.toMatch(FORBIDDEN);
+
+    answers[URL_A] = knowledge([
+      fact('Kenny lives in Busan', { fact_id: 'mem_back', relation: 'lives_in', origin: 'corrected' }),
+    ]);
+    fireEvent.click(within(history).getByTestId('fact-restore'));
+
+    expect(await screen.findByText('Kenny lives in Busan')).toBeInTheDocument();
+    expect(calls.filter((c) => c.method !== 'GET')).toEqual([
+      { url: '/api/agents/scout/memory/mem_busan/restore', method: 'POST', body: undefined },
+    ]);
+  });
+
+  it('reads the list again when the value can no longer come back, so no stale row stays', async () => {
+    // Killed by: frontend/src/components/artifacts/RemembersPanel.tsx :: if (!outcome.ok && outcome.status === 409) {
+    // Becomes: if (!outcome.ok && outcome.status === 418) {
+    edits['POST /api/agents/scout/memory/mem_busan/restore'] = {
+      status: 409,
+      body: { detail: 'This value can no longer be brought back.' },
+    };
+    answers[URL_A] = knowledge([seoul]);
+    render(<RemembersPanel roomId="room-a" seatId="scout" seatName="Scout" />);
+    fireEvent.click(await screen.findByTestId('fact-history-toggle'));
+
+    // Meanwhile another writer replaced Seoul with Daegu.
+    answers[URL_A] = knowledge([
+      fact('Kenny lives in Daegu', { fact_id: 'mem_daegu', relation: 'lives_in', origin: 'told' }),
+    ]);
+    fireEvent.click(screen.getByTestId('fact-restore'));
+
+    expect(await screen.findByText('Kenny lives in Daegu')).toBeInTheDocument();
+    expect(screen.queryByText('Kenny lives in Seoul')).toBeNull();
+    expect(screen.queryByTestId('fact-restore')).toBeNull();
+    expect(requested).toEqual([URL_A, URL_A]);
+  });
+
+  it('still tells the person after the re-read that their value did not come back', async () => {
+    // Killed by: frontend/src/components/artifacts/RemembersPanel.tsx :: onStale(old.value);
+    // Becomes: void old;
+    // Killed by: frontend/src/components/artifacts/RemembersPanel.tsx :: setStale(null);
+    // Becomes: void roomId;
+    edits['POST /api/agents/scout/memory/mem_busan/restore'] = {
+      status: 409,
+      body: { detail: 'OSError mem_busan' },
+    };
+    answers[URL_A] = knowledge([seoul]);
+    answers['/api/rooms/room-a/knowledge?agent_id=guardian'] = knowledge([
+      fact('Guardian watches the door'),
+    ]);
+    const { rerender } = render(<RemembersPanel roomId="room-a" seatId="scout" seatName="Scout" />);
+    fireEvent.click(await screen.findByTestId('fact-history-toggle'));
+
+    answers[URL_A] = knowledge([
+      fact('Kenny lives in Daegu', { fact_id: 'mem_daegu', relation: 'lives_in', origin: 'told' }),
+    ]);
+    fireEvent.click(screen.getByTestId('fact-restore'));
+
+    await screen.findByText('Kenny lives in Daegu');
+    const notice = screen.getByTestId('remembers-notice');
+    expect(notice).toHaveTextContent('Busan could not be brought back: it changed meanwhile.');
+    expect(notice.textContent).not.toMatch(/OSError|mem_|409/);
+
+    // Switching to another clone clears the notice so it never speaks for the other clone.
+    rerender(<RemembersPanel roomId="room-a" seatId="guardian" seatName="Guardian" />);
+    await screen.findByText('Guardian watches the door');
+    expect(screen.queryByTestId('remembers-notice')).toBeNull();
+  });
+
+  it('says plainly when nothing was replaced, and when a restore is refused', async () => {
+    // Killed by: frontend/src/components/artifacts/RemembersPanel.tsx :: if (!outcome.ok) setRefused(true);
+    // Becomes: if (!outcome.ok) setRefused(false);
+    edits['POST /api/agents/scout/memory/mem_busan/restore'] = {
+      status: 409,
+      body: { detail: 'Only a value another one replaced can be brought back.' },
+    };
+    answers[URL_A] = knowledge([seoul, fact('Kenny likes jazz', { fact_id: 'mem_jazz' })]);
+    render(<RemembersPanel roomId="room-a" seatId="scout" seatName="Scout" />);
+
+    const [first, second] = await screen.findAllByTestId('fact-history-toggle');
+    fireEvent.click(second);
+    expect(screen.getByTestId('fact-history-none')).toHaveTextContent('It replaced no earlier value.');
+    fireEvent.click(first);
+    fireEvent.click(screen.getByTestId('fact-restore'));
+
+    const refusal = await screen.findByTestId('fact-restore-refusal');
+    expect(refusal).toHaveTextContent(
+      'Scout could not bring that value back. It may have been changed already.',
+    );
+    expect(refusal.textContent).not.toMatch(/409|mem_/);
+  });
+});
+
+describe('RemembersPanel: near-matching subjects merged and kept separate (uGraph §6 Q2)', () => {
+  const merged = fact('김지현 works at Hanbit', {
+    fact_id: 'mem_jh',
+    subject: '김지현',
+    predicate: 'works_at',
+    object_value: 'Hanbit',
+    relation: 'works_at',
+    merged_from: '지현',
+  });
+
+  it('shows the merged subject name and lets a person split it back out', async () => {
+    // Killed by: frontend/src/components/artifacts/RemembersPanel.tsx :: const outcome = await unmergeSubject(seatId, source);
+    // Becomes: const outcome = await unmergeSubject(seatId, '');
+    // Killed by: frontend/src/lib/roomDock.ts :: body: JSON.stringify({ subject }),
+    // Becomes: body: JSON.stringify({ subject: '' }),
+    // Killed by: frontend/src/i18n/locales/en/dock.json :: "mergedFrom": "Merged with {name}",
+    // Becomes: "mergedFrom": "Merged",
+    // Killed by: frontend/src/i18n/locales/en/dock.json :: "keepSeparate": "Keep separate"
+    // Becomes: "keepSeparate": "Separate"
+    answers[URL_A] = knowledge([merged]);
+    render(<RemembersPanel roomId="room-a" seatId="scout" seatName="Scout" />);
+
+    const banner = await screen.findByTestId('fact-merged-from');
+    expect(banner).toHaveTextContent('Merged with 지현');
+    const button = within(banner).getByTestId('fact-unmerge');
+    expect(button).toHaveTextContent('Keep separate');
+
+    answers[URL_A] = knowledge([
+      fact('김지현 works at Hanbit', {
+        fact_id: 'mem_kjh',
+        subject: '김지현',
+        predicate: 'works_at',
+        object_value: 'Hanbit',
+        relation: 'works_at',
+        merged_from: null,
+      }),
+      fact('지현 works at Hanbit', {
+        fact_id: 'mem_jh_only',
+        subject: '지현',
+        predicate: 'works_at',
+        object_value: 'Hanbit',
+        relation: 'works_at',
+        merged_from: null,
+      }),
+    ]);
+    fireEvent.click(button);
+
+    await vi.waitFor(() => expect(screen.queryByTestId('fact-merged-from')).toBeNull());
+    expect(calls.filter((c) => c.method !== 'GET')).toEqual([
+      { url: '/api/agents/scout/subjects/unmerge', method: 'POST', body: { subject: '지현' } },
+    ]);
+    expect(screen.getAllByTestId('known-fact')).toHaveLength(2);
+  });
+
+  it('shows a plain refusal when keeping separate fails, and words Korean copy in Korean', async () => {
+    // Killed by: frontend/src/i18n/locales/ko/dock.json :: "mergedFrom": "{name}와(과) 같은 대상으로 합침",
+    // Becomes: "mergedFrom": "merged",
+    // Killed by: frontend/src/i18n/locales/ko/dock.json :: "keepSeparate": "따로 두기"
+    // Becomes: "keepSeparate": "separate"
+    edits['POST /api/agents/scout/subjects/unmerge'] = {
+      status: 500,
+      body: { detail: 'OSError: disk I/O' },
+    };
+    answers[URL_A] = knowledge([merged]);
+    render(<RemembersPanel roomId="room-a" seatId="scout" seatName="Scout" />);
+
+    fireEvent.click(await screen.findByTestId('fact-unmerge'));
+
+    const refusal = await screen.findByTestId('fact-edit-refusal');
+    expect(refusal).toHaveTextContent('The change could not be made. Try again.');
+    expect(refusal.textContent).not.toMatch(/OSError|disk/);
+
+    const copy = ko.dock.remembers;
+    expect(copy.mergedFrom).toContain('{name}');
+    for (const line of [copy.mergedFrom.replace('{name}', ''), copy.keepSeparate]) {
+      expect(line).toMatch(/[가-힣]/);
+      expect(line).not.toMatch(/[A-Za-z]/);
+    }
+  });
+});
+

@@ -120,6 +120,15 @@ describe('BrowserSection', () => {
     expect(failure.textContent).not.toContain('Failed to fetch');
   });
 
+  it('shows Saved sign-ins and Signed-in sites below the connection, and opens the form on a prefilled site', async () => {
+    mockFetch([status({ connected: true, version: '0.1.0' })]);
+    render(<BrowserSection signInPrefill={{ site: 'shop.example.com', key: 1 }} />);
+
+    expect(await screen.findByTestId('settings-sign-ins')).toBeTruthy();
+    expect(screen.getByTestId('settings-signed-in')).toBeTruthy();
+    expect((screen.getByTestId('sign-in-site') as HTMLInputElement).value).toBe('shop.example.com');
+  });
+
   it('has every sentence in Korean too, and all of them plain', () => {
     const ko = CATALOGS.ko.browser;
     expect(Object.keys(ko).sort()).toEqual(Object.keys(copy).sort());

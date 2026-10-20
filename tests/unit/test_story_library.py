@@ -25,8 +25,11 @@ from uclone_x.agent.base import BaseAgent
 from uclone_x.agent.models import AgentConfig, AgentLLMConfig, ToolExecutionRecord
 from uclone_x.llm.connectors.mock import MockLLMConnector
 from uclone_x.llm.models import LLMRequest, ModelResponse, ToolCallRequest
-from uclone_x.story import OPEN_STORY_KEY, StoryLifecycleHook, story_after
-from uclone_x.story.library import (
+from uclone_x.tools.base import BaseTool
+from uclone_x.tools.models import NoIsolation, ToolContext, ToolResult, ToolResultStatus
+from uclone_x.tools.registry import ToolRegistry
+from uclone_x_story import OPEN_STORY_KEY, StoryLifecycleHook, story_after
+from uclone_x_story.library import (
     NoConversationError,
     NoOpenStoryError,
     StoryChangedError,
@@ -34,10 +37,7 @@ from uclone_x.story.library import (
     StoryReadOnlyError,
     UnknownStoryError,
 )
-from uclone_x.story.tool import StoryLibraryTool
-from uclone_x.tools.base import BaseTool
-from uclone_x.tools.models import NoIsolation, ToolContext, ToolResult, ToolResultStatus
-from uclone_x.tools.registry import ToolRegistry
+from uclone_x_story.tool import StoryLibraryTool
 
 ROOM_A = "room_a"
 ROOM_B = "room_b"
@@ -87,7 +87,7 @@ class TestWhereAStoryIs:
     def test_a_story_folder_linked_outside_the_library_is_refused(self, tmp_path: Path) -> None:
         """A well-formed id can still name a symlink that leaves the library.
 
-        Killed by: src/uclone_x/story/library.py :: if folder.parent != library:
+        Killed by: examples/story/src/uclone_x_story/library.py :: if folder.parent != library:
         Becomes: if False:
         """
         outside = tmp_path / "outside"
@@ -123,7 +123,7 @@ class TestWhereAStoryIs:
 
 class TestOneWriter:
     def test_a_second_conversation_opens_the_story_read_only(self, tmp_path: Path) -> None:
-        """Killed by: src/uclone_x/story/library.py :: return StoryOpening(record, writable=False, acquired=False)
+        """Killed by: examples/story/src/uclone_x_story/library.py :: return StoryOpening(record, writable=False, acquired=False)
         Becomes: return StoryOpening(record, writable=True, acquired=False)
         """
         library = StoryLibrary(tmp_path)
@@ -138,7 +138,7 @@ class TestOneWriter:
             )
 
     def test_after_take_over_the_earlier_conversation_is_refused(self, tmp_path: Path) -> None:
-        """Killed by: src/uclone_x/story/library.py :: if lease.holder != conversation_id:
+        """Killed by: examples/story/src/uclone_x_story/library.py :: if lease.holder != conversation_id:
         Becomes: if False:
         """
         library = StoryLibrary(tmp_path)
@@ -198,7 +198,7 @@ class TestTheWriterIsTheCallsConversation:
         assert library.read_file(story, "notes.md").text == "n"
 
     def test_an_agent_acting_for_another_conversation_is_refused(self, tmp_path: Path) -> None:
-        """Killed by: src/uclone_x/story/library.py :: self._require_writer(folder, story_id, conversation_id)
+        """Killed by: examples/story/src/uclone_x_story/library.py :: self._require_writer(folder, story_id, conversation_id)
         Becomes: pass
         """
         library = StoryLibrary(tmp_path)
@@ -230,7 +230,7 @@ class TestNoLostEdit:
     def test_a_file_edited_outside_the_conversation_is_not_overwritten(
         self, tmp_path: Path
     ) -> None:
-        """Killed by: src/uclone_x/story/library.py :: if current != expected_digest:
+        """Killed by: examples/story/src/uclone_x_story/library.py :: if current != expected_digest:
         Becomes: if False:
         """
         library = StoryLibrary(tmp_path)
@@ -506,7 +506,7 @@ class TestTheStoryReachesToolCalls:
         assert result.story_id == created[0]
 
     def test_only_a_declaring_tool_that_succeeded_moves_the_story(self) -> None:
-        """Killed by: src/uclone_x/story/__init__.py :: if not record.opens_story or record.status
+        """Killed by: examples/story/src/uclone_x_story/__init__.py :: if not record.opens_story or record.status
         Becomes: if record.status
         """
 

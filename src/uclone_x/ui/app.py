@@ -29,7 +29,6 @@ from typing import Any, TypeVar, cast
 from urllib.parse import urlparse
 
 from pydantic import ValidationError
-from rich.console import Console
 
 try:
     from fastapi import FastAPI, HTTPException, Request
@@ -224,7 +223,6 @@ from uclone_x.ui.knowledge import knowledge_graph
 from uclone_x.ui.single_flight import SingleFlight
 
 logger = logging.getLogger(__name__)
-_console = Console()
 
 _T = TypeVar("_T")
 
@@ -640,6 +638,7 @@ def _persona_payload(registry: PersonaRegistry, persona: PersonaDefinition) -> d
         "max_tokens": persona.llm_config.max_tokens,
         "enable_write_tools": persona.enable_write_tools,
         "enable_subagent_tools": persona.enable_subagent_tools,
+        "learn_from_conversations": persona.learn_from_conversations,
         # Clone ids, as stored; a head shows each by the peer's own entry in this list.
         "a2a_peers": list(persona.a2a_peers),
         "builtin": builtin,
@@ -1926,13 +1925,16 @@ def create_ui_app(
 
     # Before any route reads a clone (clone-data-scopes §3.8): migrate the agents root,
     # import the launch directory's personas, install the builtins. A no-op once done.
-    # The package directory is read through the registry module, as the registry reads it.
+    # The package directory, and the extensions' (#2208), are read through the registry
+    # module, as the registry reads them.
     from uclone_x.agent import persona_registry as _registry_module
     from uclone_x.agent.clone_store import ensure_clone_store
 
     _package_dir = _registry_module.BUILTIN_PERSONAS_DIR
     ensure_clone_store(
-        session_mgr.workspace_dir, builtin_dir=_package_dir if _package_dir.is_dir() else None
+        session_mgr.workspace_dir,
+        builtin_dir=_package_dir if _package_dir.is_dir() else None,
+        extension_dirs=_registry_module.extension_persona_dirs(),
     )
 
     # Per app, like the session manager: the user's external MCP servers, whose tools are
@@ -2304,13 +2306,18 @@ def create_ui_app(
         registry = get_default_persona_registry(session_mgr.workspace_dir, tool_names=tool_names)
         entries = [_persona_payload(registry, p) for p in registry.list_personas()]
         writable = registry.writable_dir()
-        return entries, {
-            # What an editor offers: the tools a clone can name, and where a save lands.
-            "available_tools": sorted(tool_names),
-            "personas_dir": str(writable) if writable is not None else None,
-            "base_tools": list(BASE_PERSONA_TOOLS),
-            "write_tools": sorted(write_tools),
-        }
+        unreadable = {clone.agent_id: clone for clone in registry.unreadable_clones()}
+        return (
+            entries,
+            {
+                # What an editor offers: the tools a clone can name, and where a save lands.
+                "available_tools": sorted(tool_names),
+                "personas_dir": str(writable) if writable is not None else None,
+                "base_tools": list(BASE_PERSONA_TOOLS),
+                "write_tools": sorted(write_tools),
+            },
+            unreadable,
+        )
 
     register_clone_routes(
         app,

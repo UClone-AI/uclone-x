@@ -9,6 +9,11 @@
   "edit": "Edit",
   "builtinBadge": "Built-in",
   "overrideBadge": "Customized",
+  "unreadableBadge": "Can't be loaded",
+  "unreadableReasons": {
+    "bare_model": "This clone's model does not say which connection it is on, so the clone cannot be loaded. In the clone's settings file, write the model the way Settings shows it, starting with its connection, or remove the model so the clone uses the default one.",
+    "unreadable_file": "This clone's settings file holds a value this version cannot read, so the clone cannot be loaded. Restore the file from a backup, or remove the clone and set it up again."
+  },
   "createTitle": "New clone",
   "editTitle": "Edit {name}",
   "builtinEditNote": "This clone ships with the app. Saving keeps your version in the workspace folder and leaves the original untouched.",
@@ -57,7 +62,10 @@
     "capabilities": "Capabilities",
     "enableWriteTools": "Allow file-writing tools",
     "enableSubagentTools": "Allow sub-agents",
-    "capabilitiesHint": "Turning one off removes those tools from this clone, and from any helper it starts, even when the list above names them."
+    "capabilitiesHint": "Turning one off removes those tools from this clone, and from any helper it starts, even when the list above names them.",
+    "memory": "Memory",
+    "learnFromConversations": "Learn from conversations",
+    "learnFromConversationsHint": "When this is on, the clone picks out what to remember from the conversation after each of its replies. Turning it off stops only that: it still saves what you ask it to remember, and you can still correct or forget what it knows."
   },
   "tierLabels": {
     "inherit": "Same as the runtime",

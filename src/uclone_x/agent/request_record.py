@@ -45,7 +45,13 @@ from uclone_x.core.session_log import (
 from uclone_x.core.session_store import SessionStoreProtocol
 from uclone_x.core.tool_results import result_handle
 from uclone_x.errors import UCloneXError
-from uclone_x.llm.models import ChatMessage, LLMRequest, MessageRole, ToolDefinition
+from uclone_x.llm.models import (
+    ChatMessage,
+    LLMRequest,
+    MessageRole,
+    ToolCallRequest,
+    ToolDefinition,
+)
 
 __all__ = [
     "RebuiltRequest",
@@ -61,6 +67,7 @@ __all__ = [
     "epoch_renderer",
     "messages_digest",
     "place_turn_context",
+    "calls_without_turn_context",
     "rebuild_epoch_conversations",
     "rebuild_requests",
     "serialize_tools",
@@ -133,6 +140,62 @@ def place_turn_context(messages: list[ChatMessage], block: str) -> list[ChatMess
     else:
         messages.append(ChatMessage(role=MessageRole.USER, content=block))
     return messages
+
+
+def _holds_block(value: Any, block: str) -> bool:
+    """Whether any string in `value`, at any depth, holds `block`."""
+    if isinstance(value, str):
+        return block in value
+    if isinstance(value, Mapping):
+        return any(_holds_block(v, block) for v in value.values())  # pyright: ignore[reportUnknownVariableType]
+    if isinstance(value, (list, tuple)):
+        return any(_holds_block(v, block) for v in value)  # pyright: ignore[reportUnknownVariableType]
+    return False
+
+
+def _without_block(value: Any, block: str) -> Any:
+    """`value` with every copy of `block` taken out of its strings, at any depth."""
+    if isinstance(value, str):
+        if block not in value:
+            return value
+        kept = value.replace(f"\n\n{block}", "")
+        return kept.replace(block, "")
+    if isinstance(value, Mapping):
+        return {k: _without_block(v, block) for k, v in value.items()}  # pyright: ignore[reportUnknownVariableType]
+    if isinstance(value, (list, tuple)):
+        return [_without_block(v, block) for v in value]  # pyright: ignore[reportUnknownVariableType]
+    return value
+
+
+def calls_without_turn_context(
+    calls: Sequence[ToolCallRequest], block: str
+) -> tuple[tuple[ToolCallRequest, ...], tuple[str, ...]]:
+    """`calls` with the turn-context `block` taken out of their arguments, and the ids changed.
+
+    `place_turn_context` joins the block to the person's message on a turn's first step, so
+    a model told to pass the person's words on "word for word" passes the block with them
+    (#2264). A tool then reads the runtime's plan and memory as something the person said:
+    `story_start` read a bare "네" followed by the block as outline feedback. The block is
+    the runtime's own text, known byte for byte for the request the model answered, so it
+    is taken out where every call enters the turn, before the call is logged, kept in
+    history or run. Nothing else in an argument changes.
+    """
+    if not block:
+        return tuple(calls), ()
+    cleaned: list[ToolCallRequest] = []
+    changed: list[str] = []
+    for call in calls:
+        if not _holds_block(call.arguments, block):
+            cleaned.append(call)
+            continue
+        changed.append(call.id)
+        arguments = _without_block(call.arguments, block)
+        cleaned.append(
+            ToolCallRequest(
+                id=call.id, name=call.name, arguments=arguments, signature=call.signature
+            )
+        )
+    return tuple(cleaned), tuple(changed)
 
 
 @dataclass(frozen=True)

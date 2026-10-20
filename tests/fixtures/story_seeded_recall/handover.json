@@ -1,0 +1,30 @@
+{
+ "model": "qwen3:8b",
+ "calls": [
+  {
+   "marker": "[story codex growth]",
+   "prompt_sha256": "ed28621e880332eacc5bc82a76a1f9d3a4cbe2d0310a5f2cfb09d208e71df9bf",
+   "reply": "{\n  \"present\": {\n    \"ijinho\": \"acting\",\n    \"maeul_jangro\": \"acting\"\n  },\n  \"facts\": [\n    {\n      \"subject\": \"maeul_jangro\",\n      \"named\": \"장로\",\n      \"key\": \"possesses\",\n      \"value\": \"jogaknan_sigye\",\n      \"object_named\": \"조각난 시계\",\n      \"quote\": \"마을 장로는 조각난 시계를 이진호에게 건넸다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"ijinho\",\n      \"named\": \"이진호\",\n      \"key\": \"possesses\",\n      \"value\": \"jogaknan_sigye\",\n      \"object_named\": \"시계\",\n      \"quote\": \"이진호는 시계를 받아 품에 넣었다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"maeul_jangro\",\n      \"named\": \"장로\",\n      \"key\": \"loses\",\n      \"value\": \"jogaknan_sigye\",\n      \"object_named\": \"조각난 시계\",\n      \"quote\": \"장로는 빈손으로 집에 돌아갔다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    }\n  ],\n  \"new\": []\n}"
+  },
+  {
+   "marker": "[alias check]",
+   "prompt_sha256": "ce467c730fb8bc1e8eaee9c1ee3a45f6aea4666f05d482dd866135bb6083efea",
+   "reply": "{\"1\": true}"
+  },
+  {
+   "marker": "[presence check]",
+   "prompt_sha256": "9ffd8d14a58c9fc78800bcdc166f50e4df25ac244f1d45c948030dc4a278d5b2",
+   "reply": "{\"1\": {\"answer\": \"reported\", \"quote\": \"마을 장로는 조각난 시계를 이진호에게 건넸다.\"}, \"2\": {\"answer\": \"holds\", \"quote\": \"이진호는 시계를 받아 품에 넣었다.\"}}"
+  },
+  {
+   "marker": "[story codex growth]",
+   "prompt_sha256": "c4544a222cf349e0a05c3ef9a7537f348b83511abac342f5e02a6e6d0620008f",
+   "reply": "{\n  \"present\": {\n    \"maeul_jangro\": \"acting\"\n  },\n  \"facts\": [\n    {\n      \"subject\": \"maeul_jangro\",\n      \"named\": \"장로\",\n      \"key\": \"status\",\n      \"value\": \"alive\",\n      \"object_named\": \"장로\",\n      \"quote\": \"장로는 조각난 시계를 꺼내 시간을 확인했다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"maeul_jangro\",\n      \"named\": \"장로\",\n      \"key\": \"possesses\",\n      \"value\": \"jogaknan_sigye\",\n      \"object_named\": \"조각난 시계\",\n      \"quote\": \"장로는 조각난 시계를 꺼내 시간을 확인했다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    },\n    {\n      \"subject\": \"maeul_jang,ro\",\n      \"named\": \"장로\",\n      \"key\": \"action\",\n      \"value\": \"looking out the window\",\n      \"object_named\": \"창밖\",\n      \"quote\": \"장로는 시계를 손에 쥔 채 창밖을 내다보았다.\",\n      \"time\": \"now\",\n      \"polarity\": \"asserted\"\n    }\n  ],\n  \"new\": []\n}"
+  },
+  {
+   "marker": "[presence check]",
+   "prompt_sha256": "f8efa094cff6c0bcc958eb8cf7b559a582ca2d376e57cc5db92bd5f72ecb131b",
+   "reply": "{\"1\": {\"answer\": \"holds\", \"quote\": \"장로는 조각난 시계를 꺼내 시간을 확인했다.\"}}"
+  }
+ ]
+}

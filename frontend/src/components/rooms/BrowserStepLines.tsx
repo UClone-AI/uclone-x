@@ -1,6 +1,6 @@
 import React from 'react';
 import { Globe } from 'lucide-react';
-import { useCopy } from '../../i18n';
+import { fmt, useCopy } from '../../i18n';
 import { stepSentence, type BrowserStep } from '../../lib/browserLive';
 
 /**
@@ -12,9 +12,12 @@ export const BrowserStepLines: React.FC<{
   steps: readonly BrowserStep[];
   onShow?: () => void;
   testId: string;
-}> = ({ steps, onShow, testId }) => {
-  const t = useCopy().dock.browser.steps;
-  if (steps.length === 0) return null;
+  /** The clone is waiting for the person to sign in (§3.5 path B): who, and on which site. */
+  asked?: { name: string; site: string } | null;
+}> = ({ steps, onShow, testId, asked = null }) => {
+  const copy = useCopy().dock.browser;
+  const t = copy.steps;
+  if (steps.length === 0 && !asked) return null;
   return (
     <ol data-testid={testId} className="mb-1.5 flex flex-col gap-0.5">
       {steps.map((step, index) => (
@@ -33,6 +36,17 @@ export const BrowserStepLines: React.FC<{
           </button>
         </li>
       ))}
+      {asked ? (
+        <li data-testid="browser-asked" className="flex items-center gap-1.5 text-[11px] text-slate-300">
+          <Globe className="w-3 h-3 shrink-0" aria-hidden="true" />
+          <span>{fmt(copy.banner.askedUser, { name: asked.name, site: asked.site })}</span>
+          {onShow ? (
+            <button type="button" onClick={onShow} className="underline text-slate-400 hover:text-slate-200">
+              {t.show}
+            </button>
+          ) : null}
+        </li>
+      ) : null}
     </ol>
   );
 };

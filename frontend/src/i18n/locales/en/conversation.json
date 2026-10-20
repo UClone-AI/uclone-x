@@ -23,6 +23,7 @@
     },
     "forget": "Forget",
     "knowledgeExtractFailed": "{label} could not pick up what to remember from this turn.",
+    "knowledgeSkipped": "{label} did not learn from this turn, to keep what is left of its budget for your next reply.",
     "imagePromptAdded": "{label} added to the picture request: {tags}.",
     "imageNegativeAdded": "{label} asked the picture to leave out: {tags}.",
     "why": "why ›",
@@ -136,6 +137,16 @@
     "refused": "{label} couldn't finish this turn: {reason}.",
     "stopped": "{label} was stopped before finishing this turn.",
     "wentWrong": "{label} couldn't finish this turn because something went wrong while it was answering.",
+    "stepFailed": "{label} couldn't finish this turn. {cause}",
+    "stepCause": {
+      "step.over_window": "The results of the tools called in this step do not fit in what the model can still read at once, even shortened, so they were not sent to it. Try asking for fewer things at a time, or use a model with a larger context window.",
+      "step.no_room": "This conversation already takes up all the room the model has to read and reply, so the results of the tools called in this step were not sent to it. Your next message can carry on: older parts of the conversation are shortened first to make room.",
+      "step.no_room_no_compaction": "This conversation already takes up all the room the model has to read and reply, so the results of the tools called in this step were not sent to it. Shorten this conversation, or use a model with a larger context window.",
+      "step.no_room_setup": "The instructions and tools this assistant starts every request with already take up all the room the model has to read and reply, so the results of the tools called in this step were not sent to it. Use a model with a larger context window.",
+      "step.no_room_setup_reply": "The instructions and tools this assistant starts every request with, together with the room it keeps for its reply, already take up all the room the model has, so the results of the tools called in this step were not sent to it. Allow this assistant shorter replies, or use a model with a larger context window.",
+      "step.empty_reply": "The model ended its turn without writing a reply, even when asked again, so there is nothing to show. Send your message again, or try another model.",
+      "step.thinking_budget": "The model kept thinking for too long without answering, even when asked again without the long thinking, so it was stopped. Send your message again, or ask for less at a time."
+    },
     "personaEditDropped": "{label} couldn't apply the changes saved to it, so it didn't answer. It kept its previous settings in this conversation.",
     "personaEditRemedy": "To use the changes here, save the clone again, then send your message again.",
     "memoryNoneSaved": {

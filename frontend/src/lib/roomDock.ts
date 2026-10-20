@@ -260,6 +260,28 @@ export interface KnownFact {
   source_turn_id: string | null;
   confidence: number | null;
   created_at: string | null;
+  /** When it was last observed: a fact seen again moves it (#2224). */
+  last_seen_at: string | null;
+  /** The relation as the clone files it; what "one value at a time" is declared on. */
+  relation: string;
+  /** The clone's rules say this relation holds one value at a time (#2332). */
+  functional: boolean;
+  /** A person's words replaced a value of this relation, and nobody has said yet whether it
+   * holds one value at a time: Remembers asks (#2332). */
+  ask_functional: boolean;
+  /** The words it was learned from, when the learner kept them (#2332). */
+  quote: string | null;
+  /** The near-matching subject name this fact was merged from (uGraph §6 Q2). */
+  merged_from?: string | null;
+  /** The values it replaced, oldest first; each can be brought back (#2332). */
+  replaced: ReplacedValue[];
+}
+
+/** A value a later fact replaced. */
+export interface ReplacedValue {
+  fact_id: string;
+  value: string;
+  said_at: string | null;
 }
 
 /** One statement the clone's rules work out from its facts, and the facts it rests on. */
@@ -307,6 +329,14 @@ export const roomDockUrls = {
     `/api/rooms/${enc(roomId)}/knowledge?agent_id=${enc(seatId)}`,
   memoryFact: (agentId: string, factId: string): string =>
     `/api/agents/${enc(agentId)}/memory/${enc(factId)}`,
+  restoreFact: (agentId: string, factId: string): string =>
+    `/api/agents/${enc(agentId)}/memory/${enc(factId)}/restore`,
+  relationSeveral: (agentId: string, relation: string): string =>
+    `/api/agents/${enc(agentId)}/relations/${enc(relation)}/several`,
+  relationFunctional: (agentId: string, relation: string): string =>
+    `/api/agents/${enc(agentId)}/relations/${enc(relation)}/functional`,
+  unmergeSubject: (agentId: string): string =>
+    `/api/agents/${enc(agentId)}/subjects/unmerge`,
 };
 
 /** A failed read: `message` is technical, `fault` is what a U0 surface may say. */
@@ -398,6 +428,97 @@ export async function editMemoryFact(
     return { ok: false, status: res.status };
   } catch {
     return { ok: false, status: null };
+  }
+}
+
+/**
+ * Say whether a relation holds one value at a time (#2332). Saved in the clone's rules; the
+ * next lesson and the next recall follow it. Every open Remembers reads again on success.
+ */
+export async function setRelationFunctional(
+  agentId: string,
+  relation: string,
+  functional: boolean,
+): Promise<MemoryEditOutcome> {
+  try {
+    const res = await fetch(roomDockUrls.relationFunctional(agentId, relation), {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ functional }),
+    });
+    if (res.ok) {
+      notifyMemoryChanged();
+      return { ok: true };
+    }
+    return { ok: false, status: res.status };
+  } catch {
+    // The Core was not reached, so there is no status to word.
+    return { status: null, ok: false };
+  }
+}
+
+/**
+ * Bring back a value a later fact replaced (#2332): it returns as a correction, so the clone
+ * learns over it no more. Every open Remembers reads again on success.
+ */
+export async function restoreMemoryFact(
+  agentId: string,
+  factId: string,
+): Promise<MemoryEditOutcome> {
+  try {
+    const res = await fetch(roomDockUrls.restoreFact(agentId, factId), { method: 'POST' });
+    if (res.ok) {
+      notifyMemoryChanged();
+      return { ok: true };
+    }
+    return { ok: false, status: res.status };
+  } catch {
+    // Nothing came back from the Core, so there is no status to word.
+    return { ok: false as const, status: null };
+  }
+}
+
+/**
+ * Say a relation holds several values at once (#2332): Remembers never asks about it again.
+ * Kept with the clone's facts; it declares nothing in the clone's rules.
+ */
+export async function markRelationSeveral(
+  agentId: string,
+  relation: string,
+): Promise<MemoryEditOutcome> {
+  try {
+    const res = await fetch(roomDockUrls.relationSeveral(agentId, relation), { method: 'POST' });
+    if (res.ok) {
+      notifyMemoryChanged();
+      return { ok: true };
+    }
+    return { ok: false, status: res.status };
+  } catch {
+    // No answer from the Core: nothing to word but that it was not kept.
+    return { ok: false as const, status: null as null };
+  }
+}
+
+/**
+ * Split a merged near-matching subject back out into its own entity and facts (uGraph §6 Q2).
+ */
+export async function unmergeSubject(
+  agentId: string,
+  subject: string,
+): Promise<MemoryEditOutcome> {
+  try {
+    const res = await fetch(roomDockUrls.unmergeSubject(agentId), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ subject }),
+    });
+    if (res.ok) {
+      notifyMemoryChanged();
+      return { ok: true };
+    }
+    return { ok: false, status: res.status };
+  } catch {
+    return { ok: false as const, status: null as null };
   }
 }
 

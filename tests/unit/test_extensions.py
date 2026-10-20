@@ -4,7 +4,8 @@ Three things are pinned here. The core reads every kind of contribution from the
 registry -- tools, hooks, protected folders, the leased folder kind, routes -- so a fake
 extension added in a test reaches each place the story's used to be named. A broken or
 conflicting extension raises `ExtensionError` rather than being left out. And the story,
-registered as the first extension, gives the core exactly what it had before: the same
+the first extension and its own example package (#2208), gives the core exactly what it
+had before: the same
 tools, the story's `character_sheet` in the core's place, its hooks, `stories/` refused to
 general tools, and the story library on the Files screen.
 """
@@ -12,6 +13,12 @@ general tools, and the story library on the Files screen.
 from __future__ import annotations
 
 import importlib.metadata
+import logging
+import os
+import shutil
+import subprocess
+import tomllib
+import traceback
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -19,12 +26,20 @@ from typing import Any
 import pytest
 
 from uclone_x.agent.clone_builder import with_app_lifecycle_hooks
+from uclone_x.agent.clone_store import install_builtin_personas
 from uclone_x.agent.composition import HostDependencies
 from uclone_x.agent.models import ToolExecutionRecord
+from uclone_x.agent.persona_avatar import PersonaAvatarStore
+from uclone_x.agent.persona_registry import (
+    BUILTIN_PERSONAS_DIR,
+    PersonaLoadError,
+    PersonaRegistry,
+)
 from uclone_x.agent.session import SessionStore
 from uclone_x.artifacts.kinds import FolderItem, FolderItemUnreadableError
 from uclone_x.artifacts.library import ArtifactLibrary
 from uclone_x.browser.turn import BrowserTurnHook
+from uclone_x.core.agent_home import AGENTS_DIR_ENV_VAR
 from uclone_x.engine.event_bus import EventBus
 from uclone_x.extensions import (
     ENTRY_POINT_GROUP,
@@ -43,15 +58,20 @@ from uclone_x.llm.connectors.mock import MockLLMConnector
 from uclone_x.room.service import RoomService
 from uclone_x.room.store import RoomStore
 from uclone_x.sandbox import story_jail
-from uclone_x.story import StoryLifecycleHook
-from uclone_x.story.character import StoryCharacterSheetTool
-from uclone_x.story.scene_turn import SceneTurnHook
-from uclone_x.story.ucx_extension import StoryFolderKind
 from uclone_x.telemetry.tracer import TelemetryTracer
 from uclone_x.tools.builtin.character import CharacterSheetTool
 from uclone_x.tools.builtin.filesystem import FileWriteTool
 from uclone_x.tools.models import NoIsolation, ToolContext
 from uclone_x.tools.registry import LocalTool, ToolRegistry, create_default_registry
+from uclone_x_story import StoryLifecycleHook
+from uclone_x_story.character import StoryCharacterSheetTool
+from uclone_x_story.scene_turn import SceneTurnHook
+from uclone_x_story.ucx_extension import EXTENSION as STORY_EXTENSION
+from uclone_x_story.ucx_extension import PERSONAS_DIR, StoryFolderKind
+
+#: The story example's own distribution metadata (#2208).
+REPO_ROOT = Path(__file__).resolve().parents[2]
+STORY_PYPROJECT = REPO_ROOT / "examples" / "story" / "pyproject.toml"
 
 #: The story tools the default registry held before #2205, in its order then.
 STORY_TOOLS = (
@@ -139,14 +159,6 @@ def _vault(**overrides: Any) -> Extension:
 # -- discovery -----------------------------------------------------------------------------
 
 
-def test_the_story_is_found_in_the_tree_without_being_named() -> None:
-    """`story/ucx_extension.py` is found by its module name alone."""
-    found = discover()
-
-    assert [e.name for e in found] == ["story"]
-    assert found[0].source == "uclone_x.story.ucx_extension"
-
-
 class _EntryPoint:
     def __init__(self, name: str, value: object) -> None:
         self.name = name
@@ -167,13 +179,52 @@ def _installed(monkeypatch: pytest.MonkeyPatch, *entries: _EntryPoint) -> None:
     monkeypatch.setattr(importlib.metadata, "entry_points", entry_points)
 
 
+def _declared_entry_point() -> importlib.metadata.EntryPoint:
+    """The one entry point the story example's `pyproject.toml` declares."""
+    declared = tomllib.loads(STORY_PYPROJECT.read_text(encoding="utf-8"))
+    (group,) = declared["project"]["entry-points"]
+    ((name, value),) = declared["project"]["entry-points"][group].items()
+    return importlib.metadata.EntryPoint(name=name, value=value, group=group)
+
+
+def test_the_story_example_is_found_through_its_entry_point(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The example declares `story` in the core's group, naming its `EXTENSION` (#2208).
+
+    The entry point is read from the example's `pyproject.toml` and loaded as an installed
+    one would be, so a wrong group, module or attribute there fails here, not only in a
+    built wheel.
+    """
+    declared = _declared_entry_point()
+
+    def entry_points(*, group: str) -> list[importlib.metadata.EntryPoint]:
+        return [declared] if group == declared.group else []
+
+    monkeypatch.setattr(importlib.metadata, "entry_points", entry_points)
+
+    found = discover()
+
+    assert declared.group == ENTRY_POINT_GROUP
+    assert [e.name for e in found] == ["story"]
+    assert found[0] == STORY_EXTENSION
+    assert found[0].source == f"entry point 'story' ({declared.value})"
+
+
+def test_nothing_installed_finds_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The core's own packages hold no extension since the story left them (#2208)."""
+    _installed(monkeypatch)
+
+    assert discover() == ()
+
+
 def test_an_installed_extension_is_found_through_its_entry_point(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """An entry point naming an `Extension`, or a function returning one, both count.
 
-    Killed by: src/uclone_x/extensions/registry.py :: return _checked([*_in_tree(), *_installed()])
-    Becomes: return _checked([*_in_tree()])
+    Killed by: src/uclone_x/extensions/registry.py :: return _checked(_installed())
+    Becomes: return _checked([])
     """
     _installed(
         monkeypatch,
@@ -183,43 +234,271 @@ def test_an_installed_extension_is_found_through_its_entry_point(
 
     found = discover()
 
-    assert [e.name for e in found] == ["atlas", "story", "vault"]
-    assert found[2].source == "entry point 'vault' (fake:vault)"
+    assert [e.name for e in found] == ["atlas", "vault"]
+    assert found[1].source == "entry point 'vault' (fake:vault)"
+
+
+_REGISTRY_LOGGER = "uclone_x.extensions.registry"
+
+
+def _plain(words: str, *internals: str) -> None:
+    """`words` name the extension as a person installed it, and none of `internals` (#2283).
+
+    Where the entry point points and what the exception said go to the log instead.
+    """
+    assert "'vault'" in words
+    for internal in ("entry point", "fake:", "Error", "Traceback", *internals):
+        assert internal not in words, f"{internal!r} reached a person: {words!r}"
 
 
 def test_an_extension_that_does_not_load_is_an_error_not_a_gap(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A broken extension stops discovery, naming where it came from (P6).
+    """A broken extension stops discovery, in plain words; the log says where and why (P6).
 
-    Killed by: src/uclone_x/extensions/registry.py :: raise ExtensionError(f"The extension at {source} could not be loaded: {exc}") from exc
+    Killed by: src/uclone_x/extensions/registry.py :: raise _logged(ExtensionError(_could_not_load(entry.name))) from exc
     Becomes: continue
     """
-    _installed(monkeypatch, _EntryPoint("vault", ModuleNotFoundError("No module named 'vault'")))
+    problem = ModuleNotFoundError("No module named 'vault_impl'")
+    _installed(monkeypatch, _EntryPoint("vault", problem))
 
-    with pytest.raises(ExtensionError, match="'vault'.*could not be loaded"):
+    with caplog.at_level("ERROR", logger=_REGISTRY_LOGGER):
+        with pytest.raises(ExtensionError) as caught:
+            discover()
+
+    _plain(str(caught.value), "No module named", "vault_impl")
+    assert "could not be loaded" in str(caught.value)
+    assert "fake:vault" in caplog.text and "No module named 'vault_impl'" in caplog.text
+
+
+def test_an_extension_whose_factory_fails_says_so_in_plain_words(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A factory that raises: the extension's name for a person, the cause for the log.
+
+    Killed by: src/uclone_x/extensions/registry.py :: ExtensionError(_could_not_start(name))
+    Becomes: ExtensionError(f"The extension at {source} failed to start: {exc}")
+    """
+
+    def factory() -> Extension:
+        raise RuntimeError("no vault index at /srv/vault/index.db")
+
+    _installed(monkeypatch, _EntryPoint("vault", factory))
+
+    with caplog.at_level("ERROR", logger=_REGISTRY_LOGGER):
+        with pytest.raises(ExtensionError) as caught:
+            discover()
+
+    _plain(str(caught.value), "/srv/vault", "index")
+    assert "could not start" in str(caught.value)
+    assert "fake:vault" in caplog.text and "/srv/vault/index.db" in caplog.text
+
+
+class _NewerEntryPoint(_EntryPoint):
+    """An extension written against a newer core: it builds `Extension` with a field
+    this core's contract does not have, as the story did in a worktree based before #2243."""
+
+    def load(self) -> object:
+        unknown_to_this_core: dict[str, Any] = {"quests": ()}
+        return Extension(name=self.name, **unknown_to_this_core)
+
+
+def test_an_extension_newer_than_the_core_says_so_in_plain_words(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A checkout older than the installed extension is told to update itself (#2245).
+
+    The words say what happened and what to do, and carry no Python internals.
+
+    Killed by: src/uclone_x/extensions/registry.py :: return isinstance(exc, TypeError) and
+    Becomes: return isinstance(exc, KeyError) and
+    """
+    _installed(monkeypatch, _NewerEntryPoint("vault", None))
+
+    with pytest.raises(ExtensionError) as caught:
         discover()
+
+    words = str(caught.value)
+    assert "'vault'" in words
+    assert "newer version of uclone-x" in words
+    assert "merge origin/main" in words
+    for internal in ("__init__", "keyword argument", "quests", "TypeError", "fake:"):
+        assert internal not in words
+
+
+def test_a_newer_extension_behind_a_factory_is_named_as_a_person_knows_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The factory path words a newer extension by its entry name too (#2256).
+
+    It used to pass where the entry point points, so the sentence read "The extension
+    \"entry point 'vault' (fake:vault)\" was written for a newer version...".
+
+    Killed by: src/uclone_x/extensions/registry.py :: ExtensionError(_newer_than_the_core(name))
+    Becomes: ExtensionError(_newer_than_the_core(source))
+    """
+
+    def factory() -> Extension:
+        unknown_to_this_core: dict[str, Any] = {"quests": ()}
+        return Extension(name="vault", **unknown_to_this_core)
+
+    _installed(monkeypatch, _EntryPoint("vault", factory))
+
+    with pytest.raises(ExtensionError) as caught:
+        discover()
+
+    words = str(caught.value)
+    assert words.startswith("The extension 'vault' was written for a newer version")
+    for internal in ("entry point", "fake:", "__init__", "keyword argument", "quests"):
+        assert internal not in words
+
+
+def test_ucx_puts_this_checkouts_examples_on_the_path(tmp_path: Path) -> None:
+    """`./ucx` runs this checkout's example code, not the editable install's (#2256).
+
+    The shared venv installs `examples/story` editable from the primary checkout, so a
+    worktree's dev app and evals loaded the primary's story. The real `ucx` is copied
+    beside a stub interpreter that prints the `PYTHONPATH` it was given.
+
+    Killed by: ucx :: EXAMPLES_PATH="$EXAMPLES_PATH$example_src:"
+    Becomes: EXAMPLES_PATH="$EXAMPLES_PATH"
+    """
+    sandbox = tmp_path / "repo"
+    (sandbox / ".venv" / "bin").mkdir(parents=True)
+    shutil.copy2(REPO_ROOT / "ucx", sandbox / "ucx")
+    (sandbox / "examples" / "story" / "src").mkdir(parents=True)
+    (sandbox / "examples" / "notes").mkdir(parents=True)  # no src: not put on the path
+    stub = sandbox / ".venv" / "bin" / "python"
+    stub.write_text('#!/bin/sh\nprintf "%s" "$PYTHONPATH"\n', encoding="utf-8")
+    stub.chmod(0o755)
+    env = {key: value for key, value in os.environ.items() if key != "PYTHONPATH"}
+
+    result = subprocess.run(
+        ["bash", str(sandbox / "ucx"), "--help"],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=True,
+    )
+
+    entries = [Path(entry) for entry in result.stdout.split(os.pathsep) if entry]
+    resolved = sandbox.resolve()
+    assert resolved / "examples" / "story" / "src" in entries
+    assert resolved / "src" in entries
+    assert not any("notes" in entry.parts for entry in entries)
+
+
+def _causes_logged(caplog: pytest.LogCaptureFixture, cause: str) -> list[logging.LogRecord]:
+    """The records whose traceback carries `cause`."""
+    return [
+        record
+        for record in caplog.records
+        if record.exc_info is not None
+        and cause in "".join(traceback.format_exception(*record.exc_info))
+    ]
+
+
+def test_an_extensions_own_chained_error_is_logged_once_where_it_failed(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Its own `ExtensionError`, chained to the cause, is logged by the registry (#2294 review).
+
+    The registry re-raised it unlogged, so the web head, which has no launcher, kept no
+    record of the cause. It is logged once, and the error says so for the launcher.
+
+    Killed by: src/uclone_x/extensions/registry.py :: _logged(exc)
+    Becomes: pass
+    """
+
+    def factory() -> Extension:
+        try:
+            raise OSError("no vault index at /srv/vault/index.db")
+        except OSError as exc:
+            raise ExtensionError("The vault index is missing.") from exc
+
+    _installed(monkeypatch, _EntryPoint("vault", factory))
+
+    with caplog.at_level("ERROR", logger=_REGISTRY_LOGGER):
+        with pytest.raises(ExtensionError) as caught:
+            discover()
+
+    assert str(caught.value) == "The vault index is missing."
+    assert caught.value.cause_logged
+    assert len(_causes_logged(caplog, "/srv/vault/index.db")) == 1
+    assert "fake:vault" in caplog.text
+
+
+def test_an_extensions_own_error_from_its_tools_is_logged_once(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Killed by: src/uclone_x/extensions/registry.py :: _logged(error)
+    Becomes: pass
+    """
+
+    def broken() -> Sequence[LocalTool]:
+        try:
+            raise OSError("no vault index at /srv/vault/index.db")
+        except OSError as exc:
+            raise ExtensionError("The vault index is missing.") from exc
+
+    with use_extensions([_vault(tools=broken)]):
+        with caplog.at_level("ERROR", logger=_REGISTRY_LOGGER):
+            with pytest.raises(ExtensionError) as caught:
+                with_extension_tools([])
+
+    assert caught.value.cause_logged
+    assert len(_causes_logged(caplog, "/srv/vault/index.db")) == 1
 
 
 def test_an_entry_point_that_is_not_an_extension_is_an_error(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """Killed by: src/uclone_x/extensions/registry.py :: if not isinstance(value, Extension):
     Becomes: if False:
+
+    Killed by: src/uclone_x/extensions/registry.py :: ExtensionError(_not_an_extension(name))
+    Becomes: ExtensionError(f"{source} is not an extension: it gives a {type(value).__name__}.")
     """
     _installed(monkeypatch, _EntryPoint("vault", {"name": "vault"}))
 
-    with pytest.raises(ExtensionError, match="not an extension: it gives a dict"):
-        discover()
+    with caplog.at_level("ERROR", logger=_REGISTRY_LOGGER):
+        with pytest.raises(ExtensionError) as caught:
+            discover()
+
+    _plain(str(caught.value), "dict")
+    assert "does not provide a uclone-x extension" in str(caught.value)
+    assert "fake:vault" in caplog.text and "dict" in caplog.text
 
 
 def test_two_extensions_with_one_name_are_an_error() -> None:
     """Killed by: src/uclone_x/extensions/registry.py :: if extension.name in by_name:
     Becomes: if False:
     """
-    with pytest.raises(ExtensionError, match="Two extensions are named 'vault'"):
+    with pytest.raises(ExtensionError, match="Two installed extensions are both named 'vault'"):
         with use_extensions([_vault(), _vault(tools=lambda: ())]):
             pass
+
+
+def test_two_installed_extensions_with_one_name_name_no_entry_point(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Both found through entry points: the log says which two, the words only the name.
+
+    Killed by: src/uclone_x/extensions/registry.py :: ExtensionError(_named_twice(extension.name))
+    Becomes: ExtensionError(f"Two extensions are named {extension.name!r} ({extension.source}).")
+    """
+    _installed(
+        monkeypatch,
+        _EntryPoint("vault_a", Extension(name="vault")),
+        _EntryPoint("vault_b", Extension(name="vault")),
+    )
+
+    with caplog.at_level("ERROR", logger=_REGISTRY_LOGGER):
+        with pytest.raises(ExtensionError) as caught:
+            discover()
+
+    _plain(str(caught.value), "vault_a", "vault_b")
+    assert "fake:vault_a" in caplog.text and "fake:vault_b" in caplog.text
 
 
 def test_two_extensions_cannot_protect_one_folder() -> None:
@@ -300,13 +579,24 @@ def test_two_extensions_adding_one_tool_name_are_an_error() -> None:
             with_extension_tools([])
 
 
-def test_an_extension_whose_tools_fail_to_build_is_an_error() -> None:
+def test_an_extension_whose_tools_fail_to_build_is_an_error(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Killed by: src/uclone_x/extensions/registry.py :: ExtensionError(_tools_failed(extension.name))
+    Becomes: ExtensionError(f"The extension {extension.name!r} could not build its tools: {exc}")
+    """
+
     def broken() -> Sequence[LocalTool]:
         raise ImportError("cannot import name 'VaultTool'")
 
     with use_extensions([_vault(tools=broken)]):
-        with pytest.raises(ExtensionError, match="'vault' could not build its tools"):
-            with_extension_tools([])
+        with caplog.at_level("ERROR", logger=_REGISTRY_LOGGER):
+            with pytest.raises(ExtensionError) as caught:
+                with_extension_tools([])
+
+    _plain(str(caught.value), "VaultTool", "cannot import")
+    assert "could not set up its tools" in str(caught.value)
+    assert "cannot import name 'VaultTool'" in caplog.text
 
 
 # -- hooks, folders, routes ---------------------------------------------------------------
@@ -415,7 +705,7 @@ def test_each_extensions_routes_are_mounted_with_the_heads_context() -> None:
 def test_the_story_gives_the_default_registry_what_it_had() -> None:
     """Every story tool, and the story's `character_sheet` where the core's stood.
 
-    Killed by: src/uclone_x/story/ucx_extension.py :: replaces_tools=("character_sheet",),
+    Killed by: examples/story/src/uclone_x_story/ucx_extension.py :: replaces_tools=("character_sheet",),
     Becomes: replaces_tools=(),
     """
     registry = create_default_registry(enable_mcp=False)
@@ -476,3 +766,84 @@ def test_an_unreadable_story_says_why(tmp_path: Path) -> None:
     assert kind.is_item(folder)
     with pytest.raises(FolderItemUnreadableError):
         kind.load(tmp_path, "salt-road")
+
+
+# -- personas an extension ships (#2208) ----------------------------------------------------
+
+
+def _persona_registry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> PersonaRegistry:
+    """A registry checking tools against the default registry, as the web head's does."""
+    monkeypatch.setenv(AGENTS_DIR_ENV_VAR, str(tmp_path / "agents"))
+    names = [tool.name for tool in create_default_registry(enable_mcp=False).list_tools()]
+    return PersonaRegistry(workspace_root=tmp_path / "workspace", tool_names=names)
+
+
+def test_without_the_story_every_core_persona_loads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The core alone lists its clones; no builtin names a story tool it lacks (#2208).
+
+    Measured before the Writer moved: the core's `writer.yaml` named the story tools, and a
+    registry checking tools refused it with `PersonaLoadError`, so no clone listed at all.
+    The defect is a file, not a line: copying `writer.yaml` back into
+    `src/uclone_x/personas/` fails this test with that error (checked by hand, #2208).
+    """
+    with use_extensions([]):
+        registry = _persona_registry(tmp_path, monkeypatch)
+        names = [persona.name for persona in registry.list_personas()]
+
+    assert "writer" not in names
+    assert {"clone", "artist", "scout"} <= set(names)
+
+
+def test_without_the_story_the_core_clone_is_still_its_builtin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Core alone, `clone` is unchanged from what shipped, so it reads as builtin (#2256).
+
+    Its `writer` peer is pending, not gone: the comparison with the shipped peers counts
+    it where it stands, rather than calling the clone edited for a peer it never lost.
+
+    Killed by: src/uclone_x/agent/persona_registry.py :: held_peers = peers_with_pending(record, peer_handles(held.a2a_peers, root))
+    Becomes: held_peers = peer_handles(held.a2a_peers, root)
+    """
+    with use_extensions([]):
+        registry = _persona_registry(tmp_path, monkeypatch)
+
+        assert registry.is_builtin("clone")
+        assert registry.get_persona("writer") is None
+
+
+def test_the_story_ships_the_writer_as_a_builtin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Writer is installed as a clone from the example, a builtin with its picture.
+
+    Killed by: examples/story/src/uclone_x_story/ucx_extension.py :: personas=(PERSONAS_DIR,),
+    Becomes: personas=(),
+    """
+    registry = _persona_registry(tmp_path, monkeypatch)
+    writer = registry.get_persona("writer")
+    picture = PersonaAvatarStore(registry).find("writer")
+
+    assert writer is not None and "story_start" in writer.allowed_tools
+    assert registry.is_builtin("writer") and registry.has_builtin("writer")
+    assert picture is not None and picture.path == PERSONAS_DIR / "writer.png"
+
+
+def test_a_builtin_shipped_twice_is_refused(tmp_path: Path) -> None:
+    """An extension shipping a core builtin's name is an error, not a coin toss.
+
+    Killed by: src/uclone_x/agent/clone_store.py :: if handle in found:
+    Becomes: if False:
+    """
+    shipped = tmp_path / "vault-personas"
+    shipped.mkdir()
+    (shipped / "clone.yaml").write_text(
+        "name: clone\nrole: Mine\nsystem_prompt: Mine.\n", encoding="utf-8"
+    )
+
+    with pytest.raises(PersonaLoadError, match="'clone' is already shipped"):
+        install_builtin_personas(
+            BUILTIN_PERSONAS_DIR, extension_dirs=(shipped,), root=tmp_path / "agents"
+        )

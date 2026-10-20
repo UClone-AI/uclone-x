@@ -38,6 +38,7 @@ from uclone_x.agent.models import (
     AgentContext,
     AgentLLMConfig,
     PersonaDefinition,
+    ToolExecutionRecord,
 )
 from uclone_x.agent.persona_registry import PersonaRegistry
 from uclone_x.agent.session import SessionStore
@@ -48,8 +49,6 @@ from uclone_x.llm.models import LLMRequest, MessageRole, ModelResponse, ToolCall
 from uclone_x.memory.store import CrossSessionMemory
 from uclone_x.room.a2a_handlers import PersonaTaskHandler, register_persona_handlers
 from uclone_x.room.models import Participant, ParticipantKind, RoomPolicy, RoomState
-from uclone_x.story.library import StoryLibrary
-from uclone_x.story.tools import story_characters
 from uclone_x.telemetry.tracer import TelemetryTracer
 from uclone_x.tools.base import BaseTool, artifact_content_url, linked_paths
 from uclone_x.tools.builtin.a2a import (
@@ -63,6 +62,8 @@ from uclone_x.tools.builtin.a2a import (
 )
 from uclone_x.tools.models import ToolContext, ToolResultStatus
 from uclone_x.tools.registry import ToolRegistry
+from uclone_x_story.library import StoryLibrary
+from uclone_x_story.tools import story_characters
 
 # --------------------------------------------------------------------------------------
 # Fakes
@@ -516,6 +517,49 @@ class TestTheCallersBudget:
 
         assert record.status is ToolResultStatus.ERROR
         assert writer.run_steps - before == 2
+
+    @pytest.mark.asyncio
+    async def test_a_peer_that_stopped_passes_on_what_it_wrote(self, tmp_path: Path) -> None:
+        """A failed call still carries the peer's own account of its writes (#2229).
+
+        Without it the room can only guess, and it guessed "wrote a file" for a peer that
+        stopped on a provider error before running any tool. A peer that gives no account
+        is reported as one that may have written.
+
+        Killed by: src/uclone_x/tools/builtin/a2a.py :: output={**_write_report(call.agent, output), **_child_failure(output)},
+        Becomes: output=_child_failure(output),
+        """
+        records: list[ToolExecutionRecord] = []
+        accounts: list[dict[str, Any]] = [
+            {"steps": 1, "paths": [], "unnamed_writes": False},
+            {"steps": 1},
+        ]
+        for data in accounts:
+            transport = A2AInMemoryTransport()
+            transport.register_handler(
+                "artist",
+                _Recorder(
+                    TaskResult(
+                        task_id="x",
+                        status=TaskStatus.FAILED,
+                        output_data=data,
+                        error="it could not finish",
+                        provenance=Provenance.primary(provider="mock", model="mock-model"),
+                    )
+                ),
+            )
+            records.append(
+                await _writer(tmp_path, transport).execute_tool_call(
+                    A2A_CALL_TOOL_NAME, {"agent": "artist", "task": "Draw."}
+                )
+            )
+
+        assert [r.status for r in records] == [ToolResultStatus.ERROR] * 2
+        assert [r.output for r in records] == [
+            {"agent": "artist", "paths": [], "unnamed_writes": False},
+            {"agent": "artist", "paths": [], "unnamed_writes": True},
+        ]
+        assert [r.produced_paths for r in records] == [(), ()]
 
     @pytest.mark.asyncio
     async def test_a_peer_reason_is_led_by_its_name_only_when_it_does_not_give_it(
@@ -1234,7 +1278,7 @@ class TestTheCharactersTheCallNames:
     async def test_a_call_naming_no_character_sends_its_input_as_it_was(
         self, tmp_path: Path
     ) -> None:
-        """Killed by: src/uclone_x/story/tools.py :: if isinstance(item.entry, CharacterEntry) and item.entry.visual is not None
+        """Killed by: examples/story/src/uclone_x_story/tools.py :: if isinstance(item.entry, CharacterEntry) and item.entry.visual is not None
         Becomes: if item.entry.name
         """
         given = await self._sent(tmp_path, {"task": "월광검을 그려 줘.", "input": {"size": 2}})
@@ -1321,3 +1365,130 @@ async def test_the_picture_artist_drew_is_in_the_rooms_file_list(tmp_path: Path)
         ("images/hero.png", "writer", A2A_CALL_TOOL_NAME)
     ]
     assert saved.file_record.unattributed_writes == 0
+
+
+class _GoogleRefuses(MockLLMConnector):
+    """A model that answers every request with an error no rule places (#2227)."""
+
+    async def generate(self, request: LLMRequest) -> ModelResponse:
+        from uclone_x.llm.connectors.failures import failed_status
+
+        raise failed_status(
+            provider="Google",
+            model="gemini-3.8-flash",
+            status_code=400,
+            body='{"error": {"message": "Function call is missing a thought_signature"}}',
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_child_that_fails_says_why_to_the_caller(tmp_path: Path) -> None:
+    """On 2026-10-10 the caller was told only "scout stopped before finishing: it could not
+    finish", and the child's session was a temporary folder, so its reason was nowhere
+    (#2227). The child's plain sentence reaches the caller's result, and its stop reason,
+    and the provider's status and body, reach the caller's tool result record.
+
+    Killed by: src/uclone_x/room/a2a_handlers.py :: output["failure"] = _failure(turn, reason)
+    Becomes: pass
+    Killed by: src/uclone_x/room/a2a_handlers.py :: reason = "it ran out of steps" if out_of_steps else _plain_reason(turn)
+    Becomes: reason = "it ran out of steps" if out_of_steps else "it could not finish"
+    Killed by: src/uclone_x/tools/builtin/a2a.py :: output={**_write_report(call.agent, output), **_child_failure(output)},
+    Becomes: output=_write_report(call.agent, output),
+    """
+    transport = A2AInMemoryTransport()
+    transport.register_handler("artist", _handler(tmp_path, _GoogleRefuses(), ToolRegistry([])))
+    record = await _writer(tmp_path, transport).execute_tool_call(
+        A2A_CALL_TOOL_NAME, {"agent": "artist", "task": "Draw the hero."}
+    )
+    assert record.status is ToolResultStatus.ERROR
+    assert record.error == (
+        "artist stopped before finishing: Google returned an error UClone-X didn't recognise. "
+        "If it happens again, check the model name and any custom endpoint."
+    )
+    assert isinstance(record.output, dict)
+    assert record.output["failure"] == {
+        "stop_reason": "provider_error",
+        "provider_kind": "provider_error",
+        "message": (
+            "Google returned an error UClone-X didn't recognise. If it happens again, check "
+            "the model name and any custom endpoint."
+        ),
+        "provider_status": 400,
+        "provider_body": '{"error": {"message": "Function call is missing a thought_signature"}}',
+    }
+
+
+#: A raw failure as a non-provider error leaves it: a class name, a path, an internal id.
+_RAW_FAILURE = "KeyError: 'sess_7f3a9c' at /srv/internal/agent/turn_executor.py:42"
+_INTERNALS = ("KeyError", "sess_7f3a9c", "/srv/", "turn_executor.py", "Traceback")
+
+
+def _no_internals(text: object) -> bool:
+    return isinstance(text, str) and not any(word in text for word in _INTERNALS)
+
+
+@pytest.mark.asyncio
+async def test_a_child_failing_for_a_non_provider_reason_keeps_its_record_plain(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A child turn that failed for a reason no provider gave put its raw `error` in the
+    caller's record; the record says it plainly and the raw detail goes to the log (#2234).
+
+    Killed by: src/uclone_x/room/a2a_handlers.py :: return {"stop_reason": turn.stop_reason, "message": f"{reason[:1].upper()}{reason[1:]}."}
+    Becomes: return {"stop_reason": turn.stop_reason, "message": turn.error}
+    """
+    from uclone_x.agent.models import TurnResult
+
+    async def failed_turn(self: BaseAgent, *args: Any, **kwargs: Any) -> TurnResult:
+        return TurnResult(
+            turn_index=1,
+            content="",
+            is_completed=False,
+            error=_RAW_FAILURE,
+            stop_reason="budget_exceeded",
+            provenance=None,
+        )
+
+    monkeypatch.setattr(BaseAgent, "execute_turn", failed_turn)
+    transport = A2AInMemoryTransport()
+    transport.register_handler("artist", _handler(tmp_path, _draw_llm(), ToolRegistry([])))
+    with caplog.at_level("WARNING", logger="uclone_x.room.a2a_handlers"):
+        record = await _writer(tmp_path, transport).execute_tool_call(
+            A2A_CALL_TOOL_NAME, {"agent": "artist", "task": "Draw the hero."}
+        )
+
+    assert record.status is ToolResultStatus.ERROR
+    assert _no_internals(record.error)
+    assert isinstance(record.output, dict)
+    assert record.output["failure"] == {
+        "stop_reason": "budget_exceeded",
+        "message": "It could not finish.",
+    }
+    assert any(_RAW_FAILURE in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_a_child_that_raises_leaves_a_plain_failure_in_the_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A child that raised past `execute_turn` left the caller's record no `failure` at all,
+    unlike a failed turn; it gets the same plain one, the cause staying in the log (#2234).
+
+    Killed by: src/uclone_x/room/a2a_handlers.py :: "failure": {"stop_reason": None, "message": "It ran into a problem."},
+    Becomes: "failure_unused": {},
+    """
+
+    async def raising_turn(self: BaseAgent, *args: Any, **kwargs: Any) -> Any:
+        raise KeyError(_RAW_FAILURE)
+
+    monkeypatch.setattr(BaseAgent, "execute_turn", raising_turn)
+    transport = A2AInMemoryTransport()
+    transport.register_handler("artist", _handler(tmp_path, _draw_llm(), ToolRegistry([])))
+    record = await _writer(tmp_path, transport).execute_tool_call(
+        A2A_CALL_TOOL_NAME, {"agent": "artist", "task": "Draw the hero."}
+    )
+
+    assert record.status is ToolResultStatus.ERROR
+    assert _no_internals(record.error)
+    assert isinstance(record.output, dict)
+    assert record.output["failure"] == {"stop_reason": None, "message": "It ran into a problem."}

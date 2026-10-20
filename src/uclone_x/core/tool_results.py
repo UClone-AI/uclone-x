@@ -44,6 +44,7 @@ from uclone_x.errors import PlainRefusalError
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "EMPTY_REPLY_MESSAGE",
     "EXCERPT_NOTE",
     "STEP_EXCERPT_MIN_BYTES",
     "STEP_NO_ROOM_MESSAGE",
@@ -55,6 +56,7 @@ __all__ = [
     "STEP_REPLY_RESERVE_TOKENS",
     "STORED_RESULT_PREFIX",
     "STUB_NOTE",
+    "THINKING_BUDGET_MESSAGE",
     "TOOL_RESULT_CAP_BYTES",
     "TOOL_RESULT_CAP_TOKENS",
     "TOOL_RESULT_READ_TOOL",
@@ -194,12 +196,35 @@ reply length is a second fix besides a larger model, and the refusal names both.
 words, like the other step refusals, and translated by code like them (#1862).
 """
 
+EMPTY_REPLY_MESSAGE: Final = (
+    "The model ended its turn without writing a reply, even when asked again, so there is "
+    "nothing to show. Send your message again, or try another model."
+)
+"""What a turn says when its answer is still empty after the re-ask (#2264).
+
+A step that writes nothing and calls nothing is asked once more for a reply (#1808). When
+the turn still ends with nothing to show, it ends with this instead of an empty reply: a
+person shown nothing cannot tell a model that failed from one still working.
+"""
+
+THINKING_BUDGET_MESSAGE: Final = (
+    "The model kept thinking for too long without answering, even when asked again "
+    "without the long thinking, so it was stopped. Send your message again, or ask for "
+    "less at a time."
+)
+"""What a turn says when the model thinks past its budget twice in one turn (#2202).
+
+The first time the step is cut, it is asked again with thinking off; this is the second.
+"""
+
 StepRefusalCode = Literal[
     "step.over_window",
     "step.no_room",
     "step.no_room_no_compaction",
     "step.no_room_setup",
     "step.no_room_setup_reply",
+    "step.empty_reply",
+    "step.thinking_budget",
 ]
 """Why a turn refused a step, as a key a head translates (#1862).
 
@@ -215,6 +240,8 @@ STEP_REFUSAL_TEXT: Final[Mapping[StepRefusalCode, str]] = {
     "step.no_room_no_compaction": STEP_NO_ROOM_NO_COMPACTION_MESSAGE,
     "step.no_room_setup": STEP_NO_ROOM_SETUP_MESSAGE,
     "step.no_room_setup_reply": STEP_NO_ROOM_SETUP_REPLY_MESSAGE,
+    "step.empty_reply": EMPTY_REPLY_MESSAGE,
+    "step.thinking_budget": THINKING_BUDGET_MESSAGE,
 }
 """Each step refusal's sentence in English: `TurnResult.error`, and what a head without a
 catalog for the person's language shows."""

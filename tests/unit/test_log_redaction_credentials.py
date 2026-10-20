@@ -405,3 +405,33 @@ class TestTelemetryCredentialRedaction:
         assert "sk-1234567890" not in str(exported_span.attributes.get("custom_key"))
         assert "[REDACTED]" in str(exported_span.attributes.get("custom_key"))
         assert "Bearer [REDACTED]" in str(exported_span.attributes.get("custom_desc"))
+
+
+def test_a_url_password_is_redacted_and_the_rest_of_the_url_kept() -> None:
+    r"""`scheme://user:pass@host` hides the password; a URL with no password is unchanged (#2319).
+
+    Killed by: src/uclone_x/core/secrets.py :: re.compile(r"(?i)\b([a-z][a-z0-9+.\-]*://[^/\s:@]*:)([^\s/]+)(@)"),
+    Becomes: re.compile(r"(?!x)x"),
+    """
+    from uclone_x.core.secrets import redact_credentials
+
+    said = redact_credentials("reached https://u:p4ssw0rd@example.com/v1 and ftp://anon@host.test")
+    assert "p4ssw0rd" not in said
+    assert "https://u:[REDACTED]@example.com/v1" in said
+    assert "ftp://anon@host.test" in said
+
+
+def test_a_url_password_with_no_user_or_an_unencoded_at_is_redacted_whole() -> None:
+    r"""`redis://:pass@host` has no user, and a password may hold a raw `@` (#2327).
+
+    Killed by: src/uclone_x/core/secrets.py :: re.compile(r"(?i)\b([a-z][a-z0-9+.\-]*://[^/\s:@]*:)([^\s/]+)(@)"),
+    Becomes: re.compile(r"(?i)\b([a-z][a-z0-9+.\-]*://[^/\s:@]+:)([^@\s/]+)(@)"),
+    """
+    from uclone_x.core.secrets import redact_credentials
+
+    said = redact_credentials(
+        "redis://:hunter2secret@cache:6379/0 then https://u:p@ss@example.com/x"
+    )
+    assert "hunter2secret" not in said and "redis://:[REDACTED]@cache:6379/0" in said
+    assert "p@ss" not in said and "ss@example.com" not in said
+    assert "https://u:[REDACTED]@example.com/x" in said

@@ -1,0 +1,29 @@
+# The story example: a novel-writing domain built on UClone-X's core (#2204, #2208).
+#
+# Its own distribution, so the core installs and runs without it. Installed next to
+# `uclone-x`, it registers itself through the entry point below; the core never names it.
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "uclone-x-story"
+version = "0.1.0"
+description = "Example UClone-X extension: a Writer clone's story library, codex and story tools"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+authors = [
+    { name = "Kenny Lim", email = "kennylim@uclone.net" }
+]
+dependencies = [
+    "uclone-x>=0.4.0",
+]
+
+[project.entry-points."uclone_x.extensions"]
+story = "uclone_x_story.ucx_extension:EXTENSION"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/uclone_x_story"]
+
+[tool.uv.sources]
+uclone-x = { workspace = true }

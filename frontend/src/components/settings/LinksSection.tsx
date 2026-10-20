@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { ExternalLink, Link2 } from 'lucide-react';
 import { fmt, useCopy, useLocale } from '../../i18n';
-import { cloneLabel, type Labelled } from '../../lib/cloneLabel';
+import { cloneLabel, isUsableClone, type Labelled } from '../../lib/cloneLabel';
 import { useApiRead } from '../../lib/useApiRead';
 import {
   connectUclone2,
@@ -58,7 +58,7 @@ const toggleFor = (state: LinkState): 'offline' | 'online' | null => {
 };
 
 interface CloneList {
-  clones?: Labelled[];
+  clones?: (Labelled & { status?: string })[];
 }
 
 /**
@@ -81,7 +81,8 @@ export const LinksSection: React.FC<{ pollMs?: number }> = ({ pollMs = TRANSIENT
     read.fault ?? (read.data !== null && list === null ? { kind: 'unreadable' as const, detail: null } : null);
   const clones = useApiRead<CloneList>('/api/clones');
   // A link names its local clone by handle (`local_clone_names` in `ui/links.py`).
-  const names = (clones.data?.clones ?? []).map((p) => ({ id: p.name, label: cloneLabel(p, language) }));
+  // A clone whose settings could not be loaded cannot answer a link, so it is not offered (#2253).
+  const names = (clones.data?.clones ?? []).filter(isUsableClone).map((p) => ({ id: p.name, label: cloneLabel(p, language) }));
 
   const transient = list?.links.some((l) => TRANSIENT.has(l.state)) ?? false;
   useEffect(() => {

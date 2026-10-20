@@ -150,6 +150,102 @@ def test_cross_session_memory_auto_retract_conflicts() -> None:
     assert len(all_facts) == 2
 
 
+def test_a_fact_that_holds_beside_others_supersedes_nothing(tmp_path: Path) -> None:
+    """ "Prefers jazz", then "prefers Korean": both stay, and the store keeps which kind (#2224).
+
+    Killed by: src/uclone_x/memory/models.py :: if not other.single_valued:
+    Becomes: if False:
+    Killed by: src/uclone_x/memory/store.py :: single_valued=single_valued,
+    Becomes: single_valued=True,
+    """
+    path = tmp_path / "knowledge.sqlite3"
+    memory = CrossSessionMemory(storage_path=path)
+    prov = _test_provenance()
+    jazz = memory.record_fact("user", "prefers", "jazz", prov, "s0", single_valued=False)
+
+    korean = memory.record_fact("user", "prefers", "Korean", prov, "s1", single_valued=False)
+
+    assert korean.contradicts_fact_id is None
+    assert {f.fact_id for f in memory.list_facts()} == {jazz.fact_id, korean.fact_id}
+    reread = CrossSessionMemory(storage_path=path).get_fact(korean.fact_id)
+    assert reread is not None
+    assert reread.single_valued is False
+
+
+def test_the_newer_facts_answer_decides_whether_it_replaces() -> None:
+    """A newer single-valued fact replaces an older one that said it held beside others.
+
+    The newer statement is the latest word on the predicate, so its answer is the one read;
+    the older fact's is not (#2224).
+    """
+    prov = _test_provenance()
+    older = MemoryFact(
+        subject="user",
+        predicate="lives_in",
+        object_value="Busan",
+        provenance=prov,
+        source_session_id="s0",
+        single_valued=False,
+    )
+    newer = MemoryFact(
+        subject="user",
+        predicate="lives_in",
+        object_value="Seoul",
+        provenance=prov,
+        source_session_id="s1",
+    )
+
+    assert older.conflicts_with(newer) is True
+    assert newer.conflicts_with(older) is False
+
+
+def test_a_fact_replaces_the_active_facts_it_names_under_any_predicate() -> None:
+    """`replaces` supersedes the named facts, and passes over an unknown or withdrawn id (#2224).
+
+    Killed by: src/uclone_x/memory/store.py :: superseded.append(gone_id)
+    Becomes: pass
+    Killed by: src/uclone_x/memory/store.py :: if row is None or gone_id in superseded or fact_of(row).retracted:
+    Becomes: if row is None or gone_id in superseded:
+    """
+    memory = CrossSessionMemory()
+    prov = _test_provenance()
+    rust = memory.record_fact("user", "learning", "Rust", prov, "s0", single_valued=False)
+    go = memory.record_fact("user", "works_with", "Go", prov, "s0", single_valued=False)
+    forgotten = memory.record_fact("user", "learning", "Perl", prov, "s0", single_valued=False)
+    memory.retract_fact(forgotten.fact_id, "never said that", prov)
+
+    zig = memory.record_fact(
+        "user",
+        "current_language",
+        "Zig",
+        prov,
+        "s1",
+        single_valued=False,
+        replaces=("mem_unknown", forgotten.fact_id, rust.fact_id),
+    )
+
+    assert zig.contradicts_fact_id == rust.fact_id
+    assert {f.fact_id for f in memory.list_facts()} == {go.fact_id, zig.fact_id}
+    assert memory.get_fact(forgotten.fact_id).retraction_reason == "never said that"  # type: ignore[union-attr]
+
+
+def test_correcting_one_of_several_values_keeps_the_others() -> None:
+    """A person corrects "prefers jazz" to "blues": "prefers Korean" stays beside it (#2224).
+
+    Killed by: src/uclone_x/memory/store.py :: single_valued=current.single_valued,
+    Becomes: single_valued=True,
+    """
+    memory = CrossSessionMemory()
+    prov = _test_provenance()
+    jazz = memory.record_fact("user", "prefers", "jazz", prov, "s0", single_valued=False)
+    korean = memory.record_fact("user", "prefers", "Korean", prov, "s0", single_valued=False)
+
+    blues = memory.correct_fact(jazz.fact_id, "blues", prov)
+
+    assert blues.single_valued is False
+    assert {f.fact_id for f in memory.list_facts()} == {korean.fact_id, blues.fact_id}
+
+
 #: "José" as a build before #1895 could store it (`e` and a combining accent), and as a
 #: model writes it now (one composed code point). Unequal as strings, one name in NFC.
 _JOSE_DECOMPOSED = "Jose\u0301"
@@ -466,3 +562,111 @@ def test_record_memory_fact_params_accepts_json_list_tags() -> None:
     )
     assert params.tags == ("personal", "preference")
     assert isinstance(params.tags, tuple)
+
+
+class TestRestoreAReplacedValue:
+    """A person brings back a value a later fact replaced by mistake (#2332)."""
+
+    def test_the_value_returns_as_a_correction_and_its_replacer_becomes_history(self) -> None:
+        """
+        Killed by: src/uclone_x/memory/store.py :: replacer.edge.id,
+        Becomes: old.fact_id,
+        Killed by: src/uclone_x/memory/graph.py :: "superseded_by": by,
+        Becomes: "superseded_by": None,
+        """
+        memory = CrossSessionMemory()
+        prov = _test_provenance()
+        busan = memory.record_fact("user", "lives_in", "Busan", prov, "s0", single_valued=False)
+        seoul = memory.record_fact(
+            "user", "lives_in", "Seoul", prov, "s1", single_valued=False, replaces=(busan.fact_id,)
+        )
+        assert memory.get_fact(busan.fact_id).superseded_by == seoul.fact_id  # type: ignore[union-attr]
+
+        back = memory.restore_fact(busan.fact_id, prov)
+
+        assert (back.object_value, back.origin, back.confidence) == ("Busan", "corrected", 1.0)
+        assert back.contradicts_fact_id == seoul.fact_id
+        assert [f.fact_id for f in memory.list_facts()] == [back.fact_id]
+        assert memory.get_fact(seoul.fact_id).superseded_by == back.fact_id  # type: ignore[union-attr]
+
+    def test_a_restore_leaves_exactly_one_current_value(self) -> None:
+        """Busan -> Seoul -> Daegu: Busan's replacer is no longer current, so restoring it is
+        refused; restoring Seoul works, and restoring it twice is refused the second time
+        (review of #2337). Each leaves one current value.
+
+        Killed by: src/uclone_x/memory/store.py :: if replacer is None or fact_of(replacer).retracted:
+        Becomes: if False:
+        """
+        memory = CrossSessionMemory()
+        prov = _test_provenance()
+        busan = memory.record_fact("user", "lives_in", "Busan", prov, "s0", single_valued=False)
+        seoul = memory.record_fact(
+            "user", "lives_in", "Seoul", prov, "s1", single_valued=False, replaces=(busan.fact_id,)
+        )
+        daegu = memory.record_fact(
+            "user", "lives_in", "Daegu", prov, "s2", single_valued=False, replaces=(seoul.fact_id,)
+        )
+
+        with pytest.raises(ValueError):
+            memory.restore_fact(busan.fact_id, prov)
+        assert [f.fact_id for f in memory.list_facts()] == [daegu.fact_id]
+
+        back = memory.restore_fact(seoul.fact_id, prov)
+        with pytest.raises(ValueError):
+            memory.restore_fact(seoul.fact_id, prov)
+        assert [f.fact_id for f in memory.list_facts()] == [back.fact_id]
+
+    def test_a_fact_replaced_before_replacers_were_kept_is_not_restored(self) -> None:
+        """No `superseded_by`: what replaced it is unknown, so it could not be put back as the
+        one current value. The same check as the chain's refuses it (`replacer is None`).
+        """
+        memory = CrossSessionMemory()
+        prov = _test_provenance()
+        busan = memory.record_fact("user", "lives_in", "Busan", prov, "s0", single_valued=False)
+        seoul = memory.record_fact(
+            "user", "lives_in", "Seoul", prov, "s1", single_valued=False, replaces=(busan.fact_id,)
+        )
+        with memory.knowledge.transaction() as tx:  # as a row written before #2332 reads
+            tx.update_edge(busan.fact_id, record={"superseded_by": None})
+
+        with pytest.raises(ValueError):
+            memory.restore_fact(busan.fact_id, prov)
+        assert [f.fact_id for f in memory.list_facts()] == [seoul.fact_id]
+
+    def test_only_a_replaced_value_can_be_restored(self) -> None:
+        """A current fact, and one a person forgot, are not "replaced"; an unknown id is gone.
+
+        Killed by: src/uclone_x/memory/store.py :: if replacer is None or fact_of(replacer).retracted:
+        Becomes: if False:
+        """
+        memory = CrossSessionMemory()
+        prov = _test_provenance()
+        current = memory.record_fact("user", "likes", "tea", prov, "s0")
+        forgotten = memory.record_fact("user", "drinks", "coffee", prov, "s0")
+        memory.retract_fact(forgotten.fact_id, "forgotten by the user", prov)
+
+        with pytest.raises(ValueError):
+            memory.restore_fact(current.fact_id, prov)
+        with pytest.raises(ValueError):
+            memory.restore_fact(forgotten.fact_id, prov)
+        with pytest.raises(KeyError):
+            memory.restore_fact("mem_000000000000", prov)
+        assert [f.fact_id for f in memory.list_facts()] == [current.fact_id]
+
+
+def test_a_relation_answered_several_values_is_kept_once(tmp_path: Path) -> None:
+    """
+    Killed by: src/uclone_x/memory/store.py :: tx.set_meta(SEVERAL_VALUES_KEY, json.dumps(sorted(held | {key})))
+    Becomes: pass
+    """
+    from uclone_x.memory.store import SEVERAL_VALUES_KEY
+
+    memory = CrossSessionMemory(storage_path=tmp_path / "knowledge.sqlite3")
+
+    assert memory.mark_several_values("Prefers") is True
+    assert memory.mark_several_values("prefers") is False
+    assert memory.mark_several_values("speaks") is True
+    with pytest.raises(ValueError):
+        memory.mark_several_values(" ")
+    reread = CrossSessionMemory(storage_path=tmp_path / "knowledge.sqlite3")
+    assert reread.knowledge.meta(SEVERAL_VALUES_KEY) == '["prefers", "speaks"]'

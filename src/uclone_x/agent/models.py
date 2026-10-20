@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from enum import StrEnum
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator
 
@@ -123,6 +124,23 @@ class AgentConfig(BaseModel):
             "without tools is correct. On for agents whose answers are claims about "
             "something they can inspect -- see #697, where a median of one tool call met "
             "a median declared horizon of six."
+        ),
+    )
+    thinking_budget_tokens: int | None = Field(
+        default=8_192,
+        gt=0,
+        description=(
+            "How much one streamed step may think before it is cut (#2202). Ollama "
+            "streams only: it is the one connector that streams thinking, one token per "
+            "piece, so the budget counts tokens there and acts nowhere else (#2322). "
+            "Declared retry policy (P6): a cut step's stream is closed, which stops the "
+            "generation, and the step is asked once more with the same messages and "
+            "thinking off; its answer carries `provenance.path == retry`. A second cut in "
+            "the turn, or a retry the server refuses as sent (a model that can only "
+            "think), ends it with `step.thinking_budget`. Normal requests stay far under "
+            "it: on qwen3:8b the 99th percentile was about 1,800 tokens, and no request "
+            "fell between 3,402 and 11,317. `None` turns the cut off. A step served "
+            "without streaming is not counted."
         ),
     )
     max_steps: int = Field(
@@ -254,6 +272,14 @@ class ToolExecutionRecord(BaseModel):
         "not declare `writes_files` (#2079), and each of those broke a reader that parsed.",
     )
 
+    written_output_paths: tuple[str, ...] | None = Field(
+        default=None,
+        description="Of the `path`/`paths` the output names, those the call created or "
+        "changed, as checked on disk by the one site that ran it (#2331). None where no "
+        "check ran (a record not built by that site), and then `produced_paths` takes the "
+        "output's names as they are.",
+    )
+
     @field_validator("artifacts")
     @classmethod
     def _workspace_relative(cls, value: tuple[str, ...]) -> tuple[str, ...]:
@@ -278,7 +304,9 @@ class ToolExecutionRecord(BaseModel):
         only when it declared none, and only for a tool that declares `writes_files`, the
         `path` and `paths` its output names -- the shape external MCP tools, peers and the
         story tools still report by. `file_read` returns a `path` too and declares no
-        writes, so a file it read is never counted as produced.
+        writes, so a file it read is never counted as produced. And of those names, only
+        the files the call created or changed (`written_output_paths`): a read-only MCP
+        tool is declared as writing, and the file it looked up was not made (#2331).
         """
         if self.status is not ToolResultStatus.SUCCESS:
             return ()
@@ -286,15 +314,22 @@ class ToolExecutionRecord(BaseModel):
             return self.artifacts
         if not self.writes_files or not isinstance(self.output, dict):
             return ()
-        candidates: list[object] = [self.output.get("path")]
-        listed = self.output.get("paths")
-        if isinstance(listed, list):
-            candidates.extend(listed)
-        named: list[str] = []
-        for candidate in candidates:
-            if isinstance(candidate, str) and candidate and candidate not in named:
-                named.append(candidate)
-        return tuple(named)
+        if self.written_output_paths is not None:
+            return self.written_output_paths
+        return output_named_paths(self.output)
+
+
+def output_named_paths(output: Mapping[str, Any]) -> tuple[str, ...]:
+    """The `path` and each of `paths` an output names, each once, in order."""
+    candidates: list[object] = [output.get("path")]
+    listed = output.get("paths")
+    if isinstance(listed, list):
+        candidates.extend(cast(list[object], listed))
+    named: list[str] = []
+    for candidate in candidates:
+        if isinstance(candidate, str) and candidate and candidate not in named:
+            named.append(candidate)
+    return tuple(named)
 
 
 TurnStopReason = Literal[
@@ -320,6 +355,8 @@ TurnStopReason = Literal[
     "provider_error",
     "persona_edit_failed",
     "tool_call_unreadable",
+    "empty_reply",
+    "thinking_budget",
     "cancelled",
 ]
 """How a turn's step run ended: the vocabulary of `TURN_END.stop_reason` and `TurnResult`.
@@ -367,6 +404,15 @@ read as a call (#2188, owner ruling 2026-10-04). Nothing of that reply ran or en
 history, and the turn did not fall back to native tool calling. Its `error` is a fixed
 plain sentence; the reply is in the log's `MODEL_RESPONSE` event. It is not a refusal -- a
 retry samples a new reply.
+
+`empty_reply` is a turn whose answer was still empty after the re-ask (#2264): nothing to
+show, so it ends with `EMPTY_REPLY_MESSAGE` and the code `step.empty_reply` rather than as a
+finished turn with an empty reply. It is not a refusal -- a retry samples a new reply.
+
+`thinking_budget` is a turn whose model thought past `AgentConfig.thinking_budget_tokens`
+twice: the cut step was asked once more with thinking off, and that ran away too (#2202).
+It ends with `THINKING_BUDGET_MESSAGE` and the code `step.thinking_budget`. It is not a
+refusal.
 """
 
 
@@ -403,11 +449,28 @@ class ProviderFailure(BaseModel):
         description="The one action a head offers: 'use_system_default' clears the clone's "
         "own model so it follows Settings. The turn is never re-run on the default unasked.",
     )
+    status_code: int | None = Field(
+        default=None,
+        description="The provider's HTTP status, when it answered one no rule places (#2227). "
+        "For whoever debugs the failure, never shown to U0: `message` is U0's.",
+    )
+    body_excerpt: str | None = Field(
+        default=None,
+        description="The start of the provider's answer, capped and with credentials "
+        "redacted, beside `status_code` (#2227). For whoever debugs it, never U0's.",
+    )
 
     @classmethod
     def of(cls, exc: ProviderFailureError) -> ProviderFailure:
         """The record of a raised provider failure."""
-        return cls(kind=exc.kind, message=str(exc), retryable=exc.retryable, provider=exc.provider)
+        return cls(
+            kind=exc.kind,
+            message=str(exc),
+            retryable=exc.retryable,
+            provider=exc.provider,
+            status_code=exc.status_code,
+            body_excerpt=exc.body_excerpt,
+        )
 
 
 class TurnResult(BaseModel):

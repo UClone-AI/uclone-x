@@ -16,7 +16,7 @@ import {
   conversationListCopy,
 } from '../rooms/ConversationList';
 import { fmt, useCopy, useLocale, type Language, type Messages } from '../../i18n';
-import { cloneLabel } from '../../lib/cloneLabel';
+import { cloneLabel, isUsableClone } from '../../lib/cloneLabel';
 import { en } from '../../i18n/en';
 import { avatarUrlsOf, pictureOf } from '../../lib/avatarChoice';
 import { Rail } from '../../ui-kit';
@@ -66,6 +66,8 @@ export const railCopy = (t: Messages, language: Language): RailCopy => {
     moreLabel: (name) => fmt(r.moreLabel, { name }),
     moreTitle: r.moreTitle,
     pinnedHeading: r.pinnedHeading,
+    unreadableBadge: r.unreadableBadge,
+    unreadableTitle: r.unreadableTitle,
     cloneConversations: {
       heading: r.cloneConversations.heading,
       none: r.cloneConversations.none,
@@ -123,7 +125,8 @@ export const WorkspaceSidebar: React.FC<WorkspaceSidebarProps> = (props) => {
   }, [personas]);
   // Each clone labelled by its display name for this screen's language; the id stays `name`.
   const labelled = useMemo(
-    () => personas?.map((p) => ({ ...p, label: cloneLabel(p, language) })),
+    () =>
+      personas?.map((p) => ({ ...p, label: cloneLabel(p, language), unreadable: !isUsableClone(p) })),
     [personas, language],
   );
   return (

@@ -249,6 +249,7 @@ def _put(
             source_session_id="sess_a",
             confidence=0.8,
             created_at=created_at,
+            updated_at=created_at,
         ),
     )
 
@@ -298,8 +299,8 @@ async def test_self_facts_lead_under_their_own_line_newest_first_and_capped_at_e
 async def test_self_facts_do_not_count_against_the_prompt_budget() -> None:
     """Eight facts about the clone and a budget of five: the person still gets all five.
 
-    Killed by: src/uclone_x/memory/recall.py :: about_user = _newest_about(about_others, USER_SUBJECT, min(USER_FACTS_LIMIT, limit))
-    Becomes: about_user = _newest_about(about_others, USER_SUBJECT, min(USER_FACTS_LIMIT, limit - len(about_self)))
+    Killed by: src/uclone_x/memory/recall.py :: user_limit = min(USER_FACTS_LIMIT, limit)
+    Becomes: user_limit = min(USER_FACTS_LIMIT, limit - len(about_self))
     """
     memory = CrossSessionMemory(max_facts_in_prompt=5)
     for day in range(1, 9):
@@ -353,8 +354,8 @@ async def _never(_request: LLMRequest) -> ModelResponse:
 def test_the_extractor_is_told_to_use_the_self_subject_and_sees_self_facts() -> None:
     """The prompt names `self` for what a person says about the clone, and lists what is held.
 
-    Killed by: src/uclone_x/memory/extractor.py :: f'Use the subject "{SELF_SUBJECT}", with source "person", when a person line tells '
-    Becomes: f'Use the subject "user", with source "person", when a person line tells '
+    Killed by: src/uclone_x/memory/extractor.py :: f'Use the subject "{SELF_SUBJECT}" when a person line tells '
+    Becomes: f'Use the subject "user" when a person line tells '
     Killed by: src/uclone_x/memory/extractor.py :: if (subject := fold_name(fact.subject)) in (PERSON_SUBJECT, SELF_SUBJECT)
     Becomes: if (subject := fold_name(fact.subject)) in (PERSON_SUBJECT,)
     """
@@ -373,7 +374,7 @@ def test_the_extractor_is_told_to_use_the_self_subject_and_sees_self_facts() -> 
     render = extractor_module._instructions  # pyright: ignore[reportPrivateUsage]
     told = " ".join(render(lesson).split())
 
-    assert 'Use the subject "self", with source "person", when a person line tells Scout' in told
+    assert 'Use the subject "self" when a person line tells Scout' in told
     assert '"hair", "eyes", "age", "appearance", "personality" or "speech_style"' in told
     assert "Scout's own lines never define it." in told
     assert "the contents of a story" in told
@@ -394,7 +395,7 @@ class _Model(BaseLLMConnector):
     async def generate(self, request: LLMRequest) -> ModelResponse:
         system = str(request.messages[0].content) if request.messages else ""
         if system.startswith(extractor_module.INSTRUCTIONS_OPENING):
-            content = json.dumps(self.extractions.pop(0) if self.extractions else [])
+            content = json.dumps({"facts": self.extractions.pop(0) if self.extractions else []})
         else:
             content = "Okay."
         return ModelResponse(
@@ -440,15 +441,19 @@ class _Always:
         )
 
 
-def _told(subject: str, relation: str, value: str) -> dict[str, Any]:
+def _told(
+    subject: str, relation: str, value: str, quote: str | None = None, **extra: Any
+) -> dict[str, Any]:
+    """A fact told by the person; its quote is its value unless given."""
     return {
         "subject": subject,
-        "relation": relation,
+        "key": relation,
         "value": value,
-        "source": "person",
+        "quote": value if quote is None else quote,
         "confidence": 0.95,
         "durable": True,
         "why": "said so",
+        **extra,
     }
 
 
@@ -463,8 +468,8 @@ async def test_a_person_defining_the_clone_in_a_room_leaves_one_active_hair_fact
 
     Killed by: src/uclone_x/room/orchestrator.py :: clone_names=_clone_names(state, speaker),
     Becomes: clone_names=(),
-    Killed by: src/uclone_x/memory/extractor.py :: subject = fact_subject(candidate.subject, lesson.person_names, lesson.clone_names)
-    Becomes: subject = fact_subject(candidate.subject, lesson.person_names, ())
+    Killed by: src/uclone_x/memory/extractor.py :: clone = tuple(n for n in (*SELF_WORDS, *lesson.clone_names) if name_key(n) not in person)
+    Becomes: clone = tuple(SELF_WORDS)
     """
     person = _participant("alice", ParticipantKind.HUMAN, "Alice")
     clone = Participant(
@@ -475,7 +480,12 @@ async def test_a_person_defining_the_clone_in_a_room_leaves_one_active_hair_fact
         session_id="sess_room__r1__rin",
     )
     memory = CrossSessionMemory(storage_path=tmp_path / "rin-memory.json")
-    llm = _Model([[_told("너", "hair", "빨간 머리")], [_told("린", "hair", "파란 머리")]])
+    llm = _Model(
+        [
+            [_told("너", "hair", "빨간 머리", quote="너는 빨간 머리야")],
+            [_told("린", "hair", "파란 머리", quote="파란 머리야", replaces="빨간 머리")],
+        ]
+    )
     agent = BaseAgent(
         config=AgentConfig(
             agent_id=clone.id, name="Rin", llm_config=AgentLLMConfig(model_name="scripted")

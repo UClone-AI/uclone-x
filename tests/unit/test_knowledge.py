@@ -1,4 +1,5 @@
-"""uGraph step 1: the shared fold, the near-match measure, the model and the resolver."""
+"""uGraph: the shared fold, the near-match measure, the model, the resolver, and what an
+extraction keeps of a model's facts (`verify_facts`)."""
 
 from __future__ import annotations
 
@@ -18,9 +19,18 @@ from uclone_x.knowledge import (
     fold,
     holds_at,
 )
+from uclone_x.knowledge.extraction import (
+    ALIAS_MARKER,
+    AliasCandidate,
+    ExtractedFact,
+    alias_prompt,
+    confirmed_aliases,
+    read_presence,
+    verify_facts,
+)
 from uclone_x.knowledge.models import EdgeStatus
+from uclone_x.knowledge.quotes import folded
 from uclone_x.memory.models import fold_name
-from uclone_x.story.quotes import folded
 
 SCOPE = "story:s1"
 
@@ -186,8 +196,8 @@ def _edge(
 
 def test_facts_at_reads_approved_unexpired_edges_valid_at_the_point() -> None:
     """
-    Killed by: src/uclone_x/knowledge/store.py :: return edge.status in wanted and edge.expired_at is None and edge.valid.contains(axis, point)
-    Becomes: return edge.status != "retracted" and edge.expired_at is None and edge.valid.contains(axis, point)
+    Killed by: src/uclone_x/knowledge/store.py :: edge.status in wanted
+    Becomes: edge.status != "retracted"
     """
     edges = [
         _edge("1", Interval("story", None, (2, 0)), value="alive"),
@@ -230,3 +240,328 @@ def test_an_edge_has_one_object_or_one_value() -> None:
         _edge("x", Interval("wall"))
     with pytest.raises(ValueError):
         _edge("x", Interval("wall"), object_id="a", value="b")
+
+
+# -- verify_facts: the names a fact gives ------------------------------------------------
+
+CAST = _entities(
+    ("kalrin_deu_raiteu", "칼린 드 라이트", ()),
+    ("moraseu", "모라스", ()),
+    ("harin", "하린", ("린",)),
+    ("haeun", "하은", ("린",)),
+)
+TEXT = "Kalrin fell in the snow and did not rise. 린은 문 앞에 서 있었다. Moras watched."
+
+
+def _fact(subject: str, quote: str, named: str = "") -> ExtractedFact:
+    return ExtractedFact(subject=subject, key="status", value="dead", quote=quote, named=named)
+
+
+def test_a_name_two_entities_share_drops_the_fact_and_guesses_neither() -> None:
+    """#2216 review (M7): a fact about "린", which 하린 and 하은 both go by, is dropped and
+    counted, never filed under the first match.
+
+    Killed by: src/uclone_x/knowledge/extraction.py :: if len(ids) > 1:
+    Becomes: if len(ids) > 9:
+    """
+    verified = verify_facts(
+        [_fact("린", "린은 문 앞에 서 있었다")], TEXT, EntityResolver(SCOPE, CAST)
+    )
+    assert verified.kept == []
+    assert verified.dropped == {"ambiguous_name": 1}
+
+
+def test_an_id_answer_resolves_a_name_written_in_another_script_and_is_an_alias() -> None:
+    """#2217: the cast is in Hangul and the prose in Latin letters. The reply's id resolves
+    the subject, and the words the quote calls it by come back as a candidate alias -- no
+    rule in code maps one script to the other.
+
+    Killed by: src/uclone_x/knowledge/extraction.py :: return named, False
+    Becomes: return None, False
+    """
+    verified = verify_facts(
+        [_fact("kalrin_deu_raiteu", "Kalrin fell in the snow", named="Kalrin")],
+        TEXT,
+        EntityResolver(SCOPE, CAST),
+    )
+    [read] = verified.kept
+    assert (read.subject, read.alias) == ("kalrin_deu_raiteu", "Kalrin")
+    assert verified.dropped == {}
+
+
+def test_a_name_the_subject_has_or_the_quote_lacks_is_no_alias() -> None:
+    """A name the entity already has is no news, and words not in the quote were not
+    copied from the text.
+
+    Killed by: src/uclone_x/knowledge/extraction.py :: if fold(named) not in fold(fact.quote):
+    Becomes: if False:
+    """
+    resolver = EntityResolver(SCOPE, CAST)
+    known = verify_facts([_fact("moraseu", "Moras watched", named="모라스")], TEXT, resolver)
+    absent = verify_facts(
+        [_fact("kalrin_deu_raiteu", "Kalrin fell in the snow", named="Ilsa")], TEXT, resolver
+    )
+    assert [(r.subject, r.alias) for r in known.kept] == [("moraseu", None)]
+    assert [(r.subject, r.alias) for r in absent.kept] == [("kalrin_deu_raiteu", None)]
+
+
+def test_a_name_that_is_another_entitys_drops_the_fact() -> None:
+    """The reply's id says Kalrin and its words say 모라스: they disagree, and nothing is
+    guessed.
+
+    Killed by: src/uclone_x/knowledge/extraction.py :: return None, found.entity_id != subject
+    Becomes: return None, found.entity_id == subject
+    """
+    text = "모라스 watched Kalrin fall."
+    verified = verify_facts(
+        [_fact("kalrin_deu_raiteu", "모라스 watched Kalrin fall", named="모라스")],
+        text,
+        EntityResolver(SCOPE, CAST),
+    )
+    assert verified.kept == []
+    assert verified.dropped == {"named_other": 1}
+
+
+def test_a_name_two_other_entities_share_drops_the_fact() -> None:
+    """ "린" is 하린's and 하은's, and the reply's id says Kalrin: the words name someone else,
+    whichever of the two they are (#2226).
+
+    Killed by: src/uclone_x/knowledge/extraction.py :: return None, subject not in found.ambiguous_ids
+    Becomes: return None, False
+    """
+    verified = verify_facts(
+        [_fact("kalrin_deu_raiteu", "린은 문 앞에 서 있었다", named="린")],
+        TEXT,
+        EntityResolver(SCOPE, CAST),
+    )
+    assert verified.kept == []
+    assert verified.dropped == {"named_other": 1}
+
+
+def test_the_alias_question_lists_each_candidate_and_only_a_yes_confirms() -> None:
+    """Stage 4 (§3.4): a candidate is a name only when the answer says so; an answer that
+    cannot be read confirms none.
+
+    Killed by: src/uclone_x/knowledge/extraction.py :: if said is True or (isinstance(said, str) and said.strip().lower() in ("true", "yes")):
+    Becomes: if said or (isinstance(said, str) and said.strip().lower() in ("true", "yes")):
+    """
+    kalrin = CAST[0]
+    asked = alias_prompt(
+        [
+            AliasCandidate(kalrin, "Kalrin", "Kalrin fell"),
+            AliasCandidate(kalrin, "she", "she fell"),
+        ]
+    )
+    assert asked.startswith(ALIAS_MARKER)
+    assert '1. 칼린 드 라이트 -- words: "Kalrin" -- quote: "Kalrin fell"' in asked
+    assert '2. 칼린 드 라이트 -- words: "she"' in asked
+    reply = '{"1": true, "2": false, "3": "no", "4": "yes"}'
+    assert confirmed_aliases(reply, 4) == {0, 3}
+    assert confirmed_aliases("I think the first one.", 2) == set()
+
+
+# --------------------------------------------------------------------------------------
+# A fact's object stands on a quote that names it, in any script (#2238, #2249)
+# --------------------------------------------------------------------------------------
+
+#: One holder and one item per script family. The item's name is never the word the quote
+#: uses whole: a noun-first name (French), names with no spaces (Japanese, Chinese), a
+#: one-character word (키), so a rule on a name's last word or its spacing fails somewhere.
+SCRIPTS = {
+    "ko": ("에이든", "도시 중심가의 키", "에이든은 키를 주머니에 넣었다", "키"),
+    "en": ("Aidan", "the old relic of the vale", "Aidan held the relic close", "relic"),
+    "fr": ("Aidan", "la clé du centre-ville", "Aidan sortit la clé de sa poche", "la clé"),
+    "ja": ("ジノ", "壊れた懐中時計", "ジノは時計をポケットに入れた", "時計"),
+    "zh": ("艾登", "城市中心的钥匙", "艾登把钥匙放进口袋", "钥匙"),
+}
+
+
+def _holding(script: str) -> tuple[EntityResolver, str, str, str]:
+    holder, item, quote, words = SCRIPTS[script]
+    resolver = EntityResolver(
+        SCOPE,
+        [
+            Entity("holder", SCOPE, "characters", holder),
+            Entity("item", SCOPE, "items", item),
+            Entity("place", SCOPE, "places", "도시 중심가"),
+        ],
+    )
+    return resolver, quote, words, item
+
+
+def _held(quote: str, *, value: str = "item", object_named: str = "") -> ExtractedFact:
+    return ExtractedFact(
+        subject="holder", key="possesses", value=value, quote=quote, object_named=object_named
+    )
+
+
+@pytest.mark.parametrize("script", list(SCRIPTS))
+def test_the_words_the_reading_gives_for_the_object_hold_it_in_every_script(script: str) -> None:
+    """The reading model says which words of the quote name the object (`object_named`);
+    they hold it when they are in the quote and in the object's name, as characters --
+    no word order, spacing or ending is assumed (#2249).
+
+    Killed by: src/uclone_x/knowledge/extraction.py :: return words in _squeezed(name)
+    Becomes: return False
+    """
+    resolver, quote, words, _ = _holding(script)
+    verified = verify_facts([_held(quote, object_named=words)], quote, resolver)
+    assert [r.subject for r in verified.kept] == ["holder"]
+
+
+@pytest.mark.parametrize("script", list(SCRIPTS))
+def test_without_those_words_only_the_whole_name_holds_the_object(script: str) -> None:
+    """With no `object_named`, the quote must hold one of the object's names or aliases
+    whole; a part of the name does not, whatever the script.
+
+    Killed by: src/uclone_x/knowledge/extraction.py :: if any(_squeezed(name) in said for name in names):
+    Becomes: if True:
+    """
+    resolver, quote, _, item = _holding(script)
+    holder = SCRIPTS[script][0]
+    whole = f"{holder} {item}"
+    partial = verify_facts([_held(quote)], quote, resolver)
+    named = verify_facts([_held(whole)], whole, resolver)
+    assert partial.kept == [] and partial.dropped == {"object_not_in_quote": 1}
+    assert [r.subject for r in named.kept] == ["holder"]
+
+
+def test_object_words_that_are_not_in_the_quote_or_name_another_entity_hold_nothing() -> None:
+    """The words must be the quote's own, and not another entity's name: "도시 중심가" is
+    in "도시 중심가의 키" as characters, and it is a place (#2238's false finding).
+
+    Killed by: src/uclone_x/knowledge/extraction.py :: if not words or words not in said:
+    Becomes: if not words:
+    Killed by: src/uclone_x/knowledge/extraction.py :: if found.kind != "new" and found.entity_id != entity_id:
+    Becomes: if False:
+    """
+    resolver, quote, _, _ = _holding("ko")
+    cafe = "사라가 도시 중심가의 한 카페에 앉아 있었다"
+    elsewhere = "에이든은 열쇠를 주머니에 넣었다"
+    verified = verify_facts(
+        [
+            _held(elsewhere, object_named="키"),  # in the item's name, not in the quote
+            _held(cafe, object_named="도시 중심가"),  # another entity's name
+            _held(quote, object_named="주머니"),  # in the quote, not in the item's name
+        ],
+        f"{quote} {cafe} {elsewhere}",
+        resolver,
+    )
+    assert verified.kept == []
+    assert verified.dropped == {"object_not_in_quote": 3}
+
+
+def test_a_relation_stands_on_a_quote_that_names_the_other() -> None:
+    """`of` is held to its quote as the value is: kin named there is kept, kin not named
+    is dropped (#2249 item 2).
+
+    Killed by: src/uclone_x/knowledge/extraction.py :: objects = [e for e in (other, _object_of(resolver, fact, subject)) if e is not None]
+    Becomes: objects = [e for e in (_object_of(resolver, fact, subject),) if e is not None]
+    """
+    resolver = EntityResolver(SCOPE, CAST)
+    said = "칼린 드 라이트는 모라스의 딸이었다"
+    elsewhere = "칼린 드 라이트는 눈 속에 쓰러졌다"
+    facts = [
+        ExtractedFact(
+            subject="kalrin_deu_raiteu", key="family", value="daughter", quote=said, of="moraseu"
+        ),
+        ExtractedFact(
+            subject="kalrin_deu_raiteu", key="family", value="sister", quote=elsewhere, of="moraseu"
+        ),
+    ]
+    verified = verify_facts(facts, f"{said} {elsewhere}", resolver)
+    assert [r.fact.value for r in verified.kept] == ["daughter"]
+    assert verified.dropped == {"object_not_in_quote": 1}
+
+
+def test_a_new_person_a_relation_names_stands_on_a_quote_that_names_them() -> None:
+    """The clone files a name it does not hold as a new subject (#2235); a relation to such
+    a person is kept when the quote names them, not dropped for being no entity yet
+    (#2249 item 3).
+
+    Killed by: src/uclone_x/knowledge/extraction.py :: names = resolver.names_of(entity_id) or (entity_id,)
+    Becomes: names = resolver.names_of(entity_id)
+    """
+    resolver = EntityResolver("clone:c", [Entity("user", "clone:c", "person", "user")])
+    said = "My sister Mina works in Seoul"
+    facts = [
+        ExtractedFact(subject="user", key="sister", value="yes", quote=said, of="Mina"),
+        ExtractedFact(subject="user", key="brother", value="yes", quote=said, of="Jo"),
+    ]
+    verified = verify_facts(facts, said, resolver, new_names=True)
+    assert [(r.fact.key, r.of) for r in verified.kept] == [("sister", "Mina")]
+    assert verified.dropped == {"object_not_in_quote": 1}
+
+
+def test_object_words_that_are_only_a_bracket_or_quotation_marks_drop_that_fact_alone() -> None:
+    """`object_named` of `(그것)` is in the quote, and is no name once its brackets go: it
+    was resolved as one, which raised and lost the whole reading. It holds nothing; the
+    reading's other facts stand (#2254 review).
+
+    Killed by: src/uclone_x/knowledge/extraction.py :: if not name_key(fact.object_named):
+    Becomes: if False:
+    """
+    resolver, quote, _, _ = _holding("ko")
+    bracketed = "에이든은 (그것)을 주머니에 넣었다"
+    verified = verify_facts(
+        [
+            _held(bracketed, object_named="(그것)"),
+            _held(quote, object_named="키"),
+        ],
+        f"{bracketed} {quote}",
+        resolver,
+    )
+    assert [r.fact.quote for r in verified.kept] == [quote]
+    assert verified.dropped == {"object_not_in_quote": 1}
+
+
+def test_names_are_folded_by_one_function() -> None:
+    """`quotes.folded`, the name the story example imports, is `fold` itself, not a second
+    copy of the rule (#2240 item 5).
+
+    Killed by: src/uclone_x/knowledge/quotes.py :: folded = fold
+    Becomes: folded = str.casefold
+    """
+    from uclone_x.knowledge import quotes
+
+    assert quotes.folded is fold
+
+
+# -- read_presence: who a reply says is there at the text's own time (#2311) -------------
+
+
+def test_a_presence_map_is_read_by_entity_and_keeps_only_its_words() -> None:
+    """Names and ids both resolve; a word not among the four and a name no entity has are
+    left out, not guessed.
+
+    Killed by: src/uclone_x/knowledge/extraction.py :: if presence not in PRESENCES:
+    Becomes: if False:
+    """
+    resolver = EntityResolver(SCOPE, _entities(("harin", "하린", ()), ("jinho", "이진호", ())))
+
+    read = read_presence(
+        {"harin": "Acting", "이진호": "remembered", "누군가": "acting", "jinho ": "ghost"},
+        resolver,
+    )
+
+    assert read == {"harin": "acting", "jinho": "remembered"}
+
+
+def test_one_entity_given_twice_is_acting_when_either_says_so() -> None:
+    """
+    Killed by: src/uclone_x/knowledge/extraction.py :: if out.get(entity) != ACTING:
+    Becomes: if True:
+    """
+    resolver = EntityResolver(SCOPE, _entities(("jinho", "이진호", ())))
+
+    assert read_presence({"jinho": "acting", "이진호": "mentioned"}, resolver) == {
+        "jinho": "acting"
+    }
+
+
+def test_no_map_is_no_answer_and_an_empty_map_names_nobody() -> None:
+    resolver = EntityResolver(SCOPE, _entities(("jinho", "이진호", ())))
+
+    assert read_presence(None, resolver) is None
+    assert read_presence(["jinho"], resolver) is None
+    assert read_presence({}, resolver) == {}

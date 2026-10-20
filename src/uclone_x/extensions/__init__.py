@@ -11,10 +11,10 @@ from __future__ import annotations
 from uclone_x.extensions.contract import Extension, ExtensionError, ProtectedRoot
 from uclone_x.extensions.registry import (
     ENTRY_POINT_GROUP,
-    IN_TREE_MODULE,
     a2a_character_lookup,
     discover,
     extension_lifecycle_hooks,
+    extension_persona_dirs,
     leased_folder_kinds,
     loaded_extensions,
     mount_extension_routes,
@@ -25,12 +25,12 @@ from uclone_x.extensions.registry import (
 
 __all__ = [
     "ENTRY_POINT_GROUP",
-    "IN_TREE_MODULE",
     "Extension",
     "ExtensionError",
     "ProtectedRoot",
     "a2a_character_lookup",
     "discover",
+    "extension_persona_dirs",
     "extension_lifecycle_hooks",
     "leased_folder_kinds",
     "loaded_extensions",

@@ -390,3 +390,40 @@ def test_turn_summary_carries_the_provider_failure(tools_recorded: bool) -> None
     state = RoomState(room_id="room_1", participants=(_make_agent("scout"),), transcript=(msg,))
 
     assert summarize_turn(state, 1).provider_failure == failure
+
+
+def test_a_turn_that_ended_in_an_error_is_not_reported_as_substituted() -> None:
+    """A provider error ends the turn in the core's error handler (#2229). Its provenance
+    says `failover` and `degraded`, but nothing answered in the model's place, so the
+    panel must not be told the model was substituted or served on a failover path.
+
+    Killed by: src/uclone_x/room/turn_summary.py :: if message.error is not None and path_str == "failover":
+    Becomes: if False:
+    """
+    prov = Provenance(
+        path=ExecutionPath.FAILOVER,
+        requested=ServiceRef(provider="gemini", model="gemini-3.8-flash"),
+        served_by=ServiceRef(provider="agent.core", model="error_handler"),
+        attempts=(
+            AttemptRecord(
+                provider="gemini",
+                model="gemini-3.8-flash",
+                error_class="LLMStreamInterruptedError",
+            ),
+        ),
+    )
+    msg = RoomMessage(
+        seq=1,
+        sender_id="scout",
+        content="",
+        error="Google returned an error UClone-X didn't recognise.",
+        turn_id="turn_err",
+        tools_recorded=True,
+        provenance=prov,
+        decision=SpeakerDecision(
+            verdict=SelectionVerdict.SPEAK, speaker_id="scout", selector="sole_agent"
+        ),
+    )
+    state = RoomState(room_id="room_1", participants=(_make_agent("scout"),), transcript=(msg,))
+
+    assert summarize_turn(state, 1).notable == ["ended_in_error"]

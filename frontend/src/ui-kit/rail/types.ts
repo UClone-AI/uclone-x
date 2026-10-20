@@ -29,6 +29,12 @@ export interface RailPersona {
   /** What the rail shows as its name; the host resolves it. Absent means `name`. */
   label?: string;
   role: string;
+  /**
+   * Its settings file could not be loaded (#2241). The rail lists it only while it has 1:1
+   * conversations, which are drawn under its row and would otherwise vanish; marked, and with
+   * no new-conversation action, since a turn that names it is refused.
+   */
+  unreadable?: boolean;
   description: string;
   allowed_tools: string[];
   model_name?: string | null;
@@ -183,6 +189,10 @@ export interface RailCopy {
   moreTitle: string;
   /** Heads the pinned clones, which the list sorts first, so a row needs no mark of its own. */
   pinnedHeading: string;
+  /** Marks a clone whose settings file could not be loaded (#2241). */
+  unreadableBadge: string;
+  /** Why the mark is there and what it means, on hover: it cannot answer, and where to look. */
+  unreadableTitle: string;
   cloneConversations: CloneConversationsCopy;
   /*
    * `stepBudget`, `turns`, `saturated`, `tokens`, `estimated` and `estimatedTitle` were keys

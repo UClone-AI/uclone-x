@@ -128,6 +128,15 @@ export interface PersonaInfo {
   id?: string;
   /** Its handle, the `@mention` token; the same as `name`. */
   handle?: string;
+  /**
+   * Whether it is running (`live`), installed and idle (`dormant`), or could not be loaded
+   * (`unreadable`, #2220): then only `id`, `name` and `reason` are present.
+   */
+  status?: 'live' | 'dormant' | 'unreadable';
+  /** What the Core says about it, in plain words; for an unreadable clone, why and what to do. */
+  reason?: string;
+  /** For an unreadable clone, which reason (`bare_model`, `unreadable_file`), worded here (#2241). */
+  reason_code?: string;
   /** Its handle: what `@` inserts and a command names. A rename changes it. */
   name: string;
   /**
@@ -149,6 +158,8 @@ export interface PersonaInfo {
   max_tokens?: number;
   enable_write_tools?: boolean;
   enable_subagent_tools?: boolean;
+  /** "Learn from conversations" (#1840); absent reads as on, the Core's default. */
+  learn_from_conversations?: boolean;
   /** The clones this one may call through `a2a_call` (#1558), by id; kept through an edit. */
   a2a_peers?: string[];
   /** The persona's own prompt, without the appended default prompt (#892). */
@@ -820,6 +831,12 @@ export interface RoomTranscriptMessage {
   error?: string | null;
   /** Set beside `error` when a retry would meet the same refusal (#969). */
   refusal?: RoomTurnRefusal | null;
+  /**
+   * Set beside `error` when the turn refused a step whose tool results did not fit the
+   * model's window (`StepRefusalCode`, #2264). Typed `string`: a code this head does not
+   * know falls back to the generic sentence. Retry is still offered.
+   */
+  step_refusal?: string | null;
   /** Set beside `error` when the turn failed at a hosted provider (#1630). */
   provider_failure?: RoomProviderFailure | null;
   /**
@@ -875,6 +892,8 @@ export interface RoomTranscriptMessage {
    * cause. The reply stands. The conversation shows its own translated line, not this text.
    */
   knowledge_extract_error?: string | null;
+  /** Learning from this turn waited so the person's next reply keeps its budget (#2328). */
+  knowledge_skipped?: boolean;
   /**
    * The turn that produced this row, per `RoomMessage.turn_id` -- the id every streamed
    * delta of that turn carried. What lets the head retire a turn's live bubble the moment

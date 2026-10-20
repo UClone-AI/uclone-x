@@ -430,6 +430,10 @@ class PromptAssembler:
 
     def __init__(self, scope: PromptScope) -> None:
         self._scope = scope
+        #: The turn context of the request recorded last, which is the one the model is
+        #: answering: `request_context_fields` records each request just before it is sent.
+        #: The step's calls are cleaned of it (`calls_without_turn_context`, #2264).
+        self.sent_turn_context = ""
 
     @property
     def _ontology(self) -> OntologyEngineProtocol | None:
@@ -488,7 +492,11 @@ class PromptAssembler:
         live session, where the turn executor holds it for the turn.
         """
         memory = self._memory
-        return None if memory is None else await recall_prompt_section(memory, message)
+        if memory is None:
+            return None
+        ontology = self._ontology
+        functional = frozenset[str]() if ontology is None else ontology.functional_relations()
+        return await recall_prompt_section(memory, message, functional=functional)
 
     def get_active_invariants_prompt_section(
         self,
@@ -658,6 +666,7 @@ class PromptAssembler:
         session = self._active_session
         self._declare_tools_module_change(session)
         snapshot_id = self.record_context_snapshot(req, layers)
+        self.sent_turn_context = layers.turn_context
         session.record_shown(list(layers.shown), step=step)
         # The conversation is recorded as the log entries it rendered from and their
         # forms, never as message text: `layers.conversation` is `layers.shown` rendered,

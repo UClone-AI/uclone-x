@@ -19,6 +19,7 @@ from uclone_x.agent.turn_executor import PERSONA_EDIT_NOT_APPLIED
 from uclone_x.agent.turn_trace import trace_turn
 from uclone_x.core.context_state import EPOCH_PERSONA_EDITED
 from uclone_x.engine.event_bus import EventBus
+from uclone_x.i18n.tool_refusals import TOOL_REFUSAL_TEXT
 from uclone_x.llm.connectors.mock import MockLLMConnector
 from uclone_x.llm.models import LLMRequest, ModelResponse, ToolCallRequest
 from uclone_x.log.reader import read_session_log
@@ -312,7 +313,7 @@ class TestRoomPersonaResolution:
         record = result.tool_executions[0]
         assert record.tool_name == "admin_shell"
         assert record.status is ToolResultStatus.ERROR
-        assert "allowed_tools" in (record.error or "")
+        assert record.error == TOOL_REFUSAL_TEXT["tool.out_of_range"]
 
 
 class TestAPersonaEditReachesARoomSeat:

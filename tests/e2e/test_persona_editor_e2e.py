@@ -109,7 +109,7 @@ async def test_an_agent_created_in_settings_is_listed_and_answers_with_its_instr
             await page.locator("#persona-prompt").fill(_PROMPT)
             await page.get_by_test_id("persona-editor").get_by_role("button", name="Save").click()
 
-            await section.get_by_test_id("persona-row-surveyor").wait_for(timeout=10_000)
+            await section.locator('[data-clone-handle="surveyor"]').wait_for(timeout=10_000)
             await section.get_by_role("status").wait_for(timeout=5_000)
 
             # A saved clone lives in its own directory's `clone.yaml` (clone-data-scopes §3.3).
@@ -265,3 +265,92 @@ async def test_generate_fills_the_instructions_from_the_model_and_can_be_undone(
         r for r in llm.requests if "Description: Maps the site" in (r.messages[-1].content or "")
     ]
     assert len(drafts) == 1, [r.messages[-1].content for r in llm.requests]
+
+
+class _CountingLearner(MockLLMConnector):
+    """Answers turns normally and learning calls with no facts, keeping each learning call."""
+
+    def __init__(self) -> None:
+        super().__init__(default_model="mock-gpt-4o", default_response="Noted.")
+        self.learning: list[LLMRequest] = []
+        self._learner = nothing_learned()
+
+    async def generate(self, request: LLMRequest) -> ModelResponse:
+        if is_extraction_request(request):
+            self.learning.append(request)
+            return await self._learner.generate(request)
+        return await super().generate(request)
+
+
+@pytest.mark.asyncio
+async def test_learn_from_conversations_switched_off_in_the_editor_stops_learning_until_switched_on(
+    tmp_path: Path,
+) -> None:
+    """#1840 through the shipped bundle: the switch the editor saves is the one a room obeys.
+
+    A clone created with "Learn from conversations" off answers a turn and is not asked what
+    to remember. Switched on in the same editor, its next turn is. The second turn's learning
+    call is waited for, and by then the first turn's would long have been made, so "no call
+    names the first message" is an observed absence, not an early look.
+
+    The switch is checked twice once saved: before a lesson is queued and again when it is
+    learned (#2248), so neither gate alone fails this test. What it pins is the editor's
+    switch reaching the clone's file (#2286).
+
+    Killed by: src/uclone_x/agent/clone_store.py :: if not learns:
+    Becomes: if False:
+    """
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    llm = _CountingLearner()
+
+    def spans() -> list[str]:
+        return [
+            " ".join(m.content or "" for m in request.messages if m.role is not MessageRole.SYSTEM)
+            for request in llm.learning
+        ]
+
+    with running_ui(storage_dir=tmp_path / "sessions", llm=llm, workspace_dir=workspace) as server:
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(headless=True)
+            try:
+                page = await browser.new_page(viewport={"width": 1600, "height": 900})
+                await page.goto(server, wait_until="networkidle")
+                await page.get_by_test_id("open-settings").click()
+                section = page.get_by_test_id("settings-personas")
+                editor = page.get_by_test_id("persona-editor")
+
+                await section.get_by_role("button", name="New clone").click()
+                await page.locator("#persona-name").fill("diarist")
+                await page.locator("#persona-role").fill("Diarist")
+                await page.locator("#persona-prompt").fill(_PROMPT)
+                learn = editor.get_by_role("checkbox", name="Learn from conversations")
+                assert await learn.is_checked(), "a new clone learns unless switched off"
+                await learn.uncheck()
+                await editor.get_by_role("button", name="Save").click()
+                await section.locator('[data-clone-handle="diarist"]').wait_for(timeout=10_000)
+
+                (agent_id,) = clone_handles(default_agents_root()).get("diarist", ("",))
+                assert agent_id, "the save did not land in the directory the loader reads"
+
+                await _room_turn(page.request, server, "diarist", "I keep bees.")
+
+                await section.get_by_role("button", name="Edit diarist").click()
+                learn = editor.get_by_role("checkbox", name="Learn from conversations")
+                assert not await learn.is_checked(), "the editor shows the saved switch"
+                await learn.check()
+                await editor.get_by_role("button", name="Save").click()
+                await section.get_by_role("status").wait_for(timeout=5_000)
+
+                await _room_turn(page.request, server, "diarist", "I grow tomatoes.")
+                loop = asyncio.get_running_loop()
+                deadline = loop.time() + 20
+                while not any("tomatoes" in span for span in spans()):
+                    assert loop.time() < deadline, (
+                        f"the switched-on turn was not learned: {spans()}"
+                    )
+                    await asyncio.sleep(0.1)
+            finally:
+                await browser.close()
+
+    assert not any("bees" in span for span in spans()), spans()

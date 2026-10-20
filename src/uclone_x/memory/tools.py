@@ -37,6 +37,14 @@ class RecordMemoryFactParams(BaseModel):
     tags: tuple[str, ...] = Field(
         default_factory=tuple, description="Optional categorization tags."
     )
+    single_valued: bool = Field(
+        default=True,
+        description=(
+            "Whether the subject has only one value of this predicate at a time, such as "
+            "where they live or their job: a new value then replaces the old. False when "
+            "values add up, such as things they like or languages they speak: each is kept."
+        ),
+    )
 
     valid_until: str | None = Field(
         default=None,
@@ -78,7 +86,8 @@ class RecordMemoryFactTool(BaseTool[RecordMemoryFactParams]):
     not_run_note: ClassVar[str] = "Nothing was saved to memory."
     description: str = (
         "Record a verified cross-session fact (subject, predicate, object_value) into durable memory. "
-        "Carries in-band P6 provenance and automatically supersedes conflicting prior assertions. "
+        "Carries in-band P6 provenance. A fact marked single_valued supersedes the prior value "
+        "of the same subject and predicate; one that is not is kept beside it. "
         'Use the subject "user" for facts about the person you work for, and the subject '
         f'"{PROJECT_SUBJECT}" for durable working preferences of this workspace, such as the '
         "reply language or a code style. "
@@ -113,6 +122,7 @@ class RecordMemoryFactTool(BaseTool[RecordMemoryFactParams]):
                 source_room_id=context.room_id,
                 source_turn_id=context.turn_id,
                 valid_until=params.valid_until,
+                single_valued=params.single_valued,
             )
         except ValueError as exc:
             # The store refuses an empty field before it touches anything, so this one

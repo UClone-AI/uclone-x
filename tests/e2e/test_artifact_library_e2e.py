@@ -23,7 +23,7 @@ from tests.e2e.conftest import mock_llm, running_ui
 from uclone_x.artifacts.library import READERS_NOT_CLEARED_NOTE
 from uclone_x.room.service import RoomService
 from uclone_x.room.store import RoomStore
-from uclone_x.story.library import StoryLibrary
+from uclone_x_story.library import StoryLibrary
 
 pytestmark = pytest.mark.e2e
 

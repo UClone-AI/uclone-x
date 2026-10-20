@@ -21,15 +21,15 @@ back to inferring it from a second endpoint. `dormant` names the one thing that 
 from `live`: installed, and not running. The reason string says so in words.
 
 *What does a row say when its home is unreadable?* **It says so, in place.** The row keeps
-its position with `status: "unreadable"`, `id: null`, and a reason naming the path and the
-fault. Dropping it would render "this clone's home is damaged" identically to "this clone
+its position with `status: "unreadable"`, the id its directory names (`null` when that
+could not be learned, #2260), and a reason naming the path and the fault. Dropping it would render "this clone's home is damaged" identically to "this clone
 is not installed" -- and of those two it is the damaged home the reader can act on, while
 the name stays taken either way.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -46,6 +46,7 @@ from uclone_x.core.agent_home import (
 )
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle; the app imports this module
+    from uclone_x.agent.clone_store import UnreadableClone
     from uclone_x.ui.app import AgentSessionManager
     from uclone_x.ui.rooms import RoomStack
 
@@ -96,12 +97,16 @@ class CloneSummary(BaseModel):
     #: what makes it unique without a second index that could disagree.
     name: str
     #: The opaque identifier recorded in the home, minted the first time the clone runs.
-    #: `null` before that, and for a home that could not be read.
+    #: `null` before that, and for a home whose id could not be learned.
     id: str | None
     status: CloneStatus
     #: Rendered verbatim. It states what is true of this clone, so that a row never
     #: depends on the reader working out why it looks the way it does.
     reason: str
+    #: For a clone whose settings file could not be loaded, which reason (`bare_model`,
+    #: `unreadable_file`): a head words it in the reader's language, and falls back to
+    #: `reason` for a code it does not know (#2241). `None` for every other row.
+    reason_code: str | None = None
 
 
 class CloneListing(BaseModel):
@@ -219,14 +224,29 @@ def _damage_reason(entry: AgentHomeEntry) -> str:
     )
 
 
-def _clone_from_home(entry: AgentHomeEntry, running: frozenset[str]) -> CloneSummary:
-    """Turn one home into the row a surface draws, in the product's vocabulary."""
-    if entry.state is AgentHomeState.UNREADABLE:
+def _clone_from_home(
+    entry: AgentHomeEntry, running: frozenset[str], unreadable: Mapping[str, UnreadableClone]
+) -> CloneSummary:
+    """Turn one home into the row a surface draws, in the product's vocabulary.
+
+    `unreadable` maps a clone id to the clone whose settings file could not be loaded as a
+    persona: the home is sound, so it keeps its id, and it says why it cannot be used.
+    """
+    found = unreadable.get(entry.agent_id) if entry.agent_id is not None else None
+    if entry.state is AgentHomeState.UNREADABLE or found is not None:
+        # A damaged home says so whatever its persona; a sound one with an unreadable
+        # persona keeps its id (#2220) and carries a code a head can word (#2241).
+        persona = None if entry.state is AgentHomeState.UNREADABLE else found
+        # The id the directory names, damaged home or not: a head keys seats by it, and a
+        # row without it could not be matched to a room that seats it (#2260). `None` only
+        # where it could not be learned (a legacy name, an empty or unreadable id file).
+        known_id = entry.agent_id
         return CloneSummary(
             name=entry.username,
-            id=None,
+            id=known_id,
             status=CloneStatus.UNREADABLE,
-            reason=_damage_reason(entry),
+            reason=_damage_reason(entry) if persona is None else persona.reason,
+            reason_code=None if persona is None else persona.reason_code,
         )
     # Seats are keyed by clone id (clone-data-scopes §4 step 3); a seat of a name that is no
     # clone is keyed by that name, which is why both are looked for.
@@ -278,6 +298,7 @@ def clone_listing(
     room_stack: RoomStack,
     *,
     unhomed: Iterable[str] = (),
+    unreadable: Mapping[str, UnreadableClone] | None = None,
 ) -> CloneListing:
     """Every installed clone, with the running ones marked as running.
 
@@ -291,6 +312,10 @@ def clone_listing(
 
     `unhomed` names clones the persona catalog holds with no folder behind them (one
     registered while the app runs). Each is a row, counted by the sentence above the list.
+
+    `unreadable` maps the id of each clone whose settings file could not be loaded to that
+    clone, whose reason its row shows (#2220); the persona store, not the disk listing,
+    knows it.
     """
     listing = list_agent_homes()
     running = _running_clone_names(session_mgr, room_stack)
@@ -298,7 +323,7 @@ def clone_listing(
         entry.agent_id for entry in listing.homes if entry.agent_id is not None
     )
 
-    clones = [_clone_from_home(entry, running) for entry in listing.homes]
+    clones = [_clone_from_home(entry, running, unreadable or {}) for entry in listing.homes]
     for name in unhomed:
         if name in on_disk:
             continue
@@ -341,9 +366,10 @@ def clone_listing(
 
 
 #: The persona side of a clone entry, as the head's persona payload writes it: a list of
-#: entries each carrying `id` and `handle`, and the fields that go beside the list (the
-#: tools an editor offers, where a save lands).
-CloneCatalog = tuple[list[dict[str, Any]], dict[str, Any]]
+#: entries each carrying `id` and `handle`, the fields that go beside the list (the tools
+#: an editor offers, where a save lands), and why each clone that could not be loaded was
+#: not, by clone id.
+CloneCatalog = tuple[list[dict[str, Any]], dict[str, Any], Mapping[str, "UnreadableClone"]]
 
 
 def merged_listing(listing: CloneListing, entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -368,6 +394,8 @@ def merged_listing(listing: CloneListing, entries: list[dict[str, Any]]) -> list
         # The row's own facts win: they are what the disk held when it was listed, and the
         # sentence above the list was written from them.
         row.update(name=clone.name, id=clone.id, status=clone.status.value, reason=clone.reason)
+        if clone.reason_code is not None:
+            row["reason_code"] = clone.reason_code
         rows.append(row)
     return rows
 
@@ -402,11 +430,17 @@ def register_clone_routes(
         # clones (clone-data-scopes §3.8), and the listing reports what it found, not what
         # its own read made.
         listing = clone_listing(session_mgr, room_stack)
-        entries, extras = catalog()
+        entries, extras, unreadable = catalog()
         unhomed = [str(entry["handle"]) for entry in entries if entry["id"] == entry["handle"]]
-        if unhomed:
-            listing = clone_listing(session_mgr, room_stack, unhomed=unhomed)
+        if unhomed or unreadable:
+            listing = clone_listing(session_mgr, room_stack, unhomed=unhomed, unreadable=unreadable)
         rows = merged_listing(listing, entries)
+        for row in rows:
+            # An unreadable row joins no persona entry, so its name a person gave it comes
+            # from the store, when that much of the file could be read (#2275).
+            found = unreadable.get(row["id"]) if row["status"] == "unreadable" else None
+            if found is not None:
+                row["display_name"] = dict(found.display_name)
         return {
             **extras,
             "status": "ok",

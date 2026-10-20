@@ -15,6 +15,7 @@ from uclone_x.core.immutable import unwrap_immutable
 from uclone_x.core.provenance import Provenance
 from uclone_x.errors import (
     LLMProviderError,
+    LLMRequestRefusedError,
     LLMTimeoutError,
     ModelLacksToolSupportError,
     UnmappableChatMessageError,
@@ -133,10 +134,14 @@ def _chat_status_failure(
     that cannot take tools gets an error of its own, worded for the person who chose the
     model, because a clone turn always sends tools and so the status and body would
     otherwise be all they see of a problem only a different model fixes. Any other status
-    keeps the diagnostic wording, which existing tests pin.
+    keeps the diagnostic wording, which existing tests pin; any other 400 is an
+    `LLMRequestRefusedError`, so a caller can tell a refused request from a failing server.
     """
     if status_code == 400 and _NO_TOOL_SUPPORT_PHRASE in body:
         return ModelLacksToolSupportError(model)
+    if status_code == 400:
+        # Refused as sent, by status alone (#2322): Ollama's words for it are not read.
+        return LLMRequestRefusedError(f"{prefix} {status_code}: {body}")
     return LLMProviderError(f"{prefix} {status_code}: {body}")
 
 

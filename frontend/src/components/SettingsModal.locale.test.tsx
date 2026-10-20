@@ -98,8 +98,11 @@ describe('Settings in the chosen language', () => {
     );
     const select = await screen.findByTestId('settings-language-select');
     expect(screen.getByText(en.settings.header.title)).toBeTruthy();
-    // The leftover check below must be able to see English at all.
-    expect(englishOnly.filter((sentence) => visibleWords(baseElement).includes(sentence)).length).toBeGreaterThan(20);
+    // The leftover check below must be able to see English at all. The window's words are
+    // read once: read inside the filter, they were rebuilt for every English sentence, which
+    // was almost all of this test's time (1.66 s of 1.72 s on a quiet machine, #2260).
+    const before = visibleWords(baseElement);
+    expect(englishOnly.filter((sentence) => before.includes(sentence)).length).toBeGreaterThan(20);
 
     fireEvent.change(select, { target: { value: 'ko' } });
 
@@ -117,9 +120,7 @@ describe('Settings in the chosen language', () => {
     const standsAlone = (sentence: string) =>
       new RegExp(`(?<![A-Za-z])${sentence.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![A-Za-z])`).test(shown);
     expect(englishOnly.filter((sentence) => shown.includes(sentence)).filter(standsAlone)).toEqual([]);
-    // Renders the whole window twice and searches it for every English sentence: under 2 s on
-    // a quiet machine, past the 5 s default under a parallel gate, where it timed out.
-  }, 20_000);
+  });
 
   it('keeps what the user typed when the language changes', async () => {
     render(
@@ -134,5 +135,5 @@ describe('Settings in the chosen language', () => {
 
     await waitFor(() => expect(screen.getByText(ko.settings.header.title)).toBeTruthy());
     expect(folder.value).toBe('~/notes');
-  }, 20_000);
+  });
 });

@@ -74,6 +74,7 @@ from uclone_x.engine.protocols import (
     SchedulerProtocol,
     TimerServiceProtocol,
 )
+from uclone_x.extensions import use_extensions
 from uclone_x.llm import (
     AnthropicConnector,
     ContextCompactor,
@@ -273,7 +274,10 @@ _web_fetch_tool: ToolProtocol = WebFetchTool()
 _web_search_tool: ToolProtocol = WebSearchTool()
 _ddg_provider: SearchProviderProtocol = DuckDuckGoSearchProvider()
 _tool_registry: ToolRegistryProtocol = ToolRegistry()
-_default_registry: ToolRegistryProtocol = create_default_registry()
+# The core's own: built at import, before the suite's extension pin, so it names the set it
+# is built with rather than read whatever the environment has installed (#2208).
+with use_extensions([]):
+    _default_registry: ToolRegistryProtocol = create_default_registry()
 _mcp: MCPClientProtocol = MCPClient(
     config=MCPConnectionConfig(
         server_name="test_mcp", command="python", workspace_root=Path("/tmp")
@@ -474,7 +478,7 @@ def test_the_real_tool_registry_and_mcp_client_satisfy_protocols() -> None:
     assert _web_fetch_tool.name == "web_fetch"
     assert _web_search_tool.name == "web_search"
     assert isinstance(_ddg_provider, SearchProviderProtocol)
-    assert len(_default_registry.list_tools()) == 26
+    assert len(_default_registry.list_tools()) == 18
 
 
 def test_the_real_llm_subsystem_satisfies_protocols_at_runtime() -> None:

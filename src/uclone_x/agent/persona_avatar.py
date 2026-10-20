@@ -16,8 +16,10 @@ from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import cast
 
 from uclone_x.agent.persona_registry import PersonaRegistry
+from uclone_x.core.agent_home import peer_handles
 from uclone_x.errors import PlainRefusalError
 from uclone_x.tools.base import replace_file
 
@@ -63,12 +65,69 @@ _SUFFIX_FOR_MIME = {
 
 _ACCEPTED = "a PNG, JPEG, WebP or GIF image"
 
+#: The tool a clone draws with, and the one it asks a peer with (`tools/builtin/a2a.py`).
+#: Names only: this module is below the tools that define them.
+DRAWING_TOOL = "generate_image"
+PEER_CALL_TOOL = "a2a_call"
+#: The builtin that draws for clones that cannot.
+ARTIST = "artist"
+
+#: What a clone with no picture at the path it gave can do next, by what it holds (#2290).
+#: None names a tool: the reader may be the person, who sees the refusal too (#2165).
+DRAW_IT_FIRST = "Draw the picture first, then use the path the drawing returned."
+ASK_ARTIST_FIRST = "Ask Artist to draw one first, then use the path Artist's answer gives."
+CANNOT_DRAW = "This clone cannot draw pictures; the person can ask Artist for one."
+#: For a caller that is no clone -- the head, setting a picture a person chose.
+_FROM_A_PATH = "Use the path of a picture that is in the workspace."
+
+
+def missing_picture_advice(agent: object) -> str:
+    """What `agent`, the clone that called, can do to get a picture, as one sentence.
+
+    Read from the running agent itself -- the tools it holds (`held_tools`, which its
+    `allowed_tools` range already narrows) and whether it may reach Artist now (#2290) --
+    never from the text of the request.
+    """
+    held = _held_tool_names(agent)
+    if DRAWING_TOOL in held:
+        return DRAW_IT_FIRST
+    if _may_ask_artist(agent, held):
+        return ASK_ARTIST_FIRST
+    return CANNOT_DRAW
+
+
+def _held_tool_names(agent: object) -> set[str]:
+    """The names of the tools `agent` holds; none for a caller that is no agent."""
+    held_tools: object = getattr(agent, "held_tools", None)
+    if not callable(held_tools):
+        return set()
+    tools: object = held_tools()
+    if not isinstance(tools, list):
+        return set()
+    return {str(getattr(tool, "name", "")) for tool in cast(list[object], tools)}
+
+
+def _may_ask_artist(agent: object, held: set[str]) -> bool:
+    """Whether `a2a_call` from `agent` would reach Artist: it holds the tool, Artist a peer.
+
+    `held_tools` already leaves `a2a_call` out for an agent with no transport -- one a peer
+    call built, which may not call another (`BaseAgent._may_call_peers`) -- so the seat,
+    not only the persona file, decides.
+    """
+    if PEER_CALL_TOOL not in held:
+        return False
+    persona = getattr(agent, "persona_definition", None)
+    peers: object = getattr(persona, "a2a_peers", ())
+    if not isinstance(peers, tuple):
+        return False
+    return ARTIST in peer_handles([str(peer) for peer in cast(tuple[object, ...], peers)])
+
 
 class AvatarRefused(PlainRefusalError):
     """A picture was not set or reset, for a reason written for a person.
 
     `reason_code` names which reason, so the head can say what to do without reading the
-    sentence: `no_clone`, `not_saved`, `too_large`, `not_an_image`, `no_file`,
+    sentence: `no_clone`, `clone_unreadable`, `not_saved`, `too_large`, `not_an_image`, `no_file`,
     `outside_workspace`, `no_source`, `stale_change`. (`no_workspace` went with the
     workspace pictures folder, 2026-09-27: a clone keeps its picture in its own directory.)
     """
@@ -190,10 +249,11 @@ class PersonaAvatarStore:
         record = self._registry.clone_record(name)
         if record is not None:
             folders.append((record.path, self._CHOSEN))
-            package = self._registry.package_dir()
             # An imported workspace edit of a builtin has no template but keeps the
-            # shipped picture of its handle, as it did before clones were stored.
+            # shipped picture of its handle, as it did before clones were stored. The
+            # builtin may ship with the package or with an extension (#2208).
             template = record.template or (name if self._registry.has_builtin(name) else None)
+            package = self._registry.shipped_dir(template) if template is not None else None
             if template is not None and package is not None:
                 folders.append((package, template))
         else:
@@ -209,6 +269,14 @@ class PersonaAvatarStore:
         folder = self._clone_dir(name)
         if folder is not None:
             return folder
+        unreadable = self._registry.unreadable_clone(name)
+        if unreadable is not None:
+            # The clone is there; it is its settings file that cannot be read (#2241).
+            raise AvatarRefused(
+                f"The clone '{unreadable.handle}' cannot keep a picture until it can be "
+                f"loaded, so no picture was set. {unreadable.reason}",
+                reason_code="clone_unreadable",
+            )
         if self._registry.get_persona(name) is None:
             raise AvatarPersonaNotFound(
                 f"There is no clone named '{name}' here, so no picture was set. "
@@ -262,16 +330,21 @@ class PersonaAvatarStore:
                     other.unlink(missing_ok=True)
             return AvatarChange(change_id=change_id, previous=replaced)
 
-    def set_from_path(self, name: str, path: Path, *, undo_of: int | None = None) -> AvatarChange:
-        """`set` with the bytes of `path`, a file the caller has already resolved safely."""
+    def set_from_path(
+        self, name: str, path: Path, *, undo_of: int | None = None, advice: str = _FROM_A_PATH
+    ) -> AvatarChange:
+        """`set` with the bytes of `path`, a file the caller has already resolved safely.
+
+        `advice` ends the refusal when there is no file at `path`: what the caller can do
+        next. A clone passes `missing_picture_advice(agent)` (#2290).
+        """
         if undo_of is not None and undo_of != self.latest_change(name):
             # Said before the file checks, so a stale undo is not reported as a missing file;
             # `set` checks again under the lock, which is what makes the refusal hold.
             raise AvatarStaleChange()
         if not path.is_file():
             raise AvatarRefused(
-                f"There is no picture at '{path.name}', so none was set. Use a path a tool "
-                "returned: draw the picture with generate_image first, or ask Artist for one.",
+                f"There is no picture at '{path.name}', so none was set. {advice}",
                 reason_code="no_file",
             )
         if path.stat().st_size > MAX_AVATAR_BYTES:

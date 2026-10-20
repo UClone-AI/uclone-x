@@ -17,9 +17,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
+import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Protocol, cast
 
 from uclone_x.agent.hooks import HookAction, HookContext, HookEvent, HookRunner
@@ -29,6 +32,7 @@ from uclone_x.agent.models import (
     PlanState,
     PlanStep,
     ToolExecutionRecord,
+    output_named_paths,
 )
 from uclone_x.agent.tool_invoker import ToolInvoker, unadvertised_tool_message
 from uclone_x.core.immutable import unwrap_immutable
@@ -36,6 +40,7 @@ from uclone_x.core.tool_results import canonical_tool_text
 from uclone_x.engine.event_bus import AgentEvent, EventType
 from uclone_x.engine.protocols import EventBusProtocol, PublisherHandleProtocol
 from uclone_x.errors import PathTraversalError
+from uclone_x.i18n.tool_refusals import tool_refusal_text
 from uclone_x.llm.models import ChatMessage, MessageRole, ToolCallRequest
 from uclone_x.tools.base import (
     tool_approval_timeout_note,
@@ -56,12 +61,46 @@ from uclone_x.tools.outcome import (
 
 __all__ = [
     "ExecutionScope",
+    "changed_output_paths",
     "PlanSession",
     "ToolCallExecutor",
     "tool_outcome_of",
 ]
 
 logger = logging.getLogger(__name__)
+
+
+def changed_output_paths(
+    output: object, workspace_root: Path | None, since: float
+) -> tuple[str, ...]:
+    """Of the `path`/`paths` an output names, those whose file changed at or after `since`.
+
+    A tool declared as writing may still only read: an MCP tool is declared so whatever
+    it does, and a lookup names the file it read. Naming a file is not making it, so a
+    name counts only when the file's content time is the call's own (#2331). Reading a
+    file changes no content time. A relative name is the workspace's, and a name with no
+    file behind it names nothing this call made. With no workspace to read a relative
+    name against, nothing can be checked and the name is kept, as before the check. A
+    copy that keeps its source's old time is missed, which reports "made nothing" rather
+    than a file never made.
+    """
+    if not isinstance(output, dict):
+        return ()
+    kept: list[str] = []
+    for name in output_named_paths(cast(dict[str, Any], output)):
+        path = Path(name)
+        if not path.is_absolute():
+            if workspace_root is None:
+                kept.append(name)
+                continue
+            path = workspace_root / path
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        if stat.st_mtime >= since:
+            kept.append(name)
+    return tuple(kept)
 
 
 def _modified_arguments(modified_payload: Mapping[str, Any] | None) -> dict[str, Any] | None:
@@ -463,7 +502,6 @@ class ToolCallExecutor:
         # and a turn should not collapse what a direct call keeps apart. This check is the
         # *only* refusal: a `ScopedToolRegistry`'s lookup finds a registered tool outside its
         # scope (#908) -- the scope governs what `list_tools` advertises, not what `get` finds.
-        allowed_names = self._config.allowed_tools
         if not self._tool_invoker.knows_tool(effective_tc.name):
             # R4 (#2190): a name no tool has. Answered before the range check, in plain
             # words with the closest tools this agent may use, so an invented name is
@@ -473,10 +511,10 @@ class ToolCallExecutor:
                 effective_tc, did_you_mean, (asyncio.get_running_loop().time() - t_start) * 1000.0
             )
         if not self._tool_invoker.in_tool_range(effective_tc.name):
-            err_msg = (
-                f"Tool '{effective_tc.name}' is not in agent "
-                f"'{self.agent_id}' allowed_tools {tuple(allowed_names)!r}"
-            )
+            # Plain words (#2196): the record reaches the person's screen, and the agent's
+            # id and permission list help neither the person nor the model's next call.
+            # English, as every tool result the model reads; heads say it from the catalog.
+            err_msg = tool_refusal_text("tool.out_of_range", "en")
             duration_ms = (asyncio.get_running_loop().time() - t_start) * 1000.0
             return (
                 ChatMessage(
@@ -548,6 +586,9 @@ class ToolCallExecutor:
                 if approved_by_person
                 else tool_ctx
             )
+            # Whole seconds: a file system that keeps whole-second times would put a file
+            # written in the call's first second before a finer start (#2331).
+            call_started = math.floor(time.time())
             try:
                 res = await tool_inst.execute(unwrapped_args, call_ctx)
                 duration_ms = (
@@ -655,6 +696,7 @@ class ToolCallExecutor:
                     # text is what the event log and the stream show.
                     images=res.images if res.success else (),
                 )
+                written = changed_output_paths(res.output, tool_ctx.workspace_root, call_started)
                 rec = ToolExecutionRecord(
                     tool_name=effective_tc.name,
                     arguments=unwrapped_args,
@@ -671,6 +713,8 @@ class ToolCallExecutor:
                     opens_story=res.success and tool_opens_story(tool_inst),
                     # What the tool says it produced; read through `produced_paths` (#2085).
                     artifacts=res.artifacts if res.success else (),
+                    # Of the paths the output names, the files this call made or changed.
+                    written_output_paths=written,
                 )
             except PathTraversalError as exc:
                 duration_ms = (asyncio.get_running_loop().time() - t_start) * 1000.0

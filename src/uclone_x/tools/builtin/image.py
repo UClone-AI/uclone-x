@@ -34,7 +34,13 @@ from pydantic import BaseModel, ConfigDict, Field
 from uclone_x.errors import LLMError, PlainRefusalError, UCloneXError
 from uclone_x.skills.models import SkillStatus
 from uclone_x.skills.protocols import SkillRegistryProtocol
-from uclone_x.tools.base import BaseTool, artifact_content_url, linked_paths, replace_file
+from uclone_x.tools.base import (
+    BaseTool,
+    artifact_content_url,
+    linked_paths,
+    replace_file,
+    session_artifacts_dir,
+)
 from uclone_x.tools.builtin.comfy_client import (
     DEFAULT_COMFYUI_BASE_URL,
     ComfyClient,
@@ -1486,8 +1492,10 @@ class ComfyUIImageEngine(BaseImageEngine):
 
 #: The picture model that picks a ready engine on its own (model-gateway §3.5).
 IMAGE_AUTO = "auto"
-#: The cloud picture model offered first, when the model registry declares no other.
-DEFAULT_IMAGE_MODEL = "gemini-2.5-flash-image"
+#: The Gemini model the cloud fallback draws with when nothing names another: under `auto`,
+#: only when no own engine (GPU worker, ComfyUI, in-process) is ready, and only on a Google
+#: connection with its own key. Not the default picture model, which is `IMAGE_AUTO` (#2295).
+GEMINI_FALLBACK_IMAGE_MODEL = "gemini-3.1-flash-image"
 #: The engine name results and sidecars carry for a picture Gemini drew.
 GEMINI_ENGINE_NAME = "gemini"
 #: How long one look at the local engines stands for, under `auto` with Gemini as the
@@ -1518,7 +1526,7 @@ class ImageEngineChoice:
     """The picture model one draw follows, as the shell resolved it (model-gateway §3.5).
 
     ``chosen`` is `auto` or a model ref (`comfyui/anillustrious_v4`,
-    `gemini/gemini-2.5-flash-image`, `remote_gpu/auto`); ``pin`` is the engine a ref names.
+    `gemini/gemini-3.1-flash-image`, `remote_gpu/auto`); ``pin`` is the engine a ref names.
     A ref that cannot be served at all (its connection gone, no key) carries ``refusal``,
     the sentence the draw is refused with: it is never replaced by another model (P6).
 
@@ -1829,7 +1837,9 @@ class GeminiImageEngine(BaseImageEngine):
     other engines record theirs, but it does not make a Gemini picture reproducible.
     """
 
-    def __init__(self, client: GeminiImageClient | None, model: str = DEFAULT_IMAGE_MODEL) -> None:
+    def __init__(
+        self, client: GeminiImageClient | None, model: str = GEMINI_FALLBACK_IMAGE_MODEL
+    ) -> None:
         self._client = client
         self._model = model
 
@@ -2008,6 +2018,13 @@ def _whose(choice: ImageEngineChoice) -> str:
     return "chosen for this clone" if choice.chosen_by == "clone" else "chosen in Settings"
 
 
+def _addressless_remote() -> RemoteCudaImageEngine:
+    """A GPU server engine with no address: never available, and blind to the environment."""
+    engine = RemoteCudaImageEngine()
+    engine.use_address(None)
+    return engine
+
+
 class ImagePipelineDispatcher:
     """Draws with the picture model in effect (model-gateway §3.5).
 
@@ -2030,7 +2047,10 @@ class ImagePipelineDispatcher:
         registry: ModelRegistry | None = None,
         engine_settings: Callable[[str | None], ImageEngineChoice] | None = None,
         pinned_comfy_engine: Callable[[str, str], BaseImageEngine] | None = None,
+        remote_engine_at: Callable[[str], BaseImageEngine] | None = None,
     ) -> None:
+        #: The GPU server engine for a head that binds no settings (the environment's
+        #: address). Under saved connections each address has its own engine, below.
         self._remote_engine = remote_engine or RemoteCudaImageEngine()
         self._comfy_engine = comfy_engine or ComfyUIImageEngine()
         self._local_engine = local_engine or LocalDiffusersImageEngine()
@@ -2044,13 +2064,19 @@ class ImagePipelineDispatcher:
         self._pinned_comfy_engine: Callable[[str, str], BaseImageEngine] = pinned_comfy_engine or (
             lambda url, checkpoint: ComfyUIImageEngine(base_url=url, checkpoint=checkpoint)
         )
+        #: Builds the engine for one GPU server address. One per address, kept: a single
+        #: engine re-pointed on each draw let one clone's draw land on another clone's
+        #: server when the two drew at once (#2179).
+        self._remote_engine_at: Callable[[str], BaseImageEngine] = remote_engine_at or (
+            lambda url: RemoteCudaImageEngine(base_url=url)
+        )
+        self._remote_engines: dict[str, BaseImageEngine] = {}
         #: The engines last looked at under `auto`, when, and whether any was ready.
         self._local_probe: tuple[tuple[object, ...], float, bool] | None = None
         #: The look a stale description started on the running loop, while it runs.
         self._local_refresh: asyncio.Task[bool] | None = None
-        #: The connection addresses last handed to the ComfyUI and remote engines.
+        #: The connection address last handed to the ComfyUI engine.
         self._comfy_saved_url: str | None = None
-        self._remote_saved_url: str | None = None
 
     @property
     def registry(self) -> ModelRegistry:
@@ -2079,10 +2105,24 @@ class ImagePipelineDispatcher:
             if choice.comfyui_base_url != self._comfy_saved_url:
                 self._comfy_saved_url = choice.comfyui_base_url
                 self._comfy_engine.use_saved_address(choice.comfyui_base_url)
-            if choice.remote_url != self._remote_saved_url:
-                self._remote_saved_url = choice.remote_url
-                self._remote_engine.use_address(choice.remote_url)
         return choice
+
+    def _remote_for(self, choice: ImageEngineChoice) -> BaseImageEngine:
+        """The GPU server engine for ``choice``'s connection address, never re-pointed.
+
+        Under saved connections the address is the choice's own: one engine per address,
+        so draws for two servers at once each keep theirs. With no saved connections, the
+        environment's engine. A connection with no address gets an engine with none,
+        which is never available; the environment's address is not consulted then.
+        """
+        if not choice.from_connections:
+            return self._remote_engine
+        url = (choice.remote_url or "").rstrip("/")
+        engine = self._remote_engines.get(url)
+        if engine is None:
+            engine = self._remote_engine_at(url) if url else _addressless_remote()
+            self._remote_engines[url] = engine
+        return engine
 
     def _local_engines(
         self, choice: ImageEngineChoice
@@ -2095,12 +2135,12 @@ class ImagePipelineDispatcher:
         if choice.pin == "gemini":
             return []
         if choice.pin == "remote_gpu":
-            return [("chosen GPU server", "remote-cuda", self._remote_engine)]
+            return [("chosen GPU server", "remote-cuda", self._remote_for(choice))]
         if choice.pin == "comfyui":
             return [("chosen ComfyUI daemon", "comfyui-local", self._comfy_engine)]
         engines: list[tuple[str, ImageEngineName, BaseImageEngine]] = []
         if not choice.from_connections or choice.remote_url:
-            engines.append(("Remote CUDA worker", "remote-cuda", self._remote_engine))
+            engines.append(("Remote CUDA worker", "remote-cuda", self._remote_for(choice)))
         if not choice.from_connections or choice.comfyui_base_url:
             engines.append(("detected local ComfyUI daemon", "comfyui-local", self._comfy_engine))
         engines.append(("in-process diffusers engine", "diffusers-sdxl", self._local_engine))
@@ -2236,7 +2276,7 @@ class ImagePipelineDispatcher:
         """The profile of the model that draws next: the cloud's, a pin's, or the local one's."""
         choice = self.engine_choice(own)
         if choice.refusal is None and self.draws_with_gemini(choice):
-            return self._cloud_profile(choice.gemini_model or DEFAULT_IMAGE_MODEL)
+            return self._cloud_profile(choice.gemini_model or GEMINI_FALLBACK_IMAGE_MODEL)
         pinned = self._pinned_profile(choice)
         if pinned is not None:
             return pinned
@@ -2273,7 +2313,8 @@ class ImagePipelineDispatcher:
     def _pin_silence(self, choice: ImageEngineChoice) -> str:
         """What did not answer, for a pinned own engine, in the person's words."""
         if choice.pin == "remote_gpu":
-            return f"your GPU server at {self._remote_engine.base_url or 'its address'} does not answer"
+            address = getattr(self._remote_for(choice), "base_url", "") or "its address"
+            return f"your GPU server at {address} does not answer"
         return (
             f"ComfyUI at {choice.comfyui_base_url or self._comfy_engine.base_url} does not answer"
         )
@@ -2305,7 +2346,7 @@ class ImagePipelineDispatcher:
         if choice.refusal is not None:
             raise ImageEngineRefusal(choice.refusal)
         if await self._draws_with_gemini_now(choice):
-            cloud_model = choice.gemini_model or DEFAULT_IMAGE_MODEL
+            cloud_model = choice.gemini_model or GEMINI_FALLBACK_IMAGE_MODEL
             profile = self._cloud_profile(cloud_model)
             # The registry's name for it, when it has one; else the id the person chose.
             registered = self._registry.resolve(cloud_model)
@@ -2410,10 +2451,9 @@ class ImagePipelineDispatcher:
         except UCloneXError as exc:
             return str(exc)
         parts: list[str] = []
-        if self._remote_engine.base_url:
-            parts.append(
-                f"Configured remote worker at '{self._remote_engine.base_url}' was unreachable."
-            )
+        remote_url = getattr(self._remote_for(choice), "base_url", "")
+        if remote_url:
+            parts.append(f"Configured remote worker at '{remote_url}' was unreachable.")
         elif choice.from_connections:
             parts.append("No GPU server connection is saved.")
         else:
@@ -2678,8 +2718,8 @@ class GenerateImageTool(BaseTool[GenerateImageParams]):
             )
 
         session_id = context.session_id or "sess_default"
-        # The session's own directory, the one the Docs & Artifacts listing reads (#1390).
-        images_dir = f"artifacts/{session_id}/images"
+        # The session's own directory (#1390); its id is checked before it names a folder.
+        images_dir = f"{session_artifacts_dir(context)}/images"
         turn_idx = getattr(context, "turn_index", 0) or 0
         if not turn_idx and getattr(context, "agent_delegate", None) is not None:
             turn_idx = getattr(context.agent_delegate, "_turn_counter", 0) or 0

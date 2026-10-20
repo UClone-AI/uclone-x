@@ -15,6 +15,7 @@ from __future__ import annotations
 import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from uclone_x.errors import UCloneXError
@@ -38,8 +39,15 @@ class ExtensionError(UCloneXError):
     """An extension could not be loaded, or what it adds conflicts with the core or another.
 
     Raised, never logged and skipped: a registry missing an extension's tools would look
-    like a working one (P6). The message names the extension and where it came from.
+    like a working one (P6). The message names the extension as it was installed, in plain
+    words; where it came from and the cause are logged (#2283).
+
+    `cause_logged` says the registry already logged the cause, with its traceback, where
+    the extension failed; one who logs the error again adds the traceback only when it is
+    False, so the cause is in the log once (#2292).
     """
+
+    cause_logged: bool = False
 
 
 def _nothing() -> tuple[()]:
@@ -98,6 +106,10 @@ class Extension:
       names (`tools.builtin.a2a.CharacterLookup`).
     * `routes` -- mounts the extension's HTTP routes on the web head. Called once, with the
       head's route context (`ui.extension_routes.ExtensionRouteContext`).
+    * `personas` -- folders of persona files (`<name>.yaml`, and its picture beside it)
+      installed as clones exactly as the core's own builtins are (#2208). A persona that
+      lists the extension's tools ships with the extension, so the core never holds a
+      persona naming a tool it does not have.
     """
 
     name: str
@@ -108,6 +120,7 @@ class Extension:
     leased_folders: Callable[[], Sequence[LeasedFolderKind]] = _nothing
     a2a_characters: Callable[[], CharacterLookup] | None = None
     routes: Callable[[Any], None] | None = None
+    personas: tuple[Path, ...] = ()
     #: Where the extension was found; set by discovery, for error messages.
     source: str = field(default="", compare=False)
 

@@ -54,7 +54,6 @@ from uclone_x.llm.connectors.mock import MockLLMConnector
 from uclone_x.llm.models import ToolCallRequest
 from uclone_x.sandbox import story_jail
 from uclone_x.sandbox.story_jail import JAIL_SERVER_REFUSAL, JAIL_SETUP_REFUSAL
-from uclone_x.story.tool import StoryLibraryTool
 from uclone_x.tools.builtin import shell
 from uclone_x.tools.builtin.character import CharacterSheetTool
 from uclone_x.tools.builtin.comfy_client import ComfyClient
@@ -76,6 +75,7 @@ from uclone_x.tools.models import (
     ToolResultStatus,
 )
 from uclone_x.tools.registry import create_default_registry
+from uclone_x_story.tool import StoryLibraryTool
 
 ROOM = "room_a"
 VANE = "codex/characters/vane.yaml"

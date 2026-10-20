@@ -15,7 +15,7 @@ import logging
 import re
 import shutil
 import socket
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, cast
@@ -242,8 +242,13 @@ _REMOTE_PROBE_PYTHON_CMD = (
 )
 
 
-async def probe_remote_host(host: str, timeout: float = 6.0) -> RemoteHostInspection:
-    """Probe an SSH host for GPU availability and active AI services."""
+async def probe_remote_host(
+    host: str, timeout: float = 6.0, *, ssh: Sequence[str] = ("ssh",)
+) -> RemoteHostInspection:
+    """Probe an SSH host for GPU availability and active AI services.
+
+    `ssh` is the ssh command to run (a script that runs the run's own ssh passes it).
+    """
     clean_host = host.strip()
     if not is_valid_host(clean_host):
         return RemoteHostInspection(
@@ -252,7 +257,7 @@ async def probe_remote_host(host: str, timeout: float = 6.0) -> RemoteHostInspec
             error=f"Invalid SSH host format: {clean_host!r}",
         )
 
-    if not shutil.which("ssh"):
+    if not shutil.which(ssh[0]):
         return RemoteHostInspection(
             host=clean_host,
             reachable=False,
@@ -260,7 +265,7 @@ async def probe_remote_host(host: str, timeout: float = 6.0) -> RemoteHostInspec
         )
 
     cmd = [
-        "ssh",
+        *ssh,
         "-o",
         "BatchMode=yes",
         "-o",
@@ -467,8 +472,13 @@ async def launch_remote_comfyui(
     host: str,
     comfy_dir: str,
     timeout: float = 12.0,
+    *,
+    ssh: Sequence[str] = ("ssh",),
 ) -> tuple[bool, str | None]:
-    """Launch ComfyUI on remote host if not running and wait for port 8188 to listen."""
+    """Launch ComfyUI on remote host if not running and wait for port 8188 to listen.
+
+    `ssh` is the ssh command to run (a script that runs the run's own ssh passes it).
+    """
     clean_host = host.strip()
     clean_dir = comfy_dir.strip() if comfy_dir else ""
     if not is_valid_host(clean_host):
@@ -481,7 +491,7 @@ async def launch_remote_comfyui(
         f"nohup $PY {clean_dir}/main.py --listen 127.0.0.1 --port 8188 </dev/null >{clean_dir}/comfy.log 2>&1 &"
     )
     cmd = [
-        "ssh",
+        *ssh,
         "-o",
         "BatchMode=yes",
         "-o",
@@ -516,7 +526,7 @@ async def launch_remote_comfyui(
         "'"
     )
     poll_cmd = [
-        "ssh",
+        *ssh,
         "-o",
         "BatchMode=yes",
         "-o",
@@ -544,7 +554,7 @@ async def launch_remote_comfyui(
 
     diag = ""
     tail_cmd = [
-        "ssh",
+        *ssh,  # the run's own ssh, as every call here (#2367 review)
         "-o",
         "BatchMode=yes",
         "-o",

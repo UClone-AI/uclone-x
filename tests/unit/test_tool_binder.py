@@ -26,6 +26,7 @@ from uclone_x.agent.models import AgentConfig, AgentContext, AgentLLMConfig, Per
 from uclone_x.agent.session import SessionStore
 from uclone_x.agent.tool_invoker import unadvertised_tool_message
 from uclone_x.core.provenance import ExecutionPath, Provenance, ServiceRef
+from uclone_x.i18n.tool_refusals import TOOL_REFUSAL_TEXT
 from uclone_x.llm.connectors.mock import MockLLMConnector
 from uclone_x.llm.models import (
     ChatMessage,
@@ -680,7 +681,8 @@ async def test_a_refusal_for_another_reason_keeps_its_own_words() -> None:
 
     (record,) = result.tool_executions
     assert ran == []
-    assert "allowed_tools" in (record.error or "")
+    assert record.error == TOOL_REFUSAL_TEXT["tool.out_of_range"]
+    assert record.error != unadvertised_tool_message("gamma_calc")
 
 
 @pytest.mark.asyncio

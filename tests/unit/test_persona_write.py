@@ -429,6 +429,7 @@ def test_editing_a_builtin_writes_an_override_and_leaves_the_shipped_file(
     )
     shipped_bytes = shipped_file.read_bytes()
     monkeypatch.setattr(persona_registry, "BUILTIN_PERSONAS_DIR", shipped)
+    monkeypatch.setattr(persona_registry, "extension_persona_dirs", tuple)
     workspace = tmp_path / "ws"
     workspace.mkdir()
     client = _client(workspace)

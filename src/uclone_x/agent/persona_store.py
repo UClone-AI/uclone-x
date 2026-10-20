@@ -95,6 +95,9 @@ class PersonaDraft(BaseModel):
     #: What a person reads as the clone's name, per locale; `name` stays the handle.
     #: A clone edit that leaves the field out keeps the name the clone has (`model_fields_set`).
     display_name: dict[str, str] = Field(default_factory=dict[str, str])
+    #: "Learn from conversations" (#1840). A clone edit that leaves it out keeps the
+    #: clone's own setting (`model_fields_set`), so an older editor cannot turn it back on.
+    learn_from_conversations: bool = True
 
     @model_validator(mode="after")
     def _models_name_their_connection(self) -> PersonaDraft:
@@ -254,6 +257,9 @@ def persona_file_contents(draft: PersonaDraft) -> dict[str, Any]:
     if draft.a2a_peers:
         # Written only when set, so a persona that calls no one keeps the file it had.
         contents["a2a_peers"] = list(draft.a2a_peers)
+    if not draft.learn_from_conversations:
+        # Written only when off, so a clone that learns keeps the file it had (#1840).
+        contents["learn_from_conversations"] = False
     return contents
 
 
@@ -609,6 +615,7 @@ class InMemoryPersonaStore:
             enable_subagent_tools=draft.enable_subagent_tools,
             a2a_peers=tuple(draft.a2a_peers),
             display_name={locale: text.strip() for locale, text in draft.display_name.items()},
+            learn_from_conversations=draft.learn_from_conversations,
         )
         if draft.append_default_prompt:
             persona = _with_default_prompt(persona)

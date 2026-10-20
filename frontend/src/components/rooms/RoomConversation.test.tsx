@@ -1726,6 +1726,26 @@ describe('RoomConversation stops and failures', () => {
     expect(screen.getByTestId('row-body-1')).toHaveTextContent('Here it is.');
   });
 
+  // Learning waited for the budget: one plain line, not a failure (#2328).
+  // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: {message.knowledge_skipped ? (
+  // Becomes: {false && message.knowledge_skipped ? (
+  it('says, under a reply, that the clone did not learn from it to keep budget for the next reply', () => {
+    renderRoom({
+      room: room({
+        transcript: [
+          message({ seq: 1, sender_id: 'scout', content: 'happy to help', knowledge_skipped: true }),
+          message({ seq: 2, sender_id: 'scout', content: 'fine' }),
+        ],
+      }),
+    });
+
+    expect(screen.getByTestId('row-knowledge-skipped-1')).toHaveTextContent(
+      /did not learn from this turn, to keep what is left of its budget for your next reply\.$/,
+    );
+    expect(screen.queryByTestId('row-knowledge-extract-failed-1')).toBeNull();
+    expect(screen.queryByTestId('row-knowledge-skipped-2')).toBeNull();
+  });
+
   // Learning from a turn failed: one plain line, never the Core's sentence or a cause (#1404).
   // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: {message.knowledge_extract_error ? (
   // Becomes: {false && message.knowledge_extract_error ? (
@@ -3295,8 +3315,8 @@ describe('RoomConversation failure copy (#1408)', () => {
       room: room({ transcript: [message(rows[name])] }),
     });
 
-  // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: : turnFailureSentence(
-  // Becomes: : ((..._args: unknown[]) => message.error)(
+  // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: turnFailureSentence(
+  // Becomes: ((..._args: unknown[]) => message.error)(
   it.each([
     'raised',
     'provider',

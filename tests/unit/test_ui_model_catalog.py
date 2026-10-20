@@ -467,6 +467,27 @@ async def test_ollama_show_answers_when_the_listing_is_silent() -> None:
 
 
 @pytest.mark.asyncio
+async def test_an_empty_capabilities_list_says_nothing_and_is_asked_again() -> None:
+    """`capabilities: []` is a silent answer, not "cannot chat" (#2179).
+
+    It hid a chat model; it now falls through to `/api/show`, as a missing field does.
+
+    Killed by: src/uclone_x/llm/model_listing.py :: if not isinstance(raw, list) or not raw:
+    Becomes: if not isinstance(raw, list):
+    """
+    flags = await _chat_flags(
+        _ollama(
+            [
+                {"name": "qwen3:14b", "capabilities": []},
+                {"name": "bge-m3:latest", "capabilities": []},
+            ],
+            show={"qwen3:14b": ["completion"], "bge-m3:latest": ["embedding"]},
+        )
+    )
+    assert flags == {"qwen3:14b": True, "bge-m3:latest": False}
+
+
+@pytest.mark.asyncio
 async def test_an_old_ollama_falls_back_to_the_family_it_reports() -> None:
     """With neither field, the listing's family decides: a BERT encoder cannot chat.
 

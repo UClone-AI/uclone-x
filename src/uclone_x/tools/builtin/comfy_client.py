@@ -17,6 +17,8 @@ import httpx
 from uclone_x.errors import ComfyUIError, ComfyUIExecutionError
 
 DEFAULT_COMFYUI_BASE_URL: str = "http://127.0.0.1:8188"
+#: Overrides the daemon address the agent tool's client talks to.
+COMFYUI_BASE_URL_ENV: str = "COMFYUI_BASE_URL"
 #: Overrides the checkpoint asked of the daemon — for the agent tool and the engine alike.
 COMFY_CHECKPOINT_ENV: str = "UCX_COMFYUI_CHECKPOINT"
 #: What the ComfyUI daemon is asked to load. It names a file in *that* daemon's model
@@ -127,7 +129,7 @@ class ComfyClient:
         raw_url = (
             base_url
             if base_url is not None
-            else os.environ.get("COMFYUI_BASE_URL", DEFAULT_COMFYUI_BASE_URL)
+            else os.environ.get(COMFYUI_BASE_URL_ENV, DEFAULT_COMFYUI_BASE_URL)
         )
         self.base_url: str = raw_url.rstrip("/")
         self.timeout: float = timeout

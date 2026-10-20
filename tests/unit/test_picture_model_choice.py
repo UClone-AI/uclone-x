@@ -11,6 +11,7 @@ Nothing here reaches the network: every daemon and listing is a fake or a MockTr
 
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import replace as dataclass_replace
 from pathlib import Path
@@ -160,9 +161,9 @@ def test_auto_finds_a_google_key_on_a_differently_named_row_whatever_the_chat_mo
 
     assert isinstance(choice.gemini, GeminiConnector)
     assert choice.gemini.api_key == "work-key"
-    assert (choice.gemini_connection, choice.gemini_model) == ("work", "gemini-2.5-flash-image")
+    assert (choice.gemini_connection, choice.gemini_model) == ("work", "gemini-3.1-flash-image")
 
-    pinned = image_engine_choice(path, "work/gemini-2.5-flash-image")
+    pinned = image_engine_choice(path, "work/gemini-3.1-flash-image")
     assert isinstance(pinned.gemini, GeminiConnector)
     assert pinned.gemini.api_key == "work-key"
 
@@ -556,7 +557,7 @@ async def test_the_picture_set_lists_each_engines_models_from_its_own_listing(
     monkeypatch.setattr(RemoteCudaImageEngine, "is_available", AsyncMock(return_value=True))
 
     async def catalog(kind: str, **_kw: Any) -> CatalogResult:
-        entries = (CatalogEntry(id="gemini-2.5-flash-image"), CatalogEntry(id="gemini-3-pro"))
+        entries = (CatalogEntry(id="gemini-3.1-flash-image"), CatalogEntry(id="gemini-3-pro"))
         return CatalogResult(provider=kind, status="live", entries=entries)
 
     monkeypatch.setattr(gateway_module, "read_provider_catalog", catalog)
@@ -576,7 +577,7 @@ async def test_the_picture_set_lists_each_engines_models_from_its_own_listing(
     assert [(g.connection_id, [m.ref for m in g.models]) for g in pictures.groups] == [
         ("comfyui", ["comfyui/anillustrious_v4"]),
         ("remote_gpu", ["remote_gpu/auto"]),
-        ("gemini", ["gemini/gemini-2.5-flash-image"]),
+        ("gemini", ["gemini/gemini-3.1-flash-image"]),
     ]
     chat = await gateway.model_set("chat")
     assert {g.connection_id for g in chat.groups} == {"gemini", "openai"}
@@ -762,3 +763,55 @@ def test_the_status_offers_a_comfyui_found_here_only_while_none_is_connected(
     # Detected is not used: nothing draws there until the person adds it.
     assert bare.comfy_url is None and bare.comfy_alive is False
     assert media_status_payload(connected)["detected_comfyui"] is None
+
+
+@pytest.mark.asyncio
+async def test_two_clones_pinned_to_two_gpu_servers_each_draw_on_their_own(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two GPU server pins drawing at once each draw at their own address (#2179).
+
+    One engine served every GPU server pin and was re-pointed on each draw, so a draw that
+    was waiting while another clone's draw began drew on the other clone's server.
+
+    Killed by: src/uclone_x/tools/builtin/image.py :: return [("chosen GPU server", "remote-cuda", self._remote_for(choice))]
+    Becomes: return [("chosen GPU server", "remote-cuda", self._remote_engine)]
+    """
+    arrived: list[str] = []
+    both_in = asyncio.Event()
+    drew_at: list[str] = []
+
+    async def is_available(self: RemoteCudaImageEngine) -> bool:
+        arrived.append(self.base_url)
+        if len(arrived) == 1:
+            await both_in.wait()
+        else:
+            both_in.set()
+        return True
+
+    async def generate(self: RemoteCudaImageEngine, *args: Any, **kwargs: Any) -> Any:
+        drew_at.append(self.base_url)
+        return _result("remote-cuda")
+
+    monkeypatch.setattr(RemoteCudaImageEngine, "is_available", is_available)
+    monkeypatch.setattr(RemoteCudaImageEngine, "generate", generate)
+    servers = {"gpu_a/auto": "http://10.0.0.5:9000", "gpu_b/auto": "http://10.0.0.6:9000"}
+
+    def settings(own: str | None) -> ImageEngineChoice:
+        assert own is not None
+        return ImageEngineChoice(
+            chosen=own,
+            chosen_by="clone",
+            pin="remote_gpu",
+            from_connections=True,
+            remote_url=servers[own],
+        )
+
+    _, comfy, local = _engines()
+    dispatcher = ImagePipelineDispatcher(
+        comfy_engine=comfy, local_engine=local, engine_settings=settings
+    )
+
+    await asyncio.gather(_draw(dispatcher, "gpu_a/auto"), _draw(dispatcher, "gpu_b/auto"))
+
+    assert sorted(drew_at) == sorted(servers.values()), drew_at

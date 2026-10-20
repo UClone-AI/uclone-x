@@ -34,6 +34,7 @@ import { DiagnosticsSection } from './settings/DiagnosticsSection';
 import { UsageSection } from './settings/UsageSection';
 import { LinksSection } from './settings/LinksSection';
 import { BrowserSection } from './settings/BrowserSection';
+import type { SignInPrefill } from './settings/BrowserSignIns';
 import { UsageOffer } from './settings/UsageOffer';
 import type { UsageReport } from '../lib/usage';
 import { fetchPersonaCatalog, savePersona } from '../lib/personasApi';
@@ -95,6 +96,8 @@ interface SettingsModalProps {
   onDeveloperModeChange: (on: boolean) => void;
   /** The tab to show when the modal opens, e.g. `'usage'` from the room's usage banner. */
   initialTab?: SettingsTabId;
+  /** The dock's Save offer: Settings ▸ Browser opens the Saved sign-ins form on this site. */
+  browserSignInPrefill?: SignInPrefill | null;
 }
 
 export const SettingsModal: React.FC<SettingsModalProps> = ({
@@ -104,6 +107,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   developerMode,
   onDeveloperModeChange,
   initialTab,
+  browserSignInPrefill = null,
 }) => {
   const copy = useCopy();
   const t = copy.settings;
@@ -138,7 +142,25 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   // server re-checks every entry and refuses the list when one has gone missing, so it is
   // never sent with another field that such a refusal would take down with it.
   const [readRoots, setReadRoots] = useState<string[]>([]);
+  // Whether `readRoots` is the saved list. Set only by this opening's settings read: a save
+  // sends the whole list, so one made before then would replace the saved folders (#2260),
+  // and the model-list re-read after a GPU connect does not read them (#2282).
+  const [rootsLoaded, setRootsLoaded] = useState(false);
+  const [rootsLoadFailed, setRootsLoadFailed] = useState(false);
   const [newReadRoot, setNewReadRoot] = useState<string>('');
+  // Reset while rendering the opening itself, not in an effect: the window stays mounted
+  // while closed, and an effect runs only after the reopened window is committed, so its
+  // first frame drew the last opening's folders and their Remove buttons (#2292). React
+  // re-renders before committing when state is set during render. The field is cleared at
+  // the same moment, as the window opens, not when the settings arrive (#2252).
+  const [openSeen, setOpenSeen] = useState(isOpen);
+  if (openSeen !== isOpen) {
+    setOpenSeen(isOpen);
+    if (isOpen) {
+      setRootsLoaded(false); // the last opening's folders are not drawn
+      setNewReadRoot(''); // the field starts empty each time the window opens
+    }
+  }
   const [feedbackMessage, setFeedbackMessage] = useState<{
     type: 'success' | 'error';
     text: string;
@@ -187,13 +209,14 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 
   const fetchCurrentSettings = useCallback(async () => {
     setFeedbackMessage(null);
+    setRootsLoadFailed(false);
     try {
       const res = await fetch('/api/settings');
       if (!res.ok) throw await failureOf(res);
       const data: RuntimeSettings = await res.json();
       setCurrentSettings(data);
       setReadRoots(data.read_roots ?? []);
-      setNewReadRoot('');
+      setRootsLoaded(true);
 
       try {
         const gpuRes = await fetch('/api/settings/remote-gpu/status');
@@ -223,14 +246,14 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       }
     } catch (err) {
       console.error('Failed to load settings:', err);
+      setRootsLoadFailed(true);
       setFeedbackMessage({ type: 'error', text: plainFailure(err, copyRef.current.settings.failure.load) });
     }
   }, [connectionsChangedHere]);
 
   useEffect(() => {
-    if (isOpen) {
-      fetchCurrentSettings();
-    }
+    // `rootsLoaded` and the field were reset as this opening rendered (`openSeen`, above).
+    if (isOpen) fetchCurrentSettings();
   }, [isOpen, fetchCurrentSettings]);
 
   useEffect(() => {
@@ -285,7 +308,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 
   const handleAddReadRoot = () => {
     const root = newReadRoot.trim();
-    if (!root) return;
+    // A save sends the whole list, so one made before the saved folders load would replace
+    // them with this one alone (#2260). The typed folder stays in the field until then.
+    if (!root || !rootsLoaded) return;
     setNewReadRoot('');
     if (readRoots.includes(root)) return;
     const next = [...readRoots, root];
@@ -294,6 +319,11 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   };
 
   const handleRemoveReadRoot = (root: string) => {
+    // A save still on its way when the window closed can refill `readRoots` (its answer, or
+    // the restore of a refused one), so a list can exist before this opening's read lands; a
+    // Remove then would send it whole over the saved folders (#2287). The list is not drawn
+    // until then either; this is the second line behind that.
+    if (!rootsLoaded) return;
     const next = readRoots.filter((r) => r !== root);
     setReadRoots(next);
     readRootsSave.commit(next);
@@ -807,7 +837,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 <p className="text-[11px] text-slate-500">
                   {t.folders.othersHint}
                 </p>
-                {readRoots.length > 0 ? (
+                {/* Only this opening's read may draw the list: a late save's answer or restore
+                    also fills `readRoots`, and would otherwise hide the not-loaded notice (#2287). */}
+                {rootsLoaded && readRoots.length > 0 ? (
                   <ul className="space-y-1" aria-label={t.folders.listLabel}>
                     {readRoots.map((root) => (
                       <li
@@ -834,11 +866,24 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                       </li>
                     ))}
                   </ul>
-                ) : (
+                ) : rootsLoadFailed ? (
+                  // Not "no folders": they could not be read, and are unknown until they are.
+                  <div className="flex items-center gap-2" data-testid="settings-read-roots-not-loaded">
+                    <p className="text-[11px] text-amber-300">{t.folders.notLoaded}</p>
+                    <Button
+                      variant="bordered"
+                      data-testid="settings-read-roots-retry"
+                      onClick={() => void fetchCurrentSettings()}
+                      className="px-2 py-1 rounded-lg text-[11px] shrink-0"
+                    >
+                      {t.folders.retry}
+                    </Button>
+                  </div>
+                ) : rootsLoaded ? (
                   <p className="text-[11px] text-slate-400" data-testid="settings-read-roots-empty">
                     {t.folders.empty}
                   </p>
-                )}
+                ) : null}
                 {envReadRoots.length > 0 && (
                   <div data-testid="settings-read-roots-env">
                     <p className="text-[11px] text-slate-500">
@@ -876,7 +921,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   <Button
                     variant="bordered"
                     onClick={handleAddReadRoot}
-                    disabled={!newReadRoot.trim()}
+                    disabled={!newReadRoot.trim() || !rootsLoaded}
                     className="px-3 py-2 rounded-xl bg-slate-800/80 border-slate-700/80 text-slate-200 hover:text-slate-200 shrink-0"
                   >
                     <Plus className="w-3.5 h-3.5 text-cyan-400" />
@@ -938,7 +983,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           {activeTab === 'all' && <hr className="border-slate-800/80" />}
 
           {/* Section 5c: Browser -- connect your Chrome (browser-agent.md §3.6) */}
-          {(activeTab === 'all' || activeTab === 'browser') && <BrowserSection />}
+          {(activeTab === 'all' || activeTab === 'browser') && <BrowserSection signInPrefill={browserSignInPrefill} />}
 
           {activeTab === 'all' && <hr className="border-slate-800/80" />}
 

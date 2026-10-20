@@ -22,6 +22,7 @@ import logging
 
 import httpx
 
+from uclone_x.core.secrets import redact_credentials
 from uclone_x.errors import (
     ModelNotAvailableError,
     ProviderAuthError,
@@ -38,8 +39,9 @@ __all__ = ["failed_request", "failed_status", "unusable_response"]
 logger = logging.getLogger(__name__)
 
 #: The level the raw response is logged at. Below WARNING, because Python's fallback handler
-#: prints WARNING and above to stderr when no head has configured logging -- and none does --
-#: which would put the status and body on the user's terminal (#1630 review).
+#: prints WARNING and above to stderr where logging is not configured, which would put the
+#: status and body on the user's terminal (#1630 review). The dashboard server writes
+#: `uclone_x` INFO records to `ucx.log` (`logging_setup.server_log_config`, #2227).
 _RAW_RESPONSE_LOG_LEVEL = logging.INFO
 
 #: How much of a response body the log keeps. An HTML error page from a proxy can be long,
@@ -101,7 +103,16 @@ def failed_status(
         return ProviderQuotaError(provider=provider, model=model)
     if status_code >= 500 or "overloaded" in text:
         return ProviderOutageError(provider=provider, model=model)
-    return ProviderResponseError(provider=provider, model=model)
+    return _answered(ProviderResponseError(provider=provider, model=model), status_code, body)
+
+
+def _answered(error: ProviderFailureError, status_code: int, body: str) -> ProviderFailureError:
+    """`error` with what the provider answered, capped and with credentials redacted (#2227):
+    an error no rule here places is debugged from Google's own words, and they were kept
+    nowhere but an INFO line no head wrote down."""
+    error.status_code = status_code
+    error.body_excerpt = redact_credentials(body[:_LOGGED_BODY_CHARS])
+    return error
 
 
 def failed_request(*, provider: str, model: str, exc: httpx.RequestError) -> ProviderFailureError:

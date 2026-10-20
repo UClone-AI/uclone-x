@@ -21,6 +21,7 @@ import rail from '../locales/ko/rail.json';
 import time from '../locales/ko/time.json';
 import toolSteps from '../locales/ko/toolSteps.json';
 import usage from '../locales/ko/usage.json';
+import turnDetail from '../locales/ko/turnDetail.json';
 import avatar from '../locales/ko/avatar.json';
 import imageCard from '../locales/ko/imageCard.json';
 import links from '../locales/ko/links.json';
@@ -45,6 +46,7 @@ export const ko: Messages = {
   cloneProfile,
   notices,
   usage,
+  turnDetail,
   avatar,
   imageCard,
   links,

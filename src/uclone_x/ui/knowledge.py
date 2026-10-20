@@ -11,6 +11,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
+from uclone_x.knowledge.fold import fold, relation_key
 from uclone_x.memory.models import MemoryFact
 from uclone_x.ontology.models import OntologyAxiom
 from uclone_x.ontology.reasoner import worked_out
@@ -200,8 +201,59 @@ def _statement(subject: str, relation: str, obj: str) -> str:
     return f"{subject} {relation.replace('_', ' ').strip()} {obj}"
 
 
+def _relations_to_ask(
+    facts: Sequence[MemoryFact],
+    superseded: Sequence[MemoryFact],
+    functional: frozenset[str],
+    several: frozenset[str],
+) -> set[str]:
+    """The relations to ask a person about: values a person's words replaced (#2332).
+
+    A relation not declared functional, where a fact the person told replaced another value
+    under the same subject and relation. Asked on every read until it is answered: ignoring
+    the question saves nothing. Answered "several values" (`several`), it is never asked
+    again.
+    """
+    replaced = {
+        fact.fact_id: (fold(fact.subject), relation_key(fact.predicate)) for fact in superseded
+    }
+    ask: set[str] = set()
+    for fact in facts:
+        key = relation_key(fact.predicate)
+        if key in several:
+            continue
+        if fact.origin != "told" or key in functional or fact.contradicts_fact_id is None:
+            continue
+        if replaced.get(fact.contradicts_fact_id) == (fold(fact.subject), key):
+            ask.add(key)
+    return ask
+
+
+def _quote(fact: MemoryFact) -> str | None:
+    """The words the fact was learned from, as the learner kept them; `None` when it did not."""
+    quote = fact.metadata.get("quote")
+    return quote.strip() if isinstance(quote, str) and quote.strip() else None
+
+
+def _merged_from(fact: MemoryFact) -> str | None:
+    """The near-matching subject name this fact was merged from (uGraph §6 Q2), or `None`."""
+    raw = fact.metadata.get("merged_from")
+    if not isinstance(raw, str):
+        return None
+    cleaned = raw.strip()
+    if not cleaned or fold(cleaned) == fold(fact.subject):
+        return None
+    return cleaned
+
+
 def known_facts(
-    facts: Sequence[MemoryFact], room_id: str, session_id: str | None
+    facts: Sequence[MemoryFact],
+    room_id: str,
+    session_id: str | None,
+    *,
+    functional: frozenset[str] = frozenset(),
+    superseded: Sequence[MemoryFact] = (),
+    several: frozenset[str] = frozenset(),
 ) -> list[dict[str, Any]]:
     """A clone's facts as plain statements, one clone-wide list (clone-knowledge-graph §3.8).
 
@@ -211,8 +263,20 @@ def known_facts(
     conversation, which is how such a fact was marked before.
 
     The field names are the store's own (`predicate`, `object_value`), not the design's
-    earlier `relation` / `value`.
+    earlier `relation` / `value`. `relation` is the predicate as the clone files it, the
+    key its rules declare functional by; `functional` says whether they do, and
+    `ask_functional` whether Remembers asks the person (#2332).
+
+    For its history (#2332): `quote`, the words it was learned from when the learner kept
+    them, and `replaced`, the values it replaced, oldest first, each one a person can
+    restore. `merged_from` names the shorter near-matching subject it was merged from
+    (uGraph §6 Q2), so Remembers can show the merge and let a person split it back.
     """
+    ask = _relations_to_ask(facts, superseded, functional, several)
+    replaced_by: dict[str, list[MemoryFact]] = {}
+    for old in superseded:
+        if old.superseded_by is not None:
+            replaced_by.setdefault(old.superseded_by, []).append(old)
     listed: list[dict[str, Any]] = []
     for fact in facts:
         if fact.source_room_id is not None:
@@ -231,6 +295,16 @@ def known_facts(
                 "source_turn_id": fact.source_turn_id,
                 "confidence": fact.confidence,
                 "created_at": fact.created_at,
+                "last_seen_at": fact.updated_at,
+                "relation": relation_key(fact.predicate),
+                "functional": relation_key(fact.predicate) in functional,
+                "ask_functional": relation_key(fact.predicate) in ask,
+                "quote": _quote(fact),
+                "merged_from": _merged_from(fact),
+                "replaced": [
+                    {"fact_id": old.fact_id, "value": old.object_value, "said_at": old.created_at}
+                    for old in replaced_by.get(fact.fact_id, [])
+                ],
             }
         )
     return listed

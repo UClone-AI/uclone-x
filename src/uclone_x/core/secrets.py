@@ -278,6 +278,11 @@ _CREDENTIAL_VALUE_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
         re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9_]{30,}|github_pat_[A-Za-z0-9_]{22,})\b"),
         REDACTED_PLACEHOLDER,
     ),
+    # 3b. Google API keys (Gemini, #2227): "AIza" and 35 more characters
+    (
+        re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b"),
+        REDACTED_PLACEHOLDER,
+    ),
     # 4. AWS Access Key IDs
     (
         re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
@@ -300,11 +305,21 @@ _CREDENTIAL_VALUE_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
         re.compile(r"\bxox[baprs]-[A-Za-z0-9\-]{10,}\b"),
         REDACTED_PLACEHOLDER,
     ),
-    # 8. Explicit generic secret assignments
+    # 8. Explicit generic secret assignments. A value under 16 characters (`?token=abc123`)
+    # stays visible: it cannot be told from an ordinary query value. Accepted in review
+    # (#2331); revisit if a real short credential turns up.
     (
         re.compile(
             r"(?i)\b((?:api[_-]?key|access[_-]?token|auth[_-]?token|secret[_-]?key|client[_-]?secret|token)\s*[:=]\s*['\"]?)([A-Za-z0-9_\-\.~+/]{16,})(['\"]?)"
         ),
+        r"\1" + REDACTED_PLACEHOLDER + r"\3",
+    ),
+    # 9. A password in a URL's userinfo (`scheme://user:pass@host`); the user and host stay.
+    # The user may be empty (`redis://:pass@host`), and the password runs to the *last* `@`
+    # before the host, so a raw `@` in it is not left half shown (#2327). A raw `/` or a
+    # space in a password ends it early; both must be percent-encoded in a URL anyway.
+    (
+        re.compile(r"(?i)\b([a-z][a-z0-9+.\-]*://[^/\s:@]*:)([^\s/]+)(@)"),
         r"\1" + REDACTED_PLACEHOLDER + r"\3",
     ),
 )

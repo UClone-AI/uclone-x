@@ -76,6 +76,22 @@ export const providerFailureSentence = (
 };
 
 /**
+ * The sentence for a turn that refused a step because its tools' results did not fit the
+ * model's window (#2264), or that ended with nothing to show or thinking past its budget
+ * (#2264, #2202), from the Core's `step_refusal` code alone, or `null` for a code
+ * this head has no sentence for. Never the row's `error`, which is the Core's English.
+ */
+export const stepRefusalSentence = (
+  label: string,
+  code: string | null | undefined,
+  copy: OutcomeCopy = ENGLISH,
+): string | null => {
+  if (!code) return null;
+  const cause = (copy.stepCause as Partial<Record<string, string>>)[code];
+  return cause ? fmt(copy.stepFailed, { label, cause }) : null;
+};
+
+/**
  * What a failed turn's row says happened (#1408).
  *
  * Never the row's `error` field: the Core writes it as `"<ExceptionClass>: <message>"`

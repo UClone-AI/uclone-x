@@ -2,7 +2,12 @@ import React, { useEffect, useMemo, useState } from 'react';
 import { BookOpen, Lightbulb, MoreHorizontal } from 'lucide-react';
 import {
   editMemoryFact,
+  markRelationSeveral,
+  notifyMemoryChanged,
   onMemoryChanged,
+  restoreMemoryFact,
+  setRelationFunctional,
+  unmergeSubject,
   roomDockUrls,
   useRoomRead,
   type KnownFact,
@@ -67,13 +72,26 @@ interface FactRowProps {
   name: string;
   t: Copy;
   onChanged: () => void;
+  /** This fact's value is the one said last of several under its relation (#2328). */
+  saidLast?: boolean;
+  /** A value could not be brought back because it changed meanwhile (#2344). */
+  onStale: (value: string | null) => void;
 }
 
 /** One fact: its sentence, how it was learned, and the `⋯` that corrects or forgets it. */
-const FactRow: React.FC<FactRowProps> = ({ fact, seatId, name, t, onChanged }) => {
+const FactRow: React.FC<FactRowProps> = ({
+  fact,
+  seatId,
+  name,
+  t,
+  onChanged,
+  saidLast,
+  onStale,
+}) => {
   const [editing, setEditing] = useState<Editing | null>(null);
   const [working, setWorking] = useState(false);
   const [refusal, setRefusal] = useState<string | null>(null);
+  const [showHistory, setShowHistory] = useState(false);
 
   const close = () => {
     setEditing(null);
@@ -91,6 +109,7 @@ const FactRow: React.FC<FactRowProps> = ({ fact, seatId, name, t, onChanged }) =
     setWorking(false);
     if (outcome.ok) {
       setEditing(null);
+      onStale(null);
       onChanged();
     } else {
       setRefusal(editRefusedSentence(outcome.status, name, t));
@@ -104,9 +123,23 @@ const FactRow: React.FC<FactRowProps> = ({ fact, seatId, name, t, onChanged }) =
     >
       <div className="flex items-start gap-2">
         <span className="flex-1 min-w-0 break-words">{fact.statement}</span>
+        {saidLast && (
+          <span data-testid="fact-said-last" className="shrink-0 text-[10px] text-cyan-300">
+            {t.saidLast}
+          </span>
+        )}
         <span data-testid="fact-origin" className="shrink-0 text-[10px] text-slate-400">
           {t.origin[fact.origin] ?? fact.origin}
         </span>
+        <button
+          type="button"
+          data-testid="fact-history-toggle"
+          aria-expanded={showHistory}
+          onClick={() => setShowHistory((open) => !open)}
+          className="shrink-0 text-[10px] text-slate-400 underline hover:text-slate-200"
+        >
+          {showHistory ? t.historyHide : t.history}
+        </button>
         <button
           type="button"
           data-testid="fact-actions"
@@ -119,6 +152,37 @@ const FactRow: React.FC<FactRowProps> = ({ fact, seatId, name, t, onChanged }) =
           <MoreHorizontal className="w-3.5 h-3.5" />
         </button>
       </div>
+
+      {fact.merged_from && (
+        <div
+          data-testid="fact-merged-from"
+          className="flex flex-wrap items-center gap-2 text-[11px] text-slate-400"
+        >
+          <span className="flex-1 min-w-0">{fmt(t.mergedFrom, { name: fact.merged_from })}</span>
+          <button
+            type="button"
+            data-testid="fact-unmerge"
+            disabled={working}
+            onClick={async () => {
+              const source = fact.merged_from;
+              if (!source) return;
+              setWorking(true);
+              setRefusal(null);
+              const outcome = await unmergeSubject(seatId, source);
+              setWorking(false);
+              if (outcome.ok) {
+                onStale(null);
+                onChanged();
+              } else {
+                setRefusal(editRefusedSentence(outcome.status, name, t));
+              }
+            }}
+            className="px-2 py-0.5 rounded-lg bg-slate-800 text-slate-200 hover:bg-slate-700 disabled:opacity-50"
+          >
+            {working ? t.working : t.keepSeparate}
+          </button>
+        </div>
+      )}
 
       {editing?.kind === 'menu' && (
         <div className="flex gap-2">
@@ -138,6 +202,7 @@ const FactRow: React.FC<FactRowProps> = ({ fact, seatId, name, t, onChanged }) =
           >
             {t.forget}
           </button>
+          <OneValueToggle fact={fact} seatId={seatId} t={t} testId="fact-one-value" />
         </div>
       )}
 
@@ -204,6 +269,10 @@ const FactRow: React.FC<FactRowProps> = ({ fact, seatId, name, t, onChanged }) =
         </div>
       )}
 
+      {showHistory && (
+        <FactHistory fact={fact} seatId={seatId} name={name} t={t} onStale={onStale} />
+      )}
+
       {refusal && (
         <p data-testid="fact-edit-refusal" role="alert" className="text-[11px] text-amber-300">
           {refusal}
@@ -211,6 +280,237 @@ const FactRow: React.FC<FactRowProps> = ({ fact, seatId, name, t, onChanged }) =
       )}
     </li>
   );
+};
+
+/** The day of an ISO time, as the reader's locale writes it; empty when there is none. */
+const day = (iso: string | null): string => (iso ? new Date(iso).toLocaleDateString() : '');
+
+interface FactHistoryProps {
+  fact: KnownFact;
+  seatId: string;
+  name: string;
+  t: Copy;
+  onStale: (value: string | null) => void;
+}
+
+/**
+ * Where a fact came from and what it replaced (#2332): the words it was learned from, when
+ * it was learned and last heard, and each earlier value it replaced, which a person can
+ * bring back. Bringing one back saves it as a correction, so the clone learns over it no more.
+ */
+const FactHistory: React.FC<FactHistoryProps> = ({ fact, seatId, name, t, onStale }) => {
+  const [working, setWorking] = useState<string | null>(null);
+  const [refused, setRefused] = useState(false);
+  return (
+    <div data-testid="fact-history" className="pl-1 space-y-1 text-[11px] text-slate-400">
+      {fact.quote && <p data-testid="fact-history-quote">{fmt(t.historyQuote, { quote: fact.quote })}</p>}
+      <p>
+        {fmt(t.historyLearned, { when: day(fact.created_at) })}
+        {fact.last_seen_at && fact.last_seen_at !== fact.created_at && (
+          <> · {fmt(t.historyLastSeen, { when: day(fact.last_seen_at) })}</>
+        )}
+      </p>
+      {fact.replaced.length === 0 ? (
+        <p data-testid="fact-history-none">{t.historyNothingReplaced}</p>
+      ) : (
+        <ul className="space-y-1">
+          {fact.replaced.map((old) => (
+            <li key={old.fact_id} data-testid="fact-history-replaced" className="flex items-center gap-2">
+              <span className="flex-1 min-w-0">
+                {fmt(t.historyReplaced, { value: old.value, when: day(old.said_at) })}
+              </span>
+              <button
+                type="button"
+                data-testid="fact-restore"
+                disabled={working !== null}
+                onClick={async () => {
+                  setWorking(old.fact_id);
+                  setRefused(false);
+                  const outcome = await restoreMemoryFact(seatId, old.fact_id);
+                  setWorking(null);
+                  // On success every open Remembers reads again (`restoreMemoryFact`).
+                  if (outcome.ok) onStale(null);
+                  if (!outcome.ok) setRefused(true);
+                  // 409: what replaced it changed meanwhile, so this list is stale. Read it
+                  // again, so no row or Bring back that no longer holds stays (#2338).
+                  if (!outcome.ok && outcome.status === 409) {
+                    // The re-read can take this row away with its notice, so the panel keeps
+                    // one of its own (#2344).
+                    onStale(old.value);
+                    notifyMemoryChanged();
+                  }
+                }}
+                className="px-2 py-0.5 rounded-lg bg-slate-800 text-slate-200 hover:bg-slate-700 disabled:opacity-50"
+              >
+                {working === old.fact_id ? t.working : t.restore}
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+      {refused && (
+        <p role="alert" data-testid="fact-restore-refusal" className="text-amber-300">
+          {fmt(t.restoreFailed, { name })}
+        </p>
+      )}
+    </div>
+  );
+};
+
+/** A relation as a person reads it: `lives_in` is "lives in". */
+const spoken = (relation: string): string => relation.replace(/_/g, ' ').trim();
+
+interface OneValueToggleProps {
+  fact: KnownFact;
+  seatId: string;
+  t: Copy;
+  testId: string;
+}
+
+/**
+ * Whether the fact's relation holds one value at a time, as a checkbox (#2332). Saved in the
+ * clone's rules; on success every open Remembers reads again, which is what moves the box.
+ */
+const OneValueToggle: React.FC<OneValueToggleProps> = ({ fact, seatId, t, testId }) => {
+  const [working, setWorking] = useState(false);
+  const [failed, setFailed] = useState(false);
+  return (
+    <label className="inline-flex items-center gap-1.5 text-[11px] text-slate-300">
+      <input
+        type="checkbox"
+        data-testid={testId}
+        checked={fact.functional}
+        disabled={working}
+        onChange={async (e) => {
+          setWorking(true);
+          setFailed(false);
+          const outcome = await setRelationFunctional(seatId, fact.relation, e.target.checked);
+          setWorking(false);
+          setFailed(!outcome.ok);
+        }}
+      />
+      {t.oneValue}
+      {failed && (
+        <span role="alert" data-testid="one-value-refusal" className="text-amber-300">
+          {t.oneValueFailed}
+        </span>
+      )}
+    </label>
+  );
+};
+
+interface RelationGroupProps {
+  facts: KnownFact[];
+  seatId: string;
+  name: string;
+  t: Copy;
+  onChanged: () => void;
+  onStale: (value: string | null) => void;
+}
+
+/**
+ * The current values of one subject's relation, together (#2328, #2332). The value said last
+ * is marked, as recall marks it. The header holds the one-value-at-a-time box, and, when a
+ * person's words replaced a value of it and nobody has answered yet, the question; ignoring
+ * it saves nothing.
+ */
+const RelationGroup: React.FC<RelationGroupProps> = ({
+  facts,
+  seatId,
+  name,
+  t,
+  onChanged,
+  onStale,
+}) => {
+  const [first] = facts;
+  // The relation's answers are the same on each of its facts; any one asking is the group's.
+  const asks = facts.some((f) => f.ask_functional);
+  const [asking, setAsking] = useState(false);
+  const [failed, setFailed] = useState(false);
+  const latest = facts.reduce((a, b) =>
+    (b.last_seen_at ?? '') > (a.last_seen_at ?? '') ? b : a,
+  );
+  return (
+    <li data-testid="relation-group" className="space-y-1.5">
+      <div className="flex flex-wrap items-center gap-2 px-1">
+        <span className="text-[11px] text-slate-400">
+          {first.subject} · {spoken(first.relation)}
+        </span>
+        <OneValueToggle fact={first} seatId={seatId} t={t} testId="relation-one-value" />
+      </div>
+      {asks && (
+        <div
+          data-testid="relation-ask"
+          className="flex flex-wrap items-center gap-2 px-3 py-2 rounded-xl bg-cyan-950/40 border border-cyan-900 text-[11px] text-slate-200"
+        >
+          <span className="flex-1 min-w-0">
+            {fmt(t.askOneValue, { relation: spoken(first.relation) })}
+          </span>
+          <button
+            type="button"
+            data-testid="relation-ask-yes"
+            disabled={asking}
+            onClick={async () => {
+              setAsking(true);
+              setFailed(false);
+              const outcome = await setRelationFunctional(seatId, first.relation, true);
+              setAsking(false);
+              setFailed(!outcome.ok);
+            }}
+            className="px-2 py-1 rounded-lg bg-cyan-700 text-white disabled:opacity-50"
+          >
+            {asking ? t.working : t.askYes}
+          </button>
+          <button
+            type="button"
+            data-testid="relation-ask-no"
+            disabled={asking}
+            onClick={async () => {
+              setAsking(true);
+              setFailed(false);
+              const outcome = await markRelationSeveral(seatId, first.relation);
+              setAsking(false);
+              setFailed(!outcome.ok);
+            }}
+            className="px-2 py-1 rounded-lg bg-slate-800 text-slate-200 disabled:opacity-50"
+          >
+            {t.askNo}
+          </button>
+          {failed && (
+            <span role="alert" data-testid="relation-ask-refusal" className="text-amber-300">
+              {t.oneValueFailed}
+            </span>
+          )}
+        </div>
+      )}
+      <ul className="space-y-1.5">
+        {facts.map((f) => (
+          <FactRow
+            key={f.fact_id}
+            fact={f}
+            seatId={seatId}
+            name={name}
+            t={t}
+            onChanged={onChanged}
+            onStale={onStale}
+            saidLast={facts.length > 1 && f === latest}
+          />
+        ))}
+      </ul>
+    </li>
+  );
+};
+
+/** `list` in groups of one subject's relation, each group where its first fact was. */
+const byRelation = (list: KnownFact[]): KnownFact[][] => {
+  const groups = new Map<string, KnownFact[]>();
+  for (const f of list) {
+    const key = `${f.subject.toLowerCase()}\u0000${f.relation}`;
+    const held = groups.get(key);
+    if (held) held.push(f);
+    else groups.set(key, [f]);
+  }
+  return [...groups.values()];
 };
 
 /**
@@ -240,6 +540,12 @@ export const RemembersPanel: React.FC<RemembersPanelProps> = ({
   refreshKey,
 }) => {
   const [edits, setEdits] = useState(0);
+  // A value that could not be brought back, said at the panel's level so a re-read that
+  // removes its row does not take the notice with it (#2344).
+  const [stale, setStale] = useState<string | null>(null);
+  useEffect(() => {
+    setStale(null);
+  }, [roomId, seatId]);
   useEffect(() => {
     return onMemoryChanged(() => {
       setEdits((n) => n + 1);
@@ -313,16 +619,29 @@ export const RemembersPanel: React.FC<RemembersPanelProps> = ({
       <section data-testid={testid} className="space-y-1.5">
         <h3 className="text-[11px] font-semibold text-slate-300">{heading}</h3>
         <ul className="space-y-1.5">
-          {list.map((f) => (
-            <FactRow
-              key={f.fact_id}
-              fact={f}
-              seatId={seatId}
-              name={name}
-              t={t}
-              onChanged={onChanged}
-            />
-          ))}
+          {byRelation(list).map((facts) =>
+            facts.length > 1 || facts[0].ask_functional || facts[0].functional ? (
+              <RelationGroup
+                key={facts[0].fact_id}
+                facts={facts}
+                seatId={seatId}
+                name={name}
+                t={t}
+                onChanged={onChanged}
+                onStale={setStale}
+              />
+            ) : (
+              <FactRow
+                key={facts[0].fact_id}
+                fact={facts[0]}
+                seatId={seatId}
+                name={name}
+                t={t}
+                onChanged={onChanged}
+                onStale={setStale}
+              />
+            ),
+          )}
         </ul>
       </section>
     );
@@ -331,6 +650,11 @@ export const RemembersPanel: React.FC<RemembersPanelProps> = ({
     <div data-testid="remembers-panel" className="flex flex-col h-full gap-3 min-h-0">
       {header}
       <div className="flex-1 overflow-y-auto min-h-0 space-y-4 pr-1">
+        {stale !== null && (
+          <p data-testid="remembers-notice" role="status" className="text-[11px] text-amber-300">
+            {fmt(t.restoreStale, { value: stale })}
+          </p>
+        )}
         {group('remembers-here', t.hereHeading, here)}
         {group('remembers-elsewhere', t.elsewhereHeading, elsewhere)}
         {workedOut.length > 0 && (

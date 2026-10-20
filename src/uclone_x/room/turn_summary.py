@@ -74,16 +74,20 @@ class TurnSummary(BaseModel):
 def _compute_notable(message: RoomMessage) -> list[str]:
     notable: list[str] = []
     prov = message.provenance
-    if prov is not None:
+    path_val = getattr(prov, "path", None) if prov is not None else None
+    path_str = str(getattr(path_val, "value", path_val)) if path_val is not None else ""
+    if message.error is not None and path_str == "failover":
+        # The core's error handler records an error-ended turn as `failover` and `degraded`
+        # (P6 Check 4). Nothing answered in the model's place, so it is not reported as a
+        # substitution or a failover path (#2229): the turn ended in an error.
+        notable.append("ended_in_error")
+    elif prov is not None:
         if getattr(prov, "degraded", False):
             notable.append("degraded")
-        path_val = getattr(prov, "path", None)
-        if path_val is not None:
-            path_str = str(getattr(path_val, "value", path_val))
-            if path_str == "failover":
-                notable.append("failover")
-            elif path_str == "retry":
-                notable.append("retried")
+        if path_str == "failover":
+            notable.append("failover")
+        elif path_str == "retry":
+            notable.append("retried")
 
     dec = message.decision
     if dec is not None:

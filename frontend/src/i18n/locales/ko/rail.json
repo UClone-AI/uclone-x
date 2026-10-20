@@ -16,6 +16,8 @@
   "moreLabel": "{name}에 대한 추가 작업",
   "moreTitle": "추가 작업",
   "pinnedHeading": "고정됨",
+  "unreadableBadge": "불러올 수 없음",
+  "unreadableTitle": "설정 파일을 읽을 수 없어 대답할 수 없습니다. 설정 › 페르소나 및 클론에서 이유를 확인할 수 있습니다.",
   "cloneConversations": {
     "heading": "대화",
     "none": "아직 참여한 대화가 없습니다.",

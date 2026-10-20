@@ -251,7 +251,9 @@ async def test_a_turn_that_sends_no_text_says_so_rather_than_drawing_an_empty_bu
     The row's *text* is asserted, not the testid alone: an element that exists and says nothing
     is the defect, and a testid on an empty `<div>` satisfies a presence check.
 
-    Mutation-checked by hand, as the case above. Rebuilt, this fails and the case above passes
+    Mutation-checked by hand, as the case above. Since #2264 ends a live blank reply with
+    `step.empty_reply` rather than a completed empty row, rebuilt this fails when
+    `stepRefusalSentence` in `frontend/src/components/rooms/RoomConversation.tsx` is bypassed or
     when `frontend/src/components/rooms/RoomConversation.tsx`'s
     `) : message.content.trim() === '' ? (` becomes `) : false ? (`.
     """
@@ -264,9 +266,11 @@ async def test_a_turn_that_sends_no_text_says_so_rather_than_drawing_an_empty_bu
 
             row = page.locator("[data-testid='row-body-4']")
             said = (await row.text_content() or "").strip()
-            assert "without sending any text" in said or "sent no text" in said, (
-                f"a silent turn rendered as {said!r}"
-            )
+            assert (
+                "without writing a reply" in said
+                or "without sending any text" in said
+                or "sent no text" in said
+            ), f"a silent turn rendered as {said!r}"
         finally:
             await browser.close()
 

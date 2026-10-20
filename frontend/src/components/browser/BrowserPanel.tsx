@@ -80,6 +80,11 @@ export interface BrowserPanelProps {
   live?: BrowserLive;
   /** Open Settings ▸ Browser, to connect U0's Chrome. */
   onConnect?: () => void;
+  /**
+   * Open Settings ▸ Browser with the Saved sign-ins form open on `site` (§3.5, path A). The
+   * person types the username and password there; nothing is read from the page.
+   */
+  onSaveSignIn?: (site: string) => void;
 }
 
 /**
@@ -88,7 +93,13 @@ export interface BrowserPanelProps {
  * Stop. It is mounted only while it is the dock's surface, so frames are asked for only while
  * it is on screen, at the width the dock gives it.
  */
-export const BrowserPanel: React.FC<BrowserPanelProps> = ({ roomId, room, live, onConnect }) => {
+export const BrowserPanel: React.FC<BrowserPanelProps> = ({
+  roomId,
+  room,
+  live,
+  onConnect,
+  onSaveSignIn,
+}) => {
   const t = useCopy().dock.browser;
   const own = useBrowserLive(live ? null : roomId);
   const { state, connection, lastStep, channel } = live ?? own;
@@ -247,6 +258,38 @@ export const BrowserPanel: React.FC<BrowserPanelProps> = ({ roomId, room, live, 
         onStop={() => channel.stop()}
         onConnect={onConnect}
       />
+      {state?.save_offer && onSaveSignIn ? (
+        <div
+          data-testid="browser-save-offer"
+          className="px-3 py-1.5 flex flex-wrap items-center gap-2 border-b border-slate-800 text-[11px] text-slate-300 shrink-0"
+        >
+          <span className="min-w-0">
+            {fmt(t.saveOffer.ask, { name: cloneName(room, state.save_offer.clone) })}
+          </span>
+          <span className="flex items-center gap-1.5">
+            <button
+              type="button"
+              data-testid="browser-save-offer-save"
+              onClick={() => {
+                const site = state.save_offer?.site ?? '';
+                channel.dismissSaveOffer();
+                onSaveSignIn(site);
+              }}
+              className="px-2 py-0.5 rounded border border-slate-700 text-slate-200 hover:bg-slate-800 transition-colors"
+            >
+              {t.saveOffer.save}
+            </button>
+            <button
+              type="button"
+              data-testid="browser-save-offer-dismiss"
+              onClick={() => channel.dismissSaveOffer()}
+              className="px-2 py-0.5 rounded text-slate-400 hover:text-slate-200 hover:bg-slate-800 transition-colors"
+            >
+              {t.saveOffer.notNow}
+            </button>
+          </span>
+        </div>
+      ) : null}
       {state !== null && connection === 'lost' ? (
         <p data-testid="browser-lost" className="px-3 py-1 text-[11px] text-slate-500">
           {t.lost}

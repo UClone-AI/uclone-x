@@ -221,14 +221,27 @@ class PersonaDefinition(BaseModel):
         ),
     )
 
+    learn_from_conversations: bool = Field(
+        default=True,
+        description=(
+            "Whether the clone picks out what to remember after each of its turns (#1840)."
+            " Off stops only that: `record_memory_fact` and a person's Correct and Forget"
+            " keep working."
+        ),
+    )
+
     @model_serializer(mode="wrap")
-    def _omit_unset_tools_module(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
-        """Leave `tools_module` out when unset, so a persona without one -- every persona
-        before #2188, and every session record that carries one -- is written as before
-        (#1844)."""
+    def _omit_defaults_older_records_lack(
+        self, handler: SerializerFunctionWrapHandler
+    ) -> dict[str, object]:
+        """Leave out `tools_module` when unset and `learn_from_conversations` when on, so a
+        persona that sets neither -- every persona before #2188 and #1840, and every session
+        record that carries one -- is written as before (#1844)."""
         data: dict[str, object] = handler(self)
         if data.get("tools_module") is None:
             data.pop("tools_module", None)
+        if data.get("learn_from_conversations") is True:
+            data.pop("learn_from_conversations", None)
         return data
 
     @model_validator(mode="after")

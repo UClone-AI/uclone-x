@@ -57,6 +57,7 @@ from uclone_x.core.agent_home import (
     peer_handles,
     seat_id_for,
 )
+from uclone_x.errors import PlainRefusalError
 from uclone_x.extensions import extension_lifecycle_hooks
 from uclone_x.memory.store import CrossSessionMemory, default_cross_session_memory
 from uclone_x.ontology.engine import OntologyEngine
@@ -76,6 +77,7 @@ __all__ = [
     "APP_ONTOLOGY",
     "AppScope",
     "BuiltClone",
+    "CloneUnreadableError",
     "check_tools_module",
     "CLONE_ONTOLOGY_ROOT",
     "GlobalModels",
@@ -551,6 +553,17 @@ def with_app_lifecycle_hooks(host: HostDependencies) -> HostDependencies:
     return dataclasses.replace(host, lifecycle_hooks=(*held, *added))
 
 
+class CloneUnreadableError(PlainRefusalError):
+    """A turn named a clone whose settings file could not be read (#2220).
+
+    Its message is written for a person: the clone's handle and what to do. The loader's
+    own words, with the path and the field, are in the log.
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, reason_code="clone_unreadable")
+
+
 def build_clone(
     app: AppScope,
     *,
@@ -581,6 +594,13 @@ def build_clone(
     `fallback_llm`. `config_update` carries what a CLI command sets
     and no persona holds (isolation, a step budget).
     """
+    unreadable = app.persona_registry.unreadable_clone(persona or clone_id)
+    if unreadable is not None:
+        # Not built as a clone with no persona: that would answer as the fallback, in
+        # this clone's name, with none of what its file says.
+        raise CloneUnreadableError(
+            f"The clone '{unreadable.handle}' cannot answer. {unreadable.reason}"
+        )
     persona_def = app.persona_registry.get_persona(persona or clone_id)
     host = with_app_lifecycle_hooks(app.host)
     if not isinstance(ontology, _AppOntology):

@@ -14,8 +14,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import datetime
 import functools
 import logging
+import time
 import urllib.parse
 from collections.abc import AsyncGenerator, Awaitable, Callable, Coroutine, Sequence
 from dataclasses import dataclass, field
@@ -46,7 +48,18 @@ from uclone_x.browser.actions import (
 )
 from uclone_x.browser.cdp import CdpClosedError, CdpError, CdpEvent
 from uclone_x.browser.link import BrowserLink
+from uclone_x.browser.sign_ins import SavedSignIn, sign_in_for, site_key
+from uclone_x.browser.signin import (
+    CAPTCHA_JS,
+    PAGE_PROBE_JS,
+    field_expression,
+    insecure_for_secrets,
+    shown_username,
+    sign_in_signal,
+    site_of,
+)
 from uclone_x.browser.snapshot import Entry, RefTable, build_entries, diff, find, render
+from uclone_x.browser.totp import totp
 from uclone_x.browser.vision import View, capture, page_point
 from uclone_x.errors import PlainRefusalError
 from uclone_x.llm.models import ImagePart
@@ -98,6 +111,61 @@ _BROWSER_FAILED = (
 )
 _BROWSER_CLOSED = "The browser window was closed. Open the page again with action=open."
 
+#: What signing out of a site clears besides its cookies.
+_SITE_STORAGE = "local_storage,session_storage,indexeddb,websql,cache_storage,service_workers"
+
+
+def _iso(at: float) -> str:
+    return datetime.datetime.fromtimestamp(at, tz=datetime.UTC).isoformat(timespec="seconds")
+
+
+def _abandon(task: asyncio.Future[Any]) -> None:
+    """Stop a fill that a dialog or a stalled page left pending, and keep its outcome quiet.
+
+    A task already finished has its exception read now; one still running is cancelled and
+    its exception read when it ends. Either way asyncio never reports it as lost (#2388).
+
+    At `sign_in`'s call site this behaves like a plain `cancel()` (#2390). `_perform`'s
+    timed-out wait goes through `asyncio.shield`, which reads the exception itself, and a
+    dialog leaves the task running. It is kept for any caller without that shield.
+    """
+
+    def _retrieve(done: asyncio.Future[Any]) -> None:
+        if not done.cancelled():
+            done.exception()
+
+    if task.done():
+        _retrieve(task)
+        return
+    task.add_done_callback(_retrieve)
+    task.cancel()
+
+
+@dataclass
+class _CallLock:
+    """One key's call lock and how many calls hold or wait for it."""
+
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    users: int = 0
+
+
+class _PageMoved(Exception):
+    """The page left the saved sign-in's host (or HTTPS) between finding a field and typing."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+#: How many form steps one `sign_in` fills: username, password, then a code (§3.5 path A).
+SIGN_IN_STEPS = 3
+_SIGN_IN_LABELS = {"user": "Username", "password": "Password", "code": "Code"}
+VALUE_JS = "function () { return this.value; }"
+BOX_JS = """function () {
+  const r = this.getBoundingClientRect();
+  return {x: r.x, y: r.y, width: r.width, height: r.height};
+}"""
+
 
 @dataclass
 class _Tab:
@@ -118,6 +186,10 @@ class _Tab:
     )
     hand_over_pending: bool = False
     asked_user: dict[str, str] | None = None
+    opener: str | None = None
+    """The target of the tab whose page opened this one (a pop-up), if any (#2397)."""
+    sign_in_tried: set[str] = field(default_factory=lambda: cast(set[str], set()))
+    """The pages (loader ids) a saved sign-in was tried on: one attempt per page (§3.5)."""
     view: View | None = None
     """What the last `look` showed, so a coordinate click can be put back on the page."""
 
@@ -150,8 +222,16 @@ class BrowserService:
         link_factory: Callable[[], Awaitable[BrowserLink]],
         *,
         downloads_dir: Path = DEFAULT_DOWNLOADS_DIR,
+        sign_ins: Callable[[], Sequence[SavedSignIn]] | None = None,
     ) -> None:
         self._link_factory = link_factory
+        self._sign_ins: Callable[[], Sequence[SavedSignIn]] = sign_ins or (lambda: ())
+        # Sites the clones' tabs have shown, and when: Settings ▸ Browser lists those that
+        # still hold a session (§3.5 "Signed-in sites and saved sign-ins").
+        self._visited: dict[str, float] = {}
+        # After the person signs in by hand (path B), the offer to save that sign-in, per
+        # conversation, until it is taken or dismissed (§3.5 path A step 1).
+        self._save_offers: dict[str, dict[str, str]] = {}
         self._link: BrowserLink | None = None
         self._link_lock = asyncio.Lock()
         self._windows: dict[TabKey, _Window] = {}
@@ -163,6 +243,8 @@ class BrowserService:
         self._watchers: dict[str, list[asyncio.Queue[Notice]]] = {}
         self._acting: dict[TabKey, str] = {}
         self._steps: dict[TabKey, Notice] = {}
+        # One call at a time per (conversation, clone): a step's calls arrive together.
+        self._call_locks: dict[TabKey, _CallLock] = {}
         self._problems: dict[str, str] = {}
 
     @property
@@ -263,6 +345,31 @@ class BrowserService:
             queue.put_nowait(notice)
 
     @contextlib.asynccontextmanager
+    async def one_call_at_a_time(self, key: TabKey) -> AsyncGenerator[None]:
+        """Hold the key's lock for a `browser` call's whole run (#2392).
+
+        The agent runs a step's tool calls together. Two calls on one tab that overlap race:
+        a `type` and a `click` sent together lost the click, and one call's result carried
+        the other's change. Taken in arrival order, which is the model's order; calls for
+        another conversation or clone are not held up.
+
+        A key's lock is dropped once no call holds or waits for it and the key has no tabs
+        left. It is never dropped under a waiting call, so the call that closes the last
+        tab and the one queued behind it still share one lock (#2396 review).
+        """
+        entry = self._call_locks.get(key)
+        if entry is None:
+            entry = self._call_locks[key] = _CallLock()
+        entry.users += 1
+        try:
+            async with entry.lock:
+                yield
+        finally:
+            entry.users -= 1
+            if entry.users == 0 and key not in self._windows:
+                self._call_locks.pop(key, None)
+
+    @contextlib.asynccontextmanager
     async def acting(self, key: TabKey, action: str) -> AsyncGenerator[Notice]:
         """Mark one browser call as in progress for the live view, and report its step.
 
@@ -332,7 +439,22 @@ class BrowserService:
         }
         if asked_user is not None:
             state["asked_user"] = asked_user
+        offer = self._save_offers.get(conversation)
+        if offer is not None:
+            state["save_offer"] = dict(offer)
         return state
+
+    def dismiss_save_offer(self, conversation: str, site: str | None = None) -> None:
+        """Drop the conversation's save offer; with `site`, only an offer for that site."""
+        offer = self._save_offers.get(conversation)
+        if offer is not None and (site is None or offer["site"] == site):
+            del self._save_offers[conversation]
+            self._notify(conversation, {"type": "state"})
+
+    def sign_in_saved(self, site: str) -> None:
+        """A sign-in for `site` was saved: no conversation needs to offer it any more."""
+        for conversation in list(self._save_offers):
+            self.dismiss_save_offer(conversation, site)
 
     async def wait_for_control(self, key: TabKey) -> None:
         """Wait until control returns to the clone if U0 has taken over the active tab."""
@@ -416,9 +538,7 @@ class BrowserService:
         conversation, clone = key
         await self._ensure_link()
         _, _, tab = self._existing(key)
-        import urllib.parse
-
-        domain = urllib.parse.urlparse(tab.url).netloc or tab.url
+        domain = site_of(tab.url)
         tab.controller = "user"
         tab.controller_resumed.clear()
         tab.asked_user = {
@@ -431,11 +551,239 @@ class BrowserService:
         await tab.controller_resumed.wait()
         tab.asked_user = None
         snap = await self.snapshot(key)
+        if (
+            kind == "sign_in"
+            and "sign_in_likely" not in snap
+            and sign_in_for(tab.url, self._sign_ins()) is None
+        ):
+            # The person signed in by hand: offer to save it, so the clone can next time.
+            self._save_offers[conversation] = {"clone": clone, "site": site_key(tab.url)}
+            self._notify(conversation, {"type": "state"})
+        # Whether the person signed in is the page's to say: `sign_in_likely` is still in
+        # the observation if it asks for one (§3.5), so the reply does not claim it.
         return {
             "status": "ok",
-            "message": f"Signed in — now at {tab.url}",
+            "message": f"The person gave the tab back. It is now at {tab.url}.",
             **snap,
         }
+
+    def use_sign_ins(self, provider: Callable[[], Sequence[SavedSignIn]]) -> None:
+        """Where `sign_in` reads the saved sign-ins; the UI app points it at the settings file."""
+        self._sign_ins = provider
+
+    async def sign_in(self, key: TabKey) -> dict[str, Any]:
+        """Sign in to the page's site with its saved sign-in (§3.5 path A).
+
+        The Core types the saved values; the model is told only the outcome. Whatever this
+        cannot finish (no saved sign-in, a CAPTCHA, a code with no setup key saved, a
+        rejected password) goes to the person (path B), with the page left where it stopped.
+        One attempt per page: a page it already tried goes straight to the person.
+        """
+        link, window, tab = self._existing(key)
+        await self._track_page_load(link, tab)
+        site = site_of(tab.url)
+        if tab.loader in tab.sign_in_tried:
+            return await self._hand_sign_in_over(
+                key, f"The saved sign-in was already tried on this page of {site}."
+            )
+        saved = sign_in_for(tab.url, self._sign_ins())
+        if saved is None:
+            return await self._hand_sign_in_over(key, f"No sign-in is saved for {site}.")
+        filled: set[str] = set()
+        for _ in range(SIGN_IN_STEPS):
+            tab.sign_in_tried.add(tab.loader)
+            # The page may have moved since the last step (a redirect): the saved values go
+            # only to the host they were saved for, and only over HTTPS.
+            moved = self._refuse_page(saved, await self._here(link, tab))
+            if moved is not None:
+                return await self._hand_sign_in_over(key, moved)
+            if await self._evaluate(link, tab, CAPTCHA_JS) is True:
+                return await self._hand_sign_in_over(
+                    key, f"{site} shows a CAPTCHA, which only the person can answer."
+                )
+            values: list[tuple[str, str, str]] = []  # (role, element, value)
+            code = await self._handle(link, tab, field_expression("code"))
+            if code is not None:
+                if not saved.totp_key:
+                    return await self._hand_sign_in_over(
+                        key,
+                        f"{site} asks for a one-time code, and no 2FA setup key is saved for it.",
+                    )
+                values.append(("code", code, totp(saved.totp_key)))
+            for role, value in (("user", saved.username), ("password", saved.password)):
+                element = await self._handle(link, tab, field_expression(role))
+                if element is None:
+                    continue
+                if role == "user" and await self._call(link, tab, element, VALUE_JS) == value:
+                    continue
+                if role in filled:
+                    return await self._hand_sign_in_over(
+                        key, f"{site} did not accept the saved sign-in."
+                    )
+                values.append((role, element, value))
+            if not values:
+                break
+            try:
+                seen = await self._perform(
+                    tab, functools.partial(self._fill, link, tab, key, saved, values)
+                )
+            except _PageMoved as moved:
+                return await self._hand_sign_in_over(key, moved.reason)
+            if tab.pending is not None:
+                # A dialog or a stalled page interrupted the fill: abandon it, so it can
+                # never type into whatever page comes next.
+                _abandon(tab.pending)
+                tab.pending = None
+                if tab.dialog is not None:
+                    await self._dismiss_dialog(link, tab)
+                    return await self._hand_sign_in_over(
+                        key, f"{site} opened a dialog during the sign-in, so it was stopped."
+                    )
+                return await self._hand_sign_in_over(
+                    key, f"{site} stopped responding during the sign-in, so it was stopped."
+                )
+            filled.update(role for role, _, _ in values)
+            result = await self._observe(link, window, seen)
+            if "sign_in_likely" not in result:
+                result["message"] = f"Signed in to {saved.site} as {shown_username(saved.username)}"
+                return result
+            await self._track_page_load(link, tab)
+        return await self._hand_sign_in_over(
+            key, f"Signing in to {site} stopped at a step the saved sign-in cannot do."
+        )
+
+    @staticmethod
+    def _refuse_page(saved: SavedSignIn, here: str) -> str | None:
+        """Why the saved values must not be typed into the page at `here`, or `None`."""
+        if sign_in_for(here, [saved]) is None:
+            return (
+                f"The sign-in moved to {site_of(here)}, which is not {saved.site}, so the "
+                "saved sign-in was not used there."
+            )
+        if insecure_for_secrets(here):
+            return (
+                f"{site_of(here)} is not using a secure connection, so the saved password "
+                "was not typed."
+            )
+        return None
+
+    async def _here(self, link: BrowserLink, tab: _Tab) -> str:
+        """The page's address right now, read from the page, never the last observation.
+
+        An address that cannot be read is no address: it matches no saved sign-in, so the
+        caller hands over rather than typing into a page it could not identify (#2388).
+        """
+        href = await self._evaluate(link, tab, "location.href")
+        return href if isinstance(href, str) else ""
+
+    async def _fill(
+        self,
+        link: BrowserLink,
+        tab: _Tab,
+        key: TabKey,
+        saved: SavedSignIn,
+        values: Sequence[tuple[str, str, str]],
+    ) -> None:
+        """Type the saved values into their fields, then submit. Only the page receives them.
+
+        The page's host is checked again right before each value: a page that navigated
+        between finding a field and typing into it gets nothing.
+        """
+        for role, element, value in values:
+            refused = self._refuse_page(saved, await self._here(link, tab))
+            if refused is not None:
+                raise _PageMoved(refused)
+            box = await self._call(link, tab, element, BOX_JS)
+            if isinstance(box, dict):
+                label = _SIGN_IN_LABELS[role]
+                await self.broadcast_overlay(
+                    key[0], cast(dict[str, Any], box), label, tab=tab, clone=key[1]
+                )
+            await link.send(tab.target, "DOM.focus", {"objectId": element})
+            await self._call(link, tab, element, SELECT_ALL_JS)
+            await self._keys(link, tab, "Backspace")
+            # `Input.insertText` types wherever focus is. Focus moved into a frame (another
+            # origin's) or anywhere else since `DOM.focus` gets nothing (#2388).
+            if await self._call(link, tab, element, IS_FOCUSED_JS) is not True:
+                raise _PageMoved(
+                    f"Focus left the {_SIGN_IN_LABELS[role].lower()} field on "
+                    f"{site_of(tab.url)} before it was typed into, so nothing was typed."
+                )
+            await link.send(tab.target, "Input.insertText", {"text": value})
+        await self._keys(link, tab, "Enter")
+
+    async def _handle(self, link: BrowserLink, tab: _Tab, expression: str) -> str | None:
+        """A handle to the element `expression` evaluates to, or `None` when it finds none."""
+        result = await link.send(tab.target, "Runtime.evaluate", {"expression": expression})
+        remote = result.get("result")
+        if not isinstance(remote, dict):
+            return None
+        found = cast(dict[str, Any], remote)
+        handle = found.get("objectId")
+        return handle if found.get("subtype") == "node" and isinstance(handle, str) else None
+
+    # -- signed-in sites (§3.5): the sessions the clones' browsing left in the profile ------
+
+    async def signed_in_sites(self) -> tuple[bool, list[dict[str, Any]]]:
+        """Whether the browser is open, and the sites the clones visited that hold a session.
+
+        Read from the browser's cookies, so a site signed out elsewhere drops off. Nothing is
+        started to answer: with no browser open there is nothing to list.
+        """
+        target = self._any_target()
+        if self._link is None or target is None:
+            return False, []
+        sites: list[dict[str, Any]] = []
+        for host, used in sorted(self._visited.items(), key=lambda item: -item[1]):
+            if await self._cookies(self._link, target, host):
+                sites.append({"site": host, "last_used": _iso(used)})
+        return True, sites
+
+    async def sign_out(self, site: str | None = None) -> tuple[bool, list[dict[str, Any]]]:
+        """Clear one listed site's cookies and storage, or every listed site's (`None`)."""
+        open_, listed = await self.signed_in_sites()
+        target = self._any_target()
+        if not open_ or self._link is None or target is None:
+            return False, []
+        link = self._link
+        for host in [s["site"] for s in listed if site is None or s["site"] == site]:
+            for cookie in await self._cookies(link, target, host):
+                with contextlib.suppress(CdpError):
+                    await link.send(
+                        target,
+                        "Network.deleteCookies",
+                        {k: cookie[k] for k in ("name", "domain", "path") if k in cookie},
+                    )
+            for scheme in ("https", "http"):
+                with contextlib.suppress(CdpError):
+                    await link.send(
+                        target,
+                        "Storage.clearDataForOrigin",
+                        {"origin": f"{scheme}://{host}", "storageTypes": _SITE_STORAGE},
+                    )
+            self._visited.pop(host, None)
+        return await self.signed_in_sites()
+
+    def _any_target(self) -> str | None:
+        return next((w.tabs[0].target for w in self._windows.values() if w.tabs), None)
+
+    async def _cookies(self, link: BrowserLink, target: str, host: str) -> list[dict[str, Any]]:
+        try:
+            result = await link.send(
+                target, "Network.getCookies", {"urls": [f"https://{host}/", f"http://{host}/"]}
+            )
+        except CdpError:
+            return []
+        cookies = result.get("cookies")
+        return cast(list[dict[str, Any]], cookies) if isinstance(cookies, list) else []
+
+    async def _hand_sign_in_over(self, key: TabKey, reason: str) -> dict[str, Any]:
+        """Path B from where path A stopped: the person finishes, and the call returns then."""
+        result = await self.ask_user(key, kind="sign_in", message=reason)
+        result["message"] = (
+            f"{reason} The person was asked to finish signing in. {result['message']}"
+        )
+        return result
 
     async def open_user_tab(self, conversation: str, url: str = "about:blank") -> _Tab:
         """Open a new tab owned by U0 (design §3.4)."""
@@ -682,6 +1030,13 @@ class BrowserService:
             info = await self._field(link, tab, element)
             if is_secret_field(str(info.get("type", "")), str(info.get("autocomplete", ""))):
                 raise PlainRefusalError(SECRET_FIELD_REFUSAL, reason_code="secret_field")
+            if info.get("file") is True:
+                # Decided by the field's own type, not its label (#2397).
+                raise PlainRefusalError(
+                    "That is a file field, so it can't be typed into. Choose the files for it "
+                    f'with upload(ref="{ref}", paths=["<file in the workspace>"]).',
+                    reason_code="file_field",
+                )
             if not info.get("editable"):
                 raise PlainRefusalError(
                     "That element is not a text field, so it can't be typed into. "
@@ -1137,6 +1492,7 @@ class BrowserService:
                 return taken > 0, str(refused)
             taken += 1
             tab = await self._attach(link, adopted)
+            tab.opener = opener.target
             await self._loaded(link, tab)
             await self._read_frame(link, tab)
             window.tabs.append(tab)
@@ -1255,9 +1611,16 @@ class BrowserService:
         index = int(history.get("currentIndex", 0)) + step
         if not 0 <= index < len(entries):
             word = "earlier" if step < 0 else "later"
-            raise PlainRefusalError(
-                f"There is no {word} page in this tab.", reason_code="no_history"
+            message = f"There is no {word} page in this tab."
+            opener = next(
+                (n for n, t in enumerate(window.tabs, start=1) if t.target == tab.opener), None
             )
+            if step < 0 and opener is not None:
+                # A page opened this tab: the page it came from is that tab (#2397).
+                message += (
+                    f" Tab {opener} opened it: go back to that page with tab(index={opener})."
+                )
+            raise PlainRefusalError(message, reason_code="no_history")
         entry_id = entries[index].get("id")
         seen = await self._perform(
             tab,
@@ -1534,11 +1897,22 @@ class BrowserService:
         return _value_of(result)
 
     async def _location(self, link: BrowserLink, tab: _Tab) -> dict[str, Any]:
-        value = await self._evaluate(link, tab, "[location.href, document.title]")
-        if isinstance(value, list) and len(cast(list[object], value)) == 2:
-            href, title = cast(list[object], value)
+        """The page's address and title; also whether it asks for a sign-in (§3.5)."""
+        value = await self._evaluate(link, tab, PAGE_PROBE_JS)
+        sign_in: str | None = None
+        if isinstance(value, list) and len(cast(list[object], value)) == 4:
+            href, title, status, secret_field = cast(list[object], value)
             tab.url, tab.title = str(href), str(title)
-            return {"url": tab.url, "title": tab.title}
+            host = urllib.parse.urlsplit(tab.url).hostname
+            if host:
+                self._visited[host.lower()] = time.time()
+            sign_in = sign_in_signal(
+                tab.url,
+                status if isinstance(status, int) else 0,
+                secret_field=secret_field is True,
+            )
+        if sign_in:
+            return {"url": tab.url, "title": tab.title, "sign_in_likely": sign_in}
         return {"url": tab.url, "title": tab.title}
 
 

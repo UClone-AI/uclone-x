@@ -7,6 +7,7 @@ import { openConfirmedWindow } from '../../lib/person';
 import {
   artifactLibraryApi,
   type ChangeView,
+  type EntryView,
   type EvidenceView,
   type JsonValue,
   type ChapterView,
@@ -53,6 +54,58 @@ const decision = (p: ProposalView, t: StoryCopy): string => {
   if (p.decided_in === 'story_view') return applied ? t.appliedHere : t.rejectedHere;
   if (p.decided_in === 'conversation') return applied ? t.appliedInConversation : t.rejectedInConversation;
   return applied ? t.appliedElsewhere : t.rejectedElsewhere;
+};
+
+/**
+ * What an entry is to others at the start, and what each scene changed, read-only
+ * (uGraph step 6, #2332; §6 Q3, #2346). Names, never ids: an id with no entry or scene behind
+ * it is shown as written, and a progression that came from an applied proposal shows the
+ * words it rests on. A change still goes through a proposal.
+ */
+const EntryGraph: React.FC<{
+  entry: EntryView;
+  names: Map<string, string>;
+  scenes: Map<string, string>;
+  quotes: Map<string, string[]>;
+  t: StoryCopy;
+}> = ({ entry, names, scenes, quotes, t }) => {
+  const nameOf = (id: string): string => names.get(id) ?? id;
+  const relations = Object.entries(entry.relations ?? {});
+  const changes = entry.progressions.map((p) => {
+    const set = Object.entries((p.set ?? {}) as Record<string, JsonValue>).map(
+      ([k, v]) => `${k}: ${show(v, t)}`,
+    );
+    const rel = Object.entries((p.relations ?? {}) as Record<string, string | null>).map(
+      ([other, word]) =>
+        word === null
+          ? fmt(t.relationEnds, { name: nameOf(other) })
+          : fmt(t.relationNow, { word, name: nameOf(other) }),
+    );
+    const at = typeof p.at === 'string' ? p.at : '';
+    const line = fmt(t.changeFrom, { scene: scenes.get(at) ?? at, what: [...set, ...rel].join(', ') });
+    const propQuotes = typeof p.proposal === 'string' ? quotes.get(p.proposal) : undefined;
+    return propQuotes && propQuotes.length > 0
+      ? `${line} (${propQuotes.map((q) => `“${q}”`).join(', ')})`
+      : line;
+  });
+  return (
+    <>
+      {relations.length > 0 && (
+        <p className="text-slate-400" data-testid="story-entry-relations">
+          {fmt(t.relationsLine, {
+            relations: relations
+              .map(([other, word]) => fmt(t.relationOf, { word, name: nameOf(other) }))
+              .join(', '),
+          })}
+        </p>
+      )}
+      {changes.map((line) => (
+        <p key={line} className="text-slate-500" data-testid="story-entry-change">
+          {line}
+        </p>
+      ))}
+    </>
+  );
 };
 
 const kindLabel = (kind: string, t: StoryCopy): string =>
@@ -578,6 +631,15 @@ const BoardScene: React.FC<{
         </span>
       </p>
       {scene.summary && <p className="text-slate-400">{scene.summary}</p>}
+      {scene.illustration && (
+        <img
+          src={scene.illustration}
+          alt={scene.title}
+          data-testid="story-scene-illustration"
+          className="mt-1.5 max-h-48 rounded border border-slate-800 object-cover"
+          loading="lazy"
+        />
+      )}
       {scene.entries.length > 0 && (
         <div className="mt-1 flex flex-wrap items-center gap-1" data-testid="story-scene-entries">
           <span className="text-[11px] text-slate-500">{b.inScene}</span>
@@ -663,6 +725,17 @@ const BoardScene: React.FC<{
 const Codex: React.FC<{ story: StoryOverview; chosen: Chosen | null }> = ({ story, chosen }) => {
   const t = useCopy().dock.story;
   const chosenRef = useRef<HTMLLIElement | null>(null);
+  const names = new Map(story.codex.flatMap((g) => g.entries.map((e) => [e.id, e.name] as const)));
+  const scenes = new Map(
+    (story.outline?.chapters ?? []).flatMap((c) =>
+      c.scenes.map((s) => [s.id, s.title || s.id] as const),
+    ),
+  );
+  const quotes = new Map(
+    story.decided
+      .filter((p) => p.status === 'applied' && p.evidence.length > 0)
+      .map((p) => [p.id, p.evidence.map((e) => e.quote)] as const),
+  );
   useEffect(() => {
     // jsdom has no scrollIntoView; a browser does.
     chosenRef.current?.scrollIntoView?.({ block: 'nearest', behavior: 'smooth' });
@@ -701,6 +774,7 @@ const Codex: React.FC<{ story: StoryOverview; chosen: Chosen | null }> = ({ stor
                               .join(' · ')}
                           </p>
                         )}
+                        <EntryGraph entry={e} names={names} scenes={scenes} quotes={quotes} t={t} />
                         {e.looks && e.looks.length > 0 && (
                           <p className="text-slate-500">{fmt(t.looks, { looks: e.looks.join(', ') })}</p>
                         )}

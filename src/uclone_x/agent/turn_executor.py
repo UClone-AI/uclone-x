@@ -22,8 +22,19 @@ and the two reads of history a turn makes before it starts (`_repeats_unanswered
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import json
 import logging
-from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
+from collections import Counter
+from collections.abc import (
+    AsyncGenerator,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Collection,
+    Mapping,
+    Sequence,
+)
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -71,6 +82,7 @@ from uclone_x.agent.prompt_assembler import (
     undone_attempt_section,
 )
 from uclone_x.agent.protocols import (
+    ReplyTextAidProtocol,
     TurnAidHookProtocol,
     TurnAidProtocol,
     TurnLifecycleHookProtocol,
@@ -79,6 +91,7 @@ from uclone_x.agent.reply_lines import is_korean, lines_to_add, reply_notes, wit
 from uclone_x.agent.request_record import (
     RequestLayers,
     assemble_request_messages,
+    calls_without_turn_context,
 )
 from uclone_x.agent.session import (
     CompactionResult,
@@ -87,6 +100,7 @@ from uclone_x.agent.session import (
 from uclone_x.agent.text_tool_calls import detect_text_emitted_tool_calls
 from uclone_x.agent.tool_execution import tool_outcome_of
 from uclone_x.agent.tool_invoker import BoundToolsSession, ToolInvoker
+from uclone_x.agent.work_done import work_done, work_done_lines
 from uclone_x.core.context_state import (
     EPOCH_PERSONA_EDITED,
     ContextForm,
@@ -108,7 +122,6 @@ from uclone_x.core.session_log import (
     result_handle_of,
 )
 from uclone_x.core.tool_results import (
-    STEP_REFUSAL_TEXT,
     STEP_REPLY_RESERVE_TOKENS,
     TOOL_RESULT_READ_TOOL,
     ResultBodies,
@@ -129,15 +142,20 @@ from uclone_x.engine.protocols import (
 from uclone_x.errors import (
     BudgetExceededError,
     LLMConnectorNotConfiguredError,
+    LLMError,
     LLMModelNotConfiguredError,
+    LLMRequestRefusedError,
     LLMStreamInterruptedError,
     LLMTimeoutError,
     ModelLacksToolSupportError,
     ProviderFailureError,
     ProviderFailureKind,
     TokenBudgetExhaustedError,
+    UCloneXError,
     UsageLimitReachedError,
 )
+from uclone_x.i18n.language import Language
+from uclone_x.i18n.refusals import refusal_text
 from uclone_x.llm.compactor import (
     estimate_message_tokens,
     estimate_reply_tokens,
@@ -181,10 +199,14 @@ from uclone_x.tools.protocols import ToolRegistryProtocol
 
 __all__ = [
     "PERSONA_EDIT_NOT_APPLIED",
+    "THINKING_RETRY_STATUS",
+    "EmptyReplyError",
     "StreamProgress",
+    "ThinkingBudgetExceededError",
     "TurnExecutor",
     "TurnScope",
     "TurnSession",
+    "TurnStoppedError",
     "named_model",
 ]
 
@@ -223,6 +245,91 @@ def _caller_turn_id_field(caller_turn_id: str | None) -> dict[str, str]:
 def _model_name_reason(model_name: str | None, why: str) -> dict[str, str]:
     """`{"model_name_reason": why}` when no model is named, else nothing to spread in."""
     return {} if model_name is not None else {"model_name_reason": why}
+
+
+def _with_retry_provenance(resp: ModelResponse, cut: AttemptRecord | None) -> ModelResponse:
+    """`resp`, its provenance naming the retry `cut` led to (#2202, P6).
+
+    Unchanged when the turn was not cut, or when `resp` carries no provenance: an
+    unattributed answer stays unattributed rather than gaining a made-up one.
+    """
+    served = resp.provenance
+    if cut is None or served is None:
+        return resp
+    retried = Provenance(
+        path=ExecutionPath.RETRY,
+        requested=served.requested,
+        served_by=served.served_by,
+        attempts=(cut,),
+    )
+    return resp.model_copy(update={"provenance": retried})
+
+
+class TurnStoppedError(UCloneXError):
+    """A turn that ends with a plain sentence for the person and the code a head says it by.
+
+    Raised where the turn learns it cannot answer; the turn's failure path ends it with
+    `stop_reason`, the sentence in the person's language as `error`, and `code` as
+    `TurnResult.error_code`, which the room records on the row as `step_refusal`.
+    """
+
+    def __init__(
+        self, code: StepRefusalCode, stop_reason: TurnStopReason, language: Language
+    ) -> None:
+        super().__init__(refusal_text(code, language))
+        self.code: StepRefusalCode = code
+        self.stop_reason: TurnStopReason = stop_reason
+
+
+class EmptyReplyError(TurnStoppedError):
+    """The turn's reply was still empty after the re-ask (#2264)."""
+
+    def __init__(self, language: Language) -> None:
+        super().__init__("step.empty_reply", "empty_reply", language)
+
+
+class ThinkingBudgetExceededError(LLMError):
+    """A streamed step thought past `AgentConfig.thinking_budget_tokens` and was cut (#2202).
+
+    Raised from inside the stream loop, so the stream is closed on the way out, which
+    stops the generation on the server. Never shown to a person: the turn asks the step
+    once more with thinking off, and only a second cut ends it, as `TurnStoppedError`.
+    """
+
+    def __init__(self, thinking_tokens: int, budget: int, elapsed_s: float) -> None:
+        super().__init__(
+            f"The model thought for {thinking_tokens} streamed pieces, past the budget of "
+            f"{budget}, in {elapsed_s:.1f}s, so its stream was closed."
+        )
+        self.thinking_tokens = thinking_tokens
+        self.budget = budget
+        self.elapsed_s = elapsed_s
+
+
+#: The status a person is shown while a cut step is asked again (#2202). Plain words, no
+#: figures: the figures are in the log's `THINKING_BUDGET_STOP` event.
+THINKING_RETRY_STATUS = (
+    "Thinking went on too long, so it was stopped. Answering again without it..."
+)
+
+_Chunk = TypeVar("_Chunk")
+
+
+@contextlib.asynccontextmanager
+async def _closing(stream: AsyncIterator[_Chunk]) -> AsyncGenerator[AsyncIterator[_Chunk]]:
+    """`stream`, closed when the block ends however it ends (#2202).
+
+    Leaving an `async for` early does not close an async generator; it is closed only when
+    collected, and until then a connector's HTTP response stays open and the server keeps
+    generating. Closing it here ends the request at once. An iterator with no `aclose`
+    has nothing to close.
+    """
+    try:
+        yield stream
+    finally:
+        aclose = getattr(stream, "aclose", None)
+        if aclose is not None:
+            await aclose()
 
 
 @dataclass(slots=True)
@@ -270,6 +377,8 @@ class _PersonaEditNotApplied(Exception):
 
 
 _ChainedError = TypeVar("_ChainedError", bound=BaseException)
+#: What a turn aid's call returns (`TurnExecutor._of_aid`).
+_AidResult = TypeVar("_AidResult")
 
 
 def _in_cause_chain(exc: BaseException, kind: type[_ChainedError]) -> _ChainedError | None:
@@ -305,8 +414,27 @@ def _model_lacking_tools(exc: BaseException) -> ModelLacksToolSupportError | Non
     return _in_cause_chain(exc, ModelLacksToolSupportError)
 
 
+def _provider_answer(exc: BaseException) -> dict[str, object]:
+    """What the provider answered, for the failed step's event: its status and the start of
+    its body, credentials redacted, or nothing when it did not answer (#2227).
+
+    Kept beside the error's own sentence, which is U0's and names none of it. Google's
+    "Function call is missing a thought_signature" was recorded nowhere, so a failure every
+    tool turn hit read only as "an error UClone-X didn't recognise".
+    """
+    failure = _in_cause_chain(exc, ProviderFailureError)
+    if failure is None or failure.status_code is None:
+        return {}
+    return {"provider_status": failure.status_code, "provider_body": failure.body_excerpt}
+
+
 def _turn_failure(
-    exc: BaseException, stop_reason: TurnStopReason, agent_id: str
+    exc: BaseException,
+    stop_reason: TurnStopReason,
+    agent_id: str,
+    *,
+    session_id: str | None = None,
+    room_id: str | None = None,
 ) -> tuple[TurnStopReason, str, ProviderFailure | None]:
     """The stop reason, `error` and `provider_failure` a turn that raised `exc` ends with,
     logged as it deserves.
@@ -327,9 +455,24 @@ def _turn_failure(
     if provider_failure is not None:
         # Not a fault in the code either, and the raw response was logged where it was
         # classified; a traceback here would put it on the user's terminal a second time.
-        logger.info("Turn for agent %s failed at the provider: %s", agent_id, provider_failure)
+        # Named by session and room, so the server log leads to the turn (#2227).
+        at_provider = (
+            "Turn for agent %s failed at the provider (session %s, room %s): %s [%s %s]",
+            agent_id,
+            session_id,
+            room_id,
+            provider_failure,
+            provider_failure.status_code,
+            provider_failure.body_excerpt,
+        )
+        logger.info(*at_provider, extra={"session_id": session_id})
         failure = ProviderFailure.of(provider_failure)
         return _PROVIDER_STOP_REASONS[failure.kind], failure.message, failure
+    if isinstance(exc, TurnStoppedError):
+        # The model's reply, not a fault in the code: the reply and the stop are in the
+        # log, and the turn ends with the plain sentence (#2264, #2202).
+        logger.info("Turn for agent %s stopped (%s): %s", agent_id, exc.code, exc)
+        return exc.stop_reason, str(exc), None
     if isinstance(exc, TextToolCallUnreadableError):
         # The model's reply, not a fault in the code: the reply is in the log's
         # MODEL_RESPONSE event, and the turn ends with the plain sentence (#2188).
@@ -355,7 +498,13 @@ def _turn_failure(
             provider=no_model.provider,
         )
         return "model_unavailable", failure.message, failure
-    logger.exception("Error executing turn for agent %s", agent_id)
+    logger.exception(
+        "Error executing turn for agent %s (session %s, room %s)",
+        agent_id,
+        session_id,
+        room_id,
+        extra={"session_id": session_id},
+    )
     return stop_reason, str(exc), None
 
 
@@ -369,6 +518,51 @@ _PROVIDER_STOP_REASONS: dict[ProviderFailureKind, TurnStopReason] = {
     ProviderFailureKind.PROVIDER_OUTAGE: "provider_outage",
     ProviderFailureKind.PROVIDER_ERROR: "provider_error",
 }
+
+
+#: How many times one call may be refused for the same reason in a turn before it is not
+#: run again (#2300). A live Writer on qwen3:8b retried the same refused write 155 times
+#: across four turns, until each step's results overflowed the window and the turn was
+#: lost; two identical refusals already say the call cannot work.
+REPEATED_REFUSAL_LIMIT = 2
+
+
+def call_shape(arguments: Mapping[str, object], keys: frozenset[str] | None) -> str:
+    """What makes two calls of one tool the same call: the arguments named by `keys` (a
+    tool's `retry_key_arguments`), or every argument when it names none."""
+    kept = {k: v for k, v in arguments.items() if keys is None or k in keys}
+    return json.dumps(kept, sort_keys=True, ensure_ascii=False, default=str)
+
+
+def repeated_refusals(
+    tool_calls: Sequence[ToolCallRequest],
+    prior: Sequence[ToolExecutionRecord],
+    keys_of: Callable[[str], frozenset[str] | None] = lambda _name: None,
+) -> dict[str, int]:
+    """The calls among `tool_calls` this turn already saw refused the same way
+    `REPEATED_REFUSAL_LIMIT` times or more, by call id, with that count.
+
+    The same call is the same tool with the same arguments, or with the same of those its
+    tool names as its target (`keys_of`; `story_manuscript` names the scene, so a rewrite
+    with new text is the same call). The same way is the same error text. A call to the
+    same tool with other arguments is another call: two timeouts on two URLs do not stop
+    a third URL (#2302 review).
+    """
+    counts = Counter(
+        (record.tool_name, call_shape(record.arguments, keys_of(record.tool_name)), error)
+        for record in prior
+        if record.status is ToolResultStatus.ERROR and (error := (record.error or "").strip())
+    )
+    repeated: dict[str, int] = {}
+    for call in tool_calls:
+        shape = call_shape(call.arguments, keys_of(call.name))
+        times = max(
+            (n for (name, seen, _), n in counts.items() if name == call.name and seen == shape),
+            default=0,
+        )
+        if times >= REPEATED_REFUSAL_LIMIT:
+            repeated[call.id] = times
+    return repeated
 
 
 def _repeats_unanswered_prompt(history: Sequence[ChatMessage], user_prompt: ChatMessage) -> bool:
@@ -665,6 +859,11 @@ class TurnExecutor:
         self._turn_person_names: tuple[str, ...] = ()
         #: The running turn's aids, worked out once at its start (#1808).
         self._turn_aids: tuple[TurnAidProtocol, ...] = ()
+        #: The running turn's person's language, for the sentence a stopped turn ends with.
+        self._turn_language: Language = "en"
+        #: The running turn's thinking-budget cut, once one happened (#2202): every later
+        #: step of the turn is asked with thinking off, and its answer names the retry.
+        self._thinking_cut: AttemptRecord | None = None
         #: The last tool step's result handles, by call id, for its `TOOL_RESULT` events.
         self._step_result_handles: dict[str, str] = {}
 
@@ -894,6 +1093,8 @@ class TurnExecutor:
         turn_live.recalled_memory = await self._prompt_assembler.recall_memory(message)
         self._log_recalled_memory(turn_live)
         self._turn_aids = self._work_out_turn_aids(message)
+        self._turn_language = "ko" if is_korean(message) else "en"
+        self._thinking_cut = None
         sections = list(present_sections(undone_section, image_set_section, case_section))
         sections.extend(aid.section for aid in self._turn_aids)
         return sections, image_set_section
@@ -980,6 +1181,32 @@ class TurnExecutor:
                 aids.append(aid)
         return tuple(aids)
 
+    def _calls_of(
+        self,
+        resp: ModelResponse,
+        step: int,
+        durable_events: list[dict[str, Any]],
+    ) -> tuple[ToolCallRequest, ...]:
+        """The step's calls, without the turn context a model copied into them (#2264).
+
+        The person's words reach a tool as the person wrote them, never with the runtime's
+        `[Turn Context]` block that the request joined to them (`calls_without_turn_context`).
+        The response itself is logged as the model sent it (`MODEL_RESPONSE`); this event
+        names the calls whose arguments were cleaned, so the difference is on the record.
+        """
+        block = self._prompt_assembler.sent_turn_context
+        calls, cleaned = calls_without_turn_context(resp.tool_calls, block)
+        if cleaned:
+            durable_events.append(
+                {
+                    "type": "TURN_CONTEXT_REMOVED_FROM_CALLS",
+                    "step": step,
+                    "turn_index": self._turn_counter,
+                    "tool_call_ids": list(cleaned),
+                }
+            )
+        return calls
+
     def _late_nudge(
         self,
         content: str,
@@ -998,8 +1225,9 @@ class TurnExecutor:
         and no tool call is asked again for a reply (#1808): qwen3:8b ended 3 of 8 Writer
         turns that way. Only while no nudge of any kind has been sent this turn (`asked`):
         an empty answer to the evidence or grounding nudge already keeps the first answer. A step cut off by the output limit never gets here (it raises
-        `TokenBudgetExhaustedError`), so an empty reply here had room left to write, and a
-        second one stops the turn as it did before. Otherwise an answer that links an image
+        `TokenBudgetExhaustedError`), so an empty reply here had room left to write. A turn
+        that still ends with nothing to show ends with `EMPTY_REPLY_MESSAGE` instead
+        (`_finished_reply`, #2264). Otherwise an answer that links an image
         no tool made is asked to make it (`evaluate_artifact_nudge`). Records the nudge's
         durable event; returns its text, or `None` when there is none to give.
         """
@@ -1035,10 +1263,15 @@ class TurnExecutor:
         resp_content: str,
         assistant_msg_idx: int | None,
     ) -> str:
-        """Sanitize missing image links after the turn completes."""
+        """Sanitize missing image links after the turn completes, and give the reply as the
+        turn's aids give it to the person (`_aid_reply_text`, #2300).
+
+        One call from `execute_turn`, which sits at pyright's flow-analysis limit: a second
+        statement there makes pyright stop reading the function.
+        """
         # ``k_act`` (#2188): an answer that ends in a cut-off opening tag loses it.
         shown = self._tool_invoker.visible_reply(resp_content)
-        sanitized = apply_artifact_sanitization(shown, self.workspace_root)
+        sanitized = self._aid_reply_text(apply_artifact_sanitization(shown, self.workspace_root))
         if (
             sanitized != resp_content
             and assistant_msg_idx is not None
@@ -1046,6 +1279,104 @@ class TurnExecutor:
         ):
             self._rewrite_answer(assistant_msg_idx, sanitized, "artifact_sanitized")
         return sanitized
+
+    def _aid_reply_text(self, content: str) -> str:
+        """`content` as the turn's aids give it to the person (`ReplyTextAidProtocol`).
+
+        An aid that raises leaves the reply as it was (`_of_aid`): a domain's bug costs its
+        rewrite, never the turn's finish (#2303).
+        """
+        for aid in self._turn_aids:
+            if not isinstance(aid, ReplyTextAidProtocol):
+                continue
+            rewritten = self._of_aid(lambda a=aid, c=content: a.reply_text(c), "rewrite the reply")
+            content = content if rewritten is None else rewritten
+        return content
+
+    def _aid_lines(self, records: Sequence[ToolExecutionRecord], *, korean: bool) -> list[str]:
+        """Every turn aid's reply lines; an aid that raises adds none (`_of_aid`, #2303)."""
+        lines: list[str] = []
+        for aid in self._turn_aids:
+            given = self._of_aid(
+                lambda a=aid: a.reply_lines(records, korean=korean), "give its reply lines"
+            )
+            lines.extend(given or [])
+        return lines
+
+    def _of_aid(self, call: Callable[[], _AidResult], what: str) -> _AidResult | None:
+        """What a turn aid's `call` returns, or `None` when it raises; the raise is logged.
+
+        A turn aid is a host's domain code, run at the turn's finish: its bug must not take
+        the person's reply with it, as a raise when an aid is worked out does not either
+        (`_work_out_turn_aids`).
+        """
+        try:
+            return call()
+        except Exception:
+            logger.warning(
+                "Agent %s: a turn aid failed to %s; the turn finishes without it",
+                self.agent_id,
+                what,
+                exc_info=True,
+            )
+            return None
+
+    async def _finished_reply(
+        self,
+        content: str,
+        assistant_msg_idx: int | None,
+        message: str,
+        records: Sequence[ToolExecutionRecord],
+        durable_events: list[dict[str, Any]],
+        emit: Callable[[str, dict[str, Any]], Awaitable[None]],
+    ) -> str:
+        """The finished turn's reply as the person is given it, which is never empty (#2264).
+
+        Sanitized and given as the turn's aids give it (`_sanitize_turn_artifacts`), with
+        the lines code adds (`_add_reply_lines`). A reply that is still blank after all of
+        that -- the re-ask spent and the model silent again, as qwen3:8b's Writer was twice
+        in one live run after its calls were refused -- ends the turn with the plain
+        sentence instead: a row with no reply and no reason reads as a model still working.
+        Unless the turn's calls produced files -- a picture made, a file written: then the
+        reply says what was done (`agent/work_done.py`, #2322), so the person is
+        not sent to ask for the same work again. One call from `execute_turn`, which sits
+        at pyright's flow-analysis limit.
+
+        A nudged retry that wrote nothing leaves the answer it rejected standing in history
+        as the turn's only answer (design §5.5); that answer is the reply, not a blank one
+        (`_standing_answer`).
+
+        Raises:
+            EmptyReplyError: The reply is blank, and the turn's calls produced no file.
+        """
+        content = content if content.strip() else self._standing_answer(assistant_msg_idx)
+        shown = self._sanitize_turn_artifacts(content, assistant_msg_idx)
+        shown = await self._add_reply_lines(
+            shown, assistant_msg_idx, message, records, durable_events, emit
+        )
+        if not shown.strip():
+            done = work_done_lines(work_done(records), self._turn_language)
+            if not done:
+                raise EmptyReplyError(self._turn_language)
+            shown = await self._add_reply_lines(
+                shown, assistant_msg_idx, message, (), durable_events, emit, extra=done
+            )
+        return shown
+
+    def _standing_answer(self, assistant_msg_idx: int | None) -> str:
+        """The answer this turn left standing in history, or "".
+
+        `assistant_msg_idx` is set only by this turn. It names a message with text and no
+        calls only when that message is the turn's answer: one a nudged retry rejected and
+        then, writing nothing, could not replace.
+        """
+        history = self._history
+        if assistant_msg_idx is None or assistant_msg_idx >= len(history):
+            return ""
+        standing = history[assistant_msg_idx]
+        if standing.role is not MessageRole.ASSISTANT or standing.tool_calls:
+            return ""
+        return standing.content or ""
 
     async def _add_reply_lines(
         self,
@@ -1055,8 +1386,11 @@ class TurnExecutor:
         records: Sequence[ToolExecutionRecord],
         durable_events: list[dict[str, Any]],
         emit: Callable[[str, dict[str, Any]], Awaitable[None]],
+        extra: Sequence[str] = (),
     ) -> str:
         """`content` with the lines code adds to a finished turn's reply (#1808).
+
+        `extra` is lines the caller adds after those, as they are (`_finished_reply`).
 
         Each tool's reply note and each turn aid's line, in the language of `message`,
         once each and only when the reply does not already hold it (`agent/reply_lines.py`).
@@ -1066,8 +1400,9 @@ class TurnExecutor:
         """
         korean = is_korean(message)
         wanted = [
-            *reply_notes(records, korean=korean),
-            *(line for aid in self._turn_aids for line in aid.reply_lines(records, korean=korean)),
+            *reply_notes(records, korean=korean, reply=content),
+            *self._aid_lines(records, korean=korean),
+            *extra,
         ]
         added = lines_to_add(content, wanted)
         if not added:
@@ -1252,54 +1587,63 @@ class TurnExecutor:
             chunks_received = 0
             # A label for the log lines below, not an attribution.
             eff_model_name = requested_model or "an unreported model"
+            budget = self._config.thinking_budget_tokens
+            started = asyncio.get_running_loop().time()
             try:
-                async for chunk in llm.stream(req):
-                    chunks_received += 1
-                    if chunk.model:
-                        served_model = chunk.model
-                        eff_model_name = chunk.model
-                    if chunk.delta_thinking:
-                        thinking_chunks.append(chunk.delta_thinking)
-                        if len(thinking_chunks) == 1:
-                            logger.info(
-                                "🧠 [%s] Model %s began thinking/reasoning",
-                                self.agent_id,
-                                eff_model_name,
+                async with _closing(llm.stream(req)) as chunks:
+                    async for chunk in chunks:
+                        chunks_received += 1
+                        if chunk.model:
+                            served_model = chunk.model
+                            eff_model_name = chunk.model
+                        if chunk.delta_thinking:
+                            thinking_chunks.append(chunk.delta_thinking)
+                            if budget is not None and len(thinking_chunks) > budget:
+                                raise ThinkingBudgetExceededError(
+                                    len(thinking_chunks),
+                                    budget,
+                                    asyncio.get_running_loop().time() - started,
+                                )
+                            if len(thinking_chunks) == 1:
+                                logger.info(
+                                    "🧠 [%s] Model %s began thinking/reasoning",
+                                    self.agent_id,
+                                    eff_model_name,
+                                )
+                            elif len(thinking_chunks) % 50 == 0:
+                                logger.debug(
+                                    "🧠 [%s] Model %s thinking progress: %d tokens",
+                                    self.agent_id,
+                                    eff_model_name,
+                                    len(thinking_chunks),
+                                )
+                            res = stream_callback(
+                                "status",
+                                {"status": "thinking", "detail": chunk.delta_thinking},
                             )
-                        elif len(thinking_chunks) % 50 == 0:
-                            logger.debug(
-                                "🧠 [%s] Model %s thinking progress: %d tokens",
-                                self.agent_id,
-                                eff_model_name,
-                                len(thinking_chunks),
+                            if asyncio.iscoroutine(res):
+                                await res
+                        if chunk.delta_content:
+                            if thinking_chunks and not content_chunks:
+                                logger.info(
+                                    "💬 [%s] Model %s finished thinking (%d tokens); generating response",
+                                    self.agent_id,
+                                    eff_model_name,
+                                    len(thinking_chunks),
+                                )
+                            content_chunks.append(chunk.delta_content)
+                            res = stream_callback(
+                                "token",
+                                {"content": chunk.delta_content},
                             )
-                        res = stream_callback(
-                            "status",
-                            {"status": "thinking", "detail": chunk.delta_thinking},
-                        )
-                        if asyncio.iscoroutine(res):
-                            await res
-                    if chunk.delta_content:
-                        if thinking_chunks and not content_chunks:
-                            logger.info(
-                                "💬 [%s] Model %s finished thinking (%d tokens); generating response",
-                                self.agent_id,
-                                eff_model_name,
-                                len(thinking_chunks),
-                            )
-                        content_chunks.append(chunk.delta_content)
-                        res = stream_callback(
-                            "token",
-                            {"content": chunk.delta_content},
-                        )
-                        if asyncio.iscoroutine(res):
-                            await res
-                    if chunk.tool_calls:
-                        tool_calls_list.extend(chunk.tool_calls)
-                    if chunk.usage:
-                        last_usage = chunk.usage
-                    if chunk.finish_reason:
-                        last_finish = chunk.finish_reason
+                            if asyncio.iscoroutine(res):
+                                await res
+                        if chunk.tool_calls:
+                            tool_calls_list.extend(chunk.tool_calls)
+                        if chunk.usage:
+                            last_usage = chunk.usage
+                        if chunk.finish_reason:
+                            last_finish = chunk.finish_reason
             except asyncio.CancelledError:
                 # Stopped by the caller (the room's Stop). What streamed was served and is
                 # booked like an interrupted stream's, then the cancellation propagates
@@ -1314,6 +1658,20 @@ class TurnExecutor:
                     content_chunks,
                 )
                 progress.usage = cancelled_usage
+                raise
+            except ThinkingBudgetExceededError:
+                # Cut by the thinking budget (#2202): the stream is already closed. What it
+                # thought was served, so it is booked, as an interrupted stream's is.
+                cut_usage = self._book_partial_stream(
+                    llm,
+                    req,
+                    last_usage,
+                    served_model or requested_model,
+                    chunks_received,
+                    tool_calls_list,
+                    [*thinking_chunks, *content_chunks],
+                )
+                progress.usage = cut_usage
                 raise
             except UsageLimitReachedError:
                 # The usage gate refused before the first chunk: nothing was sent, so nothing
@@ -1468,6 +1826,131 @@ class TurnExecutor:
         durable_events: list[dict[str, Any]],
         step_usages: list[TokenUsage],
     ) -> ModelResponse:
+        """`_invoke_step_once`, with a runaway thought cut and asked once more (#2202).
+
+        A step cut by the thinking budget is asked again with the same messages and
+        thinking off: at temperature 0 an identical request runs away the same way. The cut
+        is recorded (`THINKING_BUDGET_STOP`), announced as a retry (P6: a `failover.event`
+        span, a `RETRY` event, and `provenance.path == retry` on every answer of the turn
+        from then on), and shown to the person as a plain status. Every later step of the
+        turn is asked with thinking off too. A second cut ends the turn with the plain
+        sentence `step.thinking_budget`, and so does a retry the server refuses as sent
+        (`LLMRequestRefusedError`, #2322): a model that can only think cannot be asked less.
+        """
+        cut = self._thinking_cut
+        # Every later step of a turn that ran away once is asked with thinking off.
+        req = req if cut is None else req.model_copy(update={"thinking": False})
+        try:
+            resp = await self._invoke_step_once(
+                llm, req, step, stream_callback, durable_events, step_usages
+            )
+        except ThinkingBudgetExceededError as exc:
+            if cut is not None:
+                raise TurnStoppedError(
+                    "step.thinking_budget", "thinking_budget", self._turn_language
+                ) from exc
+            self._thinking_cut = await self._announce_thinking_cut(
+                llm, req, step, exc, stream_callback, durable_events
+            )
+            try:
+                return await self._invoke_step_model(
+                    llm, req, step, stream_callback, durable_events, step_usages
+                )
+            except TurnStoppedError:
+                raise
+            except Exception as retry_exc:
+                # A model that can only think may be refused the thinking-off request
+                # (#2322): there is no request left that thinks less, so the turn ends as a
+                # second cut does. Any other failure of the retry stays what it is.
+                if _in_cause_chain(retry_exc, LLMRequestRefusedError) is None:
+                    raise
+                raise TurnStoppedError(
+                    "step.thinking_budget", "thinking_budget", self._turn_language
+                ) from retry_exc
+        return _with_retry_provenance(resp, cut)
+
+    async def _announce_thinking_cut(
+        self,
+        llm: LLMProviderProtocol,
+        req: LLMRequest,
+        step: int,
+        exc: ThinkingBudgetExceededError,
+        stream_callback: Callable[[str, dict[str, Any]], Awaitable[None] | None] | None,
+        durable_events: list[dict[str, Any]],
+    ) -> AttemptRecord:
+        """Record, announce and show a thinking-budget cut; return its attempt (#2202, P6)."""
+        provider = llm.provider_name
+        model = named_model(req.model)
+        durable_events.append(
+            {
+                "type": "THINKING_BUDGET_STOP",
+                "turn_index": self._turn_counter,
+                "step": step,
+                "reason": "thinking_budget",
+                "thinking_tokens": exc.thinking_tokens,
+                "budget": exc.budget,
+                "elapsed_s": round(exc.elapsed_s, 3),
+                "retry": "thinking_off",
+                "at": _now_iso(),
+            }
+        )
+        logger.info("Agent %s: %s Asking once more with thinking off.", self.agent_id, exc)
+        span_id = self._tracer.start_span(
+            FAILOVER_EVENT_SPAN_NAME,
+            attributes={
+                "requested_provider": provider,
+                "served_provider": provider,
+                "error_class": type(exc).__name__,
+                "error_message": str(exc),
+            },
+        )
+        self._tracer.end_span(span_id=span_id, status=SpanStatus.ERROR, error_message=str(exc))
+        attempt = AttemptRecord(
+            provider=provider, model=model, error_class=type(exc).__name__, span_id=span_id
+        )
+        if self._bus is not None:
+            retry_event = AgentEvent(
+                type=EventType.RETRY,
+                recipient_id=self.agent_id,
+                topic="agent.chat.retry",
+                priority=EventPriority.NORMAL,
+                payload={
+                    "requested_provider": provider,
+                    "requested_model": model,
+                    "error_class": type(exc).__name__,
+                    "error_message": str(exc),
+                    "span_id": span_id,
+                    "session_id": self._context.session_id,
+                },
+                provenance=Provenance(
+                    path=ExecutionPath.RETRY,
+                    requested=ServiceRef(provider=provider, model=model),
+                    served_by=ServiceRef(provider=provider, model=model),
+                    attempts=(attempt,),
+                ),
+                trace_id=self._tracer.trace_id,
+            )
+            if self._publisher is not None:
+                await self._publisher.publish(retry_event)
+            else:
+                await self._bus.publish(retry_event)
+        if stream_callback is not None:
+            shown = stream_callback(
+                "status", {"status": "retrying", "detail": THINKING_RETRY_STATUS}
+            )
+            if asyncio.iscoroutine(shown):
+                await shown
+        return attempt
+
+    async def _invoke_step_once(
+        self,
+        llm: LLMProviderProtocol,
+        req: LLMRequest,
+        step: int,
+        stream_callback: Callable[[str, dict[str, Any]], Awaitable[None] | None] | None,
+        durable_events: list[dict[str, Any]],
+        step_usages: list[TokenUsage],
+    ) -> ModelResponse:
         """`_invoke_model`, recorded as one `MODEL_RESPONSE` whether it returns or raises.
 
         On an exception -- cancellation included -- the event carries what had streamed
@@ -1518,6 +2001,7 @@ class TurnExecutor:
                         "type": type(invoke_exc).__name__,
                         "message": str(invoke_exc),
                         "partial_content": partial_content,
+                        **_provider_answer(invoke_exc),
                     },
                     **_model_name_reason(
                         err_model,
@@ -1970,7 +2454,7 @@ class TurnExecutor:
                         llm, req, step, stream_callback, durable_events, step_usages
                     )
                     resp_content = resp.content or ""
-                    tool_calls = resp.tool_calls
+                    tool_calls = self._calls_of(resp, step, durable_events)
 
                     if (
                         not tool_calls
@@ -2319,7 +2803,11 @@ class TurnExecutor:
                             tool_executions=tuple(tool_executions),
                             is_completed=False,
                             text_emitted_tool_calls=tuple(text_emitted),
-                            error=STEP_REFUSAL_TEXT[step_refusal],
+                            # In the person's language, by the rule reply notes follow
+                            # (#2300): the row's text is read by heads and records.
+                            error=refusal_text(
+                                step_refusal, "ko" if is_korean(content_input) else "en"
+                            ),
                             error_code=step_refusal,
                             stop_reason=stop_reason,
                             correlation_id=correlation_id,
@@ -2379,8 +2867,7 @@ class TurnExecutor:
                                 ChatMessage(role=MessageRole.ASSISTANT, content=resp_content)
                             )
 
-                resp_content = self._sanitize_turn_artifacts(resp_content, assistant_msg_idx)
-                resp_content = await self._add_reply_lines(
+                resp_content = await self._finished_reply(
                     resp_content,
                     assistant_msg_idx,
                     content_input,
@@ -2530,9 +3017,18 @@ class TurnExecutor:
                 # prose, and prose is not something a caller can branch on without
                 # guessing at a provider's wording (#1277).
                 stop_reason, failure, provider_failure = _turn_failure(
-                    exc, stop_reason, self.agent_id
+                    exc,
+                    stop_reason,
+                    self.agent_id,
+                    session_id=self._context.session_id,
+                    room_id=self._turn_room_id,
                 )
                 req_model = self._config.llm_config.model_name
+                # The service the turn asked, named as every other provenance names it --
+                # the connector's provider -- not the agent (#2229). A connector that cannot
+                # say its name keeps the agent id rather than an invented one.
+                named = getattr(self._llm, "provider_name", None)
+                req_provider = named if isinstance(named, str) and named else self.agent_id
 
                 # Execute ON_ERROR hook
                 err_ctx = HookContext(
@@ -2555,7 +3051,7 @@ class TurnExecutor:
                 span_id = self._tracer.start_span(
                     FAILOVER_EVENT_SPAN_NAME,
                     attributes={
-                        "requested_provider": self.agent_id,
+                        "requested_provider": req_provider,
                         "served_provider": "agent.core",
                         "served_model": "error_handler",
                         "error_class": type(exc).__name__,
@@ -2571,7 +3067,7 @@ class TurnExecutor:
                 failover_provenance = Provenance(
                     path=ExecutionPath.FAILOVER,
                     requested=ServiceRef(
-                        provider=self.agent_id,
+                        provider=req_provider,
                         model=req_model,
                     ),
                     served_by=ServiceRef(
@@ -2580,7 +3076,7 @@ class TurnExecutor:
                     ),
                     attempts=(
                         AttemptRecord(
-                            provider=self.agent_id,
+                            provider=req_provider,
                             model=req_model,
                             error_class=type(exc).__name__,
                             span_id=span_id,
@@ -2626,6 +3122,7 @@ class TurnExecutor:
                     tool_executions_complete=not tools_unreported,  # a failure mid-step
                     is_completed=False,
                     error=failure,
+                    error_code=exc.code if isinstance(exc, TurnStoppedError) else None,
                     provider_failure=provider_failure,
                     stop_reason=stop_reason,
                     correlation_id=correlation_id,
@@ -3003,6 +3500,49 @@ class TurnExecutor:
             )
         return messages, executions
 
+    def _retry_keys_of(self, name: str) -> frozenset[str] | None:
+        """The arguments `name`'s tool names as what a call to it acts on, if any."""
+        keys: object = getattr(self._tool_invoker.resolve(name), "retry_key_arguments", None)
+        if not isinstance(keys, frozenset):
+            return None
+        return frozenset(str(key) for key in cast("frozenset[object]", keys))
+
+    async def _run_skipping_repeats(
+        self,
+        tool_calls: Sequence[ToolCallRequest],
+        repeated: Mapping[str, int],
+        stream_callback: Callable[[str, dict[str, Any]], Awaitable[None] | None] | None,
+        shown_tool_names: set[str],
+    ) -> tuple[list[ChatMessage], list[ToolExecutionRecord]]:
+        """The step with each repeated refused call skipped and every other call run (#2300).
+
+        Only the repeating calls are skipped: the tools stay offered, so the model can still
+        do what the refusal asked, or use any other tool (#2302 review). The results come
+        back in the order the model made the calls.
+        """
+        skipped = [tc for tc in tool_calls if tc.id in repeated]
+        run = [tc for tc in tool_calls if tc.id not in repeated]
+        results: dict[str, tuple[ChatMessage, ToolExecutionRecord]] = {}
+        for call in skipped:
+            notice = (
+                f"This call to {call.name} was refused {repeated[call.id]} times in this turn "
+                "for the same reason, so it was not run again. Do not repeat it: do what the "
+                "refusal said instead, or conclude your reply and tell the person, in their "
+                "language, what stopped it."
+            )
+            [message], [record] = self._synthesize_guarded_tool_results([call], notice)
+            results[call.id] = (message, record)
+        if run:
+            messages, records = await self._execute_tools(
+                tuple(run), stream_callback=stream_callback, advertised=frozenset(shown_tool_names)
+            )
+            if self._tool_invoker.tools_module == "k_act":
+                self._announce_bound_on_call(messages, records, shown_tool_names)
+            for call, message, record in zip(run, messages, records, strict=True):
+                results[call.id] = (message, record)
+        ordered = [results[tc.id] for tc in tool_calls]
+        return [m for m, _ in ordered], [r for _, r in ordered]
+
     async def _execute_step_tools(
         self,
         tool_calls: tuple[ToolCallRequest, ...] | list[ToolCallRequest],
@@ -3013,6 +3553,8 @@ class TurnExecutor:
         shown_tool_names: set[str],
     ) -> tuple[list[ChatMessage], list[ToolExecutionRecord], bool]:
         """Execute or intercept tool calls, applying loop and budget guardrails."""
+        # The step's guardrail first: a repeat skipped below must never let the step's other
+        # calls past the duplicate-image or the context-overflow guard (#2302 re-review).
         guard_notice = self._evaluate_tool_guardrail(tool_calls, tool_executions, req)
         if guard_notice is not None:
             tool_messages, step_executions = self._synthesize_guarded_tool_results(
@@ -3021,6 +3563,14 @@ class TurnExecutor:
             tool_defs.clear()
             shown_tool_names.clear()
             return tool_messages, step_executions, True
+        repeated = repeated_refusals(tool_calls, tool_executions, self._retry_keys_of)
+        if repeated:
+            return (
+                *await self._run_skipping_repeats(
+                    tool_calls, repeated, stream_callback, shown_tool_names
+                ),
+                False,
+            )
 
         tool_messages, step_executions = await self._execute_tools(
             tuple(tool_calls),

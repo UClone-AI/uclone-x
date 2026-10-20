@@ -25,8 +25,8 @@ import yaml
 from playwright.async_api import Page, async_playwright, expect
 
 from tests.e2e.conftest import mock_llm, running_ui
-from uclone_x.story.library import StoryLibrary
-from uclone_x.story.schemas import Chapter, Outline, Proposal, Scene, dump_file
+from uclone_x_story.library import StoryLibrary
+from uclone_x_story.schemas import Chapter, Outline, Proposal, Scene, dump_file
 
 pytestmark = pytest.mark.e2e
 
@@ -186,7 +186,9 @@ async def test_a_person_decides_a_proposal_in_the_story_view(
                 timeout=10_000
             )
             vane = yaml.safe_load((root / "codex/characters/vane.yaml").read_text("utf-8"))
-            assert vane["progressions"] == [{"at": "ch01.s01", "set": {"wounded": True}}]
+            assert vane["progressions"] == [
+                {"at": "ch01.s01", "set": {"wounded": True}, "proposal": "p001"}
+            ]
             decided = yaml.safe_load((root / "proposals/p001.yaml").read_text("utf-8"))
             assert (decided["status"], decided["decided_in"]) == ("applied", "story_view")
 

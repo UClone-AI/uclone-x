@@ -1,9 +1,9 @@
 """The agent imports no domain; the story moves through a composed lifecycle hook (#1732).
 
 `BaseAgent` carries a turn's `story_id` to its tool calls but no longer decides how it
-moves: `uclone_x.story.StoryLifecycleHook` does, and every head composes it in through
+moves: `uclone_x_story.StoryLifecycleHook` does, and every head composes it in through
 `agent/clone_builder.py`, which takes it from the story extension (#2205). These tests pin
-the three halves of that: the agent package names nothing in `uclone_x.story`, the hook moves the story exactly as `story_after` says,
+the three halves of that: the agent package names nothing in `uclone_x_story`, the hook moves the story exactly as `story_after` says,
 and both places that compose an agent for a head -- `build_clone` and the peer-call
 handler -- put the hook in.
 """
@@ -28,11 +28,11 @@ from uclone_x.engine.event_bus import EventBus
 from uclone_x.llm.connectors.mock import MockLLMConnector
 from uclone_x.room import a2a_handlers
 from uclone_x.room.a2a_handlers import PersonaTaskHandler
-from uclone_x.story import OPEN_STORY_KEY, StoryLifecycleHook
 from uclone_x.telemetry.tracer import TelemetryTracer
 from uclone_x.tools.builtin.a2a import A2A_DEPTH_KEY
 from uclone_x.tools.models import ToolContext, ToolResultStatus
 from uclone_x.tools.registry import ToolRegistry
+from uclone_x_story import OPEN_STORY_KEY, StoryLifecycleHook
 
 AGENT_PACKAGE = Path(__file__).resolve().parents[2] / "src" / "uclone_x" / "agent"
 
@@ -52,7 +52,7 @@ def _story_hooks(hooks: tuple[Any, ...]) -> list[Any]:
 
 
 def test_the_agent_package_imports_nothing_from_the_story_domain() -> None:
-    """No module under `agent/` imports `uclone_x.story` (#1732).
+    """No module under `agent/` imports `uclone_x_story` (#1732).
 
     Checked at every scope, `TYPE_CHECKING` included; a relative import is resolved
     against its module's package, and `from uclone_x import story` counts too. Since #2205
@@ -67,14 +67,14 @@ def test_the_agent_package_imports_nothing_from_the_story_domain() -> None:
                 continue
             package = package_of(f"agent/{path.relative_to(AGENT_PACKAGE).as_posix()}")
             names = imported_modules(node, package)
-            hits = [n for n in names if n == "uclone_x.story" or n.startswith("uclone_x.story.")]
+            hits = [n for n in names if n == "uclone_x_story" or n.startswith("uclone_x_story.")]
             if hits:
                 offenders.append(f"{path.relative_to(AGENT_PACKAGE)}: {hits[0]}")
     assert offenders == []
 
 
 def test_the_story_hook_moves_the_story_a_declaring_call_names(tmp_path: Path) -> None:
-    """Killed by: src/uclone_x/story/__init__.py :: return context.model_copy(update={"story_id": story})
+    """Killed by: examples/story/src/uclone_x_story/__init__.py :: return context.model_copy(update={"story_id": story})
     Becomes: return context
     """
     hook = StoryLifecycleHook()

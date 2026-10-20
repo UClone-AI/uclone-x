@@ -44,7 +44,8 @@ async def test_a_field_changed_is_kept_across_a_reload(
     lethality ratchet runs a browser test against the committed bundle without rebuilding
     it: rebuilt with `vite build` after `readRootsSave.commit(next);` in
     `handleAddReadRoot` of `frontend/src/components/SettingsModal.tsx` became nothing, this
-    fails waiting for the save.
+    fails waiting for the save. The load race behind #2252 is pinned in vitest
+    (`keeps a folder typed while the settings are still loading`), where it is deterministic.
     """
     papers = tmp_path / "papers"
     papers.mkdir()
@@ -54,7 +55,13 @@ async def test_a_field_changed_is_kept_across_a_reload(
             page = await browser.new_page(viewport={"width": 1400, "height": 900})
             await page.goto(server, wait_until="networkidle")
 
-            await page.get_by_test_id("open-settings").click()
+            # Wait for the settings the window loads as it opens, not only for the field to be
+            # drawn: the field is there before they arrive. Until #2252 their arrival cleared
+            # it, so under load the folder typed below was lost and the save never came.
+            async with page.expect_response(
+                lambda r: r.url.endswith("/api/settings") and r.request.method == "GET"
+            ):
+                await page.get_by_test_id("open-settings").click()
             field = page.get_by_label("Folder to add")
             await field.wait_for(state="visible", timeout=10_000)
             assert await page.get_by_role("button", name="Save & Apply Settings").count() == 0

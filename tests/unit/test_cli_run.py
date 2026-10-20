@@ -1193,13 +1193,14 @@ def test_a_single_shot_reply_with_an_unbalanced_closing_tag_exits_zero_and_is_sa
     assert _assistant_texts(store, _only_seat(store, "tag-agent")) == ["closing [/bold] tag"]
 
 
-def test_an_empty_single_shot_reply_leaves_stdout_empty(
+def test_an_empty_single_shot_reply_fails_the_turn_with_the_plain_sentence(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """No placeholder where the reply goes: a script would read it as the model's answer.
+    """An empty reply is a failed turn (#2264): nothing on stdout, where a script reads the
+    reply, the plain sentence on stderr, and the failed-turn status.
 
-    Killed by: src/uclone_x/cli/commands/run.py :: err_console.print("[dim](No response content)[/dim]")
-    Becomes: console.print("[dim](No response content)[/dim]")
+    Killed by: src/uclone_x/agent/turn_executor.py :: if not shown.strip():
+    Becomes: if False:
     """
     _isolated_run_env(monkeypatch, tmp_path)
     _use_connector(monkeypatch, _answering_llm(""))
@@ -1208,9 +1209,10 @@ def test_an_empty_single_shot_reply_leaves_stdout_empty(
         main.app, ["run", "quiet-agent", "--prompt", "hello", "--cwd", str(tmp_path)]
     )
 
-    assert result.exit_code == 0, result.output
+    assert result.exit_code == run.FAILED_TURN_EXIT_CODE, result.output
     assert result.stdout == ""
-    assert "(No response content)" in result.stderr
+    assert "without writing a reply" in " ".join(result.stderr.split())
+    assert "(No response content)" not in result.stderr
 
 
 def test_single_shot_notices_name_the_agent_and_session_verbatim_on_stderr(
@@ -1749,13 +1751,14 @@ def test_a_single_shot_reply_keeps_trailing_whitespace_crlf_and_control_characte
     assert result.stdout_bytes == f"{_RAW_REPLY}\n".encode()
 
 
-def test_a_whitespace_only_single_shot_reply_is_written_not_replaced_by_the_placeholder(
+def test_a_whitespace_only_single_shot_reply_fails_like_an_empty_one(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """Only an empty reply is "no response". Spaces and a newline are a reply, and are written.
+    """Spaces and a newline show a person nothing, so they end the turn as an empty reply
+    does (#2264), never written to stdout as if they were the answer.
 
-    Killed by: src/uclone_x/cli/commands/run.py :: if reply_text:
-    Becomes: if reply_text.strip():
+    Killed by: src/uclone_x/agent/turn_executor.py :: if not shown.strip():
+    Becomes: if not shown:
     """
     _isolated_run_env(monkeypatch, tmp_path)
     _use_connector(monkeypatch, _answering_llm("  \n "))
@@ -1764,9 +1767,9 @@ def test_a_whitespace_only_single_shot_reply_is_written_not_replaced_by_the_plac
         main.app, ["run", "blank-agent", "--prompt", "hello", "--cwd", str(tmp_path)]
     )
 
-    assert result.exit_code == 0, result.output
-    assert result.stdout_bytes == b"  \n \n"
-    assert "(No response content)" not in result.stderr
+    assert result.exit_code == run.FAILED_TURN_EXIT_CODE, result.output
+    assert result.stdout_bytes == b""
+    assert "without writing a reply" in " ".join(result.stderr.split())
 
 
 def test_a_reply_written_into_a_closed_pipe_is_reported_and_the_turn_is_still_saved(
@@ -3081,3 +3084,170 @@ def test_the_repl_says_it_kept_a_record_when_it_exits_before_any_turn(
     assert result.exit_code == 0, result.output
     assert [p for p in path.parent.iterdir() if ".unreadable-" in p.name], "nothing set aside"
     assert run.SESSION_SET_ASIDE_NOTICE in " ".join(result.stdout.split())
+
+
+#: How the fake extension's factory fails, and what the person reads for it.
+_FACTORY_RAISES = (
+    'raise RuntimeError("secret cause at /srv/hidden/index.db")',
+    "The extension 'broken' could not start. Reinstall it, or uninstall it to run without it.",
+)
+#: The extension raises its own plain `ExtensionError`, chained to what went wrong.
+_FACTORY_CHAINS_ITS_OWN = (
+    "from uclone_x.extensions.contract import ExtensionError\n"
+    "    try:\n"
+    '        open("/srv/hidden/index.db")\n'
+    "    except OSError as exc:\n"
+    '        raise ExtensionError("The story index is missing.") from exc',
+    "The story index is missing.",
+)
+#: The contract refuses what the factory builds.
+_FACTORY_BREAKS_THE_CONTRACT = (
+    'from uclone_x.extensions.contract import Extension\n    return Extension(name="Bad Name")',
+    "An extension's name must be lowercase words such as 'story', not 'Bad Name'.",
+)
+
+
+def _a_broken_extension(site: Path, body: str) -> None:
+    """An installed extension whose factory runs `body`, as `site` on `PYTHONPATH` declares it.
+
+    A `.dist-info` beside a module is all `importlib.metadata.entry_points` reads, so the
+    child finds it exactly as it would an installed wheel's.
+    """
+    dist = site / "broken_ext-0.0.dist-info"
+    dist.mkdir(parents=True)
+    (dist / "METADATA").write_text(
+        "Metadata-Version: 2.1\nName: broken-ext\nVersion: 0.0\n", encoding="utf-8"
+    )
+    (dist / "entry_points.txt").write_text(
+        "[uclone_x.extensions]\nbroken = broken_ext:make\n", encoding="utf-8"
+    )
+    (site / "broken_ext.py").write_text(f"def make():\n    {body}\n", encoding="utf-8")
+
+
+def _log_records(logs: Path) -> list[dict[str, Any]]:
+    text = (logs / "ucx.log").read_text(encoding="utf-8")
+    return [json.loads(line) for line in text.splitlines() if line.strip()]
+
+
+@pytest.mark.parametrize(
+    ("factory", "words"),
+    [
+        pytest.param(*_FACTORY_RAISES, id="factory-raises"),
+        pytest.param(*_FACTORY_CHAINS_ITS_OWN, id="own-error-chained"),
+        pytest.param(*_FACTORY_BREAKS_THE_CONTRACT, id="contract-refuses"),
+    ],
+)
+def test_a_broken_extension_reaches_the_terminal_as_one_plain_sentence(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, factory: str, words: str
+) -> None:
+    """`ucx run` with an extension that cannot start: its words, then the log; no cause (#2290).
+
+    #2285 made `ExtensionError`'s message plain, but the launcher let it through to
+    `sys.excepthook`, so ~170 lines of Rich traceback above that sentence carried the
+    factory's own exception, its file and "The above exception was the direct cause".
+    The traceback belongs in `ucx.log` -- once, from the registry, where the extension
+    failed (#2292). That holds for an extension's own `ExtensionError` chained to its cause
+    and for a contract refusal too, which the registry used to re-raise unlogged: #2294's
+    review found their cause in no log at all once the launcher stopped adding it.
+
+    Killed by: src/uclone_x/shells/entry.py :: except ExtensionError as exc:
+    Becomes: except MissingDependencyError as exc:
+    Killed by: src/uclone_x/shells/entry.py :: "ucx: an extension stopped the command: %s",
+    Becomes: "ucx: stopped: %s",
+    Killed by: src/uclone_x/shells/entry.py :: exc_info=None if exc.cause_logged else exc,
+    Becomes: exc_info=exc,
+    Killed by: src/uclone_x/extensions/registry.py :: _logged(exc)
+    Becomes: pass
+    """
+    site = tmp_path / "site"
+    _a_broken_extension(site, factory)
+    logs = tmp_path / "logs"
+    for var in ("LLM_PROVIDER", "OTEL_EXPORTER_OTLP_ENDPOINT", "LANGFUSE_PUBLIC_KEY"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("UCX_LOG_DIR", str(logs))
+    monkeypatch.setenv("UCLONE_SESSION_DIR", str(tmp_path / "sessions"))
+    src = Path(run.__file__).resolve().parents[3]
+    monkeypatch.setenv("PYTHONPATH", os.pathsep.join([str(site), str(src)]))
+
+    child = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from uclone_x.shells.entry import main; main()",
+            *["run", "--provider", "mock", "--prompt", "hello", "--cwd", str(tmp_path)],
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+
+    assert child.returncode == 1, f"exit {child.returncode}:\n{child.stderr}"
+    assert words in child.stderr, child.stderr
+    for internal in (
+        "Traceback",
+        "direct cause",
+        "secret cause",
+        "/srv/hidden",
+        "RuntimeError",
+        "FileNotFoundError",
+        "ExtensionError",
+        "broken_ext",
+    ):
+        assert internal not in child.stderr, f"{internal!r} reached the terminal:\n{child.stderr}"
+    assert "The reason is in the log" in child.stderr
+    records = _log_records(logs)
+    # The traceback, naming the extension's own file, once: the registry's record.
+    with_cause = [r for r in records if "broken_ext.py" in r.get("exception", "")]
+    assert len(with_cause) == 1, records
+    assert with_cause[0]["logger"] == "uclone_x.extensions.registry"
+    if "/srv/hidden" in factory:
+        assert "/srv/hidden/index.db" in with_cause[0]["exception"]
+    # The launcher's own record says the command stopped, in the person's words.
+    stopped = [r for r in records if r["logger"] == "uclone_x.shells.entry"]
+    assert [r["message"] for r in stopped] == [f"ucx: an extension stopped the command: {words}"]
+    assert "exception" not in stopped[0]
+
+
+def test_an_extension_error_nothing_logged_keeps_its_cause_in_the_launchers_record(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An `ExtensionError` raised where the registry logs nothing: the launcher logs its cause.
+
+    A conflict, or an extension's error from a part the registry does not wrap. The printed
+    line still says the reason is in the log, so the launcher's record carries the
+    traceback whenever the error says its cause was not logged (#2294's review).
+
+    Killed by: src/uclone_x/shells/entry.py :: exc_info=None if exc.cause_logged else exc,
+    Becomes: exc_info=None,
+    """
+    logs = tmp_path / "logs"
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("UCX_LOG_DIR", str(logs))
+    src = Path(run.__file__).resolve().parents[3]
+    monkeypatch.setenv("PYTHONPATH", str(src))
+    script = (
+        "import sys\n"
+        "from uclone_x.cli.main import app\n"
+        "from uclone_x.extensions.contract import ExtensionError\n"
+        "@app.command('stops')\n"
+        "def stops() -> None:\n"
+        "    try:\n"
+        "        raise OSError('the vault at /srv/vault is gone')\n"
+        "    except OSError as exc:\n"
+        "        raise ExtensionError('The vault extension could not start.') from exc\n"
+        "from uclone_x.shells.entry import main\n"
+        "sys.argv = ['ucx', 'stops']\n"
+        "main()\n"
+    )
+
+    child = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, timeout=120, check=False
+    )
+
+    assert child.returncode == 1, child.stderr
+    assert "/srv/vault" not in child.stderr and "Traceback" not in child.stderr
+    stopped = [r for r in _log_records(logs) if r["logger"] == "uclone_x.shells.entry"]
+    assert len(stopped) == 1
+    assert "the vault at /srv/vault is gone" in stopped[0]["exception"]

@@ -324,8 +324,83 @@ async def test_ask_user_suspends_until_give_back_and_returns_snapshot(
     result = await asyncio.wait_for(task, timeout=1.0)
 
     assert result["status"] == "ok"
-    assert "Signed in" in result["message"]
     assert result["snapshot"] == "Dashboard content"
+
+
+async def test_ask_user_does_not_claim_a_sign_in_the_person_may_not_have_done(
+    service: BrowserService, fake_link: FakeLink
+) -> None:
+    """Giving the tab back says only that, and where the tab is: whether a sign-in happened
+    is `sign_in_likely`'s to say, and the person may have solved a CAPTCHA or closed a dialog.
+
+    Killed by: src/uclone_x/browser/service.py :: "message": f"The person gave the tab back. It is now at {tab.url}.",
+    Becomes: "message": f"Signed in — now at {tab.url}",
+    """
+    service._link = fake_link  # pyright: ignore[reportPrivateUsage]
+    tab = BrowserTab(target="tab-1", events=asyncio.Queue(), url="https://example.com/login")
+    key: TabKey = ("room-1", "scout")
+    service._windows[key] = BrowserWindow(tabs=[tab], active=0)  # pyright: ignore[reportPrivateUsage]
+    service.snapshot = AsyncMock(return_value={"snapshot": ""})  # pyright: ignore[method-assign]
+
+    asking = asyncio.create_task(service.ask_user(key, message="Please sign in"))
+    await asyncio.sleep(0.01)
+    service.give_back("room-1", "scout")
+    result = await asyncio.wait_for(asking, timeout=1.0)
+
+    assert "Signed in" not in result["message"]
+    assert "gave the tab back" in result["message"]
+    assert "https://example.com/login" in result["message"]
+
+
+class _PageLink(FakeLink):
+    """A page whose probe reports a password field (or not) and an HTTP status."""
+
+    def __init__(self, url: str, status: int, secret_field: bool) -> None:
+        super().__init__()
+        self.probe = [url, "Page", status, secret_field]
+
+    async def send(
+        self, tab: str, method: str, params: Mapping[str, Any] | None = None
+    ) -> dict[str, Any]:
+        if method == "Runtime.evaluate":
+            return {"result": {"value": self.probe}}
+        return await super().send(tab, method, params)
+
+
+@pytest.mark.parametrize(
+    ("url", "status", "secret_field", "asks"),
+    [
+        ("https://shop.example.com/login", 200, True, True),
+        ("https://shop.example.com/account", 401, False, True),
+        ("https://accounts.google.com/v3/signin", 200, False, True),
+        ("https://shop.example.com/", 200, False, False),
+    ],
+)
+async def test_every_observation_says_when_the_page_asks_for_a_sign_in(
+    url: str, status: int, secret_field: bool, asks: bool
+) -> None:
+    """Killed by: src/uclone_x/browser/service.py :: secret_field=secret_field is True,
+    Becomes: secret_field=False,
+    """
+    link = _PageLink(url, status, secret_field)
+
+    async def _factory() -> BrowserLink:
+        return link
+
+    service = BrowserService(_factory)
+    service._link = link  # pyright: ignore[reportPrivateUsage]
+    key: TabKey = ("room-1", "scout")
+    service._windows[key] = BrowserWindow(  # pyright: ignore[reportPrivateUsage]
+        tabs=[BrowserTab(target="tab-1", events=asyncio.Queue(), url=url)], active=0
+    )
+
+    for observed in (await service.snapshot(key), await service.find(key, "Sign in")):
+        assert observed["url"] == url
+        if asks:
+            assert "shop.example.com" in observed["sign_in_likely"] or "google" in url
+            assert "Call sign_in" in observed["sign_in_likely"]
+        else:
+            assert "sign_in_likely" not in observed
 
 
 def test_cdp_detached_canceled_by_user_takes_over_tab() -> None:

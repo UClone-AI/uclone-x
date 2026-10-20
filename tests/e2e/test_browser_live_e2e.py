@@ -16,8 +16,8 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from playwright.sync_api import sync_playwright
 
+from tests.support.chromium import chromium_executable
 from uclone_x.browser import BrowserService, R2Link
 from uclone_x.browser.live import LiveView
 from uclone_x.browser.tool import BrowserParams, BrowserTool
@@ -49,8 +49,7 @@ def site(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
 
 @pytest.fixture(scope="module")
 def chromium() -> Path:
-    with sync_playwright() as p:
-        return Path(p.chromium.executable_path)
+    return chromium_executable()
 
 
 @pytest.fixture

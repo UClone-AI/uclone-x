@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import type { PersonaInfo } from '../../types';
 import type { Messages } from '../../i18n';
 import type { ModelSet } from '../../lib/modelGateway';
+import { cloneIdOf } from '../../lib/cloneLabel';
 import {
   cloneLabel,
   draftFromPersona,
@@ -12,6 +13,7 @@ import {
   type PersonaEditMode,
   type PersonaEditorCopy,
   type PersonaSaveResult,
+  unreadableReason,
 } from '../../lib/personaDraft';
 import { PersonaEditor, type IconComponent, type PersonaEditorIcons } from './PersonaEditor';
 
@@ -167,16 +169,27 @@ export const PersonaManager: React.FC<PersonaManagerProps> = ({
         <p className="text-xs text-slate-500">{copy.emptyList}</p>
       ) : (
         <ul className="divide-y divide-slate-800/80 border border-slate-800 rounded-xl">
-          {personas.map((persona) => (
+          {personas.map((persona) => {
+            // A clone whose settings file could not be read (#2220): its row says why, in
+            // the Core's plain words, and there is nothing loaded to edit.
+            const unreadable = persona.status === 'unreadable';
+            return (
             <li
-              key={persona.name}
-              data-testid={`persona-row-${persona.name}`}
+              // By id: two clones can claim one handle, and both are listed (#2282, #2286).
+              // The handle is beside it, which is what the end-to-end tests know.
+              key={cloneIdOf(persona)}
+              data-clone-handle={persona.name}
+              data-testid={`persona-row-${cloneIdOf(persona)}`}
               className="px-3 py-2 flex items-center justify-between gap-3"
             >
               <div className="min-w-0">
                 <div className="flex items-center gap-2">
                   <span className="text-xs font-mono text-white truncate">{cloneLabel(persona, language)}</span>
-                  {persona.builtin ? (
+                  {unreadable ? (
+                    <span className="text-[10px] text-amber-300 border border-amber-800 rounded px-1">
+                      {copy.unreadableBadge}
+                    </span>
+                  ) : persona.builtin ? (
                     <span className="text-[10px] text-slate-400 border border-slate-700 rounded px-1">
                       {copy.builtinBadge}
                     </span>
@@ -186,11 +199,15 @@ export const PersonaManager: React.FC<PersonaManagerProps> = ({
                     </span>
                   ) : null}
                 </div>
-                <div className="text-[11px] text-slate-400 truncate">{persona.role}</div>
+                {unreadable ? (
+                  <p className="text-[11px] text-amber-200/90">{unreadableReason(persona, copy)}</p>
+                ) : (
+                  <div className="text-[11px] text-slate-400 truncate">{persona.role}</div>
+                )}
               </div>
               <button
                 type="button"
-                disabled={!canWrite}
+                disabled={!canWrite || unreadable}
                 aria-label={`${copy.edit} ${cloneLabel(persona, language)}`}
                 onClick={() =>
                   open({
@@ -205,7 +222,8 @@ export const PersonaManager: React.FC<PersonaManagerProps> = ({
                 {copy.edit}
               </button>
             </li>
-          ))}
+            );
+          })}
         </ul>
       )}
     </div>

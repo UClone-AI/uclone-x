@@ -107,6 +107,15 @@ def _refusal(message: str, context: ToolContext, start: float, tool: str) -> Too
     )
 
 
+def _child_failure(output: dict[str, Any]) -> dict[str, JsonValue]:
+    """What the peer kept of its failure, for this call's tool result record (#2227): its
+    stop reason and plain sentence, and what its provider answered. The peer's own session
+    is gone when the task ends, so this record is where a developer finds why. Empty when
+    the peer kept none; the failed result's write report (#2229) is beside it."""
+    failure = output.get("failure")
+    return {"failure": cast(JsonValue, failure)} if isinstance(failure, dict) else {}
+
+
 def _names(text: str, persona: str) -> bool:
     """Whether `text` is a sentence about `persona`: it starts with the name, or quotes it.
 
@@ -143,6 +152,16 @@ def _reported_paths(output: Mapping[str, Any]) -> list[str]:
         if isinstance(item, str) and item and item not in paths:
             paths.append(item)
     return paths
+
+
+def _write_report(agent: str, output: Mapping[str, Any]) -> dict[str, Any]:
+    """A stopped peer's account of what it wrote: the files it named, and whether it may
+    have written others. A peer that gives no account may have written (#2229)."""
+    return {
+        "agent": agent,
+        "paths": _reported_paths(output),
+        "unnamed_writes": output.get("unnamed_writes") is not False,
+    }
 
 
 class A2ACallTool(BaseTool[A2ACallParams]):
@@ -310,6 +329,10 @@ class A2ACallTool(BaseTool[A2ACallParams]):
             return ToolResult(
                 success=False,
                 error=error,
+                # What the peer says it wrote before it stopped, so the room does not have
+                # to guess (#2229), and what it kept of its failure (#2227). Its files are
+                # not this call's result: no `artifacts`.
+                output={**_write_report(call.agent, output), **_child_failure(output)},
                 execution_time_ms=elapsed,
                 isolation_level=ctx.isolation.level,
                 provenance=result.provenance,

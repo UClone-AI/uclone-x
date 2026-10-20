@@ -17,6 +17,7 @@ from rich.panel import Panel
 from rich.prompt import Prompt
 from rich.table import Table
 
+from uclone_x.agent.clone_builder import CloneUnreadableError
 from uclone_x.agent.loop import (
     LoopJob,
     LoopScheduler,
@@ -1114,9 +1115,10 @@ def run_agent_repl(
             f"[dim]{escape(str(exc))}[/dim]"
         )
         raise typer.Exit(code=2) from exc
-    except UnknownToolsModuleError as exc:
-        # The clone's file names a tools module this version lacks (#2188). Its sentence
-        # is written for the person; the class, the paths and the frames are not.
+    except (UnknownToolsModuleError, CloneUnreadableError) as exc:
+        # The clone's file names a tools module this version lacks (#2188), or could not
+        # be read at all (#2220). Its sentence is written for the person; the class, the
+        # paths and the frames are not.
         err_console.print(str(exc), markup=False, highlight=False)
         raise typer.Exit(code=1) from exc
     except LLMError as exc:

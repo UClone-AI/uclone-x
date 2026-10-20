@@ -154,7 +154,7 @@ let roomReadFault: Map<string, 'no-answer' | 'bare-500'>;
 let routeFault: Map<string, 'no-answer' | 'bare-500'>;
 /** A conversation's rows, by room id; empty where unnamed. */
 let transcriptsOnServer: Map<string, unknown[]>;
-let personasOnServer: { name: string }[];
+let personasOnServer: { name: string; status?: string }[];
 let modelsOnServer: string[];
 let currentModelOnServer: string;
 /** What `POST /api/rooms` refuses with, when it refuses. */
@@ -607,8 +607,8 @@ describe('App reads the seats on every landed turn (#1286)', () => {
 
 describe('App opens a conversation by itself (#1208)', () => {
   it('opens the most recent one, because there is no longer a surface to fall back to', async () => {
-    // Killed by: frontend/src/App.tsx :: const mostRecent = rooms[0];
-    // Becomes: const mostRecent = undefined;
+    // Killed by: frontend/src/App.tsx :: const openable = rooms.find((room) => !onlyUnreadableSeats(room));
+    // Becomes: const openable = undefined;
     render(<App />);
 
     await openedConversation();
@@ -620,8 +620,8 @@ describe('App opens a conversation by itself (#1208)', () => {
   });
 
   it('starts one on an install that has none, under the name its first message takes', async () => {
-    // Killed by: frontend/src/App.tsx :: void (mostRecent ? openRoom(mostRecent.room_id) : handleNewRoom());
-    // Becomes: void (mostRecent ? openRoom(mostRecent.room_id) : Promise.resolve());
+    // Killed by: frontend/src/App.tsx :: void (openable ? openRoom(openable.room_id) : handleNewRoom());
+    // Becomes: void (openable ? openRoom(openable.room_id) : Promise.resolve());
     roomsOnServer = new Map();
     render(<App />);
 
@@ -1070,16 +1070,61 @@ describe('App dock scope (#1356)', () => {
 });
 
 describe('App no default agent (#1125)', () => {
+  // Killed by: frontend/src/App.tsx :: const openable = rooms.find((room) => !onlyUnreadableSeats(room));
+  // Becomes: const openable = rooms[0];
+  it('does not reopen a conversation whose only clone cannot be loaded (#2275)', async () => {
+    // Its composer would say the clone answers, and every message would be refused.
+    personasOnServer = [{ name: 'broken', status: 'unreadable' }, { name: 'champion' }];
+    listedSeatsOnServer = new Map([
+      ['r1', ['broken']],
+      ['r2', ['champion']],
+    ]);
+    render(<App />);
+
+    await openedConversation();
+    await waitFor(() => expect(sent('GET', '/api/rooms/r2').length).toBeGreaterThan(0));
+    expect(sent('GET', '/api/rooms/r1')).toHaveLength(0);
+  });
+
+  // Killed by: frontend/src/App.tsx :: room.agent_ids.length > 0 && room.agent_ids.every((id) => unreadable.has(id));
+  // Becomes: room.agent_ids.length > 0 && room.agent_ids.some((id) => unreadable.has(id));
+  it('still reopens a group conversation that has a clone able to answer', async () => {
+    personasOnServer = [{ name: 'broken', status: 'unreadable' }, { name: 'champion' }];
+    listedSeatsOnServer = new Map([
+      ['r1', ['broken', 'champion']],
+      ['r2', ['champion']],
+    ]);
+    render(<App />);
+
+    await openedConversation();
+    await waitFor(() => expect(sent('GET', '/api/rooms/r1').length).toBeGreaterThan(0));
+  });
+
   it('adopts the first agent the server names, rather than opening on a literal name', async () => {
     // The head opened on `champion` whether or not this install had ever registered that
     // name, so a fresh install asked for a conversation addressed to nobody.
-    // Killed by: frontend/src/App.tsx :: if (loaded.length > 0) firstNamed = cloneIdOf(loaded[0]);
-    // Becomes: if (loaded.length > 0) firstNamed = 'champion';
+    // Killed by: frontend/src/App.tsx :: if (usable.length > 0) firstNamed = cloneIdOf(usable[0]);
+    // Becomes: if (usable.length > 0) firstNamed = 'champion';
     personasOnServer = [{ name: 'novelist' }];
     roomsOnServer = new Map();
     render(<App />);
 
     // The conversation it starts seats that agent, not the name the head once assumed.
+    await openedConversation();
+    expect(JSON.parse(sent('POST', '/api/rooms')[0].body ?? '{}')).toMatchObject({
+      agent_ids: ['novelist'],
+    });
+  });
+
+  // Killed by: frontend/src/App.tsx :: const usable = loaded.filter(isUsableClone);
+  // Becomes: const usable = loaded;
+  it('opens on the next clone when the first one listed cannot be loaded (#2253)', async () => {
+    // A turn that names an unreadable clone is refused, so opening on it would start a
+    // conversation that cannot answer.
+    personasOnServer = [{ name: 'broken', status: 'unreadable' }, { name: 'novelist' }];
+    roomsOnServer = new Map();
+    render(<App />);
+
     await openedConversation();
     expect(JSON.parse(sent('POST', '/api/rooms')[0].body ?? '{}')).toMatchObject({
       agent_ids: ['novelist'],
@@ -2249,6 +2294,19 @@ describe('App says what it knows about a send that got no answer (#1441)', () =>
 });
 
 describe('App room clone invites and group chat creation', () => {
+  // Killed by: frontend/src/App.tsx :: () => personas.filter(isUsableClone).map((p) => ({ id: cloneIdOf(p), label: cloneLabel(p, language) })),
+  // Becomes: () => personas.map((p) => ({ id: cloneIdOf(p), label: cloneLabel(p, language) })),
+  it('does not offer a clone whose settings could not be loaded (#2241)', async () => {
+    personasOnServer = [{ name: 'champion' }, { name: 'surveyor' }, { name: 'broken', status: 'unreadable' }];
+
+    render(<App />);
+    await openedConversation();
+    fireEvent.click(screen.getByTestId('add-someone'));
+
+    expect(screen.getByTestId('invite-surveyor')).toBeInTheDocument();
+    expect(screen.queryByTestId('invite-broken')).toBeNull();
+  });
+
   it('populates room invite choices from personas', async () => {
     personasOnServer = [{ name: 'champion' }, { name: 'surveyor' }];
 
@@ -2372,3 +2430,64 @@ describe('App auto-opens dock on browser tool use (#2104)', () => {
 });
 
 
+
+describe('App fronts the Browser tab when a clone asks the person to sign in (§3.5 path B)', () => {
+  class LiveSocket {
+    static instances: LiveSocket[] = [];
+    url: string;
+    binaryType = 'blob';
+    readyState = 1;
+    onopen: (() => void) | null = null;
+    onclose: (() => void) | null = null;
+    onerror: (() => void) | null = null;
+    onmessage: ((event: { data: unknown }) => void) | null = null;
+    constructor(url: string) {
+      this.url = url;
+      LiveSocket.instances.push(this);
+    }
+    send() {}
+    close() {
+      this.readyState = 3;
+    }
+  }
+  const original = globalThis.WebSocket;
+  beforeEach(() => {
+    LiveSocket.instances = [];
+    (globalThis as unknown as { WebSocket: unknown }).WebSocket = LiveSocket;
+  });
+  afterEach(() => {
+    globalThis.WebSocket = original;
+  });
+
+  const state = (asked: boolean) => ({
+    data: JSON.stringify({
+      type: 'state',
+      tabs: [{ clone: 'scout', index: 1, url: 'https://shop.example.com/login', title: 'Sign in', current: true, controller: asked ? 'user' : 'clone' }],
+      acting: null,
+      problem: null,
+      asked_user: asked ? { clone: 'scout', kind: 'sign_in', site: 'shop.example.com', message: '' } : null,
+    }),
+  });
+
+  it('reopens the dock on the Browser tab after the person closed it', async () => {
+    render(<App />);
+    await openedConversation();
+    const socket = LiveSocket.instances.find((s) => s.url.includes('/api/browser/r1'));
+    expect(socket).toBeDefined();
+
+    // The first browser use opens the dock; the person closes it.
+    await act(async () => {
+      socket!.onmessage?.(state(false));
+    });
+    expect(screen.getByTestId('artifacts-dock')).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId('toggle-dock'));
+    expect(screen.queryByTestId('artifacts-dock')).toBeNull();
+
+    // The clone asks: the person has to see the page to sign in.
+    await act(async () => {
+      socket!.onmessage?.(state(true));
+    });
+    expect(screen.getByTestId('artifacts-dock')).toBeInTheDocument();
+    expect(screen.getByTestId('tab-browser').className).toContain('font-semibold');
+  });
+});

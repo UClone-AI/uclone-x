@@ -27,7 +27,7 @@ from pydantic import AliasChoices, AliasPath, BaseModel, ValidationError
 
 from uclone_x.core.agent_home import AGENTS_DIR_ENV_VAR
 from uclone_x.core.provenance import Provenance
-from uclone_x.core.session import SESSION_STORAGE_DIR_ENV_VAR
+from uclone_x.core.session import SESSION_STORAGE_DIR_ENV_VAR, validate_session_id
 from uclone_x.errors import PathTraversalError, PlainRefusalError
 from uclone_x.extensions import ProtectedRoot, protected_roots
 from uclone_x.sandbox.path_validator import PathValidator
@@ -193,6 +193,22 @@ def in_app_state_dir(resolved: Path) -> bool:
             if folder.exists() and root.exists() and folder.samefile(root):
                 return True
     return False
+
+
+def session_artifacts_dir(context: ToolContext) -> str:
+    """`artifacts/<session id>`, the folder a tool's pictures go to when none is named.
+
+    The id names a folder, so one that is empty or climbs out (`../x`, from a hand-built
+    context) is refused here in plain words, before anything is written (#1390).
+    """
+    session_id = context.session_id or "sess_default"
+    try:
+        validate_session_id(session_id)
+    except PathTraversalError as exc:
+        raise PlainRefusalError(
+            "This conversation's id cannot name a folder, so no picture was made."
+        ) from exc
+    return f"artifacts/{session_id}"
 
 
 def artifact_content_url(rel_path: str) -> str:
@@ -736,6 +752,11 @@ class BaseTool(abc.ABC, Generic[TParams]):
     #: whether anything happened, and one model guessed that it had (#1375). A tool whose
     #: effect has a plainer name says it: the memory tool says nothing was saved.
     not_run_note: ClassVar[str] = "The tool did not run, so nothing was done."
+    #: The arguments that name what a call acts on, for telling a retry of one refused call
+    #: from another call (`agent.turn_executor.repeated_refusals`, #2300). `None`: every
+    #: argument. A tool whose calls carry free text beside their target names the target,
+    #: so a refused write retried with new text is still the same call.
+    retry_key_arguments: ClassVar[frozenset[str] | None] = None
 
     def __init__(
         self,

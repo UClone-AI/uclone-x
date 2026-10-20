@@ -17,7 +17,7 @@ from uclone_x.errors import PlainRefusalError
 
 SECRET_FIELD_REFUSAL = (
     "That field takes a password or a one-time code, which a clone never types. "
-    "Use sign_in, or ask the person to take over."
+    "Call ask_user so the person can sign in."
 )
 STALE_REF = "That element is no longer on the page — take a new snapshot."
 POPUP_NOT_FOLLOWED = (

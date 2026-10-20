@@ -49,6 +49,7 @@ from uclone_x.room.service import (
 if TYPE_CHECKING:
     from uclone_x.agent.models import ProviderFailure, ToolExecutionRecord, TurnResult
     from uclone_x.core.provenance import Provenance
+    from uclone_x.core.tool_results import StepRefusalCode
     from uclone_x.llm.models import TokenUsage
     from uclone_x.room.store import RoomStore
 
@@ -108,6 +109,7 @@ class HeadTurn:
     content: str = ""
     error: str | None = None
     refusal: RoomTurnRefusal | None = None
+    step_refusal: StepRefusalCode | None = None
     provider_failure: ProviderFailure | None = None
     provenance: Provenance | None = None
     usage: TokenUsage | None = None
@@ -125,6 +127,7 @@ class HeadTurn:
             content=result.content,
             error=result.error,
             refusal=turn_refusal(result.stop_reason) if failed else None,
+            step_refusal=result.error_code if failed else None,
             provider_failure=result.provider_failure if failed else None,
             provenance=result.provenance,
             usage=result.usage,
@@ -364,6 +367,7 @@ def record_head_turn(
         usage=turn.usage,
         error=turn.error,
         refusal=turn.refusal,
+        step_refusal=turn.step_refusal,
         provider_failure=turn.provider_failure,
         completed=turn.completed,
         rendered_through=asked.seq,

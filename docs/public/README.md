@@ -11,6 +11,7 @@ for people who want to understand, extend or contribute to it.
 | [protocols.md](protocols.md) | Talking to a clone from another agent (A2A) or an editor (ACP) |
 | [security.md](security.md) | What the runtime protects, and what it does not |
 | [performance.md](performance.md) | The performance budgets, and which are measured |
+| [glossary.md](glossary.md) | The knowledge graph's terms (uGraph): what each means and where it is in the code |
 | [principle-amendment-policy.md](principle-amendment-policy.md) | How the principles are changed |
 
 The principles themselves, P0–P9, are in

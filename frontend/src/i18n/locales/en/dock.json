@@ -46,7 +46,26 @@
     "valueMissing": "Write what it should say instead.",
     "factGone": "This fact is no longer in {name}'s memory. It may have been forgotten or corrected already.",
     "memoryUnreadable": "{name}'s memory could not be read, so nothing was changed.",
-    "editFailed": "The change could not be made. Try again."
+    "editFailed": "The change could not be made. Try again.",
+    "oneValue": "One value at a time",
+    "oneValueOn": "Holds one value at a time: a new one replaces the old.",
+    "askOneValue": "Can {relation} hold only one value at a time? Then a new one will replace the old.",
+    "askYes": "Yes, one at a time",
+    "askNo": "No, several at once",
+    "saidLast": "said last",
+    "oneValueFailed": "That could not be saved. Try again.",
+    "history": "History",
+    "historyHide": "Hide history",
+    "historyQuote": "Learned from: “{quote}”",
+    "historyLearned": "Learned {when}",
+    "historyLastSeen": "Last heard {when}",
+    "historyReplaced": "Replaced {value}, said {when}",
+    "historyNothingReplaced": "It replaced no earlier value.",
+    "restore": "Bring back",
+    "restoreStale": "{value} could not be brought back: it changed meanwhile.",
+    "restoreFailed": "{name} could not bring that value back. It may have been changed already.",
+    "mergedFrom": "Merged with {name}",
+    "keepSeparate": "Keep separate"
   },
   "activity": {
     "readFailed": "{name}'s activity could not be read.",
@@ -144,6 +163,7 @@
     "helpers": "Helpers ran ({names}). Their own model calls are not kept.",
     "helpersUnreadable": "A tool result that names a helper could not be read, so a helper may be missing from this list.",
     "noSteps": "The session log lists no model calls for this turn.",
+    "where": "Session {session} · server log {log}",
     "headline": {
       "step": "step {step}",
       "tokens": "{input} → {output} tokens"
@@ -317,6 +337,11 @@
     "codex": "Codex",
     "noEntries": "No {label} are in the codex yet.",
     "looks": "looks: {looks}",
+    "relationOf": "{word} of {name}",
+    "relationsLine": "Is: {relations}",
+    "changeFrom": "From “{scene}”: {what}",
+    "relationNow": "{word} of {name}",
+    "relationEnds": "no longer anything to {name}",
     "unreadable": "These files could not be read, so they are not shown:",
     "codexUnreadable": "These files or folders could not be read, so they are not shown:",
     "decided": "Decided",
@@ -420,11 +445,16 @@
     "restart": "Restart",
     "lastStep": "Last step: {step}",
     "lastStepNone": "No actions taken yet",
+    "saveOffer": {
+      "ask": "Save this sign-in so {name} can sign in next time?",
+      "save": "Save",
+      "notNow": "Not now"
+    },
     "banner": {
       "acting": "{name} is using the browser",
       "idle": "Idle — {name} finished",
       "userControl": "You have control",
-      "askedUser": "{name} needs you to sign in to {site}",
+      "askedUser": "{name} asked you to take over on {site}",
       "chromeMissing": "Google Chrome isn't installed. Clones need it to use the browser.",
       "extensionMissing": "Connect your Chrome: add the UClone-X extension",
       "crashed": "The browser stopped unexpectedly.",
@@ -470,6 +500,8 @@
       "tab": "Switched tabs",
       "other": "Used the browser",
       "failed": "{step} — did not work",
+      "askUser": "Handed you the tab",
+      "signIn": "Used a saved sign-in",
       "show": "Show in the Browser tab"
     }
   }

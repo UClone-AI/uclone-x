@@ -1,4 +1,4 @@
-"""A written scene held to its plan and to the settled plot (`uclone_x.story.plan_check`)."""
+"""A written scene held to its plan and to the settled plot (`uclone_x_story.plan_check`)."""
 
 from __future__ import annotations
 
@@ -7,8 +7,8 @@ from typing import Any
 
 import pytest
 
-from uclone_x.story.context import CodexIndex, CodexItem
-from uclone_x.story.plan_check import (
+from uclone_x_story.context import CodexIndex, CodexItem
+from uclone_x_story.plan_check import (
     MAX_UNPLANNED,
     PLAN_MARKER,
     absent_cast,
@@ -16,7 +16,7 @@ from uclone_x.story.plan_check import (
     plan_findings,
     plan_prompt,
 )
-from uclone_x.story.schemas import CharacterEntry, Scene
+from uclone_x_story.schemas import CharacterEntry, Scene
 
 _CODEX = CodexIndex(
     (
@@ -57,7 +57,7 @@ def _held(reply: str, text: str = _TEXT, *, chapter: int = 1, twist_chapter: int
 
 class TestAPlannedCharacterWhoNeverAppears:
     def test_is_found_by_code_and_named_for_the_person(self) -> None:
-        """Killed by: src/uclone_x/story/plan_check.py :: if not keys or any(key in haystack for key in keys):
+        """Killed by: examples/story/src/uclone_x_story/plan_check.py :: if not keys or any(key in haystack for key in keys):
         Becomes: if True:
         """
         [finding] = absent_cast(_CODEX, _SCENE, "하린은 등대 계단을 올랐다. 바람이 불었다.")
@@ -70,7 +70,7 @@ class TestAPlannedCharacterWhoNeverAppears:
         assert absent_cast(_CODEX, _SCENE, "하린은 검은 고양이를 안았다.") == []
 
     def test_one_word_of_a_longer_name_counts_as_appearing(self) -> None:
-        """Killed by: src/uclone_x/story/plan_check.py :: words = [w for n in called for w in (n, *n.split())]
+        """Killed by: examples/story/src/uclone_x_story/plan_check.py :: words = [w for n in called for w in (n, *n.split())]
         Becomes: words = list(called)
         """
         codex = CodexIndex(
@@ -82,7 +82,7 @@ class TestAPlannedCharacterWhoNeverAppears:
         assert "마을 장로가 쓴 장면에는 나오지 않습니다" in finding.note
 
     def test_a_planned_id_the_codex_does_not_have_is_not_looked_for(self) -> None:
-        """Killed by: src/uclone_x/story/plan_check.py :: if found is None:
+        """Killed by: examples/story/src/uclone_x_story/plan_check.py :: if found is None:
         Becomes: if False:
         """
         scene = _SCENE.model_copy(update={"characters": ["harin", "rejected_one"]})
@@ -91,7 +91,7 @@ class TestAPlannedCharacterWhoNeverAppears:
 
 class TestAPlannedBeatTheSceneLeavesOut:
     def test_the_beat_the_reading_says_is_not_done_is_shown(self) -> None:
-        """Killed by: src/uclone_x/story/plan_check.py :: if 1 <= number <= len(scene.beats) and _false(read.get("done")):
+        """Killed by: examples/story/src/uclone_x_story/plan_check.py :: if 1 <= number <= len(scene.beats) and _false(read.get("done")):
         Becomes: if False:
         """
         reply = _reply(
@@ -115,9 +115,9 @@ class TestAPlannedBeatTheSceneLeavesOut:
 
 class TestTheTwistToldEarly:
     def test_a_quoted_reveal_before_the_twist_chapter_is_shown(self) -> None:
-        """Killed by: src/uclone_x/story/plan_check.py :: return bool(twist) and twist_chapter is not None and chapter < twist_chapter
+        """Killed by: examples/story/src/uclone_x_story/plan_check.py :: return bool(twist) and twist_chapter is not None and chapter < twist_chapter
         Becomes: return bool(twist) and twist_chapter is not None and chapter > twist_chapter
-        Killed by: src/uclone_x/story/plan_check.py :: if quote_found(quote, text):
+        Killed by: examples/story/src/uclone_x_story/plan_check.py :: if quote_found(quote, text):
         Becomes: if True:
         """
         reply = _reply(twist_revealed=True, twist_quote=_TWIST_LINE)
@@ -143,7 +143,7 @@ class TestTheTwistToldEarly:
 
 class TestAnUnplannedTurn:
     def test_a_quoted_event_is_shown_and_an_unquoted_one_is_not(self) -> None:
-        """Killed by: src/uclone_x/story/plan_check.py :: if quote in kept or not quote_found(quote, text):
+        """Killed by: examples/story/src/uclone_x_story/plan_check.py :: if quote in kept or not quote_found(quote, text):
         Becomes: if quote in kept:
         """
         line = "먹물은 계단 아래로 떨어져 다시 일어나지 않았다"
@@ -154,7 +154,7 @@ class TestAnUnplannedTurn:
         assert finding.note == f"‘계단’ 장면의 “{line}” — 장면 계획에 없던 큰 사건입니다."
 
     def test_at_most_a_few_are_shown_per_scene(self) -> None:
-        """Killed by: src/uclone_x/story/plan_check.py :: if len(kept) > MAX_UNPLANNED:
+        """Killed by: examples/story/src/uclone_x_story/plan_check.py :: if len(kept) > MAX_UNPLANNED:
         Becomes: if False:
         """
         lines = ["하린은 등대 계단을 올랐다", "먹물이 발밑을 따라왔다", "꼭대기에 닿자 안개 속에서"]

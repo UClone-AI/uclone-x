@@ -61,6 +61,8 @@ _NOT_TOOL_NAMES = frozenset(
         "earlier_changes",  # a story_context 'for_scene' bundle key (#1613)
         "request_conflicts",  # a story_context 'for_scene' bundle key (#1613)
         "negative_prompt",  # a generate_image argument
+        "go_on",  # a story_start argument (#2351)
+        "must_have",  # a story_start argument (#2351)
     }
 )
 

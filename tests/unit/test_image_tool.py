@@ -210,7 +210,7 @@ def _dispatcher_mocks(
 async def test_dispatcher_prefers_remote_cuda_over_every_local_engine() -> None:
     """A reachable remote worker wins even when both local engines are also ready.
 
-    Killed by: src/uclone_x/tools/builtin/image.py :: ("Remote CUDA worker", "remote-cuda", self._remote_engine))
+    Killed by: src/uclone_x/tools/builtin/image.py :: ("Remote CUDA worker", "remote-cuda", self._remote_for(choice)))
     Becomes: ("Remote CUDA worker", "remote-cuda", self._local_engine))
     """
     mock_remote, mock_comfy, mock_local = _dispatcher_mocks(remote=True, comfy=True, local=True)
@@ -484,8 +484,8 @@ async def test_a_generated_picture_is_saved_in_the_session_directory(
     """Default saves land in `artifacts/<session id>/images/`, the directory the Docs &
     Artifacts listing reads for a session (#1390), for one picture and for a batch.
 
-    Killed by: src/uclone_x/tools/builtin/image.py :: images_dir = f"artifacts/{session_id}/images"
-    Becomes: images_dir = f"artifacts/images"
+    Killed by: src/uclone_x/tools/builtin/image.py :: images_dir = f"{session_artifacts_dir(context)}/images"
+    Becomes: images_dir = "artifacts/images"
     """
     dispatcher = AsyncMock(spec=ImagePipelineDispatcher)
     dispatcher.dispatch.return_value = ImageGenerationResult(

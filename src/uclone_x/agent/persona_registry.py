@@ -7,7 +7,13 @@ import logging
 from collections.abc import Collection, Sequence
 from pathlib import Path
 
-from uclone_x.agent.clone_store import CloneDirectoryPersonaStore, CloneRecord, ensure_clone_store
+from uclone_x.agent.clone_store import (
+    CloneDirectoryPersonaStore,
+    CloneRecord,
+    UnreadableClone,
+    ensure_clone_store,
+    peers_with_pending,
+)
 from uclone_x.agent.models import PersonaDefinition
 from uclone_x.agent.persona_store import (
     BUILTIN_PERSONAS_DIR,
@@ -27,11 +33,13 @@ from uclone_x.agent.persona_store import (
 )
 from uclone_x.core.agent_home import peer_handles
 from uclone_x.core.models import AGENT_COMPOSED_TOOLS
+from uclone_x.extensions import extension_persona_dirs
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
     "BUILTIN_PERSONAS_DIR",
+    "extension_persona_dirs",
     "DEFAULT_PERSONA_NAME",
     "DEFAULT_WORKSPACE_PERSONAS_SUBDIR",
     "CompositePersonaStore",
@@ -86,6 +94,8 @@ class PersonaRegistry:
         self._builtin_names: frozenset[str] = frozenset()
         self._clone_store: CloneDirectoryPersonaStore | None = None
         self._package: YamlFilePersonaStore | None = None
+        #: The builtin folders installed extensions ship (#2208), one store each.
+        self._extension_packages: list[YamlFilePersonaStore] = []
         self.reload()
 
     @property
@@ -111,23 +121,23 @@ class PersonaRegistry:
             reload_fn = getattr(self._store, "reload", None)
             if callable(reload_fn):
                 reload_fn()
-            if BUILTIN_PERSONAS_DIR.is_dir():
-                self._builtin_names = frozenset(
-                    p.stem
-                    for p in sorted(BUILTIN_PERSONAS_DIR.glob("*.yaml"))
-                    + sorted(BUILTIN_PERSONAS_DIR.glob("*.yml"))
-                )
-            else:
-                self._builtin_names = frozenset()
+            self._builtin_names = frozenset(
+                p.stem
+                for folder in (BUILTIN_PERSONAS_DIR, *extension_persona_dirs())
+                if folder.is_dir()
+                for p in sorted(folder.glob("*.yaml")) + sorted(folder.glob("*.yml"))
+            )
             return
 
         # Before anything reads a clone: migrate, import this workspace's personas, and
         # install the package's (clone-data-scopes §3.8). A no-op once done. The package
         # directory is read here, at call time, so a test that swaps it is honoured.
         package_dir: Path = BUILTIN_PERSONAS_DIR
+        extension_dirs = extension_persona_dirs() if self._include_defaults else ()
         ensure_clone_store(
             self._workspace_root,
             builtin_dir=package_dir if package_dir.is_dir() else None,
+            extension_dirs=extension_dirs,
             install=self._include_defaults,
         )
 
@@ -152,10 +162,16 @@ class PersonaRegistry:
         if self._include_defaults and package_dir.is_dir():
             package = YamlFilePersonaStore(package_dir, read_only=True)
             self._package = package
-            self._builtin_names = frozenset(p.name for p in package.list_personas())
         else:
             self._package = None
-            self._builtin_names = frozenset()
+        self._extension_packages = [
+            YamlFilePersonaStore(folder, read_only=True)
+            for folder in extension_dirs
+            if folder.is_dir()
+        ]
+        self._builtin_names = frozenset(
+            p.name for shipped in self._shipped_stores() for p in shipped.list_personas()
+        )
 
         self._store = CompositePersonaStore(
             stores=stores,
@@ -218,6 +234,25 @@ class PersonaRegistry:
             return self._dynamic_personas[name]
         return self._store.get_persona(self.handle_for(name))
 
+    def unreadable_clone(self, name: str) -> UnreadableClone | None:
+        """The clone `name` (a handle or a clone id) names, when its file could not be read.
+
+        Such a clone is not loaded, so `get_persona` has nothing for it; a caller about to
+        speak as `name` asks here first, rather than serving the fallback in its place.
+        """
+        if name in self._dynamic_personas or self._clone_store is None:
+            return None
+        return self._clone_store.unreadable_clone(name)
+
+    def unreadable_reason(self, name: str) -> str | None:
+        """Why the clone `name` could not be loaded, in plain words; None when it was."""
+        found = self.unreadable_clone(name)
+        return found.reason if found is not None else None
+
+    def unreadable_clones(self) -> tuple[UnreadableClone, ...]:
+        """Every clone whose file could not be read; the others are loaded (#2220)."""
+        return self._clone_store.unreadable_clones() if self._clone_store is not None else ()
+
     def register_persona(self, persona: PersonaDefinition) -> None:
         """Dynamically register or override a persona definition in memory."""
         self._validate_tools(persona, source="<registered in memory>")
@@ -234,12 +269,13 @@ class PersonaRegistry:
         """Whether the clone `name` is still the package's builtin, unchanged.
 
         True when it was installed from the package persona of the same name and its
-        definition still equals that one, peers compared by handle. An edited builtin is
+        definition still equals that one, peers compared by handle, a peer still waiting
+        for its builtin counted where it stands (#2256). An edited builtin is
         a clone of its own, which `has_builtin` still reports as overriding the package's.
         """
         name = self.handle_for(name)
         record = self.clone_record(name)
-        package = self._package
+        package = self._shipping(name)
         if record is None or package is None or record.template != name:
             return False
         shipped = package.get_persona(name)
@@ -247,9 +283,10 @@ class PersonaRegistry:
         if shipped is None or held is None or name in self._dynamic_personas:
             return False
         root = self._clone_store.root if self._clone_store is not None else None
-        return held.model_copy(
-            update={"a2a_peers": peer_handles(held.a2a_peers, root)}
-        ) == shipped.model_copy(update={"a2a_peers": peer_handles(shipped.a2a_peers, root)})
+        held_peers = peers_with_pending(record, peer_handles(held.a2a_peers, root))
+        return held.model_copy(update={"a2a_peers": tuple(held_peers)}) == shipped.model_copy(
+            update={"a2a_peers": peer_handles(shipped.a2a_peers, root)}
+        )
 
     def has_builtin(self, name: str) -> bool:
         """Whether the package ships a persona of this name, whether or not it is in force."""
@@ -258,6 +295,22 @@ class PersonaRegistry:
     def package_dir(self) -> Path | None:
         """The package's own personas directory, when this registry reads it."""
         return self._package.directory if self._package is not None else None
+
+    def shipped_dir(self, name: str) -> Path | None:
+        """The folder that ships the builtin `name`: the package's, or an extension's (#2208)."""
+        shipping = self._shipping(name)
+        return shipping.directory if shipping is not None else None
+
+    def _shipped_stores(self) -> list[YamlFilePersonaStore]:
+        own = [self._package] if self._package is not None else []
+        return [*own, *self._extension_packages]
+
+    def _shipping(self, name: str) -> YamlFilePersonaStore | None:
+        """The builtin store that ships `name`, or None."""
+        for shipped in self._shipped_stores():
+            if shipped.get_persona(name) is not None:
+                return shipped
+        return None
 
     def clone_record(self, name: str) -> CloneRecord | None:
         """The clone directory behind the persona `name`, or None for one without."""

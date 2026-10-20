@@ -35,6 +35,7 @@ import {
   memoryUnsavedNotice,
   providerFailureRemedy,
   refusalRemedy,
+  stepRefusalSentence,
   turnFailureSentence,
 } from '../../lib/turnOutcome';
 import { useEscapeOwner } from '../../lib/escapePrecedence';
@@ -152,6 +153,8 @@ interface RoomConversationProps {
    * steps are read from `room.tool_uses` instead, so they survive a reload.
    */
   browserSteps?: readonly BrowserStep[];
+  /** A clone waiting for the person to sign in, from the browser socket (§3.5 path B). */
+  browserAsked?: { clone: string; site: string } | null;
   /** Front the dock's Browser tab, from a step line. */
   onShowBrowser?: () => void;
   /**
@@ -357,13 +360,14 @@ const TranscriptRow = React.memo<{
                   went wrong" would not tell them the edit is gone. */}
               {message.persona_edit_dropped
                 ? fmt(t.outcome.personaEditDropped, { label })
-                : turnFailureSentence(
+                : (stepRefusalSentence(label, message.step_refusal, t.outcome) ??
+                  turnFailureSentence(
                     label,
                     message.refusal,
                     message.completed,
                     message.provider_failure,
                     t.outcome,
-                  )}
+                  ))}
             </p>
             {message.refusal ? (
               <p data-testid={`row-remedy-${message.seq}`} className="mt-1 text-xs text-slate-400">
@@ -508,6 +512,14 @@ const TranscriptRow = React.memo<{
             className="mt-1 text-[11px] text-slate-500"
           >
             {fmt(t.row.knowledgeExtractFailed, { label })}
+          </p>
+        ) : null}
+        {message.knowledge_skipped ? (
+          <p
+            data-testid={`row-knowledge-skipped-${message.seq}`}
+            className="mt-1 text-[11px] text-slate-500"
+          >
+            {fmt(t.row.knowledgeSkipped, { label })}
           </p>
         ) : null}
 
@@ -711,6 +723,7 @@ export const RoomConversation: React.FC<RoomConversationProps> = ({
   avatarUrls,
   insertDraft = null,
   browserSteps,
+  browserAsked = null,
   onShowBrowser,
   onClonesChanged,
 }) => {
@@ -1580,6 +1593,11 @@ export const RoomConversation: React.FC<RoomConversationProps> = ({
                 steps={liveBrowserSteps}
                 onShow={onShowBrowser}
                 testId="live-turn-browser-steps"
+                asked={
+                  browserAsked && browserAsked.clone === liveTurn.agentId
+                    ? { name: senderLabel(room, liveTurn.agentId, t.you), site: browserAsked.site }
+                    : null
+                }
               />
               {!liveTurn.text.trim() ? (
                 <div

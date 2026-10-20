@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "uclone-x"
-version = "0.4.0"
+version = "0.4.1"
 description = "Local AI clones with memory, tools and group chat, on an event-driven agent runtime"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -144,6 +144,10 @@ dev = [
     # The real SDK `tests/unit/test_adapters_uclone2_adk_content.py` checks the uClone2 ADK
     # mirror against. Nothing under `src/` imports it (#2011).
     "google-genai>=0.1.0",
+    # starlette 1.6's `testclient.py` imports `httpx2 as httpx` under `TYPE_CHECKING`, so
+    # without it pyright reads every `TestClient` in `tests/` as unknown: 2165 errors on
+    # a venv rebuilt from this file (#2244). The old venv had it by accident.
+    "httpx2>=2.13.1",
     "pytest>=8.1.0",
     "pytest-asyncio>=0.23.0",
     "pytest-cov>=5.0.0",
@@ -164,6 +168,19 @@ all = [
     "uclone-x[cli,http,code_intel,telemetry,llm,ontology,media,dev]",
 ]
 
+
+# The story example (`examples/story/`, #2208) is its own distribution. It is a member of
+# this workspace and in the `dev` group, so a development environment synced from the root
+# has it installed (editable) and the core finds it through its entry point. Dependency
+# groups are not published metadata: `pip install uclone-x` never brings it.
+[tool.uv.workspace]
+members = ["examples/story"]
+
+[dependency-groups]
+dev = ["uclone-x-story"]
+
+[tool.uv.sources]
+uclone-x-story = { workspace = true }
 
 [project.urls]
 Homepage = "https://about.uclone.net/#uclone-x"
@@ -204,6 +221,8 @@ only-include = [
 
 [tool.ruff]
 line-length = 100
+# The story example (`examples/story/`, #2208) is first-party code of this repository too.
+src = [".", "src", "examples/story/src"]
 target-version = "py311"
 
 [tool.ruff.lint]
@@ -218,7 +237,9 @@ ignore = ["E501"]
 # not there. Non-Python or
 # build-artifact directories (node_modules, __pycache__, frontend) are
 # excluded.
-include = ["src", "tests"]
+include = ["src", "tests", "examples/story/src"]
+# The story example is its own distribution (#2208); the tests and evals import it from here.
+extraPaths = ["src", "examples/story/src"]
 # `evals/fixtures/` holds the *contents of a measured workspace*, not code this
 # project runs: the agent under test reads those files, and a question about them
 # has a fixed answer only while they stay exactly as written. Type-annotating them
@@ -238,7 +259,7 @@ reportMissingTypeStubs = false
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-pythonpath = [".", "src"]
+pythonpath = [".", "src", "examples/story/src"]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 markers = [
@@ -249,14 +270,14 @@ markers = [
     "fitness: checks the repository's own declarations rather than product code; no coverage",
     "pre_release: Acceptance scenarios executed exclusively during release qualification",
 ]
-addopts = "--cov=src/uclone_x --cov-branch --cov-report=term-missing --cov-fail-under=70"
+addopts = "--cov=src/uclone_x --cov=examples/story/src/uclone_x_story --cov-branch --cov-report=term-missing --cov-fail-under=70"
 
 [tool.coverage.run]
 branch = true
 # sys.monitoring (3.14+) measures branches at ~60% of ctrace's CPU; on 3.12 coverage warns
 # `no-sysmon` and falls back to ctrace, so this only pays off once the venv is on 3.14.
 core = "sysmon"
-source = ["src/uclone_x"]
+source = ["examples/story/src/uclone_x_story", "src/uclone_x"]
 omit = [
     "src/uclone_x/ui_static/*",
 ]

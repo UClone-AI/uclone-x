@@ -643,8 +643,8 @@ async def test_a_provider_failure_ends_the_turn_with_its_kind_and_plain_message(
 
     Killed by: src/uclone_x/agent/turn_executor.py :: return _PROVIDER_STOP_REASONS[failure.kind], failure.message, failure
     Becomes: return stop_reason, failure.message, failure
-    Killed by: src/uclone_x/agent/turn_executor.py :: logger.info("Turn for agent %s failed at the provider: %s", agent_id, provider_failure)
-    Becomes: logger.exception("Turn for agent %s failed at the provider: %s", agent_id, provider_failure)
+    Killed by: src/uclone_x/agent/turn_executor.py :: logger.info(*at_provider, extra={"session_id": session_id})
+    Becomes: logger.exception(*at_provider, extra={"session_id": session_id})
     """
     agent = _agent(_Raising(failure))
     await agent.start()

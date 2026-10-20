@@ -8,13 +8,15 @@ page for a model that reads images, and `click` at a point of that picture.
 
 from __future__ import annotations
 
+from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import Any, ClassVar, Final, Literal
+from typing import Any, ClassVar, Final, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from uclone_x.browser.extension import default_browser_link
 from uclone_x.browser.service import BrowserService, TabKey
+from uclone_x.browser.sign_ins import SavedSignIn
 from uclone_x.core.provenance import Provenance
 from uclone_x.errors import PathTraversalError, PlainRefusalError
 from uclone_x.llm.models import CANNOT_SEE_PICTURES
@@ -37,7 +39,7 @@ HELP_TEXT: Final = (
     "• look: picture of the page for vision models, or snapshot if model cannot see.\n"
     "• click(ref, double=False, right=False, hover=False) or click(x, y, double=False, right=False, hover=False): click control or coordinate.\n"
     "• type(ref, text, submit=False, append=False): type text into an input field.\n"
-    "• select(ref, options): choose dropdown options.\n"
+    "• select(ref, options) or select(ref, text): choose dropdown options by label.\n"
     "• check(ref, on=True): check or uncheck a checkbox.\n"
     "• press(key): press a key or chord (e.g. Enter, Escape, Tab, Meta+A).\n"
     "• scroll(direction='down', amount=1.0, ref=None): scroll page or element.\n"
@@ -45,19 +47,30 @@ HELP_TEXT: Final = (
     "• wait(text=None, ref=None, ms=None): wait for text, ref, or milliseconds (max 10000).\n"
     "• back / forward / reload: tab history navigation.\n"
     "• tab(index=None, close=False): list tabs, switch to tab index, or close tab.\n"
+    "• sign_in: sign in to this page's site with the person's saved sign-in; what it cannot "
+    "finish is handed to the person.\n"
     "• ask_user(text=None): ask user to take over tab for sign-in or CAPTCHA; text says why.\n"
-    "Password and one-time-code fields are refused for safety: ask the user to take over."
+    "Password and one-time-code fields are refused for safety: use sign_in."
 )
 
 _default_service: BrowserService | None = None
+_default_sign_ins: Callable[[], Sequence[SavedSignIn]] = tuple
 
 
 def default_browser_service() -> BrowserService:
     """The Core's one browser service. Chrome starts on its first call, not here."""
     global _default_service
     if _default_service is None:
-        _default_service = BrowserService(default_browser_link)
+        _default_service = BrowserService(
+            default_browser_link, sign_ins=lambda: _default_sign_ins()
+        )
     return _default_service
+
+
+def use_default_sign_ins(provider: Callable[[], Sequence[SavedSignIn]]) -> None:
+    """Where the Core's browser reads saved sign-ins (§3.5 path A), without creating it."""
+    global _default_sign_ins
+    _default_sign_ins = provider
 
 
 Action = Literal[
@@ -79,6 +92,7 @@ Action = Literal[
     "forward",
     "reload",
     "tab",
+    "sign_in",
     "ask_user",
 ]
 _NEEDS_REF = frozenset({"select", "check", "upload"})
@@ -127,6 +141,19 @@ class BrowserParams(BaseModel):
     index: int | None = Field(default=None, ge=1)
     close: bool = _off()
 
+    @model_validator(mode="before")
+    @classmethod
+    def _one_option_in_text(cls, data: Any) -> Any:
+        """`select(ref, text="Maple")` chooses one option, as `type` takes its text (#2393)."""
+        if not isinstance(data, dict):
+            return data
+        raw = cast(dict[str, Any], data)
+        text = raw.get("text")
+        if raw.get("action") == "select" and not raw.get("options") and isinstance(text, str):
+            if text.strip():
+                return {**raw, "options": [text]}
+        return raw
+
     @model_validator(mode="after")
     def _arguments_for_action(self) -> BrowserParams:
         if self.action == "open" and not self.url:
@@ -150,7 +177,10 @@ class BrowserParams(BaseModel):
         if self.action == "type" and self.text is None:
             raise ValueError("type needs text")
         if self.action == "select" and not self.options:
-            raise ValueError("select needs options")
+            raise ValueError(
+                'select needs options=["<label>"], the label of each option to choose '
+                '(or text="<label>" for one)'
+            )
         if self.action == "press" and not (self.key or "").strip():
             raise ValueError("press needs a key")
         if self.action == "upload" and not self.paths:
@@ -192,10 +222,12 @@ class BrowserTool(BaseTool[BrowserParams]):
             return {"help": HELP_TEXT}
         service = self._service or default_browser_service()
         key: TabKey = (context.room_id or context.session_id, context.agent_id)
-        if params.action != "ask_user":
-            await service.wait_for_control(key)
-        async with service.acting(key, params.action) as step:
-            result = await self._dispatch(service, key, params, context)
+        # A step's calls run together (`asyncio.gather`); on one tab they must not (#2392).
+        async with service.one_call_at_a_time(key):
+            if params.action != "ask_user":
+                await service.wait_for_control(key)
+            async with service.acting(key, params.action) as step:
+                result = await self._dispatch(service, key, params, context)
         element = step.get("element")
         if isinstance(element, str) and element and isinstance(result, dict):
             return {"element": element, **result}
@@ -266,6 +298,8 @@ class BrowserTool(BaseTool[BrowserParams]):
                 return await service.reload(key)
             case "tab":
                 return await service.tab(key, index=params.index, close=params.close)
+            case "sign_in":
+                return await service.sign_in(key)
             case "ask_user":
                 return await service.ask_user(key, message=params.text)
 

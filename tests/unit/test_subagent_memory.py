@@ -25,6 +25,7 @@ from uclone_x.agent.models import (
     AgentContext,
     PersonaDefinition,
 )
+from uclone_x.i18n.tool_refusals import TOOL_REFUSAL_TEXT
 from uclone_x.llm.connectors.mock import MockLLMConnector
 from uclone_x.llm.models import ToolCallRequest
 from uclone_x.memory.store import CrossSessionMemory
@@ -141,7 +142,7 @@ class TestByDefaultAChildHasNoMemory:
 
         calls = [r for r in result.tool_executions if r.tool_name == RECORD]
         assert [r.status for r in calls] == [ToolResultStatus.ERROR]
-        assert calls[0].error is not None and "allowed_tools" in calls[0].error
+        assert calls[0].error == TOOL_REFUSAL_TEXT["tool.out_of_range"]
         assert parent.memory is not None and parent.memory.list_facts() == []
 
     @pytest.mark.asyncio
@@ -254,7 +255,7 @@ class TestSharingTheParentsMemory:
         result = await child.run_turn("Change the parent's memory.")
         calls = [r for r in result.tool_executions if r.tool_name == name]
         assert [r.status for r in calls] == [ToolResultStatus.ERROR]
-        assert calls[0].error is not None and "allowed_tools" in calls[0].error
+        assert calls[0].error == TOOL_REFUSAL_TEXT["tool.out_of_range"]
 
         assert document.read_bytes() == before
         assert [f.object_value for f in parent.memory.list_facts()] == ["teal"]

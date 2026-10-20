@@ -16,7 +16,7 @@ import { fmt, type Plural } from '../i18n/format';
 /** Re-exported so the editor components fill their sentences without importing `i18n`. */
 export { fmt, plural } from '../i18n/format';
 /** Re-exported so the editor components label a clone without importing outside this module. */
-export { cloneLabel } from './cloneLabel';
+export { cloneLabel, isUsableClone } from './cloneLabel';
 import type { PersonaInfo, PersonaModelTier } from '../types';
 
 /**
@@ -43,6 +43,9 @@ export interface PersonaDraft {
   max_tokens: number | null;
   enable_write_tools: boolean;
   enable_subagent_tools: boolean;
+  /** "Learn from conversations" (#1840): off stops only the clone's automatic picking-out
+   * of what to remember after each turn. */
+  learn_from_conversations: boolean;
   /** Not editable here, by clone id; carried so an edit does not drop who it may call. */
   a2a_peers: string[];
   /** The name a person reads, per locale; the editor changes only the screen's language. */
@@ -77,6 +80,7 @@ export const emptyPersonaDraft = (): PersonaDraft => ({
   max_tokens: null,
   enable_write_tools: false,
   enable_subagent_tools: false,
+  learn_from_conversations: true,
   a2a_peers: [],
   display_name: {},
 });
@@ -98,6 +102,7 @@ export const draftFromPersona = (persona: PersonaInfo): PersonaDraft => ({
   max_tokens: persona.max_tokens ?? null,
   enable_write_tools: persona.enable_write_tools ?? false,
   enable_subagent_tools: persona.enable_subagent_tools ?? false,
+  learn_from_conversations: persona.learn_from_conversations ?? true,
   a2a_peers: [...(persona.a2a_peers ?? [])],
   display_name: { ...(persona.display_name ?? {}) },
 });
@@ -170,6 +175,10 @@ export interface PersonaEditorCopy {
   edit: string;
   builtinBadge: string;
   overrideBadge: string;
+  /** Marks a clone whose settings file could not be read; its reason is shown beside it. */
+  unreadableBadge: string;
+  /** Why such a clone could not be loaded, by the code the Core sends (#2241). */
+  unreadableReasons: { bare_model: string; unreadable_file: string };
   createTitle: string;
   editTitle: string;
   builtinEditNote: string;
@@ -216,6 +225,9 @@ export interface PersonaEditorCopy {
     enableWriteTools: string;
     enableSubagentTools: string;
     capabilitiesHint: string;
+    memory: string;
+    learnFromConversations: string;
+    learnFromConversationsHint: string;
   };
   tierLabels: Record<PersonaModelTier, string>;
   noToolsSelected: string;
@@ -243,3 +255,19 @@ export type PromptDraftResult =
   | { ok: true; prompt: string; source: 'llm'; model: string }
   | { ok: true; prompt: string; source: 'template'; fallbackReason: string }
   | { ok: false; message: string };
+
+/**
+ * Why a clone could not be loaded, in the screen's language (#2241). The Core sends a code
+ * beside its English sentence; a code this head does not know yet (a newer Core), or none
+ * (an older one), shows that sentence, so the row is never blank.
+ */
+export const unreadableReason = (
+  clone: { reason?: string; reason_code?: string },
+  copy: PersonaEditorCopy,
+): string => {
+  const code = clone.reason_code;
+  if (code && Object.prototype.hasOwnProperty.call(copy.unreadableReasons, code)) {
+    return copy.unreadableReasons[code as keyof PersonaEditorCopy['unreadableReasons']];
+  }
+  return clone.reason ?? '';
+};

@@ -34,6 +34,7 @@ __all__ = [
     "ADKUnrepresentableMessageError",
     "AgentStateError",
     "BudgetExceededError",
+    "NoRoomToLearnError",
     "CapabilityUnavailableError",
     "ComfyUIError",
     "ComfyUIExecutionError",
@@ -55,6 +56,7 @@ __all__ = [
     "LLMError",
     "LLMModelNotConfiguredError",
     "LLMProviderError",
+    "LLMRequestRefusedError",
     "LLMProviderNotConfiguredError",
     "LLMStreamInterruptedError",
     "LLMTimeoutError",
@@ -478,6 +480,16 @@ class UsageLimitsUnreadableError(PlainRefusalError):
     """
 
 
+class NoRoomToLearnError(UCloneXError):
+    """Work on a clone's behalf after a turn was not started: it would leave less than a
+    reply's worth of the clone's budget (#1851).
+
+    Not a budget breach and not a failure: nothing was sent, and the person's next reply
+    keeps its room. Raised by `BaseAgent.invoke_auxiliary_model`; learning reads it as a
+    lesson skipped, never as one that failed.
+    """
+
+
 class StepBudgetExceededError(BudgetExceededError):
     """An agent step budget ceiling was reached (Principle 4, Principle 6).
 
@@ -692,6 +704,21 @@ class LLMProviderError(LLMError):
     """An LLM provider returned an error or was unreachable."""
 
 
+class LLMRequestRefusedError(LLMProviderError):
+    """The server answered 400: it refused the request as it was sent (#2322).
+
+    A distinct type because a caller can act on it without reading the server's words: the
+    request asked for something the model or server does not take. The turn's thinking-off
+    retry reads it as "this model cannot be asked without thinking" (an Ollama model that
+    only thinks can refuse `think: false`). The message keeps the status and body for the
+    log, as a plain `LLMProviderError` from the same connector does.
+    """
+
+    def __init__(self, message: str, *, status_code: int = 400) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
 class LLMTimeoutError(LLMProviderError):
     """A call to a provider ran past the ceiling the caller set for it (#1233).
 
@@ -787,6 +814,11 @@ class ProviderFailureError(LLMProviderError):
         super().__init__(message)
         self.provider = provider
         self.model = model
+        #: The provider's HTTP status and the start of its body, credentials redacted, when
+        #: it answered (#2227): for whoever debugs the failure -- the session's event log
+        #: and `ucx.log` keep them -- never part of the message above.
+        self.status_code: int | None = None
+        self.body_excerpt: str | None = None
 
 
 class ModelNotAvailableError(ProviderFailureError):
@@ -860,8 +892,11 @@ class ProviderResponseError(ProviderFailureError):
     """The provider answered with something none of the other kinds recognises.
 
     Not a guess at one of them: a response this code cannot place is said to be exactly
-    that (P6). The message does not send the user to a log: no head configures one, so there
-    is nowhere to look. It names the two settings a beginner can check instead.
+    that (P6). The message names the two settings a beginner can check, and not the log:
+    the provider's status and body excerpt (`status_code`, `body_excerpt`) are for whoever
+    debugs it, and are kept in the failed step's event in the session log and in `ucx.log`,
+    which the dashboard server and every worker it spawns write to (#2227). A developer finds
+    both from the failed turn in developer mode.
     """
 
     kind = ProviderFailureKind.PROVIDER_ERROR

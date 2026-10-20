@@ -544,6 +544,41 @@ async def test_a_step_that_does_not_fit_is_refused_and_earlier_results_are_not_s
 
 
 @pytest.mark.asyncio
+async def test_a_refused_step_says_why_in_the_persons_language(tmp_path: Path) -> None:
+    """#2300: a Korean person's refused step was worded in English on the row.
+
+    Killed by: src/uclone_x/agent/turn_executor.py :: step_refusal, "ko" if is_korean(content_input) else "en"
+    Becomes: step_refusal, "en"
+    """
+    from uclone_x.i18n.refusals import refusal_text
+    from uclone_x.llm.compactor import estimate_request_tokens
+
+    tools = [_returning("small", "o" * 2_000), _returning("tiny", "x")]
+
+    def steps() -> list[list[ToolCallRequest]]:
+        return [
+            [ToolCallRequest(id="c1", name="small", arguments={})],
+            [ToolCallRequest(id="c2", name="tiny", arguments={})],
+        ]
+
+    probe_llm = _ScriptedLLM(steps())
+    await _agent(tmp_path / "probe", probe_llm, tools).execute_turn("가자")
+    window = estimate_request_tokens(probe_llm.requests[1]) + 64 + 6
+    agent = _agent(
+        tmp_path / "real",
+        _ScriptedLLM(steps()),
+        tools,
+        llm_config=AgentLLMConfig(model_name="mock-model", context_limit=window, max_tokens=64),
+    )
+
+    result = await agent.execute_turn("가자")
+
+    assert result.error_code == "step.over_window"
+    assert result.error == refusal_text("step.over_window", "ko")
+    assert result.error != STEP_OVER_WINDOW_MESSAGE
+
+
+@pytest.mark.asyncio
 async def test_a_file_read_again_on_an_8k_window_is_sent_once(tmp_path: Path) -> None:
     """The #1422 review's reproduction: default tools with browser (#2116), an 8K window,
     one small file read four times. Every read reaches the model, the first verbatim in every
@@ -1295,8 +1330,8 @@ async def test_a_step_that_cannot_fit_even_as_excerpts_is_refused_in_plain_words
     The step is refused; the over-window request is never sent, and the refusal says so
     without a path, a handle, a class name or any other internal.
 
-    Killed by: src/uclone_x/agent/turn_executor.py :: error=STEP_REFUSAL_TEXT[step_refusal],
-    Becomes: error=repr(step_results[0]),
+    Killed by: src/uclone_x/agent/turn_executor.py :: error=refusal_text(
+    Becomes: error=repr(step_results[0]) + refusal_text(
     """
     names = [f"f{i:02d}.txt" for i in range(40)]
     for name in names:

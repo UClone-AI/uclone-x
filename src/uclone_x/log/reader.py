@@ -99,6 +99,10 @@ TURN_LOOP_EVENT_TYPES: frozenset[str] = frozenset(
         # (#1423). Both say what left the conversation, so the log still accounts for it.
         "TOOL_STEP_DROPPED",
         "TURN_ROLLED_BACK",
+        # A step's calls whose arguments held the turn context a model copied (#2264).
+        "TURN_CONTEXT_REMOVED_FROM_CALLS",
+        # A step cut for thinking past its budget, asked once more without thinking (#2202).
+        "THINKING_BUDGET_STOP",
     }
 )
 

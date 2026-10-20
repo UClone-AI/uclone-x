@@ -692,7 +692,9 @@ async def test_a_reply_with_no_call_and_no_text_is_asked_once_more_then_ends(
     ended = await quiet.execute_turn("draw it")
     assert len(twice.requests) == 2
     assert ended.content == ""
-    assert ended.stop_reason == "model_stopped_after_nudge"
+    # Ended with the plain sentence, not an empty reply (#2264).
+    assert ended.stop_reason == "empty_reply"
+    assert ended.error_code == "step.empty_reply"
 
 
 # --------------------------------------------------------------------------------------

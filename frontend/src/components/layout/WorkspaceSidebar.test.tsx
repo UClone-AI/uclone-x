@@ -250,7 +250,7 @@ describe('WorkspaceSidebar clone row interactions', () => {
 });
 
 describe('WorkspaceSidebar with no agents and no personas (#1060)', () => {
-  // Killed by: frontend/src/ui-kit/rail/Rail.tsx :: {copy.conversations.emptyCause(modelConfigured, clones.length)}
+  // Killed by: frontend/src/ui-kit/rail/Rail.tsx :: {copy.conversations.emptyCause(modelConfigured, listed.length)}
   // Becomes: <span>General Assistant</span>
   it('names no clone, because the runtime has offered none', () => {
     renderSidebar({ personas: [], rooms: [] });
@@ -261,7 +261,7 @@ describe('WorkspaceSidebar with no agents and no personas (#1060)', () => {
     );
   });
 
-  // Killed by: frontend/src/ui-kit/rail/Rail.tsx :: {copy.conversations.emptyCause(modelConfigured, clones.length)}
+  // Killed by: frontend/src/ui-kit/rail/Rail.tsx :: {copy.conversations.emptyCause(modelConfigured, listed.length)}
   // Becomes: {'No agents configured.'}
   it.each([
     ['a model is configured', true as boolean | null],
@@ -309,7 +309,7 @@ describe('WorkspaceSidebar conversation list', () => {
     expect(onNewRoom).toHaveBeenCalledTimes(1);
   });
 
-  // Killed by: frontend/src/ui-kit/rail/Rail.tsx :: agentCount={clones.length}
+  // Killed by: frontend/src/ui-kit/rail/Rail.tsx :: agentCount={listed.length}
   // Becomes: agentCount={0}
   it('does not say no clones are set up directly above the clones it lists (#1088)', () => {
     // The list's empty cause was counted from `agents` -- the *running* instances -- while
@@ -667,8 +667,8 @@ describe('WorkspaceSidebar uclone2-style group chats and clone smart accordion s
 
   // Killed by: frontend/src/ui-kit/rail/Rail.tsx :: const agentLabel = (agentId: string) => clones.find((c) => c.id === agentId)?.label ?? agentId;
   // Becomes: const agentLabel = (agentId: string) => agentId;
-  // Killed by: frontend/src/ui-kit/rail/Rail.tsx :: const base = (personas ?? []).map((p) => ({ id: p.id ?? p.name, label: p.label ?? p.name, role: p.role }));
-  // Becomes: const base = (personas ?? []).map((p) => ({ id: p.name, label: p.label ?? p.name, role: p.role }));
+  // Killed by: frontend/src/ui-kit/rail/Rail.tsx :: id: p.id ?? p.name,
+  // Becomes: id: p.name,
   it('names a conversation`s clones by display name, and picks a clone by its id (#1814)', () => {
     // A room's `agent_ids` are clone ids since #1815; a raw `agt_…` is not a name anybody reads.
     const onSelectAgent = vi.fn();

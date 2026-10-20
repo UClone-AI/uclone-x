@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import copy
+import importlib
 import json
 import logging
 from collections.abc import Generator
@@ -9,7 +11,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from uclone_x.core.log_inspector import get_default_log_dir, get_log_file
 from uclone_x.core.secrets import redact_credentials
@@ -58,6 +60,13 @@ class CommandLogHandler(UcxRotatingFileHandler):
             super().close()
         except OSError:
             _drop_records()
+
+
+class RedactingFormatter(logging.Formatter):
+    """A plain text line with credentials redacted, traceback included (#2319 review)."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        return redact_credentials(super().format(record))
 
 
 class JsonLogFormatter(logging.Formatter):
@@ -122,6 +131,110 @@ def log_to_file_not_terminal() -> Generator[None]:
         handler.close()
 
 
+def server_log_config() -> dict[str, Any]:
+    """The logging config the dashboard server hands uvicorn: uvicorn's own, plus `ucx.log`.
+
+    `ucx ui --dev` serves from a reload worker that uvicorn spawns as a fresh interpreter,
+    so the handler `log_to_file_not_terminal` put on the launcher's root logger is not in
+    it, and the worker wrote nothing anywhere but the terminal: on 2026-10-10 a failed
+    turn's provider error and the reason for it were in no file (#2227). uvicorn applies
+    this config in the serving process and again in every worker it spawns
+    (`uvicorn._subprocess.subprocess_started`), so each one writes:
+
+    - `uclone_x` records from INFO up -- a provider's raw answer (`connectors.failures`), a
+      turn's failure with its session and room, an `a2a_call` child's reason;
+    - anything else from WARNING up;
+    - uvicorn's own log, an unhandled exception's traceback included ("Exception in ASGI
+      application"). The access log is left to the terminal.
+
+    The terminal that started the server still shows every WARNING and above, as uvicorn's
+    own lines are shown (#2234); a `ucx` command, which logs through
+    `log_to_file_not_terminal`, still does not (#1934).
+
+    Records are JSON lines with credentials redacted (`JsonLogFormatter`). If the log
+    directory cannot be made, uvicorn's config is returned as it is, so the server still
+    starts. The file is opened on the first record, and a failed write is dropped, not
+    printed (`CommandLogHandler`).
+    """
+    from uvicorn.config import LOGGING_CONFIG
+
+    config: dict[str, Any] = copy.deepcopy(LOGGING_CONFIG)
+    # uvicorn's own lines -- an ASGI exception's traceback, a request's URL -- go to the
+    # terminal through its formatters; they are redacted too, before anything else can
+    # return the config (#2327).
+    _redact_uvicorn_formatters(config)
+    try:
+        target_dir = get_default_log_dir()
+        target_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return config
+    config["formatters"]["ucx_json"] = {"()": f"{__name__}.JsonLogFormatter"}
+    config["handlers"]["ucx_file"] = {
+        "class": f"{__name__}.CommandLogHandler",
+        "formatter": "ucx_json",
+        "filename": str(target_dir / "ucx.log"),
+        "maxBytes": MAX_LOG_BYTES,
+        "backupCount": BACKUP_COUNT,
+        "encoding": "utf-8",
+        "delay": True,
+    }
+    config["root"] = {"handlers": ["ucx_file"], "level": "WARNING"}
+    # The file handler took the place of Python's last-resort printer, so the server's own
+    # WARNINGs stopped reaching the terminal that started it (#2234). uvicorn's loggers do
+    # not propagate to the root, so their lines are not printed twice.
+    # Formatted through the same redaction as the file: a line here is read off a screen,
+    # and the file's `JsonLogFormatter` never sees it (#2319 review).
+    config["formatters"]["ucx_redacted"] = {
+        "()": "uclone_x.core.logging_setup.RedactingFormatter",
+        "fmt": "%(levelname)s:     %(name)s: %(message)s",
+    }
+    config["handlers"]["ucx_terminal"] = {
+        "class": "logging.StreamHandler",
+        "formatter": "ucx_redacted",
+        "stream": "ext://sys.stderr",
+        "level": "WARNING",
+    }
+    cast(list[str], config["root"]["handlers"]).append("ucx_terminal")
+    config["loggers"]["uclone_x"] = {"level": "INFO"}
+    config["loggers"]["uvicorn"]["handlers"].append("ucx_file")
+    return config
+
+
+def redacting_formatter(base: str, **kwargs: Any) -> logging.Formatter:
+    """An instance of the formatter class ``base`` names, its every line redacted (#2327).
+
+    Keeps the class's own output (uvicorn's level prefix, colours, request line) and runs
+    `redact_credentials` over the finished line, traceback included.
+    """
+    module_name, _, class_name = base.rpartition(".")
+    cls = cast(type[logging.Formatter], getattr(importlib.import_module(module_name), class_name))
+
+    class Redacting(cls):
+        def format(self, record: logging.LogRecord) -> str:
+            return redact_credentials(super().format(record))
+
+    return Redacting(**kwargs)
+
+
+def _redact_uvicorn_formatters(config: dict[str, Any]) -> None:
+    """Swap each uvicorn formatter for `redacting_formatter` over the same class."""
+    formatters = cast(dict[str, dict[str, Any]], config["formatters"])
+    for name in ("default", "access"):
+        spec = dict(formatters[name])
+        base = spec.pop("()")
+        formatters[name] = {"()": f"{__name__}.redacting_formatter", "base": base, **spec}
+
+
+def shown_log_file() -> str:
+    """`ucx.log`'s path as a person is shown it: from `~` when it is under the home
+    directory, the way they type it and without their account name (#1934, #2234)."""
+    log_file = get_log_file()
+    try:
+        return f"~/{log_file.relative_to(Path.home().resolve()).as_posix()}"
+    except ValueError:
+        return str(log_file)
+
+
 def reason_is_in_the_log() -> str:
     """The sentence a plain notice ends with when its cause went to the log (#1934).
 
@@ -131,11 +244,7 @@ def reason_is_in_the_log() -> str:
     there, so the sentence says that instead, naming the log so the person can see which
     file to fix (#1945).
     """
-    log_file = get_log_file()
-    try:
-        shown = f"~/{log_file.relative_to(Path.home().resolve()).as_posix()}"
-    except ValueError:
-        shown = str(log_file)
+    shown = shown_log_file()
     if _records_dropped:
         return f"The reason could not be recorded, because the log, {shown}, could not be written."
     return f"The reason is in the log, {shown}."

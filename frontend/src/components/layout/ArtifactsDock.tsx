@@ -194,6 +194,8 @@ export interface ArtifactsDockProps {
   browserLive?: BrowserLive;
   /** Open Settings ▸ Browser to connect U0's Chrome. */
   onConnectBrowser?: () => void;
+  /** Open Settings ▸ Browser on the Saved sign-ins form for `site` (the Save offer). */
+  onSaveBrowserSignIn?: (site: string) => void;
 }
 
 /**
@@ -237,6 +239,7 @@ export const ArtifactsDock: React.FC<ArtifactsDockProps> = ({
   isRefreshing,
   browserLive,
   onConnectBrowser,
+  onSaveBrowserSignIn,
 }) => {
   const [width, setWidth] = useState<number>(readStoredWidth);
   const draggingRef = useRef<boolean>(false);
@@ -514,6 +517,7 @@ export const ArtifactsDock: React.FC<ArtifactsDockProps> = ({
             room={room && room.room_id === roomId ? room : null}
             live={browserLive}
             onConnect={onConnectBrowser}
+            onSaveSignIn={onSaveBrowserSignIn}
           />
         )}
 
