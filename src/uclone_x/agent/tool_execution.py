@@ -44,6 +44,7 @@ from uclone_x.i18n.tool_refusals import tool_refusal_text
 from uclone_x.llm.models import ChatMessage, MessageRole, ToolCallRequest
 from uclone_x.tools.base import (
     tool_approval_timeout_note,
+    tool_approval_unavailable_ends_turn,
     tool_approval_unavailable_note,
     tool_call_needs_approval,
     tool_call_writes_files,
@@ -325,13 +326,18 @@ class ToolCallExecutor:
                 if pre_payload.get("needs_approval") is True
                 else None
             )
-            return self._refused_tool_call(
+            refused_msg, refused_rec = self._refused_tool_call(
                 tc,
                 unavailable_note
                 or "This call needs a person's approval, and this app cannot ask for it "
                 "during a conversation, so it did not run.",
                 (asyncio.get_running_loop().time() - t_start) * 1000.0,
             )
+            if pre_payload.get("needs_approval") is True and tool_approval_unavailable_ends_turn(
+                pre_tool
+            ):
+                refused_rec = refused_rec.model_copy(update={"ends_turn": True})
+            return refused_msg, refused_rec
 
         if pre_decision.action == HookAction.ASK:
             request_id = f"appr_{uuid.uuid4().hex[:8]}"

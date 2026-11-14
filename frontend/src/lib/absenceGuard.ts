@@ -73,7 +73,6 @@ export const DOCK_SOURCES: readonly string[] = [
   './components/artifacts/ActivityTimeline.tsx',
   './components/artifacts/RemembersPanel.tsx',
   './components/artifacts/KnowledgeGraphViewer.tsx',
-  './components/TopologyTab.tsx',
   './components/layout/ArtifactsDock.tsx',
   './lib/roomDock.ts',
 ];

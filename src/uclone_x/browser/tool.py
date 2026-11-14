@@ -8,6 +8,8 @@ page for a model that reads images, and `click` at a point of that picture.
 
 from __future__ import annotations
 
+import json
+import os
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any, ClassVar, Final, Literal, cast
@@ -52,6 +54,32 @@ HELP_TEXT: Final = (
     "• ask_user(text=None): ask user to take over tab for sign-in or CAPTCHA; text says why.\n"
     "Password and one-time-code fields are refused for safety: use sign_in."
 )
+
+#: How many workspace entries a missed upload path looks through for a file of its name.
+_SCAN_LIMIT: Final = 2000
+
+
+def _named_in(root: Path, name: str, limit: int = 3) -> list[str]:
+    """Workspace files called `name`, as workspace-relative paths; hidden folders skipped."""
+    found: list[str] = []
+    scanned = 0
+    for folder, dirs, files in os.walk(root):
+        dirs[:] = sorted(d for d in dirs if not d.startswith("."))
+        scanned += len(files) + len(dirs)
+        if name in files:
+            found.append((Path(folder) / name).relative_to(root).as_posix())
+        if len(found) >= limit or scanned >= _SCAN_LIMIT:
+            break
+    return found
+
+
+def _did_you_mean(message: str, path: str, root: Path) -> str:
+    """`message`, naming the workspace's files with the missed path's name, if any (#2399)."""
+    found = _named_in(root, Path(path).name) if Path(path).name else []
+    if found:
+        return f"{message} Did you mean paths={json.dumps(found)}?"
+    return message
+
 
 _default_service: BrowserService | None = None
 _default_sign_ins: Callable[[], Sequence[SavedSignIn]] = tuple
@@ -333,14 +361,22 @@ class BrowserTool(BaseTool[BrowserParams]):
                 "This conversation has no workspace, so there are no files to upload.",
                 reason_code="no_workspace",
             )
+        root = context.workspace_root
         try:
             resolved, _ = self.resolve_read_path(path, context)
         except PathTraversalError as exc:
             raise PlainRefusalError(
-                f"{path} is outside the files this clone can read.", reason_code="path_outside"
+                _did_you_mean(
+                    f"{path} is outside the files this clone can read. "
+                    "Paths are relative to the conversation's workspace.",
+                    path,
+                    root,
+                ),
+                reason_code="path_outside",
             ) from exc
         if not resolved.is_file():
             raise PlainRefusalError(
-                f"There is no file {path} in the workspace.", reason_code="no_such_file"
+                _did_you_mean(f"There is no file {path} in the workspace.", path, root),
+                reason_code="no_such_file",
             )
         return resolved

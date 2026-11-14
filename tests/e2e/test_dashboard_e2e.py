@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 from typing import Final
 
 import pytest
@@ -62,61 +61,6 @@ async def test_dashboard_initial_load_and_focus(ui_test_server: str) -> None:
         await browser.close()
 
 
-@pytest.mark.asyncio
-async def test_topology_tab_renders_without_crash(ui_test_server: str) -> None:
-    """Verify that switching to the Topology tab renders DAG nodes without throwing TypeError (Issue #116)."""
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        page: Page = await browser.new_page()
-
-        errors: list[str] = []
-        page.on("pageerror", lambda err: errors.append(str(err)))
-
-        await page.goto(ui_test_server, wait_until="commit")
-
-        # The DAG is a developer instrument: it is in the dock's developer drawer, which exists
-        # only in developer mode, and developer mode is off by default (owner ruling
-        # 2026-09-22). So: switch it on, then open the dock, which starts closed.
-        await page.wait_for_selector("[data-testid='toggle-dock']", timeout=10000)
-        await turn_on_developer_mode(page)
-        await page.locator("[data-testid='toggle-dock']").click()
-        dock = await dock_locator(page)
-        await dock.wait_for(state="visible", timeout=10000)
-        await dock.locator("[data-testid='dev-tab-topology']").click()
-
-        # Header must be visible and no uncaught exceptions thrown. Waiting on the heading
-        # itself rather than on a duration: the fixed 500ms this replaced was both slower
-        # than the render on an idle machine and shorter than it under load (R7).
-        heading = dock.locator("h2")
-        await heading.first.wait_for(state="visible", timeout=10000)
-        h2_text = await heading.first.inner_text()
-        assert "How this conversation ran" in h2_text
-        assert len(errors) == 0
-
-        # The graph is the conversation on screen (#1355): either its seats, or the sentence
-        # saying why there is nothing to draw (P6). Never a blank panel. The panel says
-        # "Reading this conversation…" until its fetch lands, so wait for either settled
-        # state before reading; a single read raced that fetch under gate load. That loading
-        # sentence sits in `topology-reason` too, so it is excluded: counting it as settled let
-        # the fetch land between the read and the count below (#1900 gate, author's choice).
-        # "No conversation is open" is excluded too: it is what the panel says before the
-        # room on screen reaches it, not a settled state of this room's graph (#1907).
-        settled = (
-            dock.locator("[data-testid='topology-reason']")
-            .filter(has_not_text=re.compile("Reading this conversation|No conversation is open"))
-            .or_(dock.get_by_text(re.compile(r" seated · ")))
-        )
-        await settled.first.wait_for(state="visible", timeout=15000)
-        # The fixture opens a conversation with a seat, so the settled state is its graph. The
-        # error sentence is also a `topology-reason`, and accepting any reason let a failing
-        # graph route pass as "nothing to draw" (#1903). So: no error, and the seats drawn.
-        dock_text = await dock.inner_text()
-        assert "Couldn't read this conversation's graph" not in dock_text, dock_text[:400]
-        assert " seated · " in dock_text, dock_text[:400]
-
-        await browser.close()
-
-
 # What each panel must actually render.
 #
 # This replaces `assert len(main.inner_text()) > 100`. That threshold does catch a panel
@@ -136,10 +80,7 @@ async def test_topology_tab_renders_without_crash(ui_test_server: str) -> None:
 _CONVERSATION_SURFACE: Final[str] = "[data-testid='room-conversation']"
 
 _DOCK_CONTENT_MARKERS: Final[dict[str, tuple[str, ...]]] = {
-    # The DAG of the conversation on screen (#1355); the heading is the only fixed text.
-    "topology": ("How this conversation ran",),
-    "ledger": ("EventBus SSE Stream Ledger", "Last Heartbeat"),
-    "ontology": ("Total Concepts", "Asserted (Axiomatic)"),
+    "knowledge_graph": ("Triples", "All Tiers"),
     # ACP and Skills were dock surfaces here until #1358 moved them into Settings; their
     # markers are asserted there by
     # `test_workspace_layout_e2e.py::test_settings_holds_skills_always_and_diagnostics_only_in_developer_mode`.

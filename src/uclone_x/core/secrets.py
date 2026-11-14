@@ -42,6 +42,7 @@ Pattern-based redaction is a heuristic mitigation, not an absolute guarantee:
 from __future__ import annotations
 
 import fnmatch
+import json
 import re
 from collections.abc import Mapping, Sequence
 from typing import Any, cast
@@ -56,6 +57,7 @@ __all__ = [
     "is_secret_env_name",
     "redact_credentials",
     "redact_log_payload",
+    "serialize_session_event",
 ]
 
 
@@ -369,3 +371,23 @@ def redact_log_payload(payload: Any, placeholder: str = REDACTED_PLACEHOLDER) ->
         seq = cast("Sequence[object]", payload)
         return [redact_log_payload(item, placeholder=placeholder) for item in seq]
     return payload
+
+
+def serialize_session_event(entry: Any, *, offset: int | None = None) -> str:
+    """Serialize a session event payload into a redacted JSON string.
+
+    Unwraps immutable mappings (`MappingProxyType`) and tuples via
+    `redact_log_payload`, stamps `"offset"` when provided on mapping entries,
+    and scrubs inline credential tokens via `redact_credentials`.
+    """
+    payload: Any = entry
+    if isinstance(entry, Mapping):
+        copied: dict[str, Any] = dict(cast("Mapping[str, Any]", entry))
+        if offset is not None:
+            copied["offset"] = int(offset)
+        payload = copied
+    elif isinstance(entry, str):
+        return redact_credentials(entry)
+    clean_entry = redact_log_payload(payload)
+    raw_line = json.dumps(clean_entry, ensure_ascii=False)
+    return redact_credentials(raw_line)

@@ -27,6 +27,7 @@ from uclone_x.llm.connectors.base import (
     tool_images_caption,
 )
 from uclone_x.llm.connectors.base import named_model as _named
+from uclone_x.llm.connectors.connect_fallback import post_with_fallback, stream_with_fallback
 from uclone_x.llm.connectors.failures import failed_request, failed_status, unusable_response
 from uclone_x.llm.connectors.listing import from_unix, get_listing_page, listed_items, optional_str
 from uclone_x.llm.models import (
@@ -397,7 +398,9 @@ class OpenAIConnector(BaseLLMConnector):
         should_close = self._http_client is None
 
         try:
-            resp = await client.post(url, json=payload, headers=headers, timeout=self.timeout)
+            resp = await post_with_fallback(
+                client, url, json=payload, headers=headers, timeout=self.timeout
+            )
             if resp.status_code != 200:
                 raise failed_status(
                     provider=self._display_name,
@@ -491,8 +494,8 @@ class OpenAIConnector(BaseLLMConnector):
         streamed: list[str] = []
 
         try:
-            async with client.stream(
-                "POST", url, json=payload, headers=headers, timeout=self.timeout
+            async with stream_with_fallback(
+                client, "POST", url, json=payload, headers=headers, timeout=self.timeout
             ) as resp:
                 if resp.status_code != 200:
                     err_body = await resp.aread()

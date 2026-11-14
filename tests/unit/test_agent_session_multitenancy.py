@@ -1978,7 +1978,13 @@ def test_no_module_under_src_names_a_revision_value() -> None:
     # TOCTOU window.
     # `core.session_state`, not `agent.session`, since #1734 moved `SessionState` and the
     # `with_messages` / `reset` constructions with it.
-    assert constructors == {"core.session_state", "agent.session_lifecycle", "agent.bootstrap"}, (
+    assert constructors == {
+        "core.session_state",
+        "agent.session_lifecycle",
+        "agent.bootstrap",
+        "adapters.cluster.session_store",
+        "shells.cluster.runtime_stack",
+    }, (
         f"the set of modules constructing a SessionState changed: {sorted(constructors)}. "
         "That set is not itself the rule — a new construction site is fine if it forwards "
         "a revision — but it is how this test knows its own visitor still resolves callee "

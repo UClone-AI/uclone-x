@@ -52,7 +52,6 @@ export type SettingsTabId =
   | 'all'
   | 'llm'
   | 'usage'
-  | 'tools'
   | 'folders'
   | 'clones'
   | 'skills'
@@ -70,7 +69,6 @@ const SETTINGS_TABS: SettingsTabItem[] = [
   { id: 'all', icon: Settings },
   { id: 'llm', icon: Server },
   { id: 'usage', icon: Gauge },
-  { id: 'tools', icon: Cpu },
   { id: 'folders', icon: FolderOpen },
   { id: 'clones', icon: Users },
   { id: 'skills', icon: Wrench },
@@ -131,8 +129,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   // Empty until the person names a computer: there is no host every install shares.
   const [remoteHost, setRemoteHost] = useState<string>('');
   const [remoteHostPresets, setRemoteHostPresets] = useState<string[]>([]);
-  // Off unless ticked: a worker connected for images keeps the LLM where it was.
-  const [remoteSyncLlm, setRemoteSyncLlm] = useState<boolean>(false);
+  // On by default: under Model Gateway (G1, G7), the tunnel's Ollama joins the model set as
+  // its own connection (`remote-gpu`) without overwriting `default_models`.
+  const [remoteSyncLlm, setRemoteSyncLlm] = useState<boolean>(true);
   const [remoteGpuStatus, setRemoteGpuStatus] = useState<RemoteGpuStatus | null>(null);
   const [connectingRemote, setConnectingRemote] = useState<boolean>(false);
   const [disconnectingRemote, setDisconnectingRemote] = useState<boolean>(false);
@@ -225,6 +224,15 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           setRemoteGpuStatus(gpuData);
           if (gpuData.host) {
             setRemoteHost(gpuData.host);
+          }
+          if (gpuData.connected && typeof gpuData.llm_on_remote === 'boolean') {
+            setRemoteSyncLlm(gpuData.llm_on_remote);
+          }
+          if (!gpuData.connected && gpuData.error && gpuData.host) {
+            setRemoteConnectError({
+              message: fmt(copyRef.current.settings.remoteGpu.connectFailedHost, { host: gpuData.host }),
+              rawError: gpuData.error,
+            });
           }
           // A tunnel that died removed the connections it had added; read them again.
           if (gpuData.restored_settings) connectionsChangedHere();
@@ -779,8 +787,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 
           {activeTab === 'all' && <hr className="border-slate-800/80" />}
 
-          {/* Section 1: Models -- every connection, and the default models chosen from them
-              (model-gateway.md §3.7). */}
+          {/* Section 1: Models -- every connection, the remote GPU computer tunnel that adds
+              its Ollama and ComfyUI connections, and the default models chosen from them
+              (model-gateway.md §3.5, §3.7). */}
           {(activeTab === 'all' || activeTab === 'llm') && (
             <div className="space-y-6" data-testid="settings-models">
               <ConnectionsSection
@@ -788,6 +797,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 version={connectionsVersion}
                 paidOffer={<UsageOffer onOpen={() => setActiveTab('usage')} saved={savedUsage} />}
               />
+              {remoteGpuCard}
               <DefaultModelsSection
                 version={gatewayVersion}
                 flushers={flushers}
@@ -800,14 +810,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 
           {/* Paid model usage limits (llm-token-gateway.md §4.5.1): not behind developer mode */}
           {(activeTab === 'all' || activeTab === 'usage') && <UsageSection onSaved={setSavedUsage} />}
-
-          {activeTab === 'all' && <hr className="border-slate-800/80" />}
-
-          {/* Section 2: the GPU computer. Its ComfyUI and Ollama become connections under
-              Models, where the picture model is chosen (model-gateway.md §3.5). */}
-          {(activeTab === 'all' || activeTab === 'tools') && (
-            <div className="space-y-4">{remoteGpuCard}</div>
-          )}
 
           {activeTab === 'all' && <hr className="border-slate-800/80" />}
 

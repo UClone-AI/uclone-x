@@ -13,6 +13,7 @@ import {
 const win = (window: UsageWindowStatus['window'], used: number, limit: number | null): UsageWindowStatus => ({
   window,
   used,
+  cached: 0,
   limit,
   available_again_at: null,
 });

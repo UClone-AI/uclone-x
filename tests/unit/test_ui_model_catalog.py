@@ -88,7 +88,7 @@ async def test_the_model_set_holds_what_the_connection_listed_and_suggests_from_
 ) -> None:
     """G1/G2: the picker holds the connection's chat models under their refs.
 
-    Killed by: src/uclone_x/llm/gateway.py :: entries = [e for e in listing.entries if e.chat_capable]
+    Killed by: src/uclone_x/llm/gateway.py :: entries = [e for e in listing.entries if e.chat_capable and e.id not in pictures]
     Becomes: entries = list(listing.entries)
     """
     listing = _Listing(_LISTING)

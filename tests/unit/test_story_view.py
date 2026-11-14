@@ -851,3 +851,50 @@ def test_a_scene_on_the_board_shows_its_illustration_url(
         == "/api/artifacts/content?path=artifacts/sess_1/images/s01.png"
     )
     assert scenes["ch01.s02"].illustration is None
+
+
+def test_story_view_exposes_effective_world_kg_timeline_and_scene_manuscript(
+    workspace: Path, rooms: RoomService, view: StoryView
+) -> None:
+    """`StoryView.show` exposes `world_kg` (including pending proposals and planned RPG
+    transitions), `kg_timeline` ($G_0 \\to G_t$), and `SceneView.manuscript` for written scenes.
+
+    Killed by: examples/story/src/uclone_x_story/view.py :: world_kg=world_groups,
+    Becomes: world_kg=[],
+    Killed by: examples/story/src/uclone_x_story/view.py :: kg_timeline=kg_timeline_raw,
+    Becomes: kg_timeline=[],
+    Killed by: examples/story/src/uclone_x_story/view.py :: manuscript=text.text.strip() if text and text.text.strip() else None,
+    Becomes: manuscript=None,
+    """
+    start = _start_yaml(
+        planned_transitions=[
+            {
+                "scene_id": "ch01.s02",
+                "entity_id": "mara",
+                "kind": "characters",
+                "set": {"location": "Salt Gate"},
+                "relations": {},
+                "note": "Mara reaches the Salt Gate.",
+            }
+        ]
+    )
+    story_id = _board_story(workspace, rooms, start)
+
+    shown = view.show(story_id)
+
+    # Approved codex does not yet contain pending proposal p002 (Mara), but world_kg does
+    approved_char_ids = [e.id for g in shown.codex if g.kind == "characters" for e in g.entries]
+    world_char_ids = [e.id for g in shown.world_kg if g.kind == "characters" for e in g.entries]
+    assert "mara" not in approved_char_ids
+    assert "mara" in world_char_ids
+
+    # Chronological KG timeline includes both ch01.s01 and the planned ch01.s02 transition
+    assert [step["scene_id"] for step in shown.kg_timeline] == ["ch01.s01", "ch01.s02"]
+    step_changes = shown.kg_timeline[1]["changes"]
+    assert isinstance(step_changes, list) and any("Mara" in str(ch) for ch in step_changes)
+
+    # Written scene ch01.s01 exposes its manuscript text, while unwritten ch01.s02 has None
+    assert shown.outline is not None
+    scenes = {s.id: s for s in shown.outline.chapters[0].scenes}
+    assert scenes["ch01.s01"].manuscript == "An arrow grazed Lord Vane at the salt gate."
+    assert scenes["ch01.s02"].manuscript is None

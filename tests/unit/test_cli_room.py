@@ -723,6 +723,18 @@ class TestAFailedRowIsShownInPlainWords:
             model="qwen3:14b",
             cause=fill(outcome["providerCause"]["provider_unreachable"], provider="gpu-box"),
         )
+        # With no system default to fall back to, the Core offers no action (#2424): the
+        # failure is still the clone's own model's, and says so.
+        # Killed by: src/uclone_x/cli/commands/room.py :: own = bool(failure.clone) and bool(slash) and bool(connection)
+        # Becomes: own = failure.action == "use_system_default" and bool(slash) and bool(connection)
+        no_default = own.model_copy(
+            update={
+                "provider_failure": own.provider_failure.model_copy(update={"action": None})
+                if own.provider_failure is not None
+                else None
+            }
+        )
+        assert room_cmd.turn_failure_sentence(no_default) == room_cmd.turn_failure_sentence(own)
         stopped = RoomMessage(
             seq=2, sender_id="scout", turn_id="t13", content="", error="x", completed=False
         )
@@ -810,6 +822,60 @@ class TestRetryCommand:
 
         assert result.exit_code == 1
         assert "did not fail" in result.output
+
+
+class TestContinueCommand:
+    def test_a_paused_turn_says_so_and_continue_goes_on_from_it(
+        self, rooms: RoomStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A turn its usage ceiling paused prints as paused, names `ucx room continue`, and the
+        command drives the Core's continue and shows what came back (#2431).
+
+        Killed by: src/uclone_x/cli/commands/room.py :: asyncio.run(orchestrator.continue_turn(room_id))
+        Becomes: before
+        Killed by: src/uclone_x/cli/commands/room.py :: if last is not None and last.stopped_at_ceiling:
+        Becomes: if False:
+        """
+        from uclone_x.room.models import RoomMessage
+
+        _seed(
+            rooms,
+            "room_c",
+            RoomMessage(seq=1, sender_id="alice", content="write a melody"),
+            RoomMessage(
+                seq=2, sender_id="scout", turn_id="t1", content="", stopped_at_ceiling=True
+            ),
+        )
+        shown = _run("show", "room_c")
+        assert "scout paused this turn" in " ".join(shown.output.split())
+        assert "ucx room continue room_c" in shown.output
+        assert "retry" not in shown.output
+
+        continued: list[str] = []
+
+        class StubOrchestrator:
+            async def continue_turn(self, room_id: str) -> RoomState:
+                continued.append(room_id)
+                state = room_cmd.build_service().get(room_id)
+                return state.model_copy(
+                    update={
+                        "transcript": (
+                            *state.transcript,
+                            RoomMessage(seq=3, sender_id="scout", turn_id="t1b", content="Here."),
+                        )
+                    }
+                )
+
+        def _stub(**_kwargs: object) -> StubOrchestrator:
+            return StubOrchestrator()
+
+        monkeypatch.setattr(room_cmd, "build_orchestrator", _stub)
+
+        result = _run("continue", "room_c")
+
+        assert result.exit_code == 0, result.output
+        assert continued == ["room_c"]
+        assert "Here." in result.output
 
 
 class TestRoster:

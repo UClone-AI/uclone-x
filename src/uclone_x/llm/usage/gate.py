@@ -1,16 +1,32 @@
-"""The usage gate: check the user's limits before a paid call, record its tokens after.
+"""The usage gate: check the user's limits before paid work, record its tokens after.
 
 See the token-gateway design §4.1. The factory wraps every connector whose
 `paid` is true, so every caller (agent turns, persona drafts, the room's selector, the
 compactor) passes the gate without a change at its call site. A connector that is not paid
 is returned untouched.
 
+**A turn is checked once, when it starts** (owner ruling 2026-10-30, #2431): "한도는 턴을
+시작할때 확인하고, 일단 턴이 시작하면 한도를 넘더라도 끝내야 한다" ("check the limit when a turn
+starts; once it has started, finish it even past the limit"). Stopping an admitted turn at
+step N+1 wasted steps 1..N, left their tools half done, and asked for a resend that cost
+more than finishing. `enter_admitted_turn` checks at the turn's start and marks the rest
+of it (a context variable, so concurrent turns and the tasks a turn starts each see their
+own); inside, every call is booked and none is refused. A call outside any turn (a persona
+draft, the room selector, the compactor) is checked per call, as before.
+
+**A runaway turn stops at a step boundary** (owner amendment, same day: "폭주 상한 방지
+한도는 두자"). Every call booked inside a turn is added to that turn's own spend, and the
+gate stops the turn before its next call once the spend passes `per_10_minutes`
+(`usage_turn_ceiling`), raising `TurnCeilingReachedError`; the turn ends as
+`usage_ceiling`. It never stops a call midway; the person continues the turn in place
+(`admission.py`).
+
 The wrap is a subclass rather than a wrapper, so the connector keeps its type name, its
 attributes and every `isinstance` check a head makes.
 
 Overshoot is accepted (§4.2): the check reads usage already recorded, and there is no
-reservation, so calls running at once may each finish past a limit. The next call is the
-one refused.
+reservation, so turns running at once may each finish past a limit. The next turn, or the
+next call outside a turn, is the one refused.
 """
 
 from __future__ import annotations
@@ -31,6 +47,19 @@ from uclone_x.llm.models import (
     TokenCountSource,
     TokenUsage,
 )
+from uclone_x.llm.usage.admission import (
+    ADMITTED as _ADMITTED,
+)
+from uclone_x.llm.usage.admission import (
+    book_turn_spend,
+    check_turn_ceiling,
+)
+from uclone_x.llm.usage.admission import (
+    enter_admitted_turn as enter_admitted_turn,
+)
+from uclone_x.llm.usage.admission import (
+    leave_admitted_turn as leave_admitted_turn,
+)
 from uclone_x.llm.usage.limits import (
     UsageLimits,
     check,
@@ -44,7 +73,14 @@ from uclone_x.llm.usage.store import (
     default_usage_file,
 )
 
-__all__ = ["UsageGate", "gate_if_paid", "shared_store"]
+__all__ = [
+    "UsageGate",
+    "enter_admitted_turn",
+    "gate_connector",
+    "gate_if_paid",
+    "leave_admitted_turn",
+    "shared_store",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -132,17 +168,32 @@ class UsageGate:
             return None
         return max(0, min(left))
 
+    def turn_ceiling(self) -> int | None:
+        """What one turn may spend before it stops at a step boundary: the 10-minute limit.
+
+        `None` when the person chose No limit for that window: then there is no ceiling.
+        """
+        return self._limits().per_10_minutes
+
     def record(self, usage: TokenUsage) -> None:
-        """Book one call's tokens. The provider's count, or the estimate it is labelled as."""
+        """Book one call's tokens. The provider's count, or the estimate it is labelled as.
+
+        Inside an admitted turn the tokens are also that turn's own spend (#2431).
+        """
+        tokens = usage.input_tokens + usage.output_tokens
         self.store.add(
             UsageEntry(
                 at=self._clock(),
-                tokens=usage.input_tokens + usage.output_tokens,
+                tokens=tokens,
                 provider=usage.provider,
                 model=usage.model,
                 count_source=usage.count_source,
+                cached_tokens=usage.cache_read_input_tokens,
+                input_tokens=usage.input_tokens,
+                output_tokens=usage.output_tokens,
             )
         )
+        book_turn_spend(tokens)  # the running turn's own spend, for its ceiling (#2431)
 
 
 def _gate_of(connector: BaseLLMConnector) -> UsageGate:
@@ -160,7 +211,10 @@ def _gated_class(base: type[BaseLLMConnector]) -> type[BaseLLMConnector]:
         # `base` is always a concrete connector; pyright sees only the abstract bound.
         async def generate(self, request: LLMRequest) -> ModelResponse:
             gate = _gate_of(self)
-            gate.admit()
+            if not _ADMITTED.get():  # a call outside any admitted turn (#2431)
+                gate.admit()
+            else:
+                check_turn_ceiling()  # an admitted turn past its own ceiling stops here
             response = await super().generate(  # pyright: ignore[reportAbstractUsage]
                 request
             )
@@ -170,6 +224,14 @@ def _gated_class(base: type[BaseLLMConnector]) -> type[BaseLLMConnector]:
                 # A failed write must not throw away a reply the provider already served.
                 logger.exception("Could not record paid-model usage for a call")
             return response
+
+        def usage_admit(self) -> None:
+            """The check a turn makes at its start (`admission.enter_admitted_turn`, #2431)."""
+            _gate_of(self).admit()
+
+        def usage_turn_ceiling(self) -> int | None:
+            """The tokens one turn may spend before it stops at a step boundary (#2431)."""
+            return _gate_of(self).turn_ceiling()
 
         def usage_remaining(self) -> int | None:
             """What the person's usage limit leaves now (`UsageRemainingProtocol`, #1851)."""
@@ -199,7 +261,10 @@ async def _gated_stream(
     before any chunk is not booked: nothing shows the provider served it (#938).
     """
     gate = _gate_of(connector)
-    gate.admit()
+    if not _ADMITTED.get():  # inside an admitted turn nothing is refused (#2431)
+        gate.admit()
+    else:
+        check_turn_ceiling()  # a turn's stream past its own ceiling is not opened
     reported: list[TokenUsage] = []
     text: list[str] = []
     model = request.model
@@ -250,7 +315,18 @@ def gate_if_paid(connector: BaseLLMConnector, gate: UsageGate | None = None) -> 
 
     Idempotent: a connector already gated is not gated twice.
     """
-    if not connector.paid or getattr(type(connector), "_usage_gated", False):
+    if not connector.paid:
+        return connector
+    return gate_connector(connector, gate)
+
+
+def gate_connector(connector: BaseLLMConnector, gate: UsageGate | None = None) -> BaseLLMConnector:
+    """Pass `connector`'s calls through `gate`, paid or not. Idempotent, like `gate_if_paid`.
+
+    For a head that books an unpaid model too (the cluster's ledger, #2466); it hands such a
+    connector a gate with no limits, so nothing about a local model is ever refused.
+    """
+    if getattr(type(connector), "_usage_gated", False):
         return connector
     connector.__class__ = _gated_class(type(connector))
     connector._usage_gate = gate  # pyright: ignore[reportAttributeAccessIssue]

@@ -146,7 +146,6 @@ describe('the notice that a skill is not offered to a clone', () => {
       <CloneProfile
         cloneId="scout"
         persona={makePersonaInfo({ name: 'scout' })}
-        onStartConversation={vi.fn()}
       />,
     );
 

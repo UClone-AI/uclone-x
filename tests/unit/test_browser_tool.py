@@ -183,11 +183,50 @@ async def test_upload_hands_over_workspace_files_only(tmp_path: Path) -> None:
 
     with pytest.raises(PlainRefusalError) as outside:
         await tool.run(BrowserParams(action="upload", ref="e2", paths=["../etc/passwd"]), context)
-    assert str(outside.value) == "../etc/passwd is outside the files this clone can read."
+    assert str(outside.value) == (
+        "../etc/passwd is outside the files this clone can read. "
+        "Paths are relative to the conversation's workspace."
+    )
 
     bare = ToolContext(agent_id="scout", session_id="s-1")
     with pytest.raises(PlainRefusalError, match="no workspace"):
         await tool.run(BrowserParams(action="upload", ref="e2", paths=["cv.pdf"]), bare)
+
+
+async def test_an_upload_path_that_misses_names_the_workspace_file_it_meant(
+    tmp_path: Path,
+) -> None:
+    """#2399: the live run's last try was `paths=["/workspace/report.txt"]`, refused as
+    "outside the files this clone can read" with no hint, and the model gave up. A refused
+    or missing path now says paths are workspace-relative, and names the workspace's file of
+    that name when there is one. Decided by what resolves, not by the path's text.
+
+    Killed by: src/uclone_x/browser/tool.py :: return f"{message} Did you mean paths={json.dumps(found)}?"
+    Becomes: return message
+    """
+    service = _Recording()
+    tool = BrowserTool(service=service)
+    (tmp_path / "report.txt").write_text("figures", encoding="utf-8")
+    (tmp_path / "drafts").mkdir()
+    (tmp_path / "drafts" / "notes.md").write_text("n", encoding="utf-8")
+    context = ToolContext(agent_id="scout", session_id="s-1", workspace_root=tmp_path)
+
+    with pytest.raises(PlainRefusalError) as outside:
+        await tool.run(
+            BrowserParams(action="upload", ref="e1", paths=["/workspace/report.txt"]), context
+        )
+    assert str(outside.value) == (
+        "/workspace/report.txt is outside the files this clone can read. "
+        "Paths are relative to the conversation's workspace. "
+        'Did you mean paths=["report.txt"]?'
+    )
+
+    with pytest.raises(PlainRefusalError) as missing:
+        await tool.run(BrowserParams(action="upload", ref="e1", paths=["notes.md"]), context)
+    assert str(missing.value) == (
+        'There is no file notes.md in the workspace. Did you mean paths=["drafts/notes.md"]?'
+    )
+    assert service.calls == []
 
 
 def test_the_tool_stays_usable_by_read_only_personas() -> None:

@@ -7,6 +7,7 @@ import binascii
 import json
 import logging
 import os
+import re
 from collections.abc import AsyncIterator, Sequence
 from typing import Any, cast
 
@@ -17,6 +18,7 @@ from uclone_x.core.provenance import Provenance
 from uclone_x.errors import (
     ImageNotReturnedError,
     LLMCredentialsNotConfiguredError,
+    PictureModelNotForChatError,
     UnmappableChatMessageError,
 )
 from uclone_x.llm.catalog import CatalogEntry
@@ -29,6 +31,7 @@ from uclone_x.llm.connectors.base import (
     resolve_model,
     resolve_token_counts,
 )
+from uclone_x.llm.connectors.connect_fallback import post_with_fallback, stream_with_fallback
 from uclone_x.llm.connectors.failures import failed_request, failed_status, unusable_response
 from uclone_x.llm.connectors.listing import (
     MAX_LISTING_PAGES,
@@ -186,6 +189,28 @@ def _first_inline_image(data: object, *, model: str) -> tuple[bytes, str]:
     raise ImageNotReturnedError(provider=_PROVIDER, model=model)
 
 
+#: Google names its picture models with an `-image` segment in the id
+#: (`gemini-2.5-flash-image`, `gemini-3-pro-image-preview`,
+#: `gemini-2.0-flash-preview-image-generation`), or after their brand, a `nano-banana`
+#: segment (`nano-banana-pro-preview`, `gemini-nano-banana-2.1`, both in a live listing on
+#: 2026-10-29). `models.list` reports no output modality, and these models answer the same
+#: `generateContent` a conversation uses, so the id is the only thing that tells one from a
+#: chat model (#2416). A rule on Google's id naming, not on anything a person writes;
+#: "image" inside a longer word (`-imagery`) is not the segment.
+_PICTURE_MODEL_ID = re.compile(r"-image(?:-|$)|(?:^|-)nano-banana(?:-|$)")
+
+
+def is_picture_model(model_id: str) -> bool:
+    """Whether ``model_id`` is one of Google's picture models, by its id (#2416)."""
+    return _PICTURE_MODEL_ID.search(model_id) is not None
+
+
+#: Read ceiling between response chunks when Gemini is thinking and streaming large
+#: structured tool-call arguments (such as multi-bar music compositions). TCP/TLS connect
+#: stays capped at ``CONNECT_PHASE_TIMEOUT_S`` (10s) inside ``connect_fallback.py``.
+DEFAULT_GEMINI_TIMEOUT_SECONDS: float = 180.0
+
+
 class GeminiConnector(BaseLLMConnector):
     """Google Gemini API connector."""
 
@@ -193,7 +218,7 @@ class GeminiConnector(BaseLLMConnector):
         self,
         api_key: str | None = None,
         base_url: str | None = None,
-        timeout: float = 60.0,
+        timeout: float = DEFAULT_GEMINI_TIMEOUT_SECONDS,
         http_client: httpx.AsyncClient | None = None,
         model: str | None = None,
         context_windows: ListedContextWindows | None = None,
@@ -248,6 +273,14 @@ class GeminiConnector(BaseLLMConnector):
         """
         return resolve_model(request.model, self._default_model, _PROVIDER)
 
+    def _chat_model(self, request: LLMRequest) -> str:
+        """The model a conversation is sent to; a picture model is refused before anything
+        is sent (#2416), since it would take the same `generateContent` call."""
+        chosen = self._requested_model(request)
+        if is_picture_model(chosen):
+            raise PictureModelNotForChatError(provider=_PROVIDER, model=chosen)
+        return chosen
+
     async def observe_context_window(self, model: str | None = None) -> int | None:
         """The window Gemini's listing reports for `model` (#1978).
 
@@ -277,7 +310,8 @@ class GeminiConnector(BaseLLMConnector):
         """The models this key can use, from Gemini's `models.list` (#1631).
 
         Gemini reports each model's input and output token limits and the methods it
-        supports; a model without `generateContent` (an embedding model) cannot chat. It
+        supports; a model without `generateContent` (an embedding model) cannot chat, and
+        neither can a picture model, which takes `generateContent` too (`is_picture_model`). It
         does not say whether a model reads images, so `accepts_images` stays `False` (#2107).
         """
         entries: list[CatalogEntry] = []
@@ -295,14 +329,16 @@ class GeminiConnector(BaseLLMConnector):
                 if name is None:
                     continue
                 methods = item.get("supportedGenerationMethods")
+                model_id = name.removeprefix("models/")
                 entries.append(
                     CatalogEntry(
-                        id=name.removeprefix("models/"),
+                        id=model_id,
                         display_name=optional_str(item.get("displayName")),
                         context_window=optional_int(item.get("inputTokenLimit")),
                         max_output_tokens=optional_int(item.get("outputTokenLimit")),
                         chat_capable=isinstance(methods, list)
-                        and "generateContent" in cast(list[object], methods),
+                        and "generateContent" in cast(list[object], methods)
+                        and not is_picture_model(model_id),
                     )
                 )
             token = optional_str(page.get("nextPageToken"))
@@ -336,7 +372,9 @@ class GeminiConnector(BaseLLMConnector):
         client = self._get_client()
         should_close = self._http_client is None
         try:
-            resp = await client.post(url, json=payload, headers=headers, timeout=self.timeout)
+            resp = await post_with_fallback(
+                client, url, json=payload, headers=headers, timeout=self.timeout
+            )
             if resp.status_code != 200:
                 raise failed_status(
                     provider=_PROVIDER, model=chosen, status_code=resp.status_code, body=resp.text
@@ -593,7 +631,7 @@ class GeminiConnector(BaseLLMConnector):
 
     async def generate(self, request: LLMRequest) -> ModelResponse:
         """Generate response from Gemini REST endpoint."""
-        model = self._requested_model(request)
+        model = self._chat_model(request)
         payload = self._build_payload(request)
         url = f"{self.base_url}/models/{model}:generateContent"
         headers: dict[str, str] = {
@@ -604,14 +642,18 @@ class GeminiConnector(BaseLLMConnector):
         should_close = self._http_client is None
 
         try:
-            resp = await client.post(url, json=payload, headers=headers, timeout=self.timeout)
+            resp = await post_with_fallback(
+                client, url, json=payload, headers=headers, timeout=self.timeout
+            )
             for _ in _THINKING_OFF_STEPS[1:]:  # at most one request per step
                 if resp.status_code == 200 or not self._learned_a_thinking_step(
                     model, payload, resp.status_code, resp.text
                 ):
                     break
                 payload = self._build_payload(request)
-                resp = await client.post(url, json=payload, headers=headers, timeout=self.timeout)
+                resp = await post_with_fallback(
+                    client, url, json=payload, headers=headers, timeout=self.timeout
+                )
             if resp.status_code != 200:
                 raise failed_status(
                     provider=_PROVIDER, model=model, status_code=resp.status_code, body=resp.text
@@ -694,7 +736,7 @@ class GeminiConnector(BaseLLMConnector):
 
     async def stream(self, request: LLMRequest) -> AsyncIterator[StreamChunk]:
         """Stream response chunks from Gemini SSE endpoint."""
-        model = self._requested_model(request)
+        model = self._chat_model(request)
         payload = self._build_payload(request)
         url = f"{self.base_url}/models/{model}:streamGenerateContent?alt=sse"
         headers: dict[str, str] = {
@@ -706,8 +748,8 @@ class GeminiConnector(BaseLLMConnector):
 
         try:
             for _ in _THINKING_OFF_STEPS:
-                async with client.stream(
-                    "POST", url, json=payload, headers=headers, timeout=self.timeout
+                async with stream_with_fallback(
+                    client, "POST", url, json=payload, headers=headers, timeout=self.timeout
                 ) as resp:
                     if resp.status_code != 200:
                         body = (await resp.aread()).decode("utf-8", errors="replace")

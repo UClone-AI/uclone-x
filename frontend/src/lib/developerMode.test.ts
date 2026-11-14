@@ -26,17 +26,17 @@ describe('developer mode preference', () => {
     // Killed by: frontend/src/lib/developerMode.ts :: !developerMode && isDeveloperSurface(active)
     // Becomes: !developerMode
     expect(shownSurface('activity', false)).toBe('activity');
-    expect(shownSurface('ledger', false)).toBe('artifacts');
-    expect(shownSurface('ledger', true)).toBe('ledger');
+    expect(shownSurface('knowledge_graph', false)).toBe('artifacts');
+    expect(shownSurface('knowledge_graph', true)).toBe('knowledge_graph');
   });
 });
 
-describe('the dock no longer hosts Skills, ACP or Evals (#1358)', () => {
-  it('lists four developer surfaces, none of them a moved one', () => {
-    expect([...DEVELOPER_SURFACES]).toEqual(['knowledge_graph', 'topology', 'ledger', 'ontology']);
+describe('the dock hosts only Knowledge Graph in the developer drawer (#1358, #2442)', () => {
+  it('lists Knowledge Graph as the sole developer surface', () => {
+    expect([...DEVELOPER_SURFACES]).toEqual(['knowledge_graph']);
   });
 
-  it('refuses the moved surfaces as dock surfaces at compile time', () => {
+  it('refuses removed and moved surfaces as dock surfaces at compile time', () => {
     // `tsc` (the `npm run build` the bundle is rebuilt with) fails on each line below if the
     // member comes back to `DockSurface`: an unused `@ts-expect-error` is itself an error. So a
     // dock tab naming one cannot be written without the type being widened first.
@@ -46,6 +46,12 @@ describe('the dock no longer hosts Skills, ACP or Evals (#1358)', () => {
     const acp: DockSurface = 'acp';
     // @ts-expect-error -- Evals is in Settings' Diagnostics now.
     const evals: DockSurface = 'evaluations';
-    expect([skills, acp, evals]).toHaveLength(3);
+    // @ts-expect-error -- DAG (topology) was removed (#2442).
+    const topology: DockSurface = 'topology';
+    // @ts-expect-error -- EventBus (ledger) was removed (#2442).
+    const ledger: DockSurface = 'ledger';
+    // @ts-expect-error -- Ontology was removed (#2442).
+    const ontology: DockSurface = 'ontology';
+    expect([skills, acp, evals, topology, ledger, ontology]).toHaveLength(6);
   });
 });

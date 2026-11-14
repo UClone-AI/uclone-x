@@ -100,7 +100,15 @@ class WindowStatus(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
 
     window: UsageWindow
-    used: int
+    used: int = Field(
+        description="Every token in the window, cached input included: what "
+        "the limit counts (#2429)."
+    )
+    cached: int = Field(
+        default=0,
+        description="Of `used`, the input tokens the provider reported serving from its prompt "
+        "cache. A call with no cached figure adds nothing here, so all of it counts as new.",
+    )
     limit: int | None
     available_again_at: datetime | None = Field(
         default=None,
@@ -158,7 +166,11 @@ def check(limits: UsageLimits, store: UsageStore, now: datetime) -> UsageStatus:
     for window in UsageWindow:
         start = now - window.duration
         inside = [e for e in rows if e.at > start]
+        # The limit counts every token, cached input included (#2429): providers still bill
+        # cached input and count it against their rate limits, and a saved limit was set in
+        # these units, so counting only new tokens would silently loosen it.
         used = sum(e.tokens for e in inside)
+        cached = sum(e.cached_tokens or 0 for e in inside)
         limit = limits.limit_for(window)
         again = (
             _available_again_at(inside, window, limit, now)
@@ -166,7 +178,9 @@ def check(limits: UsageLimits, store: UsageStore, now: datetime) -> UsageStatus:
             else None
         )
         windows.append(
-            WindowStatus(window=window, used=used, limit=limit, available_again_at=again)
+            WindowStatus(
+                window=window, used=used, cached=cached, limit=limit, available_again_at=again
+            )
         )
     return UsageStatus(checked_at=now, windows=tuple(windows))
 

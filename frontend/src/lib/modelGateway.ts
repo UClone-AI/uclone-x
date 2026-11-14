@@ -153,6 +153,26 @@ export const refState = (set: ModelSet, ref: string): 'listed' | 'unavailable' =
 export const pickableGroups = (set: ModelSet): ModelGroup[] =>
   set.groups.filter((g) => g.models.length > 0);
 
+/**
+ * What a picker shows for each model of `group`: its display name, or its id when it has
+ * none. Google gives several ids one display name ("Nano Banana Pro" three times, #2416),
+ * so a name another model in the group shares is shown with the id beside it.
+ */
+export const modelNames = (group: ModelGroup): Map<string, string> => {
+  const counts = new Map<string, number>();
+  for (const model of group.models) {
+    const name = model.display_name || model.id;
+    counts.set(name, (counts.get(name) ?? 0) + 1);
+  }
+  return new Map(
+    group.models.map((model) => {
+      const name = model.display_name || model.id;
+      const twice = (counts.get(name) ?? 0) > 1;
+      return [model.ref, twice ? `${name} (${model.id})` : name];
+    }),
+  );
+};
+
 /** The groups that cannot offer a model now, each to be shown with its reason. */
 export const silentGroups = (set: ModelSet): ModelGroup[] =>
   set.groups.filter((g) => g.models.length === 0);

@@ -5,7 +5,8 @@ import { CloneProfile } from './CloneProfile';
 import { makePersonaInfo } from '../../test/fixtures';
 
 /**
- * The dock's Clone surface: who a clone is, and the one thing you can do with it (#1300).
+ * The dock's Clone surface: who a clone is, and editing it (#1300). A conversation with it is
+ * started from the rail, not here (#2417).
  *
  * Clicking a clone in the rail used to change a highlight and nothing else, and the clone's
  * settings were folded into an expanded rail row 240px wide, where the tool pills wrapped four
@@ -20,7 +21,7 @@ describe('CloneProfile (#1300)', () => {
   // Killed by: frontend/src/components/clones/CloneProfile.tsx :: <h2 data-testid="clone-profile-name" className="text-lg font-semibold text-slate-100">{label}</h2>
   // Becomes: <h2 data-testid="clone-profile-name" className="text-lg font-semibold text-slate-100"></h2>
   it('names the clone it is showing, above its picture', () => {
-    render(<CloneProfile cloneId="reader" persona={reader} onStartConversation={vi.fn()} />);
+    render(<CloneProfile cloneId="reader" persona={reader} />);
 
     expect(screen.getByTestId('clone-profile-name')).toHaveTextContent('reader');
     // The picture is beside the name, never instead of it: the default is the same drawing
@@ -35,24 +36,20 @@ describe('CloneProfile (#1300)', () => {
       <CloneProfile
         cloneId="reader"
         persona={makePersonaInfo({ role: '' })}
-        onStartConversation={vi.fn()}
       />,
     );
 
     expect(screen.getByTestId('clone-profile-role')).toHaveTextContent('No role set');
   });
 
-  // Killed by: frontend/src/components/clones/CloneProfile.tsx :: onStartConversation(cloneId)
-  // Becomes: undefined
-  it('starts a conversation with the clone on screen, by its id', () => {
-    const onStartConversation = vi.fn();
-    render(
-      <CloneProfile cloneId="reader" persona={reader} onStartConversation={onStartConversation} />,
-    );
+  // #2417: the conversation is open beside the dock, so the profile offers no way to start
+  // one; a clone in no conversation yet is started from its row in the rail.
+  it('offers no "Start a conversation" button, and Edit takes the row', () => {
+    render(<CloneProfile cloneId="reader" persona={reader} onEdit={vi.fn()} />);
 
-    fireEvent.click(screen.getByTestId('clone-profile-start'));
-
-    expect(onStartConversation).toHaveBeenCalledWith('reader');
+    expect(screen.queryByTestId('clone-profile-start')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /conversation/i })).not.toBeInTheDocument();
+    expect(screen.getByTestId('clone-profile-edit')).toHaveClass('w-full');
   });
 
   // Killed by: frontend/src/components/clones/CloneProfile.tsx ::         <PersonaDetail persona={persona} />
@@ -69,7 +66,6 @@ describe('CloneProfile (#1300)', () => {
           enable_write_tools: true,
           enable_subagent_tools: false,
         })}
-        onStartConversation={vi.fn()}
       />,
     );
 
@@ -85,7 +81,7 @@ describe('CloneProfile (#1300)', () => {
     // The rail builds a row from a live instance too, and an instance can outlive the file it
     // was started from. "This clone has no settings" and "the settings did not load" are the
     // same blank panel otherwise (P6).
-    render(<CloneProfile cloneId="ephemeral" onStartConversation={vi.fn()} />);
+    render(<CloneProfile cloneId="ephemeral" />);
 
     expect(screen.getByTestId('clone-profile-no-definition')).toHaveTextContent(
       'Nothing is installed under this name',
@@ -95,10 +91,10 @@ describe('CloneProfile (#1300)', () => {
   // Killed by: frontend/src/components/clones/CloneProfile.tsx :: if (cloneId === '') {
   // Becomes: if (false) {
   it('sends the reader to the rail when no clone is picked at all', () => {
-    render(<CloneProfile cloneId="" onStartConversation={vi.fn()} />);
+    render(<CloneProfile cloneId="" />);
 
     expect(screen.getByTestId('clone-profile-none')).toHaveTextContent('Clones');
-    expect(screen.queryByTestId('clone-profile-start')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('clone-profile-edit')).not.toBeInTheDocument();
   });
 
   it('shows an edit button when a persona is loaded and triggers mode change', () => {
@@ -107,7 +103,6 @@ describe('CloneProfile (#1300)', () => {
       <CloneProfile
         cloneId="reader"
         persona={reader}
-        onStartConversation={vi.fn()}
         onModeChange={onModeChange}
       />,
     );
@@ -123,7 +118,6 @@ describe('CloneProfile (#1300)', () => {
       <CloneProfile
         cloneId="reader"
         persona={reader}
-        onStartConversation={vi.fn()}
         onModeChange={vi.fn()}
         canWrite={false}
       />,
@@ -137,7 +131,6 @@ describe('CloneProfile (#1300)', () => {
       <CloneProfile
         cloneId="reader"
         persona={reader}
-        onStartConversation={vi.fn()}
         mode="edit"
         onModeChange={vi.fn()}
       />,
@@ -151,7 +144,6 @@ describe('CloneProfile (#1300)', () => {
     render(
       <CloneProfile
         cloneId=""
-        onStartConversation={vi.fn()}
         mode="create"
         onModeChange={vi.fn()}
       />,
@@ -166,7 +158,6 @@ describe('CloneProfile (#1300)', () => {
     render(
       <CloneProfile
         cloneId=""
-        onStartConversation={vi.fn()}
         onModeChange={onModeChange}
       />,
     );
@@ -182,7 +173,6 @@ describe('CloneProfile (#1300)', () => {
       <CloneProfile
         cloneId="reader"
         persona={reader}
-        onStartConversation={vi.fn()}
         mode="edit"
         onModeChange={vi.fn()}
       />,
@@ -197,7 +187,6 @@ describe('CloneProfile (#1300)', () => {
       <CloneProfile
         cloneId="reader"
         persona={{ ...reader }}
-        onStartConversation={vi.fn()}
         mode="edit"
         onModeChange={vi.fn()}
       />,
@@ -211,7 +200,6 @@ describe('CloneProfile (#1300)', () => {
       <CloneProfile
         cloneId=""
         persona={reader}
-        onStartConversation={vi.fn()}
         mode="create"
         onModeChange={vi.fn()}
       />,
@@ -226,7 +214,6 @@ describe('CloneProfile (#1300)', () => {
       <CloneProfile
         cloneId=""
         persona={{ ...reader }}
-        onStartConversation={vi.fn()}
         mode="create"
         onModeChange={vi.fn()}
       />,
@@ -243,7 +230,6 @@ describe('CloneProfile (#1300)', () => {
       <CloneProfile
         cloneId="clone-a"
         persona={cloneA}
-        onStartConversation={vi.fn()}
         mode="edit"
         onModeChange={vi.fn()}
       />,
@@ -256,7 +242,6 @@ describe('CloneProfile (#1300)', () => {
       <CloneProfile
         cloneId="clone-b"
         persona={cloneB}
-        onStartConversation={vi.fn()}
         mode="edit"
         onModeChange={vi.fn()}
       />,
@@ -273,7 +258,6 @@ describe('CloneProfile (#1300)', () => {
         <CloneProfile
           cloneId="reader"
           persona={reader}
-          onStartConversation={vi.fn()}
           mode="edit"
           onModeChange={onModeChange}
           studio
@@ -338,7 +322,6 @@ describe('CloneProfile (#1300)', () => {
         <CloneProfile
           cloneId="reader"
           persona={reader}
-          onStartConversation={vi.fn()}
           mode="edit"
           onModeChange={onModeChange}
           studio={studio}
@@ -363,16 +346,43 @@ describe('CloneProfile (#1300)', () => {
       expect(onModeChange).not.toHaveBeenCalled();
     });
 
-    it('leaves an Escape pressed on a dropdown to the dropdown (#1377)', () => {
+    it('leaves an Escape pressed on a dropdown to the dropdown (#1377)', async () => {
       // Killed by: frontend/src/components/clones/CloneProfile.tsx :: if (event.target instanceof HTMLSelectElement) return;
       // Becomes: if (false) return;
-      render(<StudioHost onModeChange={vi.fn()} />);
+      // A model picker is the editor's dropdown since the tier one went (#2419); it draws once
+      // a model set is read.
+      const modelSet = {
+        groups: [
+          {
+            connection_id: 'g',
+            label: 'G',
+            kind: 'gemini',
+            status: 'connected',
+            detail: null,
+            models: [{ ref: 'g/m', id: 'm', display_name: 'M', capabilities: ['chat'], context_window: null }],
+          },
+        ],
+        defaults: { deep: null, fast: null, image: 'auto' },
+        recommended: { deep: null, fast: null },
+      };
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => new Response(JSON.stringify(modelSet), { status: 200 })),
+      );
+      try {
+        render(<StudioHost onModeChange={vi.fn()} />);
+        const dropdown = await waitFor(() => {
+          const found = document.querySelector('[data-testid="clone-profile-editor"] select');
+          expect(found).toBeInstanceOf(HTMLSelectElement);
+          return found as HTMLSelectElement;
+        });
 
-      fireEvent.keyDown(document.getElementById('persona-tier') as HTMLSelectElement, {
-        key: 'Escape',
-      });
+        fireEvent.keyDown(dropdown, { key: 'Escape' });
 
-      expect(screen.getByTestId('clone-profile-editor')).toHaveAttribute('data-studio', 'true');
+        expect(screen.getByTestId('clone-profile-editor')).toHaveAttribute('data-studio', 'true');
+      } finally {
+        vi.unstubAllGlobals();
+      }
     });
 
     it('leaves an Escape that cancels a composition to the input method (#1377)', () => {

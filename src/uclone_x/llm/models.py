@@ -4,14 +4,16 @@ from __future__ import annotations
 
 import base64
 import hashlib
-from collections.abc import Sequence
+import re
+from collections.abc import Mapping, Sequence
 from enum import StrEnum
-from typing import Final, Literal, Self
+from typing import Final, Literal, Self, cast
 
 from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    field_validator,
     model_validator,
 )
 
@@ -75,6 +77,29 @@ class MessageRole(StrEnum):
     TOOL = "tool"
 
 
+_SURROGATES: Final[re.Pattern[str]] = re.compile("[\\ud800-\\udfff]")
+_REPLACEMENT: Final[str] = "\ufffd"
+
+
+def _without_surrogates(value: object) -> object:
+    """`value` with every surrogate code point, however deep, replaced by U+FFFD.
+
+    A provider's JSON can carry a lone `\\ud800`, which decodes to a `str` that UTF-8 cannot
+    encode. Nothing downstream can store one: `model_dump_json`, a body's digest and a database
+    parameter all raise, and a saved escape does not parse back. So what a model says is made
+    storable where it enters, on the models every connector returns it in. A NUL needs nothing:
+    it serialises as `\\u0000`.
+    """
+    if isinstance(value, str):
+        return _SURROGATES.sub(_REPLACEMENT, value)
+    if isinstance(value, Mapping):
+        items = cast("Mapping[str, object]", value).items()
+        return {key: _without_surrogates(item) for key, item in items}
+    if isinstance(value, list | tuple):
+        return [_without_surrogates(item) for item in cast("Sequence[object]", value)]
+    return value
+
+
 class ToolCallRequest(BaseModel):
     """Structured tool invocation request produced by an LLM."""
 
@@ -83,6 +108,8 @@ class ToolCallRequest(BaseModel):
     id: str
     name: str
     arguments: ImmutableJsonMapping = Field(default_factory=dict)
+
+    _storable = field_validator("id", "name", "arguments", mode="before")(_without_surrogates)
     #: The provider's opaque token for this call, sent back with it when the call is
     #: replayed, or `None` when the provider gave none. Gemini 3 signs a function call
     #: (`thoughtSignature`) and refuses a request that replays the call without it, so a
@@ -417,6 +444,9 @@ class ModelResponse(BaseModel):
     )
     finish_reason: FinishReason | None = None
     model_name: str = "unknown"
+
+    _storable = field_validator("content", "thinking", mode="before")(_without_surrogates)
+
     provenance: Provenance | None = Field(
         description="In-band attribution required by Principle 6. Explicit with no "
         "default: `None` is representable so a non-conformant value can be rejected by "
@@ -443,6 +473,10 @@ class StreamChunk(BaseModel):
         "wire and never filled in by the connector. `None` means the chunk named none. A "
         "streamed step is attributed from this, the way `generate` attributes from the "
         "response body, because the request often names no model at all (#1447).",
+    )
+
+    _storable = field_validator("delta_content", "delta_thinking", mode="before")(
+        _without_surrogates
     )
 
 

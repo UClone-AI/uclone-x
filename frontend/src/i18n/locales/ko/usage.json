@@ -20,6 +20,8 @@
   },
   "ofLimit": "{limit} 중 {used} ({pct}%)",
   "noLimit": "{used} 사용, 한도 없음",
+  "split": "새 토큰 {new} · 캐시된 토큰 {cached}",
+  "cachedNote": "캐시된 토큰은 제공자가 앞선 호출에서 이미 받아 둔 입력이며, 보통 더 낮은 요금이 붙습니다. 한도는 새 토큰과 캐시된 토큰을 모두 셉니다.",
   "pausedUntil": "{time}까지 유료 모델 사용이 멈춥니다.",
   "envOverride": "{variable}로 설정됨",
   "limitLabel": "한도",

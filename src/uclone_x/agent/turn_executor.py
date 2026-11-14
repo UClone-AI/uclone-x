@@ -82,12 +82,19 @@ from uclone_x.agent.prompt_assembler import (
     undone_attempt_section,
 )
 from uclone_x.agent.protocols import (
+    RefreshingTurnAidProtocol,
     ReplyTextAidProtocol,
     TurnAidHookProtocol,
     TurnAidProtocol,
     TurnLifecycleHookProtocol,
 )
-from uclone_x.agent.reply_lines import is_korean, lines_to_add, reply_notes, with_lines
+from uclone_x.agent.reply_lines import (
+    is_korean,
+    lines_to_add,
+    replaces_reply,
+    reply_notes,
+    with_lines,
+)
 from uclone_x.agent.request_record import (
     RequestLayers,
     assemble_request_messages,
@@ -148,9 +155,11 @@ from uclone_x.errors import (
     LLMStreamInterruptedError,
     LLMTimeoutError,
     ModelLacksToolSupportError,
+    NothingToContinueError,
     ProviderFailureError,
     ProviderFailureKind,
     TokenBudgetExhaustedError,
+    TurnCeilingReachedError,
     UCloneXError,
     UsageLimitReachedError,
 )
@@ -182,6 +191,7 @@ from uclone_x.llm.protocols import (
     request_for_model,
 )
 from uclone_x.llm.router import LLMTier, SemanticModelRouter
+from uclone_x.llm.usage.admission import enter_admitted_turn
 from uclone_x.sandbox.models import (
     IsolationPolicy,
 )
@@ -565,6 +575,39 @@ def repeated_refusals(
     return repeated
 
 
+def _ceiling_stop_reason(exc: Exception, current: TurnStopReason) -> TurnStopReason:
+    """How the turn the budget handler ends stops, from the ceiling that ended it.
+
+    Stated, not left to the wording of `error` (#969):
+
+    * `usage_ceiling` (#2431): the turn's own spend passed the person's 10-minute limit, and
+      the gate stopped it before its next call. Not a failure: the person continues it.
+    * `usage_limit`: the user's system-wide paid-model limit (`llm-token-gateway.md` §4.3),
+      not this session's ceiling: a new conversation meets it too, and its message is
+      written for the user, so heads show it as is.
+    * `budget_exceeded`: the ledger only grows, so a retry meets this ceiling again until
+      the ceiling changes, and a head deciding whether to offer Retry reads it from here.
+      This also matches `StepBudgetExceededError`, which subclasses it. Nothing in `src/`
+      raises that class today, and the step ceiling returns its own `step_budget_exceeded`
+      result before reaching the handler, so no behaviour depends on the overlap.
+
+    Anything else (`TokenBudgetExhaustedError`) keeps `current`.
+    """
+    if isinstance(exc, TurnCeilingReachedError):
+        return "usage_ceiling"
+    if isinstance(exc, UsageLimitReachedError):
+        return "usage_limit"
+    if isinstance(exc, BudgetExceededError):
+        return "budget_exceeded"
+    return current
+
+
+def _ceiling_error(exc: Exception) -> str | None:
+    """The `error` of a turn the budget handler ends: none for the turn's own usage ceiling,
+    which paused it rather than failed it (#2431)."""
+    return None if isinstance(exc, TurnCeilingReachedError) else str(exc)
+
+
 def _repeats_unanswered_prompt(history: Sequence[ChatMessage], user_prompt: ChatMessage) -> bool:
     """Whether `user_prompt` is the prompt already waiting, unanswered, at the end of `history`.
 
@@ -859,6 +902,8 @@ class TurnExecutor:
         self._turn_person_names: tuple[str, ...] = ()
         #: The running turn's aids, worked out once at its start (#1808).
         self._turn_aids: tuple[TurnAidProtocol, ...] = ()
+        #: Each aid's section as the turn context carries it now, in `_turn_aids` order.
+        self._turn_aid_sections: list[str] = []
         #: The running turn's person's language, for the sentence a stopped turn ends with.
         self._turn_language: Language = "en"
         #: The running turn's thinking-budget cut, once one happened (#2202): every later
@@ -866,6 +911,9 @@ class TurnExecutor:
         self._thinking_cut: AttemptRecord | None = None
         #: The last tool step's result handles, by call id, for its `TOOL_RESULT` events.
         self._step_result_handles: dict[str, str] = {}
+        #: True while a turn its usage ceiling stopped is being continued (#2431): its
+        #: prompt is not appended again, and it is not checked at its start.
+        self._continuing = False
 
     # -- the agent's state, read through the scope ---------------------------------
 
@@ -1096,8 +1144,34 @@ class TurnExecutor:
         self._turn_language = "ko" if is_korean(message) else "en"
         self._thinking_cut = None
         sections = list(present_sections(undone_section, image_set_section, case_section))
-        sections.extend(aid.section for aid in self._turn_aids)
+        self._turn_aid_sections = [aid.section for aid in self._turn_aids]
+        sections.extend(self._turn_aid_sections)
         return sections, image_set_section
+
+    def _sections_after_step(
+        self,
+        sections: list[str],
+        plan: str | None,
+        executions: Sequence[ToolExecutionRecord],
+    ) -> None:
+        """The turn's tail sections after a step, in place (`drop_once_drawn`, #2429).
+
+        An aid that refreshes gives its section anew when the step changed what it shows;
+        the new one takes the old one's place. The sections are the turn context, built
+        per request and never written to history, so no message a request sent changes.
+        """
+        drop_once_drawn(sections, plan, executions)
+        for index, aid in enumerate(self._turn_aids):
+            if not isinstance(aid, RefreshingTurnAidProtocol):
+                continue
+            fresh = self._of_aid(
+                lambda a=aid: a.section_after_step(executions), "refresh its section"
+            )
+            current = self._turn_aid_sections[index]
+            if fresh is None or fresh == current or current not in sections:
+                continue
+            sections[sections.index(current)] = fresh
+            self._turn_aid_sections[index] = fresh
 
     def _announce_bound_on_message(
         self, turn_live: TurnSession, tool_defs: Sequence[ToolDefinition]
@@ -1399,22 +1473,33 @@ class TurnExecutor:
         stored one agree.
         """
         korean = is_korean(message)
+        body = (
+            message.split("]:", 1)[1].strip()
+            if message.startswith("[") and "]:" in message
+            else message
+        )
+        if not korean and not any(ch.isalpha() for ch in body):
+            korean = is_korean(content) or any(
+                is_korean(m.content or "") for m in reversed(self._history) if m.content
+            )
+        base = "" if replaces_reply(records) else content
         wanted = [
-            *reply_notes(records, korean=korean, reply=content),
+            *reply_notes(records, korean=korean, reply=base),
             *self._aid_lines(records, korean=korean),
             *extra,
         ]
-        added = lines_to_add(content, wanted)
+        added = lines_to_add(base, wanted)
         if not added:
             return content
-        full = with_lines(content, added)
+        full = with_lines(base, added)
         history = self._history
         if content and assistant_msg_idx is not None and assistant_msg_idx < len(history):
             self._rewrite_answer(assistant_msg_idx, full, "reply_lines")
         else:
             self._active_session.append(ChatMessage(role=MessageRole.ASSISTANT, content=full))
         durable_events.append({"type": "REPLY_LINES_ADDED", "lines": added})
-        await emit("token", {"content": full[len(content) :]})
+        if base:
+            await emit("token", {"content": full[len(content) :]})
         return full
 
     def _log_recalled_memory(self, turn_live: TurnSession) -> None:
@@ -1481,6 +1566,84 @@ class TurnExecutor:
                 apply_edit()
         except Exception as exc:
             raise _PersonaEditNotApplied from exc
+
+    def _start_turn_llm(self) -> LLMProviderProtocol:
+        """The turn's model, with its staged changes taken, and the usage limit checked once.
+
+        Owner ruling 2026-10-30 (#2431): the paid-model limit is checked when a turn starts,
+        and an admitted turn finishes even past it; every call is still booked. A refusal
+        raises `UsageLimitReachedError`, which `execute_turn` ends as `usage_limit`. The mark
+        it sets is put back by `BaseAgent.execute_turn` once the turn returns. Kept out of
+        `execute_turn`, which is at the limit of what the type checker can analyse.
+        """
+        llm = self._take_staged_changes()
+        # The agent restores the mark after the turn.
+        enter_admitted_turn(llm, continuing=self._continuing)
+        return llm
+
+    def _appends_prompt(self, user_prompt: ChatMessage) -> bool:
+        """Whether the turn puts `user_prompt` in history: not when it is the same prompt
+        waiting unanswered (`_repeats_unanswered_prompt`), nor when the turn continues one
+        its usage ceiling stopped, whose prompt is there already (#2431)."""
+        return not self._continuing and not _repeats_unanswered_prompt(self._history, user_prompt)
+
+    async def continue_turn(
+        self,
+        *,
+        stream_callback: Callable[[str, dict[str, Any]], Awaitable[None] | None] | None = None,
+        caller_turn_id: str | None = None,
+        room_id: str | None = None,
+        story_id: str | None = None,
+        person_names: tuple[str, ...] = (),
+        workspace_root: Path | None = None,
+    ) -> TurnResult:
+        """Continue the turn its usage ceiling stopped, from where it stopped (#2431).
+
+        The turn's prompt and its finished steps are in history already: the prompt is not
+        sent again, and the model goes on from the last tool results. It is the same turn,
+        so it is not checked against the limit at its start, and it spends from zero: one
+        more ceiling's worth.
+
+        Raises:
+            NothingToContinueError: No prompt of the person's is in this session.
+        """
+        prompt = next(
+            (m.content for m in reversed(self._history) if m.role is MessageRole.USER), None
+        )
+        if not isinstance(prompt, str):
+            raise NothingToContinueError(
+                "There is no stopped turn to continue in this conversation."
+            )
+        self._continuing = True
+        try:
+            return await self.execute_turn(
+                prompt,
+                stream_callback=stream_callback,
+                caller_turn_id=caller_turn_id,
+                room_id=room_id,
+                story_id=story_id,
+                person_names=person_names,
+                workspace_root=workspace_root,
+            )
+        finally:
+            self._continuing = False
+
+    def _take_staged_changes(self) -> LLMProviderProtocol:
+        """Take a staged persona edit and model change, and the connector this turn runs on.
+
+        A staged model change (#2418) may put another connector on the seat at this turn's
+        start, so the turn runs on the connector read here, after the take, not on the one
+        read before the turn lock. A function of its own: `execute_turn` sits at the edge
+        of what the type checker can analyse.
+        """
+        self._take_staged_persona()
+        llm = self._llm
+        if llm is None:
+            raise LLMConnectorNotConfiguredError(
+                f"Agent '{self.agent_id}' cannot execute a reasoning turn: the model it was "
+                "given has no connector."
+            )
+        return llm
 
     @property
     def _ingest_tool_message(self) -> _IngestToolMessage:
@@ -1673,10 +1836,11 @@ class TurnExecutor:
                 )
                 progress.usage = cut_usage
                 raise
-            except UsageLimitReachedError:
+            except BudgetExceededError:
                 # The usage gate refused before the first chunk: nothing was sent, so nothing
-                # is booked, and the turn stops as `usage_limit`, not as an interrupted
-                # stream (the token-gateway design §4.5.4).
+                # is booked, and the turn stops as `usage_limit`, or at its own ceiling as
+                # `usage_ceiling` (#2431), not as an interrupted stream (the token-gateway
+                # design §4.5.4).
                 raise
             except Exception as stream_err:
                 # The stream stopped before it finished, and the turn fails (#938). This
@@ -2188,7 +2352,7 @@ class TurnExecutor:
                 # Inside the `try` (#1904): an edit that fails to apply is a failed turn
                 # result, like any other failure at the turn's start, not an exception out
                 # of `execute_turn`. It runs before the first request is built.
-                self._take_staged_persona()
+                llm = self._start_turn_llm()
                 if isinstance(input_data, str):
                     content_input = input_data
                 else:
@@ -2247,7 +2411,7 @@ class TurnExecutor:
                 user_prompt = redact_message(
                     ChatMessage(role=MessageRole.USER, content=content_input)
                 )
-                if not _repeats_unanswered_prompt(self._history, user_prompt):
+                if self._appends_prompt(user_prompt):
                     self._active_session.append(user_prompt)
                 durable_events.append(
                     {
@@ -2750,7 +2914,9 @@ class TurnExecutor:
                     # here, once; later steps render the same excerpt.
                     reader_offered = any(d.name == TOOL_RESULT_READ_TOOL for d in tool_defs)
                     step_results = [redact_message(m) for m in tool_messages]
-                    drop_once_drawn(turn_extra_sections, image_set_section, step_executions)
+                    self._sections_after_step(
+                        turn_extra_sections, image_set_section, step_executions
+                    )
                     self._append_step_results(step_results, reader_offered)
                     tool_executions.extend(step_executions)
                     tools_unreported = False
@@ -2942,24 +3108,7 @@ class TurnExecutor:
                 # budget refusal above already uses: `is_completed=False`, the ceiling's own
                 # message, and `provenance=None` because no path produced a value.
                 self.transition_to(AgentState.ERROR)
-                if isinstance(exc, UsageLimitReachedError):
-                    # The user's system-wide paid-model limit (`llm-token-gateway.md`
-                    # §4.3), not this session's ceiling: a new conversation meets it too,
-                    # and its message is written for the user, so heads show it as is.
-                    stop_reason = "usage_limit"
-                elif isinstance(exc, BudgetExceededError):
-                    # Stated, not left to the wording of `error` (#969): the ledger only
-                    # grows, so a retry meets this ceiling again until the ceiling changes,
-                    # and a head deciding whether to offer Retry reads it from here.
-                    #
-                    # This also matches `StepBudgetExceededError`, which subclasses it.
-                    # Nothing in `src/` raises that class today, and the step ceiling
-                    # returns its own `step_budget_exceeded` result before reaching this
-                    # handler, so no behaviour depends on the overlap. Whoever raises it
-                    # first should decide whether a step ceiling is a refusal a retry
-                    # meets again -- it is not, since `run_steps` resets per turn -- and
-                    # narrow this test rather than inherit the label by accident.
-                    stop_reason = "budget_exceeded"
+                stop_reason = _ceiling_stop_reason(exc, stop_reason)
                 logger.warning(
                     "Budget ceiling reached or token budget exhausted for agent %s: %s",
                     self.agent_id,
@@ -2990,7 +3139,7 @@ class TurnExecutor:
                     tool_executions=tuple(tool_executions),  # ran before the ceiling
                     tool_executions_complete=not tools_unreported,  # a ceiling mid-step
                     is_completed=False,
-                    error=str(exc),
+                    error=_ceiling_error(exc),
                     stop_reason=stop_reason,
                     correlation_id=correlation_id,
                     provenance=None,
@@ -3579,6 +3728,13 @@ class TurnExecutor:
         )
         if self._tool_invoker.tools_module == "k_act":
             self._announce_bound_on_call(tool_messages, step_executions, shown_tool_names)
+        if any(record.ends_turn for record in step_executions):
+            # Only a person, elsewhere, can do what the refused call asked (#2429): the
+            # rest of the turn offers no tools, so the model answers instead of finding
+            # another way to the same change.
+            tool_defs.clear()
+            shown_tool_names.clear()
+            return tool_messages, step_executions, True
         return tool_messages, step_executions, False
 
     async def _model_accepts_images(
@@ -3630,6 +3786,7 @@ class TurnExecutor:
             room_id=self._turn_room_id,
             turn_id=self._turn_caller_turn_id,
             story_id=self._turn_story_id,
+            turn_aid_sections=tuple(self._turn_aid_sections),
             person_names=self._turn_person_names,
             # The clone's own names, so `record_memory_fact` files a fact about it under
             # `self` (#2016). A name it shares with the person stays the person's.

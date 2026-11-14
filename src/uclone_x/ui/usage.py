@@ -103,6 +103,7 @@ def usage_report(
             {
                 "window": window.window.value,
                 "used": window.used,
+                "cached": window.cached,
                 "limit": window.limit,
                 "available_again_at": _iso(window.available_again_at),
             }

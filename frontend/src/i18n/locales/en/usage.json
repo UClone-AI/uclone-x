@@ -20,6 +20,8 @@
   },
   "ofLimit": "{used} of {limit} ({pct}%)",
   "noLimit": "{used} used, no limit",
+  "split": "{new} new · {cached} cached",
+  "cachedNote": "Cached tokens are input the provider already had from an earlier call, and providers usually charge less for them. The limit counts both new and cached tokens.",
   "pausedUntil": "Paid models are paused until {time}.",
   "envOverride": "Set by {variable}",
   "limitLabel": "Limit",

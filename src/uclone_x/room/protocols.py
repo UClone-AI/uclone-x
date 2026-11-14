@@ -201,6 +201,19 @@ class RoomOrchestratorProtocol(Protocol):
         """
         ...
 
+    async def continue_turn(self, room_id: str) -> RoomState:
+        """Continue, in place, the room's last utterance when its usage ceiling stopped it.
+
+        The seat goes on from its last finished step, with no resend and no new
+        conversation, and may spend one more ceiling's worth (#2431). The stopped row is
+        kept; the continuation appends beside it.
+
+        Raises:
+            NothingToContinueError: The last utterance is not a turn its ceiling stopped.
+            UnknownRoomParticipantError: The agent that stopped has left the room.
+        """
+        ...
+
     async def note_human_activity(self, room_id: str, sender_id: str = "human") -> None:
         """Record that a human is active — typing, not yet sent.
 

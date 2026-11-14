@@ -382,7 +382,8 @@ def image_ref_problem(ref: ModelRef, conn: Connection | None) -> str | None:
     if conn is None:
         return (
             f"The picture model {ref} cannot be used: there is no connection called "
-            f"{ref.connection_id}."
+            f"{ref.connection_id}. Choose another picture model in Settings › Models, or in "
+            "the clone editor."
         )
     spec = spec_for(conn.kind)
     if conn.unsupported or spec is None:

@@ -27,7 +27,9 @@ import { ReadFailure, ReadLoading } from './ReadState';
  *
  * Not behind developer mode: the limit is the user's spending decision, set in one place for
  * the whole installation. A bar per window, a preset picker whose Custom choice opens the three
- * numbers, the per-provider totals, and a line saying this counts tokens, not money.
+ * numbers, the per-provider totals, and a line saying this counts tokens, not money. Each window
+ * also splits its figure into new and cached tokens (#2429): an agent loop resends its whole
+ * conversation, so most of a busy window can be input the provider already held.
  */
 export const UsageSection: React.FC<{
   /** Called with the answer to a save that landed, so a sibling reading the same report can refresh. */
@@ -125,6 +127,9 @@ export const UsageSection: React.FC<{
                 <WindowBar key={id} status={status} overridden={report.env_overrides.includes(id)} />
               ) : null;
             })}
+            <p className="text-[11px] text-slate-500" data-testid="settings-usage-cached-note">
+              {copy.cachedNote}
+            </p>
           </div>
 
           <div className="space-y-2">
@@ -243,6 +248,9 @@ const WindowBar: React.FC<{ status: UsageWindowStatus; overridden: boolean }> = 
           <div className={`h-full ${tone}`} style={{ width: `${pct}%` }} />
         </div>
       )}
+      <p className="text-[11px] text-slate-500 tabular-nums" data-testid={`settings-usage-split-${status.window}`}>
+        {fmt(copy.split, { new: compactTokens(status.used - status.cached), cached: compactTokens(status.cached) })}
+      </p>
       {reached && status.available_again_at && (
         <p className="text-[11px] text-rose-300" data-testid={`settings-usage-paused-${status.window}`}>
           {fmt(copy.pausedUntil, { time: clockTime(status.available_again_at) })}

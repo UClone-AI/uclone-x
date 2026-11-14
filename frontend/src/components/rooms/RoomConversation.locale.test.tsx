@@ -140,8 +140,8 @@ describe('the conversation in the chosen language', () => {
     expect(left).not.toHaveTextContent(/asked|leave out/);
   });
 
-  // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: {refusalRemedy(message.refusal, t.outcome)}
-  // Becomes: {refusalRemedy(message.refusal)}
+  // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: {ownRemedy ?? refusalRemedy(message.refusal, t.outcome)}
+  // Becomes: {ownRemedy ?? refusalRemedy(message.refusal)}
   it('says a refused turn and its remedy in Korean, with the clone named', () => {
     render(
       <Host

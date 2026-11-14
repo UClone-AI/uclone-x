@@ -23,9 +23,6 @@ export const DEVELOPER_MODE_KEY = 'uclone-x.developer-mode';
  */
 export const DEVELOPER_SURFACES: readonly DockSurface[] = [
   'knowledge_graph',
-  'topology',
-  'ledger',
-  'ontology',
 ];
 
 export const isDeveloperSurface = (surface: DockSurface): boolean =>

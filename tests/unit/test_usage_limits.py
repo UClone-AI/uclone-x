@@ -7,6 +7,7 @@ where the store is not the subject, and a `tmp_path` SQLite file where it is.
 from __future__ import annotations
 
 import json
+import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -192,6 +193,92 @@ def test_sqlite_entries_since_is_oldest_first_exclusive_and_round_trips(tmp_path
         model=None,
         count_source=TokenCountSource.ESTIMATE,
     )
+
+
+def test_sqlite_store_keeps_cached_input_apart_from_new(tmp_path: Path) -> None:
+    """Of a call's tokens, the cached input is stored as its own figure (#2429).
+
+    Killed by: src/uclone_x/llm/usage/store.py :: entry.cached_tokens,
+    Becomes: None,
+    """
+    store = SqliteUsageStore(tmp_path / "usage.sqlite3", now=NOW)
+    store.add(
+        UsageEntry(
+            at=NOW - timedelta(minutes=2), tokens=1_010, provider="gemini", cached_tokens=900
+        )
+    )
+    store.add(UsageEntry(at=NOW - timedelta(minutes=1), tokens=40, provider="gemini"))
+
+    rows = store.entries_since(NOW - timedelta(hours=1))
+
+    assert [(e.tokens, e.cached_tokens, e.new_tokens) for e in rows] == [
+        (1_010, 900, 110),
+        (40, None, 40),  # not reported: counted as new, never as 0 cached by assumption
+    ]
+
+
+_OLD_SCHEMA = """
+CREATE TABLE usage (
+    at REAL NOT NULL,
+    tokens INTEGER NOT NULL,
+    provider TEXT NOT NULL,
+    model TEXT,
+    count_source TEXT NOT NULL
+);
+CREATE INDEX usage_at ON usage (at);
+"""
+
+
+def test_an_old_usage_file_without_a_cache_column_reads_as_all_new(tmp_path: Path) -> None:
+    """A file written before the cache column existed opens, and its rows read as all new.
+
+    Killed by: src/uclone_x/llm/usage/store.py :: conn.execute("ALTER TABLE usage ADD COLUMN cached_tokens INTEGER")
+    Becomes: pass
+    """
+    path = tmp_path / "usage.sqlite3"
+    old = sqlite3.connect(path)
+    with old:
+        old.executescript(_OLD_SCHEMA)
+        old.execute(
+            "INSERT INTO usage VALUES (?, ?, ?, ?, ?)",
+            ((NOW - timedelta(minutes=3)).timestamp(), 500, "gemini", "m", "provider"),
+        )
+    old.close()
+
+    store = SqliteUsageStore(path, now=NOW)
+    store.add(
+        UsageEntry(
+            at=NOW - timedelta(minutes=1), tokens=1_000, provider="gemini", cached_tokens=800
+        )
+    )
+
+    rows = store.entries_since(NOW - timedelta(hours=1))
+    assert [(e.tokens, e.cached_tokens, e.new_tokens) for e in rows] == [
+        (500, None, 500),
+        (1_000, 800, 200),
+    ]
+    five = _window(check(UsageLimits(), store, NOW), UsageWindow.PER_5_HOURS)
+    assert (five.used, five.cached) == (1_500, 800)
+    # A second process opening the upgraded file finds the column and adds nothing.
+    assert SqliteUsageStore(path, now=NOW).entries_since(NOW - timedelta(hours=1)) == rows
+
+
+def test_the_limit_counts_cached_input_as_well_as_new(tmp_path: Path) -> None:
+    """Author's choice (#2429): the limit counts every token, cached input included.
+
+    Killed by: src/uclone_x/llm/usage/limits.py :: used = sum(e.tokens for e in inside)
+    Becomes: used = sum(e.new_tokens for e in inside)
+    """
+    store = MemoryUsageStore()
+    store.add(
+        UsageEntry(
+            at=NOW - timedelta(minutes=1), tokens=1_000, provider="gemini", cached_tokens=940
+        )
+    )
+
+    five = _window(check(UsageLimits(per_5_hours=1_000), store, NOW), UsageWindow.PER_5_HOURS)
+
+    assert (five.used, five.cached, five.reached) == (1_000, 940, True)
 
 
 # --- load_limits / save_limits ------------------------------------------------------------

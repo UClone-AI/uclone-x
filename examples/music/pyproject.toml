@@ -1,0 +1,26 @@
+# The music example: an interactive multi-track music composition domain built on UClone-X's core.
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "uclone-x-music"
+version = "0.1.0"
+description = "Example UClone-X extension: a Composer clone's song library, score, orchestra and track tools"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+authors = [
+    { name = "Kenny Lim", email = "kennylim@uclone.net" }
+]
+dependencies = [
+    "uclone-x>=0.4.0",
+]
+
+[project.entry-points."uclone_x.extensions"]
+music = "uclone_x_music.ucx_extension:EXTENSION"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/uclone_x_music"]
+
+[tool.uv.sources]
+uclone-x = { workspace = true }

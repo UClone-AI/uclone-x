@@ -152,7 +152,6 @@ def _draft(name: str = "surveyor", **overrides: Any) -> dict[str, Any]:
         "allowed_tools": ["map_area"],
         # A model ref on a saved connection (model-gateway §3.4); `_with_box` saves `box`.
         "model_name": None,
-        "model_tier": "fast",
         "temperature": 0.3,
         "max_tokens": 512,
         "enable_write_tools": False,
@@ -217,7 +216,7 @@ def test_create_writes_one_yaml_file_in_the_directory_the_loader_reads(workspace
         "fast_model": None,
         "image_model": None,
     }
-    assert listed["model_tier"] == "fast"
+    assert "model_tier" not in listed
     assert listed["temperature"] == 0.3
     assert listed["max_tokens"] == 512
     assert listed["enable_write_tools"] is False
@@ -235,12 +234,6 @@ def test_a_written_persona_round_trips_through_a_fresh_loader(workspace: Path) -
 
     Killed by: src/uclone_x/agent/persona_store.py :: "allowed_tools": list(draft.allowed_tools),
     Becomes: "allowed_tools": [],
-
-    The tier is the case that could not load before this write path existed: the model
-    config is strict and YAML has no enum, so `model_tier: fast` was refused by the loader.
-
-    Killed by: src/uclone_x/agent/persona_store.py :: llm_dict["model_tier"] = ModelTier(tier)
-    Becomes: pass
     """
     _with_box(workspace)
     client = _client(workspace)
@@ -255,7 +248,6 @@ def test_a_written_persona_round_trips_through_a_fresh_loader(workspace: Path) -
     assert loaded.system_prompt == prompt
     assert loaded.allowed_tools == ("map_area",)
     assert loaded.llm_config.model_name == _BOX_MODEL
-    assert loaded.llm_config.model_tier == "fast"
     assert loaded.llm_config.max_tokens == 512
     assert loaded.enable_subagent_tools is True
 
@@ -678,3 +670,26 @@ def test_a_sub_agent_of_a_tool_scoped_persona_gets_only_the_parent_s_tools_edits
         child = portal.call(parent.spawn_subagent, "helper", "help")
         with pytest.raises(PermissionError):
             portal.call(child.execute_tool_call, "map_area", dict[str, Any]())
+
+
+def test_a_file_that_still_names_a_tier_loads_with_the_key_dropped() -> None:
+    """A tier chose nothing and is gone (#2419): a clone's turns run on its own model, else
+    the default deep one. A file written before still loads; only that key is dropped.
+
+    Killed by: src/uclone_x/core/models.py :: if "model_tier" in fields:
+    Becomes: if False:
+    """
+    from uclone_x.agent.persona_store import persona_from_mapping
+
+    for tier in ("inherit", "fast", "pro"):
+        loaded = persona_from_mapping(
+            {
+                "name": "surveyor",
+                "role": "Surveyor",
+                "system_prompt": "You survey.",
+                "llm_config": {"model_tier": tier, "temperature": 0.3},
+            },
+            Path("surveyor.yaml"),
+        )
+        assert loaded.llm_config.temperature == 0.3
+        assert "model_tier" not in loaded.llm_config.model_dump()

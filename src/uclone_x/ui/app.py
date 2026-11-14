@@ -104,6 +104,7 @@ from uclone_x.core.session_diagnostics import (
     DEFAULT_MAX_CONVERSATION_TURNS,
     count_active_turns,
 )
+from uclone_x.core.session_store import SessionStoreProtocol
 from uclone_x.core.set_aside import expire_set_aside, set_aside_unreadable
 from uclone_x.engine.event_bus import (
     AgentEvent,
@@ -513,6 +514,11 @@ ROOM_SESSION_PREFIX = f"{_ROOM_SESSION_PREFIX}{_ROOM_SESSION_SEPARATOR}"
 #: before the Settings list.
 READ_ROOTS_ENV_VAR = "UCLONE_READ_ROOTS"
 
+#: Environment variable enabling distributed cluster backing (`docker`, `1` or `true`) for the
+#: Web UI. The cluster is the docker compose topology; its endpoints and secrets come from the
+#: stack env file (`UCX_CLUSTER_ENV_FILE`). There is no in-process stand-in.
+CLUSTER_MODE_ENV_VAR = "UCLONE_CLUSTER_MODE"
+
 
 def _holds_folder(folder: Path, inner: Path) -> bool:
     """Whether `folder` is `inner` or one of its ancestors, compared by inode.
@@ -633,7 +639,6 @@ def _persona_payload(registry: PersonaRegistry, persona: PersonaDefinition) -> d
             "fast_model": persona.llm_config.fast_model,
             "image_model": persona.llm_config.image_model,
         },
-        "model_tier": str(persona.llm_config.model_tier),
         "temperature": persona.llm_config.temperature,
         "max_tokens": persona.llm_config.max_tokens,
         "enable_write_tools": persona.enable_write_tools,
@@ -767,6 +772,8 @@ class AgentSessionManager:
         budget_tracker: TokenBudgetManager | None = None,
         eval_reports_dir: Path | None = None,
         workspace_dir: Path | None = None,
+        core_store: Any | None = None,
+        cluster_room_store: Any | None = None,
     ) -> None:
         self._bus = bus if bus is not None else get_ui_event_bus()
         #: A connector the embedding head handed in (a test's fake, a demo): it answers every
@@ -810,7 +817,12 @@ class AgentSessionManager:
         # record per session, which is what P8's single store means; they now both
         # resolve to `<root>/core/<id>.json`. The transcript is genuinely a different
         # artifact and gets `<root>/ui/`.
-        self._core_store = SessionStore(storage_dir=self._storage_dir / CORE_RECORD_SUBDIR)
+        self._core_store: SessionStoreProtocol = (
+            core_store
+            if core_store is not None
+            else SessionStore(storage_dir=self._storage_dir / CORE_RECORD_SUBDIR)
+        )
+        self.cluster_room_store: Any = cluster_room_store
         self._transcript_dir = self._storage_dir / UI_TRANSCRIPT_SUBDIR
         self._transcript_dir.mkdir(parents=True, exist_ok=True)
         reap_orphaned_temp_files(self._transcript_dir)
@@ -952,7 +964,7 @@ class AgentSessionManager:
         return self._fallback_to_mock
 
     @property
-    def core_store(self) -> SessionStore:
+    def core_store(self) -> Any:
         """The Core session store this UI is a client of (P8)."""
         return self._core_store
 
@@ -1904,6 +1916,20 @@ def create_ui_app(
     active_bus = bus if bus is not None else get_ui_event_bus()
     active_tracer = tracer if tracer is not None else get_ui_tracer()
     active_shutdown_event = shutdown_event if shutdown_event is not None else asyncio.Event()
+    cluster_mode_env = os.environ.get(CLUSTER_MODE_ENV_VAR, "").strip().lower()
+    cluster_stack: Any | None = None
+    if cluster_mode_env in ("docker", "1", "true"):
+        from uclone_x.adapters.cluster.config import ClusterRuntimeConfig, stack_env_path
+        from uclone_x.shells.cluster.runtime_stack import ClusterRuntimeStack
+
+        cluster_stack = ClusterRuntimeStack.create_docker_stack(
+            config=ClusterRuntimeConfig.from_stack_env(stack_env_path())
+        )
+    elif cluster_mode_env:
+        raise ValueError(
+            f"{CLUSTER_MODE_ENV_VAR}={cluster_mode_env!r} is not a cluster mode; use 'docker' "
+            "(the in-process 'memory' stand-in was removed in #2466)"
+        )
     session_mgr = (
         session_manager
         if session_manager is not None
@@ -1918,6 +1944,8 @@ def create_ui_app(
             budget_tracker=budget_tracker,
             eval_reports_dir=eval_reports_dir,
             workspace_dir=workspace_dir,
+            core_store=cluster_stack.session_store if cluster_stack is not None else None,
+            cluster_room_store=cluster_stack.room_store if cluster_stack is not None else None,
         )
     )
     if eval_reports_dir is not None and session_manager is not None:
@@ -2149,7 +2177,7 @@ def create_ui_app(
                 host,
                 apply_settings=record.get("apply_settings") is not False,
                 auto_start_comfyui=record.get("auto_start_comfyui") is not False,
-                sync_llm=record.get("sync_llm") is True,
+                sync_llm=record.get("sync_llm") is not False,
                 timeout=15.0,
                 ports=ports,
             )
@@ -2163,6 +2191,9 @@ def create_ui_app(
 
     @asynccontextmanager
     async def _app_lifespan(app_inst: FastAPI) -> AsyncGenerator[None, None]:
+        active_cluster = getattr(app_inst.state, "cluster_stack", None)
+        if active_cluster is not None:
+            await active_cluster.bootstrap_schema()
         # Before the first turn: an approved skill that is not loaded is one no clone is
         # told about and `load_skill` refuses. A missing store loads nothing.
         await load_approved_skills(session_mgr.skill_registry)
@@ -2264,6 +2295,11 @@ def create_ui_app(
     # rewritten to their ids, once, as loading it would (clone-data-scopes §4 step 3).
     room_stack.service.survey_rooms()
     app.state.room_stack = room_stack
+    app.state.cluster_stack = cluster_stack
+    if cluster_stack is not None:
+        from uclone_x.shells.cluster.runtime_stack import register_cluster_routes
+
+        register_cluster_routes(app, cluster_stack)
     register_room_routes(
         app,
         room_stack,
@@ -2369,6 +2405,7 @@ def create_ui_app(
             "runtime": "uclone_x",
             "protocol_version": "a2a-v1",
             "event_bus_mode": "in_memory_fastpath",
+            "cluster_mode": cluster_stack.backend if cluster_stack is not None else "standalone",
             "absorbed_failures": {
                 "dropped_spans": {
                     "count": active_tracer.buffer_evicted_span_count,
@@ -2853,10 +2890,10 @@ def create_ui_app(
         host = str(req.get("host", "")).strip()
         apply_settings = bool(req.get("apply_settings", True))
         auto_start_comfyui = bool(req.get("auto_start_comfyui", True))
-        # The LLM moves to the remote worker only when asked. It used to follow whenever the
-        # remote Ollama held a model of the same name, so a worker meant for images also
-        # answered every turn, and nothing on the Settings card said so.
-        sync_llm = req.get("sync_llm") is True
+        # Under Model Gateway (G1, G7), the tunnel's Ollama joins the model set as its own
+        # connection (`remote-gpu`) without overwriting `default_models`; `sync_llm` defaults
+        # to True unless the caller explicitly passes `sync_llm: False`.
+        sync_llm = req.get("sync_llm") is not False
         timeout = float(req.get("timeout", 15.0))
         if not host:
             raise HTTPException(

@@ -166,6 +166,18 @@ export function lastSeq(room: RoomState | null): number {
 }
 
 /**
+ * The seq of the room's last utterance, skipping membership rows and notes, or `null` in a
+ * room where nobody has spoken (#2431). The Core continues only that turn, so a row offers
+ * Continue only while it is this one.
+ */
+export function lastUtteranceSeq(room: Pick<RoomState, 'transcript'>): number | null {
+  for (let i = room.transcript.length - 1; i >= 0; i -= 1) {
+    if (room.transcript[i].kind === 'utterance') return room.transcript[i].seq;
+  }
+  return null;
+}
+
+/**
  * Whether `room` holds a human utterance numbered after `afterSeq` whose text is `content`.
  *
  * Exact text, because `accept` stores what it was sent unchanged. `afterSeq` is the last
@@ -283,6 +295,9 @@ export const roomsApi = {
 
   retry: async (roomId: string): Promise<RoomState> =>
     readOrThrow(await ask(`/api/rooms/${roomId}/retry`, { method: 'POST' })),
+  /** Continue a turn its usage ceiling paused, from where it stopped (#2431). */
+  continueTurn: async (roomId: string): Promise<RoomState> =>
+    readOrThrow(await ask(`/api/rooms/${roomId}/continue`, { method: 'POST' })),
 
   typing: async (roomId: string): Promise<void> => {
     await readOrThrow(await ask(`/api/rooms/${roomId}/typing`, { method: 'POST' }));
@@ -419,8 +434,20 @@ export function senderOf(
  */
 export function serviceRefLabel(ref: RoomServiceRef | null | undefined): string | null {
   if (!ref || !ref.provider) return null;
+  if (ref.provider === NOTHING_SERVED.provider && ref.model === NOTHING_SERVED.model) return null;
   return ref.model ? `${ref.provider}:${ref.model}` : ref.provider;
 }
+
+/** The provider the Core names as the server of a turn no model answered (`turn_executor`). */
+const CORE_HANDLER_PROVIDER = 'agent.core';
+
+/**
+ * What the Core writes as `served_by` on a turn its error handler closed
+ * (`agent/turn_executor.py`): its own marker, not a model. Nothing served that turn, so it
+ * gets no served line and is not a model the conversation was answered by (#2424: the card
+ * showed "agent.core:error_handler" to the person).
+ */
+const NOTHING_SERVED = { provider: 'agent.core', model: 'error_handler' } as const;
 
 /**
  * What served this turn, and -- when it was not what was asked for -- what was.
@@ -433,6 +460,10 @@ export function servedByLabel(
   provenance: RoomProvenance | null | undefined,
   instead: string = en.conversation.row.servedInstead,
 ): string | null {
+  // A turn no model answered names the Core's own error handler as its server (P6 keeps
+  // the record honest). It is no model, so a row, its attribution and the strip beside
+  // Send say nothing for it rather than an internal name (#2418).
+  if (provenance?.served_by?.provider === CORE_HANDLER_PROVIDER) return null;
   const served = serviceRefLabel(provenance?.served_by);
   if (!served) return null;
   const requested = serviceRefLabel(provenance?.requested);

@@ -3,6 +3,7 @@ import {
   answerHint,
   applyRoomEvent,
   attributionLines,
+  lastServedModel,
   conversationShape,
   headerAttribution,
   mentionCandidates,
@@ -49,6 +50,7 @@ import type {
 } from '../types';
 import publishedRoomEvents from '../test/room-stream-events.json';
 import { expectPlain } from '../test/plainCopy';
+import { ko } from '../i18n/ko';
 
 const roster = (...ids: string[]): RoomParticipant[] => [
   { id: 'user', kind: 'human' },
@@ -107,6 +109,39 @@ describe('serviceRefLabel / servedByLabel', () => {
     expect(servedByLabel(degraded)).toBe('ollama:qwen3:4b (asked for ollama:qwen3:8b)');
   });
 
+  // Killed by: frontend/src/lib/rooms.ts :: if (ref.provider === NOTHING_SERVED.provider && ref.model === NOTHING_SERVED.model) return null;
+  // Becomes: if (false) return null;
+  it("says nothing served a turn the Core's error handler closed (#2424)", () => {
+    // A failed turn's `served_by` is the Core's own marker, not a model: the card showed
+    // "agent.core:error_handler (asked for gemini:gemini-flash-latest)" under the error,
+    // and the strip beside the composer named it as the last model that answered.
+    const failed: RoomProvenance = {
+      path: 'failover',
+      requested: { provider: 'gemini', model: 'gemini-flash-latest' },
+      served_by: { provider: 'agent.core', model: 'error_handler' },
+      degraded: true,
+    };
+    expect(serviceRefLabel(failed.served_by)).toBeNull();
+    expect(servedByLabel(failed)).toBeNull();
+    const answered: RoomTranscriptMessage = {
+      seq: 1,
+      sender_id: 'composer',
+      content: 'Here is the melody.',
+      kind: 'utterance',
+      created_at: '2026-10-30T05:20:00Z',
+      completed: true,
+      provenance: {
+        path: 'primary',
+        requested: { provider: 'gemini', model: 'gemini-flash-latest' },
+        served_by: { provider: 'gemini', model: 'gemini-flash-latest' },
+        degraded: false,
+      },
+    };
+    expect(
+      lastServedModel([answered, { ...answered, seq: 2, content: '', provenance: failed }]),
+    ).toBe('gemini:gemini-flash-latest');
+  });
+
   it('says only what served when nothing was substituted', () => {
     const clean: RoomProvenance = {
       path: 'primary',
@@ -116,6 +151,50 @@ describe('serviceRefLabel / servedByLabel', () => {
     };
 
     expect(servedByLabel(clean)).toBe('ollama:qwen3:8b');
+  });
+
+  // Killed by: frontend/src/lib/rooms.ts :: if (provenance?.served_by?.provider === CORE_HANDLER_PROVIDER) return null;
+  // Becomes:
+  it('names no model for a turn no model answered, never the Core`s error handler (#2418)', () => {
+    // What the Core records for a turn that failed at its provider (`turn_executor`).
+    const failed: RoomProvenance = {
+      path: 'failover',
+      requested: { provider: 'ollama', model: 'qwen3:14b' },
+      served_by: { provider: 'agent.core', model: 'error_handler' },
+      degraded: true,
+    };
+
+    expect(servedByLabel(failed)).toBeNull();
+    expect(servedByLabel(failed, ko.conversation.row.servedInstead)).toBeNull();
+  });
+});
+
+describe('a failed turn in the attribution and the strip beside Send (#2418)', () => {
+  const served = (seq: number, provider: string, model: string): RoomTranscriptMessage => ({
+    seq,
+    sender_id: 'scout',
+    content: `turn ${seq}`,
+    kind: 'utterance',
+    created_at: '2026-10-29T00:00:00Z',
+    completed: true,
+    provenance: {
+      path: provider === 'agent.core' ? 'failover' : 'primary',
+      requested: { provider: 'ollama', model: 'qwen3:14b' },
+      served_by: { provider, model },
+      degraded: provider === 'agent.core',
+    },
+  });
+  const transcript = [served(1, 'ollama', 'qwen3:14b'), served(2, 'agent.core', 'error_handler')];
+
+  it('keeps naming the model that last answered, not an internal name', () => {
+    expect(lastServedModel(transcript)).toBe('ollama:qwen3:14b');
+  });
+
+  it('prints no attribution line for the failed turn', () => {
+    for (const shape of ['solo', 'multi'] as const) {
+      const lines = [...attributionLines(transcript, shape).values()].join(' ');
+      expect(lines).not.toMatch(/agent\.core|error_handler/);
+    }
   });
 });
 

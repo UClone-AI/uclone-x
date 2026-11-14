@@ -375,6 +375,23 @@ async def test_back_in_a_tab_a_page_opened_names_the_tab_to_go_back_to(
     _plain(str(refused.value))
 
 
+async def test_back_from_the_first_page_a_clone_opened_is_refused_not_a_blank_page(
+    service: BrowserService, site: str
+) -> None:
+    """#2401: a tab the service opens starts at about:blank and then loads the page, so
+    `back` from the first page went to the blank. It is not a page anyone visited.
+
+    Killed by: src/uclone_x/browser/service.py :: first = 1 if tab.started_blank and blank_first else 0
+    Becomes: first = 0
+    """
+    await _open(service, site)
+
+    with pytest.raises(PlainRefusalError) as refused:
+        await service.back(KEY)
+
+    assert str(refused.value) == "There is no earlier page in this tab."
+
+
 async def test_type_into_a_file_field_names_upload(service: BrowserService, site: str) -> None:
     """#2397: `type` on a file input was refused with "Use click, select or check", none of
     which chooses a file. Decided by the field's own type, not its label.

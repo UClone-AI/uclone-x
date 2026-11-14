@@ -202,9 +202,21 @@ class RoomStack:
     agent's session from disk on every turn.
     """
 
-    def __init__(self, session_mgr: AgentSessionManager) -> None:
+    def __init__(
+        self,
+        session_mgr: AgentSessionManager,
+        *,
+        room_store: Any | None = None,
+    ) -> None:
         self._session_mgr = session_mgr
-        self.store = RoomStore(room_storage_dir_under(session_mgr.storage_dir))
+        injected_store = (
+            room_store if room_store is not None else vars(session_mgr).get("cluster_room_store")
+        )
+        self.store: RoomStore = (
+            cast("RoomStore", injected_store)
+            if injected_store is not None
+            else RoomStore(room_storage_dir_under(session_mgr.storage_dir))
+        )
         # The story library is the story extension's leased folder kind (#2205).
         kinds = leased_folder_kinds()
         self.service = RoomService(
@@ -1338,6 +1350,15 @@ def register_room_routes(
         state = _room(room_id)
         try:
             return (await stack.orchestrator(state).retry(room_id)).model_dump(mode="json")
+        except Exception as exc:
+            raise _http_error(exc) from exc
+
+    @router.post("/api/rooms/{room_id}/continue")
+    async def continue_turn(room_id: str) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
+        """Continue a turn its usage ceiling stopped, from its last finished step (#2431)."""
+        state = _room(room_id)
+        try:
+            return (await stack.orchestrator(state).continue_turn(room_id)).model_dump(mode="json")
         except Exception as exc:
             raise _http_error(exc) from exc
 

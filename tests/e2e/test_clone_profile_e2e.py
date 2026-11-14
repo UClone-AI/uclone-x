@@ -137,7 +137,9 @@ async def test_a_picked_clone_arrives_on_the_dock_with_the_picture_installed_for
                 f"the card is {box['width']}px wide, no wider than the {RAIL_WIDTH_PX}px rail "
                 "it was moved out of"
             )
-            assert await page.get_by_test_id("clone-profile-start").is_visible()
+            # No way to start a conversation here: it is open beside the dock (#2417).
+            assert await page.get_by_test_id("clone-profile-edit").is_visible()
+            assert await page.get_by_test_id("clone-profile-start").count() == 0
         finally:
             await browser.close()
 

@@ -161,3 +161,62 @@ def ui_stop(
             f"bound only to another address is not detected.[/dim]",
             soft_wrap=True,
         )
+
+
+@ui_app.command("up")
+def ui_up(
+    port: int = typer.Option(5180, "--port", "-p", help="Port to bind the developer GUI backend"),
+    host: str = typer.Option("127.0.0.1", "--host", "-h", help="Host address to bind"),
+    verify: bool = typer.Option(
+        True,
+        "--verify/--no-verify",
+        help="Automatically run live readiness verification after startup",
+    ),
+    open_browser: bool = typer.Option(
+        False,
+        "--open/--no-open",
+        help="Automatically open the Web UI in the default browser",
+    ),
+    wait_seconds: int = typer.Option(
+        15,
+        "--wait-seconds",
+        help="Maximum seconds to wait for the Web UI daemon to become healthy",
+    ),
+    as_json: bool = typer.Option(
+        False,
+        "--json",
+        help="Output startup and verification report as JSON",
+    ),
+) -> None:
+    """Start the standalone Web UI & Chat server in the background and verify readiness."""
+    from uclone_x.cli.commands.cluster import stack_up
+
+    stack_up(
+        cluster=False,
+        port=port,
+        host=host,
+        wait_seconds=wait_seconds,
+        verify=verify,
+        open_browser=open_browser,
+        as_json=as_json,
+    )
+
+
+@ui_app.command("down")
+def ui_down(
+    port: int = typer.Option(
+        5180,
+        "--port",
+        "-p",
+        help="Port of the developer GUI backend to stop",
+    ),
+    as_json: bool = typer.Option(
+        False,
+        "--json",
+        help="Output shutdown report as JSON",
+    ),
+) -> None:
+    """Stop the standalone Web UI & Chat background server."""
+    from uclone_x.cli.commands.cluster import stack_down
+
+    stack_down(port=port, cluster=False, as_json=as_json)

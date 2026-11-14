@@ -65,6 +65,20 @@ class TurnAidProtocol(Protocol):
 
 
 @runtime_checkable
+class RefreshingTurnAidProtocol(Protocol):
+    """A turn aid whose section can go stale within the turn, and says when it has (#2429).
+
+    The section is turn context: built per request, at the tail, never written to history.
+    So the agent may replace it between steps without changing anything a request already
+    sent. After each step the agent asks; `None` keeps the section it has.
+    """
+
+    def section_after_step(self, records: Sequence[ToolExecutionRecord]) -> str | None:
+        """The section as it is after the step that ran `records`, or `None` to keep it."""
+        ...
+
+
+@runtime_checkable
 class ReplyTextAidProtocol(Protocol):
     """A turn aid that also rewrites the turn's final reply before it is kept (#2300).
 
@@ -85,8 +99,8 @@ class TurnAidHookProtocol(Protocol):
     The agent finds these among its lifecycle hooks with `isinstance`, so a host adds one
     the way it adds any lifecycle hook, and the agent imports nothing of its domain. The
     aid is worked out once, before the turn's first request, and kept for every step of
-    it: the turn context does not change between steps. A raise is logged and the turn
-    runs without the aid.
+    it; an aid that is also a `RefreshingTurnAidProtocol` may give its section anew after
+    a step. A raise is logged and the turn runs without the aid.
     """
 
     def turn_aid(
@@ -210,6 +224,22 @@ class BaseAgentProtocol(Protocol):
         The `dict[str, Any]` arm is gone: the turn entry point accepted an arbitrary
         untyped payload, which is the contract shape P8 forbids (issue 2026-09-02-036).
         A caller with structured input builds an `AgentEvent`.
+        """
+        ...
+
+    async def continue_turn(
+        self,
+        *,
+        stream_callback: Callable[[str, dict[str, Any]], Awaitable[None] | None] | None = None,
+        caller_turn_id: str | None = None,
+        room_id: str | None = None,
+        story_id: str | None = None,
+        person_names: tuple[str, ...] = (),
+        workspace_root: Path | None = None,
+    ) -> TurnResult:
+        """Continue, in place, the turn its usage ceiling stopped (`usage_ceiling`, #2431).
+
+        No prompt is sent again: the model goes on from the turn's last finished step.
         """
         ...
 

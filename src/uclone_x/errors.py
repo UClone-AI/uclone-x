@@ -34,7 +34,6 @@ __all__ = [
     "ADKUnrepresentableMessageError",
     "AgentStateError",
     "BudgetExceededError",
-    "NoRoomToLearnError",
     "CapabilityUnavailableError",
     "ComfyUIError",
     "ComfyUIExecutionError",
@@ -56,8 +55,8 @@ __all__ = [
     "LLMError",
     "LLMModelNotConfiguredError",
     "LLMProviderError",
-    "LLMRequestRefusedError",
     "LLMProviderNotConfiguredError",
+    "LLMRequestRefusedError",
     "LLMStreamInterruptedError",
     "LLMTimeoutError",
     "ListeningProcessLookupError",
@@ -73,6 +72,8 @@ __all__ = [
     "MissingProvenanceError",
     "ModelLacksToolSupportError",
     "ModelNotAvailableError",
+    "NoRoomToLearnError",
+    "NothingToContinueError",
     "NothingToRetryError",
     "OntologyContradictionError",
     "OntologyError",
@@ -82,6 +83,7 @@ __all__ = [
     "OntologyViolationError",
     "ParticipantNotResolvableError",
     "PathTraversalError",
+    "PictureModelNotForChatError",
     "PlainRefusalError",
     "PlanGenerationError",
     "PromotionCriteriaNotMetError",
@@ -96,10 +98,9 @@ __all__ = [
     "PushNotificationNotSupportedError",
     "RoomAlreadyExistsError",
     "RoomError",
-    "RoomWorkspaceRefusedError",
-    "WorkspaceRefusalCode",
     "RoomIdError",
     "RoomNotFoundError",
+    "RoomWorkspaceRefusedError",
     "SandboxViolationError",
     "SecondHumanInRoomError",
     "SessionEventLogNotConfiguredError",
@@ -121,6 +122,7 @@ __all__ = [
     "TelemetryExportError",
     "TokenBudgetExhaustedError",
     "ToolError",
+    "TurnCeilingReachedError",
     "TurnNotLandedError",
     "TurnNotStartedError",
     "UCloneXError",
@@ -131,6 +133,7 @@ __all__ = [
     "UnreadableRoomRecordError",
     "UnsupportedOperationError",
     "VersionNotSupportedError",
+    "WorkspaceRefusalCode",
 ]
 
 
@@ -490,6 +493,22 @@ class NoRoomToLearnError(UCloneXError):
     """
 
 
+class TurnCeilingReachedError(BudgetExceededError):
+    """A turn's own paid spend passed its ceiling, the person's 10-minute limit (#2431).
+
+    Raised by the usage gate before the turn's next call, so a call is never stopped
+    midway. Not a refusal of the turn: it ends as `usage_ceiling` with its finished steps
+    kept, and the person continues it in place. With No limit there is no ceiling.
+    """
+
+    def __init__(self, used: int, ceiling: int) -> None:
+        super().__init__(
+            f"This turn has used {used} paid-model tokens, past its ceiling of {ceiling}."
+        )
+        self.used = used
+        self.ceiling = ceiling
+
+
 class StepBudgetExceededError(BudgetExceededError):
     """An agent step budget ceiling was reached (Principle 4, Principle 6).
 
@@ -831,6 +850,26 @@ class ModelNotAvailableError(ProviderFailureError):
         super().__init__(
             f"The model {model} is not available from {provider}. It may have been "
             "retired, or the name may be misspelled.",
+            provider=provider,
+            model=model,
+        )
+
+
+class PictureModelNotForChatError(ProviderFailureError):
+    """A conversation asked of a model that makes pictures (#2416).
+
+    Google's picture models answer the same `generateContent` call a conversation uses, so
+    a clone saved with one as its chat model would be sent there. It is refused before
+    anything is sent; the saved choice is not changed for the person.
+    """
+
+    kind = ProviderFailureKind.MODEL_UNAVAILABLE
+    retryable = False
+
+    def __init__(self, *, provider: str, model: str) -> None:
+        super().__init__(
+            f"The model {model} from {provider} makes pictures and cannot hold a "
+            "conversation. Choose a conversation model for this clone.",
             provider=provider,
             model=model,
         )
@@ -1473,6 +1512,14 @@ class NothingToRetryError(RoomError):
     which would make "retried and it worked" and "there was nothing to retry"
     indistinguishable to the caller, in the one command a user reaches for precisely
     because they cannot tell what the room did.
+    """
+
+
+class NothingToContinueError(NothingToRetryError):
+    """A continue was asked for where no turn is stopped at its usage ceiling (#2431).
+
+    A kind of `NothingToRetryError`, and answered the same way: nothing is wrong, and
+    nothing is run. The turn to continue ended, failed, or somebody has spoken since.
     """
 
 

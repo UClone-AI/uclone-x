@@ -1,0 +1,73 @@
+styles:
+  pop_ballad:
+    label:
+      ko: "팝 발라드"
+      en: "Pop Ballad"
+    tempo: 96
+    time_signature: "4/4"
+    key_signature: "D minor"
+    default_swing: 0.5
+    chords:
+      - "Dm7"
+      - "Gm7"
+      - "C7"
+      - "Fmaj7"
+    layering_order:
+      - "bass"
+      - "violin"
+      - "piano"
+      - "drums"
+  hiphop_groove:
+    label:
+      ko: "힙합 그루브"
+      en: "Hip-Hop Groove"
+    tempo: 92
+    time_signature: "4/4"
+    key_signature: "D minor"
+    default_swing: 0.58
+    chords:
+      - "Dm7"
+      - "Gm7"
+      - "BbMaj7"
+      - "A7"
+    layering_order:
+      - "bass"
+      - "violin"
+      - "piano"
+      - "drums"
+  jazz_swing:
+    label:
+      ko: "재즈 스윙"
+      en: "Jazz Swing"
+    tempo: 112
+    time_signature: "4/4"
+    key_signature: "D minor"
+    default_swing: 0.60
+    chords:
+      - "Dm9"
+      - "Gm7"
+      - "C13"
+      - "Fmaj9"
+    layering_order:
+      - "bass"
+      - "violin"
+      - "piano"
+      - "drums"
+  classical_strict:
+    label:
+      ko: "클래식 현악"
+      en: "Classical Strings"
+    tempo: 88
+    time_signature: "4/4"
+    key_signature: "D minor"
+    default_swing: 0.5
+    chords:
+      - "Dm"
+      - "Gm"
+      - "A7"
+      - "Dm"
+    layering_order:
+      - "bass"
+      - "violin"
+      - "piano"
+      - "drums"

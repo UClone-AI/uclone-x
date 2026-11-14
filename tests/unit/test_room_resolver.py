@@ -568,7 +568,9 @@ class TestPersonaModelSelection:
 
         assert follower.llm is replacement
         assert follower.config.llm_config.model_name == "settings-deep-2"
-        assert follower.config.llm_config.fast_model == "settings-fast-2"
+        # No fast model of its own: its conversation model, not the Settings fast model
+        # (owner ruling 2026-10-29, #2418).
+        assert follower.config.llm_config.fast_model == "settings-deep-2"
         assert owner.llm is replacement
         assert owner.config.llm_config.model_name == "box/own-deep"
         assert owner.config.llm_config.fast_model == "box/own-fast"

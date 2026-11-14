@@ -668,8 +668,34 @@ def _connection(app: Any, conn_id: str) -> str | None:
 
 
 @pytest.mark.asyncio
+async def test_ui_connect_defaults_sync_llm_to_true(tmp_path: Path) -> None:
+    """Connecting a remote GPU adds both its Ollama (`remote-gpu`) and ComfyUI by default (#2414).
+
+    Killed by: src/uclone_x/ui/app.py :: sync_llm = req.get("sync_llm") is not False
+    Becomes: sync_llm = req.get("sync_llm") is True
+    """
+    app = create_ui_app(storage_dir=tmp_path / "uclone_storage")
+    tunnel_mgr = app.state.tunnel_manager
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://127.0.0.1") as client:
+        await _save_local_ollama(client, app)
+        with patch.object(tunnel_mgr, "connect", return_value=_dell_tunnel()):
+            resp = await client.post(
+                "/api/settings/remote-gpu/connect", json={"host": "dell", "apply_settings": True}
+            )
+        data = resp.json()
+        assert data["applied_changes"] == {
+            "connection": "remote-gpu",
+            "picture_connection": "remote-gpu-pictures",
+        }
+        assert data["llm_on_remote"] is True
+        assert data["images_on_remote"] is True
+        assert _connection(app, "remote-gpu") == "http://127.0.0.1:11435"
+        assert _connection(app, "remote-gpu-pictures") == "http://127.0.0.1:8189"
+
+
+@pytest.mark.asyncio
 async def test_ui_connect_leaves_llm_local_unless_asked(tmp_path: Path) -> None:
-    """A worker connected for images does not take the LLM, even with the same model on it.
+    """A worker connected with `sync_llm: False` skips adding `remote-gpu`.
 
     Its ComfyUI becomes a picture connection of its own (model-gateway §3.5).
 
@@ -682,7 +708,8 @@ async def test_ui_connect_leaves_llm_local_unless_asked(tmp_path: Path) -> None:
         await _save_local_ollama(client, app)
         with patch.object(tunnel_mgr, "connect", return_value=_dell_tunnel()):
             resp = await client.post(
-                "/api/settings/remote-gpu/connect", json={"host": "dell", "apply_settings": True}
+                "/api/settings/remote-gpu/connect",
+                json={"host": "dell", "apply_settings": True, "sync_llm": False},
             )
         data = resp.json()
         assert data["applied_changes"] == {"picture_connection": "remote-gpu-pictures"}

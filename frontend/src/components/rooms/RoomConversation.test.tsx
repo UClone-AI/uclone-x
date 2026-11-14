@@ -9,6 +9,7 @@ import { expectPlain } from '../../test/plainCopy';
 import failedRows from '../../test/room-failed-rows.json';
 import { LocaleProvider } from '../../i18n';
 import { ko } from '../../i18n/ko';
+import { en } from '../../i18n/en';
 import { fmt } from '../../i18n/format';
 import { AvatarChoiceContext } from '../../lib/avatarChoice';
 
@@ -1887,8 +1888,8 @@ describe('RoomConversation stops and failures', () => {
   });
 
   it('offers no Retry on a refusal a retry would meet again, and says what would help (#969)', () => {
-    // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: {message.refusal ? (
-    // Becomes: {false ? (
+    // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: ) : message.refusal ? (
+    // Becomes: ) : false ? (
     // A spent budget refuses every retry: the ledger only grows. The row used to offer
     // Retry anyway, and pressing it appended another identical failure.
     renderRoom({
@@ -1911,7 +1912,7 @@ describe('RoomConversation stops and failures', () => {
     expect(screen.getByTestId('row-error-1')).not.toHaveTextContent('Session token limit');
     expect(screen.queryByTestId('retry-turn')).toBeNull();
     expect(screen.getByTestId('row-remedy-1')).toHaveTextContent(
-      'Trying again would be refused too. Start a new conversation to continue.',
+      'Trying again would be refused too: this limit holds for the whole conversation.',
     );
   });
 
@@ -1975,6 +1976,144 @@ describe('RoomConversation stops and failures', () => {
     );
     expectPlain(row.textContent);
     expectPlain(screen.getByTestId('row-remedy-1').textContent);
+  });
+
+  describe('a failure on the clone`s own model (#2418)', () => {
+    // The Core names the clone's own ref and offers its one action only when the clone's
+    // own model was the cause (`_with_own_model`, model-gateway §3.6).
+    const ownFailure = (
+      kind: 'model_unavailable' | 'provider_unreachable',
+      action: 'use_system_default' | null = 'use_system_default',
+    ) =>
+      message({
+        seq: 1,
+        sender_id: 'scout',
+        content: '',
+        error: 'Scout is set to use its own model, remote-gpu/qwen3:14b, and it could not be used.',
+        refusal: kind === 'model_unavailable' ? 'model_unavailable' : null,
+        provider_failure: {
+          kind,
+          message: 'Scout is set to use its own model, remote-gpu/qwen3:14b, and it could not be used.',
+          retryable: kind !== 'model_unavailable',
+          provider: 'remote-gpu',
+          clone: 'Scout',
+          model_ref: 'remote-gpu/qwen3:14b',
+          action,
+        },
+        provenance: {
+          path: 'failover',
+          requested: { provider: 'ollama', model: 'qwen3:14b' },
+          served_by: { provider: 'agent.core', model: 'error_handler' },
+          degraded: true,
+        },
+      });
+
+    // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: const ownRemedy = ownModelRemedy(label, t.outcome, message.provider_failure);
+    // Becomes: const ownRemedy = null;
+    it('sends the person to the clone editor, not Settings, for a model it cannot use', () => {
+      renderRoom({ room: room({ transcript: [ownFailure('model_unavailable')] }) });
+
+      const remedy = screen.getByTestId('row-remedy-1');
+      expect(remedy).toHaveTextContent(
+        fmt(en.conversation.outcome.ownModelRemedy.model_unavailable, { label: 'Scout' }),
+      );
+      expect(remedy).not.toHaveTextContent(/Settings/);
+      expectPlain(remedy.textContent);
+    });
+
+    it('says the connection could not be reached, and where the clone`s model is chosen', () => {
+      renderRoom({ room: room({ transcript: [ownFailure('provider_unreachable')] }) });
+
+      const row = screen.getByTestId('row-error-1');
+      expect(row).toHaveTextContent('remote-gpu couldn\'t be reached.');
+      expect(row).not.toHaveTextContent(/doesn't offer/);
+      expect(screen.getByTestId('row-remedy-1')).toHaveTextContent(
+        fmt(en.conversation.outcome.ownModelRemedy.provider_unreachable, {
+          label: 'Scout',
+          connection: 'remote-gpu',
+        }),
+      );
+    });
+
+    // With no system default to fall back to, the Core offers no action (#2424); the failure
+    // is still the clone's own model's, so the card names that model and the clone editor.
+    // Killed by: frontend/src/lib/turnOutcome.ts :: if (!failure?.clone || !ref) return null;
+    // Becomes: if (!failure?.clone || !ref || failure.action !== 'use_system_default') return null;
+    it('names the clone`s own model and the clone editor when no action is offered', () => {
+      renderRoom({ room: room({ transcript: [ownFailure('provider_unreachable', null)] }) });
+
+      expect(screen.getByTestId('row-error-1')).toHaveTextContent(
+        "Scout couldn't finish this turn: it is set to use its own model, qwen3:14b, and that model couldn't be used. remote-gpu couldn't be reached.",
+      );
+      const remedy = screen.getByTestId('row-remedy-1');
+      expect(remedy).toHaveTextContent(
+        fmt(en.conversation.outcome.ownModelRemedy.provider_unreachable, {
+          label: 'Scout',
+          connection: 'remote-gpu',
+        }),
+      );
+      expect(remedy).not.toHaveTextContent(/Settings/);
+      expect(screen.queryByTestId('row-use-default-1')).toBeNull();
+    });
+
+    it('says it in Korean, with no internal names', () => {
+      renderRoom({ room: room({ transcript: [ownFailure('model_unavailable')] }) }, { korean: true });
+
+      const remedy = screen.getByTestId('row-remedy-1');
+      expect(remedy).toHaveTextContent(
+        fmt(ko.conversation.outcome.ownModelRemedy.model_unavailable, { label: 'Scout' }),
+      );
+      expect(remedy).not.toHaveTextContent('설정에서');
+      for (const internal of ['agent.core', 'error_handler', 'use_system_default', 'model_ref']) {
+        expect(screen.getByTestId('row-error-1')).not.toHaveTextContent(internal);
+      }
+    });
+
+    // Killed by: frontend/src/lib/turnOutcome.ts :: HOSTED_CLOUD_CONNECTIONS.has(own.connection.toLowerCase())
+    // Becomes: false
+    it('does not tell the person to check that a hosted cloud API is running when an own model on gemini is unreachable', () => {
+      renderRoom({
+        room: room({
+          participants: [
+            { id: 'user', kind: 'human', display_name: 'Kenny' },
+            { id: 'composer', kind: 'agent', display_name: 'Composer' },
+          ],
+          transcript: [
+            message({
+              seq: 1,
+              sender_id: 'composer',
+              content: '',
+              error: 'Composer is set to use its own model, gemini/gemini-flash-latest, and it could not be used.',
+              refusal: null,
+              provider_failure: {
+                kind: 'provider_unreachable',
+                message: 'Composer is set to use its own model, gemini/gemini-flash-latest, and it could not be used.',
+                retryable: true,
+                provider: 'Google',
+                clone: 'composer',
+                model_ref: 'gemini/gemini-flash-latest',
+                action: 'use_system_default',
+              },
+            }),
+          ],
+        }),
+      });
+
+      const remedy = screen.getByTestId('row-remedy-1');
+      expect(remedy).toHaveTextContent(
+        fmt(en.conversation.outcome.ownModelRemedy.model_unavailable, { label: 'Composer' }),
+      );
+      expect(remedy).not.toHaveTextContent('Check that gemini is running');
+      expectPlain(remedy.textContent);
+    });
+
+    // Killed by: frontend/src/lib/rooms.ts :: if (provenance?.served_by?.provider === CORE_HANDLER_PROVIDER) return null;
+    // Becomes:
+    it('names no internal handler as a model under the turn or beside Send', () => {
+      renderRoom({ room: room({ transcript: [ownFailure('provider_unreachable')] }) });
+
+      expect(document.body).not.toHaveTextContent(/agent\.core|error_handler/);
+    });
   });
 
   it('words a model-unavailable refusal with no provider failure on the row in Korean, not the stored English', () => {
@@ -2076,10 +2215,10 @@ describe('RoomConversation stops and failures', () => {
     "Scout is set to use its own model, gpu-box/qwen3:14b, and it could not be used. ModelRefUnavailableError: Couldn't get an answer from http://10.0.0.5:11434/api/chat";
 
   it("names the clone's own model and its connection when that model failed, without the Core's text", () => {
-    // Killed by: frontend/src/lib/turnOutcome.ts ::   if (own && ref) return fmt(copy.ownModelFailed, { label, model: ref.slice(slash + 1), cause });
-    // Becomes:   if (false) return fmt(copy.ownModelFailed, { label, model: ref.slice(slash + 1), cause });
-    // Killed by: frontend/src/lib/turnOutcome.ts ::     failure.provider?.trim() || (own && ref ? ref.slice(0, slash) : '') || copy.providerUnknown;
-    // Becomes:     failure.provider?.trim() || copy.providerUnknown;
+    // Killed by: frontend/src/lib/turnOutcome.ts :: if (own) return fmt(copy.ownModelFailed, { label, model: own.model, cause });
+    // Becomes: if (false) return fmt(copy.ownModelFailed, { label, model: own.model, cause });
+    // Killed by: frontend/src/lib/turnOutcome.ts :: const provider = failure.provider?.trim() || own?.connection || copy.providerUnknown;
+    // Becomes: const provider = failure.provider?.trim() || copy.providerUnknown;
     renderRoom({
       room: room({
         transcript: [
@@ -2289,6 +2428,50 @@ describe('RoomConversation stops and failures', () => {
   });
 });
 
+describe('RoomConversation: a turn its usage ceiling paused (#2431)', () => {
+  const paused = (seq: number) =>
+    message({ seq, sender_id: 'scout', content: '', stopped_at_ceiling: true });
+
+  // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: ) : message.stopped_at_ceiling ? (
+  // Becomes: ) : false ? (
+  it('says plainly why it paused, and Continue goes on with no resend', () => {
+    const onContinue = vi.fn();
+    const onRetry = vi.fn();
+    renderRoom({ room: room({ transcript: [paused(1)] }), onContinue, onRetry });
+
+    const row = screen.getByTestId('row-ceiling-1');
+    expect(row).toHaveTextContent(fmt(en.conversation.row.ceilingStopped, { label: 'Scout' }));
+    expect(row.textContent).not.toMatch(/send (your|the) message again|new conversation/i);
+    expect(screen.queryByTestId('retry-turn')).toBeNull();
+    fireEvent.click(screen.getByTestId('continue-turn'));
+    expect(onContinue).toHaveBeenCalledTimes(1);
+    expect(onRetry).not.toHaveBeenCalled();
+  });
+
+  // Killed by: frontend/src/components/rooms/RoomConversation.tsx :: {!onContinue || room.head || lastUtteranceSeq(room) !== message.seq ? null : (
+  // Becomes: {!onContinue || room.head ? null : (
+  it('offers Continue only while the paused turn is the last thing said', () => {
+    renderRoom({
+      room: room({
+        transcript: [paused(1), message({ seq: 2, sender_id: 'scout', content: 'Here it is.' })],
+      }),
+      onContinue: vi.fn(),
+    });
+
+    expect(screen.getByTestId('row-ceiling-1')).toBeInTheDocument();
+    expect(screen.queryByTestId('continue-turn')).toBeNull();
+  });
+
+  it('says it in Korean', () => {
+    renderRoom({ room: room({ transcript: [paused(1)] }), onContinue: vi.fn() }, { korean: true });
+
+    expect(screen.getByTestId('row-ceiling-1')).toHaveTextContent(
+      fmt(ko.conversation.row.ceilingStopped, { label: 'Scout' }),
+    );
+    expect(screen.getByTestId('continue-turn')).toHaveTextContent(ko.conversation.row.continue);
+  });
+});
+
 describe('RoomConversation invite list', () => {
   it('distinguishes "none installed" from "everybody is already here"', () => {
     // When no clones are installed, the invite list distinguishes that from everyone being seated.
@@ -2369,6 +2552,11 @@ describe('RoomConversation history controls', () => {
     expect(banner).toHaveTextContent(
       'Scout reached the 20-turn limit on context',
     );
+    // Owner ruling 2026-10-29: the product never pushes a new conversation (#2424).
+    expect(banner).toHaveTextContent('Shorten this conversation');
+    expect(banner.textContent).not.toMatch(/new one|new conversation/i);
+    expect(ko.conversation.reset.saturated).not.toContain('새 대화');
+    expect(ko.conversation.reset.saturated).toContain('줄이');
     expect(banner.firstElementChild).toHaveClass('max-w-3xl');
     expect(banner.firstElementChild).toHaveClass('mx-auto');
   });

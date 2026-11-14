@@ -13,6 +13,7 @@ from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+import httpx
 import pytest
 
 from uclone_x.agent.models import AgentLLMConfig
@@ -189,8 +190,44 @@ async def test_generate_records_the_provider_usage() -> None:
             provider="fakepaid",
             model="served",
             count_source=TokenCountSource.PROVIDER,
+            input_tokens=30,
+            output_tokens=12,
         )
     ]
+
+
+async def test_a_gemini_cached_count_is_booked_as_cached_and_new() -> None:
+    """Gemini's `cachedContentTokenCount` reaches the store as the cached part (#2429).
+
+    Killed by: src/uclone_x/llm/usage/gate.py :: cached_tokens=usage.cache_read_input_tokens,
+    Becomes: cached_tokens=None,
+    """
+    body = {
+        "candidates": [
+            {"content": {"parts": [{"text": "ok"}], "role": "model"}, "finishReason": "STOP"}
+        ],
+        "usageMetadata": {
+            "promptTokenCount": 5_000,
+            "cachedContentTokenCount": 4_700,
+            "candidatesTokenCount": 7,
+            "totalTokenCount": 5_007,
+        },
+    }
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _: httpx.Response(200, json=body))
+    )
+    store = MemoryUsageStore()
+    gemini = GeminiConnector(model="gemini-2.5-flash", api_key="k", http_client=client)
+
+    await _gated(gemini, store).generate(REQUEST)
+
+    [booked] = _booked(store)
+    assert (booked.provider, booked.tokens, booked.cached_tokens, booked.new_tokens) == (
+        "gemini",
+        5_007,
+        4_700,
+        307,
+    )
 
 
 async def test_stream_records_the_last_reported_usage() -> None:
@@ -372,7 +409,6 @@ _AGENT_LLM_CONFIG_FIELDS = {
     "max_tokens",
     "image_model",
     "model_name",
-    "model_tier",
     "temperature",
     "token_budget",
     "top_p",

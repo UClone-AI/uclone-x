@@ -114,6 +114,13 @@ class ToolContext(BaseModel):
         "(#1558). Story tools compute their paths from it and take none from the "
         "model; `None` means no story is open, and they refuse with that reason.",
     )
+    turn_aid_sections: tuple[str, ...] = Field(
+        default=(),
+        description="The turn aids' sections the request that made this call carried at "
+        "its tail (#2429), so a tool can tell what is already in this request from the "
+        "request itself rather than from state kept between conversations. Empty for a "
+        "call no turn made, which means nothing is known to be in the request.",
+    )
 
     person_names: tuple[str, ...] = Field(
         default=(),

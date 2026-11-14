@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import errno
 import json
 import logging
+import re
 import time
 from collections.abc import AsyncIterator, Callable, Sequence
 from pathlib import Path
@@ -548,8 +550,8 @@ async def test_ollama_stream_draws_the_same_line_generate_does() -> None:
     than no distinction: a reader who learned to trust `LLMTimeoutError` would read every
     cut-off stream as an unreachable host.
 
-    Killed by: src/uclone_x/llm/connectors/ollama.py :: self.timeout, exc, unreachable_prefix="Ollama stream connection error"
-    Becomes: self.timeout, exc, unreachable_prefix="Failed to connect to Ollama"
+    Killed by: src/uclone_x/llm/connectors/ollama.py :: unreachable_prefix="Ollama stream connection error",
+    Becomes: unreachable_prefix="Failed to connect to Ollama",
     """
 
     def timed_out(request: httpx.Request) -> httpx.Response:
@@ -1302,6 +1304,20 @@ async def test_anthropic_connector_error() -> None:
 # ======================================================================================
 # GeminiConnector Tests
 # ======================================================================================
+
+
+def test_gemini_connector_defaults_to_180s_read_timeout() -> None:
+    """Gemini thinking + large structured tool-call generation needs the 180s read ceiling.
+
+    Killed by: src/uclone_x/llm/connectors/gemini.py :: timeout: float = DEFAULT_GEMINI_TIMEOUT_SECONDS
+    Becomes: timeout: float = 60.0
+    """
+    from uclone_x.llm.connectors import DEFAULT_GEMINI_TIMEOUT_SECONDS
+
+    connector = GeminiConnector(model="gemini-2.5-pro", api_key="gem_key")
+    assert DEFAULT_GEMINI_TIMEOUT_SECONDS == 180.0
+    assert connector.timeout == DEFAULT_GEMINI_TIMEOUT_SECONDS
+    assert connector.timeout == 180.0
 
 
 @pytest.mark.asyncio
@@ -6581,3 +6597,390 @@ async def test_two_first_calls_at_once_to_a_model_that_only_thinks_both_succeed(
     assert sorted(str(thinking) for _, thinking in gemini.sent) == sorted(
         [str({"thinkingBudget": 0})] * 2 + [str({"thinkingLevel": "low"})] * 2
     )
+
+
+# -- #2424: why a connection failed, and one try on the other address family -----------------
+
+
+_GEMINI_REPLY: dict[str, Any] = {
+    "candidates": [
+        {
+            "content": {"parts": [{"text": "Here is the melody."}], "role": "model"},
+            "finishReason": "STOP",
+        }
+    ],
+    "usageMetadata": {"promptTokenCount": 5, "candidatesTokenCount": 4, "totalTokenCount": 9},
+}
+
+
+class _Stream:
+    """The connected stream httpcore hands the `trace` extension, as far as it is read."""
+
+    def __init__(self, peer: tuple[str, int]) -> None:
+        self.peer = peer
+
+    def get_extra_info(self, name: str) -> object:
+        return self.peer if name == "server_addr" else None
+
+
+def _stalls_after_connecting(peer: tuple[str, int], seen: list[str]) -> Any:
+    """The #2424 stall: TCP connects, TLS never completes, the kernel says ETIMEDOUT."""
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen.append("stalled")
+        trace = request.extensions["trace"]
+        await trace("connection.connect_tcp.started", {})
+        await trace("connection.connect_tcp.complete", {"return_value": _Stream(peer)})
+        await trace("connection.start_tls.started", {})
+        cause = TimeoutError(errno.ETIMEDOUT, "Operation timed out")
+        raise httpx.ConnectError("", request=request) from cause
+
+    return handler
+
+
+_Answer = Callable[[httpx.Request], httpx.Response]
+#: What the fallback transport was asked for, and how it answers (`other_family`).
+_FallbackState = tuple[list[Any], dict[str, _Answer]]
+
+
+@pytest.fixture
+def other_family(monkeypatch: pytest.MonkeyPatch) -> _FallbackState:
+    """The fallback transport, answered by a mock; records the family asked for."""
+    from uclone_x.llm.connectors import connect_fallback
+
+    asked: list[Any] = []
+    state: dict[str, _Answer] = {"answer": lambda _r: httpx.Response(200, json=_GEMINI_REPLY)}
+
+    def transport_for(family: Any) -> httpx.AsyncBaseTransport:
+        asked.append(family)
+        return httpx.MockTransport(lambda r: state["answer"](r))
+
+    monkeypatch.setattr(connect_fallback, "_transport_for", transport_for)
+    monkeypatch.setattr(connect_fallback, "_FALLBACKS", type(connect_fallback._FALLBACKS)())  # pyright: ignore[reportPrivateUsage]
+    return asked, state
+
+
+def _ask() -> LLMRequest:
+    return LLMRequest(
+        model="gemini-flash-latest",
+        messages=(ChatMessage(role=MessageRole.USER, content="Write a melody"),),
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_connect_failure_is_logged_with_its_real_cause(
+    other_family: _FallbackState, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The app logged only "ConnectError"; the kernel had said ETIMEDOUT after 27 s on IPv6
+    (#2424). The log now names the errno, the phase, the family and peer, the time, and
+    that no response arrived.
+
+    Killed by: src/uclone_x/llm/connectors/failures.py :: text = f"{name} ({current.errno}) {current.strerror or text}".strip()
+    Becomes: text = text
+    """
+    seen: list[str] = []
+    connector = GeminiConnector(
+        api_key="k",
+        http_client=httpx.AsyncClient(
+            transport=httpx.MockTransport(_stalls_after_connecting(("2001:db8::1", 443), seen))
+        ),
+    )
+    caplog.set_level(logging.WARNING, logger="uclone_x.llm.connectors.connect_fallback")
+
+    await connector.generate(_ask())
+
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    assert "ETIMEDOUT" in logged
+    assert "start_tls" in logged
+    assert "IPv6 [2001:db8::1]:443" in logged
+    assert "no response bytes received" in logged
+    assert re.search(r"after \d+\.\d\ds", logged)
+
+
+@pytest.mark.asyncio
+async def test_an_ipv6_stall_falls_back_once_to_ipv4_and_the_turn_succeeds(
+    other_family: _FallbackState,
+) -> None:
+    """IPv6 connected and then delivered nothing; IPv4 answers. One fallback, counted.
+
+    Killed by: src/uclone_x/llm/connectors/connect_fallback.py :: if other is None or attempt.body_sent or attempt.response_started:
+    Becomes: if True:
+    """
+    import socket
+
+    from uclone_x.llm.connectors.connect_fallback import family_fallbacks
+
+    asked, _ = other_family
+    seen: list[str] = []
+    connector = GeminiConnector(
+        api_key="k",
+        http_client=httpx.AsyncClient(
+            transport=httpx.MockTransport(_stalls_after_connecting(("2001:db8::1", 443), seen))
+        ),
+    )
+
+    reply = await connector.generate(_ask())
+
+    assert reply.content == "Here is the melody."
+    assert seen == ["stalled"]
+    assert asked == [socket.AF_INET]
+    assert family_fallbacks() == {"generativelanguage.googleapis.com": 1}
+
+
+@pytest.mark.asyncio
+async def test_a_stream_falls_back_once_too(
+    other_family: _FallbackState,
+) -> None:
+    """Only the opening falls back; once the reply has started nothing is sent again.
+
+    Killed by: src/uclone_x/llm/connectors/gemini.py :: async with stream_with_fallback(
+    Becomes: async with (lambda c, m, u, **k: c.stream(m, u, **k))(
+    """
+    _, state = other_family
+    body = "data: " + json.dumps(_GEMINI_REPLY) + "\n\n"
+    state["answer"] = lambda _r: httpx.Response(200, text=body)
+    connector = GeminiConnector(
+        api_key="k",
+        http_client=httpx.AsyncClient(
+            transport=httpx.MockTransport(_stalls_after_connecting(("2001:db8::1", 443), []))
+        ),
+    )
+
+    chunks = [chunk async for chunk in connector.stream(_ask())]
+
+    assert "".join(c.delta_content or "" for c in chunks) == "Here is the melody."
+
+
+@pytest.mark.asyncio
+async def test_no_fallback_without_a_connection_or_after_a_second_failure(
+    other_family: _FallbackState,
+) -> None:
+    """No retry loop: a failure before TCP connected (the OS tried every address) is not
+    sent again, and the fallback is tried once only.
+
+    Killed by: src/uclone_x/llm/connectors/connect_fallback.py :: socket.AF_INET6: socket.AF_INET,
+    Becomes: socket.AF_INET6: socket.AF_INET6,
+    """
+    from uclone_x.errors import ProviderUnreachableError
+
+    asked, state = other_family
+
+    def refused(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("[Errno 61] Connection refused", request=request)
+
+    connector = GeminiConnector(
+        api_key="k", http_client=httpx.AsyncClient(transport=httpx.MockTransport(refused))
+    )
+    with pytest.raises(ProviderUnreachableError):
+        await connector.generate(_ask())
+    assert asked == []
+
+    state["answer"] = refused
+    stalled = GeminiConnector(
+        api_key="k",
+        http_client=httpx.AsyncClient(
+            transport=httpx.MockTransport(_stalls_after_connecting(("2001:db8::1", 443), []))
+        ),
+    )
+    with pytest.raises(ProviderUnreachableError):
+        await stalled.generate(_ask())
+    import socket
+
+    assert asked == [socket.AF_INET]
+
+
+def _fails_after(event: str, seen: list[str]) -> Any:
+    """Connects over IPv6, gets as far as `event`, then fails with a connect-class error."""
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(event)
+        trace = request.extensions["trace"]
+        await trace(
+            "connection.connect_tcp.complete", {"return_value": _Stream(("2001:db8::1", 443))}
+        )
+        await trace("http11.send_request_headers.complete", {})
+        await trace("http11.send_request_body.complete", {})
+        if event == "http11.receive_response_headers.complete":
+            await trace(event, {})
+        raise httpx.ConnectError("", request=request)
+
+    return handler
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "event",
+    ["http11.send_request_body.complete", "http11.receive_response_headers.complete"],
+    ids=["body-sent", "reply-started"],
+)
+async def test_a_request_whose_body_went_out_is_never_sent_again(
+    other_family: _FallbackState, event: str
+) -> None:
+    """The provider may have acted on a request once its body went out, and a partial reply
+    shows it did: neither is sent again, whatever the error is called (#2428 review).
+
+    Killed by: src/uclone_x/llm/connectors/connect_fallback.py :: self.body_sent = True
+    Becomes: pass
+    """
+    from uclone_x.errors import ProviderUnreachableError
+
+    asked, _ = other_family
+    seen: list[str] = []
+    connector = GeminiConnector(
+        api_key="k",
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(_fails_after(event, seen))),
+    )
+
+    with pytest.raises(ProviderUnreachableError):
+        await connector.generate(_ask())
+
+    assert seen == [event]
+    assert asked == []
+
+
+class _ClosingTransport(httpx.MockTransport):
+    """A mock transport that says when its client closed it."""
+
+    def __init__(self, handler: Any, closed: list[bool]) -> None:
+        super().__init__(handler)
+        self.closed = closed
+
+    async def aclose(self) -> None:
+        self.closed.append(True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [False, True], ids=["generate", "stream"])
+async def test_a_stall_on_both_families_falls_back_once_and_fails_with_its_cause(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, stream: bool
+) -> None:
+    """IPv6 stalls, the one fallback over IPv4 stalls too: exactly one fallback, then the
+    failure, logged with the second attempt's cause, and the fallback client closed (#2428
+    review). A stream that failed to open used to leave that client open.
+
+    Killed by: src/uclone_x/llm/connectors/connect_fallback.py :: response = await send(fallback, second)
+    Becomes: response = await _sending(send, fallback, url, keep_fallback_open=keep_fallback_open)
+    Killed by: src/uclone_x/llm/connectors/connect_fallback.py :: close = True  # a failed fallback is closed here; the caller closes a stream it reads
+    Becomes: close = not keep_fallback_open
+    """
+    import socket
+
+    from uclone_x.errors import ProviderUnreachableError
+    from uclone_x.llm.connectors import connect_fallback
+
+    asked: list[Any] = []
+    closed: list[bool] = []
+    seen: list[str] = []
+    peers = {socket.AF_INET: ("192.0.2.1", 443), socket.AF_INET6: ("2001:db8::1", 443)}
+
+    def transport_for(family: Any) -> httpx.AsyncBaseTransport:
+        asked.append(family)
+        return _ClosingTransport(_stalls_after_connecting(peers[family], seen), closed)
+
+    monkeypatch.setattr(connect_fallback, "_transport_for", transport_for)
+    monkeypatch.setattr(connect_fallback, "_FALLBACKS", type(connect_fallback._FALLBACKS)())  # pyright: ignore[reportPrivateUsage]
+    caplog.set_level(logging.WARNING, logger="uclone_x.llm.connectors.connect_fallback")
+    connector = GeminiConnector(
+        api_key="k",
+        http_client=httpx.AsyncClient(
+            transport=httpx.MockTransport(_stalls_after_connecting(peers[socket.AF_INET6], seen))
+        ),
+    )
+
+    with pytest.raises(ProviderUnreachableError):
+        if stream:
+            [chunk async for chunk in connector.stream(_ask())]
+        else:
+            await connector.generate(_ask())
+
+    assert asked == [socket.AF_INET]
+    assert seen == ["stalled", "stalled"]
+    assert closed == [True]
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    assert re.search(r"over IPv4 either: .*ETIMEDOUT.* IPv4 192\.0\.2\.1:443", logged)
+
+
+@pytest.mark.asyncio
+async def test_the_connect_phase_is_bounded_apart_from_the_read(
+    other_family: _FallbackState,
+) -> None:
+    """A stall at connect/TLS fails in seconds; a long reply still has the full read time.
+
+    Killed by: src/uclone_x/llm/connectors/connect_fallback.py :: float(timeout), connect=min(float(timeout), CONNECT_PHASE_TIMEOUT_S)
+    Becomes: float(timeout), connect=float(timeout)
+    """
+    from uclone_x.llm.connectors.connect_fallback import CONNECT_PHASE_TIMEOUT_S
+
+    timeouts: list[dict[str, Any]] = []
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        timeouts.append(request.extensions["timeout"])
+        return httpx.Response(200, json=_GEMINI_REPLY)
+
+    connector = GeminiConnector(
+        api_key="k",
+        timeout=180.0,
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(answer)),
+    )
+    await connector.generate(_ask())
+
+    assert timeouts[0]["connect"] == CONNECT_PHASE_TIMEOUT_S
+    assert timeouts[0]["read"] == 180.0
+
+
+@pytest.mark.asyncio
+async def test_openai_and_anthropic_take_the_same_rule(
+    other_family: _FallbackState,
+) -> None:
+    """The same rule for the other hosted connectors.
+
+    Killed by: src/uclone_x/llm/connectors/openai.py :: resp = await post_with_fallback(
+    Becomes: resp = await (lambda c, u, **k: c.post(u, **k))(
+    Killed by: src/uclone_x/llm/connectors/anthropic.py :: resp = await post_with_fallback(
+    Becomes: resp = await (lambda c, u, **k: c.post(u, **k))(
+    """
+    _, state = other_family
+    hi = (ChatMessage(role=MessageRole.USER, content="hi"),)
+    state["answer"] = lambda _r: httpx.Response(
+        200,
+        json={
+            "id": "x",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "hi"},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        },
+    )
+    openai = OpenAIConnector(
+        model="gpt-4o",
+        api_key="k",
+        http_client=httpx.AsyncClient(
+            transport=httpx.MockTransport(_stalls_after_connecting(("2001:db8::2", 443), []))
+        ),
+    )
+    assert (await openai.generate(LLMRequest(model="gpt-4o", messages=hi))).content == "hi"
+
+    state["answer"] = lambda _r: httpx.Response(
+        200,
+        json={
+            "id": "m",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "hi"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+        },
+    )
+    anthropic = AnthropicConnector(
+        model="claude-3-5-sonnet",
+        api_key="k",
+        http_client=httpx.AsyncClient(
+            transport=httpx.MockTransport(_stalls_after_connecting(("2001:db8::3", 443), []))
+        ),
+    )
+    reply = await anthropic.generate(LLMRequest(model="claude-3-5-sonnet", messages=hi))
+    assert reply.content == "hi"

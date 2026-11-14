@@ -52,7 +52,7 @@ import {
   type AvatarUrls,
 } from './lib/avatarChoice';
 import { savePersona } from './lib/personasApi';
-import { useCopy, useLocale } from './i18n';
+import { fmt, useCopy, useLocale } from './i18n';
 import { cloneIdOf, cloneLabel, isUsableClone } from './lib/cloneLabel';
 import { withCloneNames } from './lib/cloneSeats';
 import type { PersonaDraft, PersonaEditMode, PersonaSaveResult } from './lib/personaDraft';
@@ -60,7 +60,6 @@ import {
   DockSurface,
   CloneChoice,
   EventEnvelope,
-  OntologyData,
   BudgetData,
   RoomSummary,
   RoomContext,
@@ -88,15 +87,10 @@ export function App() {
   const [availableTools, setAvailableTools] = useState<string[]>([]);
   const [personasDir, setPersonasDir] = useState<string | null>(null);
   const [events, setEvents] = useState<EventEnvelope[]>([]);
-  const [ontology, setOntology] = useState<OntologyData | null>(null);
-  /** Counts finished metadata reads, so the Ontology tab's own read follows each one. */
-  const [metadataReads, setMetadataReads] = useState<number>(0);
   const [budgetData, setBudgetData] = useState<BudgetData | null>(null);
 
   const [isConnected, setIsConnected] = useState<boolean>(false);
-  const [isPaused, setIsPaused] = useState<boolean>(false);
   const [isRefreshing, setIsRefreshing] = useState<boolean>(false);
-  const [lastHeartbeat, setLastHeartbeat] = useState<string>('-');
   const [healthStatus, setHealthStatus] = useState<string>('healthy');
 
   // Interactive Chat State (FR-13)
@@ -210,6 +204,7 @@ export function App() {
   /** The file Docs fronts, set by any "Open in Docs" on the page (#1354). */
   const [selectedArtifactPath, setSelectedArtifactPath] = useState<string | null>(null);
   const browserDockOpenedRoomsRef = useRef<Set<string>>(new Set());
+  const storyDockOpenedRoomsRef = useRef<Set<string>>(new Set());
   const openInDocs = useCallback((path: string) => {
     setSelectedArtifactPath(path);
     setActiveDockSurface('artifacts');
@@ -218,8 +213,6 @@ export function App() {
   const [gitCommit, setGitCommit] = useState<string | undefined>(undefined);
 
   const eventSourceRef = useRef<EventSource | null>(null);
-  const isPausedRef = useRef<boolean>(false);
-  isPausedRef.current = isPaused;
 
   // Conversations, which seat one agent or several. Since #1208 retired the
   // single-agent surface there is no second thing the centre column can show, so a
@@ -276,6 +269,18 @@ export function App() {
       setIsDockOpen(true);
     }
   }, [currentRoomId, hasBrowserActivity]);
+
+  const activeStoryId = room && room.room_id === currentRoomId ? room.story_id ?? null : null;
+  useEffect(() => {
+    if (currentRoomId && activeStoryId) {
+      const key = `${currentRoomId}:${activeStoryId}`;
+      if (!storyDockOpenedRoomsRef.current.has(key)) {
+        storyDockOpenedRoomsRef.current.add(key);
+        setActiveDockSurface(() => 'artifacts');
+        setIsDockOpen(true);
+      }
+    }
+  }, [currentRoomId, activeStoryId]);
 
   // A clone that asks the person to sign in needs them to see the page (§3.5 path B), so
   // each new ask fronts the Browser tab even after the person closed the dock.
@@ -981,7 +986,6 @@ export function App() {
     } finally {
       setIsRefreshing(false);
       setMetadataListed(true);
-      setMetadataReads((n) => n + 1);
     }
   }, []);
 
@@ -1017,31 +1021,6 @@ export function App() {
     const interval = setInterval(fetchAllMetadata, 15000);
     return () => clearInterval(interval);
   }, [fetchAllMetadata]);
-
-  /**
-   * The Ontology tab (developer mode only) shows the rules engine of the clone the dock
-   * describes: there is no shared engine to read any more (clone-knowledge-graph §3.8,
-   * #1869). Read again with every metadata read, so the tab's refresh and the poll reach it.
-   * With developer mode off, or no clone in the dock, nothing is read.
-   */
-  useEffect(() => {
-    if (!developerMode || !dockSeat) {
-      setOntology(null);
-      return;
-    }
-    let current = true;
-    fetch(`/api/ontology?agent_id=${encodeURIComponent(dockSeat)}`)
-      .then((res) => (res.ok ? res.json() : null))
-      .then((data: OntologyData | null) => {
-        if (current) setOntology(data);
-      })
-      .catch(() => {
-        if (current) setOntology(null);
-      });
-    return () => {
-      current = false;
-    };
-  }, [developerMode, dockSeat, metadataReads]);
 
   /**
    * Each clone's picture address, as the listing last gave it. Keyed by its contents, so a
@@ -1210,13 +1189,7 @@ export function App() {
             }
           }
 
-          if (raw.type === 'HEARTBEAT') {
-            setLastHeartbeat(new Date().toLocaleTimeString());
-          }
-
-          if (!isPausedRef.current) {
-            setEvents((prev) => [eventItem, ...prev.slice(0, 299)]);
-          }
+          setEvents((prev) => [eventItem, ...prev.slice(0, 299)]);
         } catch (err) {
           console.error('Failed to parse SSE event data:', err);
         }
@@ -1312,6 +1285,54 @@ export function App() {
   // What it carried that the toggle does not is nothing: reopening on the surface the
   // reader last chose rather than resetting to Docs & Artifacts (#1055) is `setIsDockOpen`
   // alone, which is exactly what the header toggle calls.
+
+  const sendMessageToCurrentRoom = async (content: string) => {
+    if (!room || !currentRoomId) return;
+    // Rethrown on purpose: the composer keeps the draft when this rejects.
+    const generation = roomGenerationRef.current;
+    // Decided from the record as it stood before this message, which is the
+    // only moment "nothing has been said yet" is still true.
+    const seed = seededTitle(room, content);
+    const storedDespite = await deliverMessage(currentRoomId, content, lastSeq(room));
+    if (storedDespite !== null && generation === roomGenerationRef.current) {
+      setRoomNotice(
+        `Your message is in this conversation. ${roomFailureReason(storedDespite)}`,
+      );
+    }
+    if (seed) {
+      // After the send, not before: a message the Core refuses must not name
+      // the conversation it was never recorded in.
+      try {
+        await roomsApi.rename(currentRoomId, seed);
+      } catch (err) {
+        if (generation === roomGenerationRef.current) {
+          setRoomNotice(
+            `Your message was sent, but this conversation could not be named after it: ${roomFailureReason(err)}`,
+          );
+        }
+      }
+    }
+    // Every send, not only the first: the message moved this conversation's
+    // `updated_at`, so it now heads the rail and reads "just now" (#1053).
+    // `fetchRooms` reports its own failure.
+    await fetchRooms();
+    // A read like any other, not an act: the send was the act, and the Core had
+    // answered it before this went out. Committed as an act, it retired the read
+    // the stream's `final` fired and could land after that read, taking the
+    // landed reply off screen (#1412).
+    // Asked before the ticket: a ticket is a promise of a read, and one never
+    // made would overtake a read issued since the act, with nothing in its place.
+    if (generation !== roomGenerationRef.current) return;
+    const ticket = issueRoomRead(currentRoomId);
+    try {
+      commitRoom(ticket, await roomsApi.get(currentRoomId));
+    } catch (err) {
+      if (roomReadIsStale(ticket)) return;
+      setRoomNotice(
+        `Your message was sent, but this conversation could not be re-read: ${roomFailureReason(err)} Open it again to see the latest.`,
+      );
+    }
+  };
 
   return (
     <OpenInDocsContext.Provider value={openInDocs}>
@@ -1425,52 +1446,7 @@ export function App() {
               browserAsked={askedUser}
               onShowBrowser={showBrowser}
               avatarUrls={avatarUrls}
-              onSend={async (content) => {
-                // Rethrown on purpose: the composer keeps the draft when this rejects.
-                const generation = roomGenerationRef.current;
-                // Decided from the record as it stood before this message, which is the
-                // only moment "nothing has been said yet" is still true.
-                const seed = seededTitle(room, content);
-                const storedDespite = await deliverMessage(currentRoomId, content, lastSeq(room));
-                if (storedDespite !== null && generation === roomGenerationRef.current) {
-                  setRoomNotice(
-                    `Your message is in this conversation. ${roomFailureReason(storedDespite)}`,
-                  );
-                }
-                if (seed) {
-                  // After the send, not before: a message the Core refuses must not name
-                  // the conversation it was never recorded in.
-                  try {
-                    await roomsApi.rename(currentRoomId, seed);
-                  } catch (err) {
-                    if (generation === roomGenerationRef.current) {
-                      setRoomNotice(
-                        `Your message was sent, but this conversation could not be named after it: ${roomFailureReason(err)}`,
-                      );
-                    }
-                  }
-                }
-                // Every send, not only the first: the message moved this conversation's
-                // `updated_at`, so it now heads the rail and reads "just now" (#1053).
-                // `fetchRooms` reports its own failure.
-                await fetchRooms();
-                // A read like any other, not an act: the send was the act, and the Core had
-                // answered it before this went out. Committed as an act, it retired the read
-                // the stream's `final` fired and could land after that read, taking the
-                // landed reply off screen (#1412).
-                // Asked before the ticket: a ticket is a promise of a read, and one never
-                // made would overtake a read issued since the act, with nothing in its place.
-                if (generation !== roomGenerationRef.current) return;
-                const ticket = issueRoomRead(currentRoomId);
-                try {
-                  commitRoom(ticket, await roomsApi.get(currentRoomId));
-                } catch (err) {
-                  if (roomReadIsStale(ticket)) return;
-                  setRoomNotice(
-                    `Your message was sent, but this conversation could not be re-read: ${roomFailureReason(err)} Open it again to see the latest.`,
-                  );
-                }
-              }}
+              onSend={sendMessageToCurrentRoom}
               onStop={() => {
                 const generation = roomGenerationRef.current;
                 void roomsApi
@@ -1489,6 +1465,17 @@ export function App() {
                   .then((next) => commitRoomAct(currentRoomId, generation, next))
                   .catch((err) =>
                     setRoomNotice(`Could not run that turn again: ${roomFailureReason(err)} Try again in a moment.`),
+                  );
+              }}
+              onContinue={() => {
+                const generation = roomGenerationRef.current;
+                void roomsApi
+                  .continueTurn(currentRoomId)
+                  .then((next) => commitRoomAct(currentRoomId, generation, next))
+                  .catch((err) =>
+                    setRoomNotice(
+                      fmt(copy.conversation.row.continueFailed, { reason: roomFailureReason(err) }),
+                    ),
                   );
               }}
               onAddAgent={(agentId) => {
@@ -1597,26 +1584,15 @@ export function App() {
             selectedArtifactPath={selectedArtifactPath}
             onOpenInDocs={openInDocs}
             events={events}
-            ontology={ontology}
             budgetData={budgetData}
             // The conversation on screen, not the retired single-agent history (#1272).
             room={namedRoom}
             roomContext={roomContext}
             selectedTurnSeq={selectedTurnSeq}
-            isPaused={isPaused}
-            onTogglePause={() => setIsPaused(!isPaused)}
-            onClearEvents={() => setEvents([])}
-            lastHeartbeat={lastHeartbeat}
             // The Clone surface's subject: the rail's pick, and the installed definitions to
-            // find it among. `onStartConversation` is `handleNewRoom` with the clone named,
-            // the same call the rail's own `Start one` makes -- one conversation, reachable
-            // from either place, never two.
+            // find it among. A conversation is started from the rail, not from here (#2417).
             selectedClone={selectedAgent}
             personas={personas}
-            onStartConversation={(cloneId) => {
-              closeOverlaidRail();
-              void handleNewRoom(cloneId);
-            }}
             cloneMode={cloneDockMode}
             onCloneModeChange={setCloneDockMode}
             availableTools={availableTools}
@@ -1629,6 +1605,7 @@ export function App() {
             browserLive={browserLive}
             onConnectBrowser={() => openSettings('browser')}
             onSaveBrowserSignIn={openSignInSettings}
+            onSendRoomMessage={sendMessageToCurrentRoom}
           />
         )}
 

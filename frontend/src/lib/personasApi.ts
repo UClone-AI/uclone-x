@@ -120,3 +120,24 @@ export const clearCloneModel = async (clone: string, ref: string): Promise<Perso
   if (!saved.ok) throw await failureOf(saved);
   return ((await saved.json()) as { persona: PersonaInfo }).persona;
 };
+
+/**
+ * Point a clone's conversation model at `ref` (#2431: a turn refused by the paid-model limit
+ * offers a local model in place). Every other field is sent back as the Core holds it.
+ * Rejects with the Core's refusal.
+ */
+export const setCloneModel = async (clone: string, ref: string): Promise<PersonaInfo> => {
+  const read = await fetch(`/api/clones/${encodeURIComponent(clone)}`);
+  if (!read.ok) throw await failureOf(read);
+  const { persona } = (await read.json()) as { persona: PersonaInfo };
+  const draft = draftFromPersona(persona);
+  draft.model_name = ref;
+  const { id, ...fields } = draft;
+  const saved = await fetch(`/api/clones/${encodeURIComponent(id || draft.name)}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(fields),
+  });
+  if (!saved.ok) throw await failureOf(saved);
+  return ((await saved.json()) as { persona: PersonaInfo }).persona;
+};

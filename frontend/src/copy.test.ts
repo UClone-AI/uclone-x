@@ -45,17 +45,7 @@ const SOURCES: Record<string, string> = import.meta.glob('./**/*.{ts,tsx}', {
  * **Keyed by file, because an exemption is a site and not a string.** A new line under an
  * existing key still needs its own reason; a copy of one under any other key is an offence.
  */
-const EXEMPT_LINES: Exemptions = new Map([
-  [
-    './components/LedgerTab.tsx',
-    new Set([
-      '<option value="P1">P1 - High</option>',
-      '<option value="P2">P2 - Normal</option>',
-      '<option value="P3">P3 - Low</option>',
-      "ev.priority === 'P1'",
-    ]),
-  ],
-]);
+const EXEMPT_LINES: Exemptions = new Map();
 
 describe('user-facing copy (#1018)', () => {
   it('reads the copy and not the comments', () => {
@@ -74,8 +64,8 @@ describe('user-facing copy (#1018)', () => {
   });
 
   it('names no principle number anywhere a user can read one', () => {
-    // Killed by: frontend/src/components/TopologyTab.tsx :: >#{turn.seq}</span>
-    // Becomes: >P6 #{turn.seq}</span>
+    // Killed by: frontend/src/components/artifacts/KnowledgeGraphViewer.tsx :: <span className="font-semibold text-sm text-slate-100">Knowledge Graph</span>
+    // Becomes: <span className="font-semibold text-sm text-slate-100">P6 Knowledge Graph</span>
     const scanned = Object.keys(SOURCES).filter(isScanned);
     expect(scanned.length).toBeGreaterThan(20);
 
@@ -86,22 +76,22 @@ describe('user-facing copy (#1018)', () => {
   // Becomes: [...exempt.values()].some((lines) => lines.has(line.trim()))
   it('exempts a line only in the file it was exempted for (#1027)', () => {
     const exempt = '            <option value="P1">P1 - High</option>';
+    const exemptions: Exemptions = new Map([
+      ['./components/Fixture.tsx', new Set(['<option value="P1">P1 - High</option>'])],
+    ]);
 
     expect(
       principleNumberOffences(
         {
-          './components/LedgerTab.tsx': exempt,
+          './components/Fixture.tsx': exempt,
           './components/SkillsTab.tsx': exempt,
         },
-        EXEMPT_LINES,
+        exemptions,
       ),
     ).toEqual(['./components/SkillsTab.tsx:1: <option value="P1">P1 - High</option>']);
   });
 
-  // Killed by: frontend/src/components/LedgerTab.tsx :: <option value="P2">P2 - Normal</option>
-  // Becomes: <option value="P2">P2 - Standard</option>
   it('keeps no exemption a screen no longer holds (#1027)', () => {
-    expect(EXEMPT_LINES.size).toBeGreaterThan(0);
     expect(staleExemptions(SOURCES, EXEMPT_LINES)).toEqual([]);
   });
 

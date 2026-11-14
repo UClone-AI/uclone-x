@@ -104,12 +104,14 @@ def estimate_text_tokens(text: str) -> int:
 
 
 def _tool_call_tokens(tool_call: ToolCallRequest) -> int:
-    """A tool call's framing, its id and name, and its JSON arguments."""
+    """A tool call's framing, its id and name, its JSON arguments, and its signature."""
     total = 4 + estimate_text_tokens(tool_call.id + tool_call.name)
     if tool_call.arguments:
         total += estimate_text_tokens(
             json.dumps(unwrap_immutable(tool_call.arguments), ensure_ascii=False)
         )
+    if tool_call.signature:
+        total += estimate_text_tokens(tool_call.signature)
     return total
 
 

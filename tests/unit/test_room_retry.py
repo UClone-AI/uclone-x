@@ -148,7 +148,7 @@ class TestRetryRunsTheFailedTurnAgain:
     async def test_retry_gives_the_floor_back_to_the_agent_that_failed(self, built: Any) -> None:
         """The answer the failure owed is recorded, without the human retyping.
 
-        Killed by: src/uclone_x/room/orchestrator.py :: return await self._take_turn(room_id, speaker, failed.decision or retried)
+        Killed by: src/uclone_x/room/orchestrator.py :: return await self._run_again(state, speaker, failed.decision or retried)
         Becomes: return state
         """
         store, _, _ = built

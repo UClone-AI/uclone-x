@@ -3,7 +3,10 @@
 from uclone_x.llm.connectors.anthropic import AnthropicConnector
 from uclone_x.llm.connectors.base import BaseLLMConnector
 from uclone_x.llm.connectors.factory import create_llm_connector
-from uclone_x.llm.connectors.gemini import GeminiConnector
+from uclone_x.llm.connectors.gemini import (
+    DEFAULT_GEMINI_TIMEOUT_SECONDS,
+    GeminiConnector,
+)
 from uclone_x.llm.connectors.mock import MockLLMConnector
 from uclone_x.llm.connectors.ollama import (
     DEFAULT_OLLAMA_TIMEOUT_SECONDS,
@@ -38,6 +41,7 @@ __all__ = [
     "BaseLLMConnector",
     "DEFAULT_EMBEDDING_DIMENSIONS",
     "DEFAULT_EMBEDDING_MODEL",
+    "DEFAULT_GEMINI_TIMEOUT_SECONDS",
     "DEFAULT_OLLAMA_TIMEOUT_SECONDS",
     "EMBEDDING_DIMENSIONS_ENV_VAR",
     "EMBEDDING_MODEL_ENV_VAR",

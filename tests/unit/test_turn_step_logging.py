@@ -1039,8 +1039,8 @@ async def test_the_log_and_the_result_say_the_users_usage_limit_stopped_the_turn
     would be recorded as `budget_exceeded`, and a head would show the session-ceiling copy
     for a limit a new conversation meets too.
 
-    Killed by: src/uclone_x/agent/turn_executor.py :: stop_reason = "usage_limit"
-    Becomes: stop_reason = "budget_exceeded"
+    Killed by: src/uclone_x/agent/turn_executor.py :: return "usage_limit"
+    Becomes: return "budget_exceeded"
     """
     agent = _agent_ending_by("usage_limit")
     await agent.start()

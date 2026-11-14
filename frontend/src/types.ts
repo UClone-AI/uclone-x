@@ -33,13 +33,10 @@ export type DockSurface =
   | 'knowledge_graph'
   | 'activity'
   | 'resource'
-  | 'browser'
-  | 'topology'
-  | 'ledger'
-  | 'ontology';
-// No 'skills', 'acp' or 'evaluations' (#1358): Skills is a Settings section, and ACP and Evals
-// are Settings' Diagnostics section. None is about the conversation on screen, so none is a
-// dock surface, and a dock tab naming one is a type error.
+  | 'browser';
+// No 'topology', 'ledger', 'ontology', 'skills', 'acp' or 'evaluations': Skills is a Settings
+// section, ACP and Evals are Settings' Diagnostics section (#1358), and DAG, EventBus and Ontology
+// were removed in favour of the single Knowledge Graph developer surface (#2442).
 
 export interface ArtifactItem {
   name: string;
@@ -166,7 +163,6 @@ export interface PersonaInfo {
   system_prompt?: string;
   /** Whether the runtime's default prompt is appended after `system_prompt`. */
   append_default_prompt?: boolean;
-  model_tier?: PersonaModelTier;
   /** Loaded from the package's own directory; an edit writes a workspace override. */
   builtin?: boolean;
   /** A workspace file that replaces a built-in persona of the same name. */
@@ -181,9 +177,6 @@ export interface PersonaInfo {
   /** The id of the latest change to that picture, made anywhere; `0` before any. */
   avatar_change_id?: number;
 }
-
-/** Which Settings model a persona's turns run on: the deep one (`inherit`) or the fast one. */
-export type PersonaModelTier = 'inherit' | 'fast';
 
 /** `GET /api/clones`: the catalogue, plus what an editor needs to offer choices. */
 export interface PersonaCatalog {
@@ -845,6 +838,13 @@ export interface RoomTranscriptMessage {
    * definition and the edit was dropped. A flag: the cause is in the log, never here.
    */
   persona_edit_dropped?: boolean;
+  /**
+   * Set when the turn stopped at its own usage ceiling (#2431): it spent past the person's
+   * 10-minute limit for paid models in one turn, and paused between steps. Not a failure:
+   * `error` is unset and its work is kept, so the row offers Continue, which goes on from
+   * there with no resend.
+   */
+  stopped_at_ceiling?: boolean;
   completed: boolean;
   /**
    * The last `seq` this utterance's turn actually saw when it started, per
@@ -998,6 +998,8 @@ export interface RoomState {
    */
   workspace?: string | null;
   default_workspace?: string;
+  /** The story currently open in this conversation (`stories/<story_id>`), if any. */
+  story_id?: string | null;
 }
 
 /**

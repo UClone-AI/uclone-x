@@ -472,7 +472,6 @@ _EDITABLE_KEYS = (
     "append_default_prompt",
     "allowed_tools",
     "model_name",
-    "model_tier",
     "temperature",
     "max_tokens",
     "enable_write_tools",

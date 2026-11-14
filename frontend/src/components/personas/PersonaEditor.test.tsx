@@ -232,13 +232,31 @@ describe('PersonaEditor', () => {
     expect(screen.queryByLabelText(GATEWAY.clone.fast)).toBeNull();
   });
 
-  it('shows the fast model in developer mode, starting on the default fast model', () => {
+  // Owner ruling 2026-10-29 (#2418): no fast model set means the clone's own conversation
+  // model, so the empty choice names that model, never the system default fast one.
+  // Killed by: frontend/src/components/personas/PersonaEditor.tsx :: defaultNow={draft.model_name ?? chatModels?.defaults.deep ?? null}
+  // Becomes: defaultNow={chatModels ? (chatModels.defaults.fast ?? chatModels.defaults.deep) : null}
+  it('shows the fast model in developer mode, starting on the clone`s conversation model', () => {
     const props = renderEditor({ developerMode: true });
     const select = screen.getByLabelText(GATEWAY.clone.fast);
 
-    expect(screen.getByRole('option', { name: 'System default (now: Gemini 3.8 Flash)' })).toBeInTheDocument();
+    expect(
+      screen.getByRole('option', { name: fmt(GATEWAY.clone.sameAsConversation, { model: 'Gemini 3.8 Pro' }) }),
+    ).toBeInTheDocument();
+    expect(select.querySelector('option[value=""]')).not.toHaveTextContent(/system default|Gemini 3.8 Flash/i);
     fireEvent.change(select, { target: { value: 'ollama/qwen3:14b' } });
     expect(props.onChange).toHaveBeenLastCalledWith(expect.objectContaining({ fast_model: 'ollama/qwen3:14b' }));
+  });
+
+  // Killed by: frontend/src/components/personas/PersonaEditor.tsx :: const defaultLabel = followsConversation
+  // Becomes: const defaultLabel = false
+  it('names the clone`s own conversation model as the fast model it follows', () => {
+    renderEditor({ developerMode: true, draft: valid({ model_name: 'ollama/qwen3:14b' }) });
+    const select = screen.getByLabelText(GATEWAY.clone.fast);
+
+    expect(select.querySelector('option[value=""]')).toHaveTextContent(
+      fmt(GATEWAY.clone.sameAsConversation, { model: 'qwen3:14b' }),
+    );
   });
 
   it('says the models are being read, and that a failed read keeps the saved choice', () => {

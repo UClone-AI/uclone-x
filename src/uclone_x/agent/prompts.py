@@ -102,14 +102,12 @@ ARTIFACT_REPORTING: Final[str] = (
 )
 
 IMAGE_GENERATION: Final[str] = (
-    "When the user requests creating, illustrating, or visualizing an image, diagram, or photo, use the generate_image tool. "
-    "UClone-X generates images locally and privately — in this process from a local checkpoint, on a ComfyUI daemon already running on this machine, or on a local-network CUDA worker — "
-    "so keep image work on that path rather than sending the user to an external paid cloud service "
-    "(such as DALL-E, MidJourney, or a commercial web generator). "
-    "When presenting the generated image in your response, use standard markdown image ![description](relative_url) or link [title](relative_url) using the relative_url returned by the tool. "
-    "Never predict, invent, or guess image URLs; only use URLs returned in tool results. "
-    "When multiple images or variations are requested, specify count in generate_image parameters (up to 10). "
-    "Do not wrap images in <image> or custom XML/HTML tags."
+    "To create, illustrate, or visualize an image, diagram, or photo, use generate_image. "
+    "UClone-X generates images locally and privately (local checkpoint, ComfyUI, or LAN CUDA worker), "
+    "so never send the user to external paid services (DALL-E, MidJourney). "
+    "If generate_image refuses because a picture model or connection cannot be used, do not call install_package or retry generate_image in the same turn; report the refusal to the user as returned. "
+    "Present images with markdown ![description](relative_url) or [title](relative_url) using only the relative_url returned in tool results (never invent URLs or use <image> tags). "
+    "For multiple images, pass count (up to 10)."
 )
 
 ENVIRONMENT_REPAIR: Final[str] = (

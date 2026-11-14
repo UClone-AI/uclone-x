@@ -231,10 +231,16 @@ def default_models_in_effect(
 
 
 class ModelRefUnavailableError(ProviderFailureError):
-    """A ref whose connection is not there any more (§3.6): refused, never re-routed."""
+    """A ref whose connection is not there any more (§3.6): refused, never re-routed.
 
-    kind = ProviderFailureKind.MODEL_UNAVAILABLE
-    retryable = False
+    Its kind is that the connection could not be reached, not that the model is missing
+    (#2418): no listing was read, so nothing says the model is absent. The remote-GPU
+    tunnel's connection is removed when the tunnel goes, and saying the model was missing
+    sent the owner to check a model the machine does list. A connection that comes back
+    re-binds the seat (`models_changed`), so the same request can then succeed.
+    """
+
+    kind = ProviderFailureKind.PROVIDER_UNREACHABLE
 
     def __init__(self, ref: ModelRef) -> None:
         super().__init__(
@@ -546,10 +552,10 @@ class ModelGateway:
     def bind(self, own: AgentLLMConfig) -> SeatBinding:
         """The connector and models a clone with config ``own`` runs on (§3.4).
 
-        Its own deep ref wins, else the default deep. Its fast model is its own ref, else
-        the default fast; it is carried only when it is on the deep model's connection,
-        since one seat holds one connector. A ref that cannot be served gets a refusing
-        connector, never the default's (§3.6).
+        Its own deep ref wins, else the default deep. Its fast model is its own ref, carried
+        only when it is on the deep model's connection, since one seat holds one connector;
+        with none of its own, it is the conversation model just resolved (#2418). A ref
+        that cannot be served gets a refusing connector, never the default's (§3.6).
         """
         binding = self._default_binding
         pinned = own.model_name.strip() if own.model_name and own.model_name.strip() else None
@@ -586,15 +592,11 @@ class ModelGateway:
         if own_fast is not None:
             fast_ref = ModelRef.parse(own_fast)
             fast_model = fast_ref.model if fast_ref.connection_id == deep_conn_id else None
-        elif binding is not None and pinned is None:
-            fast_model = binding.fast or binding.deep
         else:
-            fast_ref = self.resolve(None, "fast")
-            fast_model = (
-                fast_ref.model
-                if fast_ref is not None and fast_ref.connection_id == deep_conn_id
-                else None
-            )
+            # No fast model of its own: the clone's fast work runs on its own conversation
+            # model, on that model's connection -- never the system fast default, which
+            # serves only the work no one clone owns (owner ruling 2026-10-29, #2418).
+            fast_model = deep_model
         config = own.model_copy(update={"model_name": deep_model, "fast_model": fast_model})
         return SeatBinding(llm=llm, llm_config=config, pinned_ref=pinned, deep_ref=deep_ref)
 
@@ -794,10 +796,20 @@ def _listing_of(result: CatalogResult) -> Listing:
     )
 
 
+def _declared_pictures() -> list[str]:
+    """The cloud picture models the registry declares (`cloud_image_models`)."""
+    from uclone_x.llm.connectors.factory import cloud_image_models
+
+    return cloud_image_models()
+
+
 def _group(conn: Connection, listing: Listing, capability: Capability) -> ModelGroup:
     entries: Sequence[CatalogEntry]
     if capability == "chat":
-        entries = [e for e in listing.entries if e.chat_capable]
+        # A picture model the registry declares is never offered for conversation, whatever
+        # the listing calls it: Google's picture models take the chat call too (#2416).
+        pictures = set(_declared_pictures()) if conn.kind == "gemini" else set[str]()
+        entries = [e for e in listing.entries if e.chat_capable and e.id not in pictures]
         models = tuple(
             ModelEntry(
                 ref=f"{conn.id}/{e.id}",

@@ -37,27 +37,33 @@ _NEXT: Mapping[Stage, str] = {
     "one first. Ask the person which they want, and call story_start 'continue' with "
     "'choice' (1–3), 'genre', or 'go_on=true' for the recommended genre (plus 'must_have' / "
     "'avoid' if they named any).",
-    "choose_premise": "Show the person the three premises and ask which one. Call story_start "
+    "choose_premise": "The three premises are shown automatically in the reply note; do not "
+    "re-list them yourself. Ask the person which one they want. Call story_start "
     "'continue' with 'choice' (1–3; the recommended number for a bare yes) (or 'changes' "
     "if they reject all three and want new premises).",
-    "review_cast": "The cast and places are proposed; show them to the person and wait for "
-    "their answer. Call story_start 'continue' with 'go_on=true' (plus 'must_have' / 'avoid' "
-    "if they asked to add or drop characters or places). The first chapter's plan waits until "
-    "the proposals are decided or the person says to go on anyway.",
-    "review_outline": "The outline is saved; ask the person whether it works. If they ask for "
+    "review_cast": "The cast and places are proposed and shown automatically in the reply "
+    "note; do not re-list them yourself. Wait for the person's answer. Call story_start "
+    "'continue' with 'go_on=true' (plus 'must_have' / 'avoid' if they asked to add or drop "
+    "characters or places). The first chapter's plan waits until the proposals are decided "
+    "or the person says to go on anyway.",
+    "review_outline": "The outline is saved and shown automatically in the reply note; do not "
+    "re-list the chapters yourself. Ask the person whether it works. If they ask for "
     "a change, call story_start 'continue' with 'changes' (without 'go_on'): the outline is "
     "revised and shown again. When they agree to the outline, call 'continue' with "
     "'go_on=true': the plot is settled, its key events are proposed for the codex, and the "
     "first chapter's scene plan is shown.",
-    "review_chapter": "A chapter's scene plan is shown before the chapter is written (after "
-    "the chapter before it, if any, was written). Ask the person whether it works. If they "
+    "review_chapter": "A chapter's scene plan is shown automatically in the reply note before "
+    "the chapter is written (after the chapter before it, if any, was written); do not "
+    "re-list the scenes yourself. Ask the person whether it works. If they "
     "ask for a change, call story_start 'continue' with 'changes' (without 'go_on'): the plan "
     "is revised and shown again. When they agree, call 'continue' with 'go_on=true': that "
     "chapter is written, checked, and the plan of the one after it is shown.",
-    "review_scene": "Three RPG choices and the current world state (KG) are shown before "
-    "the scene is written. Show the person the world state and the three choices, and ask "
-    "which they want. Call story_start 'continue' with 'choice' (1–3; or 'go_on=true' for "
-    "choice 1), or pass their custom action or KG update in 'changes' (with or without "
+    "review_scene": "The written scene prose (if any), its illustration, and the three RPG "
+    "choices for the next scene are shown automatically in the reply note; reply with only a "
+    "brief one-sentence acknowledgment and do not repeat the scene text, world state, or "
+    "numbered choices yourself. On the person's next message, call story_start 'continue' "
+    "with 'choice' (1–3; or 'go_on=true' "
+    "for choice 1), or pass their custom action or KG update in 'changes' (with or without "
     "'choice'): the chosen scene is written, the KG transitions are updated in chronological "
     "order, and the next scene's choices are shown.",
     "done": "Every chapter of the outline is written. Go on with story_context and "
@@ -297,14 +303,18 @@ _CAST_FAILED: Mapping[str, tuple[str, str]] = {
 
 
 def _reply_note(
-    state: StartState, done: Sequence[str] = (), outline: Outline | None = None
+    state: StartState,
+    done: Sequence[str] = (),
+    outline: Outline | None = None,
+    *,
+    scenes_prose: Mapping[str, tuple[str, str]] | None = None,
 ) -> dict[str, str]:
     """What code tells the person, whatever the model writes: the stage and the question.
 
     The call that settled the plot says so first, and what it proposed for the codex. At
     the outline stop, `outline` is the outline the person is asked about, shown in full.
     """
-    note = _stage_note(state, done, outline)
+    note = _stage_note(state, done, outline, scenes_prose=scenes_prose)
     if "introduced" in done:
         names = [
             str(k["name"])
@@ -320,7 +330,7 @@ def _reply_note(
                 f"ties were proposed for the codex; they join it once you approve them. "
                 f"{note['en']}",
             }
-    if "plot" not in done:
+    if "plot" not in done or state.interactive:
         return note
     ko, en = _plot_note(state)
     return {"ko": f"{ko} {note['ko']}", "en": f"{en} {note['en']}"}
@@ -383,7 +393,11 @@ def _outline_lines(outline: Outline | None) -> str:
 
 
 def _stage_note(
-    state: StartState, done: Sequence[str] = (), outline: Outline | None = None
+    state: StartState,
+    done: Sequence[str] = (),
+    outline: Outline | None = None,
+    *,
+    scenes_prose: Mapping[str, tuple[str, str]] | None = None,
 ) -> dict[str, str]:
     if state.cast_failed is not None:
         why_ko, why_en = _CAST_FAILED.get(state.cast_failed, _CAST_FAILED["empty"])
@@ -430,6 +444,13 @@ def _stage_note(
         return {"ko": ko, "en": en}
     if state.stage == "review_cast":
         names = ", ".join(str(c.get("name", "")) for c in state.cast)
+        if state.interactive:
+            return {
+                "ko": f"주요 인물과 무대를 구성했습니다: {names}. 추가하거나 바꾸고 싶은 설정이 "
+                "있으면 말씀해 주세요. ‘네’라고 하시면 전체 줄거리 개요를 짜겠습니다.",
+                "en": f"Here are the main characters and places: {names}. Tell me if you want "
+                "to add or change anything, or say yes to build the story outline.",
+            }
         return {
             "ko": f"인물과 장소를 제안했습니다: {names}. 이야기 보기의 파일에서 승인하거나 "
             "고칠 수 있습니다. ‘네’라고 하시면 개요를 만들겠습니다. 첫 장은 제안을 모두 "
@@ -465,6 +486,13 @@ def _stage_note(
             en_head = "The outline is saved."
         shown = _outline_lines(outline)
         ko_not_yet, en_not_yet = _NOT_YET_OUTLINE
+        if state.interactive:
+            return {
+                "ko": f"{ko_head}{ko_shape}{shown}바꾸고 싶은 점이 있으면 말씀해 주세요. "
+                "‘네’라고 하시면 이 줄거리로 확정하고 첫 번째 장면의 선택지를 보여 드리겠습니다.",
+                "en": f"{en_head}{en_shape}{shown}Tell me what to change, or say yes "
+                "to settle the plot and see the first scene's choices.",
+            }
         return {
             "ko": f"{ko_head}{ko_shape}{shown}{ko_not_yet} 바꾸고 싶은 점이 있으면 말씀해 "
             "주세요. ‘네’라고 하시면 이 줄거리로 확정하고 첫 장의 장면 계획을 보여 드리겠습니다.",
@@ -488,7 +516,7 @@ def _stage_note(
             "Say yes and I will try again.",
         }
     wrote = state.stage == "done" or "chapter" in done or "scene" in done or "rewrite" in done
-    ko, en = _written_note(state, done) if wrote else ("", "")
+    ko, en = _written_note(state, done, scenes_prose=scenes_prose) if wrote else ("", "")
     if state.stage == "review_chapter":
         ko_plan, en_plan = _plan_note(state, done)
         ko = f"{ko}\n\n{ko_plan}" if ko else ko_plan
@@ -508,58 +536,61 @@ _NOT_YET_OUTLINE = (
 )
 
 
-def _written_note(state: StartState, done: Sequence[str]) -> tuple[str, str]:
-    """What the call wrote: the chapter, the single RPG scene, or the scenes rewritten, and
-    what the check found."""
+def _written_note(
+    state: StartState,
+    done: Sequence[str],
+    *,
+    scenes_prose: Mapping[str, tuple[str, str]] | None = None,
+) -> tuple[str, str]:
+    """What the call wrote: the chapter, the single RPG scene, or the scenes rewritten,
+    including the written scene prose and illustrations, and what the check found."""
     number = state.chapter_written or 1
     count = len(state.chapter_scenes) or len(state.scenes_written)
     ko_label = "첫 장" if number == 1 else f"{number}장"
     en_label = "The first chapter" if number == 1 else f"Chapter {number}"
-    if "scene" in done and state.scene_written_last:
-        sid = state.scene_written_last
-        ko_sid = _human_scene_ids(sid, "ko")
-        en_sid = _human_scene_ids(sid, "en")
-        ko = f"{ko_sid}을(를) 쓰고 시간순 KG 상태를 업데이트했습니다."
-        en = f"Wrote {en_sid} and updated the chronological KG state."
+    rpg_scene = "scene" in done and bool(state.scene_written_last)
+    if rpg_scene:
+        ko_out = ""
+        en_out = ""
     else:
         ko = f"{ko_label}을 썼습니다. 장면 {count}개를 저장했습니다."
         en = f"{en_label} is written: {count} scene(s) saved."
-    first = number == 1
-    if first and state.quick and state.genre_options and not state.genre_answered:
-        ko = f"요청에 장르가 없어 {genre_label(state.brief.genre, 'ko')}로 정해 썼습니다. " + ko
-        en = (
-            f"The request named no genre, so it was written as "
-            f"{genre_label(state.brief.genre, 'en')}. " + en
-        )
-    if state.stage == "done" and ("chapter" in done or "scene" in done):
-        ko += " 개요의 마지막 장까지 모두 썼습니다."
-        en += " Every chapter of the outline is written."
-    if state.rewritten and (
-        "rewrite" in done
-        or (state.stage == "done" and "chapter" not in done and "scene" not in done)
-    ):
-        shown = [
-            s for s in state.rewritten if not state.chapter_scenes or s in state.chapter_scenes
-        ]
-        ko = f"말씀하신 대로 장면 {len(shown)}개를 다시 써서 저장했습니다."
-        en = f"{len(shown)} scene(s) rewritten as you asked, and saved."
-    grown = growth_line(len(state.growth_now), scenes=True)
-    if grown is not None and ("chapter" in done or "scene" in done or "rewrite" in done):
-        ko += f" {grown['ko']}"
-        en += f" {grown['en']}"
-    if first and state.cast_assumed and "rewrite" not in done:
-        ko += (
-            " 제안한 인물과 장소를 승인된 것으로 보고 썼습니다. 제안은 아직 이야기 보기에서 "
-            "승인을 기다리고 있으니, 확인하고 승인하거나 고쳐 주세요."
-        )
-        en += (
-            " It was written treating the proposed cast and places as approved; the "
-            "proposals still wait for your approval in the story's view."
-        )
-    ko_check, en_check = _continuity_note(state)
-    ko_out = ko + ko_check
-    en_out = en + en_check
-    if "scene" in done and state.scene_written_last:
+        first = number == 1
+        if first and state.quick and state.genre_options and not state.genre_answered:
+            ko = f"요청에 장르가 없어 {genre_label(state.brief.genre, 'ko')}로 정해 썼습니다. " + ko
+            en = (
+                f"The request named no genre, so it was written as "
+                f"{genre_label(state.brief.genre, 'en')}. " + en
+            )
+        if state.stage == "done" and "chapter" in done:
+            ko += " 개요의 마지막 장까지 모두 썼습니다."
+            en += " Every chapter of the outline is written."
+        if state.rewritten and (
+            "rewrite" in done
+            or (state.stage == "done" and "chapter" not in done and "scene" not in done)
+        ):
+            shown = [
+                s for s in state.rewritten if not state.chapter_scenes or s in state.chapter_scenes
+            ]
+            ko = f"말씀하신 대로 장면 {len(shown)}개를 다시 써서 저장했습니다."
+            en = f"{len(shown)} scene(s) rewritten as you asked, and saved."
+        grown = growth_line(len(state.growth_now), scenes=True)
+        if grown is not None and ("chapter" in done or "rewrite" in done):
+            ko += f" {grown['ko']}"
+            en += f" {grown['en']}"
+        if first and state.cast_assumed and "rewrite" not in done:
+            ko += (
+                " 제안한 인물과 장소를 승인된 것으로 보고 썼습니다. 제안은 아직 이야기 보기에서 "
+                "승인을 기다리고 있으니, 확인하고 승인하거나 고쳐 주세요."
+            )
+            en += (
+                " It was written treating the proposed cast and places as approved; the "
+                "proposals still wait for your approval in the story's view."
+            )
+        ko_check, en_check = _continuity_note(state)
+        ko_out = ko + ko_check
+        en_out = en + en_check
+    if rpg_scene and state.scene_written_last:
         shown_sids = [state.scene_written_last]
     elif state.rewritten and (
         "rewrite" in done
@@ -571,51 +602,50 @@ def _written_note(state: StartState, done: Sequence[str]) -> tuple[str, str]:
     else:
         shown_sids = list(state.chapter_scenes)
     for sid in shown_sids:
+        prose_item = (scenes_prose or {}).get(sid)
+        if prose_item is not None and prose_item[1].strip():
+            sc_title, sc_text = prose_item
+            ko_head = f"### {sc_title}" if sc_title else f"### {_human_scene_ids(sid, 'ko')}"
+            en_head = f"### {sc_title}" if sc_title else f"### {_human_scene_ids(sid, 'en')}"
+            ko_block = f"{ko_head}\n{sc_text.strip()}"
+            en_block = f"{en_head}\n{sc_text.strip()}"
+            ko_out = f"{ko_out}\n\n{ko_block}" if ko_out else ko_block
+            en_out = f"{en_out}\n\n{en_block}" if en_out else en_block
         url = state.scene_illustrations.get(sid)
         if url:
             ko_sid = _human_scene_ids(sid, "ko")
             en_sid = _human_scene_ids(sid, "en")
-            ko_out += f"\n![{ko_sid}]({url})"
-            en_out += f"\n![{en_sid}]({url})"
+            ko_img = f"![{ko_sid}]({url})"
+            en_img = f"![{en_sid}]({url})"
+            ko_out = f"{ko_out}\n{ko_img}" if ko_out else ko_img
+            en_out = f"{en_out}\n{en_img}" if en_out else en_img
+    if rpg_scene and state.stage == "done":
+        ko_done = "개요의 마지막 장까지 모두 썼습니다."
+        en_done = "Every chapter of the outline is written."
+        ko_out = f"{ko_out}\n\n{ko_done}" if ko_out else ko_done
+        en_out = f"{en_out}\n\n{en_done}" if en_out else en_done
     return ko_out, en_out
 
 
 def _scene_choices_note(state: StartState, done: Sequence[str]) -> tuple[str, str]:
-    """The current world state (KG) and the 3 RPG choices for `state.scene_id`."""
+    """The 3 RPG choices for `state.scene_id` (without raw KG dumps or repetitive suffixes)."""
+    del done
     sid = state.scene_id or "ch01.s01"
     ko_sid = _human_scene_ids(sid, "ko")
     en_sid = _human_scene_ids(sid, "en")
     ko_lines: list[str] = [f"다음은 {ko_sid}의 진행 선택지입니다."]
     en_lines: list[str] = [f"Here are the RPG choices for {en_sid}."]
-    if state.scene_entering_kg:
-        ko_kg = _human_scene_ids(state.scene_entering_kg, "ko")
-        en_kg = _human_scene_ids(state.scene_entering_kg, "en")
-        ko_lines.append(f"[현재 월드 KG 상태]\n{ko_kg}")
-        en_lines.append(f"[Current World State (KG)]\n{en_kg}")
     for c in state.scene_choices:
         num = c.get("number", 1)
-        title = c.get("title", "")
-        approach = c.get("approach", "")
-        summary = c.get("summary", "")
-        trans_raw = c.get("transitions")
-        trans_list: list[object] = (
-            cast("list[object]", trans_raw) if isinstance(trans_raw, list) else []
+        title = str(c.get("title") or "").strip()
+        approach = str(c.get("approach") or "").strip()
+        summary = str(c.get("summary") or "").strip()
+        body = (
+            f"{title} — {summary}" if title and summary and summary != title else (title or summary)
         )
-        delta_parts: list[str] = []
-        for tr in trans_list:
-            if not isinstance(tr, dict):
-                continue
-            tr_dict = cast("dict[str, Any]", tr)
-            subj = str(tr_dict.get("subject") or tr_dict.get("entity") or "")
-            note = str(tr_dict.get("note") or "")
-            if subj and note:
-                delta_parts.append(f"{subj}: {note}")
-            elif note:
-                delta_parts.append(note)
-        delta_str = f" (KG 변화: {'; '.join(delta_parts)})" if delta_parts else ""
-        delta_en = f" (KG delta: {'; '.join(delta_parts)})" if delta_parts else ""
-        ko_lines.append(f"{num}. [{approach}] {title} — {summary}{delta_str}")
-        en_lines.append(f"{num}. [{approach}] {title} — {summary}{delta_en}")
+        prefix = f"[{approach}] " if approach else ""
+        ko_lines.append(f"{num}. {prefix}{body}")
+        en_lines.append(f"{num}. {prefix}{body}")
     ko_lines.append(
         "원하시는 선택지 번호(1~3, ‘네’라고만 하시면 1번)를 고르시거나, 직접 원하는 행동이나 "
         "추가할 설정(KG)을 말씀해 주세요."

@@ -25,6 +25,7 @@ from uclone_x.llm.connectors.base import (
     resolve_model,
     resolve_token_counts,
 )
+from uclone_x.llm.connectors.connect_fallback import post_with_fallback, stream_with_fallback
 from uclone_x.llm.connectors.failures import failed_request, failed_status, unusable_response
 from uclone_x.llm.connectors.listing import (
     MAX_LISTING_PAGES,
@@ -442,7 +443,9 @@ class AnthropicConnector(BaseLLMConnector):
         should_close = self._http_client is None
 
         try:
-            resp = await client.post(url, json=payload, headers=headers, timeout=self.timeout)
+            resp = await post_with_fallback(
+                client, url, json=payload, headers=headers, timeout=self.timeout
+            )
             if resp.status_code != 200:
                 raise failed_status(
                     provider=_PROVIDER, model=model, status_code=resp.status_code, body=resp.text
@@ -528,8 +531,8 @@ class AnthropicConnector(BaseLLMConnector):
         streamed: list[str] = []
 
         try:
-            async with client.stream(
-                "POST", url, json=payload, headers=headers, timeout=self.timeout
+            async with stream_with_fallback(
+                client, "POST", url, json=payload, headers=headers, timeout=self.timeout
             ) as resp:
                 if resp.status_code != 200:
                     err_body = await resp.aread()

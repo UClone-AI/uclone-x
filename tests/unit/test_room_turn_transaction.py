@@ -272,7 +272,7 @@ class TestAFailedTurnLeavesNothingInTheSeat:
         asked for in this attempt, and the prefix it had been shown was no longer the
         prefix of the next request.
 
-        Killed by: src/uclone_x/room/orchestrator.py :: rollback_error = None if committed else self._roll_back_seat(agent, speaker, checkpoint)
+        Killed by: src/uclone_x/room/orchestrator.py :: rollback_error = None if outcome.committed else roll_back(agent, speaker, plan.checkpoint)
         Becomes: rollback_error = None
         Killed by: src/uclone_x/agent/session_lifecycle.py :: live.restore_history(checkpoint)
         Becomes: pass
@@ -319,7 +319,7 @@ class TestAFailedTurnLeavesNothingInTheSeat:
         message for a seat that had kept the first. The prompts differ, so #969's guard
         never applied here at all.
 
-        Killed by: src/uclone_x/room/orchestrator.py :: rollback_error = None if committed else self._roll_back_seat(agent, speaker, checkpoint)
+        Killed by: src/uclone_x/room/orchestrator.py :: rollback_error = None if outcome.committed else roll_back(agent, speaker, plan.checkpoint)
         Becomes: rollback_error = None
         """
         llm = _Script([LLMProviderError("provider unavailable (scripted)"), "noted both"])
@@ -394,7 +394,7 @@ class TestAStoppedTurnLeavesNoUnansweredCall:
         back like any other that did not commit, and the mark is not advanced either:
         the session, the row and `last_seen_seq` agree that the turn did not happen.
 
-        Killed by: src/uclone_x/room/orchestrator.py :: rollback_error = None if committed else self._roll_back_seat(agent, speaker, checkpoint)
+        Killed by: src/uclone_x/room/orchestrator.py :: rollback_error = None if outcome.committed else roll_back(agent, speaker, plan.checkpoint)
         Becomes: rollback_error = None
         """
         sessions = SessionStore(tmp_path / "sessions")
@@ -515,7 +515,7 @@ class TestARoomThatCannotSaveTheTurnUndoesTheSeat:
         used to leave a seat that remembered answering while the transcript had no answer
         -- and it answered the next span from that turn.
 
-        Killed by: src/uclone_x/room/orchestrator.py :: self._undo_committed_seat(agent, speaker, checkpoint)
+        Killed by: src/uclone_x/room/orchestrator.py :: self._undo_committed_seat(agent, speaker, plan.checkpoint)
         Becomes: pass
         """
         sessions = SessionStore(tmp_path / "sessions")

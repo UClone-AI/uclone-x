@@ -29,6 +29,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
+from uclone_x.agent.reply_lines import replaces_reply
 from uclone_x.i18n.scripts import sentences
 from uclone_x.llm.compactor import estimate_text_tokens
 from uclone_x.tools.models import ToolResultStatus
@@ -396,6 +397,8 @@ class StartTurnAid:
         moved = found is None or found.digest != self.start_digest
         given = [text for record in records for text in _strings(record.output)]
         long_text = own_sentences(self.reply, [*given, *saved]) >= OWN_SENTENCES_SHOWN
+        if moved and replaces_reply(records):
+            long_text = False
         if waiting is None or not (long_text or (tried and not moved)):
             return []
         stop = stop_words(waiting)

@@ -17,7 +17,7 @@ import { fmt, type Plural } from '../i18n/format';
 export { fmt, plural } from '../i18n/format';
 /** Re-exported so the editor components label a clone without importing outside this module. */
 export { cloneLabel, isUsableClone } from './cloneLabel';
-import type { PersonaInfo, PersonaModelTier } from '../types';
+import type { PersonaInfo } from '../types';
 
 /**
  * What `POST /api/clones` and `PUT /api/clones/{id}` accept, field for field, and the id an
@@ -38,7 +38,6 @@ export interface PersonaDraft {
   fast_model: string | null;
   /** Its picture model: a ref or `auto`; `null` follows the default picture model. */
   image_model: string | null;
-  model_tier: PersonaModelTier;
   temperature: number;
   max_tokens: number | null;
   enable_write_tools: boolean;
@@ -58,13 +57,6 @@ export type PersonaSaveResult =
   | { ok: true; persona: PersonaInfo; liveAgentsUpdated: number }
   | { ok: false; message: string };
 
-export const MODEL_TIERS: readonly PersonaModelTier[] = ['inherit', 'fast'];
-
-/** A tier the Core still sends, else `inherit`: the retired values (pro, flash_lite, custom)
- * were read by nothing, and the Core loads a file naming one as `inherit` too. */
-const knownTier = (tier: string | null | undefined): PersonaModelTier =>
-  (MODEL_TIERS as readonly string[]).includes(tier ?? '') ? (tier as PersonaModelTier) : 'inherit';
-
 export const emptyPersonaDraft = (): PersonaDraft => ({
   name: '',
   role: '',
@@ -75,7 +67,6 @@ export const emptyPersonaDraft = (): PersonaDraft => ({
   model_name: null,
   fast_model: null,
   image_model: null,
-  model_tier: 'inherit',
   temperature: 0.7,
   max_tokens: null,
   enable_write_tools: false,
@@ -97,7 +88,6 @@ export const draftFromPersona = (persona: PersonaInfo): PersonaDraft => ({
   model_name: persona.model_name ?? null,
   fast_model: persona.fast_model ?? null,
   image_model: persona.image_model ?? null,
-  model_tier: knownTier(persona.model_tier),
   temperature: persona.temperature ?? 0.7,
   max_tokens: persona.max_tokens ?? null,
   enable_write_tools: persona.enable_write_tools ?? false,
@@ -203,7 +193,6 @@ export interface PersonaEditorCopy {
     enableWriteToolsAction?: string;
     baseTools?: string;
     baseToolsHint?: string;
-    tier: string;
     temperature: string;
     temperaturePresets?: {
       precise: string;
@@ -229,7 +218,6 @@ export interface PersonaEditorCopy {
     learnFromConversations: string;
     learnFromConversationsHint: string;
   };
-  tierLabels: Record<PersonaModelTier, string>;
   noToolsSelected: string;
   noToolsAvailable: string;
   save: string;

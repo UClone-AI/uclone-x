@@ -23,14 +23,22 @@ import pytest
 
 from uclone_x.agent.models import AgentConfig, AgentLLMConfig
 from uclone_x.core.provenance import Provenance
-from uclone_x.errors import LLMProviderError
+from uclone_x.errors import LLMProviderError, PictureModelNotForChatError
 from uclone_x.llm.catalog import CatalogEntry, CatalogResult
 from uclone_x.llm.connections import kind_rows
 from uclone_x.llm.connectors.factory import create_llm_connector, image_engine_choice
 from uclone_x.llm.connectors.gemini import GeminiConnector
 from uclone_x.llm.connectors.mock import MockLLMConnector
 from uclone_x.llm.gateway import ModelGateway
-from uclone_x.llm.models import FinishReason, LLMRequest, ModelResponse, TokenUsage, ToolCallRequest
+from uclone_x.llm.models import (
+    ChatMessage,
+    FinishReason,
+    LLMRequest,
+    MessageRole,
+    ModelResponse,
+    TokenUsage,
+    ToolCallRequest,
+)
 from uclone_x.tools.builtin.comfy_client import ComfyClient
 from uclone_x.tools.builtin.image import (
     ComfyUIImageEngine,
@@ -389,6 +397,42 @@ async def test_a_chosen_comfyui_model_whose_connection_lost_its_address_is_refus
         engine.generate.assert_not_awaited()
     gpu = image_engine_choice(path, "remote_gpu/auto").refusal
     assert gpu is not None and "remote_gpu has no address" in gpu
+
+
+@pytest.mark.asyncio
+async def test_a_chosen_picture_model_on_a_missing_connection_is_refused_with_a_remedy(
+    tmp_path: Path,
+) -> None:
+    """A picture model pointing to a connection id that does not exist names where to fix it.
+
+    Killed by: src/uclone_x/llm/connections.py :: f"{ref.connection_id}. Choose another picture model in Settings › Models, or in "
+    Becomes: f"{ref.connection_id}."
+    """
+    path = _settings(
+        tmp_path,
+        connections=[{"id": "gemini", "kind": "gemini", "key": "test-key"}],
+        default_models={"image": "comfyui/anillustrious_v4"},
+    )
+    remote, comfy, local = _engines()
+    dispatcher = ImagePipelineDispatcher(
+        remote_engine=remote,
+        comfy_engine=comfy,
+        local_engine=local,
+        engine_settings=lambda own: image_engine_choice(path, own),
+    )
+
+    with pytest.raises(ImageEngineRefusal) as refused:
+        await _draw(dispatcher)
+
+    text = str(refused.value)
+    assert text == (
+        "The picture model comfyui/anillustrious_v4 cannot be used: there is no connection "
+        "called comfyui. Choose another picture model in Settings › Models, or in the clone "
+        "editor."
+    )
+    _plain(text)
+    for engine in (remote, comfy, local):
+        engine.generate.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -815,3 +859,70 @@ async def test_two_clones_pinned_to_two_gpu_servers_each_draw_on_their_own(
     await asyncio.gather(_draw(dispatcher, "gpu_a/auto"), _draw(dispatcher, "gpu_b/auto"))
 
     assert sorted(drew_at) == sorted(servers.values()), drew_at
+
+
+# -- #2416: a picture model is never a conversation model --------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_declared_picture_model_is_not_in_the_chat_set_but_is_in_the_picture_set(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The clone LLM selector offered Google's picture models as conversation models (#2416).
+    A listing may still call one able to chat; the registry's declaration decides.
+
+    Killed by: src/uclone_x/llm/gateway.py :: if e.chat_capable and e.id not in pictures
+    Becomes: if e.chat_capable
+    """
+    import uclone_x.llm.gateway as gateway_module
+
+    async def catalog(kind: str, **_kw: Any) -> CatalogResult:
+        entries = (
+            CatalogEntry(id="gemini-3.5-flash", display_name="Gemini 3.5 Flash"),
+            CatalogEntry(id="gemini-3.1-flash-image", display_name="Nano Banana 2"),
+        )
+        return CatalogResult(provider=kind, status="live", entries=entries)
+
+    monkeypatch.setattr(gateway_module, "read_provider_catalog", catalog)
+    gateway = ModelGateway(
+        _settings(tmp_path, connections=[{"id": "gemini", "kind": "gemini", "key": "test-key"}])
+    )
+
+    chat = await gateway.model_set("chat")
+    pictures = await gateway.model_set("image")
+
+    assert [[m.ref for m in g.models] for g in chat.groups] == [["gemini/gemini-3.5-flash"]]
+    assert [[m.ref for m in g.models] for g in pictures.groups] == [
+        ["gemini/gemini-3.1-flash-image"]
+    ]
+
+
+def _no_call(request: httpx.Request) -> httpx.Response:
+    raise AssertionError(f"nothing should be sent to Google: {request.url}")
+
+
+@pytest.mark.asyncio
+async def test_a_conversation_on_a_picture_model_is_refused_in_plain_words() -> None:
+    """A clone whose saved chat model is a picture model fails when it is used, and says why
+    (#2416: pre-release, so the saved choice is not migrated). Nothing is sent to Google.
+
+    Killed by: src/uclone_x/llm/connectors/gemini.py :: raise PictureModelNotForChatError(provider=_PROVIDER, model=chosen)
+    Becomes: pass
+    """
+    connector = GeminiConnector(
+        api_key="k", http_client=httpx.AsyncClient(transport=httpx.MockTransport(_no_call))
+    )
+    request = LLMRequest(
+        model="gemini-3-pro-image-preview",
+        messages=(ChatMessage(role=MessageRole.USER, content="안녕"),),
+    )
+
+    with pytest.raises(PictureModelNotForChatError) as refused:
+        await connector.generate(request)
+    assert refused.value.retryable is False
+    assert "gemini-3-pro-image-preview" in str(refused.value)
+    _plain(str(refused.value))
+
+    with pytest.raises(PictureModelNotForChatError):
+        async for _chunk in connector.stream(request):
+            pass

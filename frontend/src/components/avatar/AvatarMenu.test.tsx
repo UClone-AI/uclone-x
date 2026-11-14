@@ -40,7 +40,6 @@ const profile = ({
       <CloneProfile
         cloneId="reader"
         persona={makePersonaInfo({ avatar_url: avatarUrl, avatar_chosen: avatarChosen })}
-        onStartConversation={vi.fn()}
       />
     </AvatarChoiceContext.Provider>
   </LocaleProvider>

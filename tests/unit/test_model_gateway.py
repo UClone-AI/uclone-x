@@ -387,7 +387,9 @@ class TestConnectorFor:
         gateway, _ = _gateway(tmp_path, _TWO)
         with pytest.raises(ModelRefUnavailableError) as refused:
             gateway.connector_for(ModelRef.parse("gone/qwen3"))
-        assert refused.value.kind is ProviderFailureKind.MODEL_UNAVAILABLE
+        # No listing was read, so nothing says the model is missing: the connection could
+        # not be reached (#2418).
+        assert refused.value.kind is ProviderFailureKind.PROVIDER_UNREACHABLE
         assert "gone/qwen3" in str(refused.value)
         _plain(str(refused.value))
 
@@ -408,15 +410,16 @@ class TestBind:
         self, tmp_path: Path
     ) -> None:
         """
-        Killed by: src/uclone_x/llm/gateway.py :: if fast_ref is not None and fast_ref.connection_id == deep_conn_id
-        Becomes: if fast_ref is not None
+        Killed by: src/uclone_x/llm/gateway.py :: fast_model = deep_model
+        Becomes: fast_model = None
         """
         gateway, _ = _gateway(tmp_path, _TWO)
         seat = gateway.bind(AgentLLMConfig())
         assert seat.llm is gateway.connector_for(ModelRef.parse("mock/deep-model"))
         assert seat.llm_config.model_name == "deep-model"
-        # The default fast is on `box`, another connection: one seat holds one connector.
-        assert seat.llm_config.fast_model is None
+        # No fast model of its own: its conversation model, never the default fast, which
+        # is on `box` (owner ruling 2026-10-29, #2418).
+        assert seat.llm_config.fast_model == "deep-model"
         assert seat.pinned_ref is None
 
     def test_a_missing_connection_gives_a_refusing_connector(self, tmp_path: Path) -> None:
@@ -576,7 +579,7 @@ class TestTwoSeatsOnTwoConnections:
     ) -> None:
         """§3.6: never re-run on the default; say which clone, which model, and offer one action.
 
-        Killed by: src/uclone_x/room/orchestrator.py :: provider_failure = self._with_own_model(speaker.id, result.provider_failure)
+        Killed by: src/uclone_x/room/orchestrator.py :: provider_failure = own_model(result.provider_failure)
         Becomes: provider_failure = result.provider_failure
         """
         from uclone_x.room.models import ParticipantKind
@@ -595,7 +598,9 @@ class TestTwoSeatsOnTwoConnections:
 
         failure = landed.provider_failure
         assert failure is not None
-        assert (failure.kind, failure.retryable) == (ProviderFailureKind.MODEL_UNAVAILABLE, False)
+        # The connection is gone, not the model (#2418); a connection that comes back
+        # re-binds the seat, so the turn can be tried again.
+        assert (failure.kind, failure.retryable) == (ProviderFailureKind.PROVIDER_UNREACHABLE, True)
         assert (failure.clone, failure.model_ref, failure.action) == (
             "alpha",
             "box/own-model",
@@ -605,6 +610,43 @@ class TestTwoSeatsOnTwoConnections:
         _plain(failure.message)
         # Nothing was sent to the default connection in its place (G7).
         assert built.get("http://a.local") is None or built["http://a.local"].models == []
+
+    def test_the_system_default_is_not_offered_when_its_connection_is_gone(
+        self, tmp_path: Path
+    ) -> None:
+        """#2424: the card offered [Use system default] while the default named a removed
+        connection (`remote-gpu`, #2422), an action that could only fail. With no usable
+        default the failure still names the clone and its model, and offers no action.
+
+        Killed by: src/uclone_x/room/orchestrator.py :: if callable(usable) and not usable():
+        Becomes: if False:
+        """
+        from uclone_x.room.models import ParticipantKind
+
+        settings = {
+            "connections": [
+                {"id": "mock", "kind": "mock", "base_url": "http://a.local"},
+                {"id": "box", "kind": "mock", "base_url": "http://b.local"},
+            ],
+            "default_models": {"deep": "remote-gpu/qwen3:14b", "fast": "remote-gpu/granite3.3:8b"},
+        }
+        app, client, _built = _room_app(tmp_path, settings)
+        stack = app.state.room_stack
+        with client:
+            pinned = _clone(client, "alpha", "box/own-model")
+            assert client.delete("/api/connections/box").status_code == 200
+            room_id = stack.service.create("Default gone too").room_id
+            stack.service.add_participant(room_id, "user", kind=ParticipantKind.HUMAN)
+            stack.service.add_participant(room_id, pinned)
+            state = stack.store.load(room_id)
+            asyncio.run(stack.orchestrator(state).post(room_id, "user", "@alpha hello"))
+            landed = stack.store.load(room_id).transcript[-1]
+
+        failure = landed.provider_failure
+        assert failure is not None
+        assert (failure.clone, failure.model_ref) == ("alpha", "box/own-model")
+        assert failure.action is None
+        _plain(failure.message)
 
 
 # -- The routes (§3.7.1) --
@@ -1122,17 +1164,18 @@ class TestADefaultChangeReachesOpenSeats:
             seat = next(p for p in state.participants if p.id == follower)
             agent = asyncio.run(stack.resolve_agent(state, seat))
             assert agent.llm is built["http://a.local"]
-            assert agent.config.llm_config.fast_model == "mock-llm"
+            # No fast model of its own: its conversation model (#2418), not the default fast.
+            assert agent.config.llm_config.fast_model == "mock-gpt-4o"
 
-            # Moved to another connection: the fast default stays on the old one, so the
-            # seat (one connector) has no fast model -- not the old connection's id.
+            # Moved to another connection: its fast model moves with its conversation model,
+            # never the old connection's id.
             moved = client.post(
                 "/api/settings", json={"default_models": {"deep": "box/mock-gpt-4o"}}
             )
             assert moved.status_code == 200, moved.text
             assert agent.llm is built["http://b.local"]
             assert agent.config.llm_config.model_name == "mock-gpt-4o"
-            assert agent.config.llm_config.fast_model is None
+            assert agent.config.llm_config.fast_model == "mock-gpt-4o"
 
             # Cleared: no connector and no model, never the one it had.
             for slot in ("fast", "deep"):

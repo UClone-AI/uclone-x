@@ -28,6 +28,7 @@ from uclone_x.cli.browser_plan import common_dir, plan_browser_suite, record_bro
 from uclone_x.cli.commands.a2a import a2a_app
 from uclone_x.cli.commands.acp import AGENT_ID_HELP as ACP_AGENT_ID_HELP
 from uclone_x.cli.commands.acp import acp_app, start_acp_server
+from uclone_x.cli.commands.cluster import cluster_app
 from uclone_x.cli.commands.dev import dev_app
 from uclone_x.cli.commands.eval import eval_app
 from uclone_x.cli.commands.key import key_app
@@ -40,6 +41,7 @@ from uclone_x.cli.commands.report import report_app
 from uclone_x.cli.commands.room import room_app
 from uclone_x.cli.commands.skill import skill_app
 from uclone_x.cli.commands.ui import ui_app
+from uclone_x.cli.commands.worker import run_worker
 from uclone_x.cli.quality_gate import (
     JUNIT_REPORT_PATH,
     describe_installed_hook_drift,
@@ -444,6 +446,8 @@ app.add_typer(media_app, name="media")
 app.add_typer(ontology_app, name="ontology")
 app.add_typer(report_app, name="report")
 app.add_typer(room_app, name="room")
+app.add_typer(cluster_app, name="cluster")
+app.command("worker")(run_worker)
 app.add_typer(skill_app, name="skill")
 app.add_typer(ui_app, name="ui")
 
@@ -955,6 +959,41 @@ def test_pre_release(
     )
     if exit_code != 0:
         sys.exit(exit_code)
+
+
+@test_app.command("cluster")
+def test_cluster(
+    env_file: str = typer.Option(
+        "",
+        "--env-file",
+        help="Stack env file of the cluster to test (default: $UCX_CLUSTER_ENV_FILE, else "
+        ".ucx-cluster/stack.env). Start the cluster first with `ucx cluster up`.",
+    ),
+) -> None:
+    """Run the opt-in live suite against the running docker compose cluster (#2466).
+
+    Never part of `ucx test changed`/`check`: those stay offline and never start docker. This
+    suite kills and restarts containers of the stack it is pointed at, so point it at a stack
+    of your own.
+    """
+    import subprocess
+
+    env = os.environ.copy()
+    if env_file:
+        env["UCX_CLUSTER_ENV_FILE"] = env_file
+    cmd = [
+        sys.executable,
+        "-m",
+        "pytest",
+        "tests/integration/cluster_live",
+        "--cluster-live",
+        "-o",
+        "addopts=",
+        "-p",
+        "no:cacheprovider",
+        "-v",
+    ]
+    sys.exit(subprocess.run(cmd, env=env, check=False).returncode)
 
 
 @test_app.command("e2e")

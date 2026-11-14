@@ -9,15 +9,13 @@ import tempfile
 import unicodedata
 from collections.abc import Collection, Sequence
 from pathlib import Path
-from typing import Any, Final, Literal, Protocol, cast, runtime_checkable
+from typing import Any, Final, Protocol, cast, runtime_checkable
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from uclone_x.agent.models import (
-    RETIRED_MODEL_TIERS,
     AgentLLMConfig,
-    ModelTier,
     PersonaDefinition,
 )
 from uclone_x.agent.prompts import compose_system_prompt, composed_default_prompts
@@ -86,7 +84,6 @@ class PersonaDraft(BaseModel):
     model_name: str | None = None
     fast_model: str | None = None
     image_model: str | None = None
-    model_tier: Literal["inherit", "fast"] = "inherit"
     temperature: float = Field(default=0.7, ge=0.0, le=2.0)
     max_tokens: int | None = Field(default=None, gt=0)
     enable_write_tools: bool = False
@@ -227,7 +224,6 @@ def dump_persona_yaml(contents: dict[str, Any]) -> str:
 def persona_file_contents(draft: PersonaDraft) -> dict[str, Any]:
     """The mapping a persona file holds, in the keys the loader reads."""
     llm_config: dict[str, Any] = {
-        "model_tier": draft.model_tier,
         "temperature": float(draft.temperature),
     }
     if draft.model_name is not None:
@@ -338,18 +334,6 @@ def persona_from_mapping(fields: dict[str, Any], file_path: Path) -> PersonaDefi
     if isinstance(raw_llm, dict):
         raw_llm_dict = cast(dict[object, object], raw_llm)
         llm_dict: dict[str, Any] = {str(k): v for k, v in raw_llm_dict.items()}
-        tier: object = llm_dict.get("model_tier")
-        if isinstance(tier, str) and tier in RETIRED_MODEL_TIERS:
-            # Offered once, read by nothing: the file keeps loading, following Settings.
-            tier = ModelTier.INHERIT.value
-        if isinstance(tier, str):
-            try:
-                llm_dict["model_tier"] = ModelTier(tier)
-            except ValueError as exc:
-                raise PersonaLoadError(
-                    f"{file_path}: 'model_tier' {tier!r} is not a tier; use one of "
-                    f"{', '.join(t.value for t in ModelTier)}"
-                ) from exc
         data["llm_config"] = AgentLLMConfig(**llm_dict)
         data.pop("llm", None)
 
@@ -592,7 +576,6 @@ class InMemoryPersonaStore:
             raise PersonaNotFound(f"no persona named {draft.name!r} is loaded.")
 
         llm_dict: dict[str, Any] = {
-            "model_tier": ModelTier(draft.model_tier),
             "temperature": float(draft.temperature),
         }
         if draft.model_name is not None:

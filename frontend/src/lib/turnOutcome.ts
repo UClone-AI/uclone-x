@@ -48,6 +48,50 @@ export const providerFailureRemedy = (
 ): string | null => (copy.providerRemedy as Partial<Record<string, string>>)[kind] ?? null;
 
 /**
+ * The clone's own model ref, split at its first `/`, when that model is what failed; else
+ * `null` (model-gateway.md §3.6).
+ *
+ * Decided by the Core's `clone` and `model_ref`, never by `action`: the Core leaves `action`
+ * out when no system default can serve the turn (#2424), and the failure is still the
+ * clone's own model's.
+ */
+const ownModel = (
+  failure: RoomProviderFailure | null | undefined,
+): { connection: string; model: string } | null => {
+  const ref = failure?.model_ref ?? null;
+  if (!failure?.clone || !ref) return null;
+  const slash = ref.indexOf('/');
+  return slash > 0 ? { connection: ref.slice(0, slash), model: ref.slice(slash + 1) } : null;
+};
+
+const HOSTED_CLOUD_CONNECTIONS = new Set(['gemini', 'openai', 'anthropic']);
+
+/**
+ * Where to act when the clone's own model is what failed, or `null` when it is not (#2418).
+ *
+ * A clone's own model is chosen in the clone editor, not in Settings, so the remedy for a
+ * system default ("Choose another model in Settings") sends the person to the wrong place.
+ * A hosted cloud API (`gemini`, `openai`, `anthropic`) is not a user-run daemon, so
+ * `provider_unreachable` there points to choosing another model in the clone editor rather
+ * than checking that the connection is running.
+ */
+export const ownModelRemedy = (
+  label: string,
+  copy: OutcomeCopy,
+  failure: RoomProviderFailure | null | undefined,
+): string | null => {
+  const own = ownModel(failure);
+  if (!failure || !own) return null;
+  const remedyKind =
+    failure.kind === 'provider_unreachable' &&
+    HOSTED_CLOUD_CONNECTIONS.has(own.connection.toLowerCase())
+      ? 'model_unavailable'
+      : failure.kind;
+  const template = (copy.ownModelRemedy as Partial<Record<string, string>>)[remedyKind];
+  return template ? fmt(template, { label, connection: own.connection }) : null;
+};
+
+/**
  * The sentence for a turn that failed at the model's provider, from the Core's structured
  * fields alone (#2167): the failure `kind`, the `provider`'s display name, and, when the
  * clone's own model was the cause (model-gateway.md §3.6), the `model_ref` it names.
@@ -62,16 +106,13 @@ export const providerFailureSentence = (
   failure: RoomProviderFailure,
   copy: OutcomeCopy = ENGLISH,
 ): string => {
-  const ref = failure.model_ref ?? null;
-  const slash = ref ? ref.indexOf('/') : -1;
-  const own = failure.action === 'use_system_default' && ref !== null && slash > 0;
-  const provider =
-    failure.provider?.trim() || (own && ref ? ref.slice(0, slash) : '') || copy.providerUnknown;
+  const own = ownModel(failure);
+  const provider = failure.provider?.trim() || own?.connection || copy.providerUnknown;
   const template =
     (copy.providerCause as Partial<Record<string, string>>)[failure.kind] ??
     copy.providerCauseOther;
   const cause = fmt(template, { provider });
-  if (own && ref) return fmt(copy.ownModelFailed, { label, model: ref.slice(slash + 1), cause });
+  if (own) return fmt(copy.ownModelFailed, { label, model: own.model, cause });
   return fmt(copy.providerFailed, { label, cause });
 };
 

@@ -57,7 +57,7 @@ VIEWPORT: ViewportSize = {"width": 1280, "height": 900}
 #: What `refusalRemedy` says about `budget_exceeded`, in the head's own words. Asserted in
 #: full rather than by substring: the remedy is the whole reason the row withholds Retry, and
 #: a row that showed the refusal and no way forward would pass a laxer check.
-REMEDY = "Trying again would be refused too. Start a new conversation to continue."
+REMEDY = "Trying again would be refused too: this limit holds for the whole conversation."
 
 #: What the row says about a spent token ceiling, in the head's words (#1408). The Core's own
 #: refusal text ("Session token limit exceeded: 0/0") stays on the row's `error` field for the

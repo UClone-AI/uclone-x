@@ -94,7 +94,6 @@ def test_yaml_file_store_saves_and_updates_in_place(tmp_path: Path) -> None:
         system_prompt="Test thoroughly.",
         allowed_tools=["test_tool"],
         model_name="openai/gpt-4o",
-        model_tier="fast",
         temperature=0.5,
     )
     created = store.save_persona(draft, create=True)

@@ -376,8 +376,8 @@ def test_retrying_a_failed_turn_shows_the_model_the_prompt_once(tmp_path: Path) 
     `[("user", "Same prompt"), ("user", "Same prompt")]`. Sending the same words after
     they were answered is a new message, and still reaches the model as one.
 
-    Killed by: src/uclone_x/agent/turn_executor.py :: if not _repeats_unanswered_prompt(self._history, user_prompt):
-    Becomes: if True:
+    Killed by: src/uclone_x/agent/turn_executor.py :: return not self._continuing and not _repeats_unanswered_prompt(self._history, user_prompt)
+    Becomes: return True
     """
     connector = _ScriptedChatConnector({1}, ["Answered", "Answered again"])
     mgr = AgentSessionManager(storage_dir=tmp_path / "sessions", llm=connector)

@@ -100,8 +100,8 @@ class TestASeatSessionSurvivesARestart:
     ) -> None:
         """Run one turn, then rebuild the resolver over the same directory and ask again.
 
-        Killed by: src/uclone_x/room/orchestrator.py :: persist_error = rollback_error or self._persist_seat(agent, speaker)
-        Becomes: persist_error = rollback_error
+        Killed by: src/uclone_x/room/orchestrator.py :: persist_error = step.outcome.persist_error or self._persist_seat(agent, speaker)
+        Becomes: persist_error = step.outcome.persist_error
         """
         room_store, service = _seated_room(tmp_path)
         sessions_dir = tmp_path / "sessions"
@@ -145,8 +145,8 @@ class TestTheHeadWritesTheSeat:
     ) -> None:
         """The probe's own observation, as a test: `sessions/core/` after a room turn.
 
-        Killed by: src/uclone_x/room/orchestrator.py :: persist_error = rollback_error or self._persist_seat(agent, speaker)
-        Becomes: persist_error = rollback_error
+        Killed by: src/uclone_x/room/orchestrator.py :: persist_error = step.outcome.persist_error or self._persist_seat(agent, speaker)
+        Becomes: persist_error = step.outcome.persist_error
         """
         from uclone_x.ui.app import AgentSessionManager, create_ui_app
 
@@ -235,8 +235,8 @@ class TestTheOrchestratorWritesEverySeatTurn:
         What is written is the seat with the failed turn rolled back out of it (#1423), so
         a restart and the agent in memory still agree; the write itself is what this pins.
 
-        Killed by: src/uclone_x/room/orchestrator.py :: persist_error = rollback_error or self._persist_seat(agent, speaker)
-        Becomes: persist_error = rollback_error or (None if error is not None else self._persist_seat(agent, speaker))
+        Killed by: src/uclone_x/room/orchestrator.py :: persist_error = step.outcome.persist_error or self._persist_seat(agent, speaker)
+        Becomes: persist_error = step.outcome.persist_error or (None if step.outcome.error is not None else self._persist_seat(agent, speaker))
         """
         agent = _RecordingAgent(result_error="LLMError: provider unreachable")
         orchestrator, session_id = _orchestrator(tmp_path, agent)

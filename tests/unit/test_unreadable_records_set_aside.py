@@ -278,8 +278,8 @@ class TestTheRoomSaysSo:
     ) -> None:
         """Once, on the row of the turn whose save set the record aside.
 
-        Killed by: src/uclone_x/room/orchestrator.py :: session_set_aside=self._session_set_aside(speaker),
-        Becomes: session_set_aside=False,
+        Killed by: src/uclone_x/room/orchestrator.py :: "session_set_aside": self._session_set_aside(speaker),
+        Becomes: "session_set_aside": False,
         Killed by: src/uclone_x/room/orchestrator.py :: return self._sessions.take_set_aside(speaker.session_id)
         Becomes: return False
         """

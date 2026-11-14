@@ -28,16 +28,10 @@ const baseProps = {
   seatId: 'scout' as string | null,
   selectedArtifactPath: null,
   events: [],
-  ontology: null,
   budgetData: null,
-  isPaused: false,
-  onTogglePause: vi.fn(),
-  onClearEvents: vi.fn(),
-  lastHeartbeat: '-',
   // No clone picked, which is the state a fresh install opens in.
   selectedClone: '',
   personas: [],
-  onStartConversation: vi.fn(),
   onRefresh: vi.fn(),
   isRefreshing: false,
 };
@@ -137,33 +131,30 @@ describe('ArtifactsDock', () => {
     }
   });
 
-  it('offers the four developer surfaces in the drawer while developer mode is on', () => {
-    // Killed by: frontend/src/components/layout/ArtifactsDock.tsx :: { id: 'ontology', label: 'Ontology', icon: <Brain className="w-3.5 h-3.5" />, accent: 'violet' },
-    // Becomes:
+  it('offers only Knowledge Graph in the drawer while developer mode is on (#2442)', () => {
+    // Killed by: frontend/src/components/layout/ArtifactsDock.tsx :: label: 'Knowledge Graph',
+    // Becomes: label: 'Graph',
     render(<ArtifactsDock {...baseProps} developerMode />);
     const drawer = screen.getByTestId('dev-drawer');
     expect(drawer).toHaveTextContent('Developer Tools');
     const labels: Record<string, string> = {
       knowledge_graph: 'Knowledge Graph',
-      topology: 'DAG',
-      ledger: 'EventBus',
-      ontology: 'Ontology',
     };
-    expect(DEVELOPER_SURFACES).toHaveLength(4);
+    expect(DEVELOPER_SURFACES).toHaveLength(1);
     for (const surface of DEVELOPER_SURFACES) {
       expect(screen.getByTestId(`dev-tab-${surface}`)).toHaveTextContent(labels[surface]);
     }
-    // Skills moved to Settings, and ACP and Evals to Settings' Diagnostics (#1358): the
-    // drawer names none of them, by tab or by label.
-    for (const gone of ['skills', 'acp', 'evaluations']) {
+    // Skills moved to Settings, ACP and Evals to Settings' Diagnostics (#1358), and DAG,
+    // EventBus and Ontology were removed (#2442): the drawer names none of them.
+    for (const gone of ['skills', 'acp', 'evaluations', 'topology', 'ledger', 'ontology']) {
       expect(screen.queryByTestId(`dev-tab-${gone}`)).toBeNull();
     }
-    for (const label of ['Skills', 'ACP', 'Evals']) {
+    for (const label of ['Skills', 'ACP', 'Evals', 'DAG', 'EventBus', 'Ontology']) {
       expect(drawer).not.toHaveTextContent(label);
     }
 
-    fireEvent.click(screen.getByTestId('dev-tab-ledger'));
-    expect(baseProps.onSelectSurface).toHaveBeenCalledWith('ledger');
+    fireEvent.click(screen.getByTestId('dev-tab-knowledge_graph'));
+    expect(baseProps.onSelectSurface).toHaveBeenCalledWith('knowledge_graph');
   });
 
   it('shows Docs & Artifacts when the selected surface is a developer one and the mode is off', () => {
@@ -203,6 +194,178 @@ describe('ArtifactsDock', () => {
       expect(pre).toBeDefined();
       expect(pre.textContent).toContain('# Hello Artifact');
     });
+  });
+
+  it('shows a plain empty state in Music Score when the conversation has no song open', async () => {
+    // Killed by: frontend/src/components/layout/ArtifactsDock.tsx :: activeStoryId !== null ? (
+    // Becomes: true ? (
+    render(<ArtifactsDock {...baseProps} activeSurface="artifacts" selectedClone="composer" />);
+
+    expect(await screen.findByTestId('music-no-song')).toHaveTextContent(
+      'No song is open in this conversation yet.',
+    );
+    const asked = vi.mocked(globalThis.fetch).mock.calls.map(([url]) => String(url));
+    expect(asked.some((url) => url.startsWith('/api/artifacts/library/songs/'))).toBe(false);
+  });
+
+  it('opens MusicView directly for a localized Composer seat without requesting /stories/ and forwards Voice Rhythm to onSendRoomMessage', async () => {
+    // Killed by: frontend/src/components/layout/ArtifactsDock.tsx :: s.display_name === '\uc791\uace1\uac00'
+    // Becomes: false
+    const onSendRoomMessage = vi.fn();
+    vi.mocked(globalThis.fetch).mockImplementation((input) => {
+      const url = String(input);
+      if (url === '/api/artifacts/library/songs/canon-in-d-7231') {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () =>
+            Promise.resolve({
+              song_id: 'canon-in-d-7231',
+              title: 'Canon in D',
+              genre: 'classical_chamber',
+              style_axioms: {
+                profile: 'classical_chamber',
+                forbid_parallel_fifths_octaves: true,
+                forbid_voice_crossing: true,
+                require_kick_bass_lock: false,
+                default_swing: 0.5,
+              },
+              writable: true,
+              holder: 'room-1',
+              decide_code: null,
+              tempo: 72,
+              key_signature: 'D major',
+              time_signature: '4/4',
+              total_bars: 2,
+              duration_seconds: 6.6,
+              bars: [
+                {
+                  global_bar: 1,
+                  section_id: 'sec_verse_01',
+                  section_title: 'Verse 1',
+                  section_bar: 1,
+                  chord: 'D',
+                  bpm: 72,
+                  start_seconds: 0.0,
+                  end_seconds: 3.3,
+                },
+                {
+                  global_bar: 2,
+                  section_id: 'sec_verse_01',
+                  section_title: 'Verse 1',
+                  section_bar: 2,
+                  chord: 'A',
+                  bpm: 72,
+                  start_seconds: 3.3,
+                  end_seconds: 6.6,
+                },
+              ],
+              sections: [
+                { id: 'sec_verse_01', title: 'Verse 1', kind: 'verse', bars: 2, chords: ['D', 'A'] },
+              ],
+              instruments: [
+                {
+                  id: 'cello_bass',
+                  name: 'Cello Bass',
+                  category: 'strings',
+                  role: 'bass_foundation',
+                  midi_program: 42,
+                  midi_channel: 1,
+                  soundfont_patch: 'gm_default',
+                  min_pitch: 'C2',
+                  max_pitch: 'A5',
+                  transposition_semitones: 0,
+                  volume: 85,
+                  pan: 0,
+                  muted: false,
+                  solo: false,
+                },
+              ],
+              tracks: [
+                {
+                  track_id: 'tr_cello',
+                  section_id: 'sec_verse_01',
+                  instrument_id: 'cello_bass',
+                  digest: 'dig-cello',
+                  groove_swing: 0.5,
+                  bars: [
+                    { bar: 1, chord: 'D', notes: ['1.0:D2:2.0:v85'], muted: false },
+                    { bar: 2, chord: 'A', notes: ['1.0:A2:2.0:v85'], muted: false },
+                  ],
+                  can_revert: false,
+                },
+              ],
+              notes: [],
+              proposals: [],
+            }),
+        } as Response);
+      }
+      return Promise.resolve({
+        ok: false,
+        status: 404,
+        json: () => Promise.resolve({ detail: 'not found' }),
+      } as Response);
+    });
+
+    render(
+      <ArtifactsDock
+        {...baseProps}
+        roomId="room-1"
+        activeSurface="artifacts"
+        selectedClone="agt_a6030f7a968e436eab6dfa526d196f07"
+        onSendRoomMessage={onSendRoomMessage}
+        room={{
+          room_id: 'room-1',
+          title: '작곡을 해보자',
+          story_id: 'canon-in-d-7231',
+          participants: [
+            { id: 'user', display_name: 'User', kind: 'human' },
+            {
+              id: 'agt_a6030f7a968e436eab6dfa526d196f07',
+              display_name: '작곡가',
+              kind: 'agent',
+            },
+          ],
+          transcript: [],
+          turn_state: { agent_turns_since_human: 0 },
+          policy: {
+            max_agent_turns_per_human_message: 4,
+            max_span_tokens: 8000,
+            transcript_window: 40,
+            hesitation_seconds: 0,
+            default_responder_id: 'agt_a6030f7a968e436eab6dfa526d196f07',
+          },
+        }}
+      />,
+    );
+
+    expect(await screen.findByTestId('music-view-title')).toHaveTextContent('Canon in D');
+    const askedUrls = vi.mocked(globalThis.fetch).mock.calls.map(([url]) => String(url));
+    expect(askedUrls.some((url) => url.includes('/api/artifacts/library/stories/'))).toBe(false);
+
+    Object.defineProperty(navigator, 'mediaDevices', {
+      value: {
+        getUserMedia: vi.fn().mockResolvedValue({
+          getTracks: () => [{ stop: vi.fn() }],
+        }),
+      },
+      configurable: true,
+    });
+
+    fireEvent.click(screen.getByTestId('music-voice-rhythm-toggle'));
+    const recBtn = await screen.findByTestId('music-voice-record-btn');
+    await act(async () => {
+      fireEvent.click(recBtn);
+    });
+    await act(async () => {
+      fireEvent.click(recBtn);
+    });
+    fireEvent.click(await screen.findByTestId('music-voice-rhythm-send'));
+
+    expect(onSendRoomMessage).toHaveBeenCalledTimes(1);
+    expect(onSendRoomMessage.mock.calls[0][0]).toContain(
+      '[sec_verse_01 | Bar 1-2 | cello_bass] [VoiceRhythm | detected_bpm=',
+    );
   });
 
   it('reports surface selection changes', () => {
@@ -245,7 +408,7 @@ describe('ArtifactsDock', () => {
     render(<ArtifactsDock {...baseProps} developerMode />);
     // The drawer is shown and the absorbing surfaces are still offered, so the absences below
     // are the tabs' and not a missing drawer's.
-    expect(screen.getByTestId('dev-tab-ledger')).toBeDefined();
+    expect(screen.getByTestId('dev-tab-knowledge_graph')).toBeDefined();
     expect(screen.getByTestId('tab-resource')).toBeDefined();
     expect(screen.getByTestId('tab-activity')).toBeDefined();
     expect(screen.queryByTestId('tab-budget')).toBeNull();
@@ -631,7 +794,6 @@ describe('ArtifactsDock: a conversation still opening, or unreadable (#1389)', (
     'activity',
     'remembers',
     'resource',
-    'topology',
     'knowledge_graph',
   ])('%s says the conversation is opening, not that none is open', (surface) => {
     // Killed by: frontend/src/components/layout/ArtifactsDock.tsx :: const pending = roomId === null && roomScoped ? roomPending : null;
@@ -655,7 +817,6 @@ describe('ArtifactsDock: a conversation still opening, or unreadable (#1389)', (
     'activity',
     'remembers',
     'resource',
-    'topology',
     'knowledge_graph',
   ])('%s still says none is open when none is', (surface) => {
     render(

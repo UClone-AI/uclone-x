@@ -16,8 +16,10 @@ import pytest
 import uclone_x
 from tests.support.frontend_build_guard import install_frontend_build_guard
 from tests.support.live_optin import (
+    CLUSTER_LIVE_SKIP_REASON,
     LIVE_SKIP_REASON,
     PRE_RELEASE_SKIP_REASON,
+    apply_cluster_live_skip,
     apply_live_skip,
     apply_pre_release_skip,
 )
@@ -48,6 +50,14 @@ from uclone_x.tools.builtin import mcp_loader
 _STORY_EXAMPLE_SRC = str(Path(__file__).resolve().parent.parent / "examples" / "story" / "src")
 if _STORY_EXAMPLE_SRC not in sys.path:
     sys.path.insert(0, _STORY_EXAMPLE_SRC)
+
+_MUSIC_EXAMPLE_SRC = str(Path(__file__).resolve().parent.parent / "examples" / "music" / "src")
+if _MUSIC_EXAMPLE_SRC not in sys.path:
+    sys.path.insert(0, _MUSIC_EXAMPLE_SRC)
+
+_VIDEO_EXAMPLE_SRC = str(Path(__file__).resolve().parent.parent / "examples" / "video" / "src")
+if _VIDEO_EXAMPLE_SRC not in sys.path:
+    sys.path.insert(0, _VIDEO_EXAMPLE_SRC)
 
 _COLLECTION_SESSION_DIR = Path(tempfile.gettempdir()) / "uclone-test-session-collection"
 _COLLECTION_SESSION_DIR.mkdir(parents=True, exist_ok=True)
@@ -220,6 +230,12 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         help="Run Tier 3 tests against a real LLM endpoint (costs tokens off the local provider)",
     )
     parser.addoption(
+        "--cluster-live",
+        action="store_true",
+        default=False,
+        help="Run the cluster_live suite against the running docker compose cluster",
+    )
+    parser.addoption(
         "--pre-release",
         action="store_true",
         default=False,
@@ -233,6 +249,11 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
         live_enabled=bool(config.getoption("--live")),
         items=items,
         skip_marker=pytest.mark.skip(reason=LIVE_SKIP_REASON),
+    )
+    apply_cluster_live_skip(
+        cluster_live_enabled=bool(config.getoption("--cluster-live")),
+        items=items,
+        skip_marker=pytest.mark.skip(reason=CLUSTER_LIVE_SKIP_REASON),
     )
     markexpr = getattr(config.option, "markexpr", "")
     pre_release_enabled = bool(config.getoption("--pre-release")) or (

@@ -1,5 +1,12 @@
 import React from 'react';
-import { findModel, pickableGroups, silentGroups, type ModelGroup, type ModelSet } from '../../lib/modelGateway';
+import {
+  findModel,
+  modelNames,
+  pickableGroups,
+  silentGroups,
+  type ModelGroup,
+  type ModelSet,
+} from '../../lib/modelGateway';
 
 /** The words a model picker shows. Passed in, so the picker carries none of its own. */
 export interface ModelRefSelectWords {
@@ -75,10 +82,12 @@ export const ModelRefSelect: React.FC<ModelRefSelectProps> = ({
             {`${value} ${words.unavailableSuffix}`}
           </option>
         )}
-        {pickableGroups(set).map((group) => (
+        {pickableGroups(set).map((group) => {
+          const names = modelNames(group);
+          return (
           <optgroup key={group.connection_id} label={group.label}>
             {group.models.map((model) => {
-              const name = model.display_name || model.id;
+              const name = names.get(model.ref) ?? model.id;
               return (
                 <option key={model.ref} value={model.ref} className="bg-slate-950 text-slate-200">
                   {model.ref === recommended ? `${name} ${words.recommendedSuffix}` : name}
@@ -86,7 +95,8 @@ export const ModelRefSelect: React.FC<ModelRefSelectProps> = ({
               );
             })}
           </optgroup>
-        ))}
+          );
+        })}
       </select>
       {silent.length > 0 && (
         <ul className="space-y-0.5" data-testid={`${testId}-silent`}>

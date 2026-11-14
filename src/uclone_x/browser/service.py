@@ -188,6 +188,8 @@ class _Tab:
     asked_user: dict[str, str] | None = None
     opener: str | None = None
     """The target of the tab whose page opened this one (a pop-up), if any (#2397)."""
+    started_blank: bool = False
+    """The service opened this tab at about:blank before loading a page (#2401)."""
     sign_in_tried: set[str] = field(default_factory=lambda: cast(set[str], set()))
     """The pages (loader ids) a saved sign-in was tried on: one attempt per page (§3.5)."""
     view: View | None = None
@@ -1387,7 +1389,9 @@ class BrowserService:
         return await self._observe(link, window, seen, fresh=True)
 
     async def _new_tab(self, link: BrowserLink) -> _Tab:
-        return await self._attach(link, await link.open_tab("about:blank"))
+        tab = await self._attach(link, await link.open_tab("about:blank"))
+        tab.started_blank = True
+        return tab
 
     async def _attach(self, link: BrowserLink, target: str) -> _Tab:
         tab = _Tab(target=target, events=link.subscribe(target))
@@ -1609,7 +1613,11 @@ class BrowserService:
         history = await link.send(tab.target, "Page.getNavigationHistory")
         entries = cast(list[dict[str, Any]], history.get("entries", []))
         index = int(history.get("currentIndex", 0)) + step
-        if not 0 <= index < len(entries):
+        # A tab the service opened begins at the blank page it was created on; that is not a
+        # page anyone visited, so `back` does not return to it (#2401).
+        blank_first = bool(entries) and entries[0].get("url") == "about:blank"
+        first = 1 if tab.started_blank and blank_first else 0
+        if not first <= index < len(entries):
             word = "earlier" if step < 0 else "later"
             message = f"There is no {word} page in this tab."
             opener = next(

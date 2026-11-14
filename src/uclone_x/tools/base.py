@@ -405,6 +405,16 @@ def tool_approval_unavailable_note(tool: object) -> str | None:
     return declared if isinstance(declared, str) and declared else None
 
 
+def tool_approval_unavailable_ends_turn(tool: object) -> bool:
+    """Whether a refusal because nobody here can approve `tool`'s call ends the turn's tools.
+
+    A tool declares `approval_unavailable_ends_turn` when what it asked for can only be
+    decided by a person elsewhere, so any other way to the same effect is a way around
+    that person (#2429). The turn then offers no more tools and the model replies.
+    """
+    return getattr(tool, "approval_unavailable_ends_turn", False) is True
+
+
 def drop_shadowed_aliases(tools: Sequence[TTool]) -> list[TTool]:
     """`tools` without any alias whose canonical tool is also in it (#1424).
 
@@ -747,6 +757,9 @@ class BaseTool(abc.ABC, Generic[TParams]):
     #: What the refusal says when this app cannot ask a person at all. See
     #: `tool_approval_unavailable_note`.
     approval_unavailable_note: ClassVar[str | None] = None
+    #: Whether that refusal ends the turn's tool use. See
+    #: `tool_approval_unavailable_ends_turn`.
+    approval_unavailable_ends_turn: ClassVar[bool] = False
     #: What a call refused on its arguments did *not* do, in words the model reads next to
     #: the refusal. A refusal that names only a field and a type leaves the model to guess
     #: whether anything happened, and one model guessed that it had (#1375). A tool whose

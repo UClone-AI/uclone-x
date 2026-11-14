@@ -1195,27 +1195,7 @@ describe('App developer mode (owner ruling 2026-09-22)', () => {
     await openedConversation();
     fireEvent.click(screen.getByTestId('toggle-dock'));
     expect(await screen.findByTestId('dev-drawer')).toBeInTheDocument();
-    expect(screen.getByTestId('dev-tab-ontology')).toBeInTheDocument();
-  });
-});
-
-describe('App reads the Ontology tab for the dock clone (#1869)', () => {
-  it('reads no rules engine with developer mode off, and the seated clone engine once it is on', async () => {
-    // Killed by: frontend/src/App.tsx :: if (!developerMode || !dockSeat) {
-    // Becomes: if (!dockSeat) {
-    //
-    // Killed by: frontend/src/App.tsx :: fetch(`/api/ontology?agent_id=${encodeURIComponent(dockSeat)}`)
-    // Becomes: fetch('/api/ontology')
-    render(<App />);
-    await openedConversation();
-    await waitFor(() => expect(sent('GET', '/api/budget').length).toBeGreaterThan(0));
-    expect(sent('GET', '/api/ontology')).toHaveLength(0);
-
-    await turnOnDeveloperMode();
-    await waitFor(() => expect(sent('GET', '/api/ontology').length).toBeGreaterThan(0));
-    for (const read of sent('GET', '/api/ontology')) {
-      expect(new URL(read.url, 'http://x').searchParams.get('agent_id')).toBe('champion');
-    }
+    expect(screen.getByTestId('dev-tab-knowledge_graph')).toBeInTheDocument();
   });
 });
 

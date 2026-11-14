@@ -21,7 +21,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from uclone_x.agent.base import BaseAgent
+from uclone_x.agent.base import BaseAgent, ModelChange
 from uclone_x.agent.clone_builder import (
     AppScope,
     GlobalModels,
@@ -33,6 +33,7 @@ from uclone_x.agent.models import AgentLLMConfig, PersonaDefinition
 from uclone_x.agent.persona_registry import PersonaRegistry, get_default_persona_registry
 from uclone_x.agent.protocols import BaseAgentProtocol
 from uclone_x.errors import ParticipantNotResolvableError
+from uclone_x.llm.connections import ModelRef
 from uclone_x.llm.protocols import LLMProviderProtocol
 from uclone_x.memory.store import CrossSessionMemory
 from uclone_x.ontology.protocols import OntologyEngineProtocol
@@ -65,6 +66,11 @@ def room_participant_system_prompt(participant: Participant) -> str:
         "contribution only — do not narrate the conversation, impersonate another "
         "participant, or prefix your reply with your own name."
     )
+
+
+def _model_slots(config: AgentLLMConfig) -> tuple[str | None, str | None, str | None]:
+    """The clone's own model choices: conversation, fast and picture (#2418)."""
+    return (config.model_name, config.fast_model, config.image_model)
 
 
 class RoomAgentResolver:
@@ -206,7 +212,10 @@ class RoomAgentResolver:
 
     @property
     def workspace_root(self) -> Path:
-        return self._app.workspace_root
+        root = self._app.workspace_root
+        if root is None:  # only a cluster worker's scope has none, and it seats no room yet
+            raise ValueError("A room resolver needs an app scope with a workspace")
+        return root
 
     @property
     def llm_config(self) -> AgentLLMConfig | None:
@@ -302,6 +311,27 @@ class RoomAgentResolver:
         """``(shown name, own model ref)`` when this seat's clone names its own model."""
         return self._pinned.get(participant_id)
 
+    def system_default_usable(self) -> bool:
+        """Whether the default deep model names a connection that is there now (#2424).
+
+        A failed turn offers "Use system default" only when that default could serve it:
+        the owner's default named `remote-gpu` after that connection was removed (#2422),
+        and the action could only fail. With no gateway there are no rows to check, so the
+        answer stays yes, as before.
+        """
+        gateway = self._app.gateway
+        if gateway is None:
+            return True
+        deep = gateway.defaults().deep
+        if not deep:
+            return False
+        try:
+            ref = ModelRef.parse(deep)
+        except ValueError:
+            return False
+        conn = gateway.connection(ref.connection_id)
+        return conn is not None and not conn.unsupported
+
     def models_changed(self) -> None:
         """Re-bind every built seat after the connections or default models changed.
 
@@ -320,6 +350,11 @@ class RoomAgentResolver:
             # connector to swap.
             if own is None or not isinstance(agent, BaseAgent):
                 continue
+            if agent.model_change_pending:
+                # A clone-editor change waits for the seat's next turn: resolve it again
+                # against the new connections, and leave the turn boundary where it was.
+                agent.stage_model_change(self._model_change(cache_key, own, agent))
+                continue
             seat = gateway.bind(own)
             # Exactly what the gateway resolved now, `None` included: a cleared default or one
             # moved to another connection must not leave the old connector or fast id behind.
@@ -337,14 +372,17 @@ class RoomAgentResolver:
         """
         self._app = self._app.with_llm(llm)
         global_models = self._app.global_models
-        deep, fast = global_models() if global_models is not None else (None, None)
+        deep, _fast = global_models() if global_models is not None else (None, None)
         for cache_key, agent in self._agents.items():
             if isinstance(agent, BaseAgent):
                 deep_follows, fast_follows = self._follows.get(cache_key, (False, False))
+                # A seat with no fast model of its own runs its fast work on its
+                # conversation model (owner ruling 2026-10-29, #2418), never the global fast.
+                conversation = deep if deep_follows else agent.config.llm_config.model_name
                 agent.hot_reload_llm(
                     llm,
                     model_name=deep if deep_follows else None,
-                    fast_model=(fast or deep) if fast_follows else None,
+                    fast_model=conversation if fast_follows else None,
                 )
 
     def persona_edited(self, persona: PersonaDefinition) -> int:
@@ -367,7 +405,63 @@ class RoomAgentResolver:
         ]
         for agent in seats:
             agent.stage_persona_edit(persona)
+        for cache_key, agent in self._agents.items():
+            if isinstance(agent, BaseAgent) and agent.persona == persona.name:
+                self._stage_model_change(cache_key, agent, persona.llm_config)
         return len(seats)
+
+    def _stage_model_change(self, cache_key: str, agent: BaseAgent, saved: AgentLLMConfig) -> None:
+        """Hand a built seat the models a clone-editor save chose, for its next turn (#2418).
+
+        Only when the save changed one of the clone's own model slots: a save that changed
+        none leaves the seat's connector as it is. The seat is re-bound from the *new*
+        choice, through the gateway as a build binds it, so an unset slot follows the
+        default now in Settings. An installation-wide override (`--model`) wins over
+        every clone's own models, so its seats have nothing to change.
+        """
+        own = self._own_llm.get(cache_key)
+        if own is None or self._app.llm_override is not None:
+            return
+        if _model_slots(saved) == _model_slots(own):
+            return
+        new_own = own.model_copy(
+            update={
+                "model_name": saved.model_name,
+                "fast_model": saved.fast_model,
+                "image_model": saved.image_model,
+            }
+        )
+        self._own_llm[cache_key] = new_own
+        self._follows[cache_key] = (not new_own.model_name, not new_own.fast_model)
+        agent.stage_model_change(self._model_change(cache_key, new_own, agent))
+
+    def _model_change(self, cache_key: str, own: AgentLLMConfig, agent: BaseAgent) -> ModelChange:
+        """What a seat whose clone's own models are `own` runs on now, as a build binds it."""
+        gateway = self._app.gateway
+        if gateway is None:
+            global_models = self._app.global_models
+            deep, fast = global_models() if global_models is not None else (None, None)
+            followed = follow_global_models(own, deep, fast)
+            return ModelChange(
+                llm=agent.llm,
+                model_name=followed.model_name,
+                fast_model=followed.fast_model,
+                image_model=followed.image_model,
+            )
+        bound = gateway.bind(own)
+        participant_id = self._sessions.get(cache_key)  # the cache key is a session id
+        if participant_id is not None:
+            if bound.pinned_ref is not None:
+                shown = self._pinned.get(participant_id, (participant_id, ""))[0]
+                self._pinned[participant_id] = (shown, bound.pinned_ref)
+            else:
+                self._pinned.pop(participant_id, None)
+        return ModelChange(
+            llm=bound.llm,
+            model_name=bound.llm_config.model_name,
+            fast_model=bound.llm_config.fast_model,
+            image_model=bound.llm_config.image_model,
+        )
 
     def _take_persona_edit(self, agent: BaseAgent) -> None:
         """Put the last saved definition of a *newly built* seat's persona in force.

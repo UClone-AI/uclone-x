@@ -18,6 +18,7 @@ written to be shown and carries none of it. It is logged below WARNING, for the 
 
 from __future__ import annotations
 
+import errno
 import logging
 
 import httpx
@@ -32,7 +33,6 @@ from uclone_x.errors import (
     ProviderResponseError,
     ProviderUnreachableError,
 )
-from uclone_x.llm.connectors.ollama import describe_transport_error
 
 __all__ = ["failed_request", "failed_status", "unusable_response"]
 
@@ -115,6 +115,27 @@ def _answered(error: ProviderFailureError, status_code: int, body: str) -> Provi
     return error
 
 
+def describe_transport_cause(exc: BaseException) -> str:
+    """`exc` and every exception behind it, with each OS error's errno name, for the log.
+
+    #2424: a `ConnectError` with no text was logged as just "ConnectError", while the
+    kernel had dropped the connection with `ETIMEDOUT`. The cause chain (`__cause__`, else
+    `__context__`) carries that, so it is written down. For whoever debugs it; never U0's.
+    """
+    parts: list[str] = []
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen and len(parts) < 6:
+        seen.add(id(current))
+        text = str(current).strip()
+        if isinstance(current, OSError) and current.errno is not None:
+            name = errno.errorcode.get(current.errno, str(current.errno))
+            text = f"{name} ({current.errno}) {current.strerror or text}".strip()
+        parts.append(f"{type(current).__name__}: {text}" if text else type(current).__name__)
+        current = current.__cause__ or current.__context__
+    return "; caused by ".join(parts)
+
+
 def failed_request(*, provider: str, model: str, exc: httpx.RequestError) -> ProviderFailureError:
     """The error for a request that got no answer at all, with the transport error logged."""
     logger.log(
@@ -122,7 +143,7 @@ def failed_request(*, provider: str, model: str, exc: httpx.RequestError) -> Pro
         "%s could not be reached for model %s: %s",
         provider,
         model,
-        describe_transport_error(exc),
+        describe_transport_cause(exc),
     )
     return ProviderUnreachableError(provider=provider, model=model)
 

@@ -20,10 +20,11 @@ import re
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final, cast
 
-from uclone_x.agent.models import ProviderFailure, ToolExecutionRecord
+from uclone_x.agent.models import ProviderFailure, ToolExecutionRecord, TurnResult
 from uclone_x.agent.protocols import BaseAgentProtocol
 from uclone_x.agent.session import SessionState
 from uclone_x.core.immutable import unwrap_immutable
@@ -32,6 +33,7 @@ from uclone_x.engine.event_bus import AgentEvent, EventSource, EventType
 from uclone_x.engine.protocols import EventBusProtocol, PublisherHandleProtocol
 from uclone_x.errors import (
     HeadRoomWriteError,
+    NothingToContinueError,
     NothingToRetryError,
     ProviderFailureKind,
     RoomError,
@@ -66,6 +68,7 @@ from uclone_x.room.models import (
     SelectionVerdict,
     SpeakerDecision,
     SpeakerRequest,
+    SpeakerStepOutcome,
     head_room_write_refusal,
     is_one_seat,
     turn_refusal,
@@ -78,7 +81,26 @@ from uclone_x.room.protocols import (
 )
 from uclone_x.tools.models import ToolResultStatus
 
-__all__ = ["RoomOrchestrator", "memory_save_outcome", "record_turn_tools"]
+__all__ = [
+    "RoomOrchestrator",
+    "SpeakerStep",
+    "SpeakerStepPlan",
+    "append_human_row",
+    "ceiling_decision",
+    "clone_names_in",
+    "decide_speaker",
+    "execute_single_speaker_step",
+    "land_speaker_step",
+    "landed_payload",
+    "memory_save_outcome",
+    "person_names_in",
+    "plan_speaker_step",
+    "record_turn_tools",
+    "landed_lesson",
+    "row_committed",
+    "validate_speaker",
+    "with_learning_recorded",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -296,6 +318,466 @@ def _record_tools(
 record_turn_tools = _record_tools
 memory_save_outcome = _memory_save_outcome
 image_prompt_additions = _image_prompt_additions
+
+
+def validate_speaker(
+    state: RoomState, chain_saw: RoomState, decision: SpeakerDecision
+) -> Participant | None:
+    """Hold a named speaker to the live roster, distinguishing a race from a defect.
+
+    Checked here and not in the selector: a selector naming a participant who has since
+    left is an ordinary event in a room whose roster changes, and the selector has no
+    way to know the roster moved after it answered.
+
+    **Two unlike cases wore one exception until #710.** A speaker the roster *had* when
+    the chain was asked and no longer has is a race, and the code can identify it
+    precisely by comparing the live roster against the one the chain was given; `None`
+    comes back and the caller gives the floor back to the chain. A speaker the roster
+    **never** had is a selector defect — no roster change explains it — and keeps the
+    raise, because a wrong selector must be loud. Before the split, an ordinary
+    departure reached the caller of `post()` as an error, and a room could be made to
+    fail by a participant leaving at the wrong moment.
+
+    The raise is also what bounds the caller's re-selection: once the departure has
+    landed, `chain_saw` no longer holds the departed agent, so a selector stuck on it
+    reaches this branch on the second round. See `_forgive_departure_race`.
+
+    Returns:
+        The speaker, or `None` when the chain was shown it and it has since left.
+    """
+    # `chain_saw` first, and that order is the whole point. Asking the live roster
+    # first short-circuits the defect check, so a selector that named someone it was
+    # never shown is rewarded whenever the name happens to have become valid — a
+    # participant who joined during selection, or one who was a human when the chain
+    # was asked and is an agent now. The selector sees exactly `chain_saw.participants`,
+    # so a name outside it is a defect by construction, whatever the roster did next.
+    seen_by_chain = (
+        RoomOrchestrator._participant(chain_saw, decision.speaker_id)  # pyright: ignore[reportPrivateUsage]
+        if decision.speaker_id
+        else None
+    )
+    if seen_by_chain is None or seen_by_chain.kind is not ParticipantKind.AGENT:
+        offered = ", ".join(p.id for p in chain_saw.participants if p.kind is ParticipantKind.AGENT)
+        raise SpeakerSelectionError(
+            f"Selector {decision.selector!r} named {decision.speaker_id!r} to speak in "
+            f"room {state.room_id!r}, which was not an agent of the room when the chain "
+            f"was consulted (it was offered: {offered or 'none'})"
+        )
+
+    # `seen_by_chain` proves `speaker_id` is a non-None agent id, so the live lookup
+    # below is total.
+    speaker = RoomOrchestrator._participant(state, seen_by_chain.id)  # pyright: ignore[reportPrivateUsage]
+    if speaker is None or speaker.kind is not ParticipantKind.AGENT:
+        return None
+    return speaker
+
+
+@dataclass(frozen=True)
+class SpeakerStepPlan:
+    """What one speaker's turn is shown, fixed before the turn runs."""
+
+    prompt: str
+    #: The span this turn actually showed. The high-water mark advances to *this*, not to the
+    #: speaker's own new message: anything appended while the turn ran -- an interjection, by
+    #: the very seam `append_human` exists to provide -- was never rendered, and marking past
+    #: it would skip it permanently. That inverts the mark's purpose from "do not show it
+    #: twice" into "never show it at all".
+    rendered_through: int
+    #: The seat's session as it stands before the turn: a turn that does not commit returns
+    #: the seat to exactly this (#1423).
+    checkpoint: SessionState
+
+
+@dataclass(frozen=True)
+class SpeakerStep:
+    """A speaker's turn, run and rolled back if it did not commit; nothing has been written."""
+
+    outcome: SpeakerStepOutcome
+    #: The turn's own result, when it returned one.
+    result: TurnResult | None
+    #: What the turn says its tools were, in full; `outcome` holds the room's bounded record.
+    executions: Sequence[ToolExecutionRecord]
+    #: The turn raised or was cancelled, and `outcome` records that. A head that lands such a
+    #: turn as a row ignores this; one with a retry policy of its own raises it.
+    raised: BaseException | None = None
+
+
+def plan_speaker_step(
+    agent: BaseAgentProtocol, speaker: Participant, state: RoomState
+) -> SpeakerStepPlan:
+    """Render what `speaker` has not seen, and take the checkpoint its turn rolls back to."""
+    prompt = RoomOrchestrator._render_span(state, speaker, span_token_budget(state, agent))  # pyright: ignore[reportPrivateUsage]
+    rendered_through = state.transcript[-1].seq if state.transcript else 0
+    return SpeakerStepPlan(prompt, rendered_through, agent.checkpoint_turn(speaker.session_id))
+
+
+async def execute_single_speaker_step(
+    agent: BaseAgentProtocol,
+    speaker: Participant,
+    state: RoomState,
+    plan: SpeakerStepPlan,
+    *,
+    turn_id: str,
+    stream_callback: Callable[[str, dict[str, Any]], Awaitable[None]] | None,
+    continuing: bool = False,
+    on_task: Callable[[asyncio.Task[Any]], None] | None = None,
+    own_model: Callable[[ProviderFailure | None], ProviderFailure | None] = lambda failure: failure,
+) -> SpeakerStep:
+    """Run one speaker's turn on a span already rendered, and say what it came to.
+
+    The one implementation of a speaker's turn: `RoomOrchestrator.post` runs it inside its loop,
+    and a cluster worker runs it for a `SEAT_TURN_EXECUTE` (`shells/cluster/turn_executor.py`).
+    It writes nothing. Who saves the seat and who lands the row is the caller's business, since
+    those are one process in the first case and two workers in the second.
+
+    **A turn commits in three places or in none (#1423):** the seat's session, the transcript
+    row's answer, and the seat's `last_seen_seq`. One predicate decides all three
+    (`SpeakerStepOutcome.committed`). A turn that fails it is rolled back out of the seat's
+    session here, before anything writes the session, so the span it was shown is not left in
+    the conversation for the retry to stack a second copy on, and a stopped turn leaves no half
+    of a tool step behind.
+    """
+    error: str | None = None
+    content = ""
+    provenance = None
+    usage = None
+    completed = True
+    refusal: RoomTurnRefusal | None = None
+    step_refusal: StepRefusalCode | None = None
+    provider_failure: ProviderFailure | None = None
+    persona_edit_dropped = False
+    stopped_at_ceiling = False
+    raised: BaseException | None = None
+    result: TurnResult | None = None
+    # What the turn says its tools were. Stays empty *and unrecorded* when the turn
+    # raised or was cancelled: there is no `TurnResult` to read them from, and an
+    # empty list stored as recorded would claim the seat used none (P6).
+    executions: Sequence[ToolExecutionRecord] = ()
+    tools_recorded = False
+    # A turn that raised or was cancelled has no `TurnResult`, and keeps the story
+    # the room had.
+    story_id = state.story_id
+    turn_kwargs: dict[str, Any] = {
+        "stream_callback": stream_callback,
+        "caller_turn_id": turn_id,
+        # Every seat gets the room's id and the room's story, so two seats in one room
+        # resolve the same story and hold its lease as one writer (#1555).
+        "room_id": state.room_id,  # the seat's conversation (#1555)
+        "story_id": state.story_id,
+        "person_names": _person_names(state),  # per turn, never stored (#1857)
+        # The room's workspace, or None for the seat's own: bound for this turn only,
+        # so a change applies from the next turn (clone-data-scopes §3.6).
+        "workspace_root": Path(state.workspace) if state.workspace is not None else None,
+    }
+    # A continued turn goes on from its last finished step, with no prompt (#2431).
+    turn_task = asyncio.create_task(
+        agent.continue_turn(**turn_kwargs)
+        if continuing
+        else agent.execute_turn(plan.prompt, **turn_kwargs)
+    )
+    if on_task is not None:
+        on_task(turn_task)
+    try:
+        result = await turn_task
+    except asyncio.CancelledError as exc:
+        completed = False
+        error = "Turn was interrupted"
+        raised = exc
+    except Exception as exc:
+        # Recorded, not raised: a room that drops a failed speaker presents as an
+        # agent that chose not to answer, which is what a working quiet room also
+        # looks like. The turn still spends budget, or a persistently failing agent
+        # is selected forever.
+        error = f"{type(exc).__name__}: {exc}"
+        raised = exc
+    else:
+        content = result.content
+        provenance = result.provenance
+        usage = result.usage
+        executions = result.tool_executions
+        story_id = result.story_id
+        # Not simply True: a turn that failed while a step's tools were running may
+        # have run calls whose records never reached the list, and storing that list
+        # as the turn's account would claim they did not happen (#1366).
+        tools_recorded = result.tool_executions_complete
+        # Its own usage ceiling stopped it between steps (#2431): not a failure, so it
+        # commits, and the row offers Continue.
+        stopped_at_ceiling = result.stop_reason == "usage_ceiling"
+        # `BaseAgent.execute_turn` returns a turn's failure rather than raising it, so a
+        # result carrying `error` is a failed turn and lands as one. Reading only
+        # `content` landed a real agent's failure as a successful empty row: nothing on
+        # the landed event for a head to show over the partial deltas it was streamed
+        # (#938), the unseen span consumed, and nothing for `retry` to re-run.
+        # `is_completed` is not read: it means "the turn reached an answer" and is
+        # False on results that never set it, while `completed` here means "not
+        # interrupted".
+        if result.error is not None:
+            error = result.error
+            # From the turn's stated stop reason, never from `error`'s wording (#969).
+            refusal = turn_refusal(result.stop_reason)
+            step_refusal = result.error_code
+            provider_failure = own_model(result.provider_failure)
+            persona_edit_dropped = result.stop_reason == "persona_edit_failed"
+
+    memory_facts_tried, memory_facts_unsaved = _memory_save_outcome(executions)
+    image_prompt_added, image_negative_added = _image_prompt_additions(executions)
+    uses, written = _record_tools(speaker, turn_id, executions)
+    outcome = SpeakerStepOutcome(
+        turn_id=turn_id,
+        rendered_through=plan.rendered_through,
+        content=content,
+        error=error,
+        completed=completed,
+        provenance=provenance,
+        usage=usage,
+        refusal=refusal,
+        step_refusal=step_refusal,
+        provider_failure=provider_failure,
+        persona_edit_dropped=persona_edit_dropped,
+        stopped_at_ceiling=stopped_at_ceiling,
+        tools_recorded=tools_recorded,
+        story_id=story_id,
+        tool_uses=uses,
+        written_files=written,
+        memory_facts_tried=memory_facts_tried,
+        memory_facts_unsaved=memory_facts_unsaved,
+        image_prompt_added=image_prompt_added,
+        image_negative_added=image_negative_added,
+    )
+    # A rollback that could not be made is on the row, and the session is not written over.
+    roll_back = RoomOrchestrator._roll_back_seat  # pyright: ignore[reportPrivateUsage]
+    rollback_error = None if outcome.committed else roll_back(agent, speaker, plan.checkpoint)
+    if rollback_error is not None:
+        outcome = outcome.model_copy(update={"persist_error": rollback_error})
+    return SpeakerStep(outcome, result, executions, raised)
+
+
+def land_speaker_step(
+    state: RoomState,
+    *,
+    speaker_id: str,
+    session_id: str,
+    decision: SpeakerDecision,
+    outcome: SpeakerStepOutcome,
+) -> tuple[RoomState, RoomMessage]:
+    """`state` with a finished turn written in: its row, its tools, its files, its counts.
+
+    `state` must be the room as it stands now, not as the turn found it: a change made while the
+    turn ran is carried into the landing rather than refused as a stale write that loses the
+    reply (#1578).
+    """
+    # A human has spoken beyond the span this turn saw: the selection that gave
+    # `speaker` the floor answered a message that has since been superseded, so
+    # `decision` is a stale judgement of it -- the same rule `_interjected` already
+    # applies to the loop (§3.8), applied here to the write this turn is about to
+    # make. The message the human sent instead already has its own, later decision
+    # on `state.last_decision`, or will get one; this turn's must not clobber it (#945).
+    superseded = RoomOrchestrator._interjected(state, outcome.rendered_through)  # pyright: ignore[reportPrivateUsage]
+    message = RoomMessage(
+        seq=len(state.transcript) + 1,
+        sender_id=speaker_id,
+        # The seat's session, recorded with the row: the trace is read from it, even
+        # after the seat is re-keyed (clone-data-scopes §4 step 3).
+        session_id=session_id or None,
+        content=outcome.content,
+        decision=decision,
+        provenance=outcome.provenance,
+        error=outcome.error,
+        refusal=outcome.refusal,
+        step_refusal=outcome.step_refusal,
+        provider_failure=outcome.provider_failure,
+        persona_edit_dropped=outcome.persona_edit_dropped,
+        stopped_at_ceiling=outcome.stopped_at_ceiling,
+        completed=outcome.completed,
+        rendered_through=outcome.rendered_through,
+        persist_error=outcome.persist_error,
+        session_set_aside=outcome.session_set_aside,
+        memory_facts_tried=outcome.memory_facts_tried,
+        memory_facts_unsaved=outcome.memory_facts_unsaved,
+        image_prompt_added=outcome.image_prompt_added,
+        image_negative_added=outcome.image_negative_added,
+        turn_id=outcome.turn_id,
+        tools_recorded=outcome.tools_recorded,
+        usage=outcome.usage,
+    )
+    turn_state = state.turn_state.model_copy(
+        update={
+            "agent_turns_since_human": state.turn_state.agent_turns_since_human + 1,
+            "last_speaker_id": speaker_id,
+        }
+    )
+    seen = dict(state.last_seen_seq)
+    if outcome.committed:
+        # Advanced only on success, so a failed turn is retried against the same
+        # unseen span instead of silently consuming it.
+        seen[speaker_id] = str(outcome.rendered_through)
+
+    landing = state.model_copy(
+        update={
+            "transcript": (*state.transcript, message),
+            "turn_state": turn_state,
+            "last_seen_seq": seen,
+            "last_decision": state.last_decision if superseded else decision,
+            # In the same write as the row, so the ledger and the transcript
+            # cannot disagree about whether this turn happened (P8).
+            "tool_uses": (*state.tool_uses, *outcome.tool_uses),
+            "written_files": (*state.written_files, *outcome.written_files),
+            # The story a `story_library` call in this turn opened, created or closed
+            # (#1555), as the seat's lifecycle hooks moved it (#1775) -- the room does
+            # not re-derive it from the records. Kept whether or not the turn then
+            # failed: the lease moved when the call succeeded, and a room that forgot
+            # it would hold a lease it does not know it has.
+            "story_id": outcome.story_id,
+            # What `written_files` cannot see, counted where it happens and kept
+            # past any clear or rewind that removes the rows above (#1366).
+            "file_record": state.file_record.model_copy(
+                update={
+                    "unrecorded_turns": state.file_record.unrecorded_turns
+                    + (0 if outcome.tools_recorded else 1),
+                    "unattributed_writes": state.file_record.unattributed_writes
+                    + sum(1 for u in outcome.tool_uses if u.wrote_unnamed),
+                    # In the same write as everything the turn produced, so it
+                    # moves only if they all reached the store (#1366).
+                    "turns_landed": state.file_record.turns_landed + 1,
+                }
+            ),
+        }
+    )
+    return landing, message
+
+
+def append_human_row(state: RoomState, sender_id: str, content: str) -> RoomState:
+    """`state` with a human utterance appended and the turn budget reset."""
+    message = RoomMessage(seq=len(state.transcript) + 1, sender_id=sender_id, content=content)
+    turn_state = state.turn_state.model_copy(
+        update={
+            "agent_turns_since_human": 0,
+            "last_speaker_id": sender_id,
+            "last_activity_ts": time.time(),
+        }
+    )
+    return state.model_copy(
+        update={
+            "transcript": (*state.transcript, message),
+            "turn_state": turn_state,
+            "last_decision": None,
+        }
+    )
+
+
+def ceiling_decision(state: RoomState) -> SpeakerDecision | None:
+    """The recorded stop when `state` has used its turn ceiling; `None` while it has not.
+
+    The circuit breaker. Checked before anyone is consulted, so an exhausted budget costs no
+    selector call and no model call. Recorded, like every other stop: since one address may name
+    more agents than the ceiling allows, reaching it routinely means somebody was asked and
+    never got the floor, and a state that says nothing reads as though everything asked was
+    answered.
+    """
+    ceiling = (
+        AUTONOMOUS_CIRCUIT_BREAKER_TURNS
+        if state.policy.autonomous
+        else state.policy.max_agent_turns_per_human_message
+    )
+    if state.turn_state.agent_turns_since_human < ceiling:
+        return None
+    reasoning = (
+        f"the autonomous circuit breaker of {ceiling} turns was reached; "
+        f"paused to prevent infinite looping. Post a message to continue."
+        if state.policy.autonomous
+        else f"the turn ceiling of {ceiling} for one human message was reached; "
+        f"anything still outstanding was not given the floor"
+    )
+    return SpeakerDecision(
+        verdict=SelectionVerdict.SILENCE,
+        selector="orchestrator",
+        reasoning=reasoning,
+    )
+
+
+async def decide_speaker(
+    selectors: Sequence[SpeakerSelectorProtocol], state: RoomState
+) -> SpeakerDecision:
+    """Run the chain and return the first non-abstaining decision.
+
+    A chain that abstains all the way through becomes `SILENCE` **here**, and nowhere
+    else: converting "nobody had an opinion" into "nobody speaks" is a decision, and
+    it is recorded as one so that a quiet room stays distinguishable from a broken
+    selector — which raises rather than returning any verdict.
+    """
+    over = RoomOrchestrator.window_over_utterances
+    windowed = over(state.transcript, state.policy.transcript_window)
+    request = SpeakerRequest(
+        room_id=state.room_id,
+        participants=state.participants,
+        transcript=windowed,
+        turn_state=state.turn_state,
+        policy=state.policy,
+    )
+    consulted: list[str] = []
+    for selector in selectors:
+        decision = await selector.select(request)
+        consulted.append(selector.name)
+        if decision.verdict is not SelectionVerdict.ABSTAIN:
+            return decision
+
+    return SpeakerDecision(
+        verdict=SelectionVerdict.SILENCE,
+        selector="orchestrator",
+        reasoning=(
+            "the selector chain was exhausted without a judgement "
+            f"(abstained: {', '.join(consulted) or 'no selectors configured'})"
+        ),
+    )
+
+
+def landed_payload(room_id: str, message: RoomMessage, turn_id: str) -> dict[str, Any]:
+    """What `room.{room_id}` says of one landed utterance."""
+    payload: dict[str, Any] = {
+        "room_id": room_id,
+        "agent_id": message.sender_id,
+        "seq": message.seq,
+        # Named rather than left implicit. The topic now carries three kinds of
+        # AGENT_REPLY -- the floor being taken, a token delta, and this -- and a
+        # consumer that selected the landed one by the *absence* of a status silently
+        # started matching every delta the moment streaming was added.
+        "status": "final",
+        # The turn the deltas named. A head accumulates a live bubble against this
+        # and clears it here; matching on the row number could not work, because the
+        # deltas were published before the row was known.
+        "turn_id": turn_id,
+        "content": message.content,
+        "completed": message.completed,
+    }
+    if message.error is not None:
+        payload["error"] = message.error
+    if message.refusal is not None:
+        payload["refusal"] = message.refusal.value
+    if message.step_refusal is not None:
+        payload["step_refusal"] = message.step_refusal
+    if message.provider_failure is not None:
+        payload["provider_failure"] = message.provider_failure.model_dump(mode="json")
+    return payload
+
+
+def with_learning_recorded(state: RoomState, outcome: ExtractionOutcome) -> RoomState | None:
+    """`state` with what a turn taught written on its row; `None` when the row is gone.
+
+    A row that is gone -- the history was cleared or rewound meanwhile -- has nothing to carry
+    it, and the facts stay saved either way.
+    """
+    rows = list(state.transcript)
+    for index, row in enumerate(rows):
+        if row.turn_id == outcome.turn_id and row.sender_id == outcome.clone_id:
+            rows[index] = row.model_copy(
+                update={
+                    "knowledge_learned": (*row.knowledge_learned, *outcome.added),
+                    "knowledge_extract_error": outcome.error,
+                    "knowledge_skipped": outcome.skipped,
+                }
+            )
+            return state.model_copy(update={"transcript": tuple(rows)})
+    return None
 
 
 class RoomOrchestrator:
@@ -640,14 +1122,6 @@ class RoomOrchestrator:
                 f"(participants: {roster or 'none'})"
             )
 
-        # The refund, and it is written before the turn runs rather than netted afterwards:
-        # `_take_turn` re-reads the room and increments from what it finds, so a refund held
-        # in memory across a provider round trip would be lost to that re-read.
-        refunded = state.turn_state.model_copy(
-            update={"agent_turns_since_human": max(0, state.turn_state.agent_turns_since_human - 1)}
-        )
-        self._store.save(state.model_copy(update={"turn_state": refunded}))
-
         retried = SpeakerDecision(
             verdict=SelectionVerdict.SPEAK,
             speaker_id=speaker.id,
@@ -657,13 +1131,75 @@ class RoomOrchestrator:
                 f"{'failed' if failed.error is not None else 'silent'} turn at seq {failed.seq}"
             ),
         )
-        # Under the floor, like every other turn. `retry` is the second door into
-        # `_take_turn`, and a retry running beside a live cascade put two agents on the
-        # floor by the one route the loop's own guard cannot see.
+        return await self._run_again(state, speaker, failed.decision or retried)
+
+    async def continue_turn(self, room_id: str) -> RoomState:
+        """Continue the turn its usage ceiling stopped, in place (#2431).
+
+        Owner amendment 2026-10-30: a runaway turn stops at a step boundary once its own
+        paid spend passes the person's 10-minute limit, and [Continue] resumes the same
+        turn, with no resend and no new conversation, granting one more ceiling's worth.
+        The stopped turn committed: its steps are in the seat's session, so the seat goes
+        on from the last of them (`BaseAgentProtocol.continue_turn`). The floor goes back
+        to that seat under the decision that gave it the floor, and the turn slot it spent
+        is given back, as a retry's is: it is one turn. The stopped row is kept; the
+        continuation appends beside it.
+
+        Raises:
+            RoomNotFoundError: No such room.
+            NothingToContinueError: The room's last utterance is not a turn its ceiling
+                stopped -- it finished, failed, or somebody has spoken since.
+            UnknownRoomParticipantError: The agent that stopped has left the room.
+        """
+        state = self._refuse_a_head_room(self._require_room(room_id))
+        stopped = state.last_utterance
+        if stopped is None or not stopped.stopped_at_ceiling:
+            raise NothingToContinueError(
+                f"The last thing said in room {room_id!r} is not a turn its usage ceiling "
+                f"stopped, so there is nothing to continue."
+            )
+        speaker = self._participant(state, stopped.sender_id)
+        if speaker is None or speaker.kind is not ParticipantKind.AGENT:
+            raise UnknownRoomParticipantError(
+                f"{stopped.sender_id!r} stopped a turn in room {room_id!r} and is no longer "
+                f"an agent of it, so it cannot continue"
+            )
+        decision = stopped.decision or SpeakerDecision(
+            verdict=SelectionVerdict.SPEAK,
+            speaker_id=speaker.id,
+            selector="orchestrator",
+            reasoning=f"continue of {speaker.id!r}'s turn stopped at seq {stopped.seq}",
+        )
+        return await self._run_again(state, speaker, decision, continuing=True)
+
+    async def _run_again(
+        self,
+        state: RoomState,
+        speaker: Participant,
+        decision: SpeakerDecision,
+        *,
+        continuing: bool = False,
+    ) -> RoomState:
+        """Give `speaker` the floor again for a turn it already spent: a retry or a continue.
+
+        The turn slot is given back first, and written before the turn runs rather than
+        netted afterwards: `_take_turn` re-reads the room and increments from what it finds,
+        so a refund held in memory across a provider round trip would be lost to that
+        re-read.
+
+        Under the floor, like every other turn. This is the second door into `_take_turn`,
+        and a retry running beside a live cascade put two agents on the floor by the one
+        route the loop's own guard cannot see.
+        """
+        room_id = state.room_id
+        refunded = state.turn_state.model_copy(
+            update={"agent_turns_since_human": max(0, state.turn_state.agent_turns_since_human - 1)}
+        )
+        self._store.save(state.model_copy(update={"turn_state": refunded}))
         self._cascade_started(room_id)
         try:
             async with self._floor.setdefault(room_id, asyncio.Lock()):
-                return await self._take_turn(room_id, speaker, failed.decision or retried)
+                return await self._take_turn(room_id, speaker, decision, continuing=continuing)
         finally:
             self._cascade_ended(room_id)
             self._start_learning(room_id)
@@ -675,21 +1211,7 @@ class RoomOrchestrator:
         message mid-loop must produce exactly the state the orchestrator would have, or
         the two disagree on sequence numbering.
         """
-        message = RoomMessage(seq=len(state.transcript) + 1, sender_id=sender_id, content=content)
-        turn_state = state.turn_state.model_copy(
-            update={
-                "agent_turns_since_human": 0,
-                "last_speaker_id": sender_id,
-                "last_activity_ts": time.time(),
-            }
-        )
-        return state.model_copy(
-            update={
-                "transcript": (*state.transcript, message),
-                "turn_state": turn_state,
-                "last_decision": None,
-            }
-        )
+        return append_human_row(state, sender_id, content)
 
     # -- the turn loop -----------------------------------------------------------------
 
@@ -719,28 +1241,8 @@ class RoomOrchestrator:
 
             # (b) The ceiling is checked before anyone is consulted, so an exhausted
             # budget costs no selector call and no model call.
-            ceiling = (
-                AUTONOMOUS_CIRCUIT_BREAKER_TURNS
-                if state.policy.autonomous
-                else state.policy.max_agent_turns_per_human_message
-            )
-            if state.turn_state.agent_turns_since_human >= ceiling:
-                # Recorded, like every other stop. Since one address may name more agents
-                # than the ceiling allows, reaching it now routinely means somebody was
-                # asked and never got the floor — and a state that says nothing reads as
-                # though everything asked was answered.
-                reasoning = (
-                    f"the autonomous circuit breaker of {ceiling} turns was reached; "
-                    f"paused to prevent infinite looping. Post a message to continue."
-                    if state.policy.autonomous
-                    else f"the turn ceiling of {ceiling} for one human message was reached; "
-                    f"anything still outstanding was not given the floor"
-                )
-                reached = SpeakerDecision(
-                    verdict=SelectionVerdict.SILENCE,
-                    selector="orchestrator",
-                    reasoning=reasoning,
-                )
+            reached = ceiling_decision(state)
+            if reached is not None:
                 return self._store.save(state.model_copy(update={"last_decision": reached}))
 
             if state.policy.autonomous and not self.is_presence_active(room_id):
@@ -831,39 +1333,16 @@ class RoomOrchestrator:
                 state = await self._take_turn(room_id, speaker, decision)
 
     async def _decide(self, state: RoomState) -> SpeakerDecision:
-        """Run the chain and return the first non-abstaining decision.
-
-        A chain that abstains all the way through becomes `SILENCE` **here**, and nowhere
-        else: converting "nobody had an opinion" into "nobody speaks" is a decision, and
-        it is recorded as one so that a quiet room stays distinguishable from a broken
-        selector — which raises rather than returning any verdict.
-        """
-        windowed = self.window_over_utterances(state.transcript, state.policy.transcript_window)
-        request = SpeakerRequest(
-            room_id=state.room_id,
-            participants=state.participants,
-            transcript=windowed,
-            turn_state=state.turn_state,
-            policy=state.policy,
-        )
-        consulted: list[str] = []
-        for selector in self._selectors:
-            decision = await selector.select(request)
-            consulted.append(selector.name)
-            if decision.verdict is not SelectionVerdict.ABSTAIN:
-                return decision
-
-        return SpeakerDecision(
-            verdict=SelectionVerdict.SILENCE,
-            selector="orchestrator",
-            reasoning=(
-                "the selector chain was exhausted without a judgement "
-                f"(abstained: {', '.join(consulted) or 'no selectors configured'})"
-            ),
-        )
+        """The chain's answer for `state` (`decide_speaker`)."""
+        return await decide_speaker(self._selectors, state)
 
     async def _take_turn(
-        self, room_id: str, speaker: Participant, decision: SpeakerDecision
+        self,
+        room_id: str,
+        speaker: Participant,
+        decision: SpeakerDecision,
+        *,
+        continuing: bool = False,
     ) -> RoomState:
         """Hand `speaker` the floor and record what it said, or that it failed.
 
@@ -874,24 +1353,15 @@ class RoomOrchestrator:
         agent = await self._resolver.resolve(
             speaker, one_seat=is_one_seat(self._require_room(room_id).participants)
         )
-        state = self._require_room(room_id)
-        prompt = self._render_span(state, speaker, span_token_budget(state, agent))
-        # The span this turn actually showed. The high-water mark advances to *this*, not to
-        # the speaker's own new message: anything appended while the turn ran — an
-        # interjection, by the very seam `append_human` exists to provide — was never
-        # rendered, and marking past it would skip it permanently. That inverts the mark's
-        # purpose from "do not show it twice" into "never show it at all".
-        rendered_through = state.transcript[-1].seq if state.transcript else 0
+        # Taken before the turn is counted as started, so that a refusal here refuses a turn
+        # nothing counted.
+        plan = plan_speaker_step(agent, speaker, self._require_room(room_id))
 
         # An identity for the turn, minted before it runs. Deliberately not a row
         # number: `append_human` is a mid-turn seam, so `len(transcript) + 1` is a guess
         # that anything appended during the turn invalidates -- and the deltas were then
         # addressed to whichever row the guess collided with.
         turn_id = uuid.uuid4().hex
-        # The seat's session as it stands before the turn, taken before the turn is
-        # counted as started: a turn that does not commit returns the seat to exactly
-        # this (#1423). Taken first so that a refusal here refuses a turn nothing counted.
-        checkpoint = agent.checkpoint_turn(speaker.session_id)
         self._record_turn_started(room_id, speaker, turn_id)
         try:
             return await self._run_started_turn(
@@ -899,10 +1369,9 @@ class RoomOrchestrator:
                 speaker,
                 decision,
                 agent,
-                prompt,
-                rendered_through,
+                plan,
                 turn_id,
-                checkpoint,
+                continuing=continuing,
             )
         finally:
             # After the landing save, or after it failed: either way this orchestrator is
@@ -951,94 +1420,36 @@ class RoomOrchestrator:
         speaker: Participant,
         decision: SpeakerDecision,
         agent: BaseAgentProtocol,
-        prompt: str,
-        rendered_through: int,
+        plan: SpeakerStepPlan,
         turn_id: str,
-        checkpoint: SessionState,
+        *,
+        continuing: bool = False,
     ) -> RoomState:
         """Run a turn already counted as started, and land it with the landed count.
 
-        **A turn commits in three places or in none (#1423):** the seat's session, the
-        transcript row's answer, and the seat's `last_seen_seq`. One predicate decides all
-        three -- no error, not interrupted. A turn that fails it is rolled back out of the
-        seat's session before the session is written, so the span it was shown is not
-        left in the conversation for the retry to stack a second copy on, and a stopped
-        turn leaves no half of a tool step behind. If the room's own write fails after a
-        turn that passed it, the seat is rolled back and rewritten before the failure
-        propagates, so the seat does not remember a turn the room does not have.
+        `execute_single_speaker_step` runs it and rolls a turn that did not commit back out of
+        the seat's session. If the room's own write fails after a turn that did commit, the
+        seat is rolled back and rewritten before the failure propagates, so the seat does not
+        remember a turn the room does not have.
         """
         state = self._require_room(room_id)
         await self._publish_turn_start(state, speaker, turn_id)
 
-        error: str | None = None
-        content = ""
-        provenance = None
-        usage = None
-        completed = True
-        refusal: RoomTurnRefusal | None = None
-        step_refusal: StepRefusalCode | None = None
-        provider_failure: ProviderFailure | None = None
-        persona_edit_dropped = False
-        # What the turn says its tools were. Stays empty *and unrecorded* when the turn
-        # raised or was cancelled: there is no `TurnResult` to read them from, and an
-        # empty list stored as recorded would claim the seat used none (P6).
-        executions: Sequence[ToolExecutionRecord] = ()
-        tools_recorded = False
-        # A turn that raised or was cancelled has no `TurnResult`, and keeps the story
-        # the room had.
-        story_id = state.story_id
-        turn_task = asyncio.create_task(
-            agent.execute_turn(
-                prompt,
-                stream_callback=self._stream_callback(room_id, speaker.id, turn_id),
-                caller_turn_id=turn_id,
-                # Every seat gets the room's id and the room's story, so two seats in one
-                # room resolve the same story and hold its lease as one writer (#1555).
-                room_id=room_id,
-                story_id=state.story_id,
-                person_names=_person_names(state),  # per turn, never stored (#1857)
-                # The room's workspace, or None for the seat's own: bound for this turn
-                # only, so a change applies from the next turn (clone-data-scopes §3.6).
-                workspace_root=Path(state.workspace) if state.workspace is not None else None,
-            )
-        )
-        self._active_turns[room_id] = (turn_id, turn_task)
+        def track(turn_task: asyncio.Task[Any]) -> None:
+            self._active_turns[room_id] = (turn_id, turn_task)
+
         try:
-            result = await turn_task
-        except asyncio.CancelledError:
-            completed = False
-            error = "Turn was interrupted"
-        except Exception as exc:
-            # Recorded, not raised: a room that drops a failed speaker presents as an
-            # agent that chose not to answer, which is what a working quiet room also
-            # looks like. The turn still spends budget, or a persistently failing agent
-            # is selected forever.
-            error = f"{type(exc).__name__}: {exc}"
-        else:
-            content = result.content
-            provenance = result.provenance
-            usage = result.usage
-            executions = result.tool_executions
-            story_id = result.story_id
-            # Not simply True: a turn that failed while a step's tools were running may
-            # have run calls whose records never reached the list, and storing that list
-            # as the turn's account would claim they did not happen (#1366).
-            tools_recorded = result.tool_executions_complete
-            # `BaseAgent.execute_turn` returns a turn's failure rather than raising it, so a
-            # result carrying `error` is a failed turn and lands as one. Reading only
-            # `content` landed a real agent's failure as a successful empty row: nothing on
-            # the landed event for a head to show over the partial deltas it was streamed
-            # (#938), the unseen span consumed, and nothing for `retry` to re-run.
-            # `is_completed` is not read: it means "the turn reached an answer" and is
-            # False on results that never set it, while `completed` here means "not
-            # interrupted".
-            if result.error is not None:
-                error = result.error
-                # From the turn's stated stop reason, never from `error`'s wording (#969).
-                refusal = turn_refusal(result.stop_reason)
-                step_refusal = result.error_code
-                provider_failure = self._with_own_model(speaker.id, result.provider_failure)
-                persona_edit_dropped = result.stop_reason == "persona_edit_failed"
+            step = await execute_single_speaker_step(
+                agent,
+                speaker,
+                state,
+                plan,
+                turn_id=turn_id,
+                stream_callback=self._stream_callback(room_id, speaker.id, turn_id),
+                continuing=continuing,
+                on_task=track,
+                own_model=lambda failure: self._with_own_model(speaker.id, failure),
+            )
         finally:
             # Only if it is still ours. Evicting somebody else's live turn made
             # `interrupt` cancel nothing while answering as though it had -- a Stop that
@@ -1055,14 +1466,6 @@ class RoomOrchestrator:
             if current_info is not None and current_info.get("turn_id") == turn_id:
                 del self._live_turn_info[room_id]
 
-        # One predicate for the whole commit (#1423): the session below, the row's answer,
-        # and `last_seen_seq` all read it, so they cannot disagree about whether the
-        # turn happened. An interrupted turn is covered by `error` too: the cancel branch
-        # above sets it, so `completed` adds nothing here. A silent turn (empty content
-        # with no tool executions) did not answer, so its unseen span is not consumed (#2168).
-        committed = error is None and (bool(content.strip()) or bool(executions))
-        rollback_error = None if committed else self._roll_back_seat(agent, speaker, checkpoint)
-
         # The seat's own session -- the model context, tool calls and results this
         # transcript deliberately leaves out -- is written here, after every turn however
         # it ended, because nothing else writes it. `resolve` hydrates it before a seat's
@@ -1074,7 +1477,13 @@ class RoomOrchestrator:
         # Written *after* the rollback, so what a restart sees is the seat without the
         # failed turn, and the log still holds the turn's events and the rollback's.
         # A rollback that could not be made is not written over, and the row says so.
-        persist_error = rollback_error or self._persist_seat(agent, speaker)
+        persist_error = step.outcome.persist_error or self._persist_seat(agent, speaker)
+        outcome = step.outcome.model_copy(
+            update={
+                "persist_error": persist_error,
+                "session_set_aside": self._session_set_aside(speaker),
+            }
+        )
 
         # Re-read, with no `await` from here to the save: a change this server's event loop
         # made while the turn ran -- a rename, a story released from the Files screen -- is
@@ -1084,84 +1493,12 @@ class RoomOrchestrator:
         # replaces the file without a lock, so a second server on the same store can still
         # race this save.
         state = self._require_room(room_id)  # the landing's own read
-        # A human has spoken beyond the span this turn saw: the selection that gave
-        # `speaker` the floor answered a message that has since been superseded, so
-        # `decision` is a stale judgement of it -- the same rule `_interjected` already
-        # applies to the loop (§3.8), applied here to the write this turn is about to
-        # make. The message the human sent instead already has its own, later decision
-        # on `state.last_decision`, or will get one; this turn's must not clobber it (#945).
-        superseded = self._interjected(state, rendered_through)
-        memory_facts_tried, memory_facts_unsaved = _memory_save_outcome(executions)
-        image_prompt_added, image_negative_added = _image_prompt_additions(executions)
-        message = RoomMessage(
-            seq=len(state.transcript) + 1,
-            sender_id=speaker.id,
-            # The seat's session, recorded with the row: the trace is read from it, even
-            # after the seat is re-keyed (clone-data-scopes §4 step 3).
-            session_id=speaker.session_id or None,
-            content=content,
+        landing, message = land_speaker_step(
+            state,
+            speaker_id=speaker.id,
+            session_id=speaker.session_id,
             decision=decision,
-            provenance=provenance,
-            error=error,
-            refusal=refusal,
-            step_refusal=step_refusal,
-            provider_failure=provider_failure,
-            persona_edit_dropped=persona_edit_dropped,
-            completed=completed,
-            rendered_through=rendered_through,
-            persist_error=persist_error,
-            session_set_aside=self._session_set_aside(speaker),
-            memory_facts_tried=memory_facts_tried,
-            memory_facts_unsaved=memory_facts_unsaved,
-            image_prompt_added=image_prompt_added,
-            image_negative_added=image_negative_added,
-            turn_id=turn_id,
-            tools_recorded=tools_recorded,
-            usage=usage,
-        )
-        uses, written = _record_tools(speaker, turn_id, executions)
-        turn_state = state.turn_state.model_copy(
-            update={
-                "agent_turns_since_human": state.turn_state.agent_turns_since_human + 1,
-                "last_speaker_id": speaker.id,
-            }
-        )
-        seen = dict(state.last_seen_seq)
-        if committed:
-            # Advanced only on success, so a failed turn is retried against the same
-            # unseen span instead of silently consuming it.
-            seen[speaker.id] = str(rendered_through)
-
-        landing = state.model_copy(
-            update={
-                "transcript": (*state.transcript, message),
-                "turn_state": turn_state,
-                "last_seen_seq": seen,
-                "last_decision": state.last_decision if superseded else decision,
-                # In the same write as the row, so the ledger and the transcript
-                # cannot disagree about whether this turn happened (P8).
-                "tool_uses": (*state.tool_uses, *uses),
-                "written_files": (*state.written_files, *written),
-                # The story a `story_library` call in this turn opened, created or closed
-                # (#1555), as the seat's lifecycle hooks moved it (#1775) -- the room does
-                # not re-derive it from the records. Kept whether or not the turn then
-                # failed: the lease moved when the call succeeded, and a room that forgot
-                # it would hold a lease it does not know it has.
-                "story_id": story_id,
-                # What `written_files` cannot see, counted where it happens and kept
-                # past any clear or rewind that removes the rows above (#1366).
-                "file_record": state.file_record.model_copy(
-                    update={
-                        "unrecorded_turns": state.file_record.unrecorded_turns
-                        + (0 if tools_recorded else 1),
-                        "unattributed_writes": state.file_record.unattributed_writes
-                        + sum(1 for u in uses if u.wrote_unnamed),
-                        # In the same write as everything the turn produced, so it
-                        # moves only if they all reached the store (#1366).
-                        "turns_landed": state.file_record.turns_landed + 1,
-                    }
-                ),
-            }
+            outcome=outcome,
         )
         try:
             saved = self._store.save(landing)
@@ -1170,8 +1507,8 @@ class RoomOrchestrator:
             # session holds a reply the transcript does not would answer the next span
             # from a turn nobody in the room saw. Rolled back and rewritten, then the
             # room's failure propagates.
-            if committed:
-                self._undo_committed_seat(agent, speaker, checkpoint)
+            if outcome.committed:
+                self._undo_committed_seat(agent, speaker, plan.checkpoint)
             if isinstance(exc, RoomError):
                 # Already a refusal written for a person (a lost compare-and-swap).
                 raise
@@ -1189,13 +1526,19 @@ class RoomOrchestrator:
                 f"{speaker.display_name}'s reply could not be saved to this conversation, "
                 "so it was not kept. The reason is in the server log."
             ) from exc
-        if committed:  # a failed turn teaches nothing
+        if outcome.committed:  # a failed turn teaches nothing
             # Queued, not run: learning waits for the cascade to end (#1404).
             self._queue_lesson(
-                state, speaker, agent, turn_id, rendered_through, content, executions
+                state,
+                speaker,
+                agent,
+                turn_id,
+                plan.rendered_through,
+                outcome.content,
+                step.executions,
             )
         # Before the landed reply, so a head sees the calls ahead of the answer they fed.
-        await self._publish_tools(saved, speaker, message.seq, uses)
+        await self._publish_tools(saved, speaker, message.seq, outcome.tool_uses)
         await self._publish(saved, message, turn_id)
         return saved
 
@@ -1319,21 +1662,10 @@ class RoomOrchestrator:
         stay saved either way.
         """
         try:
-            state = self._require_room(outcome.room_id)
-            rows = list(state.transcript)
-            for index, row in enumerate(rows):
-                if row.turn_id == outcome.turn_id and row.sender_id == outcome.clone_id:
-                    rows[index] = row.model_copy(
-                        update={
-                            "knowledge_learned": (*row.knowledge_learned, *outcome.added),
-                            "knowledge_extract_error": outcome.error,
-                            "knowledge_skipped": outcome.skipped,
-                        }
-                    )
-                    break
-            else:
+            recorded = with_learning_recorded(self._require_room(outcome.room_id), outcome)
+            if recorded is None:
                 return
-            self._store.save(state.model_copy(update={"transcript": tuple(rows)}))
+            self._store.save(recorded)
         except Exception:
             logger.warning(
                 "Room %s could not note on turn %s what %s learned from it",
@@ -1470,30 +1802,7 @@ class RoomOrchestrator:
         """
         if self._bus is None:
             return
-        payload: dict[str, Any] = {
-            "room_id": state.room_id,
-            "agent_id": message.sender_id,
-            "seq": message.seq,
-            # Named rather than left implicit. The topic now carries three kinds of
-            # AGENT_REPLY -- the floor being taken, a token delta, and this -- and a
-            # consumer that selected the landed one by the *absence* of a status silently
-            # started matching every delta the moment streaming was added.
-            "status": "final",
-            # The turn the deltas named. A head accumulates a live bubble against this
-            # and clears it here; matching on the row number could not work, because the
-            # deltas were published before the row was known.
-            "turn_id": turn_id,
-            "content": message.content,
-            "completed": message.completed,
-        }
-        if message.error is not None:
-            payload["error"] = message.error
-        if message.refusal is not None:
-            payload["refusal"] = message.refusal.value
-        if message.step_refusal is not None:
-            payload["step_refusal"] = message.step_refusal
-        if message.provider_failure is not None:
-            payload["provider_failure"] = message.provider_failure.model_dump(mode="json")
+        payload = landed_payload(state.room_id, message, turn_id)
         try:
             publisher = self._publishers.get(message.sender_id)
             if publisher is None:
@@ -1550,15 +1859,19 @@ class RoomOrchestrator:
         if len(parts) != 2 or not all(isinstance(part, str) for part in parts):
             return failure
         name, ref = str(parts[0]), str(parts[1])
-        return failure.model_copy(
-            update={
-                "message": f"{name} is set to use its own model, {ref}, and it could not be "
-                f"used. {failure.message}",
-                "clone": name,
-                "model_ref": ref,
-                "action": "use_system_default",
-            }
-        )
+        update: dict[str, object] = {
+            "message": f"{name} is set to use its own model, {ref}, and it could not be "
+            f"used. {failure.message}",
+            "clone": name,
+            "model_ref": ref,
+            "action": "use_system_default",
+        }
+        # The action is offered only when the default could serve the turn (#2424): one
+        # naming a removed connection could only fail.
+        usable = getattr(self._resolver, "system_default_usable", None)
+        if callable(usable) and not usable():
+            update["action"] = None
+        return failure.model_copy(update=update)
 
     def _stream_callback(
         self, room_id: str, agent_id: str, turn_id: str
@@ -1924,53 +2237,8 @@ class RoomOrchestrator:
     def _validate_speaker(
         self, state: RoomState, chain_saw: RoomState, decision: SpeakerDecision
     ) -> Participant | None:
-        """Hold a named speaker to the live roster, distinguishing a race from a defect.
-
-        Checked here and not in the selector: a selector naming a participant who has since
-        left is an ordinary event in a room whose roster changes, and the selector has no
-        way to know the roster moved after it answered.
-
-        **Two unlike cases wore one exception until #710.** A speaker the roster *had* when
-        the chain was asked and no longer has is a race, and the code can identify it
-        precisely by comparing the live roster against the one the chain was given; `None`
-        comes back and the caller gives the floor back to the chain. A speaker the roster
-        **never** had is a selector defect — no roster change explains it — and keeps the
-        raise, because a wrong selector must be loud. Before the split, an ordinary
-        departure reached the caller of `post()` as an error, and a room could be made to
-        fail by a participant leaving at the wrong moment.
-
-        The raise is also what bounds the caller's re-selection: once the departure has
-        landed, `chain_saw` no longer holds the departed agent, so a selector stuck on it
-        reaches this branch on the second round. See `_forgive_departure_race`.
-
-        Returns:
-            The speaker, or `None` when the chain was shown it and it has since left.
-        """
-        # `chain_saw` first, and that order is the whole point. Asking the live roster
-        # first short-circuits the defect check, so a selector that named someone it was
-        # never shown is rewarded whenever the name happens to have become valid — a
-        # participant who joined during selection, or one who was a human when the chain
-        # was asked and is an agent now. The selector sees exactly `chain_saw.participants`,
-        # so a name outside it is a defect by construction, whatever the roster did next.
-        seen_by_chain = (
-            self._participant(chain_saw, decision.speaker_id) if decision.speaker_id else None
-        )
-        if seen_by_chain is None or seen_by_chain.kind is not ParticipantKind.AGENT:
-            offered = ", ".join(
-                p.id for p in chain_saw.participants if p.kind is ParticipantKind.AGENT
-            )
-            raise SpeakerSelectionError(
-                f"Selector {decision.selector!r} named {decision.speaker_id!r} to speak in "
-                f"room {state.room_id!r}, which was not an agent of the room when the chain "
-                f"was consulted (it was offered: {offered or 'none'})"
-            )
-
-        # `seen_by_chain` proves `speaker_id` is a non-None agent id, so the live lookup
-        # below is total.
-        speaker = self._participant(state, seen_by_chain.id)
-        if speaker is None or speaker.kind is not ParticipantKind.AGENT:
-            return None
-        return speaker
+        """The live speaker `decision` names, or `None` if it has since left (`validate_speaker`)."""
+        return validate_speaker(state, chain_saw, decision)
 
     @staticmethod
     def _render_span(state: RoomState, speaker: Participant, budget: int) -> str:
@@ -2102,6 +2370,11 @@ def _add_unshared_names(
             names.append(name)
 
 
+#: For a learner running apart from the room's turns.
+person_names_in = _person_names
+clone_names_in = _clone_names
+
+
 def _functional_relations(agent: object) -> frozenset[str]:
     """The relations the seat's rules declare one value at a time; none without rules (#2332)."""
     engine = getattr(agent, "ontology", None)
@@ -2114,6 +2387,23 @@ def _still_learns(agent: LearningSeatProtocol) -> bool:
     """Whether `agent`'s clone learns from conversations now, a saved edit included (#2228)."""
     persona = agent.latest_persona_definition
     return persona is None or persona.learn_from_conversations
+
+
+def _span_lines(
+    state: RoomState, speaker: Participant, since: int, rendered_through: int
+) -> list[SpanLine]:
+    """The rows one turn rendered that `speaker` had not seen: a person's, another clone's."""
+    kinds = {p.id: p.kind for p in state.participants}
+    names = {p.id: p.display_name for p in state.participants}
+    lines: list[SpanLine] = []
+    for row in state.transcript:
+        if not (since < row.seq <= rendered_through) or not row.is_utterance:
+            continue
+        if row.sender_id == speaker.id or not row.content.strip():
+            continue
+        kind = "person" if kinds.get(row.sender_id) is ParticipantKind.HUMAN else "other"
+        lines.append(SpanLine(kind, names.get(row.sender_id, row.sender_id), row.content))
+    return lines
 
 
 def _lesson_lines(
@@ -2132,16 +2422,7 @@ def _lesson_lines(
     echoes, and last what the speaker said. Only `person` and `tool` lines can ground a
     fact; the speaker's own words and another clone's are context for reading them.
     """
-    kinds = {p.id: p.kind for p in state.participants}
-    names = {p.id: p.display_name for p in state.participants}
-    lines: list[SpanLine] = []
-    for row in state.transcript:
-        if not (since < row.seq <= rendered_through) or not row.is_utterance:
-            continue
-        if row.sender_id == speaker.id or not row.content.strip():
-            continue
-        kind = "person" if kinds.get(row.sender_id) is ParticipantKind.HUMAN else "other"
-        lines.append(SpanLine(kind, names.get(row.sender_id, row.sender_id), row.content))
+    lines = _span_lines(state, speaker, since, rendered_through)
     for record in executions:
         if record.status is not ToolResultStatus.SUCCESS:
             continue
@@ -2154,6 +2435,47 @@ def _lesson_lines(
     if content.strip():
         lines.append(SpanLine("self", speaker.display_name, content))
     return tuple(lines)
+
+
+def row_committed(state: RoomState, row: RoomMessage) -> bool:
+    """Whether a landed row's turn committed, as `SpeakerStepOutcome.committed` decided it."""
+    if row.turn_id is None or row.error is not None:
+        return False
+    return bool(row.content.strip()) or any(use.turn_id == row.turn_id for use in state.tool_uses)
+
+
+def landed_lesson(
+    state: RoomState, speaker: Participant, from_seq: int, up_to_seq: int
+) -> tuple[tuple[str, ...], tuple[SpanLine, ...]]:
+    """`speaker`'s landed turns in `(from_seq, up_to_seq]`, as `(turn ids, lesson lines)`.
+
+    For a learner running apart from the turns, which has the room and no `ToolExecutionRecord`:
+    what `_lesson_lines` reads, turn by turn, with each tool's result as the room recorded it,
+    which is cut at `TOOL_PREVIEW_CHARS`. The rule on tools is the same (#2092): a story's contents
+    and the memory tools' own echoes teach nothing, and only a successful call is read.
+    """
+    turn_ids: list[str] = []
+    lines: list[SpanLine] = []
+    since = 0
+    for row in state.transcript:
+        if row.seq > up_to_seq:
+            break
+        if row.sender_id != speaker.id or not row_committed(state, row):
+            continue
+        if row.seq > from_seq and row.turn_id is not None:
+            turn_ids.append(row.turn_id)
+            lines.extend(_span_lines(state, speaker, since, row.rendered_through))
+            lines.extend(
+                SpanLine("tool", use.tool_name, use.output_preview)
+                for use in state.tool_uses
+                if use.turn_id == row.turn_id
+                and use.status == ToolResultStatus.SUCCESS.value
+                and not use.tool_name.startswith(EXCLUDED_TOOL_PREFIXES)
+                and use.output_preview.strip()
+            )
+            lines.append(SpanLine("self", speaker.display_name, row.content))
+        since = row.rendered_through
+    return tuple(turn_ids), tuple(lines)
 
 
 def _withheld_notice(withheld: int) -> str:

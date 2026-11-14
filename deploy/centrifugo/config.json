@@ -1,0 +1,40 @@
+{
+  "log": {"level": "info"},
+  "client": {
+    "token": {"hmac_secret_key": ""},
+    "allowed_origins": ["http://127.0.0.1:5180", "http://localhost:5180"]
+  },
+  "http_api": {"key": ""},
+  "uni_sse": {"enabled": true},
+  "health": {"enabled": true},
+  "channel": {
+    "namespaces": [
+      {
+        "name": "ucx",
+        "history_size": 256,
+        "history_ttl": "300s",
+        "force_recovery": true,
+        "allow_subscribe_for_client": true
+      }
+    ]
+  },
+  "engine": {
+    "type": "redis",
+    "redis": {
+      "cluster_address": ["valkey-1:6379,valkey-2:6379,valkey-3:6379"],
+      "prefix": "centrifugo"
+    }
+  },
+  "consumers": [
+    {
+      "enabled": true,
+      "name": "ucx_stream_sse",
+      "type": "kafka",
+      "kafka": {
+        "brokers": ["kafka:9092"],
+        "topics": ["ucx.stream.sse"],
+        "consumer_group": "centrifugo-sse-edge"
+      }
+    }
+  ]
+}

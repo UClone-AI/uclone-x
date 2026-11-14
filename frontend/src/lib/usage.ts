@@ -14,7 +14,10 @@ export type UsageLimitsValue = Record<UsageWindowId, number | null>;
 
 export interface UsageWindowStatus {
   window: UsageWindowId;
+  /** Every token in the window, cached input included: what the limit counts (#2429). */
   used: number;
+  /** Of `used`, the input the provider served from its prompt cache. */
+  cached: number;
   limit: number | null;
   available_again_at: string | null;
 }
@@ -125,6 +128,23 @@ export const isUsageReport = (body: unknown): body is UsageReport => {
   return r.windows.every((w: unknown) => {
     if (typeof w !== 'object' || w === null) return false;
     const s = w as Record<string, unknown>;
-    return USAGE_WINDOWS.includes(s.window as UsageWindowId) && typeof s.used === 'number' && isLimit(s.limit);
+    return (
+      USAGE_WINDOWS.includes(s.window as UsageWindowId) &&
+      typeof s.used === 'number' &&
+      typeof s.cached === 'number' &&
+      isLimit(s.limit)
+    );
   });
+};
+
+/**
+ * When paid models can be used again: the reached window that lifts last, as the Core
+ * reports it, or `null` when no window is reached (#2431: a refused turn says when).
+ */
+export const pausedUntil = (report: UsageReport): string | null => {
+  const reached = report.windows
+    .filter((w) => w.limit !== null && w.used >= w.limit && w.available_again_at !== null)
+    .map((w) => w.available_again_at as string)
+    .sort((a, b) => Date.parse(b) - Date.parse(a));
+  return reached.length > 0 ? reached[0] : null;
 };

@@ -18,7 +18,6 @@ const renderIn = (hint: string, props: Partial<React.ComponentProps<typeof Clone
       <CloneProfile
         cloneId="reader"
         persona={makePersonaInfo({ role: '', description: '자료를 찾습니다.' })}
-        onStartConversation={vi.fn()}
         onModeChange={vi.fn()}
         canWrite
         {...props}
@@ -33,8 +32,8 @@ describe('the Clone surface in the chosen language', () => {
   });
   afterEach(() => vi.unstubAllGlobals());
 
-  // Killed by: frontend/src/components/clones/CloneProfile.tsx ::           {t.start}
-  // Becomes:           Start a conversation
+  // Killed by: frontend/src/components/clones/CloneProfile.tsx :: aria-label={fmt(t.editLabel, { name: label })}
+  // Becomes: aria-label={`Edit ${label}`}
   it('writes the header, the buttons and the persona card in Korean', () => {
     const english = renderIn('en-US');
     expect(leftoverEnglish(english.baseElement, ['cloneProfile', 'personaDetail']).length).toBeGreaterThan(4);
@@ -42,8 +41,7 @@ describe('the Clone surface in the chosen language', () => {
 
     const { baseElement } = renderIn('ko-KR');
     expect(screen.getByTestId('clone-profile-role')).toHaveTextContent(ko.cloneProfile.noRole);
-    expect(screen.getByTestId('clone-profile-start')).toHaveTextContent(ko.cloneProfile.start);
-    expect(screen.getByTestId('clone-profile-start')).toHaveAttribute('aria-label', 'reader와(과) 대화 시작');
+    expect(screen.getByTestId('clone-profile-edit')).toHaveAttribute('aria-label', 'reader 편집');
     expect(screen.getByTestId('clone-profile-edit')).toHaveTextContent(ko.cloneProfile.edit);
     expect(leftoverEnglish(baseElement, ['cloneProfile', 'personaDetail'])).toEqual([]);
   });
@@ -70,7 +68,7 @@ describe('the Clone surface in the chosen language', () => {
     const persona = makePersonaInfo({ display_name: { en: 'Sleepyhead', ko: '잠 꾸러기' } });
     const korean = renderIn('ko-KR', { persona });
     expect(screen.getByTestId('clone-profile-name')).toHaveTextContent('잠 꾸러기');
-    expect(screen.getByTestId('clone-profile-start')).toHaveAttribute('aria-label', '잠 꾸러기와 대화 시작');
+    expect(screen.getByTestId('clone-profile-edit')).toHaveAttribute('aria-label', '잠 꾸러기 편집');
     korean.unmount();
 
     renderIn('en-US', { persona });

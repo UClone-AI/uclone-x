@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { MessageSquarePlus, Pencil, Plus, Save, X, Loader2, Sparkles } from 'lucide-react';
+import { Pencil, Plus, Save, X, Loader2, Sparkles } from 'lucide-react';
 import { PersonaInfo } from '../../types';
 import { personaPicture } from '../../lib/avatarChoice';
 import { AvatarMenu } from '../avatar/AvatarMenu';
@@ -25,8 +25,6 @@ export interface CloneProfileProps {
   cloneId: string;
   /** Its installed definition, when a file under that name is loaded. */
   persona?: PersonaInfo;
-  /** Open a new conversation seating this clone. */
-  onStartConversation: (cloneId: string) => void;
   /** Current mode of the clone panel. Defaults to 'view'. */
   mode?: 'view' | 'edit' | 'create';
   /** Switch between view, edit, and create modes. */
@@ -82,7 +80,6 @@ const safeDraftFromPersona = (persona: PersonaInfo): PersonaDraft =>
 export const CloneProfile: React.FC<CloneProfileProps> = ({
   cloneId,
   persona,
-  onStartConversation,
   mode = 'view',
   onModeChange,
   onEdit,
@@ -302,32 +299,23 @@ export const CloneProfile: React.FC<CloneProfileProps> = ({
         <CloneLinkLine cloneId={handle} />
       </div>
 
-      <div className="flex items-center gap-2">
+      {/* No "Start a conversation" here (#2417): the conversation is open beside the dock,
+          and a clone that is in no conversation yet is started from its row in the rail
+          ("Start a conversation with {clone}"). */}
+      {(onModeChange || onEdit) && persona && (
         <button
           type="button"
-          data-testid="clone-profile-start"
-          aria-label={fmt(t.startLabel, { name: label })}
-          onClick={() => onStartConversation(cloneId)}
-          className="flex-1 flex items-center justify-center gap-2 px-3 py-2 rounded-lg border border-indigo-500/40 bg-indigo-950/40 text-sm font-medium text-indigo-200 hover:bg-indigo-900/50 transition-colors"
+          data-testid="clone-profile-edit"
+          aria-label={fmt(t.editLabel, { name: label })}
+          disabled={!canWrite}
+          onClick={handleEditClick}
+          className="w-full flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg border border-slate-700 bg-slate-800/80 text-sm font-medium text-slate-200 hover:bg-slate-700 hover:text-white transition-colors disabled:opacity-50"
+          title={canWrite ? fmt(copy.personaEditor.editTitle, { name: label }) : copy.personaEditor.noWorkspace}
         >
-          <MessageSquarePlus className="w-4 h-4" />
-          {t.start}
+          <Pencil className="w-4 h-4" />
+          {t.edit}
         </button>
-        {(onModeChange || onEdit) && persona && (
-          <button
-            type="button"
-            data-testid="clone-profile-edit"
-            aria-label={fmt(t.editLabel, { name: label })}
-            disabled={!canWrite}
-            onClick={handleEditClick}
-            className="flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg border border-slate-700 bg-slate-800/80 text-sm font-medium text-slate-200 hover:bg-slate-700 hover:text-white transition-colors disabled:opacity-50"
-            title={canWrite ? fmt(copy.personaEditor.editTitle, { name: label }) : copy.personaEditor.noWorkspace}
-          >
-            <Pencil className="w-4 h-4" />
-            {t.edit}
-          </button>
-        )}
-      </div>
+      )}
 
       {persona ? (
         <>

@@ -5,14 +5,15 @@ import {
   Activity,
   Gauge,
   X,
-  Network,
-  Terminal,
   Bot,
   MessageSquare,
   BookOpen,
   Globe,
 } from 'lucide-react';
 import { DocViewer } from '../artifacts/DocViewer';
+import { MusicView } from '../artifacts/MusicView';
+import { StoryView } from '../artifacts/StoryView';
+import { VideoView } from '../artifacts/VideoView';
 import { BrowserPanel } from '../browser/BrowserPanel';
 import type { BrowserLive } from '../../lib/browserLive';
 import { KnowledgeGraphViewer } from '../artifacts/KnowledgeGraphViewer';
@@ -27,9 +28,6 @@ import { useCopy } from '../../i18n';
 import { useWindowWidth } from '../../lib/rail';
 import { cloneIdOf } from '../../lib/cloneLabel';
 import { shownSurface } from '../../lib/developerMode';
-import { TopologyTab } from '../TopologyTab';
-import { LedgerTab } from '../LedgerTab';
-import { OntologyTab } from '../OntologyTab';
 import { TurnDetail } from './TurnDetail';
 import { CloneProfile } from '../clones/CloneProfile';
 import type { PersonaDraft, PersonaEditMode, PersonaSaveResult } from '../../lib/personaDraft';
@@ -37,7 +35,6 @@ import {
   BudgetData,
   DockSurface,
   EventEnvelope,
-  OntologyData,
   PersonaInfo,
   RoomContext,
   RoomState,
@@ -132,7 +129,6 @@ export interface ArtifactsDockProps {
   /** Front Docs on a file (an Activity row that wrote one). */
   onOpenInDocs?: (path: string) => void;
   events: EventEnvelope[];
-  ontology: OntologyData | null;
   budgetData: BudgetData | null;
   /**
    * The conversation on screen and how full its seats are, for the Resource surface (#1272).
@@ -151,10 +147,6 @@ export interface ArtifactsDockProps {
    * taken when the control was pressed would go on showing the old reading.
    */
   selectedTurnSeq?: number | null;
-  isPaused: boolean;
-  onTogglePause: () => void;
-  onClearEvents: () => void;
-  lastHeartbeat: string;
   /**
    * The clone the rail has picked, and the installed definitions to find it among.
    *
@@ -165,8 +157,6 @@ export interface ArtifactsDockProps {
    */
   selectedClone: string;
   personas: PersonaInfo[];
-  /** Open a new conversation seating the named clone. */
-  onStartConversation: (cloneId: string) => void;
   /** Current mode of the clone panel. Defaults to 'view'. */
   cloneMode?: 'view' | 'edit' | 'create';
   /** Switch between view, edit, and create clone modes. */
@@ -196,6 +186,8 @@ export interface ArtifactsDockProps {
   onConnectBrowser?: () => void;
   /** Open Settings ▸ Browser on the Saved sign-ins form for `site` (the Save offer). */
   onSaveBrowserSignIn?: (site: string) => void;
+  /** Send a user message into the open conversation (e.g. from MusicView Voice Rhythm or Fast Edit). */
+  onSendRoomMessage?: (content: string) => Promise<void> | void;
 }
 
 /**
@@ -216,18 +208,12 @@ export const ArtifactsDock: React.FC<ArtifactsDockProps> = ({
   selectedArtifactPath,
   onOpenInDocs,
   events,
-  ontology,
   budgetData,
   room = null,
   roomContext = null,
   selectedTurnSeq = null,
-  isPaused,
-  onTogglePause,
-  onClearEvents,
-  lastHeartbeat,
   selectedClone,
   personas,
-  onStartConversation,
   cloneMode = 'view',
   onCloneModeChange,
   availableTools,
@@ -240,8 +226,14 @@ export const ArtifactsDock: React.FC<ArtifactsDockProps> = ({
   browserLive,
   onConnectBrowser,
   onSaveBrowserSignIn,
+  onSendRoomMessage,
 }) => {
   const [width, setWidth] = useState<number>(readStoredWidth);
+  const [artifactsMode, setArtifactsMode] = useState<'story' | 'music' | 'video' | 'files'>('story');
+  const [localVideoProjectId, setLocalVideoProjectId] = useState<string | null>(null);
+  const [availableVideoProjects, setAvailableVideoProjects] = useState<
+    Array<{ project_id: string; title: string; total_timecode: string }>
+  >([]);
   const draggingRef = useRef<boolean>(false);
   const windowWidth = useWindowWidth();
   // The product surfaces' names and the dock's own chrome. The developer drawer's tabs stay
@@ -250,12 +242,88 @@ export const ArtifactsDock: React.FC<ArtifactsDockProps> = ({
   // What is on screen, which is the selection unless developer mode is off and the selection is
   // one of its surfaces: then Docs & Artifacts, never a blank panel.
   const surface = shownSurface(activeSurface, developerMode);
+  const activeStoryId = room && room.room_id === roomId && room.story_id ? room.story_id : null;
   // The dock re-reads when the conversation moves on: a new message is a new record to show.
   // So is a clone learning from a turn after it (#1404): the row gains what was saved while
   // the transcript keeps its length, so each saved fact and each failure moves the key too.
   const refreshKey = room && room.room_id === roomId ? transcriptRefreshKey(room.transcript) : 0;
   // Only the agents in *this* conversation, and only while `room` is the one on screen.
   const seats = room && room.room_id === roomId ? agentSeats(room) : [];
+  const composerIds = new Set<string>(['composer']);
+  const directorIds = new Set<string>(['director']);
+  for (const p of personas) {
+    if (p.name === 'composer') composerIds.add(cloneIdOf(p));
+    if (p.name === 'director') directorIds.add(cloneIdOf(p));
+  }
+  const isMusicRoom =
+    composerIds.has(selectedClone) ||
+    seats.some(
+      (s) =>
+        composerIds.has(s.id) ||
+        s.handle === 'composer' ||
+        s.display_name?.toLowerCase() === 'composer' ||
+        s.display_name === '\uc791\uace1\uac00',
+    );
+  const hasMusicOption =
+    isMusicRoom || personas.some((p) => p.name === 'composer');
+  const isVideoRoom =
+    directorIds.has(selectedClone) ||
+    seats.some(
+      (s) =>
+        directorIds.has(s.id) ||
+        s.handle === 'director' ||
+        s.display_name?.toLowerCase() === 'director' ||
+        s.display_name === '\uac10\ub3c5',
+    );
+  const hasVideoOption =
+    isVideoRoom || personas.some((p) => p.name === 'director');
+  const shownArtifactsMode =
+    artifactsMode === 'story' && isVideoRoom
+      ? 'video'
+      : artifactsMode === 'story' && isMusicRoom
+        ? 'music'
+        : artifactsMode;
+  useEffect(() => {
+    if (selectedArtifactPath) {
+      setArtifactsMode('files');
+    }
+  }, [selectedArtifactPath]);
+  useEffect(() => {
+    if (selectedArtifactPath) return;
+    if (isVideoRoom) {
+      setArtifactsMode('video');
+    } else if (isMusicRoom) {
+      setArtifactsMode('music');
+    } else if (activeStoryId) {
+      setArtifactsMode('story');
+    }
+  }, [activeStoryId, isMusicRoom, isVideoRoom, selectedArtifactPath]);
+
+  const effectiveVideoProjectId = activeStoryId ?? localVideoProjectId;
+
+  useEffect(() => {
+    if (artifactsMode !== 'video' || !hasVideoOption || effectiveVideoProjectId) return;
+    let cancelled = false;
+    void fetch('/api/artifacts/library/videos')
+      .then(async (res) => {
+        if (!res.ok) return [];
+        const data = (await res.json()) as Array<{
+          project_id: string;
+          title: string;
+          total_timecode: string;
+        }>;
+        return Array.isArray(data) ? data : [];
+      })
+      .then((items) => {
+        if (!cancelled) setAvailableVideoProjects(items);
+      })
+      .catch(() => {
+        if (!cancelled) setAvailableVideoProjects([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [artifactsMode, effectiveVideoProjectId, hasVideoOption]);
   const seatName = (() => {
     const seat = seats.find((s) => s.id === seatId);
     return seat ? (seat.display_name ?? seat.id) : undefined;
@@ -265,7 +333,7 @@ export const ArtifactsDock: React.FC<ArtifactsDockProps> = ({
   // The surfaces that read the open conversation. While it is opening, or could not be read,
   // they are replaced by the sentence that says which, rather than each claiming none is open.
   const roomScoped =
-    seatScoped || surface === 'artifacts' || surface === 'browser' || surface === 'topology' || surface === 'resource';
+    seatScoped || surface === 'artifacts' || surface === 'browser' || surface === 'resource';
   const pending = roomId === null && roomScoped ? roomPending : null;
 
   // What is left of the row once the rail has taken its share is what decides whether the
@@ -377,9 +445,6 @@ export const ArtifactsDock: React.FC<ArtifactsDockProps> = ({
       icon: <Brain className="w-3.5 h-3.5" />,
       accent: 'violet',
     },
-    { id: 'topology', label: 'DAG', icon: <Network className="w-3.5 h-3.5" />, accent: 'indigo' },
-    { id: 'ledger', label: 'EventBus', icon: <Terminal className="w-3.5 h-3.5" />, accent: 'cyan' },
-    { id: 'ontology', label: 'Ontology', icon: <Brain className="w-3.5 h-3.5" />, accent: 'violet' },
   ];
 
   const accentClass = (accent: string, isActive: boolean): string => {
@@ -487,7 +552,6 @@ export const ArtifactsDock: React.FC<ArtifactsDockProps> = ({
             <CloneProfile
               cloneId={selectedClone}
               persona={personas.find((p) => cloneIdOf(p) === selectedClone)}
-              onStartConversation={onStartConversation}
               mode={cloneMode}
               onModeChange={onCloneModeChange}
               availableTools={availableTools}
@@ -501,13 +565,184 @@ export const ArtifactsDock: React.FC<ArtifactsDockProps> = ({
           </div>
         )}
 
-        {/* Surface 1: Docs & Artifacts */}
+        {/* Surface 1: Docs & Artifacts (with inline World KG & Story Navigator when a story is open) */}
         {pending === null && surface === 'artifacts' && (
-          <DocViewer
-            roomId={roomId}
-            selectedArtifactPath={selectedArtifactPath}
-            refreshKey={refreshKey}
-          />
+          activeStoryId || hasMusicOption || hasVideoOption ? (
+            <div className="h-full flex flex-col min-h-0">
+              <div
+                className="px-3 py-1.5 flex items-center gap-1 border-b border-slate-800/80 bg-slate-900/40 shrink-0"
+                data-testid="dock-story-switcher"
+              >
+                {activeStoryId && !isMusicRoom && !isVideoRoom && (
+                  <button
+                    type="button"
+                    data-testid="dock-mode-story"
+                    onClick={() => setArtifactsMode('story')}
+                    className={`px-2.5 py-1 rounded text-xs font-medium transition-colors ${
+                      shownArtifactsMode === 'story'
+                        ? 'bg-cyan-600/30 text-cyan-300 border border-cyan-500/50'
+                        : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800'
+                    }`}
+                  >
+                    {t.story.dockStoryMode}
+                  </button>
+                )}
+                {hasMusicOption && (
+                  <button
+                    type="button"
+                    data-testid="dock-mode-music"
+                    onClick={() => setArtifactsMode('music')}
+                    className={`px-2.5 py-1 rounded text-xs font-medium transition-colors ${
+                      shownArtifactsMode === 'music'
+                        ? 'bg-cyan-600/30 text-cyan-300 border border-cyan-500/50'
+                        : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800'
+                    }`}
+                  >
+                    🎵 Music Score
+                  </button>
+                )}
+                {hasVideoOption && (
+                  <button
+                    type="button"
+                    data-testid="dock-mode-video"
+                    onClick={() => setArtifactsMode('video')}
+                    className={`px-2.5 py-1 rounded text-xs font-medium transition-colors ${
+                      shownArtifactsMode === 'video'
+                        ? 'bg-cyan-600/30 text-cyan-300 border border-cyan-500/50'
+                        : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800'
+                    }`}
+                  >
+                    🎬 Video Studio
+                  </button>
+                )}
+                <button
+                  type="button"
+                  data-testid="dock-mode-files"
+                  onClick={() => setArtifactsMode('files')}
+                  className={`px-2.5 py-1 rounded text-xs font-medium transition-colors ${
+                    shownArtifactsMode === 'files'
+                      ? 'bg-cyan-600/30 text-cyan-300 border border-cyan-500/50'
+                      : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800'
+                  }`}
+                >
+                  {t.story.dockFilesMode}
+                </button>
+              </div>
+              <div className="flex-1 min-h-0 flex flex-col">
+                {shownArtifactsMode === 'video' && hasVideoOption ? (
+                  effectiveVideoProjectId ? (
+                    <VideoView
+                      projectId={effectiveVideoProjectId}
+                      conversationId={roomId}
+                      refreshKey={refreshKey}
+                      onBack={() => setArtifactsMode('files')}
+                    />
+                  ) : (
+                    <div data-testid="video-no-project" className="p-4 space-y-3 text-xs text-slate-400">
+                      <p>
+                        No video project is open in this conversation yet. Ask Director to start one
+                        or open one.
+                      </p>
+                      <div className="space-y-1.5">
+                        {availableVideoProjects.map((vp) => (
+                          <button
+                            key={vp.project_id}
+                            type="button"
+                            data-testid={`video-open-project-${vp.project_id}`}
+                            onClick={() => {
+                              void fetch(
+                                `/api/artifacts/library/videos/${encodeURIComponent(vp.project_id)}/open`,
+                                {
+                                  method: 'POST',
+                                  headers: { 'Content-Type': 'application/json' },
+                                  body: JSON.stringify({ room_id: roomId ?? undefined }),
+                                }
+                              ).finally(() => {
+                                setLocalVideoProjectId(vp.project_id);
+                                onRefresh();
+                              });
+                            }}
+                            className="w-full px-3 py-2 rounded bg-slate-900 hover:bg-slate-800 border border-slate-800 text-left flex items-center justify-between text-slate-200"
+                          >
+                            <span className="font-medium">🎬 {vp.title}</span>
+                            <span className="text-[10px] font-mono text-cyan-300">
+                              {vp.project_id} • {vp.total_timecode}
+                            </span>
+                          </button>
+                        ))}
+                        <button
+                          type="button"
+                          data-testid="video-create-sample-project-btn"
+                          onClick={() => {
+                            void fetch('/api/artifacts/library/videos', {
+                              method: 'POST',
+                              headers: { 'Content-Type': 'application/json' },
+                              body: JSON.stringify({
+                                title: 'Seoul Cyber Cut',
+                                project_id: 'seoul-cyber-cut',
+                                room_id: roomId ?? undefined,
+                              }),
+                            })
+                              .then(async (res) => {
+                                if (!res.ok) return null;
+                                return (await res.json()) as { project_id?: string };
+                              })
+                              .then((created) => {
+                                const pid = created?.project_id ?? 'seoul-cyber-cut';
+                                setLocalVideoProjectId(pid);
+                                onRefresh();
+                              });
+                          }}
+                          className="px-3 py-1.5 rounded bg-cyan-600/30 hover:bg-cyan-600/50 border border-cyan-500/40 text-cyan-200 font-medium"
+                        >
+                          + Start Sample Video Studio Project
+                        </button>
+                      </div>
+                    </div>
+                  )
+                ) : shownArtifactsMode === 'music' && hasMusicOption ? (
+                  activeStoryId !== null ? (
+                    <MusicView
+                      songId={activeStoryId}
+                      conversationId={roomId}
+                      refreshKey={refreshKey}
+                      onBack={() => setArtifactsMode('files')}
+                      onFastEditPrompt={
+                        onSendRoomMessage
+                          ? (prompt) => {
+                              void onSendRoomMessage(prompt);
+                            }
+                          : undefined
+                      }
+                    />
+                  ) : (
+                    <p data-testid="music-no-song" className="p-4 text-xs text-slate-400">
+                      No song is open in this conversation yet. Ask Composer to start one or
+                      open one.
+                    </p>
+                  )
+                ) : shownArtifactsMode === 'story' && activeStoryId && !isMusicRoom && !isVideoRoom ? (
+                  <StoryView
+                    storyId={activeStoryId}
+                    refreshKey={refreshKey}
+                    onBack={() => setArtifactsMode('files')}
+                  />
+                ) : (
+                  <DocViewer
+                    roomId={roomId}
+                    selectedArtifactPath={selectedArtifactPath}
+                    refreshKey={refreshKey}
+                  />
+                )}
+              </div>
+            </div>
+          ) : (
+            <DocViewer
+              roomId={roomId}
+              selectedArtifactPath={selectedArtifactPath}
+              refreshKey={refreshKey}
+            />
+          )
         )}
 
         {/* Surface: Browser */}
@@ -567,21 +802,6 @@ export const ArtifactsDock: React.FC<ArtifactsDockProps> = ({
           </div>
         )}
 
-        {/* Developer surfaces, reached from the drawer; `surface` is never one of them out of developer mode */}
-        {pending === null && surface === 'topology' && (
-          <div className="h-full p-3"><TopologyTab roomId={roomId} refreshKey={refreshKey} /></div>
-        )}
-        {surface === 'ledger' && (
-          <div className="h-full p-3">
-            <LedgerTab
-              events={events}
-              isPaused={isPaused}
-              onTogglePause={onTogglePause}
-              onClearEvents={onClearEvents}
-              lastHeartbeat={lastHeartbeat}
-            />
-          </div>
-        )}
         {surface === 'turn' && (
           <div className="h-full p-3">
             <TurnDetail
@@ -591,9 +811,6 @@ export const ArtifactsDock: React.FC<ArtifactsDockProps> = ({
               developerMode={developerMode}
             />
           </div>
-        )}
-        {surface === 'ontology' && (
-          <div className="h-full p-3"><OntologyTab ontology={ontology} onRefresh={onRefresh} isLoading={isRefreshing} /></div>
         )}
       </div>
 

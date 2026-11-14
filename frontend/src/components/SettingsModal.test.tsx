@@ -1323,9 +1323,11 @@ describe('SettingsModal tabs', () => {
 
     await screen.findByTestId('settings-tabs-bar');
     expect(screen.getByTestId('settings-tab-llm')).toBeTruthy();
+    expect(screen.queryByTestId('settings-tab-tools')).toBeNull();
 
     fireEvent.click(screen.getByTestId('settings-tab-llm'));
     expect(await screen.findByTestId('settings-connections')).toBeTruthy();
+    expect(screen.getByTestId('settings-remote-gpu-card')).toBeTruthy();
     expect(screen.getByTestId('settings-default-models')).toBeTruthy();
     expect(screen.queryByTestId('settings-read-roots')).toBeNull();
   });
@@ -1448,23 +1450,9 @@ describe('SettingsModal Remote GPU Worker', () => {
     expect(calls.filter((c) => c.method === 'POST' && c.url === '/api/settings')).toEqual([]);
   });
 
-  it('keeps the LLM local on connect unless the box is ticked', async () => {
-    const tunnel = { host: 'dell', connected: true, mappings: [] };
-    const calls = mockFetch({
-      '/api/settings/remote-gpu/connect': () =>
-        jsonResponse({ status: 'ok', connected: true, tunnel, applied_changes: {} }),
-    });
-    render(<SettingsModal isOpen={true} onClose={() => {}} {...devModeOff} />);
-    const box = (await screen.findByTestId('remote-gpu-sync-llm')) as HTMLInputElement;
-    expect(box.checked).toBe(false);
-    fireEvent.change(screen.getByTestId('remote-gpu-host-input'), { target: { value: 'gpu-box' } });
-    fireEvent.click(screen.getByTestId('remote-gpu-connect-button'));
-    await waitFor(() => expect(calls.some((c) => c.url.includes('/remote-gpu/connect'))).toBe(true));
-    const first = calls.find((c) => c.url.includes('/remote-gpu/connect'));
-    expect((first?.body as { sync_llm: boolean }).sync_llm).toBe(false);
-  });
-
-  it('asks for the LLM too when the box is ticked, and says when the model is missing', async () => {
+  // Killed by: frontend/src/components/SettingsModal.tsx :: const [remoteSyncLlm, setRemoteSyncLlm] = useState<boolean>(true);
+  // Becomes: const [remoteSyncLlm, setRemoteSyncLlm] = useState<boolean>(false);
+  it('adds the Ollama connection too by default on connect, and says when the model is missing', async () => {
     const tunnel = { host: 'dell', connected: true, mappings: [] };
     const calls = mockFetch({
       '/api/settings/remote-gpu/connect': () =>
@@ -1477,13 +1465,50 @@ describe('SettingsModal Remote GPU Worker', () => {
         }),
     });
     render(<SettingsModal isOpen={true} onClose={() => {}} {...devModeOff} />);
-    fireEvent.click(await screen.findByTestId('remote-gpu-sync-llm'));
+    const box = (await screen.findByTestId('remote-gpu-sync-llm')) as HTMLInputElement;
+    expect(box.checked).toBe(true);
     fireEvent.change(screen.getByTestId('remote-gpu-host-input'), { target: { value: 'gpu-box' } });
     fireEvent.click(screen.getByTestId('remote-gpu-connect-button'));
     await waitFor(() => expect(calls.some((c) => c.url.includes('/remote-gpu/connect'))).toBe(true));
     const first = calls.find((c) => c.url.includes('/remote-gpu/connect'));
     expect((first?.body as { sync_llm: boolean }).sync_llm).toBe(true);
     expect(await screen.findByText(new RegExp(en.settings.remoteGpu.llmModelMissing))).toBeTruthy();
+  });
+
+  it('skips the Ollama connection on connect when the box is unticked', async () => {
+    const tunnel = { host: 'dell', connected: true, mappings: [] };
+    const calls = mockFetch({
+      '/api/settings/remote-gpu/connect': () =>
+        jsonResponse({ status: 'ok', connected: true, tunnel, applied_changes: {} }),
+    });
+    render(<SettingsModal isOpen={true} onClose={() => {}} {...devModeOff} />);
+    const box = (await screen.findByTestId('remote-gpu-sync-llm')) as HTMLInputElement;
+    expect(box.checked).toBe(true);
+    fireEvent.click(box);
+    expect(box.checked).toBe(false);
+    fireEvent.change(screen.getByTestId('remote-gpu-host-input'), { target: { value: 'gpu-box' } });
+    fireEvent.click(screen.getByTestId('remote-gpu-connect-button'));
+    await waitFor(() => expect(calls.some((c) => c.url.includes('/remote-gpu/connect'))).toBe(true));
+    const first = calls.find((c) => c.url.includes('/remote-gpu/connect'));
+    expect((first?.body as { sync_llm: boolean }).sync_llm).toBe(false);
+  });
+
+  // Killed by: frontend/src/components/SettingsModal.tsx :: setRemoteSyncLlm(gpuData.llm_on_remote);
+  // Becomes:
+  it('syncs the Ollama connection checkbox from the server status when connected', async () => {
+    mockFetch({
+      '/api/settings/remote-gpu/status': () =>
+        jsonResponse({
+          host: 'dell',
+          connected: true,
+          llm_on_remote: false,
+          images_on_remote: true,
+        }),
+    });
+    render(<SettingsModal isOpen={true} onClose={() => {}} {...devModeOff} />);
+    await screen.findByDisplayValue('dell');
+    const box = (await screen.findByTestId('remote-gpu-sync-llm')) as HTMLInputElement;
+    await waitFor(() => expect(box.checked).toBe(false));
   });
 
   // Killed by: frontend/src/components/SettingsModal.tsx :: if (gpuData.restored_settings) connectionsChangedHere();
@@ -1619,7 +1644,7 @@ describe('SettingsModal usage offer', () => {
 
   const usageReport = (limits: Record<string, number | null>) => ({
     checked_at: '2026-09-26T10:00:00Z',
-    windows: Object.entries(limits).map(([window, limit]) => ({ window, used: 0, limit, available_again_at: null })),
+    windows: Object.entries(limits).map(([window, limit]) => ({ window, used: 0, cached: 0, limit, available_again_at: null })),
     limits,
     env_overrides: [],
     providers: [],

@@ -421,6 +421,34 @@ def test_korean_tool_call_arguments_are_counted_as_utf8_not_as_escapes() -> None
     )
 
 
+def test_tool_call_signature_tokens_are_counted_toward_compaction_threshold() -> None:
+    """Historical Gemini `thoughtSignature` blobs on tool calls count toward compaction.
+
+    Killed by: src/uclone_x/llm/compactor.py :: total += estimate_text_tokens(tool_call.signature)
+    Becomes: pass
+    """
+    sig_blob = "S" * 4000
+    unsigned_call = ToolCallRequest(id="call_1", name="compose", arguments={"bars": 8})
+    signed_call = ToolCallRequest(
+        id="call_1", name="compose", arguments={"bars": 8}, signature=sig_blob
+    )
+
+    unsigned_tokens = estimate_reply_tokens(None, (unsigned_call,))
+    signed_tokens = estimate_reply_tokens(None, (signed_call,))
+    assert signed_tokens - unsigned_tokens == estimate_text_tokens(sig_blob)
+
+    compactor = ContextCompactor()
+    messages = [
+        ChatMessage(role=MessageRole.USER, content="Compose a multi-bar piece"),
+        ChatMessage(
+            role=MessageRole.ASSISTANT,
+            content="",
+            tool_calls=(signed_call,),
+        ),
+    ]
+    assert compactor.should_compact_at(messages, threshold_tokens=unsigned_tokens + 500) is True
+
+
 def test_a_korean_tool_schema_is_counted_as_utf8_not_as_escapes() -> None:
     """Killed by: src/uclone_x/llm/compactor.py :: schema = json.dumps(unwrap_immutable(tool.parameters), ensure_ascii=False)
     Becomes: schema = json.dumps(unwrap_immutable(tool.parameters))

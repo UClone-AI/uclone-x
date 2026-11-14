@@ -95,6 +95,11 @@ class SessionStoreProtocol(Protocol):
         Refuses when the stored record has moved past the state's precondition (a version or revision), so a lost update
         is an error rather than a silent overwrite. The returned state carries the
         incremented version.
+
+        `pending_events` entries may contain kernel-frozen containers (`MappingProxyType`,
+        `tuple`) and sensitive arguments; implementations must serialize them via
+        `uclone_x.core.log_writer.serialize_session_event` (or `RedactingLogWriter`) and
+        pre-validate/serialize all inputs before mutating durable state (P6).
         """
         ...
 

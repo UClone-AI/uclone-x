@@ -468,10 +468,14 @@ _PROVIDER_CAUSES: dict[ProviderFailureKind, str] = {
 
 def _provider_failure_sentence(label: str, failure: ProviderFailure) -> str:
     """The app's `providerFailureSentence`: an own-model failure names the model, and its
-    connection stands in for the provider when the Core names none."""
+    connection stands in for the provider when the Core names none.
+
+    Own-model is decided by `clone` and `model_ref`, never `action`: the Core leaves `action`
+    out when no system default can serve the turn (#2424).
+    """
     ref = failure.model_ref or ""
     connection, slash, model = ref.partition("/")
-    own = failure.action == "use_system_default" and bool(slash) and bool(connection)
+    own = bool(failure.clone) and bool(slash) and bool(connection)
     provider = (failure.provider or "").strip() or (connection if own else "")
     template = _PROVIDER_CAUSES.get(failure.kind, "{provider} answered with an error.")
     cause = template.replace("{provider}", provider or "The model's provider")
@@ -517,6 +521,15 @@ def _render_row(message: RoomMessage) -> str:
         return (
             f"[bold red]{message.seq:>3} ✖ {escape(message.sender_id)}[/bold red] "
             f"[red]{escape(turn_failure_sentence(message))}[/red]"
+        )
+    if message.stopped_at_ceiling:
+        # Paused, not failed (#2431): the app's `row.ceilingStopped`.
+        said = f"{escape(message.content)} " if message.content.strip() else ""
+        return (
+            f"[bold cyan]{message.seq:>3} {escape(message.sender_id)}[/bold cyan]  {said}"
+            f"[yellow]{escape(message.sender_id)} paused this turn: it used more of your paid "
+            "models than your 10-minute limit allows in one turn. Its work so far is kept."
+            "[/yellow]"
         )
     return (
         f"[bold cyan]{message.seq:>3} {escape(message.sender_id)}[/bold cyan]  "
@@ -715,6 +728,38 @@ def room_retry(
     _offer_retry(after)
 
 
+@room_app.command("continue")
+def room_continue(
+    room_id: str = typer.Argument(..., help="Room whose paused turn should go on"),
+    provider: str | None = typer.Option(None, "--provider", help="LLM provider override"),
+    model: str | None = typer.Option(None, "--model", help="Model for the room's agents"),
+) -> None:
+    """Continue a turn its usage ceiling paused, from where it stopped (#2431).
+
+    The turn's work so far is kept; it goes on with no resend, and may spend one more
+    ceiling's worth (the person's 10-minute limit for paid models).
+    """
+    service = build_service()
+    try:
+        before = service.get(room_id)
+    except UCloneXError as exc:
+        _fail(str(exc))
+        return
+
+    orchestrator = _orchestrator_or_exit(policy=before.policy, provider=provider, model=model)
+    try:
+        after: RoomState = asyncio.run(orchestrator.continue_turn(room_id))
+    except RoomError as exc:
+        _fail(str(exc))
+        return
+    except UCloneXError as exc:
+        _fail(f"{type(exc).__name__}: {exc}")
+        return
+
+    _render_new_rows(before, after)
+    _offer_retry(after)
+
+
 def _orchestrator_or_exit(
     *, policy: RoomPolicy, provider: str | None, model: str | None
 ) -> RoomOrchestratorProtocol:
@@ -762,6 +807,11 @@ def _offer_retry(state: RoomState) -> None:
     but a new key is, so that is named, with the variable it is read from (#1630).
     """
     last = state.last_utterance
+    if last is not None and last.stopped_at_ceiling:
+        console.print(
+            f"[dim]— go on from where it paused with:[/dim] ucx room continue {escape(state.room_id)}"
+        )
+        return
     if last is None or last.error is None:
         return
     room_id = escape(state.room_id)

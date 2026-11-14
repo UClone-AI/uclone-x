@@ -90,6 +90,81 @@ async def test_gemini_reads_every_page_and_marks_models_that_cannot_chat() -> No
     assert seen[1].url.params["pageToken"] == "page-2"
 
 
+_GEMINI_PICTURES: dict[str, Any] = {
+    "models": [
+        # What the clone LLM selector showed as conversation models (#2416): Google's picture
+        # models answer `generateContent` too, and several share one display name.
+        {
+            "name": "models/gemini-3.5-flash",
+            "displayName": "Gemini 3.5 Flash",
+            "supportedGenerationMethods": ["generateContent", "countTokens"],
+        },
+        {
+            "name": "models/gemini-2.5-flash-image",
+            "displayName": "Nano Banana",
+            "supportedGenerationMethods": ["generateContent", "countTokens"],
+        },
+        {
+            "name": "models/gemini-3-pro-image-preview",
+            "displayName": "Nano Banana Pro",
+            "supportedGenerationMethods": ["generateContent"],
+        },
+        {
+            "name": "models/gemini-3.1-flash-image",
+            "displayName": "Nano Banana 2",
+            "supportedGenerationMethods": ["generateContent"],
+        },
+        {
+            "name": "models/gemini-2.0-flash-preview-image-generation",
+            "displayName": "Nano Banana Pro",
+            "supportedGenerationMethods": ["generateContent"],
+        },
+        {
+            "name": "models/gemini-2.5-imagery-lab",
+            "displayName": "Imagery Lab",
+            "supportedGenerationMethods": ["generateContent"],
+        },
+        # Seen in a live listing on 2026-10-29: picture models named for the brand, with no
+        # `-image` segment.
+        {
+            "name": "models/nano-banana-pro-preview",
+            "displayName": "Nano Banana Pro",
+            "supportedGenerationMethods": ["generateContent"],
+        },
+        {
+            "name": "models/gemini-nano-banana-2.1",
+            "displayName": "Nano Banana 2.1",
+            "supportedGenerationMethods": ["generateContent"],
+        },
+    ]
+}
+
+
+@pytest.mark.asyncio
+async def test_gemini_picture_models_are_not_marked_as_able_to_chat() -> None:
+    """A Google id with an `-image` segment is a picture model, though it takes
+    `generateContent`; a conversation model stays one, and so does an id where "image" is
+    only part of a longer word (#2416).
+
+    Killed by: src/uclone_x/llm/connectors/gemini.py :: and not is_picture_model(model_id),
+    Becomes: and True,
+    """
+    connector = GeminiConnector(api_key="k", http_client=_client(_pages(_GEMINI_PICTURES, seen=[])))
+
+    entries = await connector.list_models()
+
+    assert [(e.id, e.chat_capable) for e in entries] == [
+        ("gemini-3.5-flash", True),
+        ("gemini-2.5-flash-image", False),
+        ("gemini-3-pro-image-preview", False),
+        ("gemini-3.1-flash-image", False),
+        ("gemini-2.0-flash-preview-image-generation", False),
+        ("gemini-2.5-imagery-lab", True),
+        ("nano-banana-pro-preview", False),
+        ("gemini-nano-banana-2.1", False),
+    ]
+
+
 @pytest.mark.asyncio
 async def test_a_listing_that_never_stops_paging_is_cut_off() -> None:
     """A provider looping on one page token is not followed forever."""

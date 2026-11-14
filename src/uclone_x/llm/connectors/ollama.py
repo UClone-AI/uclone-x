@@ -18,6 +18,8 @@ from uclone_x.errors import (
     LLMRequestRefusedError,
     LLMTimeoutError,
     ModelLacksToolSupportError,
+    ProviderFailureError,
+    ProviderUnreachableError,
     UnmappableChatMessageError,
 )
 from uclone_x.llm.connectors.base import (
@@ -98,8 +100,20 @@ def _chat_timeout_message(seconds: float, exc: BaseException) -> str:
     )
 
 
+class OllamaUnreachableError(ProviderUnreachableError):
+    """Ollama refused or never accepted the connection (#2418).
+
+    A provider failure, so a turn names it as one ("Ollama couldn't be reached") rather
+    than as something that went wrong. The text is the connector's own, kept for the log
+    and the terminal; a head words it from the kind and the provider.
+    """
+
+    def __init__(self, message: str, *, model: str) -> None:
+        ProviderFailureError.__init__(self, message, provider="Ollama", model=model)
+
+
 def _chat_transport_failure(
-    seconds: float, exc: httpx.RequestError, *, unreachable_prefix: str
+    seconds: float, exc: httpx.RequestError, *, unreachable_prefix: str, model: str
 ) -> LLMProviderError:
     """The error to raise for a transport failure on the chat path.
 
@@ -117,7 +131,9 @@ def _chat_transport_failure(
     """
     if isinstance(exc, httpx.TimeoutException) and not isinstance(exc, httpx.ConnectTimeout):
         return LLMTimeoutError(_chat_timeout_message(seconds, exc), seconds=seconds)
-    return LLMProviderError(f"{unreachable_prefix}: {describe_transport_error(exc)}")
+    return OllamaUnreachableError(
+        f"{unreachable_prefix}: {describe_transport_error(exc)}", model=model
+    )
 
 
 #: The phrase Ollama's 400 body uses when the model's template has no tool support, as in
@@ -673,7 +689,10 @@ class OllamaConnector(BaseLLMConnector):
             data: dict[str, Any] = resp.json()
         except httpx.RequestError as exc:
             raise _chat_transport_failure(
-                self.timeout, exc, unreachable_prefix="Failed to connect to Ollama"
+                self.timeout,
+                exc,
+                unreachable_prefix="Failed to connect to Ollama",
+                model=str(payload["model"]),
             ) from exc
         except json.JSONDecodeError as exc:
             raise LLMProviderError(
@@ -896,7 +915,10 @@ class OllamaConnector(BaseLLMConnector):
                         )
         except httpx.RequestError as exc:
             raise _chat_transport_failure(
-                self.timeout, exc, unreachable_prefix="Ollama stream connection error"
+                self.timeout,
+                exc,
+                unreachable_prefix="Ollama stream connection error",
+                model=model_name,
             ) from exc
         except asyncio.CancelledError:
             logger.debug("Ollama stream cancelled by caller")

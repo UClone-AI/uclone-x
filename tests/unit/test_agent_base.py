@@ -1778,8 +1778,8 @@ async def test_a_budget_refusal_is_named_by_its_stop_reason() -> None:
     refusal carried the loop's seed, `not_started`, which is exactly what a provider
     outage carries, so the only difference a head could read was the wording of `error`.
 
-    Killed by: src/uclone_x/agent/turn_executor.py :: stop_reason = "budget_exceeded"
-    Becomes: stop_reason = stop_reason
+    Killed by: src/uclone_x/agent/turn_executor.py :: return "budget_exceeded"
+    Becomes: return current
     """
     budget = TokenBudgetManager()
     budget.configure_session("sess_spent", max_tokens=0)
@@ -3198,3 +3198,49 @@ class TestAnErroredTurnKeepsItsTools:
         assert result.stop_reason == "budget_exceeded"
         assert result.tool_executions == ()
         assert result.tool_executions_complete is False
+
+
+@pytest.mark.asyncio
+async def test_a_session_record_written_before_the_tier_went_keeps_its_history(
+    tmp_path: Path,
+) -> None:
+    """#2423 review: every record holding a persona snapshot carries
+    `anchor_provenance.persona.llm_config.model_tier`, written while the tier existed (33 of
+    the owner's 71). Refused as an extra field, the record read as absent: the next turn ran
+    with no context, and `save` moved the history aside. The key is dropped wherever a model
+    config is read, so the record loads whole.
+
+    Killed by: src/uclone_x/core/models.py :: if "model_tier" in fields:
+    Becomes: if False:
+    """
+    store = SessionStore(storage_dir=tmp_path / "sessions")
+    config = AgentConfig(agent_id="tiered", name="Tiered", system_prompt="CONFIG PROMPT")
+    scout = _scouting_persona().model_copy(
+        update={"llm_config": AgentLLMConfig(model_name="ollama/qwen3:8b")}
+    )
+    agent = BaseAgent(
+        config=config,
+        llm=_RecordingConnector(["One", "Two"]),
+        store=store,
+        personas=(scout,),
+        persona="late_scout",
+    )
+    assert (await agent.execute_turn("first")).is_completed is True
+    assert (await agent.execute_turn("second")).is_completed is True
+    written = agent.persist_session()
+    assert written.anchor_provenance is not None
+
+    # The record as a build before #2419 wrote it: the persona snapshot names its tier.
+    path = store.session_path(agent.session_id)
+    record = json.loads(path.read_text(encoding="utf-8"))
+    record["anchor_provenance"]["persona"]["llm_config"]["model_tier"] = "inherit"
+    path.write_text(json.dumps(record, indent=2), encoding="utf-8")
+    files_before = sorted(tmp_path.rglob("*"))
+
+    loaded = SessionStore(storage_dir=tmp_path / "sessions").load(agent.session_id)
+
+    assert loaded is not None
+    assert len(loaded.messages) == len(written.messages) >= 4
+    assert loaded.anchor_provenance is not None
+    assert loaded.messages == written.messages
+    assert sorted(tmp_path.rglob("*")) == files_before  # nothing set aside

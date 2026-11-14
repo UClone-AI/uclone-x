@@ -42,7 +42,14 @@ def client(storage: Path, tmp_path: Path) -> TestClient:
     return TestClient(create_ui_app(static_dir=tmp_path, storage_dir=storage))
 
 
-def _book(storage: Path, ago: timedelta, tokens: int, provider: str, model: str | None) -> None:
+def _book(
+    storage: Path,
+    ago: timedelta,
+    tokens: int,
+    provider: str,
+    model: str | None,
+    cached: int | None = None,
+) -> None:
     shared_store(storage / USAGE_FILE_NAME).add(
         UsageEntry(
             at=datetime.now(UTC) - ago,
@@ -50,6 +57,7 @@ def _book(storage: Path, ago: timedelta, tokens: int, provider: str, model: str 
             provider=provider,
             model=model,
             count_source=TokenCountSource.PROVIDER,
+            cached_tokens=cached,
         )
     )
 
@@ -65,7 +73,7 @@ def test_a_fresh_install_reports_no_limits_and_no_usage(client: TestClient) -> N
     body = response.json()
     assert datetime.fromisoformat(body["checked_at"]).tzinfo is not None
     assert body["windows"] == [
-        {"window": name, "used": 0, "limit": None, "available_again_at": None}
+        {"window": name, "used": 0, "cached": 0, "limit": None, "available_again_at": None}
         for name in ("per_10_minutes", "per_5_hours", "per_week")
     ]
     assert body["limits"] == NO_LIMITS
@@ -168,6 +176,26 @@ def test_usage_counts_per_window_and_breaks_down_by_provider_for_seven_days(
             ],
         },
     ]
+
+
+def test_each_window_reports_how_much_of_its_usage_was_cached(
+    client: TestClient, storage: Path
+) -> None:
+    """The panel's "cached" figure per window; a call with no cached count adds none (#2429).
+
+    Killed by: src/uclone_x/ui/usage.py :: "cached": window.cached,
+    Becomes: "cached": 0,
+    """
+    _book(storage, timedelta(minutes=1), 1_000, "gemini", "flash", cached=940)
+    _book(storage, timedelta(hours=2), 400, "gemini", "flash", cached=100)
+    _book(storage, timedelta(days=2), 250, "anthropic", "claude-a")
+
+    body = client.get("/api/usage").json()
+
+    assert [
+        (_window(body, w)["used"], _window(body, w)["cached"])
+        for w in ("per_10_minutes", "per_5_hours", "per_week")
+    ] == [(1_000, 940), (1_400, 1_040), (1_650, 1_040)]
 
 
 def test_a_reached_window_says_when_it_lifts(client: TestClient, storage: Path) -> None:

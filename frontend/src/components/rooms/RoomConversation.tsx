@@ -12,6 +12,7 @@ import {
   answerHint,
   answeringSeats,
   attributionLines,
+  lastUtteranceSeq,
   conversationShape,
   headerAttribution,
   roomsApi,
@@ -33,6 +34,7 @@ import {
 } from '../../lib/rooms';
 import {
   memoryUnsavedNotice,
+  ownModelRemedy,
   providerFailureRemedy,
   refusalRemedy,
   stepRefusalSentence,
@@ -50,6 +52,7 @@ import { Avatar, FillRing } from '../../ui-kit';
 import { Button } from '../ui/Button';
 import { RichText } from '../RichText';
 import { UseSystemDefault } from './UseSystemDefault';
+import { UsageLimitRemedy } from './UsageLimitRemedy';
 import { ArtifactRoomContext } from '../../lib/artifactRoom';
 import { BrowserStepLines } from './BrowserStepLines';
 import { BROWSER_TOOL, recordedStep, type BrowserStep } from '../../lib/browserLive';
@@ -86,6 +89,8 @@ interface RoomConversationProps {
   onSend: (content: string) => void | Promise<void>;
   onStop: () => void;
   onRetry: () => void;
+  /** Continue the turn its usage ceiling paused, in place (#2431). Without it, no Continue. */
+  onContinue?: () => void;
   onAddAgent: (agentId: string) => void;
   onTyping: () => void;
   /**
@@ -249,6 +254,7 @@ const TranscriptRow = React.memo<{
   /** Present only on a turn that prints its attribution -- see `attributionLines`. */
   attribution: string | undefined;
   onRetry: () => void;
+  onContinue: (() => void) | undefined;
   /**
    * Show this turn's record in the workspace dock. The row keeps the control and gives up
    * the rendering: a turn's provenance is what the reader picked, and the dock is where
@@ -267,6 +273,7 @@ const TranscriptRow = React.memo<{
   shape,
   attribution,
   onRetry,
+  onContinue,
   onOpenTurn,
   avatarUrls,
   browserSteps,
@@ -283,6 +290,8 @@ const TranscriptRow = React.memo<{
   // be reachable *on the turn*, and the header is a statement about the conversation, not
   // an answer for a particular row. Read from `provenance`, never from what was said.
   const servedHere = servedByLabel(message.provenance, t.row.servedInstead);
+  // Where to act when the clone's own model failed: its clone editor, not Settings (#2418).
+  const ownRemedy = ownModelRemedy(label, t.outcome, message.provider_failure);
   const showWhy = Boolean(message.decision || servedHere || (isAgent && message.turn_id));
   const unsavedNotice = memoryUnsavedNotice(
     label,
@@ -369,9 +378,18 @@ const TranscriptRow = React.memo<{
                     t.outcome,
                   ))}
             </p>
-            {message.refusal ? (
+            {message.refusal === 'usage_limit' && !ownRemedy ? (
+              /* Refused at the turn's start by the paid-model limit (#2431): when paid models
+                 come back, and a local model for this clone, here -- never a resend. */
+              <UsageLimitRemedy
+                cloneId={message.sender_id}
+                label={label}
+                testId={`row-usage-remedy-${message.seq}`}
+                onChanged={onClonesChanged}
+              />
+            ) : message.refusal ? (
               <p data-testid={`row-remedy-${message.seq}`} className="mt-1 text-xs text-slate-400">
-                {refusalRemedy(message.refusal, t.outcome)}
+                {ownRemedy ?? refusalRemedy(message.refusal, t.outcome)}
               </p>
             ) : (
               <>
@@ -384,12 +402,12 @@ const TranscriptRow = React.memo<{
                   </p>
                 ) : null}
                 {message.provider_failure &&
-                providerFailureRemedy(message.provider_failure.kind, t.outcome) ? (
+                (ownRemedy ?? providerFailureRemedy(message.provider_failure.kind, t.outcome)) ? (
                   <p
                     data-testid={`row-remedy-${message.seq}`}
                     className="mt-1 text-xs text-slate-400"
                   >
-                    {providerFailureRemedy(message.provider_failure.kind, t.outcome)}
+                    {ownRemedy ?? providerFailureRemedy(message.provider_failure.kind, t.outcome)}
                   </p>
                 ) : null}
                 {room.head ? null : (
@@ -409,6 +427,19 @@ const TranscriptRow = React.memo<{
                 onChanged={onClonesChanged}
               />
             ) : null}
+          </div>
+        ) : message.stopped_at_ceiling ? (
+          /* Paused, not failed (#2431): the turn spent past the person's 10-minute limit in
+             one turn and stopped between steps. Its work is kept; Continue goes on from
+             there, with no resend. Offered only while it is the last thing said: after
+             that, the conversation has moved on and the Core refuses it. */
+          <div data-testid={`row-ceiling-${message.seq}`} className="text-sm text-slate-300">
+            <p>{fmt(t.row.ceilingStopped, { label })}</p>
+            {!onContinue || room.head || lastUtteranceSeq(room) !== message.seq ? null : (
+              <Button data-testid="continue-turn" onClick={onContinue} className="mt-1">
+                {t.row.continue}
+              </Button>
+            )}
           </div>
         ) : message.content.trim() === '' ? (
           /* A turn that said nothing is not a turn with nothing to say (P6). The room
@@ -705,6 +736,7 @@ export const RoomConversation: React.FC<RoomConversationProps> = ({
   onSend,
   onStop,
   onRetry,
+  onContinue,
   onAddAgent,
   onTyping,
   context = null,
@@ -796,10 +828,11 @@ export const RoomConversation: React.FC<RoomConversationProps> = ({
 
   // The owner's callbacks, called through a ref so the rows' props stay the same object
   // across renders and `TranscriptRow`'s memo holds. The owner passes fresh arrows each time.
-  const rowCallbacksRef = useRef({ onRetry, onOpenTurn, onClonesChanged });
-  rowCallbacksRef.current = { onRetry, onOpenTurn, onClonesChanged };
+  const rowCallbacksRef = useRef({ onRetry, onContinue, onOpenTurn, onClonesChanged });
+  rowCallbacksRef.current = { onRetry, onContinue, onOpenTurn, onClonesChanged };
   const clonesChangedRow = useCallback(() => rowCallbacksRef.current.onClonesChanged?.(), []);
   const retryRow = useCallback(() => rowCallbacksRef.current.onRetry(), []);
+  const continueRow = useCallback(() => rowCallbacksRef.current.onContinue?.(), []);
   const openRowTurn = useCallback((seq: number) => rowCallbacksRef.current.onOpenTurn(seq), []);
 
   const [caret, setCaret] = useState(0);
@@ -1537,6 +1570,7 @@ export const RoomConversation: React.FC<RoomConversationProps> = ({
               shape={shape}
               attribution={attribution.get(message.seq)}
               onRetry={retryRow}
+              onContinue={onContinue ? continueRow : undefined}
               onOpenTurn={openRowTurn}
               onClonesChanged={clonesChangedRow}
               avatarUrls={avatarUrls}

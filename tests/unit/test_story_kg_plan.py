@@ -1782,3 +1782,336 @@ class TestRpgInteractiveSceneAndChronologicalKg:
         out7 = cast("dict[str, Any]", res7.output)
         assert out7["stage"] == "done"
         assert out7["scenes_written"] == ["ch01.s01", "ch01.s02", "ch02.s01"]
+
+    def test_dedupe_choice_transitions_written_prose_note_and_after_list(self) -> None:
+        """Killed by: examples/story/src/uclone_x_story/start_rpg.py :: cast("dict[str, Any]", existing["set"]).update(set_map)
+        Becomes: pass
+        Killed by: examples/story/src/uclone_x_story/start_rpg.py :: tr_note = ""
+        Becomes: pass
+        Killed by: examples/story/src/uclone_x_story/start_rpg.py :: max_overlap = max((bigram_overlap(beat, u) for u in prose_units), default=0.0)
+        Becomes: max_overlap = 0.0
+        Killed by: examples/story/src/uclone_x_story/start_notes.py :: prose_item = (scenes_prose or {}).get(sid)
+        Becomes: prose_item = None
+        Killed by: examples/story/src/uclone_x_story/start_notes.py :: rpg_scene = "scene" in done and bool(state.scene_written_last)
+        Becomes: rpg_scene = False
+        Killed by: src/uclone_x/agent/reply_lines.py :: kept_before = lines[: before_blank[-1] + 1] if before_blank else []
+        Becomes: kept_before = []
+        """
+        from uclone_x.agent.models import ToolExecutionRecord
+        from uclone_x.agent.reply_lines import NOTE_LISTS_KEY, reply_notes
+        from uclone_x.tools.models import ToolResultStatus
+        from uclone_x_story.start_notes import _reply_note
+        from uclone_x_story.start_rpg import (
+            dedupe_choice_transitions,
+            fallback_choices,
+            remaining_pre_rpg_beats,
+        )
+        from uclone_x_story.start_state import Brief, StartState
+
+        # 1. Duplicate transitions on the same subject are merged into one, and a note repeating
+        # the choice summary is stripped.
+        summary = (
+            "탈리아는 칼렌과의 대화를 통해 갈등을 겪으며 잊혀진 숲으로 떠나야 한다는 명령을 받는다."
+        )
+        deduped = dedupe_choice_transitions(
+            [
+                {
+                    "subject": "탈리아",
+                    "set": {"stance": "갈등"},
+                    "note": "탈리아는 칼렌과의 대화를 통해 갈등을 겪으며 잊혀진 숲으로 떠나야 한다는 명령을 받는다.",
+                },
+                {
+                    "subject": "탈리아",
+                    "set": {"goal": "잊혀진 숲으로 이동"},
+                    "note": "목표 설정 완료",
+                },
+            ],
+            summary,
+        )
+        assert len(deduped) == 1
+        assert deduped[0]["subject"] == "탈리아"
+        assert deduped[0]["set"] == {"stance": "갈등", "goal": "잊혀진 숲으로 이동"}
+        assert deduped[0].get("note") == "목표 설정 완료"
+
+        # 2. Fallback choices produce 3 distinct titles and summaries
+        sc = Scene(
+            id="ch01.s02",
+            title="잊혀진 숲의 입구",
+            summary="탈리아가 숲 입구에 도착해 흔적을 살핀다.",
+            beats=["칼렌의 명령에 따라 잊혀진 숲으로 떠난다", "이끼 낀 비석을 발견한다"],
+            characters=["talia"],
+        )
+        fb = fallback_choices(sc, {"talia": "탈리아"}, "ko", [])
+        assert len({c["title"] for c in fb}) == 3
+        assert len({c["summary"] for c in fb}) == 3
+
+        # 3. remaining_pre_rpg_beats prunes beats already enacted in a single sentence inside a
+        # multi-sentence written scene prose
+        multi_sentence_prose = (
+            "성문이 무겁게 닫혔다. 구름 사이로 달빛이 비쳤다. 바람이 차갑게 불었다. "
+            "탈리아는 칼렌의 명령에 따라 잊혀진 숲으로 떠난다. 새벽 안개가 자욱했다."
+        )
+        rem = remaining_pre_rpg_beats(sc, multi_sentence_prose, {"talia": "탈리아"})
+        assert rem == ["이끼 낀 비석을 발견한다"]
+
+        # 4. _reply_note includes the written scene prose + illustration and omits raw KG dumps
+        # or `(KG 변화: ...)` from RPG choices
+        st = StartState(
+            request=REQUEST,
+            brief=Brief(
+                title="등대",
+                genre="fantasy",
+                tone="몽환적",
+                audience="성인",
+                length="단편",
+                language="ko",
+            ),
+            stage="review_scene",
+            interactive=True,
+            chapter_written=1,
+            scenes_written=["ch01.s01"],
+            scene_written_last="ch01.s01",
+            scene_id="ch01.s02",
+            scene_entering_kg="- 탈리아: location=숲",
+            scene_illustrations={"ch01.s01": "/api/artifacts/content?path=s01.png"},
+            scene_choices=[
+                {
+                    "number": 1,
+                    "title": "정면 돌파",
+                    "approach": "정면 돌파 / 행동",
+                    "summary": "숲속으로 나아간다.",
+                    "transitions": [{"subject": "탈리아", "set": {"location": "깊은 숲"}}],
+                }
+            ],
+        )
+        note = _reply_note(
+            st,
+            ["scene"],
+            scenes_prose={"ch01.s01": ("성에서의 출발", "탈리아는 성문을 나섰다.")},
+        )
+        assert "### 성에서의 출발\n탈리아는 성문을 나섰다." in note["ko"]
+        assert "![1장 1번째 장면](/api/artifacts/content?path=s01.png)" in note["ko"]
+        assert "[현재 월드 KG 상태]" not in note["ko"]
+        assert "KG 변화:" not in note["ko"]
+        assert "시간순 KG 상태를 업데이트했습니다" not in note["ko"]
+        assert "설정집과 대조했고" not in note["ko"]
+        assert "장면 1개를 저장했습니다" not in note["ko"]
+
+        # 5. reply_notes preserves paragraphs before a blank line (such as the written scene prose
+        # and illustration) when deduplicating a list that the model's reply already named
+        rec = ToolExecutionRecord(
+            tool_name="story_start",
+            arguments={},
+            status=ToolResultStatus.SUCCESS,
+            output={"reply_note": {**note, NOTE_LISTS_KEY: ["정면 돌파"]}},
+        )
+        preserved = "\n\n".join(
+            reply_notes([rec], korean=True, reply="다음 선택지는 1. 정면 돌파 입니다.")
+        )
+        assert "### 성에서의 출발\n탈리아는 성문을 나섰다." in preserved
+        assert "![1장 1번째 장면](/api/artifacts/content?path=s01.png)" in preserved
+        assert "1. [정면 돌파 / 행동]" not in preserved
+
+    async def test_cross_scene_and_intra_turn_choice_deduplication_and_location_progression(
+        self, tmp_path: Path
+    ) -> None:
+        """Killed by: examples/story/src/uclone_x_story/start_rpg.py :: updated_set.setdefault("location", primary_place)
+        Becomes: pass
+        Killed by: examples/story/src/uclone_x_story/start_rpg.py :: if any(folded(name) in folded_beat for name in unseen_names) and max_overlap < 0.25:
+        Becomes: if any(folded(name) in folded_beat for name in unseen_names):
+        Killed by: examples/story/src/uclone_x_story/start_rpg.py :: if summary_hit:
+        Becomes: if False:
+        Killed by: examples/story/src/uclone_x_story/start_rpg.py :: if rep_reasons:
+        Becomes: if False:
+        """
+        from uclone_x_story.start_rpg import (
+            ensure_choice_transition,
+            remaining_pre_rpg_beats,
+            repetitive_choice_reasons,
+        )
+
+        # 1. ensure_choice_transition sets location from primary_place when not already present
+        ensured = ensure_choice_transition(
+            [
+                SceneTransition(
+                    scene_id="ch02.s03",
+                    entity_id="talria",
+                    set={"stance": "결의"},
+                    note="왕관의 성으로 진입",
+                )
+            ],
+            scene_id="ch02.s03",
+            lead_id="talria",
+            title="왕관의 성 진입",
+            summary="탈리아가 왕관의 성 내부로 들어선다.",
+            primary_place="왕관의 성",
+        )
+        assert ensured[0].set["location"] == "왕관의 성"
+
+        # 2. remaining_pre_rpg_beats drops beats that were already enacted in written prose even
+        # if they mention a character or place name that had not yet appeared in prose
+        sc_crown = Scene(
+            id="ch03.s01",
+            title="왕관의 성",
+            summary="탈리아가 성 안으로 들어선다.",
+            beats=[
+                "영혼의 지배자의 경고를 무릅쓰고 왕관의 성으로 향한다",
+                "제단 위의 균열된 왕관을 마주한다",
+            ],
+            characters=["talria", "soul_lord"],
+            places=["crown_castle"],
+        )
+        prose_before = (
+            "탈리아는 레온의 지지에 힘입어 경고를 무릅쓰고 왕관의 성으로 향한다. "
+            "성문이 열리고 차가운 바람이 불어왔다."
+        )
+        rem_crown = remaining_pre_rpg_beats(
+            sc_crown,
+            prose_before,
+            {"talria": "탈리아", "soul_lord": "영혼의 지배자", "crown_castle": "왕관의 성"},
+        )
+        assert rem_crown == ["제단 위의 균열된 왕관을 마주한다"]
+
+        # 3. repetitive_choice_reasons detects choices that repeat prior scenes or each other
+        prior_scenes = [
+            (
+                "왕관의 성을 향한 결단",
+                "탈리아는 경고를 무릅쓰고 왕관의 성으로 향한다.",
+            ),
+            (
+                "그림자의 비밀을 추적하다",
+                "탈리아는 왕관의 성 주변을 탐색하며 그림자 탈리아와 연결된 단서를 발견한다.",
+            ),
+        ]
+        colliding_raw = [
+            {
+                "number": 1,
+                "title": "왕관의 성을 향한 정면 돌파",
+                "approach": "정면 돌파 / 행동",
+                "summary": "탈리아는 왕관의 성을 향해 직접 향하며 경고를 무릅쓰고 진입을 시도한다.",
+            },
+            {
+                "number": 2,
+                "title": "왕관의 성에 숨겨진 비밀을 추적하다",
+                "approach": "탐색 / 단서 추적",
+                "summary": "탈리아는 왕관의 성 주변을 탐색하며 그림자 탈리아와 연결된 새로운 단서를 발견한다.",
+            },
+            {
+                "number": 3,
+                "title": "제단 봉인 해제",
+                "approach": "대화 / 관계 변화",
+                "summary": "탈리아는 왕관의 성 주변을 탐색하며 그림자 탈리아와 연결된 새로운 단서를 발견한다.",
+            },
+        ]
+        reasons = repetitive_choice_reasons(
+            colliding_raw,
+            prior_scenes,
+            sc_crown,
+            {"talria": "탈리아", "soul_lord": "영혼의 지배자", "crown_castle": "왕관의 성"},
+            ("정면 돌파 / 행동", "탐색 / 단서 추적", "대화 / 관계 변화"),
+        )
+        assert len(reasons) >= 2
+
+        # 4. End-to-end: when the first model call for ch01.s02 proposes choices repeating ch01.s01,
+        # _propose_scene_choices retries with explicit rejection reasons and keeps the distinct retry.
+        colliding_s02_reply = {
+            "choices": [
+                {
+                    "number": 1,
+                    "title": "젖은 발자국 추적",
+                    "approach": "정면 돌파 / 행동",
+                    "summary": "하린이 계단에 찍힌 젖은 발자국과 방울을 살핀다.",
+                    "beats": ["발자국을 조사한다", "방울 조각을 줍는다"],
+                },
+                {
+                    "number": 2,
+                    "title": "계단 단서 재확인",
+                    "approach": "탐색 / 단서 추적",
+                    "summary": "하린이 계단에 찍힌 젖은 발자국과 방울을 다시 살핀다.",
+                    "beats": ["계단 틈을 본다", "물기를 확인한다"],
+                },
+                {
+                    "number": 3,
+                    "title": "창밖 부름",
+                    "approach": "대화 / 관계 변화",
+                    "summary": "하린이 계단에 찍힌 젖은 발자국과 방울을 살피며 부른다.",
+                    "beats": ["창문을 연다", "소리를 듣는다"],
+                },
+            ]
+        }
+        distinct_s02_reply = {
+            "choices": [
+                {
+                    "number": 1,
+                    "title": "등대 렌즈실 진입",
+                    "approach": "정면 돌파 / 행동",
+                    "summary": "하린이 굳게 닫힌 렌즈실 철문을 밀어젖히고 회전 거울 앞으로 뛰어든다.",
+                    "beats": ["철문 빗장을 푼다", "회전 거울 앞에 선다"],
+                },
+                {
+                    "number": 2,
+                    "title": "수지 일지 해독",
+                    "approach": "탐색 / 단서 추적",
+                    "summary": "하린이 책상 서랍 속 등대지기의 낡은 항해 일지를 펼쳐 암호를 해독한다.",
+                    "beats": ["서랍을 연다", "항해 일지의 기록을 대조한다"],
+                },
+                {
+                    "number": 3,
+                    "title": "낯선 그림자 추궁",
+                    "approach": "대화 / 관계 변화",
+                    "summary": "하린이 난간 너머에 서 있는 낯선 이에게 등불을 겨누며 정체를 묻는다.",
+                    "beats": ["등불을 치켜든다", "낯선 이의 대답을 요구한다"],
+                },
+            ]
+        }
+        s01_default_reply = {
+            "choices": [
+                {
+                    "number": 1,
+                    "title": "젖은 발자국 추적",
+                    "approach": "정면 돌파 / 행동",
+                    "summary": "하린이 계단에 찍힌 젖은 발자국과 방울을 살핀다.",
+                    "beats": ["발자국을 조사한다", "방울 조각을 줍는다"],
+                },
+                {
+                    "number": 2,
+                    "title": "벽면 문양 조사",
+                    "approach": "탐색 / 단서 추적",
+                    "summary": "하린이 등대 내벽에 새겨진 오래된 해류 문양을 더듬어 본다.",
+                    "beats": ["문양을 만진다", "숨겨진 홈을 찾는다"],
+                },
+                {
+                    "number": 3,
+                    "title": "먹물과의 교감",
+                    "approach": "대화 / 관계 변화",
+                    "summary": "하린이 고양이 먹물의 울음소리에 귀를 기울이며 방향을 가늠한다.",
+                    "beats": ["숨을 고른다", "울음소리를 따라간다"],
+                },
+            ]
+        }
+        model = ScriptedModel(
+            scenes=[_SCENE, _SCENE],
+            scene_choices=[s01_default_reply, colliding_s02_reply, distinct_s02_reply],
+        )
+        tool = StoryStartTool(model_factory=lambda _c: model, embedder_factory=lambda _c: None)
+        started = await tool.execute(
+            {"action": "start", "request": REQUEST, "interactive": True},
+            _ctx(tmp_path),
+        )
+        story = str(cast("dict[str, Any]", started.output)["open_story_id"])
+        await tool.execute({"action": "continue", "choice": 1}, _ctx(tmp_path, story=story))
+        await tool.execute({"action": "continue", "go_on": True}, _ctx(tmp_path, story=story))
+        await tool.execute({"action": "continue", "go_on": True}, _ctx(tmp_path, story=story))
+        res_s02 = await tool.execute(
+            {"action": "continue", "choice": 1},
+            _ctx(tmp_path, story=story),
+        )
+        assert res_s02.success and isinstance(res_s02.output, dict)
+        out_s02 = cast("dict[str, Any]", res_s02.output)
+        choices_s02 = cast("list[dict[str, Any]]", out_s02["scene_choices"])
+        assert [c["title"] for c in choices_s02] == [
+            "등대 렌즈실 진입",
+            "수지 일지 해독",
+            "낯선 그림자 추궁",
+        ]
+        assert "location=안개섬 등대" in str(out_s02.get("scene_entering_kg") or "")

@@ -112,6 +112,7 @@ export interface SceneView {
   characters: string[];
   places: string[];
   written: boolean;
+  manuscript?: string | null;
   illustration?: string | null;
   entries: SceneEntry[];
   changes: SceneChange[];
@@ -218,6 +219,8 @@ export interface StoryOverview {
   board_note: string | null;
   board_code?: string | null;
   codex: CodexGroup[];
+  world_kg?: CodexGroup[];
+  kg_timeline?: { scene_id: string; title: string; changes: string[] }[];
   codex_unreadable: Unreadable[];
   pending: ProposalView[];
   decided: ProposalView[];

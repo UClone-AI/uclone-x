@@ -8,6 +8,10 @@ so a store has no notion of a window or a limit.
 run`, ACP and an eval running at the same time count against one total, and a restart
 keeps the count. A JSON file was rejected because concurrent appends to a rewritten file
 lose rows; SQLite is in the standard library and serialises writers itself.
+
+Each row also keeps, apart, how many of its input tokens the provider served from its prompt
+cache (#2429): an agent loop resends its whole conversation on every call, and in one measured
+session 94% of the input was a cached prefix. `tokens` stays the whole count.
 """
 
 from __future__ import annotations
@@ -15,12 +19,11 @@ from __future__ import annotations
 import sqlite3
 import threading
 from collections.abc import Sequence
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
 
-from pydantic import BaseModel, ConfigDict, Field
-
+from uclone_x.core.usage_entry import USAGE_RETENTION, UsageEntry
 from uclone_x.llm.models import TokenCountSource
 
 __all__ = [
@@ -35,21 +38,6 @@ __all__ = [
 
 #: The store's file name, in the session root beside `settings.json`.
 USAGE_FILE_NAME = "usage.sqlite3"
-
-#: How long rows are kept: the longest window (7 days) and a day to spare.
-USAGE_RETENTION = timedelta(days=8)
-
-
-class UsageEntry(BaseModel):
-    """One paid call's tokens, input and output together."""
-
-    model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
-
-    at: datetime = Field(description="When the call finished, timezone-aware.")
-    tokens: int = Field(ge=0)
-    provider: str
-    model: str | None = None
-    count_source: TokenCountSource = TokenCountSource.PROVIDER
 
 
 class UsageStore(Protocol):
@@ -95,10 +83,24 @@ CREATE TABLE IF NOT EXISTS usage (
     tokens INTEGER NOT NULL,
     provider TEXT NOT NULL,
     model TEXT,
-    count_source TEXT NOT NULL
+    count_source TEXT NOT NULL,
+    cached_tokens INTEGER
 );
 CREATE INDEX IF NOT EXISTS usage_at ON usage (at);
 """
+
+
+def _add_cache_column(conn: sqlite3.Connection) -> None:
+    """Give a file written before #2429 its `cached_tokens` column; its rows stay `NULL`.
+
+    The store had no schema version, so the column's presence is the version. `NULL` is the
+    honest value for an old row: the cached share was never recorded, so it reads as all new.
+    Run inside the caller's write transaction, so two processes opening one old file at once
+    cannot both add the column.
+    """
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(usage)")}
+    if "cached_tokens" not in columns:
+        conn.execute("ALTER TABLE usage ADD COLUMN cached_tokens INTEGER")
 
 
 class SqliteUsageStore:
@@ -117,9 +119,19 @@ class SqliteUsageStore:
         cutoff = (now or datetime.now(UTC)) - USAGE_RETENTION
         conn = self._connect()
         try:
-            with conn:
-                conn.executescript(_SCHEMA)
+            # `executescript` commits first, so the write lock is taken explicitly: the
+            # column check and the `ALTER` must be one step across processes.
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                for statement in _SCHEMA.split(";"):
+                    if statement.strip():
+                        conn.execute(statement)
+                _add_cache_column(conn)
                 conn.execute("DELETE FROM usage WHERE at < ?", (cutoff.timestamp(),))
+            except BaseException:
+                conn.rollback()
+                raise
+            conn.commit()
         finally:
             conn.close()
 
@@ -134,14 +146,15 @@ class SqliteUsageStore:
         try:
             with conn:
                 conn.execute(
-                    "INSERT INTO usage (at, tokens, provider, model, count_source) "
-                    "VALUES (?, ?, ?, ?, ?)",
+                    "INSERT INTO usage (at, tokens, provider, model, count_source, cached_tokens) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
                     (
                         entry.at.timestamp(),
                         entry.tokens,
                         entry.provider,
                         entry.model,
                         entry.count_source.value,
+                        entry.cached_tokens,
                     ),
                 )
         finally:
@@ -150,8 +163,8 @@ class SqliteUsageStore:
     def entries_since(self, since: datetime) -> Sequence[UsageEntry]:
         conn = self._connect()
         try:
-            rows: list[tuple[float, int, str, str | None, str]] = conn.execute(
-                "SELECT at, tokens, provider, model, count_source FROM usage "
+            rows: list[tuple[float, int, str, str | None, str, int | None]] = conn.execute(
+                "SELECT at, tokens, provider, model, count_source, cached_tokens FROM usage "
                 "WHERE at > ? ORDER BY at",
                 (since.timestamp(),),
             ).fetchall()
@@ -164,6 +177,7 @@ class SqliteUsageStore:
                 provider=provider,
                 model=model,
                 count_source=TokenCountSource(source),
+                cached_tokens=cached,
             )
-            for at, tokens, provider, model, source in rows
+            for at, tokens, provider, model, source, cached in rows
         ]

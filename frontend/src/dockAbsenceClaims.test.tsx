@@ -5,14 +5,12 @@ import { ABSENCE_CLAIM, DOCK_SOURCES, absenceClaims } from './lib/absenceGuard';
 import type {
   RoomArtifacts,
   RoomToolUse,
-  RoomTopology,
   SeatHistory,
   SeatKnowledge,
 } from './lib/roomDock';
 import { DocViewer } from './components/artifacts/DocViewer';
 import { ActivityTimeline } from './components/artifacts/ActivityTimeline';
 import { RemembersPanel } from './components/artifacts/RemembersPanel';
-import { TopologyTab } from './components/TopologyTab';
 
 /**
  * The dock never says that nothing was written or that no tools ran (#1366, #1374).
@@ -113,22 +111,6 @@ const answered = (tools: RoomToolUse[] | null) => ({
   tools_not_recorded_reason: null,
 });
 
-const topology = (over: Partial<RoomTopology>): RoomTopology => ({
-  room_id: 'room-a',
-  nodes: [
-    { id: 'seat:scout', kind: 'seat', participant_id: 'scout', display_name: 'Scout', session_id: 's1', status: 'answered', turn_count: 1, live: true },
-    { id: 'seat:critic', kind: 'seat', participant_id: 'critic', display_name: 'Critic', session_id: 's2', status: 'idle', turn_count: 0, live: false },
-    { id: 'turn:t1', kind: 'turn', participant_id: 'scout', seq: 2, turn_id: 't1', status: 'answered', tools_recorded: true },
-  ],
-  edges: [{ id: 'e1', source: 'seat:scout', target: 'turn:t1', kind: 'took_turn' }],
-  history_complete: true,
-  history_gaps: [],
-  tool_call_gaps: [],
-  summary: { seats: 2, turns: 1, tool_calls: 0, subagents: 0 },
-  reason: null,
-  ...over,
-});
-
 const knowledge = (over: Partial<SeatKnowledge>): SeatKnowledge =>
   ({
     room_id: 'room-a',
@@ -208,11 +190,11 @@ describe('the dock makes no categorical absence claim (#1374)', () => {
     expect(allowed.filter((sentence) => ABSENCE_CLAIM.test(sentence))).toEqual([]);
   });
 
-  // Killed by: frontend/src/components/TopologyTab.tsx :: >#{turn.seq}</span>
-  // Becomes: >#{turn.seq} No tools called.</span>
+  // Killed by: frontend/src/components/artifacts/KnowledgeGraphViewer.tsx :: <span className="font-semibold text-sm text-slate-100">Knowledge Graph</span>
+  // Becomes: <span className="font-semibold text-sm text-slate-100">No tools called.</span>
   // A form the #1374 pattern let through (#1389):
-  // Killed by: frontend/src/components/TopologyTab.tsx :: >#{turn.seq}</span>
-  // Becomes: >#{turn.seq} No tool calls were made.</span>
+  // Killed by: frontend/src/components/artifacts/KnowledgeGraphViewer.tsx :: <span className="font-semibold text-sm text-slate-100">Knowledge Graph</span>
+  // Becomes: <span className="font-semibold text-sm text-slate-100">No tool calls were made.</span>
   it('holds no such claim in the copy of any dock source', () => {
     const offences = DOCK_SOURCES.flatMap((path) => {
       const body = SOURCES[path];
@@ -268,32 +250,6 @@ describe('the dock makes no categorical absence claim (#1374)', () => {
     render(<ActivityTimeline roomId="room-a" seatId="scout" />);
     expect(await screen.findByText(/May have written to a file without naming it/)).toBeInTheDocument();
     expect(screen.queryByText(/^Wrote to a file without naming it/)).toBeNull();
-  });
-
-  it('the DAG, with an idle seat and a turn with no tool calls listed, claims nothing', async () => {
-    answers['/api/rooms/room-a/topology'] = topology({});
-    const { container } = render(<TopologyTab roomId="room-a" />);
-    await screen.findByTestId('topology-turn-turn:t1');
-    expect(text(container)).toContain('No tool calls listed.');
-    expect(text(container)).not.toMatch(ABSENCE_CLAIM);
-    expect(text(container)).not.toMatch(/no turns yet|nobody has taken a turn/i);
-  });
-
-  it('the DAG, with no turns at all, says none are listed and names the Core’s gaps', async () => {
-    answers['/api/rooms/room-a/topology'] = topology({
-      nodes: [topology({}).nodes[1]],
-      edges: [],
-      history_complete: false,
-      history_gaps: ['its history was cleared'],
-      summary: { seats: 1, turns: 0, tool_calls: 0, subagents: 0 },
-    });
-    const { container } = render(<TopologyTab roomId="room-a" />);
-    expect(await screen.findByTestId('topology-history-gaps')).toHaveTextContent(
-      'its history was cleared',
-    );
-    expect(text(container)).toContain('No turns are listed for this conversation.');
-    expect(text(container)).not.toMatch(ABSENCE_CLAIM);
-    expect(text(container)).not.toMatch(/no turns yet|nobody has taken a turn/i);
   });
 
   it('Remembers, empty with no reason from the Core, says the list is empty', async () => {

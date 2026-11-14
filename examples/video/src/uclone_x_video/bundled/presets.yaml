@@ -1,0 +1,54 @@
+# Default 3-tier encoding profiles, color LUT presets, and title templates for uclone-x-video.
+quality_tiers:
+  preview:
+    width: 960
+    height: 540
+    codec: h264_proxy_fast
+    max_keyframe_interval: 15
+    bitrate_kbps: 2000
+  source:
+    preserve_original_bitstream: true
+  master:
+    width: 3840
+    height: 2160
+    codec: h264_master_10bit
+    crf: 14
+    audio_lufs_target: -14.0
+
+lut_presets:
+  clean_neutral:
+    contrast: 1.0
+    saturation: 1.0
+    temperature: 0.0
+  cinematic_teal_orange:
+    lift: [0.0, 0.0, 0.02]
+    gamma: [0.01, 0.0, -0.01]
+    gain: [1.06, 1.02, 0.98]
+    contrast: 1.14
+    saturation: 1.08
+    temperature: 12.0
+  warm_sunset:
+    lift: [0.01, 0.0, -0.01]
+    gamma: [0.02, 0.01, 0.0]
+    gain: [1.08, 1.03, 0.94]
+    contrast: 1.12
+    saturation: 1.10
+    temperature: 25.0
+  vintage_kodak:
+    lift: [0.02, 0.01, -0.01]
+    gamma: [0.02, 0.01, 0.0]
+    gain: [1.04, 1.00, 0.92]
+    contrast: 1.08
+    saturation: 0.92
+    temperature: 22.0
+  noir_bw:
+    contrast: 1.28
+    saturation: 0.0
+    vignette: 0.25
+  cool_cyberpunk:
+    lift: [-0.01, 0.0, 0.03]
+    gamma: [0.0, -0.01, 0.02]
+    gain: [0.98, 1.02, 1.08]
+    contrast: 1.20
+    saturation: 1.18
+    temperature: -18.0

@@ -134,6 +134,7 @@ const formatWhen = (iso: string | null): string => (iso ? new Date(iso).toLocale
 interface StoryViewProps {
   storyId: string;
   onBack: () => void;
+  refreshKey?: unknown;
 }
 
 /** An entry chosen on the board, shown in the codex. */
@@ -142,7 +143,7 @@ interface Chosen {
   id: string;
 }
 
-export const StoryView: React.FC<StoryViewProps> = ({ storyId, onBack }) => {
+export const StoryView: React.FC<StoryViewProps> = ({ storyId, onBack, refreshKey }) => {
   const t = useCopy().dock.story;
   const [story, setStory] = useState<StoryOverview | null>(null);
   const [loading, setLoading] = useState(false);
@@ -172,6 +173,14 @@ export const StoryView: React.FC<StoryViewProps> = ({ storyId, onBack }) => {
     setChosen(null);
     void load();
   }, [load]);
+
+  const prevRefreshKeyRef = useRef<unknown>(refreshKey);
+  useEffect(() => {
+    if (prevRefreshKeyRef.current !== refreshKey) {
+      prevRefreshKeyRef.current = refreshKey;
+      void load();
+    }
+  }, [refreshKey, load]);
 
   const decide = async (proposal: ProposalView, reject: string | null) => {
     const name = proposal.entry_name ?? proposal.entry_id;
@@ -260,6 +269,7 @@ export const StoryView: React.FC<StoryViewProps> = ({ storyId, onBack }) => {
             {(story.logline || story.genre) && (
               <p className="text-slate-400">{[story.genre, story.logline].filter(Boolean).join(' · ')}</p>
             )}
+            <WorldKgExplorer story={story} onChoose={setChosen} />
             <Waiting story={story} busy={busy} onDecide={(p, reason) => void decide(p, reason)} />
             <Outline story={story} onChoose={setChosen} />
             <Codex story={story} chosen={chosen} />
@@ -640,6 +650,14 @@ const BoardScene: React.FC<{
           loading="lazy"
         />
       )}
+      {scene.manuscript && (
+        <details className="mt-1.5 rounded border border-slate-800 bg-slate-950/60 p-2" data-testid="story-scene-manuscript">
+          <summary className="cursor-pointer text-[11px] font-medium text-cyan-300">
+            {t.readScene}
+          </summary>
+          <p className="mt-1.5 whitespace-pre-wrap text-slate-200 leading-relaxed">{scene.manuscript}</p>
+        </details>
+      )}
       {scene.entries.length > 0 && (
         <div className="mt-1 flex flex-wrap items-center gap-1" data-testid="story-scene-entries">
           <span className="text-[11px] text-slate-500">{b.inScene}</span>
@@ -788,6 +806,150 @@ const Codex: React.FC<{ story: StoryOverview; chosen: Chosen | null }> = ({ stor
         })}
       </div>
       <Unreadables items={story.codex_unreadable} testId="story-codex-unreadable" heading={t.codexUnreadable} />
+    </Section>
+  );
+};
+
+const WorldKgExplorer: React.FC<{
+  story: StoryOverview;
+  onChoose: (entry: Chosen) => void;
+}> = ({ story, onChoose }) => {
+  const t = useCopy().dock.story;
+  const [tab, setTab] = useState<'all' | 'characters' | 'places' | 'items' | 'threads' | 'timeline'>('all');
+  const groups = story.world_kg && story.world_kg.length > 0 ? story.world_kg : story.codex;
+  const timeline = story.kg_timeline ?? [];
+  const names = new Map(groups.flatMap((g) => g.entries.map((e) => [e.id, e.name] as const)));
+  const scenes = new Map(
+    (story.outline?.chapters ?? []).flatMap((c) =>
+      c.scenes.map((s) => [s.id, s.title || s.id] as const),
+    ),
+  );
+  const quotes = new Map(
+    story.decided
+      .filter((p) => p.status === 'applied' && p.evidence.length > 0)
+      .map((p) => [p.id, p.evidence.map((e) => e.quote)] as const),
+  );
+
+  const visibleGroups = tab === 'all' ? groups : groups.filter((g) => g.kind === tab);
+  const visibleEntries = visibleGroups.flatMap((g) => g.entries.map((e) => ({ kind: g.kind, entry: e })));
+
+  return (
+    <Section title={t.worldKg} testId="story-world-kg">
+      <div className="mb-2 flex flex-wrap gap-1" role="group" aria-label={t.worldKg}>
+        {(
+          [
+            { id: 'all', label: t.worldKgAll },
+            { id: 'characters', label: kindLabel('characters', t) },
+            { id: 'places', label: kindLabel('places', t) },
+            { id: 'items', label: kindLabel('items', t) },
+            { id: 'threads', label: kindLabel('threads', t) },
+            { id: 'timeline', label: t.worldKgTimeline },
+          ] as const
+        ).map((item) => (
+          <Button
+            key={item.id}
+            variant={tab === item.id ? 'solid' : 'ghost'}
+            aria-pressed={tab === item.id}
+            data-testid={`story-world-kg-tab-${item.id}`}
+            onClick={() => setTab(item.id)}
+          >
+            {item.label}
+          </Button>
+        ))}
+      </div>
+
+      {tab === 'timeline' ? (
+        timeline.length === 0 ? (
+          <p className="text-slate-500" data-testid="story-world-kg-timeline-empty">
+            {t.worldKgTimelineEmpty}
+          </p>
+        ) : (
+          <ol className="space-y-2" data-testid="story-world-kg-timeline">
+            {timeline.map((step) => (
+              <li
+                key={step.scene_id}
+                data-testid="story-world-kg-timeline-item"
+                data-scene={step.scene_id}
+                className="rounded border border-slate-800 bg-slate-950/50 p-2"
+              >
+                <p className="font-medium text-cyan-300">
+                  [{step.scene_id}] {step.title}
+                </p>
+                <ul className="mt-1 list-disc list-inside space-y-0.5 text-slate-300">
+                  {step.changes.map((ch, idx) => (
+                    <li key={idx}>{ch}</li>
+                  ))}
+                </ul>
+              </li>
+            ))}
+          </ol>
+        )
+      ) : visibleEntries.length === 0 ? (
+        <p className="text-slate-500" data-testid="story-world-kg-empty">
+          {t.worldKgEmpty}
+        </p>
+      ) : (
+        <div className="grid grid-cols-1 gap-2" data-testid="story-world-kg-cards">
+          {visibleEntries.map(({ kind, entry }) => {
+            const latestProg =
+              entry.progressions.length > 0 ? entry.progressions[entry.progressions.length - 1] : null;
+            const effectiveState: Record<string, JsonValue> = { ...entry.state };
+            for (const p of entry.progressions) {
+              const pSet = (p.set ?? {}) as Record<string, JsonValue>;
+              for (const [k, v] of Object.entries(pSet)) {
+                if (v === null) delete effectiveState[k];
+                else effectiveState[k] = v;
+              }
+            }
+            return (
+              <div
+                key={`${kind}:${entry.id}`}
+                data-testid="story-world-kg-card"
+                data-kind={kind}
+                data-entry={entry.id}
+                className="rounded-lg border border-slate-800 bg-slate-950/60 p-2.5"
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <button
+                    type="button"
+                    onClick={() => onChoose({ kind, id: entry.id })}
+                    className="font-semibold text-slate-100 hover:text-cyan-300 text-left"
+                  >
+                    {entry.name}
+                    {entry.aliases.length > 0 && (
+                      <span className="font-normal text-slate-500"> ({entry.aliases.join(', ')})</span>
+                    )}
+                  </button>
+                  <span className="rounded bg-slate-800 px-1.5 py-0.5 text-[10px] text-slate-300">
+                    {kindLabel(kind, t)}
+                  </span>
+                </div>
+                {entry.profile && <p className="mt-1 text-slate-400">{entry.profile}</p>}
+                {Object.keys(effectiveState).length > 0 && (
+                  <div className="mt-1.5 flex flex-wrap gap-1" data-testid="story-world-kg-state">
+                    {Object.entries(effectiveState).map(([k, v]) => (
+                      <span
+                        key={k}
+                        className="rounded border border-cyan-900/60 bg-cyan-950/30 px-1.5 py-0.5 text-[10px] text-cyan-200"
+                      >
+                        {k}: {show(v, t)}
+                      </span>
+                    ))}
+                  </div>
+                )}
+                {latestProg && typeof latestProg.note === 'string' && latestProg.note && (
+                  <p className="mt-1 text-[11px] text-amber-200/90">
+                    ↳ {latestProg.note}
+                  </p>
+                )}
+                <div className="mt-1">
+                  <EntryGraph entry={entry} names={names} scenes={scenes} quotes={quotes} t={t} />
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
     </Section>
   );
 };

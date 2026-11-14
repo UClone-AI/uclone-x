@@ -108,18 +108,20 @@ For a head with one connector and no model gateway (a test's host). A head with 
 
 
 def follow_global_models(own: AgentLLMConfig, deep: str | None, fast: str | None) -> AgentLLMConfig:
-    """``own`` with each empty model slot filled from the global ``deep`` and ``fast``.
+    """``own`` with each empty model slot filled: deep from the global ``deep``, fast from deep.
 
-    The rule for one connector with no gateway: a model the persona names is kept, and a
-    slot it leaves empty follows the given ones. An empty fast model means the deep one.
-    With a gateway, `ModelGateway.bind` applies the same rule to refs.
+    The rule for one connector with no gateway: a model the persona names is kept, and an
+    empty deep slot follows the given ``deep``. An empty fast slot is the clone's own
+    conversation model, whatever ``fast`` says (owner ruling 2026-10-29, #2418); ``fast``
+    is the global fast model, which serves only work no one clone owns. With a gateway,
+    `ModelGateway.bind` applies the same rule to refs.
     """
     updates: dict[str, str] = {}
+    conversation = own.model_name or deep
     if not own.model_name and deep:
         updates["model_name"] = deep
-    fast_or_deep = fast or deep
-    if not own.fast_model and fast_or_deep:
-        updates["fast_model"] = fast_or_deep
+    if not own.fast_model and conversation:
+        updates["fast_model"] = conversation
     return own.model_copy(update=updates) if updates else own
 
 
@@ -414,7 +416,9 @@ class AppScope:
     """
 
     host: HostDependencies
-    workspace_root: Path
+    #: `None` on a host with no user files (a pure-chat cluster worker): the clone gets no
+    #: workspace section and no workspace boundary, rather than the process's directory.
+    workspace_root: Path | None
     persona_registry: PersonaRegistry
     #: Clone id -> that clone's one memory store; `None` builds clones with no memory.
     memory_for: Callable[[str], CrossSessionMemory] | None = None
@@ -436,7 +440,7 @@ class AppScope:
     def create(
         cls,
         *,
-        workspace_root: Path,
+        workspace_root: Path | None,
         persona_registry: PersonaRegistry,
         memory_for: Callable[[str], CrossSessionMemory] | None = None,
         ontology_for: Callable[[str], OntologyEngineProtocol] | None = None,

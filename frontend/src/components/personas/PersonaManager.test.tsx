@@ -173,6 +173,9 @@ describe('PersonaManager', () => {
     await waitFor(() =>
       expect(screen.getByRole('status')).toHaveTextContent(plural(PERSONA_EDITOR_COPY.savedWithLive, 1, { name: 'surveyor' })),
     );
+    // An open conversation takes a model change at its next message too (#2418): the
+    // notice no longer sends the person to a new conversation or a restart.
+    expect(screen.getByRole('status')).not.toHaveTextContent(/new conversation|restart/i);
     expect(props.onSave).toHaveBeenCalledWith(
       expect.objectContaining({
         name: 'surveyor',
@@ -400,5 +403,20 @@ describe('PersonaManager', () => {
     expect(screen.getByRole('alert')).toHaveTextContent(
       fmt(PERSONA_EDITOR_COPY.loadFailedBecause, { reason: 'The clones folder is missing.' }),
     );
+  });
+});
+
+describe('the saved notice and a model change (#2418)', () => {
+  // Owner ruling 2026-10-29: a model saved in the clone editor reaches an open
+  // conversation from its next message, with no restart and no new conversation.
+  it.each([
+    ['en', en.personaEditor.savedWithLive, /new conversation|restart/i],
+    ['ko', ko.personaEditor.savedWithLive, /새 대화|다시 시작/],
+  ])('says nothing about a new conversation or a restart (%s)', (_locale, copy, stale) => {
+    for (const count of [1, 2]) {
+      const text = plural(copy, count, { name: 'surveyor' });
+      expect(text).not.toMatch(stale);
+      expect(text).toContain('surveyor');
+    }
   });
 });

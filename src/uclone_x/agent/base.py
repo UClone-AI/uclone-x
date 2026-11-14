@@ -7,6 +7,7 @@ import logging
 import uuid
 from collections import deque
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from dataclasses import dataclass
 from itertools import pairwise
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, Literal, cast
@@ -127,6 +128,7 @@ from uclone_x.llm.protocols import (
     UsageRemainingProtocol,
 )
 from uclone_x.llm.router import SemanticModelRouter
+from uclone_x.llm.usage.admission import leave_admitted_turn, turn_admission
 from uclone_x.memory import (
     CrossSessionMemory,
     QueryMemoryFactsTool,
@@ -227,6 +229,20 @@ AGENT_BOUND_TOOL_TYPES: Final = (
     LoadSkillTool,
     ShowSelfTool,
 )
+
+
+@dataclass(frozen=True)
+class ModelChange:
+    """The connector and model ids a saved model change puts on a seat (#2418).
+
+    Exactly what the seat runs on afterwards, ``None`` included, as `BaseAgent.rebind_llm`
+    takes them: the clone editor's save resolved them through the gateway already.
+    """
+
+    llm: LLMProviderProtocol | None
+    model_name: str | None
+    fast_model: str | None
+    image_model: str | None
 
 
 class _ParentSessionBudget:
@@ -356,11 +372,57 @@ class BaseAgent(BaseAgentProtocol):
         its old definition with no epoch opened (#1904). The edit is taken off the stage
         either way; one that fails to apply is dropped with its failed turn rather than
         failing every turn after it.
+
+        A staged model change (`stage_model_change`, #2418) is taken here too: inside the
+        returned step when there is a persona edit to apply, else at once, since it opens
+        no epoch of its own.
         """
         staged, self._staged_persona = self._staged_persona, None
-        if staged is None or self._persona_store.get(staged.name) == staged:
+        model, self._staged_model = self._staged_model, None
+        commit = (
+            None
+            if staged is None or self._persona_store.get(staged.name) == staged
+            else self._persona_definition_commit(staged)
+        )
+        if model is None:
+            return commit
+        if commit is None:
+            # A model change alone opens no epoch: the connector and model ids are not a
+            # context layer, as `rebind_llm` after a Settings change opens none (#1446).
+            self._apply_model_change(model)
             return None
-        return self._persona_definition_commit(staged)
+        persona_commit = commit
+
+        def commit_both() -> None:
+            persona_commit()
+            self._apply_model_change(model)
+
+        return commit_both
+
+    def stage_model_change(self, change: ModelChange) -> None:
+        """Hold a saved model change until this agent's next turn starts (#2418).
+
+        The clone editor's Conversation, Fast or Picture model reaches a seat that is
+        already open as a saved persona edit does (`stage_persona_edit`): taken at the next
+        turn's start, under the turn lock, so a turn that is running finishes on the model
+        it began with. A later change replaces an earlier one not taken yet.
+        """
+        self._staged_model = change
+
+    @property
+    def model_change_pending(self) -> bool:
+        """Whether a saved model change waits for this agent's next turn."""
+        return self._staged_model is not None
+
+    def _apply_model_change(self, change: ModelChange) -> None:
+        self.rebind_llm(change.llm, model_name=change.model_name, fast_model=change.fast_model)
+        self._config = self._config.model_copy(
+            update={
+                "llm_config": self._config.llm_config.model_copy(
+                    update={"image_model": change.image_model}
+                )
+            }
+        )
 
     def get_persona(self, name: str) -> PersonaDefinition | None:
         """Resolve a persona: this agent's own registrations first, then the registry.
@@ -444,6 +506,7 @@ class BaseAgent(BaseAgentProtocol):
         # other than what was sent.
         self._persona_store: dict[str, PersonaDefinition] = {p.name: p for p in personas}
         self._staged_persona: PersonaDefinition | None = None
+        self._staged_model: ModelChange | None = None
         self._bus = bus
         self._llm = llm
         self._tools = tools
@@ -1961,15 +2024,62 @@ class BaseAgent(BaseAgentProtocol):
         failures propagate".
         """
         self._turn_person_names = person_names
-        result = await self._turn_executor.execute_turn(
-            input_data,
-            stream_callback=stream_callback,
-            caller_turn_id=caller_turn_id,
-            room_id=room_id,
-            story_id=story_id,
-            person_names=person_names,
-            workspace_root=workspace_root,
+        return await self._admitted(
+            self._turn_executor.execute_turn(
+                input_data,
+                stream_callback=stream_callback,
+                caller_turn_id=caller_turn_id,
+                room_id=room_id,
+                story_id=story_id,
+                person_names=person_names,
+                workspace_root=workspace_root,
+            )
         )
+
+    async def continue_turn(
+        self,
+        *,
+        stream_callback: Callable[[str, dict[str, Any]], Awaitable[None] | None] | None = None,
+        caller_turn_id: str | None = None,
+        room_id: str | None = None,
+        story_id: str | None = None,
+        person_names: tuple[str, ...] = (),
+        workspace_root: Path | None = None,
+    ) -> TurnResult:
+        """Continue the turn its usage ceiling stopped (`usage_ceiling`), in place (#2431).
+
+        Owner amendment 2026-10-30: a runaway turn stops at a step boundary, and the person
+        continues it with no resend and no new conversation. The prompt and the finished
+        steps are in history; the model goes on from the last tool results. It is the same
+        turn, so it is not checked against the limit at its start, and it may spend one more
+        ceiling's worth.
+
+        Raises:
+            NothingToContinueError: No prompt of the person's is in this session.
+        """
+        self._turn_person_names = person_names
+        # The same arguments as `execute_turn`'s; the story is the one the stopped turn had.
+        turn: dict[str, Any] = {
+            "stream_callback": stream_callback,
+            "caller_turn_id": caller_turn_id,
+            "room_id": room_id,
+            "story_id": story_id,
+            "person_names": person_names,
+            "workspace_root": workspace_root,
+        }
+        return await self._admitted(self._turn_executor.continue_turn(**turn))
+
+    async def _admitted(self, turn: Awaitable[TurnResult]) -> TurnResult:
+        """Run `turn`, then put back the usage admission it marked at its start (#2431).
+
+        The turn marks itself admitted, with its own spend, at its start; put back here, a
+        call made after the turn, outside any, is checked again.
+        """
+        before = turn_admission()
+        try:
+            result = await turn
+        finally:
+            leave_admitted_turn(before)
         # Read with no `await` between the turn's end and here, so no next turn has yet
         # reset it. Stamped once rather than at each of the executor's six returns.
         return result.model_copy(update={"story_id": self._turn_story_id})

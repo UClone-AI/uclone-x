@@ -36,9 +36,11 @@ from uclone_x.tools.models import REPLY_NOTE_KEY, ToolResultStatus
 __all__ = [
     "NOTE_ASKS_KEY",
     "NOTE_LISTS_KEY",
+    "NOTE_REPLACE_KEY",
     "REPLY_NOTE_KEY",
     "is_korean",
     "lines_to_add",
+    "replaces_reply",
     "reply_notes",
     "with_lines",
 ]
@@ -55,6 +57,22 @@ def is_korean(text: str) -> bool:
 NOTE_LISTS_KEY = "lists"
 #: In a reply note's mapping, its question lines, as the note writes them.
 NOTE_ASKS_KEY = "asks"
+#: In a reply note's mapping, whether the note is the turn's whole reply rather than a
+#: footer appended after the model's own words.
+NOTE_REPLACE_KEY = "replace"
+
+
+def replaces_reply(records: Iterable[ToolExecutionRecord]) -> bool:
+    """Whether any successful tool call's reply note is the turn's whole reply."""
+    for record in records:
+        if record.status is not ToolResultStatus.SUCCESS or not isinstance(record.output, Mapping):
+            continue
+        note = cast(Mapping[str, object], record.output).get(REPLY_NOTE_KEY)
+        if isinstance(note, Mapping):
+            found = cast(Mapping[str, object], note)
+            if found.get(NOTE_REPLACE_KEY) is True:
+                return True
+    return False
 
 
 def _note_of(output: object, *, korean: bool, reply: str) -> str | None:
@@ -118,7 +136,8 @@ def _after_list(note: str, listed: Sequence[str], reply: str) -> str:
     """`note`, or only its lines after its list when `reply` names every listed thing.
 
     The list is the note's lines up to the last one that names a listed thing; what is
-    before it introduces the list, and goes with it.
+    before it introduces the list, and goes with it. Any paragraph before a blank line
+    preceding the list (such as a written scene's prose and illustration) is kept.
     """
     if not listed or not reply.strip():
         return note
@@ -128,7 +147,11 @@ def _after_list(note: str, listed: Sequence[str], reply: str) -> str:
         return note
     lines = note.splitlines()
     naming = [i for i, line in enumerate(lines) if any(name in _plain(line) for name in names)]
-    return "\n".join(lines[naming[-1] + 1 :]) if naming else note
+    if not naming:
+        return note
+    before_blank = [i for i in range(naming[0]) if not lines[i].strip()]
+    kept_before = lines[: before_blank[-1] + 1] if before_blank else []
+    return "\n".join([*kept_before, *lines[naming[-1] + 1 :]])
 
 
 def reply_notes(

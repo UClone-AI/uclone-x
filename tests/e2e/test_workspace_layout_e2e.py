@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 from pathlib import Path
 
 import pytest
@@ -122,20 +121,14 @@ async def test_3_panel_workspace_layout_and_toggles(ui_test_server: str, tmp_pat
         # cascade meter beside it is a different quantity and must not wear that label.
         assert await dock.locator("text=Step Budget").count() == 0
 
-        # 4. Switch dock surfaces. EventBus and DAG are developer instruments: the drawer that
-        # holds them exists only in developer mode, which is off by default (owner ruling
+        # 4. Switch dock surfaces. Knowledge Graph is a developer instrument: the drawer that
+        # holds it exists only in developer mode, which is off by default (owner ruling
         # 2026-09-22), so the test switches it on the way a user does and the dock stays open.
         await turn_on_developer_mode(page)
-        await dock.locator("[data-testid='dev-tab-ledger']").click()
-        event_stream = dock.locator("text=EventBus SSE Stream Ledger")
-        await event_stream.wait_for(state="visible", timeout=5000)
-        assert await event_stream.is_visible()
-
-        await dock.locator("[data-testid='dev-tab-topology']").click()
-        # The DAG reads the conversation on screen (#1355); its heading says so.
-        swarm_nodes = dock.locator("text=How this conversation ran")
-        await swarm_nodes.wait_for(state="visible", timeout=5000)
-        assert await swarm_nodes.is_visible()
+        await dock.locator("[data-testid='dev-tab-knowledge_graph']").click()
+        kg_viewer = dock.locator("[data-testid='knowledge-graph-viewer']")
+        await kg_viewer.wait_for(state="visible", timeout=5000)
+        assert await kg_viewer.is_visible()
 
         # 5. Progressive disclosure from a tool chip to the dock went with #1208, and is
         # not replaced. The chip it clicked was `PlaygroundTab`'s inline tool card, and the
@@ -276,9 +269,6 @@ _DOCK_TABS = (
     "knowledge_graph",
     "activity",
     "resource",
-    "topology",
-    "ledger",
-    "ontology",
 )
 
 #: The dock against the window it is drawn in. Geometry is reported, and so is what a click at
@@ -327,7 +317,7 @@ _DOCK_OFF_SCREEN = """(tabTestId) => {
 #: The surfaces in the developer drawer, which exists only in developer mode (owner ruling
 #: 2026-09-22). Their tabs carry `dev-tab-`, the primary row's `tab-`. ACP, Skills and Evals
 #: were drawer surfaces until #1358 moved them into Settings.
-_DEVELOPER_TABS = frozenset({"knowledge_graph", "topology", "ledger", "ontology"})
+_DEVELOPER_TABS = frozenset({"knowledge_graph"})
 
 
 def _tab_testid(tab: str) -> str:
@@ -471,7 +461,7 @@ _SURFACE_GRID_COLUMNS = """() => {
 }"""
 
 #: The surfaces that render a column grid with the test server's data.
-_GRID_TABS = ("resource", "topology", "ontology")
+_GRID_TABS = ("resource",)
 
 
 @pytest.mark.asyncio
@@ -521,149 +511,6 @@ async def test_a_dock_narrower_than_its_grids_lays_them_out_in_one_column(
                 assert all(max(cs) > 1 for cs in columns.values()), (
                     f"the {stored}px dock lost its columns: {columns}"
                 )
-        finally:
-            await browser.close()
-
-
-#: Ontology's two viewport-keyed grids and its detail card's span, read by the class each sets
-#: its columns with: the four-up tier cards (`md:grid-cols-4`) and the list-and-detail row
-#: (`lg:grid-cols-3`, the detail in `lg:col-span-2`).
-_ONTOLOGY_GRIDS = """() => {
-    const surface = document.querySelector("[data-testid='dock-surface']");
-    if (!surface) return null;
-    const count = (g) => g ? getComputedStyle(g).gridTemplateColumns.split(' ').length : null;
-    const row = surface.querySelector("[class*='lg:grid-cols-3']");
-    const detail = row && row.querySelector(":scope > [class*='lg:col-span-2']");
-    return {
-        surface: Math.round(surface.getBoundingClientRect().width),
-        cards: count(surface.querySelector("[class*='md:grid-cols-4']")),
-        row: count(row),
-        span: detail ? getComputedStyle(detail).gridColumnEnd : null,
-    };
-}"""
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("stored", "windows", "expected"),
-    [
-        (520, (740, 1280), {"cards": 2, "row": 3, "span": "span 2"}),
-        (880, (1000, 1400), {"cards": 4, "row": 3, "span": "span 2"}),
-        (900, (760, 1280), {"cards": 4, "row": 3, "span": "span 2"}),
-    ],
-)
-async def test_a_dock_panel_takes_its_column_count_from_the_dock_not_the_window(
-    ui_test_server: str, stored: int, windows: tuple[int, int], expected: dict[str, object]
-) -> None:
-    """#1327: one dock width, two windows, one layout -- the one the dock has room for.
-
-    `index.css` corrected only the bands that had shown a defect, so everywhere else the window
-    still decided. Measured on Ontology before this: the `lg:grid-cols-3` list and detail was
-    one column in a 519px dock at a 740px window and three at 1280, and one column in an 879px
-    dock at a 1000px window and three at 1400; the `md:grid-cols-4` cards were one column in a
-    759px overlaid dock at a 760px window and four at 1280. Each pair straddles the class's own
-    viewport breakpoint at one unchanged dock width, which is what makes it the window deciding.
-    The expected counts are asserted, not only the agreement: both cells collapsing to one would
-    agree and lose the columns the dock has room for. The detail's span is asserted with them,
-    because a parent moved onto the container with its child's `lg:col-span-2` left on the window
-    is a three-column row whose wide card silently stops spanning at a narrow window.
-
-    The 900px dock at a 760px window is drawn over the workspace at the window's width (#1019),
-    so its surface is the window's (759px), not the stored width; the surface is asserted above
-    the band's floor rather than equal to anything.
-
-    Mutation-checked by hand with a real `vite build` on each side, because the ratchet runs a
-    browser test against the committed bundle and so reads a declaration naming `frontend/src`
-    as escaped. Each fails the narrower-window cell of the rows it names and nothing else here:
-    `Killed by:` frontend/src/index.css :: `.dock-scope [class*=':grid-cols-3'] {` becoming
-    `.dock-scope [class*=':grid-cols-9'] {` -- all three rows, `row` at the narrow window.
-    `Killed by:` frontend/src/index.css :: `.dock-scope [class*=':grid-cols-4'] {` becoming
-    `.dock-scope [class*=':grid-cols-9'] {` -- the 900 row only, `cards`: at a 1000px window
-    `md:` gives the 880 row its four anyway.
-    `Killed by:` frontend/src/index.css :: `.dock-scope [class*=':col-span-2'] {` becoming
-    `.dock-scope [class*=':col-span-9'] {` -- all three rows, `span`.
-    """
-    measured: dict[int, dict[str, object]] = {}
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        try:
-            for width in windows:
-                page: Page = await browser.new_page(viewport={"width": width, "height": 900})
-                await page.add_init_script(
-                    f"try {{ localStorage.setItem('uclone-x.dock.width', '{stored}') }} "
-                    "catch (e) {}"
-                )
-                await page.goto(ui_test_server, wait_until="commit")
-                await page.wait_for_selector("[data-testid='room-composer']", timeout=20000)
-                await set_the_rail(page, "closed")
-                await turn_on_developer_mode(page)
-                await _open_the_dock(page)
-                await _show_surface(page, "ontology")
-                grids = await page.evaluate(_ONTOLOGY_GRIDS)
-                assert grids is not None and grids["row"] is not None, grids
-                assert grids["surface"] > (720 if expected["cards"] == 4 else 480), grids
-                measured[width] = {k: grids[k] for k in expected}
-                await page.close()
-        finally:
-            await browser.close()
-    assert all(m == expected for m in measured.values()), (
-        f"a {stored}px dock lays Ontology out by the window: {measured}, expected {expected}"
-    )
-
-
-@pytest.mark.asyncio
-async def test_the_topology_grid_is_measured_after_its_read_not_while_it_is_out(
-    ui_test_server: str,
-) -> None:
-    """#1722: a slow topology read is waited for, not measured through.
-
-    `TopologyTab` draws its seat grid only once `GET /api/rooms/{id}/topology` answers. The
-    grid case above waited two frames after the click and measured, which under the load a
-    gate leaves behind read the loading line: "no column grid rendered to measure", on 481
-    and 520 in turn. Here the read is held by the test and let go only after the page has
-    had its frames, so the order is decided rather than hoped for: the surface must still be
-    waiting when the read is released, and the grid it then draws is the one measured.
-
-    Killed by: tests/e2e/conftest.py :: await page.wait_for_function(SURFACE_READ_SETTLED, arg=surface, timeout=10000)
-    Becomes: pass
-    That leaves the two-frame wait #1722 was filed on: `show_dock_surface` returns while the
-    read is still held, and the `not shown.done()` assertion below fails. Watched by hand.
-    """
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        try:
-            page: Page = await browser.new_page(viewport={"width": 1280, "height": 900})
-            await page.add_init_script(
-                "try { localStorage.setItem('uclone-x.dock.width', '360') } catch (e) {}"
-            )
-            let_the_read_go = asyncio.Event()
-            held: list[str] = []
-
-            async def hold_the_topology_read(route: Route) -> None:
-                held.append(route.request.url)
-                await let_the_read_go.wait()
-                await route.continue_()
-
-            await page.route("**/api/rooms/*/topology", hold_the_topology_read)
-            await page.goto(ui_test_server, wait_until="commit")
-            await page.wait_for_selector("[data-testid='room-composer']", timeout=20000)
-            await set_the_rail(page, "closed")
-            await turn_on_developer_mode(page)
-            await _open_the_dock(page)
-
-            shown = asyncio.create_task(_show_surface(page, "topology"))
-            try:
-                await page.wait_for_selector("[data-testid='topology-reason']", timeout=10000)
-                await page.evaluate(TWO_FRAMES)
-                await page.evaluate(TWO_FRAMES)
-                assert held, "the topology read never reached the held route"
-                assert not shown.done(), "the surface was measured while its read was still out"
-            finally:
-                let_the_read_go.set()
-            await shown
-
-            counts = await page.evaluate(_SURFACE_GRID_COLUMNS)
-            assert counts == [1], f"a 360px dock's topology grid, once read: {counts}"
         finally:
             await browser.close()
 
@@ -1161,15 +1008,10 @@ async def test_no_width_dragged_at_a_wide_window_leaves_the_close_control_off_a_
 
 
 #: The drawer's surfaces and the label each tab reads, in drawer order.
-_DEVELOPER_TAB_LABELS = (
-    ("knowledge_graph", "Knowledge Graph"),
-    ("topology", "DAG"),
-    ("ledger", "EventBus"),
-    ("ontology", "Ontology"),
-)
+_DEVELOPER_TAB_LABELS = (("knowledge_graph", "Knowledge Graph"),)
 
-#: Surfaces the drawer held until #1358 moved them into Settings. No tab may offer them.
-_MOVED_TO_SETTINGS = ("acp", "skills", "evaluations")
+#: Surfaces the drawer held until #1358 moved them into Settings, or #2442 removed them. No tab may offer them.
+_MOVED_TO_SETTINGS = ("acp", "skills", "evaluations", "topology", "ledger", "ontology")
 
 #: How many text nodes on the page carry the drawer's label, not counting the dock surface's own
 #: content. The surface is excluded because Docs & Artifacts renders the workspace's Markdown, and
@@ -1255,9 +1097,9 @@ async def test_developer_mode_is_off_by_default_and_one_setting_turns_it_on(
             for moved in _MOVED_TO_SETTINGS:
                 for testid in (f"tab-{moved}", f"dev-tab-{moved}"):
                     assert await page.locator(f"[data-testid='{testid}']").count() == 0, testid
-            await drawer.locator("[data-testid='dev-tab-ledger']").click()
-            ledger = dock.get_by_text("EventBus SSE Stream Ledger")
-            await ledger.wait_for(state="visible", timeout=5000)
+            await drawer.locator("[data-testid='dev-tab-knowledge_graph']").click()
+            kg = dock.locator("[data-testid='knowledge-graph-viewer']")
+            await kg.wait_for(state="visible", timeout=5000)
 
             # 3. Kept across a reload. The dock's open state is not kept, so it is reopened.
             await page.reload(wait_until="commit")
@@ -1269,8 +1111,8 @@ async def test_developer_mode_is_off_by_default_and_one_setting_turns_it_on(
                 assert await drawer.locator(f"[data-testid='dev-tab-{surface}']").is_visible()
 
             # 4. Switched off with an instrument open: Docs & Artifacts, not the instrument.
-            await drawer.locator("[data-testid='dev-tab-ledger']").click()
-            await dock.get_by_text("EventBus SSE Stream Ledger").wait_for(
+            await drawer.locator("[data-testid='dev-tab-knowledge_graph']").click()
+            await dock.locator("[data-testid='knowledge-graph-viewer']").wait_for(
                 state="visible", timeout=5000
             )
             await page.locator("[data-testid='open-settings']").click()
@@ -1284,7 +1126,7 @@ async def test_developer_mode_is_off_by_default_and_one_setting_turns_it_on(
             await page.locator("[role='dialog']").wait_for(state="detached")
 
             await dock.locator("[data-testid='doc-viewer']").wait_for(state="visible", timeout=5000)
-            assert await dock.get_by_text("EventBus SSE Stream Ledger").count() == 0
+            assert await dock.locator("[data-testid='knowledge-graph-viewer']").count() == 0
             assert await page.locator("[data-testid='dev-drawer']").count() == 0
         finally:
             await browser.close()

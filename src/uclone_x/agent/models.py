@@ -17,9 +17,7 @@ from uclone_x.core.immutable import ImmutableJsonMapping, ImmutableStrMapping
 from uclone_x.core.models import BASE_MEMORY_TOOLS as BASE_MEMORY_TOOLS
 from uclone_x.core.models import BASE_PERSONA_TOOLS as BASE_PERSONA_TOOLS
 from uclone_x.core.models import BASE_SELF_TOOLS as BASE_SELF_TOOLS
-from uclone_x.core.models import RETIRED_MODEL_TIERS as RETIRED_MODEL_TIERS
 from uclone_x.core.models import AgentLLMConfig as AgentLLMConfig
-from uclone_x.core.models import ModelTier as ModelTier
 from uclone_x.core.models import PersonaDefinition as PersonaDefinition
 from uclone_x.core.models import PlanState as PlanState
 from uclone_x.core.models import PlanStep as PlanStep
@@ -111,7 +109,7 @@ class AgentConfig(BaseModel):
     allowed_tools: tuple[str, ...] = Field(default_factory=tuple)
     llm_config: AgentLLMConfig = Field(
         default_factory=AgentLLMConfig,
-        description="The single source of truth for model tier and sampling. The former "
+        description="The single source of truth for the models and sampling. The former "
         "sibling `model_tier: str` and `temperature: float` fields are gone: they "
         "duplicated fields inside this object, one of them untyped, with no rule for "
         "which won (issue 2026-09-02-036).",
@@ -263,6 +261,13 @@ class ToolExecutionRecord(BaseModel):
         "the same site and only for a call that succeeded. What lets the runtime read the "
         "conversation's new story from an output without trusting an output's shape.",
     )
+    ends_turn: bool = Field(
+        default=False,
+        description="The call was refused because nobody here can answer its approval "
+        "request, and its tool declares `approval_unavailable_ends_turn` (#2429): only a "
+        "person can do what it asked, somewhere else, so the turn offers no more tools and "
+        "the model answers in words. Set only by the refusal path that builds the record.",
+    )
     artifacts: tuple[str, ...] = Field(
         default=(),
         description="The workspace files the call says it produced, from the tool's own "
@@ -345,6 +350,7 @@ TurnStopReason = Literal[
     "step_results_over_window",
     "budget_exceeded",
     "usage_limit",
+    "usage_ceiling",
     "provider_timeout",
     "model_without_tools",
     "model_unavailable",
@@ -372,6 +378,11 @@ refused before the call was sent. Its `error` is a plain sentence naming the win
 it lifts and the two remedies, written to be shown as is. It is a refusal until the window
 lifts or the limit is raised -- and unlike `budget_exceeded`, a new conversation does not
 cure it, because the limit is system-wide.
+
+`usage_ceiling` is not a failure: the turn's own paid spend passed the person's 10-minute
+limit, so the loop stopped at a step boundary, never mid-call (#2431). `error` is `None`;
+the finished steps stand in history, and the person continues the turn in place
+(`BaseAgent.continue_turn`) with no resend. With No limit there is no ceiling.
 
 `provider_timeout` is the one failure ending that is named rather than left to `error`.
 Every other provider failure arrives as a string in `error` and is indistinguishable from

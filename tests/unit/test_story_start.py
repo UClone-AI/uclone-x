@@ -3361,6 +3361,8 @@ class TestAWaitingStartGetsThePersonsAnswer:
 
         Killed by: examples/story/src/uclone_x_story/scene_turn.py :: long_text = own_sentences(self.reply, [*given, *saved]) >= OWN_SENTENCES_SHOWN
         Becomes: long_text = False
+        Killed by: examples/story/src/uclone_x_story/scene_turn.py :: if moved and replaces_reply(records):
+        Becomes: if False:
         """
         story_id = await self._at_outline(tmp_path)
         aid = SceneTurnHook().turn_aid(
@@ -3383,6 +3385,11 @@ class TestAWaitingStartGetsThePersonsAnswer:
             "제가 직접 쓴 글은 이야기에 저장되지 않았습니다. 이야기는 1장의 장면 계획에 대한 "
             "답을 기다리고 있습니다."
         )
+        replacing_record = ToolExecutionRecord(
+            tool_name="story_start",
+            output=moved,
+        )
+        assert aid.reply_lines([replacing_record], korean=True) == []
 
     async def test_a_finished_start_gives_the_scene_again(self, tmp_path: Path) -> None:
         """Killed by: examples/story/src/uclone_x_story/start_notes.py :: if state is None or state.stage == "done" or state.left_request is not None:

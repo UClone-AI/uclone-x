@@ -3,7 +3,6 @@
     "all": "전체",
     "llm": "모델",
     "usage": "사용량",
-    "tools": "GPU 컴퓨터",
     "folders": "폴더 접근",
     "clones": "페르소나 및 클론",
     "skills": "스킬 및 MCP",
@@ -40,8 +39,8 @@
   },
   "remoteGpu": {
     "title": "원격 GPU 컴퓨터",
-    "usedBy": "그림 그리기 (모델 실행도 가능)",
-    "hint": "SSH로 다른 컴퓨터에 접속해 그 컴퓨터의 그래픽 카드를 사용합니다. 그 컴퓨터의 ComfyUI는 모델 탭에 그림 연결로 추가되고, 모델은 아래 항목을 체크하지 않으면 지금 쓰는 곳에 그대로 남습니다.",
+    "usedBy": "대화 모델(Ollama) 및 그림 생성(ComfyUI)",
+    "hint": "SSH로 다른 컴퓨터에 접속해 그 컴퓨터의 Ollama와 ComfyUI를 위 모델 연결 목록에 추가합니다.",
     "hostPlaceholder": "호스트 이름 또는 IP",
     "connect": "연결",
     "connecting": "연결 중...",
@@ -53,7 +52,7 @@
     "servicesReached": "연결된 서비스: {services}",
     "serviceAt": "{service} (포트 {port})",
     "autoStarted": "ComfyUI를 자동으로 시작했습니다",
-    "useForLlm": "모델도 그 컴퓨터(Ollama)에서 실행",
+    "useForLlm": "그 컴퓨터의 Ollama 모델도 연결로 추가",
     "llmModelMissing": "선택한 모델이 그 컴퓨터에 설치되어 있지 않아 모델은 이 컴퓨터에 그대로 둡니다.",
     "connectFailedHost": "{host}에 연결하지 못했습니다.",
     "errorDetails": "세부 정보",
@@ -86,7 +85,7 @@
   },
   "developerMode": {
     "title": "개발자 모드",
-    "hint": "작업 패널에 개발자 도구 모음(Knowledge Graph, DAG, EventBus, Ontology)을 추가하고, 아래에 진단 섹션(ACP와 Evals)을 표시합니다. 즉시 적용되며 이 브라우저에 저장됩니다."
+    "hint": "작업 패널에 개발자 도구 모음(Knowledge Graph)을 추가하고, 아래에 진단 섹션(ACP와 Evals)을 표시합니다. 즉시 적용되며 이 브라우저에 저장됩니다."
   },
   "footer": {
     "close": "닫기"

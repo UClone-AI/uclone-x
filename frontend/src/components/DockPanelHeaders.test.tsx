@@ -1,9 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { render, screen } from '@testing-library/react';
 import { SkillsTab } from './SkillsTab';
-import { OntologyTab } from './OntologyTab';
-import { LedgerTab } from './LedgerTab';
-import { TopologyTab } from './TopologyTab';
 import { EvaluationsTab } from './EvaluationsTab';
 import { ActivityTimeline } from './artifacts/ActivityTimeline';
 
@@ -64,52 +61,6 @@ describe('dock panel header rows wrap (#1029)', () => {
     // nothing beside the selects instead of taking a line of its own.
     expect(field.className).toMatch(/\bbasis-48\b/);
     expect(field.className).toMatch(/\bgrow\b/);
-  });
-
-  // Killed by: frontend/src/components/OntologyTab.tsx :: shadow-lg flex flex-wrap gap-3
-  // Becomes: shadow-lg flex flex-col sm:flex-row gap-3
-  it('Ontology: the search bar wraps its filter under the search', () => {
-    render(<OntologyTab ontology={null} onRefresh={vi.fn()} isLoading={false} />);
-    const search = screen.getByPlaceholderText(/Search concepts/);
-    expectWraps(rowOf(search.parentElement as HTMLElement));
-  });
-
-  // Killed by: frontend/src/components/LedgerTab.tsx :: shadow-lg flex flex-wrap gap-3
-  // Becomes: shadow-lg flex flex-col sm:flex-row gap-3
-  it('Ledger: the search bar wraps its filters under the search', () => {
-    render(
-      <LedgerTab
-        events={[]}
-        isPaused={false}
-        onTogglePause={vi.fn()}
-        onClearEvents={vi.fn()}
-        lastHeartbeat="--"
-      />,
-    );
-    const search = screen.getByPlaceholderText(/Search topic/);
-    expectWraps(rowOf(search.parentElement as HTMLElement));
-  });
-
-  // Killed by: frontend/src/components/LedgerTab.tsx :: <div className="flex flex-wrap items-center gap-3">
-  // Becomes: <div className="flex items-center gap-3">
-  it('Ledger: the heartbeat, Pause and Clear wrap', () => {
-    render(
-      <LedgerTab
-        events={[]}
-        isPaused={false}
-        onTogglePause={vi.fn()}
-        onClearEvents={vi.fn()}
-        lastHeartbeat="--"
-      />,
-    );
-    expectWraps(rowOf(screen.getByText(/Last Heartbeat/).closest('div') as HTMLElement));
-  });
-
-  // Killed by: frontend/src/components/TopologyTab.tsx :: <div className="flex flex-wrap items-center gap-3">
-  // Becomes: <div className="flex items-center gap-3">
-  it('Topology: the Refresh control wraps', () => {
-    render(<TopologyTab roomId={null} />);
-    expectWraps(rowOf(screen.getByRole('button', { name: 'Refresh' })));
   });
 
   // Killed by: frontend/src/components/EvaluationsTab.tsx :: flex flex-wrap items-center justify-between gap-4

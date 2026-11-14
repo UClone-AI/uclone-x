@@ -45,6 +45,7 @@ __all__ = [
     "RoomMessage",
     "RoomMessageKind",
     "RoomFileRecord",
+    "RoomFloor",
     "RoomLoop",
     "RoomPolicy",
     "RoomState",
@@ -53,6 +54,7 @@ __all__ = [
     "SelectionVerdict",
     "SpeakerDecision",
     "SpeakerRequest",
+    "SpeakerStepOutcome",
     "TurnState",
     "head_keeper",
     "head_room_write_refusal",
@@ -359,6 +361,16 @@ class RoomMessage(BaseModel):
         "shows for it. `error` is for the log's reader and is never shown; this is what "
         "tells the user whether their model was retired, their key refused, or the "
         "provider down. `None` on every other row, and on rows stored before it existed.",
+    )
+    stopped_at_ceiling: bool = Field(
+        default=False,
+        exclude_if=lambda stopped: not stopped,
+        description="Set when the turn stopped at its own usage ceiling (#2431, `TurnResult."
+        "stop_reason` `usage_ceiling`): it spent past the person's 10-minute limit for paid "
+        "models, and stopped between steps. Not a failure: `error` is unset and the finished "
+        "steps stand, so a head offers Continue (`POST /api/rooms/{id}/continue`), which "
+        "goes on with no resend. Left out of the saved row while `False`, so a build older "
+        "than this field can still read the room.",
     )
     persona_edit_dropped: bool = Field(
         default=False,
@@ -915,6 +927,79 @@ class RoomLoop(BaseModel):
     )
 
 
+class SpeakerStepOutcome(BaseModel):
+    """What one speaker's turn came to, before any room has written it.
+
+    `execute_single_speaker_step` produces it and `land_speaker_step` turns it into the row, so
+    a process that holds the floor (`RoomOrchestrator`) and a cluster worker that runs the seat
+    apart from the room that lands it share one account of a turn. In the cluster it crosses
+    between the two as JSON, in the seat turn's receipt.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
+
+    turn_id: str
+    rendered_through: int = 0
+    content: str = ""
+    error: str | None = None
+    completed: bool = True
+    provenance: Provenance | None = None
+    usage: TokenUsage | None = None
+    refusal: RoomTurnRefusal | None = None
+    step_refusal: StepRefusalCode | None = None
+    provider_failure: ProviderFailure | None = None
+    persona_edit_dropped: bool = False
+    stopped_at_ceiling: bool = False
+    tools_recorded: bool = False
+    story_id: str | None = None
+    tool_uses: tuple[RoomToolUse, ...] = ()
+    written_files: tuple[RoomWrittenFile, ...] = ()
+    memory_facts_tried: int = 0
+    memory_facts_unsaved: int = 0
+    image_prompt_added: tuple[str, ...] = ()
+    image_negative_added: tuple[str, ...] = ()
+    persist_error: str | None = None
+    session_set_aside: bool = False
+
+    @property
+    def committed(self) -> bool:
+        """The one predicate for a turn's commit (#1423): no error, and it said or did something.
+
+        An interrupted turn carries an `error` too. A silent turn did not answer, so its unseen
+        span is not consumed (#2168).
+        """
+        return self.error is None and (bool(self.content.strip()) or bool(self.tool_uses))
+
+
+class RoomFloor(BaseModel):
+    """The speaker a cluster worker gave the floor to, written with the count of its start.
+
+    Durable because the worker that lands the turn is not the one that gave the floor. Only the
+    cluster path writes it (`shells/cluster/room_steps.py`): a process that runs `post` holds its
+    floor in memory, and the field stays `None` on its rooms.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
+
+    turn_id: str
+    session_id: str
+    speaker_id: str
+    cascade_id: str
+    #: Whose turn this is: the seat's usage and its file tools are this user's.
+    user_id: str
+    decision: SpeakerDecision
+    #: The human row this cascade answers: a human row past it is an interjection.
+    baseline_seq: int
+    #: The cascade's lessons start after this row.
+    learn_from_seq: int
+    #: When the floor was given, for reclaiming one whose seat turn was lost.
+    given_at_ms: int
+    #: A person stopped the room: this turn's landing starts nobody for what was said by then.
+    interrupted: bool = False
+    #: The room's last row when the stop was reached. A message past it starts its own cascade.
+    stopped_through: int = 0
+
+
 class RoomState(BaseModel):
     """One room: its roster, its transcript, and its floor state.
 
@@ -924,7 +1009,7 @@ class RoomState(BaseModel):
     utterance.
 
     **Forward compatibility (#1885).** The fields added for a feature -- `tool_uses`,
-    `written_files`, `file_record`, `story_id`, `head`, `loop`, `workspace` -- are left out of the saved
+    `written_files`, `file_record`, `story_id`, `head`, `loop`, `workspace`, `floor` -- are left out of the saved
     record while they hold their default (`exclude_if`), so a room that uses none of those
     features is written in the shape an older build reads. A room that does use one still
     carries it, and an older build refuses that record under `extra="forbid"`. That
@@ -1033,6 +1118,12 @@ class RoomState(BaseModel):
         "path, or None for the server's launch directory (clone-data-scopes §3.6). Every "
         "seat's turn is bound to it from the next turn on: the file tools, the sandbox and "
         "the stories all follow it. Changed by `RoomService.set_workspace`.",
+    )
+    floor: RoomFloor | None = Field(
+        default=None,
+        exclude_if=lambda floor: floor is None,
+        description="The speaker a cluster worker has given the floor to, or None. Written in "
+        "the same commit as `turns_started`, and cleared by the commit that lands the turn.",
     )
     created_at: str = Field(default_factory=_now_iso)
     updated_at: str = Field(default_factory=_now_iso)

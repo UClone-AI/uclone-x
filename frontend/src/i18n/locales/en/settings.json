@@ -3,7 +3,6 @@
     "all": "All",
     "llm": "Models",
     "usage": "Usage",
-    "tools": "GPU computer",
     "folders": "Folder Access",
     "clones": "Personas & Clones",
     "skills": "Skills & MCP",
@@ -40,8 +39,8 @@
   },
   "remoteGpu": {
     "title": "Remote GPU computer",
-    "usedBy": "Draws pictures (and can run the model)",
-    "hint": "Connects to another computer over SSH and uses its graphics card. Its ComfyUI is added under Models as a picture connection; the model stays where it is unless you tick the box below.",
+    "usedBy": "Ollama (Remote GPU) & ComfyUI (Remote GPU pictures)",
+    "hint": "Connects to another computer over SSH and adds its Ollama (Remote GPU) and ComfyUI (Remote GPU pictures) to Model Connections above.",
     "hostPlaceholder": "Hostname or IP",
     "connect": "Connect",
     "connecting": "Connecting...",
@@ -53,7 +52,7 @@
     "servicesReached": "Reached: {services}",
     "serviceAt": "{service} (port {port})",
     "autoStarted": "ComfyUI was started for you",
-    "useForLlm": "Also run the model on that computer (Ollama)",
+    "useForLlm": "Add its Ollama models as a connection (Remote GPU)",
     "llmModelMissing": "The model stays on this computer: the chosen model is not installed on the other one.",
     "connectFailedHost": "Could not connect to {host}.",
     "errorDetails": "Details",
@@ -86,7 +85,7 @@
   },
   "developerMode": {
     "title": "Developer mode",
-    "hint": "Adds a drawer of developer tools to the workspace dock (Knowledge Graph, DAG, EventBus and Ontology) and a Diagnostics section below (ACP and Evals). Takes effect at once and is kept in this browser."
+    "hint": "Adds a drawer of developer tools to the workspace dock (Knowledge Graph) and a Diagnostics section below (ACP and Evals). Takes effect at once and is kept in this browser."
   },
   "footer": {
     "close": "Close"

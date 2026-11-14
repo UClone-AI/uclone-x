@@ -5,6 +5,7 @@ import { UsageOffer, USAGE_OFFER_DISMISSED_KEY } from './UsageOffer';
 import { UsageBanner } from '../rooms/UsageBanner';
 import { USAGE_PRESETS, type UsageLimitsValue, type UsageReport, type UsageWindowStatus } from '../../lib/usage';
 import { expectPlain } from '../../test/plainCopy';
+import { LocaleProvider } from '../../i18n';
 
 type Answer = { ok: boolean; status: number; json: () => Promise<unknown> };
 const answer = (body: unknown, ok = true, status = 200): Answer => ({ ok, status, json: async () => body });
@@ -14,7 +15,8 @@ const win = (
   used: number,
   limit: number | null,
   available_again_at: string | null = null,
-): UsageWindowStatus => ({ window, used, limit, available_again_at });
+  cached = 0,
+): UsageWindowStatus => ({ window, used, cached, limit, available_again_at });
 
 const report = (over: Partial<UsageReport> = {}, limits: UsageLimitsValue = USAGE_PRESETS.none): UsageReport => ({
   checked_at: '2026-09-26T10:00:00Z',
@@ -76,6 +78,48 @@ describe('UsageSection', () => {
     // Limits matching no preset open on Custom, with the saved figures in the boxes.
     expect(screen.getByTestId('settings-usage-preset-custom')).toHaveAttribute('aria-checked', 'true');
     expect(screen.getByTestId('settings-usage-input-per_5_hours')).toHaveValue('100000');
+  });
+
+  // Killed by: frontend/src/components/settings/UsageSection.tsx :: fmt(copy.split, { new: compactTokens(status.used - status.cached), cached: compactTokens(status.cached) })
+  // Becomes: fmt(copy.split, { new: compactTokens(status.used), cached: compactTokens(status.cached) })
+  it.each([
+    ['en', 'en-US', '56K new · 1.1M cached', 'The limit counts both new and cached tokens.'],
+    ['ko', 'ko-KR', '새 토큰 56K · 캐시된 토큰 1.1M', '한도는 새 토큰과 캐시된 토큰을 모두 셉니다.'],
+  ])('shows each window as new and cached tokens, in %s (#2429)', async (_name, hint, split, counts) => {
+    mockFetch([
+      report({
+        windows: [
+          win('per_10_minutes', 1_156_000, 1_000_000, '2026-09-26T10:08:00Z', 1_100_000),
+          win('per_5_hours', 2_000, null),
+          win('per_week', 1_158_000, null, null, 1_100_000),
+        ],
+      }),
+    ]);
+    render(
+      <LocaleProvider hints={[hint]}>
+        <UsageSection />
+      </LocaleProvider>,
+    );
+
+    const tenMinutes = await screen.findByTestId('settings-usage-split-per_10_minutes');
+    expect(tenMinutes).toHaveTextContent(split);
+    expectPlain(tenMinutes.textContent);
+    // A window where nothing was reported cached says so as 0, not by leaving the line out.
+    expect(screen.getByTestId('settings-usage-split-per_5_hours')).toHaveTextContent(
+      hint === 'en-US' ? '2K new · 0 cached' : '새 토큰 2K · 캐시된 토큰 0',
+    );
+    const note = screen.getByTestId('settings-usage-cached-note');
+    expect(note).toHaveTextContent(counts);
+    expectPlain(note.textContent);
+  });
+
+  it('treats a report without the cached figure as unreadable, not as nothing cached', async () => {
+    const { cached: _dropped, ...noCached } = win('per_week', 5, null);
+    mockFetch([report({ windows: [noCached as UsageWindowStatus] })]);
+    render(<UsageSection />);
+
+    expect(await screen.findByTestId('settings-usage-error')).toBeInTheDocument();
+    expect(screen.queryByTestId('settings-usage-windows')).toBeNull();
   });
 
   it('says when paid models are paused, for a reached window', async () => {

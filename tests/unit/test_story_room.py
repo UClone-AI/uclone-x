@@ -133,8 +133,8 @@ def _room(
 class TestEverySeatWorksOnTheRoomsStory:
     @pytest.mark.asyncio
     async def test_two_seats_in_one_room_resolve_the_same_story_root(self, tmp_path: Path) -> None:
-        """Killed by: src/uclone_x/room/orchestrator.py :: story_id=state.story_id,
-        Becomes: story_id=None,
+        """Killed by: src/uclone_x/room/orchestrator.py :: "story_id": state.story_id,
+        Becomes: "story_id": None,
         """
         story = StoryLibrary(tmp_path).create("Tide", "r1").story_id
         _, seats, orch = _room(tmp_path, story)
@@ -149,8 +149,8 @@ class TestEverySeatWorksOnTheRoomsStory:
 
     @pytest.mark.asyncio
     async def test_seats_hold_the_lease_as_one_conversation(self, tmp_path: Path) -> None:
-        """Killed by: src/uclone_x/room/orchestrator.py :: room_id=room_id,
-        Becomes: room_id=None,
+        """Killed by: src/uclone_x/room/orchestrator.py :: "room_id": state.room_id,  # the seat's conversation (#1555)
+        Becomes: "room_id": None,  # the seat's conversation (#1555)
         """
         _, seats, orch = _room(tmp_path, None)
 

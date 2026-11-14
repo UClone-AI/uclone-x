@@ -1,11 +1,181 @@
-version: "3.8"
+# UClone-X distributed runtime: the cloud topology, run locally.
+#
+#   kafka        Apache Kafka KRaft (apache/kafka-native, Apache-2.0): command and stream topics
+#   postgres     PostgreSQL 16 (PostgreSQL License): durable source of truth for session and
+#                room state (revision OCC)
+#   valkey-1..6  Valkey cluster (BSD-3-Clause), 3 primaries + 3 replicas: hot cache and
+#                coordination state, `maxmemory-policy volatile-lru`
+#   centrifugo   Centrifugo v6 (Apache-2.0): SSE edge; consumes `ucx.stream.sse` from Kafka with
+#                its built-in consumer and keeps channel history in the Valkey cluster
+#
+# Start it with `ucx cluster up`, not with `docker compose up` directly: `ucx cluster up` writes
+# the stack's secrets once into `.ucx-cluster/stack.env` (gitignored) and passes that file as
+# `--env-file`. Every secret below is `${VAR:?...}`, so a missing secret stops compose before
+# any container starts; there is no default password anywhere in this file.
+#
+# Host ports are variables so a second stack (another worktree, a test run) can live beside
+# the first: set them in the stack env file. Inside the compose network every service uses
+# its standard port.
+#
+# The `ucx-ingress` and `ucx-worker` services (UClone-X as separate stateless processes)
+# join this file in a later step; nothing here assumes the dashboard runs inside compose.
+
+name: ${UCX_CLUSTER_PROJECT:-uclone-x-cluster}
+
+x-valkey-node: &valkey-node
+  image: valkey/valkey:8.1.10-alpine
+  restart: unless-stopped
+  environment:
+    UCX_VALKEY_PASSWORD: ${UCX_VALKEY_PASSWORD:?run `ucx cluster up` to generate the stack secrets}
+    UCX_VALKEY_MAXMEMORY: ${UCX_VALKEY_MAXMEMORY:-256mb}
+  # Each node announces its compose hostname, so clients inside the network follow MOVED
+  # redirects by name; a client on the host maps those names to the published ports.
+  # `volatile-lru` evicts only keys that carry a TTL: cache keys do, coordination keys never.
+  command:
+    - sh
+    - -c
+    - >-
+      exec valkey-server
+      --port 6379
+      --cluster-enabled yes
+      --cluster-config-file /data/nodes.conf
+      --cluster-node-timeout 3000
+      --cluster-replica-validity-factor 0
+      --cluster-announce-hostname "$$(hostname)"
+      --cluster-preferred-endpoint-type hostname
+      --appendonly yes
+      --maxmemory "$$UCX_VALKEY_MAXMEMORY"
+      --maxmemory-policy volatile-lru
+      --requirepass "$$UCX_VALKEY_PASSWORD"
+      --masterauth "$$UCX_VALKEY_PASSWORD"
+  healthcheck:
+    test: ["CMD-SHELL", "valkey-cli -a \"$$UCX_VALKEY_PASSWORD\" --no-auth-warning ping | grep -q PONG"]
+    interval: 2s
+    timeout: 2s
+    retries: 30
 
 services:
+  kafka:
+    image: apache/kafka-native:3.8.0
+    restart: unless-stopped
+    environment:
+      KAFKA_NODE_ID: "1"
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093,EXTERNAL://0.0.0.0:19092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://127.0.0.1:${UCX_KAFKA_PORT:-19092}
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
+      KAFKA_NUM_PARTITIONS: "16"
+      # Topics are created by `ucx cluster up` with their declared partition counts.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      # The log stays in the container's writable layer: it survives `restart` and `stop`, and
+      # `ucx cluster down --volumes` is what discards it. (A named volume would be root-owned
+      # and the image runs as `appuser`, so the broker could not format it.)
+      KAFKA_LOG_DIRS: /tmp/kraft-combined-logs
+    ports:
+      - "127.0.0.1:${UCX_KAFKA_PORT:-19092}:19092"
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${UCX_POSTGRES_USER:-uclone}
+      POSTGRES_PASSWORD: ${UCX_POSTGRES_PASSWORD:?run `ucx cluster up` to generate the stack secrets}
+      POSTGRES_DB: ${UCX_POSTGRES_DB:-uclone_cluster}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:${UCX_POSTGRES_PORT:-15432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  valkey-1:
+    <<: *valkey-node
+    hostname: valkey-1
+    volumes: [valkey-1-data:/data]
+    ports: ["127.0.0.1:${UCX_VALKEY_PORT_1:-17001}:6379"]
+  valkey-2:
+    <<: *valkey-node
+    hostname: valkey-2
+    volumes: [valkey-2-data:/data]
+    ports: ["127.0.0.1:${UCX_VALKEY_PORT_2:-17002}:6379"]
+  valkey-3:
+    <<: *valkey-node
+    hostname: valkey-3
+    volumes: [valkey-3-data:/data]
+    ports: ["127.0.0.1:${UCX_VALKEY_PORT_3:-17003}:6379"]
+  valkey-4:
+    <<: *valkey-node
+    hostname: valkey-4
+    volumes: [valkey-4-data:/data]
+    ports: ["127.0.0.1:${UCX_VALKEY_PORT_4:-17004}:6379"]
+  valkey-5:
+    <<: *valkey-node
+    hostname: valkey-5
+    volumes: [valkey-5-data:/data]
+    ports: ["127.0.0.1:${UCX_VALKEY_PORT_5:-17005}:6379"]
+  valkey-6:
+    <<: *valkey-node
+    hostname: valkey-6
+    volumes: [valkey-6-data:/data]
+    ports: ["127.0.0.1:${UCX_VALKEY_PORT_6:-17006}:6379"]
+
+  # One-shot: joins the six nodes into a cluster (3 primaries, 1 replica each) the first time,
+  # and exits 0 without changes when the cluster already exists.
+  valkey-init:
+    image: valkey/valkey:8.1.10-alpine
+    restart: "no"
+    environment:
+      UCX_VALKEY_PASSWORD: ${UCX_VALKEY_PASSWORD:?run `ucx cluster up` to generate the stack secrets}
+    depends_on:
+      valkey-1: {condition: service_healthy}
+      valkey-2: {condition: service_healthy}
+      valkey-3: {condition: service_healthy}
+      valkey-4: {condition: service_healthy}
+      valkey-5: {condition: service_healthy}
+      valkey-6: {condition: service_healthy}
+    command:
+      - sh
+      - -c
+      - >-
+        if valkey-cli -h valkey-1 -a "$$UCX_VALKEY_PASSWORD" --no-auth-warning cluster info
+        | grep -q 'cluster_state:ok'; then echo 'valkey cluster already formed'; exit 0; fi;
+        exec valkey-cli -a "$$UCX_VALKEY_PASSWORD" --no-auth-warning --cluster create
+        valkey-1:6379 valkey-2:6379 valkey-3:6379 valkey-4:6379 valkey-5:6379 valkey-6:6379
+        --cluster-replicas 1 --cluster-yes
+
+  centrifugo:
+    image: centrifugo/centrifugo:v6.9.7
+    restart: unless-stopped
+    command: ["centrifugo", "--config", "/centrifugo/config.json"]
+    environment:
+      CENTRIFUGO_CLIENT_TOKEN_HMAC_SECRET_KEY: ${UCX_CENTRIFUGO_HMAC_SECRET:?run `ucx cluster up` to generate the stack secrets}
+      CENTRIFUGO_HTTP_API_KEY: ${UCX_CENTRIFUGO_API_KEY:?run `ucx cluster up` to generate the stack secrets}
+      CENTRIFUGO_ENGINE_REDIS_PASSWORD: ${UCX_VALKEY_PASSWORD:?run `ucx cluster up` to generate the stack secrets}
+    volumes:
+      - ./deploy/centrifugo/config.json:/centrifugo/config.json:ro
+    depends_on:
+      kafka: {condition: service_started}
+      valkey-init: {condition: service_completed_successfully}
+    ports:
+      - "127.0.0.1:${UCX_CENTRIFUGO_PORT:-18000}:8000"
+
+  # The single-process dashboard image. Not part of the cluster topology; start it explicitly
+  # with `docker compose --profile dashboard up uclone-x`.
   uclone-x:
+    profiles: ["dashboard"]
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: uclone-x-dashboard
     ports:
       - "5180:5180"
     environment:
@@ -14,3 +184,12 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
+
+volumes:
+  postgres-data:
+  valkey-1-data:
+  valkey-2-data:
+  valkey-3-data:
+  valkey-4-data:
+  valkey-5-data:
+  valkey-6-data:

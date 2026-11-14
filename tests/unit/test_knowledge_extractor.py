@@ -1465,7 +1465,7 @@ async def test_a_clone_switched_off_still_saves_corrects_and_forgets(tmp_path: P
 async def test_a_failed_turn_is_not_learned_from(tmp_path: Path) -> None:
     """Only a committed turn is queued.
 
-    Killed by: src/uclone_x/room/orchestrator.py :: if committed:  # a failed turn teaches nothing
+    Killed by: src/uclone_x/room/orchestrator.py :: if outcome.committed:  # a failed turn teaches nothing
     Becomes: if True:
     """
 

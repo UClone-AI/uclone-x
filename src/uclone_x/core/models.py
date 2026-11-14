@@ -1,6 +1,6 @@
 """The persona and plan models a session record carries, below `agent/` (#1734).
 
-`PersonaDefinition` (with the `AgentLLMConfig` and `ModelTier` it holds, and the base tool
+`PersonaDefinition` (with the `AgentLLMConfig` it holds, and the base tool
 names its `granted_tools` adds) and `PlanState`/`PlanStep` were defined in
 `agent/models.py`. `SessionState` carries both -- a persona through
 `AnchorProvenance.persona`, a plan through `SessionState.plan` -- so they moved here with
@@ -14,8 +14,7 @@ Not to be confused with the `PlanStep` in `agent/planner.py`, a different model.
 from __future__ import annotations
 
 import uuid
-from enum import StrEnum
-from typing import Literal
+from typing import Literal, cast
 
 from pydantic import (
     BaseModel,
@@ -32,9 +31,7 @@ __all__ = [
     "BASE_MEMORY_TOOLS",
     "BASE_PERSONA_TOOLS",
     "BASE_SELF_TOOLS",
-    "RETIRED_MODEL_TIERS",
     "AgentLLMConfig",
-    "ModelTier",
     "PersonaDefinition",
     "PlanState",
     "PlanStep",
@@ -42,32 +39,30 @@ __all__ = [
 ]
 
 
-class ModelTier(StrEnum):
-    """Which of the two global models an agent's turns run on by default.
-
-    ``inherit`` follows the deep model in Settings, as every shipped persona does. ``fast``
-    was already written by the persona editor and is kept readable. The other values once
-    offered (``pro``, ``flash_lite``, ``custom``) were read by nothing: a persona file that
-    still names one loads as ``inherit`` (see :data:`RETIRED_MODEL_TIERS`). The models
-    themselves are named by ``AgentLLMConfig.model_name`` and ``fast_model``.
-    """
-
-    INHERIT = "inherit"
-    FAST = "fast"
-
-
-#: Tier names persona files may still carry from before :class:`ModelTier` was cut to
-#: two. Nothing ever read them, so a file naming one loads as ``inherit`` rather than
-#: failing to load.
-RETIRED_MODEL_TIERS: frozenset[str] = frozenset({"pro", "flash_lite", "custom"})
-
-
 class AgentLLMConfig(BaseModel):
     """Per-agent LLM parameter and token budget configuration."""
 
     model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
 
-    model_tier: ModelTier = ModelTier.INHERIT
+    @model_validator(mode="before")
+    @classmethod
+    def _drop_the_retired_tier(cls, data: object) -> object:
+        """Read a config written before #2419 with its `model_tier` dropped.
+
+        The tier chose no model and is gone, but every config dumped before then carries it:
+        persona and clone files, and each session record's persona snapshot
+        (`anchor_provenance.persona.llm_config`, in 33 of the owner's 71 records). Refusing
+        it as an extra field made those records unreadable, and a conversation lost its
+        history to the clone (#2423 review). This one named key is dropped wherever the
+        config is read; any other unknown key is still refused.
+        """
+        if not isinstance(data, dict):
+            return data
+        fields = cast("dict[object, object]", data)
+        if "model_tier" in fields:
+            return {k: v for k, v in fields.items() if k != "model_tier"}
+        return fields
+
     #: The agent's own deep model -- the one its turns run on. ``None`` follows the system
     #: default. In a persona it is a model ref, ``<connection id>/<model id>``
     #: (model-gateway §3.4); on a built agent it is the bare id its connector is sent.

@@ -26,6 +26,7 @@ from uclone_x.core.log_inspector import get_log_file, read_logs
 from uclone_x.core.session_diagnostics import (
     DEFAULT_MAX_CONVERSATION_TURNS,
     check_session_health,
+    diagnose_session_forensics,
     inspect_session,
     list_session_summaries,
 )
@@ -292,6 +293,18 @@ def session_status(
         f"  • Total:      [bold]{len(details.messages)}[/bold]",
     ]
 
+    payload_kb = round(details.payload_bytes / 1024, 2)
+    sig_kb = round(details.signature_bytes / 1024, 2)
+    content_lines.extend(
+        [
+            "",
+            "[bold]Context Payload:[/bold]",
+            f"  • Estimated Tokens:   [bold]{details.estimated_tokens:,}[/bold]",
+            f"  • Wire Payload Size:  {payload_kb} KB ({details.payload_bytes:,} bytes)",
+            f"  • Thought Signatures: {details.signature_count} ({sig_kb} KB)",
+        ]
+    )
+
     # Plan section
     content_lines.append("")
     if details.has_plan:
@@ -395,6 +408,106 @@ def session_check(
 
     if total_errors > 0:
         raise typer.Exit(code=1)
+
+
+@session_app.command("diagnose")
+def session_diagnose(
+    session_id: str = typer.Argument(..., help="Session ID to diagnose"),
+    turns: int = typer.Option(
+        5, "--turns", "-t", help="Number of recent interaction turns to inspect"
+    ),
+    max_conversation_turns: int = typer.Option(
+        DEFAULT_MAX_CONVERSATION_TURNS,
+        "--max-turns",
+        "-m",
+        help="Advisory conversation-turn threshold to evaluate against",
+    ),
+) -> None:
+    """Run end-to-end session forensics: context payload, behavioral anomalies, turn timeline, and logs."""
+    store = SessionStore()
+    repo_root = _repo_root()
+    forensics = diagnose_session_forensics(
+        session_id=session_id,
+        store=store,
+        workspace_root=repo_root,
+        max_conversation_turns=max_conversation_turns,
+        tail_turns=turns,
+    )
+    if forensics is None:
+        console.print(
+            f"[bold red]✖ Session not found:[/bold red] '{session_id}' in {store.storage_dir}"
+        )
+        raise typer.Exit(code=1)
+
+    details = forensics.details
+    s = details.summary
+    payload_kb = round(details.payload_bytes / 1024, 2)
+    sig_kb = round(details.signature_bytes / 1024, 2)
+
+    summary_lines = [
+        f"[bold]Session ID:[/bold]         [cyan]{s.session_id}[/cyan]  |  [bold]Agent:[/bold] [magenta]{s.agent_id}[/magenta]  |  [bold]Status:[/bold] {_format_status_badge(s.status)}",
+        f"[bold]Estimated Tokens:[/bold]   [bold]{details.estimated_tokens:,}[/bold]",
+        f"[bold]Wire Payload Size:[/bold]  {payload_kb} KB ({details.payload_bytes:,} bytes)",
+        f"[bold]Thought Signatures:[/bold] {details.signature_count} ({sig_kb} KB)",
+    ]
+    console.print(
+        Panel(
+            "\n".join(summary_lines),
+            title=f"🩺 Session Forensics: {session_id}",
+            border_style="cyan",
+        )
+    )
+
+    if not forensics.health.issues:
+        console.print("[bold green]✔ No health or behavioral anomalies detected.[/bold green]")
+    else:
+        console.print(
+            f"[bold yellow]⚠ Detected Anomalies ({len(forensics.health.issues)}):[/bold yellow]"
+        )
+        for issue in forensics.health.issues:
+            color = "red" if issue.severity == "error" else "yellow"
+            turn_tag = f" [turn #{issue.turn_index}]" if issue.turn_index is not None else ""
+            console.print(f"  [{color}]• [{issue.code}]{turn_tag} {issue.message}[/{color}]")
+
+    if forensics.turns:
+        timeline = Table(
+            title=f"⏱ Recent Turn Execution Timeline (last {len(forensics.turns)} turn(s))",
+            padding=(0, 1),
+        )
+        timeline.add_column("Turn", justify="right", style="bold cyan")
+        timeline.add_column("Steps", justify="right")
+        timeline.add_column("Total / Max (s)", justify="right")
+        timeline.add_column("Tools (failed)", ratio=2)
+        timeline.add_column("Outcome / Prompt", ratio=3)
+        for rec in forensics.turns:
+            tools_txt = ", ".join(rec.tool_calls) if rec.tool_calls else "-"
+            if rec.failed_tools:
+                tools_txt += f" [red](failed: {', '.join(rec.failed_tools)})[/red]"
+            outcome = (
+                f"[red]{rec.stop_reason}: {rec.error_message}[/red]"
+                if rec.error_message
+                else f"[green]{rec.stop_reason}[/green]"
+            )
+            if rec.user_prompt:
+                outcome += f"\n[dim]{rec.user_prompt}[/dim]"
+            timeline.add_row(
+                str(rec.turn_index),
+                str(rec.step_count),
+                f"{rec.total_duration_seconds:.2f}s / {rec.max_step_duration_seconds:.2f}s",
+                tools_txt,
+                outcome,
+            )
+        console.print(timeline)
+
+    log_file = get_log_file()
+    if log_file.is_file():
+        log_entries = read_logs(log_file, tail=20, session_id=session_id)
+        if log_entries:
+            console.print(f"[dim]── Correlated ucx.log Entries ({len(log_entries)}) ──[/dim]")
+            for entry in log_entries:
+                console.print(
+                    f"  [dim]{entry.timestamp[:19]}[/dim] [{entry.level}] {entry.message}"
+                )
 
 
 def dev_logs(

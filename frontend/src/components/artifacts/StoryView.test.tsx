@@ -720,4 +720,79 @@ describe('StoryView: what an entry is to others, and what each scene changed (#2
     expect(vane!.textContent).not.toMatch(/ch01\.s02|mara\b|p-000/);
     expect(within(vane!).queryByRole('button')).toBeNull();
   });
+
+  it('navigates the World KG by category and timeline, and shows written scene manuscript on the board (#2409)', async () => {
+    // Killed by: frontend/src/components/artifacts/StoryView.tsx :: <WorldKgExplorer story={story} onChoose={setChosen} />
+    // Becomes: {null}
+    // Killed by: frontend/src/components/artifacts/StoryView.tsx :: const visibleGroups = tab === 'all' ? groups : groups.filter((g) => g.kind === tab);
+    // Becomes: const visibleGroups = groups;
+    // Killed by: frontend/src/components/artifacts/StoryView.tsx :: <p className="mt-1.5 whitespace-pre-wrap text-slate-200 leading-relaxed">{scene.manuscript}</p>
+    // Becomes: <p className="mt-1.5 whitespace-pre-wrap text-slate-200 leading-relaxed">{""}</p>
+    const story = boardStory();
+    story.outline!.chapters[0].scenes[0].manuscript = 'Mara stepped onto the rain-slick platform.';
+    story.world_kg = [
+      {
+        kind: 'characters',
+        label: 'Characters',
+        entries: [
+          {
+            id: 'mara',
+            name: 'Mara',
+            aliases: ['The Courier'],
+            profile: 'Carries the map.',
+            state: { location: 'Station' },
+            relations: {},
+            progressions: [{ at: 'ch01.s01', set: { location: 'Train' }, note: 'Mara boarded the express.' }],
+            looks: null,
+          },
+        ],
+      },
+      {
+        kind: 'places',
+        label: 'Places',
+        entries: [
+          {
+            id: 'station',
+            name: 'North Station',
+            aliases: [],
+            profile: 'Foggy terminal.',
+            state: {},
+            relations: {},
+            progressions: [],
+            looks: null,
+          },
+        ],
+      },
+    ];
+    story.kg_timeline = [
+      {
+        scene_id: 'ch01.s01',
+        title: 'The ticket',
+        changes: ['Mara (characters): location=Train — Mara boarded the express.'],
+      },
+    ];
+    answers[SHOW] = ok(story);
+    renderView();
+
+    const explorer = await screen.findByTestId('story-world-kg');
+    expect(within(explorer).getAllByTestId('story-world-kg-card')).toHaveLength(2);
+    expect(within(explorer).getByTestId('story-world-kg-state')).toHaveTextContent('location: Train');
+
+    // Filter by Places category
+    fireEvent.click(within(explorer).getByTestId('story-world-kg-tab-places'));
+    const placeCards = within(explorer).getAllByTestId('story-world-kg-card');
+    expect(placeCards).toHaveLength(1);
+    expect(placeCards[0]).toHaveTextContent('North Station');
+
+    // Switch to Timeline tab
+    fireEvent.click(within(explorer).getByTestId('story-world-kg-tab-timeline'));
+    const timeline = within(explorer).getByTestId('story-world-kg-timeline');
+    expect(timeline).toHaveTextContent('[ch01.s01] The ticket');
+    expect(timeline).toHaveTextContent('Mara boarded the express.');
+
+    // Written scene manuscript disclosure on the board
+    const ms = screen.getByTestId('story-scene-manuscript');
+    expect(ms).toHaveTextContent('Mara stepped onto the rain-slick platform.');
+  });
 });
+

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "uclone-x"
-version = "0.4.1"
+version = "0.5.0"
 description = "Local AI clones with memory, tools and group chat, on an event-driven agent runtime"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -99,6 +99,16 @@ telemetry = [
 # google-genai's one consumer is the test that checks the uClone2 ADK mirror against the
 # real SDK, so it is in `dev` (#2011).
 llm = []
+# Distributed runtime (`ucx cluster`): thin adapters over maintained clients for the docker
+# compose topology. All four are imported lazily, so `uclone_x` imports without them.
+# Licences: aiokafka Apache-2.0, asyncpg Apache-2.0, valkey (valkey-py) MIT, PyJWT MIT. psycopg
+# (LGPL), aiomcache (BSD-2) and the Redis client are not used (#2466).
+cluster = [
+    "aiokafka>=0.11.0",
+    "asyncpg>=0.29.0",
+    "valkey>=6.1.0",
+    "pyjwt>=2.9.0",
+]
 # Knowledge Graph & Ontology
 ontology = [
     "linkml-runtime>=1.6.0",
@@ -165,7 +175,7 @@ dev = [
 # `code_intel` now installs `tree-sitter-language-pack`, which ships cp313 wheels.
 # Per P0 and D5, includes all shell and adapter extras for full-featured default environments.
 all = [
-    "uclone-x[cli,http,code_intel,telemetry,llm,ontology,media,dev]",
+    "uclone-x[cli,http,code_intel,telemetry,llm,ontology,media,dev,cluster]",
 ]
 
 
@@ -222,7 +232,7 @@ only-include = [
 [tool.ruff]
 line-length = 100
 # The story example (`examples/story/`, #2208) is first-party code of this repository too.
-src = [".", "src", "examples/story/src"]
+src = [".", "src", "examples/story/src", "examples/music/src", "examples/video/src"]
 target-version = "py311"
 
 [tool.ruff.lint]
@@ -239,7 +249,7 @@ ignore = ["E501"]
 # excluded.
 include = ["src", "tests", "examples/story/src"]
 # The story example is its own distribution (#2208); the tests and evals import it from here.
-extraPaths = ["src", "examples/story/src"]
+extraPaths = ["src", "examples/story/src", "examples/music/src", "examples/video/src"]
 # `evals/fixtures/` holds the *contents of a measured workspace*, not code this
 # project runs: the agent under test reads those files, and a question about them
 # has a fixed answer only while they stay exactly as written. Type-annotating them
@@ -259,7 +269,7 @@ reportMissingTypeStubs = false
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-pythonpath = [".", "src", "examples/story/src"]
+pythonpath = [".", "src", "examples/story/src", "examples/music/src", "examples/video/src"]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 markers = [
@@ -267,6 +277,7 @@ markers = [
     "allow_network: Explicit opt-out for tests requiring outbound network connections",
     "recorded: Tier 2 - replays a committed VCR cassette; never touches the network",
     "live: Tier 3 - consumes a real LLM endpoint; collected but skipped without --live",
+    "cluster_live: runs against the docker compose cluster; collected but skipped without --cluster-live",
     "fitness: checks the repository's own declarations rather than product code; no coverage",
     "pre_release: Acceptance scenarios executed exclusively during release qualification",
 ]

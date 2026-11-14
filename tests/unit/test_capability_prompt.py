@@ -113,7 +113,22 @@ def test_a_persona_without_image_or_package_tools_is_told_nothing_about_them() -
     artist = _builtin("artist").system_prompt
     assert IMAGE_GENERATION in artist
     assert ENVIRONMENT_REPAIR not in artist
-    assert "install_package" not in artist
+
+
+def test_image_generation_guidance_forbids_install_package_or_retry_on_refusal() -> None:
+    """When `generate_image` refuses because a picture model or connection cannot be used,
+    clones that also hold `install_package` must report the refusal rather than trying to
+    install packages or retry `generate_image` in the same turn.
+
+    Killed by: src/uclone_x/agent/prompts.py :: "If generate_image refuses because a picture model or connection cannot be used, do not call install_package or retry generate_image in the same turn; report the refusal to the user as returned. "
+    Becomes: ""
+    """
+    artist = _builtin("artist").system_prompt
+    assert (
+        "If generate_image refuses because a picture model or connection cannot be used, "
+        "do not call install_package or retry generate_image in the same turn; "
+        "report the refusal to the user as returned."
+    ) in artist
 
 
 def test_a_persona_refused_writes_is_not_told_to_write_a_file() -> None:

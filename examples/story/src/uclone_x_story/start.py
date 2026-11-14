@@ -74,7 +74,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, ClassVar, cast
 
-from uclone_x.agent.reply_lines import NOTE_ASKS_KEY, NOTE_LISTS_KEY
+from uclone_x.agent.reply_lines import NOTE_ASKS_KEY, NOTE_LISTS_KEY, NOTE_REPLACE_KEY
 from uclone_x.knowledge.fold import bigram_overlap
 from uclone_x.tools.base import BaseTool, artifact_path_from_url
 from uclone_x.tools.models import REPLY_NOTE_KEY, ToolContext, ToolResult
@@ -553,10 +553,11 @@ class StoryStartTool(BaseTool[StoryStartParams]):
             "stage": state.stage,
             "done_now": done,
             "brief": state.brief.model_dump(mode="json"),
-            "premises": [
-                {"number": p.number, "title": p.title, "premise": p.premise} for p in state.premises
-            ],
         }
+        if state.stage in ("choose_genre", "choose_premise") or "premises" in done:
+            result["premises"] = [
+                {"number": p.number, "title": p.title, "premise": p.premise} for p in state.premises
+            ]
         if state.interactive:
             result["interactive"] = True
         if state.genre_options:
@@ -632,8 +633,23 @@ class StoryStartTool(BaseTool[StoryStartParams]):
         if state.notes:
             result["notes"] = state.notes
         result["next"] = _next_of(state)
-        shown = work.outline() if state.stage == "review_outline" else None
-        note: dict[str, Any] = dict(_reply_note(state, done, shown[0] if shown else None))
+        loaded_outline = work.outline()
+        outline_obj = loaded_outline[0] if loaded_outline else None
+        shown_outline = outline_obj if state.stage == "review_outline" else None
+        scenes_prose: dict[str, tuple[str, str]] = {}
+        if "scene" in done or "chapter" in done or "rewrite" in done:
+            title_by_sid = (
+                {sc.id: sc.title for _, sc in outline_obj.scenes_in_order()}
+                if outline_obj is not None
+                else {}
+            )
+            for sid in state.scenes_written:
+                ms = work.manuscript(sid)
+                if ms is not None and ms.text.strip():
+                    scenes_prose[sid] = (title_by_sid.get(sid, ""), ms.text.strip())
+        note: dict[str, Any] = dict(
+            _reply_note(state, done, shown_outline, scenes_prose=scenes_prose)
+        )
         if state.stage == "choose_premise" and state.cast_failed is None and state.premises:
             # The note lists the premises by title: a reply that already names every one
             # of them gets only the question after the list (`NOTE_LISTS_KEY`, #2301).
@@ -642,6 +658,25 @@ class StoryStartTool(BaseTool[StoryStartParams]):
             # The same for the genres, named in each language's own words (#2360: vague T1
             # showed the model's list, then the note's).
             note[NOTE_LISTS_KEY] = _listed_genres(state)
+        if (
+            state.stage == "review_outline"
+            and not state.cast_waiting
+            and shown_outline is not None
+            and shown_outline.chapters
+        ):
+            note[NOTE_LISTS_KEY] = [ch.title for ch in shown_outline.chapters if ch.title.strip()]
+        if state.stage == "review_chapter" and not state.chapter_failed and state.chapter_details:
+            note[NOTE_LISTS_KEY] = [
+                str(s.get("title") or "").strip()
+                for s in state.chapter_details
+                if str(s.get("title") or "").strip()
+            ]
+        if state.stage == "review_scene" and not state.chapter_failed and state.scene_choices:
+            note[NOTE_LISTS_KEY] = [
+                str(c.get("title") or "").strip()
+                for c in state.scene_choices
+                if str(c.get("title") or "").strip()
+            ]
         if state.cast_failed is None and state.stage in (
             "choose_genre",
             "choose_premise",
@@ -661,6 +696,7 @@ class StoryStartTool(BaseTool[StoryStartParams]):
             note["en"] = f"{en}\n{note['en']}" if note["en"] else en
             note[NOTE_ASKS_KEY] = [*note.get(NOTE_ASKS_KEY, []), ko, en]
             result["kept_for_later"] = {k: list(v) for k, v in kept.items() if v}
+        note[NOTE_REPLACE_KEY] = True
         result[REPLY_NOTE_KEY] = note
         return result
 

@@ -237,6 +237,7 @@ def test_cli_dev_session_show_renders_nested_tool_arguments(
     now successfully sends.
 
     Killed by: src/uclone_x/cli/commands/session_dev.py :: json.dumps(unwrap_immutable(tc.arguments))
+    Becomes: json.dumps(dict(tc.arguments))
     """
     with TemporaryDirectory() as tmp:
         monkeypatch.setenv("UCLONE_SESSION_DIR", tmp)
@@ -315,3 +316,111 @@ def test_cli_dev_session_show_marks_a_stored_tool_result(monkeypatch: pytest.Mon
         # a stored result (#1974, item 8).
         assert res.output.count("(stored)") == 1
         assert "excerpt of a stored result" in " ".join(res.output.split())
+
+
+def test_cli_dev_session_diagnose_renders_forensics_anomalies_and_logs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`ucx dev session diagnose` renders context payload metrics, detected anomalies,
+    recent turn timeline, and correlated `ucx.log` entries in one report.
+
+    Killed by: src/uclone_x/cli/commands/session_dev.py :: forensics = diagnose_session_forensics(
+    Becomes: forensics = None and diagnose_session_forensics(
+    """
+    with TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        monkeypatch.setenv("UCLONE_SESSION_DIR", str(tmp_path))
+        monkeypatch.setenv("UCX_LOG_DIR", str(tmp_path))
+
+        store = SessionStore()
+        sig_blob = "S" * 70_000
+        state = SessionState.seed("sess_diag", "fiona").with_messages(
+            (
+                ChatMessage(role=MessageRole.USER, content="Draw a lighthouse"),
+                ChatMessage(
+                    role=MessageRole.ASSISTANT,
+                    content="",
+                    tool_calls=(
+                        ToolCallRequest(
+                            id="c1",
+                            name="generate_image",
+                            arguments={"prompt": "lighthouse"},
+                            signature=sig_blob,
+                        ),
+                    ),
+                ),
+                ChatMessage(
+                    role=MessageRole.TOOL,
+                    content="Refused",
+                    tool_call_id="c1",
+                ),
+            ),
+            turn_counter=1,
+        )
+        store.save(state)
+
+        events_dir = tmp_path / "core" / "events"
+        events_dir.mkdir(parents=True, exist_ok=True)
+        events_file = events_dir / "sess_diag.jsonl"
+        events_lines = [
+            json.dumps(
+                {
+                    "type": "USER_INPUT",
+                    "turn_index": 1,
+                    "payload": {"content": "Draw a lighthouse"},
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "TOOL_EXECUTION",
+                    "turn_index": 1,
+                    "payload": {
+                        "step": 1,
+                        "tool_name": "generate_image",
+                        "success": False,
+                        "duration_seconds": 0.42,
+                        "error": (
+                            "The picture model remote-gpu-pictures/anillustrious_v4 cannot be used: "
+                            "there is no connection called remote-gpu-pictures."
+                        ),
+                    },
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "TOOL_EXECUTION",
+                    "turn_index": 1,
+                    "payload": {
+                        "step": 2,
+                        "tool_name": "install_package",
+                        "success": False,
+                        "duration_seconds": 1.15,
+                        "error": "Not an optional dependency",
+                    },
+                }
+            ),
+        ]
+        events_file.write_text("\n".join(events_lines) + "\n", encoding="utf-8")
+
+        log_file = tmp_path / "ucx.log"
+        log_file.write_text(
+            json.dumps(
+                {
+                    "timestamp": "2026-11-08T01:00:00Z",
+                    "level": "ERROR",
+                    "logger": "uclone_x.tools.image",
+                    "message": "ImageEngineRefusal on remote-gpu-pictures",
+                    "session_id": "sess_diag",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        res = runner.invoke(main.app, ["dev", "session", "diagnose", "sess_diag"])
+        assert res.exit_code == 0, res.output
+        assert "Session Forensics: sess_diag" in res.output
+        assert "CONTEXT_PAYLOAD_BLOAT" in res.output
+        assert "TOOL_RETRY_SPIRAL" in res.output
+        assert "Recent Turn Execution Timeline" in res.output
+        assert "ImageEngineRefusal on remote-gpu-pictures" in res.output

@@ -13,6 +13,28 @@ names does.
 Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Each date is
 the date that version was published.
 
+## [0.5.0] - 2026-11-13
+
+### Added
+
+- **Distributed cluster runtime and unified stack launcher**: `ucx up` / `ucx down` and `ucx cluster` launch a multi-worker distributed runtime backed by Apache Kafka (KRaft Native), PostgreSQL, Valkey, and Centrifugo, with stateless `ucx worker` processes executing solo and multi-speaker room turns and a dedicated learn consumer.
+- **Interactive Music Composer clone and Music View**: A Music Composer clone with composition, arrangement, melody generation, and voice rhythm extraction tools works alongside a live Music View dock featuring an interactive score that follows the playhead during playback.
+- **Video Co-Editing Agent and DaVinci NLE Studio UI**: A Video Co-Editing clone backed by a 3-tier immutable media vault pairs with an NLE Studio dock supporting timeline transport, keyboard controls, and cross-room lease handoff.
+- **Immersive RPG story mode and World KG explorer**: Story mode renders inline prose without raw audit blocks, deduplicates approach choices across and within turns, and adds an interactive World Knowledge Graph explorer in the dock.
+- **Session forensics and cached-token usage tracking**: Diagnostic tooling adds session forensics, payload metrics, and behavioral anomaly detectors, while usage tracking records cached input tokens separately from new tokens and stops runaway turns at a per-turn ceiling with in-place continuation.
+
+### Changed
+
+- **CLI subcommand organization**: Cluster and UI lifecycle commands are aligned under domain groups (`ucx cluster`, `ucx ui`, and top-level `ucx up` / `ucx down`).
+- **Unified GPU computer and model settings**: Remote GPU configuration is consolidated into the Models tab with `sync_llm` enabled by default, and the legacy `model_tier` field is retired across model configurations.
+
+### Fixed
+
+- **Resilient model connections and room turns**: Connection failures try the alternate provider family once and can be retried in place without exposing internal details or forcing a new conversation, model changes on a clone take effect on the next turn in open conversations, and paid-model limits are checked at turn admission so admitted turns finish cleanly.
+- **Model catalog and Gemini timeout handling**: Google image-generation models are no longer offered as chat models, duplicate display names show their model IDs, Gemini read timeouts are raised for long reasoning turns, and `thoughtSignature` tokens are counted accurately.
+- **Browser and story interaction polish**: Missed browser upload paths explain that paths are workspace-relative and suggest matching files in the workspace, `back` from a clone's initial page is refused instead of landing on `about:blank`, and bare numeric RPG replies preserve the conversation language inside rooms.
+
+
 ## [0.4.1] - 2026-10-19
 
 ### Added

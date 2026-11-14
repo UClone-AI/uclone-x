@@ -59,6 +59,7 @@ from uclone_x.errors import RoomNotFoundError, UnreadableRoomRecordError
 from uclone_x.knowledge.quotes import passage_in
 from uclone_x.room.service import RoomService
 from uclone_x_story.context import CodexIndex
+from uclone_x_story.kg_plan import chronological_kg_log, effective_codex
 from uclone_x_story.library import (
     StoryError,
     StoryLibrary,
@@ -83,6 +84,7 @@ from uclone_x_story.schemas import (
     ThreadEntry,
 )
 from uclone_x_story.start import START_FILE, StartState
+from uclone_x_story.start_rpg import is_unplanned_death_proposal
 from uclone_x_story.timeline import Placement, assumptions, place_scenes
 from uclone_x_story.work import StoryWork
 
@@ -206,6 +208,8 @@ class SceneView(BaseModel):
     places: list[str]
     #: Whether the scene has text in the manuscript.
     written: bool
+    #: The written manuscript text of the scene, when written.
+    manuscript: str | None = None
     #: Relative artifact content URL (`/api/artifacts/content?path=...`) of the scene's illustration.
     illustration: str | None = None
     #: The codex entries in the scene, listed ones first.
@@ -345,6 +349,10 @@ class StoryOverview(BaseModel):
     board_note: str | None
     board_code: StoryNoteCode | None = None
     codex: list[CodexGroup]
+    #: Effective World KG (including pending proposals and planned RPG transitions).
+    world_kg: list[CodexGroup] = Field(default_factory=list[CodexGroup])
+    #: Chronological $G_0 \to G_t$ state transition log across scenes.
+    kg_timeline: list[dict[str, JsonValue]] = Field(default_factory=list[dict[str, JsonValue]])
     codex_unreadable: list[Unreadable]
     pending: list[ProposalView]
     decided: list[ProposalView]
@@ -420,6 +428,35 @@ class StoryView:
             entries = [_entry_view(item.entry) for item in index.items if item.kind == kind]
             groups.append(CodexGroup(kind=kind, label=_KIND_LABELS[kind], entries=entries))
 
+        all_proposals = [p for p, _ in loaded]
+        planned_trans = start.planned_transitions if start is not None else []
+        try:
+            loaded_outline_pair = work.outline()
+        except StoryFileError:
+            loaded_outline_pair = None
+        outline_for_kg = loaded_outline_pair[0] if loaded_outline_pair is not None else None
+        rejected_ids = {
+            p.id
+            for p in all_proposals
+            if p.status == "rejected"
+            or is_unplanned_death_proposal(p, outline_for_kg, planned_trans)
+        }
+        eff_index = effective_codex(
+            index,
+            all_proposals,
+            planned_trans,
+            rejected=rejected_ids,
+        )
+        world_groups: list[CodexGroup] = []
+        for kind in CODEX_KINDS:
+            eff_entries = [_entry_view(item.entry) for item in eff_index.items if item.kind == kind]
+            world_groups.append(
+                CodexGroup(kind=kind, label=_KIND_LABELS[kind], entries=eff_entries)
+            )
+        kg_timeline_raw = (
+            chronological_kg_log(eff_index, outline_for_kg) if outline_for_kg is not None else []
+        )
+
         pending: list[ProposalView] = []
         decided: list[ProposalView] = []
         for proposal, digest in loaded:
@@ -441,6 +478,8 @@ class StoryView:
             board_note=board_note,
             board_code="start_unreadable" if board_note else None,
             codex=groups,
+            world_kg=world_groups,
+            kg_timeline=kg_timeline_raw,
             codex_unreadable=[Unreadable(file=u.file, reason=u.reason) for u in index.unreadable],
             pending=pending,
             decided=decided,
@@ -491,6 +530,7 @@ class StoryView:
                         characters=list(scene.characters),
                         places=list(scene.places),
                         written=scene.id in written,
+                        manuscript=text.text.strip() if text and text.text.strip() else None,
                         illustration=illustration,
                         entries=_scene_entries(scene, index, proposed, haystack),
                         changes=_scene_changes(scene.id, index),

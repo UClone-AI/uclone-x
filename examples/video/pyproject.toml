@@ -1,0 +1,26 @@
+# The video example: an interactive multi-track video editing domain built on UClone-X's core.
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "uclone-x-video"
+version = "0.1.0"
+description = "Example UClone-X extension: a Director clone's 3-tier immutable media vault, frame semantic search, manifest timeline, and color/FX tools"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+authors = [
+    { name = "Kenny Lim", email = "kennylim@uclone.net" }
+]
+dependencies = [
+    "uclone-x>=0.4.0",
+]
+
+[project.entry-points."uclone_x.extensions"]
+video = "uclone_x_video.ucx_extension:EXTENSION"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/uclone_x_video"]
+
+[tool.uv.sources]
+uclone-x = { workspace = true }

@@ -512,7 +512,7 @@ class TestSelectorRequestsOnceTheWindowSlides:
 
     @pytest.mark.asyncio
     async def test_the_window_slid_and_holds_at_most_its_size(self, slid: list[LLMRequest]) -> None:
-        """Killed by: src/uclone_x/room/orchestrator.py :: windowed = self.window_over_utterances(state.transcript, state.policy.transcript_window)
+        """Killed by: src/uclone_x/room/orchestrator.py :: windowed = over(state.transcript, state.policy.transcript_window)
         Becomes: windowed = state.transcript
         """
         windows = [_conversation_of(r.messages[-1].content or "") for r in slid]

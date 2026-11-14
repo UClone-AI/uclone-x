@@ -672,7 +672,7 @@ class TestARoomsFiles:
         The clear removes the `tool_uses` row that showed the unnamed write, so a reason
         read off the remaining rows said "none written" without learning anything new.
 
-        Killed by: src/uclone_x/room/orchestrator.py :: + sum(1 for u in uses if u.wrote_unnamed),
+        Killed by: src/uclone_x/room/orchestrator.py :: + sum(1 for u in outcome.tool_uses if u.wrote_unnamed),
         Becomes: + 0,
         """
         room_id = _create(client, ["scout"])
@@ -694,7 +694,7 @@ class TestARoomsFiles:
     ) -> None:
         """Reproduction 2: a turn that raised reported no tools; rewinding past it hid that.
 
-        Killed by: src/uclone_x/room/orchestrator.py :: + (0 if tools_recorded else 1),
+        Killed by: src/uclone_x/room/orchestrator.py :: + (0 if outcome.tools_recorded else 1),
         Becomes: + 0,
         Killed by: src/uclone_x/room/service.py :: record = record.model_copy(update={"rewinds": record.rewinds + 1})
         Becomes: record = record

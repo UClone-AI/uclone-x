@@ -1,11 +1,9 @@
 import React, { useState } from 'react';
-import type { PersonaModelTier } from '../../types';
 import type { Messages } from '../../i18n';
 import { AUTO_IMAGE, findModel, modelName, type ModelSet } from '../../lib/modelGateway';
 import { ModelRefSelect } from '../settings/ModelRefSelect';
 import { pickerWords } from '../settings/gatewayWords';
 import {
-  MODEL_TIERS,
   cloneLabel,
   draftProblem,
   fmt,
@@ -110,10 +108,15 @@ const CloneModelPicker: React.FC<{
   /** The default's own value now, from the set: a ref, `auto`, or `null` for none chosen. */
   defaultNow: string | null;
   allowAuto: boolean;
+  /**
+   * The empty slot is this clone's conversation model, not a system default: the fast
+   * model's (owner ruling 2026-10-29, #2418). `defaultNow` is then that model.
+   */
+  followsConversation?: boolean;
   hint?: string;
   copy: Messages['gateway'];
   onChange: (value: string | null) => void;
-}> = ({ slot, label, value, set, failed, defaultNow, allowAuto, hint, copy, onChange }) => {
+}> = ({ slot, label, value, set, failed, defaultNow, allowAuto, followsConversation, hint, copy, onChange }) => {
   const id = `persona-${slot.replace('_', '-')}`;
   if (set === null) {
     return (
@@ -125,8 +128,11 @@ const CloneModelPicker: React.FC<{
       </div>
     );
   }
-  const defaultLabel =
-    defaultNow === null
+  const defaultLabel = followsConversation
+    ? defaultNow === null
+      ? copy.clone.sameAsConversationNone
+      : fmt(copy.clone.sameAsConversation, { model: modelName(set, defaultNow) })
+    : defaultNow === null
       ? copy.clone.systemDefaultNone
       : defaultNow === AUTO_IMAGE
         ? copy.clone.systemDefaultAuto
@@ -161,7 +167,7 @@ const CloneModelPicker: React.FC<{
             onClick={() => onChange(null)}
             className="rounded-md border border-amber-500/40 px-2 py-0.5 text-amber-200 hover:bg-amber-500/10 transition-colors"
           >
-            {copy.clone.useSystemDefault}
+            {followsConversation ? copy.clone.useConversationModel : copy.clone.useSystemDefault}
           </button>
         </div>
       )}
@@ -577,30 +583,14 @@ export const PersonaEditor: React.FC<PersonaEditorProps> = ({
             value={draft.fast_model}
             set={chatModels}
             failed={modelsFailed}
-            defaultNow={chatModels ? (chatModels.defaults.fast ?? chatModels.defaults.deep) : null}
+            defaultNow={draft.model_name ?? chatModels?.defaults.deep ?? null}
             allowAuto={false}
+            followsConversation
             hint={modelCopy.clone.fastHint}
             copy={modelCopy}
             onChange={(next) => set('fast_model', next)}
           />
         )}
-        <div>
-          <label className={labelClass} htmlFor="persona-tier">
-            {copy.fields.tier}
-          </label>
-          <select
-            id="persona-tier"
-            className={`${inputClass} cursor-pointer`}
-            value={draft.model_tier}
-            onChange={(e) => set('model_tier', e.target.value as PersonaModelTier)}
-          >
-            {MODEL_TIERS.map((tier) => (
-              <option key={tier} value={tier}>
-                {copy.tierLabels[tier]}
-              </option>
-            ))}
-          </select>
-        </div>
         <div className="space-y-1.5 sm:col-span-2">
           <label className={labelClass}>{copy.fields.temperature}</label>
           <div className="grid grid-cols-3 gap-1.5" role="group" aria-label={copy.fields.temperature}>

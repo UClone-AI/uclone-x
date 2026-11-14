@@ -14,7 +14,6 @@ from uclone_x.agent import (
     AgentState,
     BaseAgentProtocol,
     FsScope,
-    ModelTier,
     PersonaDefinition,
     SubagentInvocation,
     SubAgentSpec,
@@ -81,7 +80,6 @@ from uclone_x.tools import (
 
 def test_agent_models_and_immutability() -> None:
     llm_cfg = AgentLLMConfig(
-        model_tier=ModelTier.FAST,
         model_name="claude-3-7-sonnet",
         temperature=0.2,
         max_tokens=4096,
@@ -97,7 +95,6 @@ def test_agent_models_and_immutability() -> None:
     )
     assert config.agent_id == "agent-1"
     assert config.role == "Lead Architect"
-    assert config.llm_config.model_tier == ModelTier.FAST
     assert config.llm_config.model_name == "claude-3-7-sonnet"
     assert config.max_subagent_depth == 2
 
@@ -119,13 +116,13 @@ def test_agent_models_and_immutability() -> None:
         description="Audits codebase for security vulnerabilities",
         system_prompt="Focus on AST, auth, and sandbox boundaries",
         allowed_tools=("grep_search", "view_file"),
-        llm_config=AgentLLMConfig(model_tier=ModelTier.FAST),
+        llm_config=AgentLLMConfig(fast_model="gemini/gemini-3.5-flash"),
         enable_write_tools=False,
         enable_subagent_tools=False,
     )
     assert persona.name == "security_reviewer"
     assert persona.enable_write_tools is False
-    assert persona.llm_config.model_tier == ModelTier.FAST
+    assert persona.llm_config.fast_model == "gemini/gemini-3.5-flash"
 
     # SubagentInvocation test
     invocation = SubagentInvocation(
@@ -144,10 +141,10 @@ def test_agent_models_and_immutability() -> None:
         role="Helper",
         system_prompt="Help",
         fs_scope=FsScope.ISOLATED,
-        llm_config=AgentLLMConfig(model_tier=ModelTier.FAST),
+        llm_config=AgentLLMConfig(fast_model="gemini/gemini-3.5-flash"),
     )
     assert spec.fs_scope is FsScope.ISOLATED
-    assert spec.llm_config.model_tier == ModelTier.FAST
+    assert spec.llm_config.fast_model == "gemini/gemini-3.5-flash"
 
     tool_req = ToolCallRequest(id="call-0", name="search", arguments={"q": "CVE"})
     turn = TurnResult(

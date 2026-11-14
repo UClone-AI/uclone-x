@@ -462,8 +462,8 @@ class TestOrchestratorDecides:
         Each agent turn is run with `caller_turn_id` equal to the `turn_id` its transcript
         row records, and two turns get two ids -- the join the trace reader makes.
 
-        Killed by: src/uclone_x/room/orchestrator.py :: caller_turn_id=turn_id,
-        Becomes: caller_turn_id=None,
+        Killed by: src/uclone_x/room/orchestrator.py :: "caller_turn_id": turn_id,
+        Becomes: "caller_turn_id": None,
         """
         _, _, agents = built
         selector = ScriptedSelector("s", [speak("scout"), speak("critic")])
@@ -1127,8 +1127,8 @@ class TestRoomWorkspaceReachesTheTurn:
     ) -> None:
         """The room's folder is what its seat's turn works in (clone-data-scopes §3.6).
 
-        Killed by: src/uclone_x/room/orchestrator.py :: workspace_root=Path(state.workspace) if state.workspace is not None else None,
-        Becomes: workspace_root=None,
+        Killed by: src/uclone_x/room/orchestrator.py :: "workspace_root": Path(state.workspace) if state.workspace is not None else None,
+        Becomes: "workspace_root": None,
         """
         store, _, agents = built
         roots: list[Any] = []
@@ -3234,7 +3234,7 @@ class TestMembershipIsNotSpeech:
         utterance window to 3 rows, causing scout's turn to push the human utterance out
         of view and dropping critic's outstanding address unannounced (#806).
 
-        Killed by: src/uclone_x/room/orchestrator.py :: windowed = self.window_over_utterances(state.transcript, state.policy.transcript_window)
+        Killed by: src/uclone_x/room/orchestrator.py :: windowed = over(state.transcript, state.policy.transcript_window)
         Becomes: windowed = state.transcript[-state.policy.transcript_window :]
         """
         from uclone_x.room.models import RoomMessageKind
@@ -3783,7 +3783,7 @@ class TestARealAgentsFailuresInTheRoom:
 
         Killed by: src/uclone_x/room/models.py :: return RoomTurnRefusal.MODEL_UNAVAILABLE
         Becomes: return None
-        Killed by: src/uclone_x/room/orchestrator.py :: provider_failure = self._with_own_model(speaker.id, result.provider_failure)
+        Killed by: src/uclone_x/room/orchestrator.py :: provider_failure = own_model(result.provider_failure)
         Becomes: provider_failure = None
         """
         from uclone_x.errors import ModelNotAvailableError
@@ -4109,7 +4109,7 @@ class TestARoomTurnsToolsAreRecorded:
     ) -> None:
         """One `TOOL_CALL` and one `TOOL_RESULT` per call, naming the room and the seat.
 
-        Killed by: src/uclone_x/room/orchestrator.py :: await self._publish_tools(saved, speaker, message.seq, uses)
+        Killed by: src/uclone_x/room/orchestrator.py :: await self._publish_tools(saved, speaker, message.seq, outcome.tool_uses)
         Becomes: pass
         """
         from uclone_x.engine.event_bus import EventBus, EventType
@@ -4173,8 +4173,8 @@ class TestARoomTurnsToolsAreRecorded:
     async def test_a_turns_tool_events_precede_its_final_reply(self, built: Any) -> None:
         """A head sees the calls ahead of the answer they fed (design §3.6, Rev 31).
 
-        Killed by: src/uclone_x/room/orchestrator.py :: await self._publish_tools(saved, speaker, message.seq, uses)
-        Becomes: asyncio.get_running_loop().call_later(0.05, lambda: asyncio.ensure_future(self._publish_tools(saved, speaker, message.seq, uses)))
+        Killed by: src/uclone_x/room/orchestrator.py :: await self._publish_tools(saved, speaker, message.seq, outcome.tool_uses)
+        Becomes: asyncio.get_running_loop().call_later(0.05, lambda: asyncio.ensure_future(self._publish_tools(saved, speaker, message.seq, outcome.tool_uses)))
         """
         from uclone_x.engine.event_bus import EventBus, EventType
         from uclone_x.room.orchestrator import RoomOrchestrator
@@ -4775,8 +4775,8 @@ class TestAFailedSaveIsOnTheRow:
         So a fact the model saves under "Alice" lands in recall's always-included user slots,
         as the extractor would have filed it.
 
-        Killed by: src/uclone_x/room/orchestrator.py :: person_names=_person_names(state),  # per turn
-        Becomes: person_names=(),  # per turn
+        Killed by: src/uclone_x/room/orchestrator.py :: "person_names": _person_names(state),  # per turn
+        Becomes: "person_names": (),  # per turn
         """
         _, _, agents = built
         _cap(built, 1)

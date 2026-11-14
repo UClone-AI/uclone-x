@@ -32,6 +32,7 @@ from uclone_x.agent.protocols import TurnAidHookProtocol, TurnAidProtocol
 from uclone_x.agent.reply_lines import (
     NOTE_ASKS_KEY,
     NOTE_LISTS_KEY,
+    NOTE_REPLACE_KEY,
     is_korean,
     lines_to_add,
     reply_notes,
@@ -569,8 +570,8 @@ def _agent(tmp_path: Path, llm: BaseLLMConnector, *hooks: Any) -> BaseAgent:
 async def test_the_aid_is_worked_out_once_and_its_section_sent_with_every_request(
     tmp_path: Path,
 ) -> None:
-    """Killed by: src/uclone_x/agent/turn_executor.py :: sections.extend(aid.section for aid in self._turn_aids)
-    Becomes: sections.extend(())
+    """Killed by: src/uclone_x/agent/turn_executor.py :: self._turn_aid_sections = [aid.section for aid in self._turn_aids]
+    Becomes: self._turn_aid_sections = []
     """
     hook = _AidHook()
     llm = _Scripted(
@@ -779,5 +780,63 @@ async def test_an_aid_that_rewrites_the_reply_is_what_the_turn_keeps(tmp_path: P
     result = await agent.execute_turn("Where are we?")
 
     assert result.content == "Next is 습격."
+    final = [m for m in agent.history if m.role is MessageRole.ASSISTANT][-1]
+    assert final.content == result.content
+
+
+class _ReplacingNotingTool(BaseTool[_NoParams]):
+    name = "story_start"
+    description = "Replacing note tool"
+
+    def run(self, params: _NoParams, context: ToolContext) -> dict[str, Any]:
+        del params, context
+        return {
+            REPLY_NOTE_KEY: {
+                "ko": "다음은 1장 1번째 장면의 진행 선택지입니다.\n1. [정면 돌파] 진입",
+                "en": "Here are the RPG choices for chapter 1, scene 1.\n1. [Direct] Enter",
+                NOTE_REPLACE_KEY: True,
+            }
+        }
+
+
+@pytest.mark.asyncio
+async def test_numeric_reply_preserves_korean_and_replacing_note_replaces_model_reply(
+    tmp_path: Path,
+) -> None:
+    """A bare numeric reply ('1') preserves Korean from history, and a replacing reply_note
+    replaces the model's duplicate paraphrase.
+
+    Killed by: src/uclone_x/agent/turn_executor.py :: if not korean and not any(ch.isalpha() for ch in body):
+    Becomes: if False:
+    Killed by: src/uclone_x/agent/turn_executor.py :: if message.startswith("[") and "]:" in message
+    Becomes: if False
+    Killed by: src/uclone_x/agent/turn_executor.py :: base = "" if replaces_reply(records) else content
+    Becomes: base = content
+    Killed by: src/uclone_x/agent/reply_lines.py :: if found.get(NOTE_REPLACE_KEY) is True:
+    Becomes: if False:
+    """
+    llm = _Scripted(
+        [
+            _reply("안녕하세요, 이야기를 시작합니다."),
+            _reply(None, ToolCallRequest(id="c1", name="story_start", arguments={})),
+            _reply("Model duplicate paraphrase that should be replaced."),
+        ]
+    )
+    tools = ToolRegistry()
+    tools.register(_ReplacingNotingTool())
+    agent = BaseAgent(
+        config=AgentConfig(
+            agent_id="writer", name="Writer", llm_config=AgentLLMConfig(model_name="m")
+        ),
+        llm=llm,
+        tools=tools,
+        context=AgentContext(agent_id="writer", session_id="s", workspace_root=tmp_path),
+    )
+
+    await agent.execute_turn("[user]: 판타지 소설을 시작해줘")
+    result = await agent.execute_turn("[user]: 1")
+
+    assert result.content == "다음은 1장 1번째 장면의 진행 선택지입니다.\n1. [정면 돌파] 진입"
+    assert "Model duplicate paraphrase" not in result.content
     final = [m for m in agent.history if m.role is MessageRole.ASSISTANT][-1]
     assert final.content == result.content

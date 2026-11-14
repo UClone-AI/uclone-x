@@ -16,7 +16,6 @@ or host egress boundaries.
 
 from __future__ import annotations
 
-import json
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Protocol, TextIO
@@ -26,11 +25,13 @@ from uclone_x.core.secrets import redact_credentials
 # Lowered to `uclone_x.core.secrets` (#1734): a pure function, needed by the kernel's
 # `core/session_state.py`, which may not import this file-writing adapter.
 from uclone_x.core.secrets import redact_log_payload as redact_log_payload
+from uclone_x.core.secrets import serialize_session_event as serialize_session_event
 
 __all__ = [
     "LogWriterProtocol",
     "RedactingLogWriter",
     "redact_log_payload",
+    "serialize_session_event",
 ]
 
 
@@ -86,9 +87,5 @@ class RedactingLogWriter:
 
     def write_entry(self, entry: str | Mapping[str, Any]) -> str:
         """Serialize entry if needed, redact credentials, and write."""
-        if isinstance(entry, Mapping):
-            sanitized = redact_log_payload(entry)
-            line = json.dumps(sanitized)
-        else:
-            line = str(entry)
+        line = serialize_session_event(entry)
         return self.write_line(line)
