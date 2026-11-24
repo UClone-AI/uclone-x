@@ -152,19 +152,39 @@ def run_worker(
         min=0.0,
         help="Seconds after a turn was submitted that a failure ends it instead of a retry.",
     ),
+    slot: str = typer.Option(
+        "",
+        "--slot",
+        help="Optional supervisor slot id (records worker-<slot>.json for `ucx up`/`ucx down`).",
+    ),
 ) -> None:
     """Run one stateless agent worker: consume turns and room commands until told to stop."""
+    import contextlib
+
+    from uclone_x.shells import daemon_supervisor
+
     if workspace is not None:
         _refuse_an_unwritable_workspace(workspace.resolve())
-    asyncio.run(
-        _serve(
-            config=ClusterRuntimeConfig.from_stack_env(stack_env_path()),
-            worker_id=worker_id or f"{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex[:6]}",
-            concurrency=concurrency,
-            workspace=workspace.resolve() if workspace is not None else None,
-            lease_ttl_seconds=lease_ttl_seconds,
-            session_timeout_ms=session_timeout_ms,
-            max_turn_attempts=max_turn_attempts,
-            turn_deadline_seconds=turn_deadline_seconds,
+    active_slot = slot.strip() or os.environ.get("UCX_WORKER_SLOT", "").strip()
+    record: daemon_supervisor.DaemonRecord | None = None
+    if active_slot:
+        record, _ = daemon_supervisor.new_daemon_record("worker", active_slot)
+        with contextlib.suppress(daemon_supervisor.DaemonNotIdentifiedError):
+            daemon_supervisor.write_daemon_record(record)
+    try:
+        asyncio.run(
+            _serve(
+                config=ClusterRuntimeConfig.from_stack_env(stack_env_path()),
+                worker_id=worker_id
+                or f"{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex[:6]}",
+                concurrency=concurrency,
+                workspace=workspace.resolve() if workspace is not None else None,
+                lease_ttl_seconds=lease_ttl_seconds,
+                session_timeout_ms=session_timeout_ms,
+                max_turn_attempts=max_turn_attempts,
+                turn_deadline_seconds=turn_deadline_seconds,
+            )
         )
-    )
+    finally:
+        if record is not None:
+            daemon_supervisor.remove_daemon_record(record)

@@ -1,5 +1,5 @@
 """UClone-X: Next-Generation Event-Driven AI Agent Core & Collaboration Framework."""
 
-__version__ = "0.5.0"
+__version__ = "0.5.1"
 __author__ = "Kenny Lim <kennylim@uclone.net>"
 __all__ = ["__version__"]

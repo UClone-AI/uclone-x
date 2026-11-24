@@ -835,6 +835,12 @@ _MALFORMED_REPLIES: Final = (
 )
 
 
+def _reply_id(value: object) -> str:
+    """A short id for a reply: the 100,000-character case printed whole cut the CI log."""
+    text = str(value)
+    return text if len(text) <= 80 else f"{text[:40]}...[{len(text)} chars]"
+
+
 class TestNoMalformedReplyBecomesASilentSilence:
     """The P6 line, held across every reply shape worth constructing.
 
@@ -847,7 +853,7 @@ class TestNoMalformedReplyBecomesASilentSilence:
     """
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize(("reply", "expected"), _MALFORMED_REPLIES)
+    @pytest.mark.parametrize(("reply", "expected"), _MALFORMED_REPLIES, ids=_reply_id)
     async def test_shape(self, reply: str, expected: str) -> None:
         """One reply shape, held to raising or to a named speaker.
 

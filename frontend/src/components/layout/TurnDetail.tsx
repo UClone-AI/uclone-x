@@ -42,6 +42,18 @@ const Field: React.FC<{ label: string; children: React.ReactNode }> = ({ label, 
 const endedInErrorOf = (error: string | null | undefined, path: string | undefined): boolean =>
   Boolean(error) && path === 'failover';
 
+const drawnModelLabel = (output: Record<string, unknown> | undefined): string | null => {
+  if (!output) return null;
+  const drawnWith = typeof output.drawn_with === 'string' ? output.drawn_with : '';
+  const match = drawnWith.match(
+    /^Drawn with (.+?) (?:on this computer|on your GPU server|in the cloud with Google)\b/,
+  );
+  if (match && match[1] && match[1] !== 'the model your GPU server has loaded') {
+    return match[1];
+  }
+  return typeof output.model_id === 'string' && output.model_id ? output.model_id : null;
+};
+
 /**
  * Detail view for one turn: what the clone did (steps & changed files) and how it replied.
  *
@@ -66,6 +78,7 @@ export const TurnDetail: React.FC<TurnDetailProps> = ({
 }) => {
   const openInDocs = useOpenInDocs();
   const copy = useCopy().turnDetail;
+  const whereCopy = useCopy().gateway.defaults.where as Partial<Record<string, string>>;
   const outcomeCopy = useCopy().conversation.outcome;
   const whyLabel = useCopy().conversation.row.why;
   const devMode =
@@ -428,6 +441,13 @@ export const TurnDetail: React.FC<TurnDetailProps> = ({
           <div className="space-y-1.5">
             {summary.steps.map((step, idx) => {
               const args = parseArgs(step.arguments_preview);
+              const output = argsRecord(parseArgs(step.output_preview));
+              const stepModel = drawnModelLabel(output);
+              const stepWhere =
+                typeof output?.where === 'string' && output.where
+                  ? (whereCopy[output.where] ?? output.where)
+                  : null;
+              const stepModelLine = [stepModel, stepWhere].filter(Boolean).join(' · ');
               const { label, summaryTitle } = classifyTool(step.tool_name, argsRecord(args));
               const isFailed = step.status === 'error' || Boolean(step.error);
 
@@ -463,6 +483,12 @@ export const TurnDetail: React.FC<TurnDetailProps> = ({
                       </span>
                     </div>
                   </div>
+
+                  {stepModelLine && (
+                    <p data-testid="turn-step-model" className="text-[11px] text-cyan-400/90">
+                      {stepModelLine}
+                    </p>
+                  )}
 
                   {step.subagent_id && (
                     <p className="text-[11px] text-slate-400">

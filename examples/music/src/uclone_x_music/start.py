@@ -3,8 +3,10 @@
 Walks a song through four incremental layering stages so the person can listen after each
 instrument is added and steer the arrangement in conversation:
 
-1. `setup_foundation` -> writes `score.yaml` and the `bass_synth` groove track, then
-   recommends `violin_solo` (`layer_melody`).
+1. `setup_foundation` -> writes `score.yaml` from the tempo, key, meter and chord progression
+   the model chose (or the song's existing score), then the `bass_synth` groove track, and
+   recommends `violin_solo` (`layer_melody`). With none of those facts it refuses before
+   creating anything: the tool has no default song.
 2. `layer_melody` -> adds `violin_solo` (`G3..E7`, `lead_melody`) in high register
    (`D5..A5`), then recommends `grand_piano` (`layer_harmony`).
 3. `layer_harmony` -> adds `grand_piano` (`A0..C8`, `arpeggio`) in mid register
@@ -23,11 +25,12 @@ keywords in the text.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, ClassVar, Literal, cast
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from uclone_x.tools.base import BaseTool
 from uclone_x.tools.models import REPLY_NOTE_KEY, ToolContext
@@ -40,6 +43,7 @@ from uclone_x_music.groove import (
     chord_third_pc,
     generate_bass_groove,
     generate_hiphop_drums,
+    is_chord_symbol,
     subdivide_bars_faster,
 )
 from uclone_x_music.library import (
@@ -49,7 +53,10 @@ from uclone_x_music.library import (
     SongLibrary,
 )
 from uclone_x_music.schemas import (
+    KEY_SIGNATURE_PATTERN,
+    TIME_SIGNATURE_PATTERN,
     InstrumentEntry,
+    MusicFileError,
     RegionSelection,
     ScoreOutline,
     ScoreSection,
@@ -58,12 +65,15 @@ from uclone_x_music.schemas import (
     TrackFile,
     beats_per_bar_for,
     default_style_axioms,
+    describe_invalid,
     dump_file,
+    normalize_track_bar,
     parse_file,
     pitch_to_name,
     resolve_track_bars,
+    validate_track_against_section,
 )
-from uclone_x_music.work import SongWork
+from uclone_x_music.work import SongWork, track_file, track_id_for
 
 __all__ = [
     "BUNDLED_STYLES_PATH",
@@ -126,7 +136,37 @@ class MusicStartParams(BaseModel):
     style_profile: StyleProfile | None = Field(
         default=None,
         description="Style profile the person asked for ('pop_ballad', 'hiphop_groove', "
-        "'jazz_swing', 'classical_strict'). Omit to keep the song's current style.",
+        "'jazz_swing', 'classical_strict'). Omit to keep the song's current style. It sets "
+        "the audit rules and the groove only; it never chooses tempo, key or chords.",
+    )
+    tempo: int | None = Field(
+        default=None,
+        ge=20,
+        le=300,
+        description="Tempo in BPM that you chose for this song from the conversation "
+        "(e.g. 128 for a bright, driving pop song, 66 for a slow lament). Required when "
+        "the song has no score yet.",
+    )
+    key_signature: str | None = Field(
+        default=None,
+        pattern=KEY_SIGNATURE_PATTERN,
+        description="Key you chose for this song, '<tonic> major' or '<tonic> minor' "
+        "(e.g. 'E major', 'F# minor', 'Bb major'). Required when the song has no score yet.",
+    )
+    time_signature: str | None = Field(
+        default=None,
+        pattern=TIME_SIGNATURE_PATTERN,
+        description="Meter you chose (e.g. '4/4', '3/4', '6/8'). Required when the song has "
+        "no score yet.",
+    )
+    chords: list[str] | None = Field(
+        default=None,
+        min_length=1,
+        max_length=32,
+        description="The opening section's chord progression you wrote for this song, one "
+        "chord symbol per bar in the chosen key (e.g. ['E', 'C#m7', 'Amaj7', 'B'] for "
+        "4 bars). Its length is the section's bar count. Required when the song has no "
+        "score yet.",
     )
     section_id: str | None = Field(
         default=None,
@@ -153,6 +193,95 @@ class MusicStartParams(BaseModel):
     factor: Literal[2, 4] = Field(
         default=2,
         description="Rhythmic subdivision factor (2 or 4) for fast regional edits.",
+    )
+    bars: list[TrackBar] | None = Field(
+        default=None,
+        description="For 'start' and 'continue': the notes you composed for the layer this "
+        "call adds (bass on 'start', then violin, piano and drums), every bar of the active "
+        "section exactly once, in the Bar-Grid Step DSL. Shape the line to the song: its "
+        "motif, rhythm and mood, not a generic chord-tone pattern.",
+    )
+    sketch: bool = Field(
+        default=False,
+        description="For 'start' and 'continue' without 'bars': let the tool write a generic "
+        "chord-tone draft of the layer instead. Use it only when the person asks for a "
+        "quick placeholder; every sketch over the same chords is the same.",
+    )
+
+    @field_validator("chords")
+    @classmethod
+    def _chords_name_roots(cls, value: list[str] | None) -> list[str] | None:
+        if value is None:
+            return None
+        bad = [symbol for symbol in value if not is_chord_symbol(symbol)]
+        if bad:
+            raise ValueError(
+                f"Not chord symbols: {bad}. Write one symbol per bar with a root letter A-G, "
+                "an optional # or b, then the quality (e.g. 'Dm7', 'F#m7b5', 'Bbmaj7', 'C/E')."
+            )
+        return [symbol.strip() for symbol in value]
+
+
+#: The musical facts a new song's score must state, in the order the refusal names them.
+FOUNDATION_FIELDS: tuple[str, ...] = ("tempo", "key_signature", "time_signature", "chords")
+
+
+def missing_foundation(params: MusicStartParams) -> list[str]:
+    """Return the `FOUNDATION_FIELDS` that `params` leaves unset."""
+    return [name for name in FOUNDATION_FIELDS if getattr(params, name) is None]
+
+
+def _layer_summary(params: MusicStartParams, instrument_id: str, sketch_summary: str) -> str:
+    """The revision note: whose notes these are, the composer's or the tool's sketch."""
+    if params.bars is not None:
+        return f"Wrote {instrument_id} from the composer's bars"
+    return f"{sketch_summary} (tool sketch)"
+
+
+def require_layer_notes(params: MusicStartParams) -> None:
+    """Refuse a layer whose notes the call neither writes (`bars`) nor delegates (`sketch`).
+
+    On a new song the section is as long as `chords`, so bars that do not cover it are
+    refused here too, before the song is created.
+    """
+    if params.bars is None and not params.sketch:
+        raise MusicError(
+            "music_start adds a layer only with its notes: write them in 'bars' (every bar "
+            "of the section, composed for this song) or pass sketch=true for a generic "
+            "chord-tone draft. Nothing was created or written."
+        )
+    if params.bars is not None and params.chords is not None:
+        require_bars_cover(
+            [b.bar for b in params.bars],
+            len(params.chords),
+            params.section_id or "sec_verse_01",
+            "the first layer",
+        )
+
+
+def require_bars_cover(numbers: list[int], bar_count: int, section_id: str, layer: str) -> None:
+    """Refuse layer bars that do not give every bar `1..bar_count` exactly once."""
+    if sorted(numbers) != list(range(1, bar_count + 1)):
+        raise MusicError(
+            f"'bars' for {layer} must give every bar of {section_id} (1..{bar_count}) exactly "
+            f"once; got bars {sorted(numbers)}. Nothing was created or written."
+        )
+
+
+def require_foundation(params: MusicStartParams) -> None:
+    """Refuse, before anything is created, a new song whose facts `params` leaves unset."""
+    missing = missing_foundation(params)
+    if missing:
+        raise foundation_refusal(missing)
+
+
+def foundation_refusal(missing: list[str]) -> MusicError:
+    """The plain refusal for a start that leaves the song's musical facts to the tool."""
+    return MusicError(
+        "This song has no score yet, so music_start needs the musical facts you chose for "
+        f"it; missing: {', '.join(missing)}. Decide them from the conversation (a bright, "
+        "driving song is not a slow minor ballad) and call again with tempo, key_signature, "
+        "time_signature and chords (one chord per bar). Nothing was created or written."
     )
 
 
@@ -564,17 +693,29 @@ def _stage_reply_note(
     stage: CompositionStage,
     *,
     style_profile: StyleProfile,
-    chords: list[str] | None = None,
+    foundation: tuple[ScoreOutline, ScoreSection] | None = None,
 ) -> dict[str, str]:
-    chord_str = "-".join(chords[:4]) if chords else "Dm7-Gm7-C7-Fmaj7"
+    if foundation is not None:
+        outline, section = foundation
+        progression = "-".join(section.chords) or "-"
+        facts_ko = (
+            f"{section.bars}마디, {outline.key_signature}, {outline.tempo} BPM, "
+            f"{outline.time_signature}, {progression}"
+        )
+        facts_en = (
+            f"{section.bars} bars, {outline.key_signature}, {outline.tempo} BPM, "
+            f"{outline.time_signature}, {progression}"
+        )
+    else:
+        facts_ko = facts_en = "-"
     if stage == "layer_melody":
         return {
             "ko": (
-                f"기본 베이스 리듬(`bass_synth`, 4마디 {chord_str})을 만들었습니다. "
+                f"기본 베이스 리듬(`bass_synth`, {facts_ko})을 만들었습니다. "
                 "들어보시고 마음에 드시면 '네' 또는 '바이올린 추가해줘'라고 말씀해 주세요."
             ),
             "en": (
-                f"Created the base rhythm track (`bass_synth`, 4 bars {chord_str}). "
+                f"Created the base rhythm track (`bass_synth`, {facts_en}). "
                 "Listen to it and say 'yes' or ask to add the violin melody next."
             ),
         }
@@ -625,7 +766,9 @@ class MusicStartTool(BaseTool[MusicStartParams]):
     name = "music_start"
     description = (
         "Start and advance an interactive multi-track song composition one instrument layer "
-        "at a time: (1) bass rhythm foundation ('bass_synth'), (2) solo violin melody "
+        "at a time. Starting a song with no score needs the musical facts you chose from the "
+        "conversation: tempo, key_signature, time_signature and chords (one per bar); the tool "
+        "never picks them. Layers: (1) bass rhythm foundation ('bass_synth'), (2) solo violin melody "
         "('violin_solo'), (3) grand piano arpeggio harmony ('grand_piano'), and (4) drum kit "
         "('drum_kit', supporting pop or 808 hip-hop swing beats locked to the bass). "
         "Also supports targeted regional fast-edits: call action='edit_region' with "
@@ -665,6 +808,8 @@ class MusicStartTool(BaseTool[MusicStartParams]):
         song_id = context.story_id
 
         if song_id is None:
+            require_foundation(params)
+            require_layer_notes(params)
             detected_style = params.style_profile or "pop_ballad"
             title = (params.title or "").strip() or "Untitled Song"
             record = library.create(
@@ -680,6 +825,8 @@ class MusicStartTool(BaseTool[MusicStartParams]):
             try:
                 library.load(song_id)
             except MusicError:
+                require_foundation(params)
+                require_layer_notes(params)
                 detected_style = params.style_profile or "pop_ballad"
                 title = (params.title or "").strip() or "Untitled Song"
                 record = library.create(
@@ -739,11 +886,14 @@ class MusicStartTool(BaseTool[MusicStartParams]):
                 style_override=params.style_profile,
                 opened_new=opened_new,
                 released_prev=released_prev,
+                params=params,
             )
 
         state, state_digest = state_pair
         if state.stage == "completed" and params.action == "start" and params.title:
             # Explicit start of a brand-new song when previous song already completed
+            require_foundation(params)
+            require_layer_notes(params)
             detected_style = params.style_profile or "pop_ballad"
             if context.story_id is not None:
                 library.release(context.story_id, room_id)
@@ -768,6 +918,7 @@ class MusicStartTool(BaseTool[MusicStartParams]):
                 style_override=params.style_profile,
                 opened_new=True,
                 released_prev=released_prev,
+                params=params,
             )
 
         return self._advance_stage(
@@ -777,6 +928,7 @@ class MusicStartTool(BaseTool[MusicStartParams]):
             style_override=params.style_profile,
             opened_new=opened_new,
             released_prev=released_prev,
+            params=params,
         )
 
     @staticmethod
@@ -800,6 +952,104 @@ class MusicStartTool(BaseTool[MusicStartParams]):
             )
         return None
 
+    @staticmethod
+    def _foundation_outline(
+        params: MusicStartParams,
+        existing: ScoreOutline | None,
+        section_id: str,
+    ) -> tuple[ScoreOutline, ScoreSection]:
+        """Build the score the foundation is written over, from the model's facts.
+
+        Each fact comes from the call when given, otherwise from a `score.yaml` the song
+        already has (a song set up with `music_score` first). A fact found in neither
+        refuses the start: the tool never picks a tempo, key, meter or progression itself.
+        """
+        existing_section = (
+            next((s for s in existing.sections if s.id == section_id), None)
+            if existing is not None
+            else None
+        )
+        tempo = params.tempo if params.tempo is not None else (existing.tempo if existing else None)
+        key_sig = params.key_signature or (existing.key_signature if existing else None)
+        time_sig = params.time_signature or (existing.time_signature if existing else None)
+        chords = params.chords
+        if chords is None and existing_section is not None and existing_section.chords:
+            chords = list(existing_section.chords)
+        facts: dict[str, object] = {
+            "tempo": tempo,
+            "key_signature": key_sig,
+            "time_signature": time_sig,
+            "chords": chords,
+        }
+        missing = [name for name in FOUNDATION_FIELDS if facts[name] is None]
+        if missing or tempo is None or key_sig is None or time_sig is None or chords is None:
+            raise foundation_refusal(missing)
+
+        if params.chords is None and existing_section is not None:
+            section = existing_section
+        else:
+            section = ScoreSection(
+                id=section_id,
+                title=existing_section.title if existing_section is not None else "Verse 1",
+                kind=existing_section.kind if existing_section is not None else "verse",
+                bars=len(chords),
+                chords=chords,
+                tempo_map=[
+                    change
+                    for change in (existing_section.tempo_map if existing_section else [])
+                    if change.bar <= len(chords)
+                ],
+            )
+        others = list(existing.sections) if existing is not None else []
+        if existing_section is not None:
+            sections = [section if s.id == section_id else s for s in others]
+        else:
+            sections = [*others, section]
+        outline = ScoreOutline(
+            tempo=tempo,
+            time_signature=time_sig,
+            key_signature=key_sig,
+            sections=sections,
+        )
+        return outline, section
+
+    @staticmethod
+    def _layer_track(
+        params: MusicStartParams,
+        outline: ScoreOutline,
+        section: ScoreSection,
+        instrument_id: str,
+        *,
+        swing: float,
+        sketch: Callable[[], TrackFile],
+    ) -> TrackFile:
+        """The layer's track: the model's `bars` when given, the tool's sketch only on request.
+
+        The model's bars must cover every bar of the section once. Their notes are fitted to
+        the meter with `normalize_track_bar`, as `music_track(write_track)` fits them.
+        """
+        if params.bars is None:
+            if not params.sketch:
+                require_layer_notes(params)
+            return sketch()
+        require_bars_cover([b.bar for b in params.bars], section.bars, section.id, instrument_id)
+        normalized = [normalize_track_bar(b, outline.time_signature) for b in params.bars]
+        try:
+            track = TrackFile(
+                track_id=track_id_for(section.id, instrument_id),
+                section_id=section.id,
+                instrument_id=instrument_id,
+                time_signature=outline.time_signature,
+                groove_swing=swing,
+                bars=sorted(normalized, key=lambda b: b.bar),
+            )
+        except ValidationError as exc:
+            raise MusicFileError(
+                describe_invalid(track_file(section.id, instrument_id), exc)
+            ) from exc
+        validate_track_against_section(track, section, outline)
+        return track
+
     def _advance_stage(
         self,
         work: SongWork,
@@ -809,38 +1059,31 @@ class MusicStartTool(BaseTool[MusicStartParams]):
         style_override: StyleProfile | None,
         opened_new: bool,
         released_prev: str | None,
+        params: MusicStartParams,
     ) -> dict[str, Any]:
         section_id = state.active_section_id
         detected_style = style_override
 
         if state.stage == "setup_foundation":
             style: StyleProfile = detected_style or state.style_profile
-            presets = load_bundled_styles()
-            preset = presets.get(style, {})
-            tempo = int(preset.get("tempo", 96))
-            time_sig = str(preset.get("time_signature", "4/4"))
-            key_sig = str(preset.get("key_signature", "D minor"))
-            raw_chords = preset.get("chords")
-            chord_items = cast(list[object], raw_chords) if isinstance(raw_chords, list) else []
-            chords = (
-                [str(c) for c in chord_items]
-                if len(chord_items) == 4
-                else ["Dm7", "Gm7", "C7", "Fmaj7"]
-            )
-
             score_pair = work.read_score()
-            section = ScoreSection(
-                id=section_id,
-                title="Verse 1",
-                kind="verse",
-                bars=4,
-                chords=chords,
+            outline, section = self._foundation_outline(
+                params,
+                score_pair[0] if score_pair is not None else None,
+                section_id,
             )
-            outline = ScoreOutline(
-                tempo=tempo,
-                time_signature=time_sig,
-                key_signature=key_sig,
-                sections=[section],
+            bass_track = self._layer_track(
+                params,
+                outline,
+                section,
+                "bass_synth",
+                swing=default_style_axioms(style).default_swing,
+                sketch=lambda: generate_bass_groove(
+                    section,
+                    instrument_id="bass_synth",
+                    style=style,
+                    time_signature=outline.time_signature,
+                ),
             )
             work.write_score(
                 outline,
@@ -866,17 +1109,13 @@ class MusicStartTool(BaseTool[MusicStartParams]):
                 expected_digest=existing_bass_inst[1] if existing_bass_inst is not None else None,
             )
 
-            bass_track = generate_bass_groove(
-                section,
-                instrument_id="bass_synth",
-                style=style,
-                time_signature=outline.time_signature,
-            )
             existing_bass_track = work.read_track(section_id, "bass_synth")
             written_track = work.write_track(
                 bass_track,
                 expected_digest=existing_bass_track[1] if existing_bass_track is not None else None,
-                summary="Created foundation bass rhythm track",
+                summary=_layer_summary(
+                    params, "bass_synth", "Created foundation bass rhythm track"
+                ),
             )
 
             next_state = MusicStartState(
@@ -898,6 +1137,23 @@ class MusicStartTool(BaseTool[MusicStartParams]):
 
         if state.stage == "layer_melody":
             outline, section = self._require_section(work, section_id)
+            bass_pair = work.read_track(section_id, "bass_synth")
+            bass_track = bass_pair[0] if bass_pair is not None else None
+            violin_track = self._layer_track(
+                params,
+                outline,
+                section,
+                "violin_solo",
+                swing=default_style_axioms(state.style_profile).default_swing,
+                sketch=lambda: _build_violin_melody_track(
+                    section,
+                    instrument_id="violin_solo",
+                    time_signature=outline.time_signature,
+                    swing=default_style_axioms(state.style_profile).default_swing,
+                    style=state.style_profile,
+                    bass_track=bass_track,
+                ),
+            )
             violin_inst = InstrumentEntry(
                 id="violin_solo",
                 name="Solo Violin",
@@ -917,21 +1173,13 @@ class MusicStartTool(BaseTool[MusicStartParams]):
                 expected_digest=existing_inst[1] if existing_inst is not None else None,
             )
 
-            bass_pair = work.read_track(section_id, "bass_synth")
-            bass_track = bass_pair[0] if bass_pair is not None else None
-            violin_track = _build_violin_melody_track(
-                section,
-                instrument_id="violin_solo",
-                time_signature=outline.time_signature,
-                swing=default_style_axioms(state.style_profile).default_swing,
-                style=state.style_profile,
-                bass_track=bass_track,
-            )
             existing_track = work.read_track(section_id, "violin_solo")
             written_track = work.write_track(
                 violin_track,
                 expected_digest=existing_track[1] if existing_track is not None else None,
-                summary="Added high-register solo violin melody track",
+                summary=_layer_summary(
+                    params, "violin_solo", "Added high-register solo violin melody track"
+                ),
             )
 
             completed = list(dict.fromkeys([*state.completed_layers, "violin_solo"]))
@@ -954,6 +1202,19 @@ class MusicStartTool(BaseTool[MusicStartParams]):
 
         if state.stage == "layer_harmony":
             outline, section = self._require_section(work, section_id)
+            piano_track = self._layer_track(
+                params,
+                outline,
+                section,
+                "grand_piano",
+                swing=default_style_axioms(state.style_profile).default_swing,
+                sketch=lambda: _build_piano_arpeggio_track(
+                    section,
+                    instrument_id="grand_piano",
+                    time_signature=outline.time_signature,
+                    swing=default_style_axioms(state.style_profile).default_swing,
+                ),
+            )
             piano_inst = InstrumentEntry(
                 id="grand_piano",
                 name="Grand Piano",
@@ -973,17 +1234,13 @@ class MusicStartTool(BaseTool[MusicStartParams]):
                 expected_digest=existing_inst[1] if existing_inst is not None else None,
             )
 
-            piano_track = _build_piano_arpeggio_track(
-                section,
-                instrument_id="grand_piano",
-                time_signature=outline.time_signature,
-                swing=default_style_axioms(state.style_profile).default_swing,
-            )
             existing_track = work.read_track(section_id, "grand_piano")
             written_track = work.write_track(
                 piano_track,
                 expected_digest=existing_track[1] if existing_track is not None else None,
-                summary="Added mid-register grand piano arpeggio track",
+                summary=_layer_summary(
+                    params, "grand_piano", "Added mid-register grand piano arpeggio track"
+                ),
             )
 
             completed = list(dict.fromkeys([*state.completed_layers, "grand_piano"]))
@@ -1010,6 +1267,32 @@ class MusicStartTool(BaseTool[MusicStartParams]):
                 detected_style if detected_style is not None else state.style_profile
             )
             use_hiphop = effective_style == "hiphop_groove"
+            bass_pair = work.read_track(section_id, "bass_synth")
+            bass_track = bass_pair[0] if bass_pair is not None else None
+
+            def _sketch_drums() -> TrackFile:
+                if use_hiphop:
+                    return generate_hiphop_drums(
+                        section,
+                        bass_track=bass_track,
+                        instrument_id="drum_kit",
+                        substyle="boombap",
+                        time_signature=outline.time_signature,
+                    )
+                return _build_pop_drums_track(
+                    section,
+                    instrument_id="drum_kit",
+                    time_signature=outline.time_signature,
+                )
+
+            drum_track = self._layer_track(
+                params,
+                outline,
+                section,
+                "drum_kit",
+                swing=default_style_axioms(effective_style).default_swing,
+                sketch=_sketch_drums,
+            )
             if use_hiphop and work.record().style_axioms.profile != "hiphop_groove":
                 work.update_style_axioms(default_style_axioms("hiphop_groove"))
 
@@ -1032,31 +1315,16 @@ class MusicStartTool(BaseTool[MusicStartParams]):
                 expected_digest=existing_inst[1] if existing_inst is not None else None,
             )
 
-            bass_pair = work.read_track(section_id, "bass_synth")
-            bass_track = bass_pair[0] if bass_pair is not None else None
-            if use_hiphop:
-                drum_track = generate_hiphop_drums(
-                    section,
-                    bass_track=bass_track,
-                    instrument_id="drum_kit",
-                    substyle="boombap",
-                    time_signature=outline.time_signature,
-                )
-            else:
-                drum_track = _build_pop_drums_track(
-                    section,
-                    instrument_id="drum_kit",
-                    time_signature=outline.time_signature,
-                )
-
             existing_track = work.read_track(section_id, "drum_kit")
             written_track = work.write_track(
                 drum_track,
                 expected_digest=existing_track[1] if existing_track is not None else None,
-                summary=(
+                summary=_layer_summary(
+                    params,
+                    "drum_kit",
                     "Added 808 hip-hop drum groove locked to bass"
                     if use_hiphop
-                    else "Added pop drum kit groove"
+                    else "Added pop drum kit groove",
                 ),
             )
 
@@ -1245,14 +1513,14 @@ class MusicStartTool(BaseTool[MusicStartParams]):
         record = work.record()
         score_pair = work.read_score()
         audit_summary: dict[str, Any] | None = None
-        sec_chords: list[str] | None = None
+        foundation: tuple[ScoreOutline, ScoreSection] | None = None
         if score_pair is not None and score_pair[0].sections:
             outline = score_pair[0]
             sec = next(
                 (s for s in outline.sections if s.id == state.active_section_id),
                 outline.sections[0],
             )
-            sec_chords = list(sec.chords)
+            foundation = (outline, sec)
             instruments = {inst.id: inst for inst, _ in work.list_instruments()}
             tracks = [t for t, _ in work.list_tracks(section_id=sec.id)]
             report = audit_section(sec, tracks, instruments, record.style_axioms)
@@ -1269,14 +1537,15 @@ class MusicStartTool(BaseTool[MusicStartParams]):
             "recommended_next": state.recommended_next,
             "opened_new_song": opened_new,
             REPLY_NOTE_KEY: _stage_reply_note(
-                state.stage, style_profile=state.style_profile, chords=sec_chords
+                state.stage, style_profile=state.style_profile, foundation=foundation
             ),
         }
         if added_instrument in ("violin_solo", "grand_piano"):
             result["composition_hint"] = (
                 f"Scaffold written to {added_instrument}. To compose a bespoke melody/part "
-                "locked to the user's custom rhythm or direction, read bars 1..4 of "
-                "bass_synth and call music_track(action='patch_bars', propose=False)."
+                "locked to the user's custom rhythm or direction, read the section's bars "
+                f"(1..{foundation[1].bars if foundation is not None else 1}) of bass_synth and "
+                "call music_track(action='patch_bars', propose=False)."
             )
         if released_prev is not None:
             result["released"] = released_prev

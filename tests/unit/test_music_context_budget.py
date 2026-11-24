@@ -85,6 +85,7 @@ async def _propose(song: Path) -> str:
             instrument_id="violin_solo",
             start_bar=1,
             end_bar=BARS,
+            sketch=True,
         ),
         _ctx(song),
     )
@@ -138,6 +139,7 @@ _CASES: list[tuple[str, BaseTool[Any], dict[str, Any]]] = [
             "start_bar": 1,
             "end_bar": BARS,
             "propose": False,
+            "sketch": True,
         },
     ),
     (
@@ -168,7 +170,11 @@ _CASES: list[tuple[str, BaseTool[Any], dict[str, Any]]] = [
         MusicContextTool(),
         {"selected_region": {"section_id": "theme_a", "start_bar": 1, "end_bar": BARS}},
     ),
-    ("proposal.propose_all", MusicProposalTool(), {"action": "propose", "instrument_id": "all"}),
+    (
+        "proposal.propose_all",
+        MusicProposalTool(),
+        {"action": "propose", "instrument_id": "all", "sketch": True},
+    ),
     ("audit", MusicTheoryAuditTool(), {"section_id": "theme_a"}),
     ("start.status", MusicStartTool(), {"action": "status"}),
 ]

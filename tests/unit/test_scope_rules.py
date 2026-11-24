@@ -90,6 +90,7 @@ def test_which_changes_call_for_the_whole_browser_suite(path: str, reaches: bool
         ("\n[browser_freshness]\n", "\n[browser_freshnes]\n", "unknown top-level"),
         ("version = 1", "version = 1\nversion = 1", "not valid TOML"),
     ],
+    ids=lambda value: str(value) if len(str(value)) <= 60 else f"{str(value)[:30]}...",
 )
 def test_a_malformed_rules_file_is_refused(old: str, new: str, message: str) -> None:
     """Killed by: src/uclone_x/cli/scope_rules.py :: unknown = sorted(set(table) - allowed)

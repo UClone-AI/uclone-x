@@ -2622,6 +2622,32 @@ class TestRoomDockTurnTraceRoutes:
             assert resp.json()["reason"]["code"] == "session_unreadable"
             assert "boom" not in resp.text
 
+    def test_cluster_store_event_log_lines_fallback_traces_turn_when_event_log_path_is_none(
+        self, client: TestClient, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Cluster session stores return `event_log_path(session_id) is None` and serve events via `read_event_log_lines`.
+
+        Killed by: src/uclone_x/ui/room_dock.py :: read_lines: Any = getattr(store, "read_event_log_lines", None)
+        Becomes:   read_lines: Any = None
+        """
+        room_id = _create(client, ["scout"])
+        _, log_path = self._real_turns(client, room_id)
+        lines = tuple(log_path.read_text(encoding="utf-8").splitlines())
+        store = _stack(client).session_manager().core_store
+
+        def _no_path(_sid: str) -> Path | None:
+            return None
+
+        def _lines_for(_sid: str) -> tuple[str, ...]:
+            return lines
+
+        monkeypatch.setattr(store, "event_log_path", _no_path)
+        monkeypatch.setattr(store, "read_event_log_lines", _lines_for, raising=False)
+
+        resp = client.get(f"/api/rooms/{room_id}/turns/1/trace")
+        assert resp.status_code == 200
+        assert resp.json()["trace"] is not None
+
 
 _LOCALES = Path(__file__).resolve().parents[2] / "frontend" / "src" / "i18n" / "locales"
 

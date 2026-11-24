@@ -679,3 +679,20 @@ class ValkeyPostgresSessionStore(ClusterSessionStoreProtocol):
         """Cluster session events are stored in PostgreSQL `session_events`, not a local file path."""
         _ = session_id
         return None
+
+    async def _read_event_log_lines_async(self, session_id: str) -> tuple[str, ...] | None:
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT event_json FROM session_events WHERE session_id = $1 ORDER BY seq ASC",
+                session_id,
+            )
+        if not rows:
+            return None
+        header = json.dumps(
+            {"schema": "uclone_x.log.v0", "version": "0.1.0-dev", "session_id": session_id}
+        )
+        return (header, *(str(r["event_json"]) for r in rows))
+
+    def read_event_log_lines(self, session_id: str) -> tuple[str, ...] | None:
+        """Return the session's stored event log lines from PostgreSQL `session_events`, if any."""
+        return self._run_sync(self._read_event_log_lines_async, session_id)

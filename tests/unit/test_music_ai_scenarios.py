@@ -268,6 +268,7 @@ async def test_scenario_s3_gentle_intro_intent_synthesizes_soft_sustained_notes(
             end_bar=2,
             summary="Soft opening chords",
             intent="gentle_intro",
+            sketch=True,
         ),
         ctx,
     )
@@ -285,6 +286,7 @@ async def test_scenario_s3_gentle_intro_intent_synthesizes_soft_sustained_notes(
             start_bar=3,
             end_bar=4,
             summary="Gentle intro, soft and sustained, 도입부를 부드럽고 잔잔하게",
+            sketch=True,
         ),
         ctx,
     )
@@ -313,6 +315,7 @@ async def test_scenario_s4_instrument_all_stages_proposals_for_every_stem_and_ap
             start_bar=1,
             end_bar=2,
             summary="Gentle intro across all instruments",
+            sketch=True,
         ),
         ctx,
     )
@@ -347,6 +350,7 @@ async def test_scenario_s5_insert_bars_prepends_intro_and_shifts_existing_bars(
             count=2,
             chords=["Am7", "Dm7"],
             intent="gentle_intro",
+            sketch=True,
         ),
         ctx,
     )
@@ -380,7 +384,9 @@ async def test_scenario_s6_append_bars_and_delete_duplicate_bars_keep_section_an
             action="append_bars",
             section_id="theme_a",
             count=4,
+            chords=["Bbmaj7", "Gm7", "A7", "Dm7"],
             intent="outro_cadence",
+            sketch=True,
         ),
         ctx,
     )
@@ -454,6 +460,7 @@ async def test_scenario_s8_sequential_same_track_proposals_reconcile_digest_on_a
             start_bar=1,
             end_bar=2,
             summary="Gentle intro violin bars 1..2",
+            sketch=True,
         ),
         ctx,
     )
@@ -465,6 +472,7 @@ async def test_scenario_s8_sequential_same_track_proposals_reconcile_digest_on_a
             start_bar=3,
             end_bar=4,
             summary="Climax ornate violin bars 3..4",
+            sketch=True,
         ),
         ctx,
     )
@@ -574,6 +582,7 @@ async def test_scenario_s11_http_routes_structure_approve_all_and_set_bar_notes(
             start_bar=1,
             end_bar=2,
             summary="Gentle intro across all stems",
+            sketch=True,
         ),
         _ctx(workspace, room_id=room_id, song_id="route-song"),
     )
@@ -757,6 +766,7 @@ async def test_scenario_s14_solo_mute_and_apply_go_through_explicit_tool_calls(
             end_bar=2,
             summary="Gentle intro",
             intent="gentle_intro",
+            sketch=True,
         ),
         ctx,
     )
@@ -808,6 +818,7 @@ async def test_a_user_message_alone_changes_no_proposal_and_no_mix(
             end_bar=2,
             summary="Gentle intro",
             intent="gentle_intro",
+            sketch=True,
         ),
         ctx,
     )
@@ -1000,3 +1011,138 @@ async def test_a_docked_conversation_that_is_answering_does_not_take_the_song(
     assert record.lease is not None and record.lease.holder == "room_deleted_000"
     after = client.get("/api/artifacts/library/songs/midnight-nocturne").json()
     assert [p["id"] for p in after["proposals"]] == [proposal_id]
+
+
+async def test_a_proposal_s_bars_are_refused_as_written_never_swapped_for_generated_ones(
+    tmp_path: Path,
+) -> None:
+    """Bars the model proposes that do not fit are refused; nothing generated takes their place.
+
+    The tool used to catch any failure and stage its own ornate variation instead, so the
+    model's melody vanished without a word. Without bars, a proposal needs `sketch=True`.
+
+    Killed by: examples/music/src/uclone_x_music/tools.py :: except (MusicError, MusicFileError, ValidationError, ValueError) as exc:
+    Becomes: except ():
+    """
+    ctx = await _seed_four_stem_song(tmp_path)
+    tool = MusicProposalTool()
+    with pytest.raises(MusicError, match="do not fit the track"):
+        await tool.run(
+            MusicProposalParams(
+                action="propose",
+                section_id="theme_a",
+                instrument_id="violin_solo",
+                start_bar=1,
+                end_bar=1,
+                bars=[TrackBar(bar=1, repeat_bar=9)],
+            ),
+            ctx,
+        )
+    with pytest.raises(MusicError, match="sketch=true"):
+        await tool.run(
+            MusicProposalParams(
+                action="propose", section_id="theme_a", instrument_id="violin_solo", start_bar=1
+            ),
+            ctx,
+        )
+    assert SongWork.for_context(ctx).list_proposals() == []
+
+
+async def test_new_bars_take_the_model_s_chords_and_rest_until_it_writes_their_notes(
+    tmp_path: Path,
+) -> None:
+    """`append_bars` into a chorded section needs the model's chords; tracks get rests.
+
+    No fixed progression from another key fills the new bars, and no generic notes are
+    written unless the call asks for a sketch.
+
+    Killed by: examples/music/src/uclone_x_music/arranger.py :: notes=[rest],
+    Becomes: notes=["1.0:D4:4.0:v80"],
+    """
+    ctx = await _seed_four_stem_song(tmp_path)
+    tool = MusicScoreTool()
+    with pytest.raises(MusicError, match="exactly 2 symbols"):
+        await tool.run(MusicScoreParams(action="append_bars", section_id="theme_a", count=2), ctx)
+    assert _section(ctx).bars == 4
+
+    await tool.run(
+        MusicScoreParams(
+            action="append_bars", section_id="theme_a", count=2, chords=["Bbmaj7", "A7sus4"]
+        ),
+        ctx,
+    )
+    section = _section(ctx)
+    assert section.chords == ["Dm7", "Gm7", "A7", "Dm7", "Bbmaj7", "A7sus4"]
+    work = SongWork.for_context(ctx)
+    for instrument in ("violin_solo", "grand_piano", "bass_synth", "drum_kit"):
+        loaded = work.read_track("theme_a", instrument)
+        assert loaded is not None
+        assert [b.notes for b in loaded[0].bars[4:]] == [["1.0:REST:4.0"], ["1.0:REST:4.0"]]
+
+
+async def test_a_patch_or_proposal_without_notes_changes_nothing_before_it_refuses(
+    tmp_path: Path,
+) -> None:
+    """A refused `patch_bars` or `propose` leaves the song exactly as it was.
+
+    Both used to extend the section (cycling its chords, copying bars into every track) and
+    only then refuse with "Nothing was changed".
+
+    Killed by: examples/music/src/uclone_x_music/tools.py :: if not params.bars and not params.sketch:
+    Becomes: if False:
+    """
+    ctx = await _seed_four_stem_song(tmp_path)
+    work = SongWork.for_context(ctx)
+    song_dir = work.library.song_dir(work.song_id)
+    before = {f: f.read_bytes() for f in song_dir.rglob("*.yaml")}
+
+    with pytest.raises(MusicError, match="sketch=true"):
+        await MusicTrackTool().run(
+            MusicTrackParams(
+                action="patch_bars",
+                section_id="theme_a",
+                instrument_id="violin_solo",
+                start_bar=5,
+                end_bar=8,
+            ),
+            ctx,
+        )
+    with pytest.raises(MusicError, match="sketch=true"):
+        await MusicProposalTool().run(
+            MusicProposalParams(
+                action="propose",
+                section_id="theme_a",
+                instrument_id="violin_solo",
+                start_bar=5,
+                end_bar=8,
+            ),
+            ctx,
+        )
+    after = {f: f.read_bytes() for f in song_dir.rglob("*.yaml")}
+    assert after == before
+
+
+async def test_a_chordless_section_takes_new_bars_as_rests_from_the_panel(tmp_path: Path) -> None:
+    """The MusicView insert/append path (a sketch) still works on a section without chords.
+
+    It gets rests and stays chordless; no progression is invented for it.
+
+    Killed by: examples/music/src/uclone_x_music/arranger.py :: drafts = sketch and bool(new_chords)
+    Becomes: drafts = sketch
+    """
+    from uclone_x_music.arranger import append_section_bars
+
+    ctx = await _seed_four_stem_song(tmp_path)
+    await MusicScoreTool().run(
+        MusicScoreParams(
+            action="upsert_section", section_id="bridge", title="Bridge", kind="bridge", bars=2
+        ),
+        ctx,
+    )
+    work = SongWork.for_context(ctx)
+    section = append_section_bars(work, "bridge", count=2)
+    assert section.bars == 4
+    assert section.chords == []
+    loaded = work.read_track("bridge", "violin_solo")
+    assert loaded is not None
+    assert [b.notes for b in loaded[0].bars] == [["1.0:REST:4.0"]] * 4

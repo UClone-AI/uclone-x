@@ -1366,7 +1366,9 @@ def test_two_genuine_os_processes_on_one_session_cannot_lose_an_update(tmp_path:
     # update was refused rather than applied on top of a state it had never seen.
     assert final.revision == 2
     assert final.turn_counter == 1
-    assert [q.name for q in tmp_path.iterdir()] == sorted(["sess_shared.json", "base.json"])
+    # Sorted: `iterdir` order is the filesystem's. APFS lists by name and ext4 does not,
+    # so the unsorted comparison passed on macOS and failed on every Linux CI leg.
+    assert sorted(q.name for q in tmp_path.iterdir()) == ["base.json", "sess_shared.json"]
 
 
 @pytest.mark.asyncio

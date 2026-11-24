@@ -46,7 +46,10 @@ console = Console()
 
 cluster_app = typer.Typer(
     name="cluster",
-    help="Manage and run the distributed stateless cluster runtime (docker compose topology)",
+    help=(
+        "Low-level distributed cluster infrastructure lifecycle and verification "
+        "(prefer `ucx up` / `ucx down` / `ucx status --stack` for declarative full-stack convergence)"
+    ),
     no_args_is_help=True,
 )
 

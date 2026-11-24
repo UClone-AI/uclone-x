@@ -7,9 +7,9 @@ import os
 import subprocess
 import sys
 import tempfile
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from pathlib import Path, PosixPath, WindowsPath
-from typing import Any, cast
+from typing import Any, Final, cast
 
 import pytest
 
@@ -243,8 +243,25 @@ def pytest_addoption(parser: pytest.Parser) -> None:
     )
 
 
+#: The longest test id collection accepts. pytest prints the id on every `-v` line, and a
+#: 100,000-character parametrize id cut GitHub's job log mid-run, hiding the real failure.
+MAX_TEST_ID_LENGTH: Final = 500
+
+
+def refuse_long_test_ids(items: Sequence[pytest.Item]) -> None:
+    """Stop collection when a test id would flood the log; name the test and its length."""
+    long_ids = [item.nodeid for item in items if len(item.nodeid) > MAX_TEST_ID_LENGTH]
+    if long_ids:
+        shown = ", ".join(f"{nodeid[:120]}... ({len(nodeid)} chars)" for nodeid in long_ids[:3])
+        raise pytest.UsageError(
+            f"{len(long_ids)} test id(s) exceed {MAX_TEST_ID_LENGTH} characters: {shown}. "
+            "Give the parametrize case a short `ids=`."
+        )
+
+
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
     """Skip every `live`-marked test unless `--live` was passed, and `pre_release` tests unless requested."""
+    refuse_long_test_ids(items)
     apply_live_skip(
         live_enabled=bool(config.getoption("--live")),
         items=items,

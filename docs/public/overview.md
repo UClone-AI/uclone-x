@@ -14,12 +14,25 @@ imports only point downward.
 
 | Layer | What it holds | Examples |
 | :--- | :--- | :--- |
-| **Shell** | The process, configuration and every inbound surface | `ui/` (the dashboard's FastAPI backend), `cli/` (`ucx`), `shells/` (console entry point, A2A and ACP servers) |
-| **Adapter** | Implementations of a kernel protocol against something real: a provider, a file, a subprocess | `llm/connectors/`, `tools/builtin/`, `memory/store.py`, `telemetry/` exporters, `code_intel/` |
+| **Shell** | The process, configuration and every inbound surface | `ui/` (the dashboard's FastAPI backend), `cli/` (`ucx`), `shells/` (`reconciler.py` for `ucx up`, `gateway_server.py` for the unified Model Gateway, stateless cluster worker, A2A and ACP servers) |
+| **Adapter** | Implementations of a kernel protocol against something real: a provider, a file, a subprocess, or cluster stores | `llm/connectors/` (including `gateway_client.py`), `adapters/cluster/` (Kafka, Valkey, PostgreSQL, Centrifugo), `tools/builtin/`, `memory/store.py`, `telemetry/` exporters, `code_intel/` |
 | **Kernel** | Pure Python: contracts, models and decisions | `agent/`, `room/`, `engine/`, `core/`, `llm/`, `tools/`, `sandbox/`, `memory/`, `skills/`, `ontology/`, `a2a/`, `acp/` |
 
 No kernel or adapter module imports a shell module. The dashboard reaches the runtime only
-over HTTP and WebSocket.
+over HTTP, SSE and WebSocket.
+
+### Two consumption tracks over one Core
+
+* **Declarative stateless cluster stack (`ucx up`)** — `shells/reconciler.py` converges
+  Docker Compose infrastructure (`kafka`, `postgres`, `valkey-1..6`, `centrifugo`) together
+  with supervised local daemons (`model_gateway`, stateless `agent_workers`, and
+  `web_ui_server`). Workers and the UI server hold no sticky in-process session state and
+  send every LLM request through the standalone **Model Gateway** (`GatewayModelClient`),
+  which isolates provider API keys and optional remote-GPU SSH tunnels in one process.
+* **Zero-broker Python Agent Kernel SDK (`pip install uclone-x`) & headless CLI** —
+  importing `uclone_x` (`compose_agent`) or running `ucx run` / `ucx acp serve` executes
+  `BaseAgent` turns directly in memory over `engine/event_bus.py` with zero external
+  brokers or Docker containers required.
 
 ## One agent
 
@@ -57,7 +70,8 @@ The multi-agent layer depends on the single-agent layer, never the reverse.
 | Package | Does | State |
 | :--- | :--- | :--- |
 | `engine/` | In-process event bus with priorities and backpressure; no external broker | Implemented |
-| `llm/` | One provider-neutral interface, token budgets and context compaction. Connectors for Gemini, Anthropic, OpenAI, Ollama and vLLM; provider SDKs are imported only inside `llm/connectors/` | Implemented |
+| `adapters/cluster/` | Stateless cluster adapters (Kafka KRaft, PostgreSQL, Valkey cluster, Centrifugo SSE edge) behind `cluster_protocols.py` | Implemented |
+| `llm/` | One provider-neutral interface, token budgets and context compaction. Connectors for Gemini, Anthropic, OpenAI, Ollama, vLLM and the standalone Model Gateway (`gateway_client.py`); provider SDKs are imported only inside `llm/connectors/` | Implemented |
 | `tools/` | Tool registry, MCP client, built-in tools (files, shell, web, images, plan, sub-agents, skills) | Implemented |
 | `memory/` | Per-clone memory across conversations, with ranked recall (embeddings when an embedder is configured, lexical overlap otherwise) | Implemented |
 | `sandbox/` | Where a tool may read, write and run. Host and workspace isolation work; container and WASM levels exist as configuration models only | Partial |

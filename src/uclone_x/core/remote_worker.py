@@ -40,15 +40,29 @@ def is_valid_host(host: str) -> bool:
     return bool(_VALID_HOST_REGEX.match(stripped))
 
 
+_VCS_SSH_DOMAINS: frozenset[str] = frozenset(
+    {
+        "github.com",
+        "gitlab.com",
+        "bitbucket.org",
+        "ssh.dev.azure.com",
+        "vs-ssh.visualstudio.com",
+    }
+)
+
+
 def find_configured_ssh_hosts(ssh_config_path: Path | None = None) -> list[str]:
     """Parse ~/.ssh/config (or `ssh_config_path`) for concrete Host declarations.
 
-    Ignores wildcards like '*' or patterns with '?'. Returns sorted unique hostnames.
+    Ignores wildcards like '*' or patterns with '?' and skips git-hosting VCS aliases
+    (`github.com`, `gitlab.com`, etc.). Returns sorted unique hostnames.
     """
     path = ssh_config_path if ssh_config_path is not None else Path.home() / ".ssh" / "config"
     if not path.is_file():
         return []
     hosts: set[str] = set()
+    excluded: set[str] = set()
+    current_hosts: list[str] = []
     try:
         content = path.read_text(encoding="utf-8", errors="replace")
     except OSError:
@@ -61,12 +75,129 @@ def find_configured_ssh_hosts(ssh_config_path: Path | None = None) -> list[str]:
         if not tokens:
             continue
         if tokens[0].lower() == "host":
+            current_hosts = []
             for name in tokens[1:]:
                 if "*" in name or "?" in name:
                     continue
                 if is_valid_host(name):
-                    hosts.add(name)
-    return sorted(hosts)
+                    current_hosts.append(name)
+                    if name.lower() in _VCS_SSH_DOMAINS:
+                        excluded.add(name)
+                    else:
+                        hosts.add(name)
+        elif tokens[0].lower() == "hostname" and len(tokens) >= 2:
+            if tokens[1].lower() in _VCS_SSH_DOMAINS:
+                excluded.update(current_hosts)
+    return sorted(hosts - excluded)
+
+
+def _hostname_override_args(hostname_override: str | None) -> list[str]:
+    """Return `ssh -o HostName=...` arguments when a valid fallback override is set."""
+    clean = (hostname_override or "").strip()
+    if not clean or not is_valid_host(clean):
+        return []
+    return ["-o", f"HostName={clean}"]
+
+
+def _is_network_unreachable_error(error: str | None) -> bool:
+    """Return True when an SSH failure indicates network/IP staleness rather than auth rejection."""
+    lower = (error or "").lower()
+    return any(
+        needle in lower
+        for needle in (
+            "timed out",
+            "no route to host",
+            "network is unreachable",
+            "could not resolve hostname",
+            "connection refused",
+        )
+    )
+
+
+def find_ssh_fallback_hostnames(
+    host: str,
+    ssh_config_path: Path | None = None,
+) -> list[str]:
+    """Return fallback HostName candidates from the matching ~/.ssh/config Host block.
+
+    When a Host block lists multiple aliases or DHCP IPs (e.g.
+    `Host comfy dell Dell5820 10.202.1.121 10.202.1.123`) and its `HostName` goes stale,
+    this yields sibling IP/dotted aliases and `<alias>.local` mDNS candidates so tunnels
+    can self-recover without manual config edits.
+    """
+    clean_target = host.strip()
+    if not clean_target:
+        return []
+    path = ssh_config_path if ssh_config_path is not None else Path.home() / ".ssh" / "config"
+    if not path.is_file():
+        return []
+    try:
+        content = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+
+    block_aliases: list[str] = []
+    block_hostname: str | None = None
+    in_matching_block = False
+    matched_aliases: list[str] = []
+    matched_hostname: str | None = None
+
+    def _flush() -> None:
+        nonlocal matched_aliases, matched_hostname
+        if in_matching_block and not matched_aliases:
+            matched_aliases = list(block_aliases)
+            matched_hostname = block_hostname
+
+    for line in content.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        tokens = stripped.replace("=", " ").split()
+        if not tokens:
+            continue
+        key = tokens[0].lower()
+        if key == "host":
+            _flush()
+            block_aliases = [
+                tok
+                for tok in tokens[1:]
+                if "*" not in tok and "?" not in tok and is_valid_host(tok)
+            ]
+            block_hostname = None
+            in_matching_block = any(
+                alias.lower() == clean_target.lower() for alias in block_aliases
+            )
+        elif key == "hostname" and len(tokens) >= 2 and is_valid_host(tokens[1]):
+            block_hostname = tokens[1]
+    _flush()
+
+    if not matched_aliases:
+        return []
+
+    skip_lower = {clean_target.lower()}
+    if matched_hostname:
+        skip_lower.add(matched_hostname.lower())
+
+    dotted_or_ip: list[str] = []
+    mdns_candidates: list[str] = []
+    seen: set[str] = set()
+
+    for alias in matched_aliases:
+        lower = alias.lower()
+        if lower in _VCS_SSH_DOMAINS:
+            continue
+        if "." in alias or ":" in alias:
+            if lower not in skip_lower and lower not in seen:
+                seen.add(lower)
+                dotted_or_ip.append(alias)
+        else:
+            local_name = f"{alias}.local"
+            local_lower = local_name.lower()
+            if local_lower not in skip_lower and local_lower not in seen:
+                seen.add(local_lower)
+                mdns_candidates.append(local_name)
+
+    return [*dotted_or_ip, *mdns_candidates]
 
 
 def is_port_in_use(port: int, host: str = "127.0.0.1") -> bool:
@@ -243,7 +374,11 @@ _REMOTE_PROBE_PYTHON_CMD = (
 
 
 async def probe_remote_host(
-    host: str, timeout: float = 6.0, *, ssh: Sequence[str] = ("ssh",)
+    host: str,
+    timeout: float = 6.0,
+    *,
+    ssh: Sequence[str] = ("ssh",),
+    hostname_override: str | None = None,
 ) -> RemoteHostInspection:
     """Probe an SSH host for GPU availability and active AI services.
 
@@ -266,6 +401,7 @@ async def probe_remote_host(
 
     cmd = [
         *ssh,
+        *_hostname_override_args(hostname_override),
         "-o",
         "BatchMode=yes",
         "-o",
@@ -364,12 +500,15 @@ async def probe_remote_host(
 async def launch_remote_ollama(
     host: str,
     timeout: float = 8.0,
+    *,
+    hostname_override: str | None = None,
 ) -> tuple[bool, str | None]:
     """Launch Ollama daemon on remote host if not running and wait for port 11434 to listen."""
     clean_host = host.strip()
     if not is_valid_host(clean_host):
         return False, f"Invalid host: {clean_host!r}"
 
+    override_args = _hostname_override_args(hostname_override)
     remote_cmd = (
         "if [ -f /opt/homebrew/bin/ollama ]; then OLLAMA=/opt/homebrew/bin/ollama; "
         "elif [ -f /usr/local/bin/ollama ]; then OLLAMA=/usr/local/bin/ollama; "
@@ -378,6 +517,7 @@ async def launch_remote_ollama(
     )
     cmd = [
         "ssh",
+        *override_args,
         "-o",
         "BatchMode=yes",
         "-o",
@@ -413,6 +553,7 @@ async def launch_remote_ollama(
     )
     poll_cmd = [
         "ssh",
+        *override_args,
         "-o",
         "BatchMode=yes",
         "-o",
@@ -474,6 +615,7 @@ async def launch_remote_comfyui(
     timeout: float = 12.0,
     *,
     ssh: Sequence[str] = ("ssh",),
+    hostname_override: str | None = None,
 ) -> tuple[bool, str | None]:
     """Launch ComfyUI on remote host if not running and wait for port 8188 to listen.
 
@@ -486,12 +628,14 @@ async def launch_remote_comfyui(
     if not clean_dir:
         return False, "ComfyUI directory not specified"
 
+    override_args = _hostname_override_args(hostname_override)
     remote_cmd = (
         f"if [ -f {clean_dir}/venv/bin/python3 ]; then PY={clean_dir}/venv/bin/python3; else PY=python3; fi; "
         f"nohup $PY {clean_dir}/main.py --listen 127.0.0.1 --port 8188 </dev/null >{clean_dir}/comfy.log 2>&1 &"
     )
     cmd = [
         *ssh,
+        *override_args,
         "-o",
         "BatchMode=yes",
         "-o",
@@ -527,6 +671,7 @@ async def launch_remote_comfyui(
     )
     poll_cmd = [
         *ssh,
+        *override_args,
         "-o",
         "BatchMode=yes",
         "-o",
@@ -632,6 +777,13 @@ class SSHTunnelManager:
             was_connected = True
             self._session.connected = False
             self._session.pid = None
+            stderr_summary = "\n".join(self._stderr_lines).strip()
+            code_label = f"code {p.returncode}" if p.returncode is not None else "EOF"
+            self._session.error = (
+                f"Tunnel process exited ({code_label}): {stderr_summary}"
+                if stderr_summary
+                else f"Tunnel process exited ({code_label})"
+            )
 
         if was_connected:
             for cb in list(self._disconnect_listeners):
@@ -662,11 +814,23 @@ class SSHTunnelManager:
         return self._session.connected
 
     def get_status(self) -> TunnelSessionStatus:
-        if self._session is None or not self.is_connected:
+        if self._session is None:
             return TunnelSessionStatus(
                 host="",
                 connected=False,
                 error="No active remote tunnel",
+            )
+        if not self.is_connected:
+            return TunnelSessionStatus(
+                host=self._session.host,
+                connected=False,
+                pid=None,
+                mappings=[],
+                gpu=self._session.gpu,
+                error=self._session.error or "Tunnel disconnected",
+                comfyui_autostarted=False,
+                ollama_autostarted=False,
+                ollama_models=list(self._session.ollama_models),
             )
         return self._session
 
@@ -685,7 +849,25 @@ class SSHTunnelManager:
             await self._disconnect_unlocked()
 
             clean_host = host.strip()
+            hostname_override: str | None = None
             inspection = await probe_remote_host(clean_host, timeout=min(6.0, timeout))
+            if not inspection.reachable and _is_network_unreachable_error(inspection.error):
+                for candidate in find_ssh_fallback_hostnames(clean_host):
+                    alt = await probe_remote_host(
+                        clean_host,
+                        timeout=min(3.0, timeout),
+                        hostname_override=candidate,
+                    )
+                    if alt.reachable:
+                        logger.info(
+                            "SSH primary target for %s failed (%s); falling back to %s",
+                            clean_host,
+                            inspection.error,
+                            candidate,
+                        )
+                        inspection = alt
+                        hostname_override = candidate
+                        break
             if not inspection.reachable:
                 status = TunnelSessionStatus(
                     host=clean_host,
@@ -709,10 +891,17 @@ class SSHTunnelManager:
 
             # Auto-start Ollama if not yet listening
             if not ollama_listening and auto_start_ollama:
-                started, start_err = await launch_remote_ollama(
-                    clean_host,
-                    timeout=min(8.0, timeout),
-                )
+                if hostname_override is not None:
+                    started, start_err = await launch_remote_ollama(
+                        clean_host,
+                        timeout=min(8.0, timeout),
+                        hostname_override=hostname_override,
+                    )
+                else:
+                    started, start_err = await launch_remote_ollama(
+                        clean_host,
+                        timeout=min(8.0, timeout),
+                    )
                 if started:
                     ollama_listening = True
                     ollama_autostarted = True
@@ -726,11 +915,19 @@ class SSHTunnelManager:
                 and inspection.comfyui_dir
                 and inspection.comfyui_dir.strip()
             ):
-                started, start_err = await launch_remote_comfyui(
-                    clean_host,
-                    inspection.comfyui_dir.strip(),
-                    timeout=10.0,
-                )
+                if hostname_override is not None:
+                    started, start_err = await launch_remote_comfyui(
+                        clean_host,
+                        inspection.comfyui_dir.strip(),
+                        timeout=25.0,
+                        hostname_override=hostname_override,
+                    )
+                else:
+                    started, start_err = await launch_remote_comfyui(
+                        clean_host,
+                        inspection.comfyui_dir.strip(),
+                        timeout=25.0,
+                    )
                 if started:
                     comfy_listening = True
                     comfyui_autostarted = True
@@ -769,6 +966,7 @@ class SSHTunnelManager:
 
             ssh_cmd = [
                 "ssh",
+                *_hostname_override_args(hostname_override),
                 "-N",
                 "-o",
                 "BatchMode=yes",
@@ -891,9 +1089,10 @@ class SSHTunnelManager:
             self._session.pid = None
 
     async def disconnect(self) -> None:
-        """Gracefully disconnect active SSH tunnel session."""
+        """Gracefully disconnect active SSH tunnel session and clear stale failure state."""
         async with self._lock:
             await self._disconnect_unlocked()
+            self._session = None
 
     async def close(self) -> None:
         """Alias for disconnect for lifecycle conformity."""

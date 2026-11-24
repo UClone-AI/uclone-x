@@ -13,6 +13,32 @@ names does.
 Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Each date is
 the date that version was published.
 
+## [0.5.1] - 2026-11-23
+
+### Added
+
+- **Model Gateway**: `ucx gateway` runs a standalone model server that every clone and
+  worker reaches through one client. It owns the SSH tunnel to a remote GPU or Metal
+  host, reconnects on its own, and `ucx gateway status` reports the connection and the
+  remaining token quota.
+- **Declarative stack**: `ucx up` plans and applies only what changed across the cluster
+  components (infrastructure, frontend bundle, model gateway, workers and web UI), and
+  `ucx down` stops them. `ucx status --stack` shows where each one stands.
+- The turn detail shows which image model drew a picture and on which GPU.
+
+### Changed
+
+- **Music**: the model now writes the notes. A new song takes its tempo, key, meter and
+  chords from the request instead of one D minor preset, and the tools fill in template
+  lines only when asked to sketch. A call that gives neither is refused before anything
+  is written.
+
+### Fixed
+
+- **Remote GPU**: a stale SSH host name falls back to sibling SSH aliases and the
+  `.local` address, reconnecting runs in the background instead of slowing requests, and
+  the remote ComfyUI port is found through the tunnel, so pictures reach the remote GPU.
+
 ## [0.5.0] - 2026-11-13
 
 ### Added

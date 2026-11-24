@@ -959,4 +959,53 @@ describe('TurnDetail', () => {
       expect(englishFragments(['turnDetail']).filter((f) => words.includes(f))).toEqual([]);
     });
   });
+
+  // Killed by: frontend/src/components/layout/TurnDetail.tsx :: const stepModelLine = [stepModel, stepWhere].filter(Boolean).join(' · ');
+  // Becomes: const stepModelLine = '';
+  it('shows the image model and GPU server on a generate_image step row in English and Korean', async () => {
+    const imgSummary = defaultSummary({
+      steps: [
+        {
+          turn_id: 'c7313cb634c84d1ba0bfbfb122ed31cb',
+          participant_id: 'scout',
+          tool_name: 'generate_image',
+          tool_call_id: 'call_0',
+          status: 'success',
+          error: null,
+          duration_ms: 7325,
+          arguments_preview: JSON.stringify({ prompt: 'moonlit beach', aspect_ratio: '3:4' }),
+          output_preview: JSON.stringify({
+            status: 'success',
+            where: 'gpu_server',
+            model_id: 'anillustrious_v4',
+            drawn_with:
+              'Drawn with Illustrious-XL v4 (Anime SDXL) on your GPU server (picked automatically).',
+          }),
+          truncated: false,
+          written_path: 'artifacts/img.png',
+          wrote_unnamed: false,
+          subagent_id: null,
+          recorded_at: '2026-11-15T20:01:35Z',
+          seq: 1,
+        },
+      ],
+    });
+
+    const { unmount } = render(
+      <TurnDetail seq={1} room={room([message()])} summary={imgSummary} developerMode={false} />,
+    );
+    expect(screen.getByTestId('turn-step-model')).toHaveTextContent(
+      'Illustrious-XL v4 (Anime SDXL) · Your GPU server',
+    );
+    unmount();
+
+    render(
+      <LocaleProvider hints={['ko-KR']}>
+        <TurnDetail seq={1} room={room([message()])} summary={imgSummary} developerMode={false} />
+      </LocaleProvider>,
+    );
+    expect(await screen.findByTestId('turn-step-model')).toHaveTextContent(
+      'Illustrious-XL v4 (Anime SDXL) · 내 GPU 서버',
+    );
+  });
 });

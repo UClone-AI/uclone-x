@@ -441,6 +441,7 @@ async def test_music_proposal_and_orchestra_extend_bars_seed_intro_and_exclusive
             start_bar=3,
             end_bar=4,
             summary="Extend violin melody into bars 3..4",
+            sketch=True,
         ),
         ctx,
     )
@@ -457,6 +458,7 @@ async def test_music_proposal_and_orchestra_extend_bars_seed_intro_and_exclusive
             start_bar=1,
             end_bar=2,
             summary="Gentle violin intro",
+            sketch=True,
         ),
         ctx,
     )

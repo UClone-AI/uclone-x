@@ -27,8 +27,10 @@ __all__ = [
     "ENTRY_ID_PATTERN",
     "INSTRUMENT_CATEGORIES",
     "INSTRUMENT_ROLES",
+    "KEY_SIGNATURE_PATTERN",
     "SONGS_DIRNAME",
     "STYLE_PROFILES",
+    "TIME_SIGNATURE_PATTERN",
     "Articulation",
     "BarNoteEvent",
     "EntryId",
@@ -167,6 +169,11 @@ STYLE_PROFILES: tuple[StyleProfile, ...] = (
 )
 
 ProposalKind = Literal["track_patch", "track_replace", "instrument_change"]
+
+#: A key as the model states it: a tonic letter, an optional accidental and the mode.
+KEY_SIGNATURE_PATTERN = r"^[A-G][#b]? (?:major|minor)$"
+#: A meter whose lower number is a note value the bar grid can count.
+TIME_SIGNATURE_PATTERN = r"^\d+/(?:2|4|8|16)$"
 
 #: General MIDI percussion note numbers for readable drum tokens.
 DRUM_PITCH_ALIASES: dict[str, int] = {
@@ -452,7 +459,7 @@ class ScoreOutline(_Shape):
     """The structural outline of a song (`score.yaml`)."""
 
     tempo: int = Field(default=96, ge=20, le=300)
-    time_signature: str = Field(default="4/4", pattern=r"^\d+/(?:2|4|8|16)$")
+    time_signature: str = Field(default="4/4", pattern=TIME_SIGNATURE_PATTERN)
     key_signature: str = Field(default="C major", min_length=1)
     sections: list[ScoreSection] = Field(default_factory=list[ScoreSection])
 
@@ -538,7 +545,7 @@ class TrackFile(_Shape):
     track_id: EntryId
     section_id: EntryId
     instrument_id: EntryId
-    time_signature: str = Field(default="4/4", pattern=r"^\d+/(?:2|4|8|16)$")
+    time_signature: str = Field(default="4/4", pattern=TIME_SIGNATURE_PATTERN)
     groove_swing: float = Field(default=0.5, ge=0.5, le=0.75)
     bars: list[TrackBar] = Field(min_length=1)
 

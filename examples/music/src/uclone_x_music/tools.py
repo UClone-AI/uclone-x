@@ -38,7 +38,7 @@ from uclone_x_music.digests import (
     section_line,
     write_result,
 )
-from uclone_x_music.groove import subdivide_bars_faster
+from uclone_x_music.groove import is_chord_symbol, subdivide_bars_faster
 from uclone_x_music.library import MusicError
 from uclone_x_music.proposals import (
     apply_proposal,
@@ -48,6 +48,8 @@ from uclone_x_music.proposals import (
     reject_proposal,
 )
 from uclone_x_music.schemas import (
+    KEY_SIGNATURE_PATTERN,
+    TIME_SIGNATURE_PATTERN,
     BarNoteEvent,
     InstrumentCategory,
     InstrumentEntry,
@@ -274,9 +276,9 @@ def _extend_section_and_tracks_to_bar(
     proposed_chord_map = {
         b.bar: b.chord for b in (proposed_bars or []) if b.chord and b.chord.strip()
     }
-    base_chords = list(sec.chords) if sec.chords else ["Dm7", "Gm7", "A7", "Dm7"]
+    base_chords = list(sec.chords) or [proposed_chord_map[k] for k in sorted(proposed_chord_map)]
     new_chords = list(sec.chords)
-    while len(new_chords) < target_bars:
+    while base_chords and len(new_chords) < target_bars:
         bar_num = len(new_chords) + 1
         chord = proposed_chord_map.get(bar_num) or base_chords[(bar_num - 1) % len(base_chords)]
         new_chords.append(chord)
@@ -287,7 +289,7 @@ def _extend_section_and_tracks_to_bar(
             title=sec.title,
             kind=sec.kind,
             bars=max(sec.bars, target_bars),
-            chords=new_chords[: max(sec.bars, target_bars)],
+            chords=new_chords[: max(sec.bars, target_bars)] if new_chords else [],
             tempo_map=list(sec.tempo_map),
         )
         new_sections = [updated_sec if s.id == section_id else s for s in outline.sections]
@@ -323,21 +325,51 @@ def _extend_section_and_tracks_to_bar(
         )
 
 
+def _require_new_bar_chords(
+    outline: ScoreOutline,
+    section_id: str,
+    chords: list[str] | None,
+    count: int,
+    action: str,
+) -> None:
+    """Refuse new bars in a chorded section unless the model wrote their chords."""
+    sec = next((s for s in outline.sections if s.id == section_id), None)
+    if sec is None or not sec.chords:
+        return
+    if chords is None or len(chords) != count:
+        got = "none" if chords is None else str(len(chords))
+        raise MusicError(
+            f"Action {action!r} adds {count} bars to {section_id!r}, whose bars carry chords, "
+            f"so it needs 'chords' with exactly {count} symbols, one per new bar (got {got}). "
+            "Write the progression the new bars should follow. Nothing was changed."
+        )
+    bad = [c for c in chords if not is_chord_symbol(c)]
+    if bad:
+        raise MusicError(f"Not chord symbols: {bad}. Nothing was changed.")
+
+
 def _ensure_section_and_track_seeded(
     work: SongWork,
     section_id: str,
     instrument_id: str,
     min_bars: int,
+    *,
+    rests_only: bool = False,
 ) -> tuple[TrackFile, str] | None:
-    """Ensure `section_id` and `tracks/<section_id>_<instrument_id>.yaml` exist with at least `min_bars` bars."""
+    """Ensure `section_id` and `tracks/<section_id>_<instrument_id>.yaml` exist with at least `min_bars` bars.
+
+    A new track repeats the instrument's bars from another section, or holds full-bar rests
+    when it has none or `rests_only` is set.
+    """
     score_pair = work.read_score()
     outline = score_pair[0] if score_pair is not None else ScoreOutline()
     score_digest = score_pair[1] if score_pair is not None else None
     sec = next((s for s in outline.sections if s.id == section_id), None)
     target_bars = max(min_bars, sec.bars if sec is not None else 4)
-    default_chords = ["Dm7", "Gm7", "A7", "Dm7"]
     if sec is None:
-        chords = [default_chords[i % len(default_chords)] for i in range(target_bars)]
+        # A section the score does not have yet gets no chords: the progression is the
+        # model's to write (`music_score` upsert_section), never a fixed one from another key.
+        chords: list[str] = []
         kind: SectionKind = "intro" if "intro" in section_id.lower() else "verse"
         sec = ScoreSection(
             id=section_id,
@@ -367,15 +399,19 @@ def _ensure_section_and_track_seeded(
             return re_track, written_re.digest
         return loaded
 
-    donor_track = next(
-        (t for t, _ in work.list_tracks() if t.instrument_id == instrument_id and t.bars),
-        None,
+    donor_track = (
+        None
+        if rests_only
+        else next(
+            (t for t, _ in work.list_tracks() if t.instrument_id == instrument_id and t.bars),
+            None,
+        )
     )
     bpb = beats_per_bar_for(outline.time_signature)
     rest_token = f"1.0:REST:{_format_beats(bpb)}"
     seeded_bars: list[TrackBar] = []
     for bar_num in range(1, sec.bars + 1):
-        chord = sec.chords[bar_num - 1] if bar_num - 1 < len(sec.chords) else "Dm7"
+        chord = sec.chords[bar_num - 1] if bar_num - 1 < len(sec.chords) else None
         if donor_track is not None:
             tmpl = donor_track.bars[(bar_num - 1) % len(donor_track.bars)]
             seeded_bars.append(
@@ -486,10 +522,14 @@ class MusicScoreParams(BaseModel):
         default=None, ge=20, le=300, description="Global tempo in BPM (20..300)."
     )
     time_signature: str | None = Field(
-        default=None, description="Global time signature (e.g. '4/4', '3/4', '6/8')."
+        default=None,
+        pattern=TIME_SIGNATURE_PATTERN,
+        description="Global time signature (e.g. '4/4', '3/4', '6/8').",
     )
     key_signature: str | None = Field(
-        default=None, description="Global key signature (e.g. 'D minor', 'C major')."
+        default=None,
+        pattern=KEY_SIGNATURE_PATTERN,
+        description="Global key, '<tonic> major' or '<tonic> minor' (e.g. 'D minor', 'C major').",
     )
     style_profile: StyleProfile | None = Field(
         default=None,
@@ -535,6 +575,12 @@ class MusicScoreParams(BaseModel):
     tempo_map: list[TempoChange] | None = Field(
         default=None,
         description="Tempo changes within the section for 'upsert_section' or 'set_tempo_map'.",
+    )
+    sketch: bool = Field(
+        default=False,
+        description="For 'insert_bars', 'append_bars' and a new section in 'upsert_section': let the "
+        "tool fill every track's new bars with a generic draft in 'intent'. Without it "
+        "they are full-bar rests that you then compose with music_track patch_bars.",
     )
 
 
@@ -637,6 +683,7 @@ class MusicScoreTool(BaseTool[MusicScoreParams]):
                     if params.count is not None
                     else (params.bars if params.bars is not None else 2)
                 )
+                _require_new_bar_chords(outline, sec_id, params.chords, count, params.action)
                 updated_sec = insert_section_bars(
                     work,
                     sec_id,
@@ -644,6 +691,7 @@ class MusicScoreTool(BaseTool[MusicScoreParams]):
                     count=count,
                     chords=params.chords,
                     intent=params.intent or ("gentle_intro" if at_bar == 1 else "continuation"),
+                    sketch=params.sketch,
                 )
             elif params.action == "append_bars":
                 count = (
@@ -651,12 +699,14 @@ class MusicScoreTool(BaseTool[MusicScoreParams]):
                     if params.count is not None
                     else (params.bars if params.bars is not None else 4)
                 )
+                _require_new_bar_chords(outline, sec_id, params.chords, count, params.action)
                 updated_sec = append_section_bars(
                     work,
                     sec_id,
                     count=count,
                     chords=params.chords,
                     intent=params.intent or "continuation",
+                    sketch=params.sketch,
                 )
             elif params.action == "delete_bars":
                 s_bar = params.start_bar if params.start_bar is not None else 1
@@ -744,6 +794,13 @@ class MusicScoreTool(BaseTool[MusicScoreParams]):
             written = work.write_score(updated_outline, expected_digest=digest)
             if replaced:
                 _extend_section_and_tracks_to_bar(work, sec_id, new_sec.bars)
+            elif has_existing_tracks and not params.sketch:
+                # Every stem gets the new section as full-bar rests, so bar counts stay in
+                # step; the notes are the model's to write with music_track.
+                for inst_entry, _ in work.list_instruments():
+                    _ensure_section_and_track_seeded(
+                        work, sec_id, inst_entry.id, new_sec.bars, rests_only=True
+                    )
             elif has_existing_tracks:
                 intent: ArrangementIntent = (
                     "gentle_intro" if new_sec.kind == "intro" else "continuation"
@@ -1108,8 +1165,13 @@ class MusicTrackParams(BaseModel):
     intent: ArrangementIntent | None = Field(
         default=None,
         description="Arrangement intent for bars generated by 'patch_bars' when 'bars' is "
-        "omitted: 'gentle_intro', 'outro_cadence', 'hiphop_groove', 'continuation', or "
-        "'climax_ornate' (the default).",
+        "omitted and 'sketch' is set: 'gentle_intro', 'outro_cadence', 'hiphop_groove', "
+        "'continuation', or 'climax_ornate' (the default).",
+    )
+    sketch: bool = Field(
+        default=False,
+        description="For 'patch_bars' without 'bars': let the tool write a generic draft of "
+        "start_bar..end_bar in 'intent'. Without it, write the bars yourself.",
     )
 
 
@@ -1163,6 +1225,16 @@ class MusicTrackTool(BaseTool[MusicTrackParams]):
         super().__init__(name=self.name, description=self.description, params_type=MusicTrackParams)
 
     async def run(self, params: MusicTrackParams, context: ToolContext) -> dict[str, Any]:
+        if (
+            params.action == "patch_bars"
+            and not params.bars
+            and not (params.sketch and params.start_bar is not None)
+        ):
+            # Refused before any seeding or extension: a refusal changes nothing.
+            raise MusicError(
+                "Action 'patch_bars' requires 'bars' you composed for start_bar..end_bar, "
+                "or sketch=true with start_bar for a generic draft. Nothing was changed."
+            )
         work = SongWork.for_context(context)
         sec_id = params.section_id.strip()
         if params.action in {"patch_bars", "clear_bars", "transpose_bars"}:
@@ -1296,18 +1368,15 @@ class MusicTrackTool(BaseTool[MusicTrackParams]):
                 if reloaded is not None:
                     track, current_digest = reloaded
                     total_bars = len(track.bars)
-            if not params.bars and params.start_bar is not None:
-                s_bar = params.start_bar
-                e_bar = params.end_bar if params.end_bar is not None else s_bar
-                resolved_bars = _synthesize_bars_for_track(
-                    work, track, s_bar, e_bar, params.intent or "climax_ornate"
-                )
-            elif params.bars:
+            if params.bars:
                 resolved_bars = _normalize_patch_bars(
                     params.bars, req_start, req_end, track.time_signature
                 )
             else:
-                raise MusicError("Action 'patch_bars' requires 'bars'.")
+                # Only a sketch with start_bar gets here; anything else was refused up front.
+                resolved_bars = _synthesize_bars_for_track(
+                    work, track, req_start, req_end, params.intent or "climax_ornate"
+                )
             start_bar = params.start_bar if params.start_bar is not None else resolved_bars[0].bar
             end_bar = params.end_bar if params.end_bar is not None else resolved_bars[-1].bar
             use_propose = True if params.propose is None else params.propose
@@ -1629,8 +1698,13 @@ class MusicProposalParams(BaseModel):
     )
     bars: list[TrackBar] | None = Field(
         default=None,
-        description="Optional replacement TrackBar list for 'propose'. When omitted, an ornate "
-        "subdivided melody variation is generated automatically for start_bar..end_bar.",
+        description="Replacement TrackBar list for 'propose': the bars you composed for "
+        "start_bar..end_bar. Omit it only with sketch=true.",
+    )
+    sketch: bool = Field(
+        default=False,
+        description="For 'propose' without 'bars': let the tool generate a generic variation "
+        "of start_bar..end_bar in 'intent'.",
     )
     summary: str | None = Field(default=None, description="Human-readable summary for 'propose'.")
     intent: ArrangementIntent | None = Field(
@@ -1684,6 +1758,12 @@ class MusicProposalTool(BaseTool[MusicProposalParams]):
             return listed
 
         if params.action == "propose":
+            if not params.bars and not params.sketch:
+                # Refused before any seeding or extension: a refusal changes nothing.
+                raise MusicError(
+                    "Action 'propose' needs 'bars' you composed for start_bar..end_bar, or "
+                    "sketch=true for a generic variation. Nothing was proposed or changed."
+                )
             score_pair = work.read_score()
             default_sec = (
                 score_pair[0].sections[0].id
@@ -1749,12 +1829,15 @@ class MusicProposalTool(BaseTool[MusicProposalParams]):
                         proposed_bars=norm_bars,
                     )
                     preview_patched_track(track, temp_prop)
-                    proposed_bars = norm_bars
-                except Exception:
-                    proposed_bars = _synthesize_bars_for_track(
-                        work, track, s_bar, e_bar, synth_intent
-                    )
+                except (MusicError, MusicFileError, ValidationError, ValueError) as exc:
+                    # The model's bars are refused as they are, never swapped for generated ones.
+                    raise MusicError(
+                        f"The proposed bars for {inst_id} bars {s_bar}..{e_bar} do not fit "
+                        f"the track: {exc} Nothing was proposed."
+                    ) from exc
+                proposed_bars = norm_bars
             else:
+                # Only a sketch gets here; a call without bars or sketch was refused up front.
                 proposed_bars = _synthesize_bars_for_track(work, track, s_bar, e_bar, synth_intent)
             summary = (
                 params.summary.strip()

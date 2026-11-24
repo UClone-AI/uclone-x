@@ -624,9 +624,17 @@ def register_room_dock_routes(
             return _TRACE_REASONS["turn_not_saved" if unsaved else "session_not_found"]
         log_path = store.event_log_path(session_id)
         if log_path is None or not log_path.exists():
-            return _TRACE_REASONS["turn_not_saved" if unsaved else "log_missing"]
+            read_lines: Any = getattr(store, "read_event_log_lines", None)
+            fallback_lines: tuple[str, ...] | None = (
+                read_lines(session_id) if read_lines is not None else None
+            )
+            if fallback_lines is None:
+                return _TRACE_REASONS["turn_not_saved" if unsaved else "log_missing"]
+            log_source: Path | tuple[str, ...] = fallback_lines
+        else:
+            log_source = log_path
         try:
-            events = list(read_session_log(log_path))
+            events = list(read_session_log(log_source))
         except Exception as exc:
             # The exception text names the file and quotes the line: it goes to the
             # server log, and the reader gets a stable code for what kind of failure.

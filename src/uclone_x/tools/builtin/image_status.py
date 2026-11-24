@@ -343,7 +343,7 @@ def probe_image_engines(
         gemini_model=choice.gemini_model if choice.gemini is not None else None,
         comfy_model=comfy_model,
         in_process_model=_known_model(checkpoint),
-        gpu_tunnel_comfy_port=gpu_tunnel_comfy_port,
+        gpu_tunnel_comfy_port=choice.gpu_tunnel_comfy_port,
         gemini_label=gemini_label,
         detected_comfyui=detected,
     )

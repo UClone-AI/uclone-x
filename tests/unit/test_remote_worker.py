@@ -438,7 +438,7 @@ async def test_ssh_tunnel_manager_auto_start_comfyui() -> None:
                     assert status.comfyui_autostarted is True
                     assert any(m.service_name == "comfyui" for m in status.mappings)
                     mock_launch.assert_called_once_with(
-                        "dell", "/home/kennylim/ComfyUI", timeout=10.0
+                        "dell", "/home/kennylim/ComfyUI", timeout=25.0
                     )
 
 
@@ -1064,3 +1064,175 @@ async def test_remote_gpu_status_and_connect_routing_flags(tmp_path: Path) -> No
                 status = (await client.get("/api/settings/remote-gpu/status")).json()
                 assert status["llm_on_remote"] is True
                 assert status["images_on_remote"] is True
+
+
+@pytest.mark.asyncio
+async def test_tunnel_manager_preserves_failure_and_drop_diagnostics_until_explicit_disconnect(
+    tmp_path: Path,
+) -> None:
+    """Failed `connect()` and unexpected process termination preserve `host` and `error` in `get_status()` until explicit `disconnect()`.
+
+    Killed by: src/uclone_x/core/remote_worker.py :: error=self._session.error or "Tunnel disconnected",
+    Becomes:   error="No active remote tunnel",
+    """
+    ssh_cfg = tmp_path / "ssh_config"
+    ssh_cfg.write_text(
+        "Host github.com\n"
+        "  User git\n"
+        "Host github-work\n"
+        "  HostName github.com\n"
+        "Host dell\n"
+        "  HostName 10.202.1.123\n"
+        "Host macmini\n"
+        "  HostName 10.202.1.50\n",
+        encoding="utf-8",
+    )
+    assert find_configured_ssh_hosts(ssh_cfg) == ["dell", "macmini"]
+
+    mgr = SSHTunnelManager()
+    assert mgr.get_status().host == ""
+    assert mgr.get_status().error == "No active remote tunnel"
+
+    unreachable = RemoteHostInspection(
+        host="dell",
+        reachable=False,
+        error="ssh: connect to host 10.202.1.123 port 22: Operation timed out",
+    )
+    with patch("uclone_x.core.remote_worker.probe_remote_host", return_value=unreachable):
+        failed = await mgr.connect("dell", timeout=2.0)
+    assert failed.connected is False
+    after_fail = mgr.get_status()
+    assert after_fail.connected is False
+    assert after_fail.host == "dell"
+    assert after_fail.error == "ssh: connect to host 10.202.1.123 port 22: Operation timed out"
+
+    # Simulate an active tunnel whose ssh process later crashes with stderr output
+    mock_proc = MagicMock()
+    mock_proc.pid = 77777
+    mock_proc.returncode = None
+    stderr_reader = asyncio.StreamReader()
+    stderr_reader.feed_data(b"client_loop: send disconnect: Broken pipe\n")
+    stderr_reader.feed_eof()
+    mock_proc.stderr = stderr_reader
+    wait_fut: asyncio.Future[int] = asyncio.get_running_loop().create_future()
+    mock_proc.wait = AsyncMock(return_value=255, side_effect=lambda: wait_fut)
+    mock_proc.terminate = MagicMock()
+
+    mgr._proc = mock_proc
+    mgr._stderr_lines.clear()
+    mgr._session = TunnelSessionStatus(
+        host="dell",
+        connected=True,
+        pid=77777,
+        mappings=[PortMapping(service_name="ollama", remote_port=11434, local_port=11435)],
+    )
+    watcher = asyncio.create_task(mgr._watch_and_drain(mock_proc))
+    mock_proc.returncode = 255
+    wait_fut.set_result(255)
+    await watcher
+
+    dropped = mgr.get_status()
+    assert dropped.connected is False
+    assert dropped.host == "dell"
+    assert dropped.mappings == []
+    assert dropped.error is not None
+    assert "Broken pipe" in dropped.error
+
+    # Explicit disconnect clears stale failure state
+    await mgr.disconnect()
+    cleared = mgr.get_status()
+    assert cleared.connected is False
+    assert cleared.host == ""
+    assert cleared.error == "No active remote tunnel"
+
+
+def test_find_ssh_fallback_hostnames(tmp_path: Path) -> None:
+    """find_ssh_fallback_hostnames extracts sibling IPs and .local mDNS candidates."""
+    from uclone_x.core.remote_worker import find_ssh_fallback_hostnames
+
+    ssh_cfg = tmp_path / "config"
+    ssh_cfg.write_text(
+        "Host comfy dell Dell5820 10.202.1.121 10.202.1.123\n"
+        "    HostName 10.202.1.123\n"
+        "    User kennylim\n",
+        encoding="utf-8",
+    )
+    candidates = find_ssh_fallback_hostnames("dell", ssh_config_path=ssh_cfg)
+    assert candidates[0] == "10.202.1.121"
+    assert "Dell5820.local" in candidates
+    assert "10.202.1.123" not in candidates
+
+
+async def test_ssh_tunnel_manager_falls_back_to_reachable_sibling_hostname() -> None:
+    """SSHTunnelManager.connect retries sibling HostName candidates when primary IP times out.
+
+    Killed by: src/uclone_x/core/remote_worker.py :: if not inspection.reachable and _is_network_unreachable_error(inspection.error):
+    Becomes: if False:
+    """
+    from uclone_x.core.remote_worker import (
+        RemoteGPUInfo,
+        RemoteHostInspection,
+        RemoteServiceStatus,
+        SSHTunnelManager,
+    )
+
+    mgr = SSHTunnelManager()
+    probe_calls: list[str | None] = []
+    spawned_cmds: list[tuple[str, ...]] = []
+
+    async def fake_probe(
+        host: str,
+        timeout: float = 6.0,
+        *,
+        ssh: tuple[str, ...] = ("ssh",),
+        hostname_override: str | None = None,
+    ) -> RemoteHostInspection:
+        probe_calls.append(hostname_override)
+        if hostname_override is None:
+            return RemoteHostInspection(
+                host=host,
+                reachable=False,
+                error="ssh: connect to host 10.202.1.123 port 22: Operation timed out",
+            )
+        return RemoteHostInspection(
+            host=host,
+            reachable=True,
+            gpu=RemoteGPUInfo(name="RTX 5070 Ti", total_mb=16303, used_mb=0, driver="610.88"),
+            ports={"ollama": RemoteServiceStatus("ollama", 11434, True)},
+            ollama_models=["qwen3:14b"],
+        )
+
+    mock_proc = MagicMock()
+    mock_proc.pid = 88888
+    mock_proc.returncode = None
+    mock_proc.stderr = asyncio.StreamReader()
+    mock_proc.stderr.feed_eof()
+    wait_fut: asyncio.Future[int] = asyncio.get_running_loop().create_future()
+    mock_proc.wait = AsyncMock(side_effect=lambda: wait_fut)
+    mock_proc.terminate = MagicMock()
+
+    async def fake_exec(*cmd: str, **kwargs: Any) -> MagicMock:
+        spawned_cmds.append(cmd)
+        return mock_proc
+
+    with (
+        patch("uclone_x.core.remote_worker.probe_remote_host", side_effect=fake_probe),
+        patch(
+            "uclone_x.core.remote_worker.find_ssh_fallback_hostnames",
+            return_value=["10.202.1.121", "Dell5820.local"],
+        ),
+        patch("uclone_x.core.remote_worker.asyncio.create_subprocess_exec", side_effect=fake_exec),
+        patch("uclone_x.core.remote_worker.find_free_port", return_value=11435),
+        patch("uclone_x.core.remote_worker.is_port_in_use", return_value=True),
+    ):
+        status = await mgr.connect("dell")
+
+    assert status.connected is True
+    assert probe_calls == [None, "10.202.1.121"]
+    assert spawned_cmds
+    assert "HostName=10.202.1.121" in spawned_cmds[0]
+
+    mock_proc.returncode = 0
+    if not wait_fut.done():
+        wait_fut.set_result(0)
+    await mgr.disconnect()

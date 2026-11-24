@@ -31,6 +31,7 @@ from uclone_x.cli.commands.acp import acp_app, start_acp_server
 from uclone_x.cli.commands.cluster import cluster_app
 from uclone_x.cli.commands.dev import dev_app
 from uclone_x.cli.commands.eval import eval_app
+from uclone_x.cli.commands.gateway import gateway_app
 from uclone_x.cli.commands.key import key_app
 from uclone_x.cli.commands.link import link_app
 from uclone_x.cli.commands.llm import llm_app
@@ -41,6 +42,7 @@ from uclone_x.cli.commands.report import report_app
 from uclone_x.cli.commands.room import room_app
 from uclone_x.cli.commands.skill import skill_app
 from uclone_x.cli.commands.ui import ui_app
+from uclone_x.cli.commands.up import down_command, render_stack_status, up_command
 from uclone_x.cli.commands.worker import run_worker
 from uclone_x.cli.quality_gate import (
     JUNIT_REPORT_PATH,
@@ -437,6 +439,7 @@ app.add_typer(agent_app, name="agent")
 app.add_typer(a2a_app, name="a2a")
 app.add_typer(acp_app, name="acp")
 app.add_typer(eval_app, name="eval")
+app.add_typer(gateway_app, name="gateway")
 app.add_typer(key_app, name="key")
 app.add_typer(link_app, name="link")
 app.add_typer(llm_app, name="llm")
@@ -447,6 +450,8 @@ app.add_typer(ontology_app, name="ontology")
 app.add_typer(report_app, name="report")
 app.add_typer(room_app, name="room")
 app.add_typer(cluster_app, name="cluster")
+app.command("up")(up_command)
+app.command("down")(down_command)
 app.command("worker")(run_worker)
 app.add_typer(skill_app, name="skill")
 app.add_typer(ui_app, name="ui")
@@ -1031,8 +1036,33 @@ def status_command(
         "http://127.0.0.1:8000", "--url", "-u", help="Target UClone-X UI server URL"
     ),
     json_output: bool = typer.Option(False, "--json", "-j", help="Output status in JSON format"),
+    stack: bool = typer.Option(
+        False,
+        "--stack",
+        help="Inspect full declarative cluster stack health and SHA-256 code/config drift",
+    ),
+    port: int = typer.Option(5180, "--port", help="Cluster Web UI port (used with --stack)"),
+    gateway_port: int = typer.Option(
+        8765, "--gateway-port", help="Model Gateway port (used with --stack)"
+    ),
+    workers: int = typer.Option(
+        2, "--workers", help="Expected stateless worker replicas (used with --stack)"
+    ),
+    remote_host: str | None = typer.Option(
+        None, "--remote-host", help="Expected remote GPU SSH host (used with --stack)"
+    ),
 ) -> None:
-    """Inspect runtime health and absorbed failure metrics (P6/P8)."""
+    """Inspect runtime health and absorbed failure metrics (P6/P8), or declarative stack drift."""
+    if stack:
+        render_stack_status(
+            port=port,
+            gateway_port=gateway_port,
+            workers=workers,
+            remote_host=remote_host,
+            json_output=json_output,
+        )
+        return
+
     import json
 
     import httpx

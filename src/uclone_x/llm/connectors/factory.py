@@ -12,6 +12,11 @@ import httpx
 from uclone_x.errors import LLMProviderError, LLMProviderNotConfiguredError
 from uclone_x.llm.connectors.anthropic import AnthropicConnector
 from uclone_x.llm.connectors.base import BaseLLMConnector, named_model
+from uclone_x.llm.connectors.gateway_client import (
+    GATEWAY_ENDPOINT_ENV_VARS,
+    GatewayModelClient,
+    has_configured_gateway_endpoint,
+)
 from uclone_x.llm.connectors.gemini import GeminiConnector
 from uclone_x.llm.connectors.mock import MockLLMConnector
 from uclone_x.llm.connectors.ollama import (
@@ -94,7 +99,7 @@ def what_outranks_saved_choice(
     for name in _CREDENTIAL_ENV_VARS:
         if _set(name):
             return name
-    for name in (*OLLAMA_ENDPOINT_ENV_VARS, *VLLM_ENDPOINT_ENV_VARS):
+    for name in (*OLLAMA_ENDPOINT_ENV_VARS, *VLLM_ENDPOINT_ENV_VARS, *GATEWAY_ENDPOINT_ENV_VARS):
         if _set(name):
             return name
     if has_configured_ollama_endpoint(base_url) or has_configured_vllm_endpoint(base_url):
@@ -392,6 +397,9 @@ def _build_connector(
     if canonical_provider(resolved_provider) is not None:
         return _construct(resolved_provider, api_key, base_url, model=model, data=data, **kwargs)
 
+    if resolved_provider == "gateway":
+        return GatewayModelClient(api_key=api_key, base_url=base_url, model=model, **kwargs)
+
     if resolved_provider:
         # An unmappable provider name is refused, naming the offending value, whatever
         # `fallback_to_mock` says. A mock returned here answers a request this factory
@@ -416,6 +424,9 @@ def _build_connector(
     # and `LLM_PROVIDER=vllm` is how the other one is chosen.
     if has_configured_vllm_endpoint(base_url):
         return _construct("vllm", api_key, base_url, model=model, data=data, **kwargs)
+
+    if has_configured_gateway_endpoint():
+        return GatewayModelClient(api_key=api_key, base_url=base_url, model=model, **kwargs)
 
     # Step 5, above the flag for the reason step 4 is: a saved choice is the person's
     # configuration, not the unconfigured case the flag decides.
@@ -483,6 +494,21 @@ def image_engine_choice(
     chosen_by: Any = "clone" if clean_own else "default"
     comfy = next((c for c in conns if c.kind == "comfyui" and c.base_url), None)
     remote = next((c for c in conns if c.kind == "remote_gpu" and c.base_url), None)
+    if gpu_tunnel_comfy_port is None:
+        from urllib.parse import urlsplit
+
+        tunnel_pic = next(
+            (
+                c
+                for c in conns
+                if c.id == "remote-gpu-pictures" and c.kind == "comfyui" and c.base_url
+            ),
+            None,
+        )
+        if tunnel_pic is not None and tunnel_pic.base_url:
+            parsed_port = urlsplit(tunnel_pic.base_url).port
+            if parsed_port is not None:
+                gpu_tunnel_comfy_port = parsed_port
     base: dict[str, Any] = {
         "chosen": chosen,
         "chosen_by": chosen_by,

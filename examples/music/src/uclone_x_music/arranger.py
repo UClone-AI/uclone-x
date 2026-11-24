@@ -92,6 +92,10 @@ def _chord_tones_for_octave(chord: str | None, base_midi: int) -> tuple[str, str
     )
 
 
+def _beats_token(beats: float) -> str:
+    return f"{beats:g}" if beats % 1 != 0 else f"{int(beats)}.0"
+
+
 def _synthesize_single_bar(
     bar_num: int,
     chord: str,
@@ -372,10 +376,15 @@ def insert_section_bars(
     count: int = 2,
     chords: Sequence[str] | None = None,
     intent: ArrangementIntent = "gentle_intro",
+    sketch: bool = True,
 ) -> ScoreSection:
     """Insert `count` bars at `at_bar` across `score.yaml` and all tracks in `section_id`.
 
-    Existing bars `>= at_bar` are shifted right by `+count` without overwriting them.
+    Existing bars `>= at_bar` are shifted right by `+count` without overwriting them. The new
+    bars take `chords` when given, otherwise the section's own progression in order (never a
+    fixed progression from another key). Each track's new bars are a full-bar rest unless
+    `sketch` asks for a generic draft in the stated `intent` and the section has chords to
+    draft over.
     """
     if count < 1 or count > 32:
         raise MusicError("insert_section_bars 'count' must be between 1 and 32.")
@@ -386,25 +395,27 @@ def insert_section_bars(
     sec = _resolve_section(outline, section_id)
     insert_pos = max(1, min(sec.bars + 1, at_bar))
 
-    default_insert_chords = (
-        ["Am7", "Dm7", "Gm7", "A7"]
-        if intent == "gentle_intro"
-        else (list(sec.chords) if sec.chords else ["Dm7", "Gm7", "A7", "Dm7"])
-    )
-    inserted_chords = [
-        (
-            chords[i]
-            if chords and i < len(chords)
-            else default_insert_chords[i % len(default_insert_chords)]
-        )
-        for i in range(count)
+    given = [c for c in (chords or []) if c.strip()]
+    source = given or list(sec.chords)
+    inserted_chords: list[str | None] = [
+        source[i % len(source)] if source else None for i in range(count)
     ]
-    existing_chords = [sec.chords[i] if i < len(sec.chords) else "Dm7" for i in range(sec.bars)]
-    new_chords = [
-        *existing_chords[: insert_pos - 1],
-        *inserted_chords,
-        *existing_chords[insert_pos - 1 :],
-    ]
+    if sec.chords or given:
+        filler = list(sec.chords) or given
+        existing_chords = [
+            sec.chords[i] if i < len(sec.chords) else filler[i % len(filler)]
+            for i in range(sec.bars)
+        ]
+        new_chords = [
+            *existing_chords[: insert_pos - 1],
+            *[c or filler[0] for c in inserted_chords],
+            *existing_chords[insert_pos - 1 :],
+        ]
+    else:
+        new_chords = []
+    # A sketch follows chords; a section without any gets rests, as it did before chords
+    # stopped being invented for it.
+    drafts = sketch and bool(new_chords)
     shifted_tempo_map = [
         TempoChange(
             bar=(tc.bar + count if tc.bar >= insert_pos else tc.bar),
@@ -438,15 +449,24 @@ def insert_section_bars(
             b.model_copy(update={"bar": idx})
             for idx, b in enumerate(track.bars[: insert_pos - 1], start=1)
         ]
+        rest = f"1.0:REST:{_beats_token(beats_per_bar_for(outline.time_signature))}"
         synth_bars = [
-            _synthesize_single_bar(
-                insert_pos + i,
-                inserted_chords[i],
-                category=category,
-                role=role,
-                intent=intent,
-                time_signature=outline.time_signature,
-                is_final_bar=(i == count - 1),
+            (
+                _synthesize_single_bar(
+                    insert_pos + i,
+                    new_chords[insert_pos - 1 + i],
+                    category=category,
+                    role=role,
+                    intent=intent,
+                    time_signature=outline.time_signature,
+                    is_final_bar=(i == count - 1),
+                )
+                if drafts
+                else TrackBar(
+                    bar=insert_pos + i,
+                    chord=new_chords[insert_pos - 1 + i] if new_chords else None,
+                    notes=[rest],
+                )
             )
             for i in range(count)
         ]
@@ -488,21 +508,22 @@ def append_section_bars(
     count: int = 4,
     chords: Sequence[str] | None = None,
     intent: ArrangementIntent = "continuation",
+    sketch: bool = True,
 ) -> ScoreSection:
-    """Append `count` continuation bars at the end of `section_id` across `score.yaml` and all tracks."""
+    """Append `count` bars at the end of `section_id` across `score.yaml` and all tracks."""
     score_pair = work.read_score()
     if score_pair is None:
         raise MusicError("score.yaml does not exist yet.")
     outline, _ = score_pair
     sec = _resolve_section(outline, section_id)
-    default_cont_chords = list(chords) if chords else ["Bbmaj7", "Gm7", "A7", "Dm7"]
     return insert_section_bars(
         work,
         sec.id,
         at_bar=sec.bars + 1,
         count=count,
-        chords=default_cont_chords,
+        chords=chords,
         intent=intent,
+        sketch=sketch,
     )
 
 
@@ -529,7 +550,8 @@ def delete_section_bars(
             f"Cannot delete all bars from section {sec.id!r}; at least 1 bar must remain."
         )
 
-    existing_chords = [sec.chords[i] if i < len(sec.chords) else "Dm7" for i in range(sec.bars)]
+    # Chords are all-or-none per section; a chordless section stays chordless.
+    existing_chords = list(sec.chords)
     new_chords = [
         *existing_chords[: start_bar - 1],
         *existing_chords[end_bar:],
@@ -610,7 +632,8 @@ def duplicate_section_bars(
     dup_count = end_bar - start_bar + 1
     target_pos = end_bar + 1 if insert_at is None else max(1, min(sec.bars + 1, insert_at))
 
-    existing_chords = [sec.chords[i] if i < len(sec.chords) else "Dm7" for i in range(sec.bars)]
+    # Chords are all-or-none per section; a chordless section stays chordless.
+    existing_chords = list(sec.chords)
     copied_chords = existing_chords[start_bar - 1 : end_bar]
     new_chords = [
         *existing_chords[: target_pos - 1],

@@ -8,6 +8,7 @@ commands.
 
 * Python 3.11 or newer, and [uv](https://docs.astral.sh/uv/)
 * Node.js and npm, for the dashboard and its tests
+* Docker (with `docker compose`), when running the full declarative cluster stack (`./ucx up`)
 * A model to talk to: [Ollama](https://ollama.com) with no account, or an API key for
   Gemini, Anthropic or OpenAI. The unit tests need neither.
 
@@ -26,8 +27,12 @@ npm ci --prefix frontend
 ## Run it
 
 ```bash
-./ucx ui --dev          # dashboard with hot reload: backend on 5180, Vite on 5173
-./ucx run               # the same agent as a terminal REPL
+./ucx up --plan         # preview declarative cluster convergence (Docker + Model Gateway + workers + UI)
+./ucx up                # converge the full stateless cluster stack on port 5180
+./ucx status --stack    # inspect live health of all 5 stack resources
+./ucx down              # stop managed daemons and Docker containers
+./ucx ui --dev          # frontend hot-reload dev server: backend on 5180, Vite on 5173
+./ucx run               # in-process zero-broker agent as a terminal REPL (no Docker needed)
 ./ucx run --prompt "…"  # answer once and exit
 ./ucx llm status        # which model providers are reachable
 ```

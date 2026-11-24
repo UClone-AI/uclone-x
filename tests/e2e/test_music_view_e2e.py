@@ -180,7 +180,13 @@ async def test_a_long_score_scrolls_to_its_last_bar(server: _Server, workspace: 
             await song_with_pending_violin_patch(workspace, room_id)
             # Twelve more bars take the four-bar section to sixteen, wider than any dock.
             await MusicScoreTool().run(
-                MusicScoreParams(action="append_bars", section_id="theme_a", count=12),
+                MusicScoreParams(
+                    action="append_bars",
+                    section_id="theme_a",
+                    count=12,
+                    chords=["Dm7", "Gm7", "A7", "Dm7"] * 3,
+                    sketch=True,
+                ),
                 _tool_context(workspace, room_id=room_id, song_id="midnight-nocturne"),
             )
             server.app.state.room_stack.service.set_story(room_id, "midnight-nocturne")

@@ -47,9 +47,26 @@ with links to open it in the browser or in Docs:
 
 ## Install
 
-> On PyPI? The `pip install uclone-x` line PyPI prints at the top of the page
-> installs the library only, without the `ucx` command. Use one of the installs
-> below; with pip, that is `pip install "uclone-x[cli,http]"`.
+> On PyPI? `pip install uclone-x` installs the **lightweight Python Agent Kernel SDK**
+> (`uclone_x` library, zero external broker dependencies). Add `[cli]` for the headless
+> terminal CLI (`ucx run`, `ucx acp serve`), or `[cli,http,cluster]` when operating the
+> full declarative cluster platform (`ucx up` over Docker).
+
+### Choose your track
+
+* **Full-stack multi-agent platform (developers & self-hosters, with Docker)** — clone
+  the repository and run `./ucx up` (`--plan`, `--workers`, `--remote-host`) to converge
+  the stateless cluster stack (Kafka KRaft, PostgreSQL, Valkey cluster, Centrifugo SSE
+  edge, standalone Model Gateway, stateless workers, and web UI); see
+  [Declarative cluster stack](#declarative-cluster-stack-ucx-up).
+* **Embeddable Python Agent Kernel SDK & headless CLI (no Docker required)** —
+  `pip install uclone-x` for in-process Python composition (`compose_agent`,
+  `examples/single_agent.py`), or `pip install "uclone-x[cli]"` for `ucx run` and
+  `ucx acp serve`.
+* **Quick local terminal installer (`install.sh`) & macOS desktop roadmap** — paste the
+  one-liner below to launch the dashboard locally today; a self-contained native macOS
+  desktop bundle (`UClone-X.dmg`, no Docker or terminal required) is planned for
+  non-developers.
 
 On macOS or Linux, paste this into a terminal:
 
@@ -107,12 +124,32 @@ library (see `examples/single_agent.py`). Model providers need no extra: every
 connector speaks HTTP directly. The heavier stacks are the genuinely optional extras:
 
 ```bash
+pip install "uclone-x[cluster]"     # aiokafka, asyncpg, valkey, PyJWT (ucx up / ucx worker)
 pip install "uclone-x[ontology]"    # LinkML, rdflib, networkx
 pip install "uclone-x[code_intel]"  # tree-sitter AST parsing
 pip install "uclone-x[all]"
 ```
 
 Every extra resolves on Python 3.11, 3.12 and 3.13.
+
+### Declarative cluster stack (`ucx up`)
+
+From a repository checkout with Docker running, `ucx up` acts as a declarative
+reconciler: it inspects live container health, secret fingerprints, worker count,
+and Model Gateway endpoints, then applies only the drift needed to converge the
+full stateless stack:
+
+```bash
+./ucx up --plan         # dry-run plan (+ create / ~ update / = unchanged)
+./ucx up                # converge Docker infra + Model Gateway + workers + Web UI
+./ucx status --stack    # inspect live health and fingerprints of all 5 stack resources
+./ucx down              # stop managed daemons and containers (-v removes volumes)
+```
+
+Every worker and the Web UI route model calls through the standalone **Model Gateway**
+(`ucx gateway serve` on `127.0.0.1:5191` by default), keeping provider credentials and
+optional remote-GPU SSH tunnels in one isolated process. Pass `-w/--workers N` to scale
+stateless workers or `-r/--remote-host user@gpu-box` to bind a remote GPU server.
 
 ### Models
 
@@ -264,8 +301,9 @@ depending on it.
 | Area | State |
 | :--- | :--- |
 | Event bus, agent state machine, sessions | Implemented |
+| Declarative cluster stack & Model Gateway (`ucx up`, `ucx gateway`, `ucx worker`) | Implemented |
 | Tool runtime, MCP client, built-in tools | Implemented |
-| LLM connectors (Gemini, Claude, OpenAI, Ollama, vLLM) | Implemented |
+| LLM connectors (Gemini, Claude, OpenAI, Ollama, vLLM, Model Gateway) | Implemented |
 | Dashboard: conversations, clones, memory, settings | Implemented |
 | Local image generation | Implemented |
 | Sandbox isolation modes | Implemented (host and workspace); container and WASM are configuration only |

@@ -2201,16 +2201,24 @@ def create_ui_app(
         # downloading, and the dashboard must not wait on it to open. Until it answers,
         # the server reads as "connecting".
         mcp_start = asyncio.create_task(mcp_manager.start())
-        # A record left on disk means the previous run was connected when it stopped. Its
-        # tunnel died with it, so the addresses it saved lead nowhere.
-        if tunnel_manager.get_status().connected is False and _read_remote_restore()[0]:
-            with contextlib.suppress(Exception):
-                restored = _restore_remote_settings()
-                logger.info("Restored settings a remote-GPU tunnel had replaced: %s", restored)
-        # A connect that was never disconnected is made again, in the background: the probe
-        # and ssh take seconds, and an unreachable worker must not hold the dashboard up.
-        # Until it answers, the addresses just put back are the ones in use.
-        reconnect = asyncio.create_task(_reconnect_remote_gpu())
+        # When an external Model Gateway (`UCX_GATEWAY_URL`) is configured, the gateway
+        # owns the remote-GPU SSH tunnel and `remote_gpu_*.json` records exclusively so
+        # restarting the UI never wipes or competes with the gateway's active tunnel.
+        from uclone_x.llm.connectors.gateway_client import has_configured_gateway_endpoint
+
+        gateway_owns_tunnel = has_configured_gateway_endpoint()
+        reconnect: asyncio.Task[None] | None = None
+        if not gateway_owns_tunnel:
+            # A record left on disk means the previous run was connected when it stopped. Its
+            # tunnel died with it, so the addresses it saved lead nowhere.
+            if tunnel_manager.get_status().connected is False and _read_remote_restore()[0]:
+                with contextlib.suppress(Exception):
+                    restored = _restore_remote_settings()
+                    logger.info("Restored settings a remote-GPU tunnel had replaced: %s", restored)
+            # A connect that was never disconnected is made again, in the background: the probe
+            # and ssh take seconds, and an unreachable worker must not hold the dashboard up.
+            # Until it answers, the addresses just put back are the ones in use.
+            reconnect = asyncio.create_task(_reconnect_remote_gpu())
         # The uClone2 links dial out in the background; a stored link that cannot reach
         # uClone2 retries on its own and never holds the dashboard up.
         await links.start()
@@ -2233,13 +2241,15 @@ def create_ui_app(
         mcp_start.cancel()
         with contextlib.suppress(BaseException):
             await mcp_start
-        reconnect.cancel()
-        with contextlib.suppress(BaseException):
-            await reconnect
+        if reconnect is not None:
+            reconnect.cancel()
+            with contextlib.suppress(BaseException):
+                await reconnect
         # Local servers are child processes; left running they outlive the app.
         await mcp_manager.close()
-        with contextlib.suppress(BaseException):
-            await tunnel_manager.close()
+        if not gateway_owns_tunnel:
+            with contextlib.suppress(BaseException):
+                await tunnel_manager.close()
         evt: asyncio.Event | None = getattr(app_inst.state, "shutdown_event", None)
         if evt is not None:
             evt.set()
@@ -2869,10 +2879,47 @@ def create_ui_app(
         except UnknownServerError as exc:
             raise HTTPException(status_code=404, detail=f"No server named '{name}'") from exc
 
+    async def _forward_remote_gpu_to_gateway(
+        method: str, suffix: str, json_body: Mapping[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """Forward a `/api/settings/remote-gpu/*` request to the configured Model Gateway."""
+        import httpx
+
+        from uclone_x.llm.connectors.gateway_client import (
+            GATEWAY_KEY_ENV_VAR,
+            resolve_gateway_base_url,
+        )
+
+        gw_url = resolve_gateway_base_url().rstrip("/")
+        headers: dict[str, str] = {}
+        gw_key = os.environ.get(GATEWAY_KEY_ENV_VAR, "").strip()
+        if gw_key:
+            headers["Authorization"] = f"Bearer {gw_key}"
+        async with httpx.AsyncClient(timeout=25.0) as client:
+            resp = await client.request(
+                method,
+                f"{gw_url}/api/settings/remote-gpu/{suffix}",
+                json=dict(json_body) if json_body is not None else None,
+                headers=headers,
+            )
+        if resp.status_code >= 400:
+            detail = resp.text
+            with contextlib.suppress(Exception):
+                parsed = resp.json()
+                if isinstance(parsed, dict) and "detail" in parsed:
+                    detail = str(cast("dict[str, object]", parsed)["detail"])
+            raise HTTPException(status_code=resp.status_code, detail=detail)
+        data: object = resp.json()
+        return cast("dict[str, Any]", data) if isinstance(data, dict) else {}
+
     @app.post("/api/settings/remote-gpu/probe")
     async def probe_remote_gpu_endpoint(request: Request, req: dict[str, Any]) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
         """Probe an SSH remote host for GPU capabilities and AI services."""
         _refuse_unless_local(request)
+        from uclone_x.llm.connectors.gateway_client import has_configured_gateway_endpoint
+
+        if has_configured_gateway_endpoint():
+            return await _forward_remote_gpu_to_gateway("POST", "probe", req)
         host = str(req.get("host", "")).strip()
         timeout = float(req.get("timeout", 6.0))
         if not host:
@@ -2887,6 +2934,10 @@ def create_ui_app(
     async def connect_remote_gpu_endpoint(request: Request, req: dict[str, Any]) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
         """Establish an SSH tunnel to the remote GPU worker and optionally activate endpoints."""
         _refuse_unless_local(request)
+        from uclone_x.llm.connectors.gateway_client import has_configured_gateway_endpoint
+
+        if has_configured_gateway_endpoint():
+            return await _forward_remote_gpu_to_gateway("POST", "connect", req)
         host = str(req.get("host", "")).strip()
         apply_settings = bool(req.get("apply_settings", True))
         auto_start_comfyui = bool(req.get("auto_start_comfyui", True))
@@ -2914,6 +2965,10 @@ def create_ui_app(
     ) -> dict[str, Any]:
         """Disconnect the active SSH tunnel session and restore previous endpoints."""
         _refuse_unless_local(request)
+        from uclone_x.llm.connectors.gateway_client import has_configured_gateway_endpoint
+
+        if has_configured_gateway_endpoint():
+            return await _forward_remote_gpu_to_gateway("POST", "disconnect")
         await tunnel_manager.disconnect()
         # Pressed by hand: the next start leaves the worker alone.
         with contextlib.suppress(FileNotFoundError):
@@ -2938,6 +2993,10 @@ def create_ui_app(
         ComfyUI address until someone presses Disconnect.
         """
         _refuse_unless_local(request)
+        from uclone_x.llm.connectors.gateway_client import has_configured_gateway_endpoint
+
+        if has_configured_gateway_endpoint():
+            return await _forward_remote_gpu_to_gateway("GET", "status")
         status = tunnel_manager.get_status()
         payload = status.to_dict()
         if not status.connected and _read_remote_restore()[0]:
@@ -2960,6 +3019,10 @@ def create_ui_app(
     ) -> dict[str, Any]:
         """Return configured SSH hosts along with the last-connected host."""
         _refuse_unless_local(request)
+        from uclone_x.llm.connectors.gateway_client import has_configured_gateway_endpoint
+
+        if has_configured_gateway_endpoint():
+            return await _forward_remote_gpu_to_gateway("GET", "hosts")
         last_host: str | None = None
         try:
             raw: object = json.loads(remote_session_path.read_text(encoding="utf-8"))

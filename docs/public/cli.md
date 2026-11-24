@@ -7,9 +7,11 @@ Commands are defined in `src/uclone_x/cli/main.py` and `src/uclone_x/cli/command
 
 ## Installation extras
 
-`pip install uclone-x` gives the core package (Python 3.11 or newer). Features that need
-more dependencies are optional extras: `cli`, `http`, `code-intel`, `telemetry`, `llm`,
-`ontology`, `media`, or `all`. For example, `pip install "uclone-x[all]"`.
+`pip install uclone-x` gives the zero-broker Python Agent Kernel SDK (Python 3.11 or
+newer). Features that need more dependencies are optional extras: `cli`, `http`, `cluster`,
+`code-intel`, `telemetry`, `llm`, `ontology`, `media`, or `all`. For example,
+`pip install "uclone-x[cli]"` for headless CLI usage or `pip install "uclone-x[all]"` for
+every surface.
 
 If a command needs an extra you have not installed, it prints `ucx: ` followed by the
 name of the missing extra on standard error and exits with status 1.
@@ -19,11 +21,15 @@ name of the missing extra on standard error and exits with status 1.
 | Command | What it does |
 |---|---|
 | `ucx version` | Print the installed version |
-| `ucx start` | Check the machine, prepare a local model, and open the dashboard in a browser |
+| `ucx up` | Converge the full declarative cluster stack (Docker infra, Model Gateway, stateless workers, Web UI) |
+| `ucx up --plan` | Print a dry-run drift plan (`+ create`, `~ update`, `= unchanged`) without starting or stopping services |
+| `ucx down` | Stop managed cluster daemons and Docker infrastructure (`-v/--volumes` also deletes volumes) |
+| `ucx status --stack` | Inspect live health and fingerprint drift across all declarative stack resources |
+| `ucx start` | Check the machine, prepare a local model, and open the single-process dashboard in a browser |
 | `ucx install` | Install the local model (Ollama) and the image engine without prompts |
 | `ucx ui` | Start the dashboard without the setup steps |
 | `ucx ui stop` | Stop the dashboard on a port |
-| `ucx status` | Show a running dashboard's health |
+| `ucx status` | Show a running dashboard's health (`--stack` inspects the full cluster stack) |
 
 `ucx start` and `ucx ui` listen on `127.0.0.1:5180` by default (`--host`, `--port`).
 `--cwd` sets the directory agents work in; it defaults to the current directory.
@@ -46,7 +52,31 @@ It exits 0 only when every requested part is ready.
 `~/.uclone/ui/`. If there is no record, or the record does not match a running dashboard,
 it refuses and exits 1 instead of stopping whatever holds the port.
 
-`ucx status` reads `http://127.0.0.1:8000` unless given `--url`; `--json` prints JSON.
+`ucx status` reads `http://127.0.0.1:8000` unless given `--url`; `--json` prints JSON. With
+`--stack`, it inspects the live declarative cluster stack (`--workers`, `--port`,
+`--gateway-port`, `--json`).
+
+## Declarative cluster stack and Model Gateway
+
+From a repository checkout with Docker running, `ucx up` converges five ordered resources
+(`stack_secrets`, `docker_infra`, `model_gateway`, `agent_workers`, `web_ui_server`) by
+comparing desired configuration fingerprints against `.ucx-cluster/deploy-state.json` and
+live OS/HTTP health probes:
+
+| Command | What it does |
+|---|---|
+| `ucx up` | Converge only drifted or unhealthy resources (`-w/--workers N`, `-p/--port 5180`, `--gateway-port 5191`, `-r/--remote-host USER@HOST`, `--open`, `--json`) |
+| `ucx up --plan` | Compute and display the reconciliation plan without mutating containers or daemons (`--detailed-exitcode` exits `0` when converged, `2` when drift exists, `1` on error) |
+| `ucx down` | Gracefully stop `web_ui_server`, `agent_workers`, `model_gateway`, and Docker Compose services (`-v/--volumes` removes containers and volumes) |
+| `ucx status --stack` | Report live readiness and drift across all five stack resources (`--json` for machine output) |
+| `ucx gateway serve` | Run the standalone unified Model Gateway (`127.0.0.1:5191` by default; `--remote-host`, `--require-auth`) |
+| `ucx gateway status` | Probe `/v1/health` and `/v1/models` on a running Model Gateway (`--url`, `--json`) |
+| `ucx worker` | Run one stateless Kafka/Valkey/PostgreSQL worker process (`--slot`, `--worker-id`) |
+| `ucx cluster up\|down\|status\|verify` | Low-level Docker Compose infrastructure lifecycle and live 5-stage cluster verification |
+
+In the cluster stack, `model_gateway` owns provider credentials and any remote-GPU SSH
+tunnel (`--remote-host`), while `agent_workers` and `web_ui_server` talk only to
+`UCX_MODEL_GATEWAY_URL` with raw cloud API keys stripped from their child environments.
 
 ## Talking to a clone: `ucx run`
 

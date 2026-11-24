@@ -234,7 +234,7 @@ def _pad_track_bars_to(
     fallback_bar = (
         source_bars[0]
         if source_bars
-        else TrackBar(bar=1, chord="Dm7", notes=[f"1.0:REST:{rest_dur}"])
+        else TrackBar(bar=1, chord=None, notes=[f"1.0:REST:{rest_dur}"])
     )
     merged: list[TrackBar] = []
     for bar_num in range(1, target_bars + 1):
@@ -305,10 +305,11 @@ def _reconcile_section_and_track_bars(
     base_chords = (
         list(sec.chords)
         if sec is not None and sec.chords
-        else [b.chord for b in track.bars if b.chord] or ["Dm7"]
+        else [b.chord for b in track.bars if b.chord]
     )
     chords = list(sec.chords) if sec is not None else []
-    while len(chords) < target_bars:
+    # A chordless song stays chordless: no progression is invented to fill the score.
+    while base_chords and len(chords) < target_bars:
         bar_num = len(chords) + 1
         patch_chord = patch_by_bar[bar_num].chord if bar_num in patch_by_bar else ""
         chords.append(patch_chord or base_chords[(bar_num - 1) % len(base_chords)])
@@ -323,7 +324,7 @@ def _reconcile_section_and_track_bars(
             title=sec.title,
             kind=sec.kind,
             bars=target_bars,
-            chords=chords[:target_bars],
+            chords=chords[:target_bars] if len(chords) >= target_bars else [],
             tempo_map=list(sec.tempo_map),
         )
         new_sections = [updated_sec if s.id == section_id else s for s in outline.sections]

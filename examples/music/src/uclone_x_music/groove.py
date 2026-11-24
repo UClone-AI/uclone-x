@@ -31,6 +31,7 @@ __all__ = [
     "generate_bass_groove",
     "generate_classical_satb_strings",
     "generate_hiphop_drums",
+    "is_chord_symbol",
     "subdivide_bars_faster",
 ]
 
@@ -44,6 +45,16 @@ _NOTE_OFFSETS: dict[str, int] = {
     "B": 11,
 }
 _CHORD_ROOT_RE = re.compile(r"^([A-Ga-g])([#b]?)(.*?)(?:/([A-Ga-g])([#b]?))?$")
+
+
+def is_chord_symbol(symbol: str) -> bool:
+    """Whether `symbol` names a chord root the generators can read (`Dm7`, `F#m7b5`, `C/E`).
+
+    The root readers below fall back to C for anything else, so a tool that takes chords
+    from the model checks them here and refuses instead of composing over a silent C.
+    """
+    text = symbol.strip()
+    return bool(text) and " " not in text and _CHORD_ROOT_RE.fullmatch(text) is not None
 
 
 def _chord_root_pc(chord_symbol: str | None) -> int:
